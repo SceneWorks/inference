@@ -157,7 +157,7 @@ root.join("transformer").join("config.json"),
 /// stock decoder 2x and — worse, E3 — under-declared the packed tiers.
 ///
 /// The packed q4/q8 diffusers tiers ([`snapshot_quant_tier`], sc-9407) ship each projection as an
-/// MLX `.weight` U32 / `.scales` / `.biases` triple. `PackedFluxDit` / `PackedT5Encoder` /
+/// MLX `.weight` U32 / `.scales` / `.biases` triple. `FluxDit` / `PackedT5Encoder` /
 /// `PackedClipText` load every triple through `QLinear::linear_detect` / `QEmbedding::detect`,
 /// which repack it into one resident GGML `QTensor` — `Q4_1` at 20 B per 32 values (5 bits per
 /// element, not the 4.5 the file holds) or `Q8_0` at 34 B — so those are priced through
@@ -331,7 +331,7 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// the block-window rung. The two counts are read from `<root>/transformer/config.json`
 /// (`num_layers` / `num_single_layers`) exactly as `pipeline.rs::dit_block_counts` does — and, like
 /// that function, **only on the diffusers layout that calls it**. The BFL single-file layout builds
-/// `IpFlux` straight from the preset, so it publishes the preset's counts even when a full BFL
+/// `FluxDit` straight from the preset, so it publishes the preset's counts even when a full BFL
 /// snapshot happens to ship a `transformer/` config alongside its root checkpoint: reading a
 /// different source than the loader would publish geometry the built model does not have.
 ///
@@ -360,7 +360,7 @@ fn architecture_facts_from_snapshot(
     let vae = crate::vae::native::Config::dev();
     // Read the block counts from `transformer/config.json` only on the layout whose loader reads
     // them. `pipeline::dit_block_counts` is called from `load_diffusers_components` alone; the
-    // stock BFL path builds `IpFlux::new(&flux_config(variant), ..)`, whose depth comes from the
+    // stock BFL path builds `FluxDit::new(&flux_config(variant), ..)`, whose depth comes from the
     // preset. A *full* BFL snapshot ships both the root single file and the diffusers subdirs, so
     // reading the file unconditionally published a trunk depth the stock loader never builds.
     let transformer_config =
@@ -1308,7 +1308,7 @@ mod tests {
         gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
 
         // A FULL black-forest-labs snapshot ships the root single file AND the diffusers subdirs.
-        // `uses_diffusers_layout` keeps it on the stock loader, which builds `IpFlux` from the
+        // `uses_diffusers_layout` keeps it on the stock loader, which builds `FluxDit` from the
         // preset — so the config's counts must NOT be published for it (SC-22667).
         // Mutation that reds this: reading `af::component_config` unconditionally, the shape under
         // review.

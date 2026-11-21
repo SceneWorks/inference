@@ -8,7 +8,7 @@
 //!   produces the pooled embed);
 //! - **19** per-double-block decoupled K/V projectors (`Linear(4096 → 3072)`) — one pair per FLUX
 //!   double block, applied as a decoupled cross-attention whose residual is injected into the image
-//!   stream (`crate::ip_dit`).
+//!   stream (`crate::transformer`).
 //!
 //! [`FluxIpInjector`] precomputes the 4 image tokens once (constant across the denoise) and exposes
 //! [`double_block_residual`](FluxIpInjector::double_block_residual) — the per-block residual the forked

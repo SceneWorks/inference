@@ -83,13 +83,13 @@ use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
 use crate::pipeline::{LATENT_CHANNELS, PATCH_SIZE, SPATIAL_SCALE};
+use crate::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 
 /// Every training canvas side is a multiple of this: one VAE cell (8 px) times the DiT's 2×2 patch.
 pub(crate) const CANVAS_STRIDE: u32 = SPATIAL_SCALE * PATCH_SIZE;

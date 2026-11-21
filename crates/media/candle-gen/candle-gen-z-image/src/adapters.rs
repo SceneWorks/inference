@@ -42,7 +42,7 @@ use candle_gen::train::merge_dit::{
 };
 use candle_gen::{CandleError, Result};
 
-use crate::packed_dit::ZImageTransformer2DModel;
+use crate::dit::ZImageTransformer2DModel;
 
 /// Fold every adapter spec in `specs` into the base DiT tensor `map` (CPU, native dtype) at each
 /// spec's `scale` — LoRA and LoKr, merged into the dense weights (`W += δ`). Returns the
@@ -462,6 +462,7 @@ pub fn install_additive(
     // factors are read on the CPU but the base weight lives on the DiT device (CUDA on a packed tier),
     // so they are moved onto it at push. A factor whose dims don't match the projection is surfaced as a
     // skipped key, never a crashing forward (the additive analog of the fold path's shape guard).
+    dit.invalidate_prepared_conditioning();
     let device = dit.device().clone();
     let plan = AdditivePlan {
         pending_lora,

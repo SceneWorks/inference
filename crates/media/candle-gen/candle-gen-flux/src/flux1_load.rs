@@ -12,7 +12,7 @@
 //! This module is the single home. Each loader takes a `label` (`"flux"`, `"flux ip-adapter"`,
 //! `"flux1 control"`) so callers keep their crafted, provider-specific diagnostics, and reuses the
 //! workspace [`candle_gen::loader`] mmap surface (F-019) for the shard listing / mmap. The genuine
-//! per-provider drift — which DiT wrapper (stock [`Flux`] vs the forked [`crate::ip_dit::IpFlux`]) is
+//! per-provider drift — which DiT wrapper (stock [`Flux`] vs the forked [`crate::transformer::FluxDit`]) is
 //! built, whether the VAE is also mirrored into a mean-encoder — stays with the caller: these helpers
 //! hand back the loaded CLIP / T5 / a DiT `VarBuilder` / the VAE and let the provider assemble its own
 //! model shape.
@@ -22,13 +22,13 @@ use std::path::{Path, PathBuf};
 use crate::vae::native::AutoEncoder;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use candle_transformers::models::t5::Config as BflT5Config;
 use rand::{rngs::StdRng, SeedableRng};
 
+use candle_gen::text_encoder::{ClipConfig, ClipTextEncoder, T5Config, T5Encoder};
 use candle_gen::{CandleError, Result};
 
-use crate::pipeline::{ae_config, clip_config};
+use crate::pipeline::ae_config;
 use crate::Variant;
 
 /// mmap a [`VarBuilder`] over `files` at `dtype`/`device`, erroring (with the `label` prefix) if any is
@@ -61,14 +61,14 @@ pub(crate) fn safetensors_in(dir: &Path, label: &str) -> Result<Vec<PathBuf>> {
 /// Load the dense **BFL**-layout FLUX text encoders — CLIP-L (`text_encoder/model.safetensors`, pooled
 /// under the `text_model.` prefix) and T5-XXL (`text_encoder_2/`, sharded, with its `config.json`
 /// alongside) — at `dtype`/`device`. The single home for the block the three providers copy-pasted; the
-/// `text_model.` prefix, the fixed [`clip_config`], and the T5 config parse are parity-critical and now
+/// `text_model.` prefix, the fixed [`ClipConfig::flux`], and the T5 config parse are parity-critical and now
 /// live once. `label` prefixes the crafted config-read/parse errors.
 pub(crate) fn text_encoders(
     root: &Path,
     dtype: DType,
     device: &Device,
     label: &str,
-) -> Result<(ClipTextTransformer, T5EncoderModel)> {
+) -> Result<(ClipTextEncoder, T5Encoder)> {
     // CLIP-L (openai/clip-vit-large-patch14 layout) under `text_encoder/`; the candle transformer pools
     // under the `text_model.` prefix. Config is fixed for FLUX.
     let clip_vb = mmap_vb(
@@ -77,11 +77,11 @@ pub(crate) fn text_encoders(
         device,
         label,
     )?;
-    let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
+    let clip = ClipTextEncoder::new_bfl(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
 
     // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
     let t5_dir = root.join("text_encoder_2");
-    let t5_cfg: T5Config = candle_gen::gen_core::__model_input_choose!(
+    let t5_cfg: BflT5Config = candle_gen::gen_core::__model_input_choose!(
         {
             let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
                 CandleError::Msg(format!("{label}: read text_encoder_2/config.json: {e}"))
@@ -104,14 +104,34 @@ pub(crate) fn text_encoders(
         }
     );
     let t5_vb = mmap_vb(&safetensors_in(&t5_dir, label)?, dtype, device, label)?;
-    let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
+    if t5_cfg.is_decoder {
+        return Err(CandleError::Msg(format!(
+            "{label}: T5 config selects a decoder, expected an encoder"
+        )));
+    }
+    let cfg = T5Config {
+        vocab_size: t5_cfg.vocab_size,
+        d_model: t5_cfg.d_model,
+        d_kv: t5_cfg.d_kv,
+        d_ff: t5_cfg.d_ff,
+        num_layers: t5_cfg.num_layers,
+        num_heads: t5_cfg.num_heads,
+        relative_attention_num_buckets: t5_cfg.relative_attention_num_buckets,
+        relative_attention_max_distance: t5_cfg.relative_attention_max_distance,
+        layer_norm_epsilon: t5_cfg.layer_norm_epsilon,
+    };
+    let gated_activation = t5_cfg
+        .feed_forward_proj
+        .gated
+        .then_some(t5_cfg.feed_forward_proj.activation);
+    let t5 = T5Encoder::new_bfl(&cfg, t5_vb, gated_activation)?;
 
     Ok((clip, t5))
 }
 
 /// mmap a [`VarBuilder`] over the root BFL DiT checkpoint (`flux1-{schnell,dev}.safetensors`) for
 /// `variant` at `dtype`/`device`. The caller builds the stock [`candle_transformers::models::flux::model::Flux`]
-/// or the forked [`crate::ip_dit::IpFlux`] over it — that choice is the genuine per-provider drift, so it
+/// or the forked [`crate::transformer::FluxDit`] over it — that choice is the genuine per-provider drift, so it
 /// stays with the caller; this just resolves + mmaps the (single) checkpoint file.
 pub(crate) fn dit_vb(
     root: &Path,
