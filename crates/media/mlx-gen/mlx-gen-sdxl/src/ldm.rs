@@ -242,13 +242,15 @@ mod tests {
 
     #[test]
     fn fused_openclip_maps_original_convrot_rows_and_scales_to_each_qkv_projection() {
-        let mut source = Weights::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fused.safetensors");
+        let mut source = std::collections::BTreeMap::new();
         for key in [
             "model.diffusion_model.input_blocks.7.0.out_layers.3.weight",
             "first_stage_model.decoder.up.1.block.2.nin_shortcut.weight",
             "conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
         ] {
-            source.insert(key, Array::from_f32(1.0));
+            source.insert(key.to_owned(), Array::from_f32(1.0));
         }
         let base = "conditioner.embedders.1.model.transformer.resblocks.9.attn.in_proj";
         let codes: Vec<i8> = (0..6 * 64).map(|i| (i / 64) as i8 - 3).collect();
@@ -266,7 +268,8 @@ mod tests {
             format!("{base}.comfy_quant"),
             Array::from_slice(desc, &[desc.len() as i32]),
         );
-        let parts = split_ldm_source(source).unwrap();
+        Array::save_safetensors(source.iter().map(|(k, v)| (k.as_str(), v)), None, &path).unwrap();
+        let parts = split_ldm_checkpoint(&path).unwrap();
         for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
             let key = format!("text_model.encoder.layers.9.self_attn.{name}_proj.weight");
             let mlx_gen::NativeProjection::ConvRot(op) =
