@@ -57,6 +57,63 @@ pub fn plan_projection_sources(
         .map(Some)
 }
 
+/// Inspect the encoded operands of a complete source before a model importer chooses a dialect.
+/// Dense parameters and integer control buffers are left to the family. Every field of an encoded
+/// leaf must have known semantics; a foreign scale spelling can never become an implicit unit
+/// scale. The returned policy describes storage only and makes no device-capability claim.
+pub fn classify_checkpoint_projection_sources(
+    paths: &[PathBuf],
+    registry: &CheckpointCodecRegistry,
+) -> crate::Result<Option<LogicalWeightPlan>> {
+    let mut tables = Vec::new();
+    for path in paths {
+        if let Some(table) = crate::safetensors_path_quantization_metadata(path)? {
+            tables.push(table);
+        }
+    }
+    plan_projection_sources(paths, |_| true, &tables, registry, &SourceCodecResidency)
+}
+
+/// Validate siblings before the projection-only view drops unrelated tensors. Named parameters
+/// such as OpenCLIP's `in_proj_weight` can also own companions at `<parameter>.<field>`.
+fn validate_projection_fields(
+    source: &BTreeMap<String, SafetensorsTensorHeader>,
+    bases: &BTreeSet<String>,
+    selected: &impl Fn(&str) -> bool,
+) -> crate::Result<()> {
+    for name in source.keys() {
+        let Some((base, field)) = name.rsplit_once('.') else {
+            continue;
+        };
+        let parameter = source.get(base).is_some_and(|header| {
+            selected(base) && matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+        });
+        if !parameter && !bases.contains(base) {
+            continue;
+        }
+        if matches!(
+            field,
+            "weight"
+                | "bias"
+                | "running_mean"
+                | "running_var"
+                | "num_batches_tracked"
+                | "comfy_quant"
+                | "weight_scale"
+                | "weight_scale_2"
+                | "input_scale"
+                | "scale_weight"
+                | "scale_input"
+        ) {
+            continue;
+        }
+        return Err(format!(
+            "unrecognized checkpoint field {name:?} beside an encoded projection; its scaling or layout requires an explicit source mapping"
+        ).into());
+    }
+    Ok(())
+}
+
 /// Validated physical rows and sidecars, reusable on relocation without rescanning shard headers.
 pub struct ProjectionSourceHeaders {
     headers: Vec<SafetensorsTensorHeader>,
@@ -133,6 +190,7 @@ impl ProjectionSourceHeaders {
                 }
             }
         }
+        validate_projection_fields(&source, &bases, &selected)?;
         let mut headers: Vec<_> = source
             .into_values()
             .filter(|h| {
@@ -214,6 +272,36 @@ mod tests {
         output.extend(header);
         output.extend(bytes);
         std::fs::write(path, output).unwrap();
+    }
+    #[test]
+    fn source_classification_keeps_mixed_dtypes_and_refuses_unmapped_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().join("mixed.safetensors")];
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let rows: &[(&str, &str, &[usize], &[u8])] = &[
+            ("unet.proj.weight", "F8_E5M2", &[2, 2], &[0x3c; 4]),
+            ("unet.proj.bias", "F16", &[2], &[0; 4]),
+            ("clip.position_ids", "I64", &[1], &[0; 8]),
+            ("vae.conv.weight", "F16", &[2, 2], &[0; 8]),
+        ];
+        write(&paths[0], rows);
+        let plan = classify_checkpoint_projection_sources(&paths, &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.tensors.len(), 1);
+        assert_eq!(plan.tensors[0].physical_key, "unet.proj.weight");
+        for name in [
+            "unet.proj.inv_s",
+            "unet.proj.weight.__scale",
+            "unet.proj.scales",
+        ] {
+            let mut contaminated = rows.to_vec();
+            contaminated.push((name, "F32", &[1], &[0; 4]));
+            write(&paths[0], &contaminated);
+            let error = classify_checkpoint_projection_sources(&paths, &registry).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
     }
     #[test]
     fn selected_shards_resolve_all_names_before_filtering_and_validate_original_codes() {
