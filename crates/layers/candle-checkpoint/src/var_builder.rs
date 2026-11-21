@@ -635,17 +635,33 @@ impl Remapped {
             physical
         }
     }
-}
-impl SimpleBackend for Remapped {
-    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+    fn read(
+        &self,
+        name: &str,
+        shape: Option<&Shape>,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Tensor> {
         let (physical, view) = self.lookup(name)?;
         if let MappedWeights::Checkpoint(src) = &self.source {
             let logical = Self::logical(src, physical, name);
             if src.reader().planned(logical).is_some() {
-                let t = src
-                    .on_device(dev)?
-                    .reader()
-                    .read_dense(logical, dtype, dev)?;
+                let requested = match shape.map(Shape::dims) {
+                    Some(&[rows, cols]) => Some((rows, cols)),
+                    _ => None,
+                };
+                let source_dims = match view {
+                    SourceView::Whole(_) | SourceView::Rows { .. } => requested,
+                    SourceView::Transposed(_) => requested.map(|(n, k)| (k, n)),
+                    SourceView::Matrix { rows, cols, .. } => Some((*rows, *cols)),
+                    SourceView::Reshape { .. } => None,
+                };
+                let t = src.on_device(dev)?.reader().read_dense_with_shape(
+                    logical,
+                    source_dims,
+                    dtype,
+                    dev,
+                )?;
                 return match view {
                     SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
                     SourceView::Transposed(_) => t.t()?.contiguous(),
@@ -663,8 +679,13 @@ impl SimpleBackend for Remapped {
             SourceView::Reshape { shape, .. } => t.reshape(shape.as_slice()),
         }
     }
+}
+impl SimpleBackend for Remapped {
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        self.read(name, None, dtype, dev)
+    }
     fn get(&self, shape: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
-        let t = self.get_unchecked(name, dtype, dev)?;
+        let t = self.read(name, Some(&shape), dtype, dev)?;
         if t.shape() != &shape {
             return Err(Error::UnexpectedShape {
                 msg: format!("remapped weight {name}"),
@@ -696,11 +717,14 @@ impl SimpleBackend for Remapped {
             let [cols, rows] = stored.shape() else {
                 candle_core::bail!("{name}: transposed projection requires a matrix");
             };
-            let dims = (*rows, *cols);
-            if shape.is_some_and(|expected| expected != dims) {
-                candle_core::bail!(
-                    "{name}: transposed projection has shape {dims:?}, expected {shape:?}"
-                );
+            let dims = shape.unwrap_or((*rows, *cols));
+            if let Some(expected) = shape {
+                if src.reader().planned(physical).is_some() {
+                    src.reader()
+                        .validate_matrix_shape(physical, [expected.1, expected.0])?;
+                } else if expected != (*rows, *cols) {
+                    candle_core::bail!("{name}: transposed projection has shape [{rows},{cols}], expected {expected:?}");
+                }
             }
             return src.native_linear_weight_transposed(physical, dims, dtype, dev);
         }
@@ -815,4 +839,79 @@ pub fn mmap_var_builder_with_geometry(
         Err(plain) => Box::new(plain),
     };
     Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn remapped_dense_mxfp8_uses_the_callers_unpadded_dimensions() {
+        use safetensors::tensor::TensorView;
+        let codes: Vec<_> = (0..32 * 32)
+            .map(|i| {
+                if i / 32 < 3 && i % 32 < 5 {
+                    0x38 + (i / 32) as u8
+                } else {
+                    0x7e
+                }
+            })
+            .collect();
+        let scales = [127; 128 * 4];
+        let descriptor = br#"{"format":"mxfp8"}"#;
+        let bytes = safetensors::tensor::serialize(
+            [
+                (
+                    "old.weight",
+                    TensorView::new(Dtype::F8_E4M3, vec![32, 32], &codes).unwrap(),
+                ),
+                (
+                    "old.weight_scale",
+                    TensorView::new(Dtype::U8, vec![128, 4], &scales).unwrap(),
+                ),
+                (
+                    "old.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![descriptor.len()], descriptor).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        for (view, shape, expected) in [
+            (
+                SourceView::Whole("new.weight".into()),
+                (3, 5),
+                vec![vec![1.; 5], vec![1.125; 5], vec![1.25; 5]],
+            ),
+            (
+                SourceView::Transposed("new.weight".into()),
+                (5, 3),
+                vec![vec![1., 1.125, 1.25]; 5],
+            ),
+        ] {
+            let st = MmapedSafetensors::from_buffers([Ok(bytes.clone())]).unwrap();
+            let scope = gen_core::CheckpointReceiptScope::default();
+            let vb = scope
+                .with(|| {
+                    remapped_var_builder(
+                        st,
+                        &[],
+                        DType::F32,
+                        &Device::Cpu,
+                        BTreeMap::from([("old.weight".into(), vec![view])]),
+                    )
+                })
+                .unwrap();
+            assert!(vb.get_unchecked("new.weight").is_err());
+            assert!(vb.get((63, 66), "new.weight").is_err());
+            assert!(scope.try_snapshots().unwrap().is_empty());
+            let layer = candle_nn::linear_no_bias(shape.1, shape.0, vb.pp("new")).unwrap();
+            let facts = scope.try_snapshots().unwrap();
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].resident_bytes(), 3 * 5 * 4);
+            assert_eq!(
+                layer.try_weight().unwrap().to_vec2::<f32>().unwrap(),
+                expected
+            );
+        }
+    }
 }
