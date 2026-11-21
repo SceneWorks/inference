@@ -424,6 +424,15 @@ impl VideoRenderPlan {
         Ok(peak)
     }
 
+    /// Raw input pixel buffers already owned by the caller when it probes this domain.
+    pub fn source_bytes(&self, domain: MemoryBudgetDomain) -> u64 {
+        if domain == self.host_domain() {
+            self.inputs.carrier_bytes
+        } else {
+            0
+        }
+    }
+
     fn host_domain(&self) -> MemoryBudgetDomain {
         if self.layout.domain == MemoryBudgetDomain::UnifiedMemory {
             MemoryBudgetDomain::UnifiedMemory

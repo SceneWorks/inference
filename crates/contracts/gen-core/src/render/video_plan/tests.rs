@@ -455,8 +455,13 @@ fn persistent_sources_and_emitted_chunks_charge_their_actual_phase_and_domain() 
         5000 + 900 + 6
     );
     assert_eq!(plan.minimum_denoise_live_bytes(HostRam).unwrap(), 900 + 6);
+    assert_eq!(plan.source_bytes(HostRam), 6);
+    assert_eq!(plan.source_bytes(DeviceVram), 0);
+    assert_eq!(plan.source_bytes(UnifiedMemory), 0);
     plan.layout.domain = UnifiedMemory;
     plan.layout.retained_allocations[0].domain = UnifiedMemory;
+    assert_eq!(plan.source_bytes(UnifiedMemory), 6);
+    assert_eq!(plan.source_bytes(HostRam), 0);
     assert_eq!(
         plan.minimum_decode_live_bytes(UnifiedMemory).unwrap(),
         2000 + 5000 + 900 + 6
