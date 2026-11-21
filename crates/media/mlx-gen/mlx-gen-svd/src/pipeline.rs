@@ -9,6 +9,10 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, subtract, zeros_like};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::{
+    render::video::{run_video_steps, VideoDenoisePhase},
+    MemoryGeometry, MemoryRequestScope,
+};
 use mlx_gen::{CancelFlag, EdmModelSampling, Error, Progress, Result};
 
 use crate::config::SchedulerConfig;
@@ -117,62 +121,32 @@ impl SvdPipeline {
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
-        let sched = EdmSchedule::karras(steps, &self.scheduler);
-        mlx_gen::video_execution::sampling(
-            "svd_native",
-            "edm_euler",
-            "edm_v_prediction",
-            serde_json::json!({"min_guidance_bits":min_g.to_bits(),"max_guidance_bits":max_g.to_bits()}),
-        );
-        mlx_gen::video_execution::schedule("svd_native", &sched.sigmas);
-
-        // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
-        let embeds2 = concatenate_axis(&[&zeros_like(image_embeds)?, image_embeds], 0)?; // [2, ctx, 1024]
-        let img_lat2 = concatenate_axis(&[&zeros_like(image_latents)?, image_latents], 0)?; // [2,F,h,w,4]
-        let atid2 = concatenate_axis(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
-        let guidance = Self::guidance_schedule(num_frames, min_g, max_g);
-
-        let mut latents = latents.clone();
-        for i in 0..steps {
-            // Honor the engine cancellation contract (F-001): an SVD render is up to MAX_STEPS=200
-            // UNet forwards over many frames, so check before each (seconds-long) step and return the
-            // typed `Error::Canceled`. The per-step `eval` below makes this effective — without it
-            // MLX's lazy graph defers all compute to VAE decode and this check would pass for every
-            // step (mirrors mlx-gen-wan's denoise, sc-5551).
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let sigma = sched.sigmas[i];
-            let sigma_next = sched.sigmas[i + 1];
-            let t = sched.timesteps[i];
-
-            let scaled = scale_model_input(&latents, sigma)?; // [1,F,h,w,4]
-            let lat2 = concatenate_axis(&[&scaled, &scaled], 0)?; // [2,F,h,w,4]
-            let inp = concatenate_axis(&[&lat2, &img_lat2], -1)?; // [2,F,h,w,8]
-
-            let pred = self.unet.forward(&inp, t, &embeds2, &atid2, num_frames)?; // [2,F,h,w,4]
-            let uncond = pred.take_axis(Array::from_int(0), 0)?.expand_dims(0)?; // [1,F,h,w,4]
-            let cond = pred.take_axis(Array::from_int(1), 0)?.expand_dims(0)?;
-            // noise_pred = uncond + guidance · (cond − uncond), frame-wise.
-            let noise_pred = add(&uncond, &multiply(&guidance, &subtract(&cond, &uncond)?)?)?;
-
-            let denoised = v_pred_denoised(&noise_pred, &latents, sigma)?;
-            latents = euler_step(&latents, &denoised, sigma, sigma_next)?;
-            // Force evaluation each step to bound the lazy graph's peak memory and make the
-            // cancellation check above effective (the diffusers reference is eager — per-step state).
-            mlx_rs::transforms::eval([&latents])?;
-            on_step(i + 1);
-        }
-        Ok(latents)
+        self.denoise_scoped(
+            EdmSchedule::karras(steps, &self.scheduler),
+            None,
+            0,
+            latents,
+            image_embeds,
+            image_latents,
+            added_time_ids,
+            num_frames,
+            min_g,
+            max_g,
+            cancel,
+            None,
+            &mut |event| {
+                if let Progress::Step { current, .. } = event {
+                    on_step(current as usize);
+                }
+            },
+        )
     }
 
     /// The curated unified-sampler denoise (epic 7114, sc-7122) — the additive alternative to the native
     /// EDM Euler [`Self::denoise`], routing any curated [`mlx_gen::Solver`] through
     /// [`mlx_gen::run_curated_sampler`] over an `EdmModelSampling` (v-prediction). SVD is **sampler-only**
     /// (no scheduler axis, matching ComfyUI): it keeps its native Karras EDM σ schedule and only swaps
-    /// the integrator. The native Euler default is preserved (the N1 gate) — `mlx_gen::Solver::Euler`
-    /// over `EdmModelSampling` reproduces it exactly (the `to_d` round-trip cancels: `c_skip`/`c_out`
-    /// equal the V `denoised_coeffs` and `c_noise = 0.25·ln σ` equals `timestep`).
+    /// the integrator. An explicit Euler uses the curated driver's scalar arithmetic and progress cadence.
     ///
     /// The per-frame CFG (`uncond + linspace(min,max,F)·(cond − uncond)`) lives in the predict closure,
     /// so a multi-eval solver re-applies it at each intermediate σ. `x_in` is the `c_in`-scaled latent
@@ -193,43 +167,100 @@ impl SvdPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let sched = EdmSchedule::karras(steps, &self.scheduler);
-        mlx_gen::video_execution::curated_sampling(
-            "svd_curated",
-            sampler_name,
-            "edm_v_prediction",
-            serde_json::json!({"min_guidance_bits":min_g.to_bits(),"max_guidance_bits":max_g.to_bits()}),
-        );
-        mlx_gen::video_execution::schedule("svd_curated", &sched.sigmas);
-        let ms = EdmModelSampling::svd();
-        // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
+        self.denoise_scoped(
+            EdmSchedule::karras(steps, &self.scheduler),
+            Some(sampler_name),
+            seed,
+            latents,
+            image_embeds,
+            image_latents,
+            added_time_ids,
+            num_frames,
+            min_g,
+            max_g,
+            cancel,
+            None,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_scoped(
+        &self,
+        schedule: EdmSchedule,
+        sampler: Option<&str>,
+        seed: u64,
+        latents: &Array,
+        image_embeds: &Array,
+        image_latents: &Array,
+        added_time_ids: &Array,
+        num_frames: i32,
+        min_g: f32,
+        max_g: f32,
+        cancel: &CancelFlag,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let &[batch, frames, height, width, _] = latents.shape() else {
+            return Err(Error::Msg("svd expects B,F,H,W,C latents".into()));
+        };
+        let geometry = MemoryGeometry {
+            width: width as u32 * crate::VAE_SCALE,
+            height: height as u32 * crate::VAE_SCALE,
+            frames: frames as u32,
+            batch: batch as u32,
+            reference_count: 1,
+        };
+        let phase =
+            VideoDenoisePhase::fixed(geometry, frames as u32, sampler, schedule.sigmas, seed);
+        let active = phase.enter(cancel, scope)?;
+        let guide = serde_json::json!({
+            "min_guidance_bits": min_g.to_bits(),
+            "max_guidance_bits": max_g.to_bits(),
+        });
+        if let Some(name) = phase.solver {
+            mlx_gen::video_execution::curated_sampling(
+                "svd_curated",
+                name,
+                "edm_v_prediction",
+                guide,
+            );
+            mlx_gen::video_execution::schedule("svd_curated", &phase.sigmas);
+        } else {
+            mlx_gen::video_execution::sampling(
+                "svd_native",
+                "edm_euler",
+                "edm_v_prediction",
+                guide,
+            );
+            mlx_gen::video_execution::schedule("svd_native", &phase.sigmas);
+        }
+
+        // Both solvers use one batch-2 prediction, with the unconditional row first.
         let embeds2 = concatenate_axis(&[&zeros_like(image_embeds)?, image_embeds], 0)?;
         let img_lat2 = concatenate_axis(&[&zeros_like(image_latents)?, image_latents], 0)?;
         let atid2 = concatenate_axis(&[added_time_ids, added_time_ids], 0)?;
         let guidance = Self::guidance_schedule(num_frames, min_g, max_g);
-        mlx_gen::run_curated_sampler(
-            mlx_gen::SamplerRun {
-                sampler_name: Some(sampler_name),
-                sigmas: &sched.sigmas,
-                seed,
-                cancel,
-                on_progress,
-            },
-            &ms,
-            latents.clone(),
+        let output = sample_edm(
+            &phase,
+            &schedule.timesteps,
+            latents,
+            cancel,
+            on_progress,
             |x_in, t| {
-                let lat2 = concatenate_axis(&[x_in, x_in], 0)?; // [2,F,h,w,4]
-                let inp = concatenate_axis(&[&lat2, &img_lat2], -1)?; // [2,F,h,w,8]
+                let lat2 = concatenate_axis(&[x_in, x_in], 0)?;
+                let inp = concatenate_axis(&[&lat2, &img_lat2], -1)?;
                 let pred = self.unet.forward(&inp, t, &embeds2, &atid2, num_frames)?;
                 let uncond = pred.take_axis(Array::from_int(0), 0)?.expand_dims(0)?;
                 let cond = pred.take_axis(Array::from_int(1), 0)?.expand_dims(0)?;
-                // noise_pred = uncond + guidance · (cond − uncond), frame-wise — the v-prediction.
                 Ok(add(
                     &uncond,
                     &multiply(&guidance, &subtract(&cond, &uncond)?)?,
                 )?)
             },
-        )
+        )?;
+        active.finish()?;
+        Ok(output)
     }
 
     /// Chunked temporal VAE decode (diffusers `decode_latents`): divide by `scaling_factor`, decode in
@@ -281,5 +312,165 @@ impl SvdPipeline {
         let frames = concatenate_axis(&refs, 0)?; // [F,H,W,3]
         let fs = frames.shape();
         Ok(frames.reshape(&[1, num_frames, fs[1], fs[2], fs[3]])?)
+    }
+}
+
+/// An omitted sampler keeps the native f64-derived coefficients and timetable. Every explicit
+/// name, including Euler, uses the curated EDM conversion and its per-evaluation progress.
+fn sample_edm(
+    phase: &VideoDenoisePhase<(), Option<&str>>,
+    timesteps: &[f32],
+    latents: &Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    if let Some(name) = phase.solver {
+        return mlx_gen::run_curated_sampler(
+            mlx_gen::SamplerRun {
+                sampler_name: Some(name),
+                sigmas: &phase.sigmas,
+                seed: phase.seed,
+                cancel,
+                on_progress,
+            },
+            &EdmModelSampling::svd(),
+            latents.clone(),
+            predict,
+        );
+    }
+    let mut latents = latents.clone();
+    run_video_steps(&phase.sigmas, cancel, |step| -> Result<()> {
+        let scaled = scale_model_input(&latents, step.sigma)?;
+        let prediction = predict(&scaled, timesteps[step.index])?;
+        let denoised = v_pred_denoised(&prediction, &latents, step.sigma)?;
+        latents = euler_step(&latents, &denoised, step.sigma, step.next_sigma)?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_progress(Progress::Step {
+            current: (step.index + 1) as u32,
+            total: timesteps.len() as u32,
+        });
+        Ok(())
+    })?;
+    Ok(latents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Predict(u32),
+        Step(u32),
+    }
+
+    fn trace_schedule() -> EdmSchedule {
+        // At this positive f32 node, Darwin logf and f64 log rounded to f32 differ by one ULP.
+        EdmSchedule::karras(
+            3,
+            &SchedulerConfig {
+                sigma_max: f32::from_bits(0x3f60_3bc6),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn edm_trace(sampler: Option<&str>, cancel_on_progress: bool) -> (Result<Array>, Vec<Event>) {
+        let schedule = trace_schedule();
+        let geometry = MemoryGeometry {
+            width: 8,
+            height: 8,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        };
+        let phase = VideoDenoisePhase::fixed(geometry, 1, sampler, schedule.sigmas, 29);
+        let cancel = CancelFlag::new();
+        let events = RefCell::new(Vec::new());
+        let result = sample_edm(
+            &phase,
+            &schedule.timesteps,
+            &Array::from_slice(&[1f32], &[1, 1, 1, 1, 1]),
+            &cancel,
+            &mut |event| {
+                let Progress::Step { current, total: 3 } = event else {
+                    panic!("unexpected {event:?}")
+                };
+                events.borrow_mut().push(Event::Step(current));
+                if cancel_on_progress {
+                    cancel.cancel();
+                }
+            },
+            |scaled, time| {
+                events.borrow_mut().push(Event::Predict(time.to_bits()));
+                Ok(scaled.clone())
+            },
+        );
+        (result, events.into_inner())
+    }
+
+    #[test]
+    fn native_and_explicit_euler_preserve_timestep_and_progress_order() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let schedule = trace_schedule();
+            for sampler in [None, Some("euler")] {
+                let (result, events) = edm_trace(sampler, false);
+                let output = result.unwrap().item::<f32>();
+                assert!(output.is_finite());
+                if sampler.is_none() {
+                    // Same mock predictor as edm_trace: its output is the scaled input.
+                    let mut reference = Array::from_slice(&[1f32], &[1, 1, 1, 1, 1]);
+                    for nodes in schedule.sigmas.windows(2) {
+                        let prediction = scale_model_input(&reference, nodes[0]).unwrap();
+                        let denoised = v_pred_denoised(&prediction, &reference, nodes[0]).unwrap();
+                        reference = euler_step(&reference, &denoised, nodes[0], nodes[1]).unwrap();
+                        mlx_rs::transforms::eval([&reference]).unwrap();
+                    }
+                    assert_eq!(output.to_bits(), reference.item::<f32>().to_bits());
+                }
+                let mut expected = Vec::new();
+                for (index, &sigma) in schedule.sigmas[..3].iter().enumerate() {
+                    let step = Event::Step(index as u32 + 1);
+                    if sampler.is_none() {
+                        expected.push(Event::Predict(
+                            (0.25 * (sigma as f64).ln() as f32).to_bits(),
+                        ));
+                        expected.push(step);
+                    } else {
+                        expected.push(step);
+                        expected.push(Event::Predict((0.25 * sigma.ln()).to_bits()));
+                    }
+                }
+                assert_eq!(events, expected);
+            }
+        });
+    }
+
+    #[test]
+    fn progress_cancellation_stops_before_the_next_prediction() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let (native, events) = edm_trace(None, true);
+            assert!(matches!(native, Err(Error::Canceled)));
+            assert!(matches!(&events[..], [Event::Predict(_), Event::Step(1)]));
+            let (explicit, events) = edm_trace(Some("euler"), true);
+            assert!(matches!(explicit, Err(Error::Canceled)));
+            assert_eq!(events, [Event::Step(1)]);
+        });
+    }
+
+    #[test]
+    fn guidance_ramp_follows_frame_order_including_single_frames() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let ramp = SvdPipeline::guidance_schedule(3, 1., 3.);
+            assert_eq!(ramp.shape(), [1, 3, 1, 1, 1]);
+            assert_eq!(ramp.as_slice::<f32>(), [1., 2., 3.]);
+            assert_eq!(SvdPipeline::guidance_schedule(1, 1., 3.).item::<f32>(), 1.);
+            assert_eq!(
+                SvdPipeline::guidance_schedule(3, 1., 0.).as_slice::<f32>(),
+                [1., 0.5, 0.]
+            );
+        });
     }
 }
