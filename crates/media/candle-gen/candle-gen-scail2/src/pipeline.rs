@@ -50,24 +50,6 @@ const DEFAULT_FPS: u32 = 16;
 #[cfg(test)]
 use gen_core::generator::SCAIL2_MAX_CHARACTERS as MAX_REFERENCE_CHARACTERS;
 
-/// The only DiT projections the SCAIL2 MLX converter packs. These raw `SCAIL2Model` names are
-/// deliberately not diffusers-prefixed: the hosted `dit.safetensors` is a flat file, while the
-/// legacy candle tree is a separate dense format.
-const PACKED_DIT_SUFFIXES: &[&str] = &[
-    "self_attn.q",
-    "self_attn.k",
-    "self_attn.v",
-    "self_attn.o",
-    "cross_attn.q",
-    "cross_attn.k",
-    "cross_attn.v",
-    "cross_attn.o",
-    "cross_attn.k_img",
-    "cross_attn.v_img",
-    "ffn.0",
-    "ffn.2",
-];
-
 /// SceneWorks/engine model id (matches `mlx-gen-scail2` so a consumer resolves the same engine across
 /// backends). A still image is `num_frames == 1`.
 pub const MODEL_ID: &str = "scail2_14b";
@@ -332,20 +314,8 @@ struct PackedProjectionSchema {
 /// triple alone is not enough to prove this: `QLinear` infers its bit width from the triple and
 /// intentionally does not compare the inferred matrix dimensions with its caller's schema.
 fn expected_packed_dit_projections(cfg: &Scail2Config) -> BTreeMap<String, PackedProjectionSchema> {
-    (0..cfg.num_layers)
-        .flat_map(|block| {
-            PACKED_DIT_SUFFIXES.iter().map(move |suffix| {
-                let (output, input) = match *suffix {
-                    "ffn.0" => (cfg.ffn_dim, cfg.dim),
-                    "ffn.2" => (cfg.dim, cfg.ffn_dim),
-                    _ => (cfg.dim, cfg.dim),
-                };
-                (
-                    format!("blocks.{block}.{suffix}"),
-                    PackedProjectionSchema { output, input },
-                )
-            })
-        })
+    gen_core::generator::scail2_fit::packed_projection_shapes(cfg.num_layers, cfg.dim, cfg.ffn_dim)
+        .map(|(name, [output, input])| (name, PackedProjectionSchema { output, input }))
         .collect()
 }
 

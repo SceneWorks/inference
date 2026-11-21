@@ -23,6 +23,83 @@ const MEMBERS: [&str; 6] = [
     "vae.safetensors",
 ];
 
+/// Native packed block projections shared with the MLX converter and Candle loader.
+pub const SCAIL2_QUANT_SUFFIXES: &[&str] = &[
+    ".self_attn.q",
+    ".self_attn.k",
+    ".self_attn.v",
+    ".self_attn.o",
+    ".cross_attn.q",
+    ".cross_attn.k",
+    ".cross_attn.v",
+    ".cross_attn.o",
+    ".cross_attn.k_img",
+    ".cross_attn.v_img",
+    ".ffn.0",
+    ".ffn.2",
+];
+
+/// Logical [output, input] dimensions of each independently packed projection from
+/// the trained SCAIL model. Embedding stems, modulations, and output head remain dense.
+pub fn packed_projection_shapes(
+    layers: usize,
+    dim: usize,
+    ffn: usize,
+) -> impl Iterator<Item = (String, [usize; 2])> {
+    (0..layers).flat_map(move |layer| {
+        SCAIL2_QUANT_SUFFIXES.iter().map(move |suffix| {
+            let shape = match *suffix {
+                ".ffn.0" => [ffn, dim],
+                ".ffn.2" => [dim, ffn],
+                _ => [dim, dim],
+            };
+            (format!("blocks.{layer}{suffix}"), shape)
+        })
+    })
+}
+
+fn complete_mlx_packing(
+    headers: &[crate::weightsmeta::SafetensorsTensorHeader],
+    bits: u64,
+    layers: usize,
+    dim: usize,
+    ffn: usize,
+) -> bool {
+    use crate::weightsmeta::Dtype;
+    let by_name = headers
+        .iter()
+        .map(|h| (h.name.as_str(), h))
+        .collect::<std::collections::HashMap<_, _>>();
+    if !matches!(bits, 4 | 8)
+        || layers == 0
+        || layers > by_name.len() / (3 * SCAIL2_QUANT_SUFFIXES.len())
+    {
+        return false;
+    }
+    packed_projection_shapes(layers, dim, ffn).all(|(stem, [out, input])| {
+        if input == 0 || out == 0 || !input.is_multiple_of(64) {
+            return false;
+        }
+        let Some(weight) = by_name.get(format!("{stem}.weight").as_str()) else {
+            return false;
+        };
+        let Some(scales) = by_name.get(format!("{stem}.scales").as_str()) else {
+            return false;
+        };
+        let Some(biases) = by_name.get(format!("{stem}.biases").as_str()) else {
+            return false;
+        };
+        let group_shape = [out, input / 64];
+        // Affine packed weights use 32-bit codes and a scale and zero point per group.
+        // The source header reader checks each tensor's byte offsets against its dtype/shape.
+        weight.dtype == Dtype::U32
+            && weight.shape == [out, input / (32 / bits as usize)]
+            && scales.shape == group_shape
+            && biases.shape == group_shape
+            && matches!(scales.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32)
+            && biases.dtype == scales.dtype
+    })
+}
 fn unsupported(reason: &str) -> Error {
     Error::Unsupported(format!("scail2 plural fit: {reason}"))
 }
@@ -42,6 +119,15 @@ pub enum Scail2FitBackend {
     Cuda,
 }
 
+/// A native environment override. An empty value differs from the native getenv
+/// default (unset). Keeping the name and value separate also preserves delimiters.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Scail2FitSetting {
+    pub name: String,
+    pub value: Option<String>,
+}
+
 /// Physical dimensions compared componentwise with one measured run. No source values,
 /// prompt text, FPS, seed or shift participate in cross-request capacity reuse.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,7 +138,7 @@ pub struct Scail2FitAxes {
     pub artifact_tier: String,
     pub effective_tier: String,
     pub load_policy: String,
-    pub execution_policy: Vec<String>,
+    pub execution_policy: Vec<Scail2FitSetting>,
     pub mlx_dpmpp: bool,
     pub width: u32,
     pub height: u32,
@@ -144,7 +230,14 @@ impl Scail2FitPrice {
     }
 }
 
-fn execution_policy(backend: Scail2FitBackend) -> Vec<String> {
+fn execution_policy(backend: Scail2FitBackend) -> Result<Vec<Scail2FitSetting>> {
+    read_execution_policy(backend, |name| std::env::var_os(name))
+}
+
+fn read_execution_policy(
+    backend: Scail2FitBackend,
+    read: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<Scail2FitSetting>> {
     // Source switches in the pinned MLX Metal scheduler/matmul implementation and
     // Candle QMatMul constructor can change allocator or weight storage for equal shapes.
     let keys: &[&str] = match backend {
@@ -167,7 +260,21 @@ fn execution_policy(backend: Scail2FitBackend) -> Vec<String> {
         ],
     };
     keys.iter()
-        .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
+        .map(|name| {
+            let value = read(name)
+                .map(|s| {
+                    s.into_string().map_err(|_| {
+                        unsupported(
+                            "native execution policy contains a non-Unicode environment value",
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(Scail2FitSetting {
+                name: (*name).into(),
+                value,
+            })
+        })
         .collect()
 }
 
@@ -334,15 +441,14 @@ impl Scail2FitProfile {
         let effective_tier = crate::Quant::affine_tier_label(spec.quantize.or(stored))
             .ok_or_else(|| unsupported("unsupported numerical realization"))?
             .to_owned();
-        let default_mlx_policy = [
-            "SCAIL2_COMPUTE_BF16",
-            "MLX_GEN_WAN_ATTN_QUERY_CHUNK",
-            "MLX_GEN_WAN_EVAL_PER_BLOCK",
-            "MLX_GEN_WAN_FFN_SEQ_CHUNK",
-        ]
-        .iter()
-        .all(|key| std::env::var_os(key).is_none());
-        let standard_packed = backend == Scail2FitBackend::Mlx
+        let policy = execution_policy(backend)?;
+        let default_mlx_policy = policy
+            .iter()
+            .filter(|setting| {
+                setting.name == "SCAIL2_COMPUTE_BF16" || setting.name.starts_with("MLX_GEN_WAN_")
+            })
+            .all(|setting| setting.value.is_none());
+        let packed_candidate = backend == Scail2FitBackend::Mlx
             && default_mlx_policy
             && matches!(packed_bits, Some(4 | 8))
             && spec.quantize.is_none()
@@ -350,6 +456,34 @@ impl Scail2FitProfile {
             && heads == 40
             && dim == 5120
             && ffn >= dim;
+        let layers = config
+            .get("num_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(40);
+        let group = config
+            .pointer("/quantization/group_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64);
+        // MLX's load_lin_q consults each .scales sidecar: a packed manifest with just
+        // one dense fallback changes the kernel family. Mixed models retain exact-token fits.
+        let standard_packed = if packed_candidate && layers == 40 && group == 64 {
+            let dit = &pins[MEMBERS
+                .iter()
+                .position(|m| *m == "dit.safetensors")
+                .unwrap()];
+            dit.read_unchanged(|p| -> Result<_> {
+                let headers = crate::weightsmeta::safetensors_path_tensor_headers(p)?;
+                Ok(complete_mlx_packing(
+                    &headers,
+                    packed_bits.unwrap(),
+                    layers as usize,
+                    dim as usize,
+                    ffn as usize,
+                ))
+            })?
+        } else {
+            false
+        };
         let mut windows = Vec::new();
         for phase in &plan.layout().phases {
             let f = u64::from(phase.latent_frames);
@@ -399,7 +533,6 @@ impl Scail2FitProfile {
             resize = resize.max(resize_bytes(img, g.width, g.height)?);
         }
         let steps = req.steps.unwrap_or(40);
-        let policy = execution_policy(backend);
         // The published Candle dpm++ alias uses native UniPC; MLX uses its own 2M solver.
         let mlx_dpmpp = backend == Scail2FitBackend::Mlx && req.sampler.as_deref() == Some("dpm++");
         // The calibrated scheduler has bounded order-2 model history after step four.
@@ -451,7 +584,7 @@ impl Scail2FitProfile {
         for pin in &self.pins {
             pin.ensure_unchanged()?;
         }
-        let current = execution_policy(self.axes.backend);
+        let current = execution_policy(self.axes.backend)?;
         if self.axes.execution_policy != current {
             return Err(unsupported("native memory policy changed"));
         }
@@ -643,6 +776,8 @@ mod tests {
                 dir.path().join(name),
                 if name == "config.json" {
                     br#"{"quantization":{"bits":4,"group_size":64}}"#
+                } else if name == "dit.safetensors" {
+                    &b"\x02\0\0\0\0\0\0\0{}"[..]
                 } else {
                     &b"tiny"[..]
                 },
@@ -814,6 +949,81 @@ mod tests {
         std::fs::write(dir.path().join("vae.safetensors"), b"changed size").unwrap();
         assert!(p.validate_load(&sp).is_err());
     }
+    #[test]
+    fn scail2_fit_sealed_packing_requires_every_native_ffn_and_attention_triple() {
+        use std::io::Write;
+        // Small valid sparse safetensors file: the reader inspects the real header and
+        // validates offsets against the file length without reading a learned tensor.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut metadata = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (stem, [out, input]) in packed_projection_shapes(2, 64, 128) {
+            for (leaf, kind, cols, bytes) in [
+                ("weight", "U32", input / 8, 4),
+                ("scales", "BF16", input / 64, 2),
+                ("biases", "BF16", input / 64, 2),
+            ] {
+                let end = offset + (out * cols * bytes) as u64;
+                metadata.insert(format!("{stem}.{leaf}"),serde_json::json!({"dtype":kind,"shape":[out,cols],"data_offsets":[offset,end]}));
+                offset = end;
+            }
+        }
+        let header = serde_json::to_vec(&metadata).unwrap();
+        let mut writer = file.as_file();
+        writer
+            .write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        writer.write_all(&header).unwrap();
+        writer.set_len(8 + header.len() as u64 + offset).unwrap();
+        let full = crate::weightsmeta::safetensors_path_tensor_headers(file.path()).unwrap();
+        assert!(complete_mlx_packing(&full, 4, 2, 64, 128));
+        assert!(!complete_mlx_packing(&full, 8, 2, 64, 128));
+        let mut mixed = full.clone();
+        mixed.retain(|h| h.name != "blocks.1.ffn.2.scales");
+        assert!(!complete_mlx_packing(&mixed, 4, 2, 64, 128));
+        let mut malformed = full;
+        malformed
+            .iter_mut()
+            .find(|h| h.name == "blocks.0.cross_attn.q.weight")
+            .unwrap()
+            .shape[1] += 1;
+        assert!(!complete_mlx_packing(&malformed, 4, 2, 64, 128));
+
+        let (_dir, spec) = spec(Scail2FitBackend::Mlx);
+        let mut smaller = profile(Scail2FitBackend::Mlx, &spec, &request(2));
+        let mut largest = profile(Scail2FitBackend::Mlx, &spec, &request(6));
+        // The fixture above exercised the header side; compare the calibrated signature
+        // of a complete vs sparse graph on the true 14B token grid independently.
+        assert!(!smaller.axes.windows[0].mlx_unsplit_ffn);
+        assert!(smaller.price(&[witness(&smaller)]).is_ok());
+        assert!(smaller.price(&[witness(&largest)]).is_err());
+        smaller.axes.windows[0].mlx_unsplit_ffn = true;
+        largest.axes.windows[0].mlx_unsplit_ffn = true;
+        assert!(smaller.price(&[witness(&largest)]).is_ok());
+    }
+
+    #[test]
+    fn scail2_fit_native_env_preserves_unset_empty_and_literal_values() {
+        let backend = Scail2FitBackend::Mlx;
+        let absent = read_execution_policy(backend, |_| None).unwrap();
+        for key in ["MLX_ENABLE_TF32", "MLX_BFS_MAX_WIDTH"] {
+            let set = |value: &str| {
+                read_execution_policy(backend, |name| (name == key).then(|| value.into())).unwrap()
+            };
+            assert_ne!(absent, set(""));
+            assert_ne!(set(""), set("unset"));
+            assert_ne!(set("=0"), set("0"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                read_execution_policy(backend, |_| Some(std::ffi::OsString::from_vec(vec![255])))
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn scail2_fit_cancelled_acquisition_precedes_disk_reads_and_cache_changes() {
         let (dir, mut spec) = spec(Scail2FitBackend::Cuda);
