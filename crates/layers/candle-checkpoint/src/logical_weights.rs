@@ -1059,6 +1059,27 @@ impl LogicalWeightReader {
         )
     }
 
+    /// Bytes planned for the packed weight itself; companion allocations are separate plan rows.
+    pub fn planned_packed_bytes(&self, key: &str) -> Option<u64> {
+        let row = self.planned(key)?;
+        (row.residency.mode == ResidencyMode::Packed).then_some(row.residency.resident_bytes)
+    }
+
+    /// Validate model-supplied matrix dimensions without decoding or accounting an allocation.
+    pub fn validate_matrix_shape(&self, key: &str, expected: [usize; 2]) -> Result<()> {
+        let row = self
+            .planned(key)
+            .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
+        let actual = Self::shaped_row(row, Some((expected[0], expected[1])))?;
+        if actual.shape != expected {
+            candle_core::bail!(
+                "{key}: model expects {expected:?}, checkpoint declares {:?}",
+                actual.shape
+            );
+        }
+        Ok(())
+    }
+
     /// Decode the requested coefficient view without changing an existing projection's execution regime.
     pub(crate) fn dense_coefficients(
         &self,

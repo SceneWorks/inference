@@ -315,11 +315,23 @@ impl VisionTower {
     pub fn new(cfg: VisionConfig, vb: VarBuilder) -> CResult<Self> {
         // Fold the bias-free Conv3d weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul.
-        let conv = vb.get_unchecked("patch_embed.proj.weight")?;
-        let dtype = conv.dtype();
-        let embed = conv.dim(0)?;
-        let in_dim: usize = conv.dims().iter().skip(1).product();
-        let patch_embed = Linear::new(conv.reshape((embed, in_dim))?, None);
+        let key = "patch_embed.proj.weight";
+        let shape = [
+            cfg.hidden_size,
+            cfg.in_channels,
+            cfg.temporal_patch_size,
+            cfg.patch_size,
+            cfg.patch_size,
+        ];
+        let patch_embed = if let Some(op) = vb.native_linear_weight_flattened(key, &shape)? {
+            Linear::from_native(op, None)
+        } else {
+            let conv = vb.get_unchecked(key)?;
+            let embed = conv.dim(0)?;
+            let in_dim: usize = conv.dims().iter().skip(1).product();
+            Linear::new(conv.reshape((embed, in_dim))?, None)
+        };
+        let dtype = patch_embed.weight_dtype();
 
         let bvb = vb.pp("blocks");
         let blocks = (0..cfg.depth)

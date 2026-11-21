@@ -33,6 +33,64 @@ fn headers(storage: NativeDitStorage) -> Vec<SafetensorsTensorHeader> {
 }
 
 #[test]
+fn unmarked_package_accepts_only_source_rows_matching_its_exact_graph() {
+    let mut geometry = cfg();
+    geometry.hidden = 8;
+    geometry.heads = 1;
+    geometry.depth = 1;
+    geometry.depth_single = 1;
+    geometry.image_in_channels = 4;
+    geometry.image_cond_in_channels = 4;
+    geometry.text_in_channels = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(super::super::DIT_WEIGHTS_FILE);
+    let storage = NativeDitStorage::Publisher(DitFormat::Dense);
+    let mut expected = storage.expected_tensors(&geometry).unwrap();
+    expected.get_mut("txt_in.weight").unwrap().dtype = Dtype::F8_E5M2;
+    expected.insert(
+        "txt_in.weight_scale".to_owned(),
+        TensorSpec {
+            dtype: Dtype::F32,
+            shape: vec![],
+        },
+    );
+    let write = |expected: &BTreeMap<String, TensorSpec>| {
+        let mut map = serde_json::Map::new();
+        let mut end = 0;
+        for (name, spec) in expected {
+            let start = end;
+            end += spec.bytes().unwrap() as usize;
+            map.insert(name.clone(), serde_json::json!({"dtype":spec.dtype.as_str(),"shape":spec.shape,"data_offsets":[start,end]}));
+        }
+        let table = serde_json::to_vec(&map).unwrap();
+        let mut buf = (table.len() as u64).to_le_bytes().to_vec();
+        buf.extend(table);
+        buf.resize(buf.len() + end, 0);
+        std::fs::write(&path, buf).unwrap();
+        gen_core::weightsmeta::safetensors_path_tensor_headers(&path).unwrap()
+    };
+    let headers = write(&expected);
+    assert!(storage
+        .validate_source_headers(&geometry, &path, &headers)
+        .unwrap());
+    let publisher = NativeDitStorage::Publisher(DitFormat::Fp8Rowwise);
+    assert!(publisher
+        .validate_source_headers(&geometry, &path, &headers)
+        .is_err());
+    assert_eq!(publisher.source_selection(None), Some(Quant::Fp8Rowwise));
+    assert!(publisher
+        .validate_selection(
+            publisher.source_selection(Some(Quant::Q4)),
+            gen_core::Precision::Bf16
+        )
+        .is_err());
+    expected.get_mut("txt_in.weight").unwrap().shape[1] += 1;
+    assert!(storage
+        .validate_source_headers(&geometry, &path, &write(&expected))
+        .is_err());
+}
+
+#[test]
 fn native_storage_marker_round_trips_without_source_format_or_bit_aliases() {
     let formats = [
         NativeDitStorage::Publisher(DitFormat::Dense),
