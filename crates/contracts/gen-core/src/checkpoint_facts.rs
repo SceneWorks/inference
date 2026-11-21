@@ -1246,6 +1246,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reader_counts_repeated_materialization_once_and_applies_declared_compute_width() {
+        use ExecutionRepresentation::{DenseFallback, NativePacked};
+        let tracker = crate::CheckpointReadAccounting::new(
+            std::sync::Arc::new(mixed_plan()),
+            nvfp4_capability(),
+            &[],
+        );
+        assert_eq!(
+            tracker.receipt().materialization,
+            LogicalReadMaterialization::Deferred
+        );
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        assert!(tracker.record("packed", NativePacked, 2305).is_err());
+        assert_eq!(tracker.facts().unwrap().receipt().tensor_count, 1);
+        tracker.declare_dense_layout("plain", &[8, 8], 4).unwrap();
+        assert!(tracker.declare_dense_layout("plain", &[8, 8], 2).is_err());
+        assert!(tracker.declare_dense_layout("plain", &[16, 4], 4).is_err());
+        tracker.record("plain", DenseFallback, 256).unwrap();
+        tracker.record("fallback", DenseFallback, 8192).unwrap();
+        let completed = tracker.facts().unwrap();
+        assert_eq!(
+            completed.receipt().materialization,
+            LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(completed.receipt().source_bytes, mixed_plan().source_bytes);
+        assert_eq!(completed.resident_bytes(), 2304 + 8192 + 256);
+        tracker.record("packed", DenseFallback, 8192).unwrap();
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        assert_eq!(tracker.materialized_bytes("packed"), Some(8192));
+        assert_eq!(tracker.facts().unwrap().receipt().demotions.len(), 1);
+    }
+
     /// **The three facts are separate and correlated (epic E8).** The source inventory says
     /// `nvfp4-v1` regardless of representation; the receipt splits the same codec into the row that
     /// executed packed and the row that fell back dense.
