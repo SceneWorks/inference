@@ -1842,14 +1842,11 @@ impl LlamaProvider {
             device.is_cuda(),
             (host_required, host_available),
             device_required.zip(device_available),
+            Some(&device),
         )?;
-        let draft_estimate = match &draft {
-            Some((draft_spec, None)) => {
-                // As a draft (never graph-wrapped), the price `admit_draft` admitted it at.
-                Some(Self::draft_memory_estimate(draft_spec, device.is_cuda())?)
-            }
-            _ => None,
-        };
+        let draft_estimate = draft
+            .as_ref()
+            .and_then(|(_, admission)| admission.as_ref().ok());
         // What the load has admitted so far in each domain: the target plus any admitted draft.
         let mut host_admitted =
             host_required.saturating_add(draft_estimate.map_or(0, |e| e.host_required_bytes));
@@ -1869,6 +1866,7 @@ impl LlamaProvider {
                 Path::new(source),
                 (host_admitted, host_available),
                 device_admitted.zip(device_available),
+                &device,
             )
             .map_err(|reason| fallbacks.push(reason))
             .ok()
@@ -1933,13 +1931,13 @@ impl LlamaProvider {
         provider.prefix = Mutex::new(PrefixCache::with_budget(prefix_budget));
         match draft {
             None => {}
-            Some((draft_spec, Some(refusal))) => {
+            Some((draft_spec, Err(refusal))) => {
                 provider.draft_report = Some(
                     DraftReport::refused(draft_spec.source, refusal)
                         .named_in(&mut provider.load_record.fallbacks),
                 );
             }
-            Some((draft_spec, None)) => {
+            Some((draft_spec, Ok(_))) => {
                 provider.attach_draft(&draft_spec, &device, requested.as_ref())
             }
         }
@@ -1950,7 +1948,7 @@ impl LlamaProvider {
 
     /// Price a named draft beside the target (sc-24436, E7) in both allocation domains — `host`
     /// and, on CUDA, `device`, each `(target required, available)` — before any weight is read.
-    /// `Ok(None)`: no draft named. `Ok(Some((draft spec, refusal)))`: the draft's load spec and,
+    /// Returns the exact admitted estimate beside the spec or,
     /// when it cannot be priced or does not fit beside the target, the named refusal (the target
     /// loads alone, E2). `Err` only when the target alone does not fit — the ordinary refusal.
     fn admit_draft(
@@ -1958,18 +1956,19 @@ impl LlamaProvider {
         cuda: bool,
         host: (u64, u64),
         device: Option<(u64, u64)>,
-    ) -> CoreResult<Option<(LoadSpec, Option<String>)>> {
+        load_device: Option<&Device>,
+    ) -> CoreResult<Option<(LoadSpec, std::result::Result<LoadMemoryEstimate, String>)>> {
         let Some(source) = spec.draft_source.as_deref() else {
             return Ok(None);
         };
         let draft_spec = draft_load_spec(spec, source);
-        let refusal = match Self::draft_memory_estimate(&draft_spec, cuda) {
+        let admission = match Self::draft_memory_estimate(&draft_spec, cuda, load_device) {
             Err(e) => {
                 core_llm::admit_load_memory(host.0, host.1)?;
                 if let Some((required, available)) = device {
                     core_llm::admit_load_memory(required, available)?;
                 }
-                Some(core_llm::draft_unpriced_refusal(e))
+                Err(core_llm::draft_unpriced_refusal(e))
             }
             Ok(estimate) => {
                 let host =
@@ -1984,17 +1983,24 @@ impl LlamaProvider {
                     }
                     (None, _) => None,
                 };
-                host.or(device)
+                match host.or(device) {
+                    Some(reason) => Err(reason),
+                    None => Ok(estimate),
+                }
             }
         };
-        Ok(Some((draft_spec, refusal)))
+        Ok(Some((draft_spec, admission)))
     }
 
     /// A named draft's load estimate: a block draft's own (its `architectures`, SW-F360,
     /// [`block_draft_load_estimate`]), any other draft's as a model loaded without a graph runner.
-    fn draft_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
+    fn draft_memory_estimate(
+        spec: &LoadSpec,
+        cuda: bool,
+        device: Option<&Device>,
+    ) -> CoreResult<LoadMemoryEstimate> {
         block_draft_load_estimate(spec, cuda)
-            .unwrap_or_else(|| Self::load_memory_estimate_as(spec, cuda, false))
+            .unwrap_or_else(|| Self::load_memory_estimate_for_device(spec, cuda, false, device))
     }
 
     /// Load the block draft `spec` names (SW-F360, SW-7197) on the target's device in its compute
@@ -2416,7 +2422,7 @@ impl LlamaProvider {
                 PricedDecoder::Causal(_) | PricedDecoder::Qwen35(..)
             );
             let mut resident_payload = payload;
-            let (cast, copy, held) = if builds && (cuda || format.is_some()) {
+            let (cast, copy, held) = if builds && (cuda || format.is_some() || device.is_some()) {
                 let mut tensors = snapshot_tensor_headers(source)?;
                 let decoder_root = decoder.snapshot_root(&tensors);
                 if let Some(device) = device {
@@ -2461,9 +2467,20 @@ impl LlamaProvider {
             LoadWorkingSet::resident_payload(resident_payload, cast, copy, decoder.is_packed())
                 .holding_on_host(held)
         };
-        let (host_required, device_required) =
+        let (mut host_required, device_required) =
             load_memory_requirements(payload, staging, projector, cuda, working)
                 .ok_or_else(overflow)?;
+        // A one-byte source can expand beyond the historical three-payload host estimate.
+        if !cuda && working.source > payload {
+            host_required = host_required.max(
+                working
+                    .source
+                    .checked_add(working.source / 4)
+                    .and_then(|n| n.checked_add(working.copy))
+                    .and_then(|n| n.checked_add(projector.checked_mul(4)?))
+                    .ok_or_else(overflow)?,
+            );
+        }
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
         let graphs = target
             && spec

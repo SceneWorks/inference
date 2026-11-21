@@ -476,6 +476,43 @@ pub(super) fn price_checkpoint_rows(
     root: Option<&str>,
     tensors: &mut SnapshotTensors,
 ) -> CoreResult<Option<(u64, u64)>> {
+    price_source_rows(dir, device, tensors, |key, _| {
+        let head = key == "lm_head.weight" || key.ends_with(".lm_head.weight");
+        let embedding = key.ends_with("embed_tokens.weight");
+        let (projection, tied) = match decoder {
+            PricedDecoder::Causal(cfg) => (
+                root.is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            PricedDecoder::Qwen35(cfg, _) => (
+                root.is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            _ => (false, false),
+        };
+        if projection || head {
+            SourceUse::Projection(None)
+        } else if embedding && tied {
+            SourceUse::TiedEmbedding
+        } else {
+            SourceUse::Coefficients
+        }
+    })
+}
+
+enum SourceUse {
+    Projection(Option<[usize; 2]>),
+    Coefficients,
+    TiedEmbedding,
+}
+
+/// Apply the device's projection plan while accounting for explicitly consumed coefficient views.
+fn price_source_rows(
+    dir: &Path,
+    device: &Device,
+    tensors: &mut SnapshotTensors,
+    roles: impl Fn(&str, &[usize]) -> SourceUse,
+) -> CoreResult<Option<(u64, u64)>> {
     if !tensors.iter().any(|(key, t)| {
         key.ends_with(".comfy_quant")
             || (t.dtype.starts_with("F8_") && !core_llm::modelopt::is_companion(key))
@@ -494,34 +531,39 @@ pub(super) fn price_checkpoint_rows(
         .sum::<u64>();
     let overflow = || CoreError::Load("checkpoint admission: resident size overflow".into());
     for row in &plan.tensors {
-        let key = &row.logical_key;
-        let head = key == "lm_head.weight" || key.ends_with(".lm_head.weight");
-        let embedding = key.ends_with("embed_tokens.weight");
-        let (projection, tied) = match decoder {
-            PricedDecoder::Causal(cfg) => (
-                root.is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
-                cfg.tie_word_embeddings,
-            ),
-            PricedDecoder::Qwen35(cfg, _) => (
-                root.is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
-                cfg.tie_word_embeddings,
-            ),
-            _ => (false, false),
+        let role = roles(&row.logical_key, &row.shape);
+        let expected = match role {
+            SourceUse::Projection(Some(shape)) => {
+                source
+                    .reader()
+                    .validate_matrix_shape(&row.logical_key, shape)
+                    .map_err(|e| CoreError::Load(e.to_string()))?;
+                Some(shape)
+            }
+            _ => None,
         };
-        let coeff_bytes = || {
-            row.shape
+        let shape = expected
+            .as_ref()
+            .map_or(row.shape.as_slice(), |dims| dims.as_slice());
+        let dense_bytes = |width| {
+            shape
                 .iter()
-                .try_fold(4u64, |a, &b| a.checked_mul(b as u64))
+                .try_fold(width, |a: u64, &b| a.checked_mul(b as u64))
                 .ok_or_else(overflow)
         };
-        let bytes = if projection || head {
-            row.residency.resident_bytes
-        } else if embedding && tied {
-            coeff_bytes()?
-                .checked_add(row.residency.resident_bytes)
-                .ok_or_else(overflow)?
-        } else {
-            row.residency.resident_bytes.max(coeff_bytes()?)
+        let packed = source.reader().planned_packed_bytes(&row.logical_key);
+        let bytes = match role {
+            SourceUse::Projection(_) => match packed {
+                Some(bytes) => bytes,
+                None => dense_bytes(if device.is_cuda() { 2 } else { 4 })?,
+            },
+            SourceUse::TiedEmbedding => {
+                // Without a native head the model reuses its embedding.
+                dense_bytes(4)?
+                    .checked_add(packed.unwrap_or(0))
+                    .ok_or_else(overflow)?
+            }
+            SourceUse::Coefficients => row.residency.resident_bytes.max(dense_bytes(4)?),
         };
         resident = resident.checked_add(bytes).ok_or_else(overflow)?;
     }
@@ -954,11 +996,42 @@ pub(super) fn load_memory_budget() -> CoreResult<Option<u64>> {
 /// a compute-dtype copy (priced at f32) of every other matrix, and the `1 + w` result of every
 /// norm vector (f32). The head's per-request attention cache is priced by request admission on
 /// the `mtp` route.
-pub(super) fn companion_head_bytes(dir: &Path) -> CoreResult<u64> {
+pub(super) fn companion_head_bytes(dir: &Path, device: Option<&Device>) -> CoreResult<u64> {
     let payload = core_llm::companion_head_payload_bytes(dir)?;
     let overflow = || CoreError::Load("companion MTP head admission overflow".into());
-    let tensors = snapshot_tensor_headers(dir)?;
-    let group_size = read_json(dir, "config.json").and_then(|config| {
+    let mut tensors = snapshot_tensor_headers(dir)?;
+    let mut retained = payload;
+    let config = read_json(dir, "config.json");
+    let geometry = config
+        .as_ref()
+        .and_then(|v| Qwen35Config::from_json(v).ok())
+        .map(|c| c.companion_mtp_geometry().matrices());
+    if let Some(device) = device {
+        if let Some((source, resident)) =
+            price_source_rows(dir, device, &mut tensors, |key, shape| {
+                if shape.len() != 2 {
+                    return SourceUse::Coefficients;
+                }
+                let name = key
+                    .strip_prefix("mtp.")
+                    .unwrap_or(key)
+                    .strip_suffix(".weight");
+                let declared = geometry.as_ref().and_then(|matrices| {
+                    matrices
+                        .iter()
+                        .find(|(base, _)| Some(*base) == name)
+                        .map(|(_, shape)| *shape)
+                });
+                SourceUse::Projection(declared)
+            })?
+        {
+            retained = payload
+                .checked_sub(source)
+                .and_then(|rest| rest.checked_add(resident))
+                .ok_or_else(overflow)?;
+        }
+    }
+    let group_size = config.as_ref().and_then(|config| {
         let quant = config
             .get("text_config")
             .and_then(|t| t.get("quantization"))
@@ -998,7 +1071,7 @@ pub(super) fn companion_head_bytes(dir: &Path) -> CoreResult<u64> {
         .ok_or_else(overflow)?;
         built = built.checked_add(bytes).ok_or_else(overflow)?;
     }
-    payload.checked_add(built).ok_or_else(overflow)
+    retained.checked_add(built).ok_or_else(overflow)
 }
 
 /// Admit a companion MTP head's resident bytes on top of what the load already admitted — the
@@ -1006,14 +1079,15 @@ pub(super) fn companion_head_bytes(dir: &Path) -> CoreResult<u64> {
 /// the device domain too ([`core_llm::admit_companion_head`], the rule MLX admits by), returning
 /// the head and its bytes. `Err` is the named load fallback (E2): the head is unreadable, or the
 /// admitted bytes plus the head's exceed a budget.
-pub(super) fn admit_companion_head(
-    head: &Path,
+pub(super) fn admit_companion_head<'a>(
+    head: &'a Path,
     host: (u64, u64),
     device: Option<(u64, u64)>,
-) -> Result<(&Path, u64), String> {
+    load_device: &Device,
+) -> Result<(&'a Path, u64), String> {
     core_llm::admit_companion_head(
         head,
-        companion_head_bytes(head),
+        companion_head_bytes(head, Some(load_device)),
         std::iter::once(("host", host.0, host.1))
             .chain(device.map(|(admitted, available)| ("device", admitted, available))),
     )

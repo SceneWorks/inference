@@ -3571,10 +3571,77 @@ fn a_cuda_load_under_the_graph_runner_prices_the_parameter_cache_once() {
         true,
         (on.host_required_bytes, u64::MAX),
         Some((target, target + draft)),
+        None,
     )
     .unwrap()
     .unwrap();
-    assert_eq!(refusal, None, "the draft carries no parameter cache");
+    assert!(refusal.is_ok(), "the draft carries no parameter cache");
+}
+
+/// The companion estimator replaces claimed file operands with the selected execution
+/// representation. On CPU the model keeps F32 coefficients; neither the raw FP8 codes
+/// nor the scale and descriptor are resident projection copies.
+#[test]
+fn encoded_companion_is_charged_once_at_its_actual_device_precision() {
+    use candle_core::Device;
+    let temp = tempfile::tempdir().unwrap();
+    let w = Tensor::from_raw_buffer(
+        &[0x38; 256],
+        candle_core::DType::F8E4M3,
+        &[16, 16],
+        &Device::Cpu,
+    )
+    .unwrap();
+    let scale = Tensor::new(1.0f32, &Device::Cpu).unwrap();
+    let mut weights = HashMap::new();
+    weights.insert("fc.weight".to_owned(), w);
+    weights.insert("fc.weight_scale".to_owned(), scale);
+    candle_core::safetensors::save(&weights, temp.path().join("model.safetensors")).unwrap();
+    let payload = core_llm::companion_head_payload_bytes(temp.path()).unwrap();
+    assert_eq!(
+        super::companion_head_bytes(temp.path(), Some(&Device::Cpu)).unwrap(),
+        payload - 256 - 4 + 256 * 4
+    );
+}
+
+#[test]
+fn companion_mx_admission_and_source_loader_use_the_same_logical_edges() {
+    use candle_core::{DType, Device};
+    let tmp = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({"model_type":"qwen3_5_mtp","hidden_size":5,"num_attention_heads":1,"num_hidden_layers":1,"vocab_size":20,"linear_num_value_heads":1,"linear_num_key_heads":1,"linear_key_head_dim":4,"linear_value_head_dim":4});
+    std::fs::write(tmp.path().join("config.json"), config.to_string()).unwrap();
+    let desc = br#"{"format":"mxfp8"}"#;
+    for prefix in ["", "mtp."] {
+        let key = format!("{prefix}fc.weight");
+        let mut weights = HashMap::new();
+        weights.insert(
+            key.clone(),
+            Tensor::from_raw_buffer(&[0x38; 32 * 32], DType::F8E4M3, &[32, 32], &Device::Cpu)
+                .unwrap(),
+        );
+        weights.insert(
+            format!("{prefix}fc.weight_scale"),
+            Tensor::from_slice(&[127u8; 128 * 4], (128, 4), &Device::Cpu).unwrap(),
+        );
+        weights.insert(
+            format!("{prefix}fc.comfy_quant"),
+            Tensor::new(desc.as_slice(), &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&weights, tmp.path().join("model.safetensors")).unwrap();
+        let bytes = core_llm::companion_head_payload_bytes(tmp.path()).unwrap();
+        let overhead = bytes - (32 * 32 + 128 * 4 + desc.len()) as u64;
+        assert_eq!(
+            super::companion_head_bytes(tmp.path(), Some(&Device::Cpu)).unwrap(),
+            overhead + 5 * 10 * 4
+        );
+        let mut raw = crate::primitives::Weights::from_dir(tmp.path(), &Device::Cpu).unwrap();
+        raw.bind_matrix_shape(&key, [5, 10]).unwrap();
+        if prefix.is_empty() {
+            raw.add_key_prefix("mtp.");
+        }
+        assert_eq!(raw.shape("mtp.fc.weight").unwrap(), [5, 10]);
+        assert_eq!(raw.require("mtp.fc.weight").unwrap().dims(), [5, 10]);
+    }
 }
 
 /// sc-24436 E7: a named draft is admitted at load only beside the target, in the host domain
@@ -3603,14 +3670,14 @@ fn a_draft_is_admitted_at_load_only_beside_the_target() {
         draft > 0 && draft < target,
         "the draft is the smaller model"
     );
-    let admit = |host, device| super::LlamaProvider::admit_draft(&spec, false, host, device);
+    let admit = |host, device| super::LlamaProvider::admit_draft(&spec, false, host, device, None);
 
     let (draft_spec, refusal) = admit((target, target + draft), None).unwrap().unwrap();
-    assert_eq!(refusal, None);
+    assert!(refusal.is_ok());
     assert_eq!(draft_spec.source, fixture.draft.to_string_lossy());
     assert_eq!(draft_spec.draft_source, None);
     let (_, refusal) = admit((target, target + draft - 1), None).unwrap().unwrap();
-    assert!(refusal.unwrap().starts_with("draft model:"));
+    assert!(refusal.unwrap_err().starts_with("draft model:"));
     assert!(
         admit((target, target - 1), None).is_err(),
         "the target alone"
@@ -3619,8 +3686,8 @@ fn a_draft_is_admitted_at_load_only_beside_the_target() {
     let (_, refusal) = admit((target, u64::MAX), Some((target, target)))
         .unwrap()
         .unwrap();
-    assert_eq!(
-        refusal, None,
+    assert!(
+        refusal.is_ok(),
         "an off-CUDA draft estimate carries no device bytes"
     );
     // On CUDA the device domain refuses the draft on its own, with the host unbounded.
@@ -3635,21 +3702,23 @@ fn a_draft_is_admitted_at_load_only_beside_the_target() {
         fixture.draft.to_string_lossy(),
     )));
     assert!(draft_device > 0);
-    let cuda = |device| super::LlamaProvider::admit_draft(&spec, true, (target, u64::MAX), device);
+    let cuda =
+        |device| super::LlamaProvider::admit_draft(&spec, true, (target, u64::MAX), device, None);
     let (_, refusal) = cuda(Some((target_device, target_device + draft_device)))
         .unwrap()
         .unwrap();
-    assert_eq!(refusal, None, "room for both on the device");
+    assert!(refusal.is_ok(), "room for both on the device");
     let (_, refusal) = cuda(Some((target_device, target_device + draft_device - 1)))
         .unwrap()
         .unwrap();
-    let refusal = refusal.expect("no device room for the draft");
+    let refusal = refusal.expect_err("no device room for the draft");
     assert!(refusal.starts_with("draft model:"), "{refusal}");
     // No draft named: nothing to admit.
     assert!(super::LlamaProvider::admit_draft(
         &core_llm::LoadSpec::dense(fixture.target.to_string_lossy()),
         false,
         (target, target),
+        None,
         None
     )
     .unwrap()
@@ -5682,7 +5751,7 @@ fn companion_head_draft_and_prefix_cache_are_admitted_together() {
     use core_llm::TextLlm;
     let target = synthetic_qwen35_snapshot_without_mtp();
     let head = companion_head(&dense_text());
-    let head_bytes = super::companion_head_bytes(head.path()).unwrap();
+    let head_bytes = super::companion_head_bytes(head.path(), None).unwrap();
     let source = target.path().display().to_string();
     let mut spec = with_head(&target, head.path()).with_draft(source.clone());
     spec.prefix_cache_bytes = Some(u64::MAX / 4);
@@ -5727,7 +5796,7 @@ fn companion_head_bytes_are_counted_by_load_admission() {
     use candle_core::quantized::GgmlDType;
     let target = synthetic_qwen35_snapshot_without_mtp();
     let head = companion_head(&dense_text());
-    let head_bytes = super::companion_head_bytes(head.path()).unwrap();
+    let head_bytes = super::companion_head_bytes(head.path(), None).unwrap();
     let payload = core_llm::checkpoint_payload_bytes(head.path()).unwrap();
     let geometry = crate::models::Qwen35Config::from_json(&dense_text())
         .unwrap()

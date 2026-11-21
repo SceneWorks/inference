@@ -307,6 +307,11 @@ impl Qwen35Config {
 
         let hidden_size = req("hidden_size")?;
         let num_heads = req("num_attention_heads")?;
+        if num_heads <= 0 || hidden_size <= 0 {
+            return Err(Error::Config(
+                "qwen3_5 hidden_size and num_attention_heads must be positive".into(),
+            ));
+        }
         // The MoE variant (`qwen3_5_moe`) has no dense `intermediate_size` — every layer is MoE — so
         // fall back to the per-expert width (unused on the MoE path, but keeps the field valid).
         let intermediate_size = int("intermediate_size")
@@ -2438,10 +2443,13 @@ impl Qwen35Mtp {
                 }
             })
             .transpose()?;
-        let raw = Weights::from_dir(dir, &target.device)?;
+        let mut raw = Weights::from_dir(dir, &target.device)?;
         let prefix = core_llm::companion_mtp_prefix(|key| raw.contains(key))
             .map_err(|e| Error::Config(e.to_string()))?;
 
+        for (name, shape) in geometry.matrices() {
+            raw.bind_matrix_shape(&format!("{prefix}{name}.weight"), shape)?;
+        }
         let logical = |key: &str| -> Option<[usize; 2]> {
             let &[rows, cols] = raw.shape(key)? else {
                 return None;

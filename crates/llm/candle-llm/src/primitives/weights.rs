@@ -38,6 +38,7 @@ pub struct Weights {
 // Keep the original reader key and placement with the row. Only coefficient consumers decode it.
 struct EncodedRow {
     key: String,
+    model_shape: Option<[usize; 2]>,
     device: Device,
     dense: OnceLock<Tensor>,
 }
@@ -258,6 +259,7 @@ impl Weights {
                 (
                     key.clone(),
                     EncodedRow {
+                        model_shape: None,
                         key: key.clone(),
                         device: place.map_or_else(|| device.clone(), |p| p(key)),
                         dense: OnceLock::new(),
@@ -310,8 +312,23 @@ impl Weights {
         Ok(self.require(key)?.device())
     }
 
+    pub(crate) fn bind_matrix_shape(&mut self, key: &str, shape: [usize; 2]) -> Result<()> {
+        if let Some(row) = self.encoded.get_mut(key) {
+            self.source
+                .as_ref()
+                .expect("owned checkpoint")
+                .reader()
+                .validate_matrix_shape(&row.key, shape)?;
+            row.model_shape = Some(shape);
+        }
+        Ok(())
+    }
+
     pub(crate) fn shape(&self, key: &str) -> Option<&[usize]> {
         if let Some(row) = self.encoded.get(key) {
+            if let Some(shape) = &row.model_shape {
+                return Some(shape.as_slice());
+            }
             return Some(&self.source.as_ref()?.reader().planned(&row.key)?.shape);
         }
         self.tensors.get(key).map(Tensor::dims)
@@ -342,12 +359,18 @@ impl Weights {
         let Some(row) = self.encoded.get(key) else {
             return Ok(None);
         };
+        use candle_nn::var_builder::SimpleBackend;
         let op = self
             .source
             .as_ref()
             .expect("encoded row belongs to source")
-            .native_linear(&row.key, dtype, device, bias)?
-            .map(super::Projection::from_native)
+            .native_linear_weight(
+                &row.key,
+                row.model_shape.map(|[n, k]| (n, k)),
+                dtype,
+                device,
+            )?
+            .map(|op| super::Projection::from_native(candle_nn::Linear::from_native(op, bias)))
             .transpose()?;
         Ok(self.record_native(op))
     }
@@ -424,10 +447,12 @@ impl Weights {
         if let Some(op) = self.native_projection(key, dtype, device, bias.clone())? {
             return Ok(Some(op));
         }
-        let dense = source
-            .on_device(device)?
-            .reader()
-            .read_dense(&row.key, dtype, device)?;
+        let dense = source.on_device(device)?.reader().read_dense_with_shape(
+            &row.key,
+            row.model_shape.map(|[n, k]| (n, k)),
+            dtype,
+            device,
+        )?;
         Ok(Some(super::Projection::load_with_bias(dense, bias, None)?))
     }
 
@@ -473,7 +498,12 @@ impl Weights {
                 .expect("encoded row belongs to source")
                 .on_device(device)?
                 .reader()
-                .read_dense(&row.key, dtype, device)?,
+                .read_dense_with_shape(
+                    &row.key,
+                    row.model_shape.map(|[n, k]| (n, k)),
+                    dtype,
+                    device,
+                )?,
         ))
     }
 
@@ -489,7 +519,12 @@ impl Weights {
                 .expect("encoded row belongs to source")
                 .on_device(&row.device)?
                 .reader()
-                .read_dense(&row.key, DType::F32, &row.device)?;
+                .read_dense_with_shape(
+                    &row.key,
+                    row.model_shape.map(|[n, k]| (n, k)),
+                    DType::F32,
+                    &row.device,
+                )?;
             let _ = row.dense.set(t);
             return Ok(row.dense.get().expect("initialized"));
         }
@@ -557,7 +592,12 @@ impl Weights {
                     .expect("encoded row belongs to source")
                     .on_device(&row.device)?
                     .reader()
-                    .read_dense(&row.key, DType::F32, &row.device)?,
+                    .read_dense_with_shape(
+                        &row.key,
+                        row.model_shape.map(|[n, k]| (n, k)),
+                        DType::F32,
+                        &row.device,
+                    )?,
             };
             self.tensors.insert(name, t);
         }
