@@ -15,7 +15,7 @@ Both arms render a 45-frame 832×480 driving clip and all its color masks with d
 
 | Backend | Counts in execution order | Child limit | Host cap / reserve | Device cap / reserve |
 | --- | --- | --- | --- | --- |
-| Secondary M5 Max | 6, 2 | 40 min each | 96 / 12 GiB unified | 28 GiB native VAE planner ceiling |
+| Secondary M5 Max | 6, 2 | 40 min each | 80 / 12 GiB unified | 28 GiB native VAE planner ceiling |
 | Windows CUDA GPU 1 | 6, 2, 3, 4, 5 | 40 min each | 64 / 8 GiB | 84 / 6 GiB |
 
 Each arm compiles the release probe once. Each count gets a fresh child and an independently guarded and released lease. Watchdog cadence is 250 ms and termination grace is 2 seconds. Model time is capped at 80 minutes on MLX and 200 minutes on CUDA. The workflow's 360-minute outer limit includes file staging, builds and claims. A failed count stops that arm and preserves the diagnostic receipt.

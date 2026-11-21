@@ -93,6 +93,16 @@ class PluralQualification(unittest.TestCase):
             self.assertNotIn("@BACKEND@", runner.source(backend))
             self.assertNotIn("@PINS@", runner.source(backend))
 
+    def test_mlx_guard_accepts_the_tightened_policy_and_refuses_the_previous_cap(self):
+        policy = c.policy("mlx")
+        self.assertEqual(policy["childFootprintCapBytes"], 80 * c.GIB)
+        self.assertEqual(policy["hostFreeReserveBytes"], 12 * c.GIB)
+        with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
+            request = {"selection": c.SELECTION, "policy": policy}
+            self.assertEqual(runner.plan("mlx", request, "head")["counts"], [6, 2])
+            with self.assertRaises(ValueError):
+                runner.plan("mlx", dict(request, policy=dict(policy, childFootprintCapBytes=96 * c.GIB)), "head")
+
     def test_all_counts_both_backend_shapes_and_mutated_native_results(self):
         for backend, counts in c.COUNTS.items():
             for count in counts:
@@ -261,7 +271,7 @@ class PluralQualification(unittest.TestCase):
                     )
             mlx = native("mlx", 2)
             guard["lifetime_peak_host_bytes"] = 800
-            approved.child_footprint_cap_bytes = 96 * c.GIB
+            approved.child_footprint_cap_bytes = c.policy("mlx")["childFootprintCapBytes"]
             result = c.measured_row(
                 mlx,
                 guard,

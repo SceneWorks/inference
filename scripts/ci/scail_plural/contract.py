@@ -61,7 +61,7 @@ def policy(backend):
         return dict(
             settings,
             backend="darwin-mlx",
-            childFootprintCapBytes=96 * GIB,
+            childFootprintCapBytes=80 * GIB,
             hostFreeReserveBytes=12 * GIB,
         )
     if backend == "candle-cuda":
