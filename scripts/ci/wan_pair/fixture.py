@@ -43,7 +43,17 @@ def case_spec(case):
         if swapped and high and int(nodes[i] * 1000) < 900:
             trace.append({"event": "load_expert", "high": False})
             high = False
-    return {"tensor_shape": shape, "outer_steps": 4, "trace": trace}
+    stride = 16 if dense else 8
+    guidance = [5.0] if dense else ([3.0, 4.0] if shift == 12 else [3.5, 3.5])
+    settings = {"sampler": "heun", "seed": SEED, "steps": 4, "shift": shift,
+                "guidance": guidance, "denoiser_dtype": "BF16", "latent_dtype": "F32",
+                "latent_shape": shape, "patch": [1, 2, 2], "model_width": 3072 if dense else 5120,
+                "heads": 24 if dense else 40, "depth": 1,
+                "reference_channels": 20 if variant == "mlx-a14b-i2v" else 0,
+                "boundary_timestep": None if dense else (875 if shift == 12 else 900),
+                "render_width": 6 * stride, "render_height": 4 * stride, "frames": 5,
+                "text_shape": [512, 4096], "residency": "swapped" if swapped else "resident"}
+    return {"tensor_shape": shape, "outer_steps": 4, "trace": trace, "settings": settings}
 
 
 def _header(variant):
@@ -148,6 +158,12 @@ def make_fixture(root, case):
 def fixture_identity(root, case):
     variant = CASES[case]
     header = _header(variant)
+    root = Path(root)
     files = sorted([*header["geometry"], "inputs.safetensors"])
+    # Candle enumerates the whole transformer directory. Reject any extra weights
+    # that could participate in the load without appearing in the paired receipt.
+    observed = sorted(p.relative_to(root).as_posix() for p in root.rglob("*.safetensors"))
+    if files != observed:
+        raise ValueError("unexpected fixture tensor files")
     return {"fixture_schema": 1, "variant": variant, "seed": SEED, "depth": 1,
-            "source": header["source"], "files": {f: sha(Path(root) / f) for f in files}}
+            "source": header["source"], "files": {f: sha(root / f) for f in files}}

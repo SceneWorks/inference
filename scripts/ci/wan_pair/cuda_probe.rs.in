@@ -71,7 +71,7 @@ fn curated_tier1() -> ProofResult<()> {
         seed: Some(SEED),
         steps: Some(STEPS as u32),
         guidance: Some(5.0),
-        sampler: Some("heun".to_owned()),
+        sampler: Some(SAMPLER.to_owned()),
         ..Default::default()
     };
     let knobs = model.resolve_knobs(&request);
@@ -81,7 +81,19 @@ fn curated_tier1() -> ProofResult<()> {
     let noise = pipeline::create_noise(SEED, model.dit_cfg.out_channels, t, h, w, &device)?;
     assert!(noise.device().is_cuda() && positive.device().is_cuda() && negative.device().is_cuda());
     println!("\nMODEL_INFERENCE_DEVICE wan_pair_fixture::curated_tier1 candle-cuda");
+    assert_eq!(positive.dtype(), DType::BF16);
+    assert_eq!(negative.dtype(), DType::BF16);
+    let settings = json!({
+        "sampler":request.sampler,"seed":knobs.seed,"steps":knobs.steps,"shift":knobs.shift,
+        "guidance":[knobs.guidance],"denoiser_dtype":"BF16","latent_dtype":"F32","latent_shape":noise.dims(),
+        "patch":model.dit_cfg.patch,"model_width":model.dit_cfg.dim,"heads":model.dit_cfg.num_heads,
+        "depth":model.dit_cfg.num_layers,"reference_channels":0,"boundary_timestep":null,
+        "render_width":request.width,"render_height":request.height,"frames":knobs.frames,
+        "text_shape":inputs["positive"].dims(),"residency":"resident"
+    });
     pair.measure(
+        noise.flatten_all()?.to_vec1::<f32>()?,
+        settings,
         || {
             let mut trace = Vec::new();
             let mut progress = |event| {

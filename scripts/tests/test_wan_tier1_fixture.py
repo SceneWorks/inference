@@ -51,6 +51,18 @@ class WanFixtureTest(unittest.TestCase):
                     self.assertEqual(len(loads), 2)
                     self.assertEqual(trace[loads[1] - 1]["evaluation"], first_low)
 
+    def test_every_file_in_diffusers_component_is_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case = "cuda-ti2v5b-t2v-heun"
+            (root / "transformer").mkdir()
+            (root / "inputs.safetensors").write_bytes(b"inputs")
+            (root / "transformer/model.safetensors").write_bytes(b"weights")
+            self.assertEqual(len(fixture.fixture_identity(root, case)["files"]), 2)
+            (root / "transformer/other.safetensors").write_bytes(b"unexpected shard")
+            with self.assertRaisesRegex(ValueError, "unexpected fixture tensor files"):
+                fixture.fixture_identity(root, case)
+
     def test_preserves_storage_conversion_and_writes_exact_offsets(self):
         shape = [7, 11]
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,6 +5,7 @@ use std::{env, error::Error as StdError, fs, path::PathBuf, time::Instant};
 type ProofResult<T> = Result<T, Box<dyn StdError>>;
 const SEED: u64 = 104729;
 const STEPS: usize = 4;
+const SAMPLER: &str = "heun";
 const FQN: &str = "wan_pair_fixture::curated_tier1";
 
 struct Pair {
@@ -25,53 +26,57 @@ impl Pair {
         })
     }
 
-    // One warmup then five measured calls. Every call must produce a finite,
-    // nonconstant latent, the same observed trace and the same dimensions.
+    // The supervisor pairs fresh processes. This process returns one synchronized
+    // measurement after its own warmup on the exact same tensors and solver.
     fn measure(
         &self,
+        initial: Vec<f32>,
+        settings: Value,
         mut run: impl FnMut() -> ProofResult<(u64, Vec<Value>, Vec<usize>, Vec<f32>)>,
         allocator_peak: impl FnOnce() -> ProofResult<u64>,
     ) -> ProofResult<()> {
-        let mut samples = Vec::new();
-        let mut expected = None;
-        for index in 0..=5 {
-            let (elapsed_ns, trace, shape, values) = run()?;
-            assert_eq!(shape.iter().product::<usize>(), values.len());
-            assert!(values.iter().all(|x| x.is_finite()));
-            assert!(values.windows(2).any(|xs| xs[0] != xs[1]));
-            let steps: Vec<_> = trace
+        assert!(initial.iter().all(|x| x.is_finite()));
+        assert!(initial.windows(2).any(|xs| xs[0] != xs[1]));
+        let initial_bytes: Vec<u8> = initial.into_iter().flat_map(f32::to_le_bytes).collect();
+        fs::write(self.out.join("state-0.f32"), &initial_bytes)?;
+        let (_, warm_trace, warm_shape, warm_values) = run()?;
+        let (elapsed_ns, trace, shape, values) = run()?;
+        assert_eq!(trace, warm_trace);
+        assert_eq!(shape, warm_shape);
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        assert!(values.iter().all(|x| x.is_finite()));
+        assert!(values.windows(2).any(|xs| xs[0] != xs[1]));
+        assert!(
+            warm_values
                 .iter()
-                .filter(|e| e["event"] == "step")
-                .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
-                .collect();
-            assert_eq!(
-                steps,
-                [(1, 4), (2, 4), (2, 4), (3, 4), (3, 4), (4, 4), (4, 4)]
-            );
-            let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
-            if let Some((ref warm_shape, ref warm_trace, ref warm_bytes)) = expected {
-                assert_eq!(&shape, warm_shape);
-                assert_eq!(&trace, warm_trace);
-                assert!(
-                    &bytes == warm_bytes,
-                    "terminal differs across fixed-seed repeats"
-                );
-                assert!(elapsed_ns > 0);
-                samples
-                    .push(json!({"elapsed_ns":elapsed_ns,"outer_steps":steps.last().unwrap().0}));
-            } else {
-                assert_eq!(index, 0);
-                expected = Some((shape, trace, bytes));
-            }
-        }
-        let (shape, trace, bytes) = expected.unwrap();
+                .map(|x| x.to_bits())
+                .eq(values.iter().map(|x| x.to_bits())),
+            "terminal differs across fixed-seed repeats"
+        );
+        let steps: Vec<_> = trace
+            .iter()
+            .filter(|e| e["event"] == "step")
+            .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            steps,
+            [(1, 4), (2, 4), (2, 4), (3, 4), (3, 4), (4, 4), (4, 4)]
+        );
+        assert!(elapsed_ns > 0);
+        let samples = [json!({"elapsed_ns":elapsed_ns,"outer_steps":steps.last().unwrap().0})];
+        let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(bytes.len(), initial_bytes.len());
+        assert!(
+            bytes != initial_bytes,
+            "sampler did not change the initial noise"
+        );
         let peak = allocator_peak()?;
         assert!(peak > 0);
         fs::write(self.out.join("state-4.f32"), bytes)?;
         fs::write(
             self.out.join("result.json"),
             serde_json::to_vec(&json!({
-                "case":self.case,"trace":trace,"tensor_shape":shape,
+                "case":self.case,"settings":settings,"trace":trace,"tensor_shape":shape,
                 "warmups":1,"samples":samples,"allocator_peak_bytes":peak
             }))?,
         )?;

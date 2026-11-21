@@ -29,6 +29,8 @@ impl Prepared {
         let positive = dit.embed_text(inputs.require("positive")?)?;
         let negative = dit.embed_text(inputs.require("negative")?)?;
         eval([&positive, &negative])?;
+        assert_eq!(positive.dtype(), mlx_rs::Dtype::Bfloat16);
+        assert_eq!(negative.dtype(), mlx_rs::Dtype::Bfloat16);
         Ok(Self {
             dit,
             positive,
@@ -120,8 +122,24 @@ fn curated_tier1() -> ProofResult<()> {
     let cancel = CancelFlag::new();
     let nt = cfg.num_train_timesteps;
     let boundary = cfg.boundary * nt as f32;
-    mlx_rs::memory::reset_peak_memory();
+    // Keep the allocator’s lifetime high-water, including resident weight preparation.
+    let settings = json!({
+        "sampler":SAMPLER,"seed":SEED,"steps":STEPS,"shift":cfg.sample_shift,
+        "guidance":if cfg.dual_model { vec![low_cfg, high_cfg] } else { vec![cfg.sample_guide_scale.effective()] },
+        "denoiser_dtype":"BF16","latent_dtype":"F32","latent_shape":noise.shape(),
+        "patch":cfg.patch_size,"model_width":cfg.dim,"heads":cfg.num_heads,"depth":cfg.num_layers,
+        "reference_channels":y.as_ref().map_or(0, |condition| condition.shape()[0]),
+        "boundary_timestep":cfg.dual_model.then_some(boundary as u32),
+        "render_width":shape[3] as usize * cfg.vae_stride.2,"render_height":shape[2] as usize * cfg.vae_stride.1,
+        "frames":1 + (shape[1] as usize - 1) * cfg.vae_stride.0,
+        "text_shape":inputs.require("positive")?.shape(),"residency":if swapped { "swapped" } else { "resident" }
+    });
+    let initial = mlx_gen::array::contiguous(&noise)?
+        .as_slice::<f32>()
+        .to_vec();
     pair.measure(
+        initial,
+        settings,
         || {
             trace.lock().unwrap().clear();
             let mut progress = |event| {
@@ -132,33 +150,61 @@ fn curated_tier1() -> ProofResult<()> {
             stream.synchronize_and_retire()?;
             let start = Instant::now();
             let latent = if swapped {
-                denoise_moe_curated_swapped(
-                    boundary,
-                    "heun",
-                    nt,
-                    STEPS,
-                    cfg.sample_shift,
-                    &noise,
-                    y.as_ref(),
-                    SEED,
-                    &cancel,
-                    @WAN_MLX_SWAP_SCOPE@
-                    &mut progress,
-                    |high| {
-                        let e = load(high)?;
-                        trace
-                            .lock()
-                            .unwrap()
-                            .push(json!({"event":"load_expert","high":high}));
-                        Ok((e.dit, e.positive, Some(e.negative), e.guidance))
-                    },
-                )?
+                // Only the private call spelling differs between revisions. The
+                // candidate receives its production phase declaration from the
+                // same schedule and threshold as the legacy private API.
+                macro_rules! swapped {
+                    (base, $loader:expr) => {
+                        denoise_moe_curated_swapped(
+                            boundary,
+                            SAMPLER,
+                            nt,
+                            STEPS,
+                            cfg.sample_shift,
+                            &noise,
+                            y.as_ref(),
+                            SEED,
+                            &cancel,
+                            &mut progress,
+                            $loader,
+                        )
+                    };
+                    (head, $loader:expr) => {{
+                        let phase = crate::pipeline::curated_phase(
+                            SAMPLER,
+                            crate::scheduler::compute_sigmas(STEPS, cfg.sample_shift, nt),
+                            SEED,
+                            noise.shape(),
+                            crate::vae::WanVae::VAE_TILING,
+                            u32::from(y.is_some()),
+                            crate::pipeline::wan_expert_rule(nt, boundary),
+                        )?;
+                        denoise_moe_curated_swapped(
+                            &phase,
+                            SAMPLER,
+                            nt,
+                            &noise,
+                            y.as_ref(),
+                            &cancel,
+                            &mut progress,
+                            $loader,
+                        )
+                    }};
+                }
+                swapped!(@WAN_MLX_SWAP_ARM@, |high| {
+                    let e = load(high)?;
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(json!({"event":"load_expert","high":high}));
+                    Ok((e.dit, e.positive, Some(e.negative), e.guidance))
+                })?
             } else if let Some(h) = &high {
                 denoise_moe_curated(
                     &low.as_ref().unwrap().expert(),
                     &h.expert(),
                     boundary,
-                    "heun",
+                    SAMPLER,
                     nt,
                     STEPS,
                     cfg.sample_shift,
@@ -172,7 +218,7 @@ fn curated_tier1() -> ProofResult<()> {
                 let e = low.as_ref().unwrap();
                 denoise_curated(
                     &e.dit,
-                    "heun",
+                    SAMPLER,
                     nt,
                     STEPS,
                     cfg.sample_shift,
@@ -190,7 +236,9 @@ fn curated_tier1() -> ProofResult<()> {
             let elapsed = start.elapsed().as_nanos().try_into()?;
             assert_eq!(latent.shape(), &shape);
             // MLX may return a strided view. Serialize logical C/F/H/W order.
-            let values = mlx_gen::array::contiguous(&latent)?.as_slice::<f32>().to_vec();
+            let values = mlx_gen::array::contiguous(&latent)?
+                .as_slice::<f32>()
+                .to_vec();
             Ok((
                 elapsed,
                 trace.lock().unwrap().clone(),
