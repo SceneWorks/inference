@@ -17,6 +17,7 @@ from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as 
 from scripts.ci import wddm_process_memory as wddm
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.ci.scail_plural import contract as c
+from scripts.ci.scail_plural.wddm_retry import SameTickSamples
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
 
@@ -70,11 +71,13 @@ class Observer:
         self.host_samples = []
         self.card_samples = []
         self.windows_peak = {}
-        self.shared = (
-            wddm.DedicatedSamples(cuda.dedicated_adapter, approved.cuda_device_uuid, shared=True)
-            if cuda
-            else None
-        )
+        self.shared = None
+        if cuda is not None:
+            cuda.dedicated = SameTickSamples(cuda.dedicated, approved.poll_millis)
+            self.shared = SameTickSamples(
+                wddm.DedicatedSamples(cuda.dedicated_adapter, approved.cuda_device_uuid, shared=True),
+                approved.poll_millis,
+            )
 
     def __getattr__(self, name):
         return getattr(self.base, name)
@@ -119,6 +122,8 @@ class Observer:
             "windows_peak": self.windows_peak,
             "wddm_shared_counter": "GPU Process Memory/Shared Usage" if self.shared else None,
             "wddm_shared": self.shared.record if self.shared else None,
+            **({"wddm_retry": {"dedicated": self.base.dedicated.diagnostics,
+                               "shared": self.shared.diagnostics}} if self.shared else {}),
         }
 
 
@@ -171,6 +176,21 @@ def build(work, contract, policy):
             "toolchain": toolchain,
         },
     )
+
+
+def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved, head):
+    try:
+        candidate = c.measured_row(native, guard, pool, adapter, hw, backend, count, approved, head)
+    except c.IncompleteWddmSamples:
+        return {"accepted": False, "telemetry_failure": "incomplete_wddm_samples"}
+    return {"accepted": True, "candidate_row_pending_physical_review": candidate}
+
+
+def require_release(claim, backend):
+    if claim.get("post_execution_verified") is not True or (
+        backend == "candle-cuda" and claim.get("lease_released") is not True
+    ):
+        raise ValueError("physical resource release unverified")
 
 
 def execute(args, contract):
@@ -270,13 +290,13 @@ def execute(args, contract):
                     if adapter
                     else None
                 )
-                record["candidate_row_pending_physical_review"] = c.measured_row(
-                    native, guard, pool, adapter, hw, backend, count, approved, contract["head"]
-                )
-            if not claim.get("post_execution_verified"):
-                raise ValueError("physical resource release unverified")
-            record["accepted"] = True
-        receipt["accepted"] = True
+            require_release(claim, backend)
+            record.update(measured_outcome(
+                native, guard, pool, adapter, hw, backend, count, approved, contract["head"]
+            ))
+        receipt["accepted"] = all(record["accepted"] for record in receipt["counts"].values())
+        if not receipt["accepted"]:
+            receipt["failure"] = "incomplete owned WDDM poll series"
     except BaseException as exc:
         receipt["failure"] = proof.redact(str(exc), dict(os.environ))
         raise
@@ -320,22 +340,32 @@ def verify(args, contract):
     for name, published in receipt["logs"].items():
         if tier1.sha(evidence.owned_file(dest, name, allowed[name])) != published["sha256"]:
             raise ValueError("changed published evidence")
-    if not receipt["accepted"]:
-        if not (receipt.get("failure") or receipt.get("log_errors")):
-            raise ValueError("unexplained partial campaign")
-        return
-    required = {name for name in allowed if not name.endswith(".guard.jsonl")}
-    if not required.issubset(receipt["logs"]) or set(receipt["counts"]) != set(
-        map(str, contract["counts"])
-    ):
-        raise ValueError("incomplete campaign")
+    known = set(map(str, contract["counts"]))
+    records = receipt["counts"]
+    if not set(records).issubset(known):
+        raise ValueError("unexpected count in physical campaign")
+    if receipt["accepted"]:
+        if set(records) != known or not all(record["accepted"] is True for record in records.values()):
+            raise ValueError("incomplete campaign")
+    elif not (receipt.get("failure") or receipt.get("log_errors")):
+        raise ValueError("unexplained partial campaign")
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory() as d:
         approved = tier1.read_policy(Path(d), "policy.json", contract["request"]["policy"])
     for count in contract["counts"]:
-        record = receipt["counts"][str(count)]
+        record = records.get(str(count))
+        if record is None:
+            continue
+        if record["accepted"] is False and "telemetry_failure" not in record:
+            if "candidate_row_pending_physical_review" in record:
+                raise ValueError("unverified count exposes a physical price")
+            continue  # hard failure before a verified measurement
         name = f"count-{count}"
+        required = {f"{name}.{suffix}" for suffix in limits if suffix != "guard.jsonl"}
+        if not required.issubset(receipt["logs"]):
+            raise ValueError("missing completed child evidence")
+        require_release(record["claim"], backend)
         guard = json.loads((dest / (name + ".supervisor.json")).read_bytes())
         pool = (
             json.loads((dest / (name + ".cuda-pool.json")).read_bytes())
@@ -343,23 +373,14 @@ def verify(args, contract):
             else None
         )
         body = proof.verify_execution(contract["case"], (dest / (name + ".stdout.log")).read_text())
-        if (
-            not record["accepted"]
-            or not record["claim"]["post_execution_verified"]
-            or record["body"] != body
-            or record["candidate_row_pending_physical_review"]
-            != c.measured_row(
-                record["native"],
-                guard,
-                pool,
-                receipt["adapter"],
-                receipt["hardware"],
-                backend,
-                count,
-                approved,
-                contract["head"],
-            )
-        ):
+        actual = measured_outcome(
+            record["native"], guard, pool, receipt["adapter"], receipt["hardware"],
+            backend, count, approved, contract["head"],
+        )
+        stored = {key: record[key] for key in (
+            "accepted", "telemetry_failure", "candidate_row_pending_physical_review"
+        ) if key in record}
+        if record["body"] != body or actual != stored:
             raise ValueError("physical/model receipt changed")
 
 

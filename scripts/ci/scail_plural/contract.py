@@ -164,6 +164,10 @@ def validate_native(data, backend, count):
         raise ValueError("native execution identity lacks the consumed solver or codec policy")
 
 
+class IncompleteWddmSamples(ValueError):
+    """A released render with a genuine missing poll in an otherwise valid sample series."""
+
+
 def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision):
     validate_native(data, backend, count)
     validate_admission(guard["admission"], policy_sha256=approved.sha256)
@@ -215,14 +219,29 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         shared_peak = wddm.sampled_peak(shared, pid=data["pid"], adapter=adapter, allow_zero=True)
         dedicated = cuda["dedicated"]["sampled_peak_bytes"]
         if (
-            dedicated is None
-            or shared_peak is None
-            or shared["created_filetime"]
-            != guard["cuda_attribution"]["wddm_dedicated"]["created_filetime"]
+            not shared["created_filetime"]
+            or shared["created_filetime"] != guard["cuda_attribution"]["wddm_dedicated"]["created_filetime"]
             or hardware["uuid"] != GPU
             or int(hardware["index"]) != 1
         ):
             raise ValueError("missing owned WDDM dedicated or shared observations")
+        dedicated_record = guard["cuda_attribution"]["wddm_dedicated"]
+        from scripts.ci.scail_plural.wddm_retry import validate_retry
+        diagnostics = guard["fit_observation"]["wddm_retry"]
+        validate_retry(diagnostics["dedicated"], dedicated_record, approved.poll_millis)
+        validate_retry(diagnostics["shared"], shared, approved.poll_millis)
+        incomplete = dedicated is None or shared_peak is None
+        if incomplete:
+            for series, peak, allow_zero in ((dedicated_record, dedicated, False), (shared, shared_peak, True)):
+                if peak is None and (
+                    series["error"] is not None or not series["missing_active_polls"]
+                    or sum(allow_zero or sample[1] > 0 for sample in series["samples"]) < 2
+                ):
+                    raise ValueError("invalid WDDM ownership or missing process observations")
+            # A missing poll cannot erase an observed guard violation. These values
+            # are used only for refusal; no incomplete high-water becomes a price.
+            dedicated = max(value for _, value in dedicated_record["samples"])
+            shared_peak = max(value for _, value in shared["samples"])
         raw = guard["fit_observation"]
         counters = raw["windows_peak"]
         if (
@@ -258,6 +277,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         gross = (max(host + shared_peak, data["axes"]["floor_host_bytes"]), device, 0)
     if max(gross[0], gross[2]) > approved.child_footprint_cap_bytes:
         raise ValueError("measured host/unified requirement exceeds approved cap")
+    if backend == "candle-cuda" and incomplete:
+        raise IncompleteWddmSamples("incomplete owned WDDM poll series")
     return dict(
         machine,
         inference_revision=revision,

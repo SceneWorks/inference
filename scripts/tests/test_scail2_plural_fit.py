@@ -1,5 +1,11 @@
 import copy
 import hashlib
+import json
+import os
+from contextlib import contextmanager
+from itertools import count
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
@@ -157,6 +163,129 @@ class PluralQualification(unittest.TestCase):
             with self.assertRaises(ValueError):
                 c.validate_stage(bad, root)
 
+    def test_one_same_tick_retry_retains_fresh_data_only(self):
+        from scripts.ci import wddm_process_memory as w
+        from scripts.ci.scail_plural import wddm_retry
+
+        adapter = dict(cuda_uuid=c.GPU, luid="luid_0x00000000_0x0001e266",
+                       physical_node=0, node_mask=1, counter=w.COUNTER)
+        for outcome, retry, gap in [
+            ("fresh", [110, 0], 0), ("missing", None, 1), ("cached", [100, 4], 1),
+            ("stale", [102, 2], 1), ("late", [110, 2], 1),
+            ("exit", [110, 2], 1), ("changed-root", [110, 2], 1),
+        ]:
+            with self.subTest(outcome=outcome):
+                owner = MagicMock()
+                owner.members.return_value = {31}
+                owner.root_identity.return_value = (99, False)
+                owner.exited_root_and_empty.return_value = True
+                values = iter([[100, 4], None, retry])
+                @contextmanager
+                def query(*args, **kwargs):
+                    def read():
+                        value = next(values)
+                        if value == retry and value is not None:
+                            if outcome == "exit":
+                                owner.members.return_value = set()
+                            if outcome == "changed-root":
+                                owner.root_identity.return_value = (77, False)
+                        return value
+                    yield read
+
+                ticks = [1000, 2000, 2010, 2020, 2_000_000 if outcome == "late" else 2080]
+                with patch.object(w, "_query", query), patch.object(wddm_retry, "local_filetime", side_effect=[109,111]), \
+                        patch.object(wddm_retry.time, "sleep"), \
+                        patch.object(wddm_retry.time, "monotonic_ns", side_effect=ticks):
+                    probe = runner.SameTickSamples(w.DedicatedSamples(adapter, c.GPU), 1)
+                    probe.poll(owner, cuda_active=True)
+                    probe.poll(owner, cuda_active=True)
+                self.assertEqual(probe.record["missing_active_polls"], gap)
+                wddm_retry.validate_retry(probe.diagnostics, probe.record, 1)
+                event = probe.diagnostics["events"][0]
+                self.assertEqual(event["recovered"], outcome == "fresh")
+                self.assertEqual(probe.diagnostics["attempts"], 1)
+                if outcome == "fresh":
+                    self.assertEqual(probe.record["samples"], [[100, 4], [110, 0]])
+                    self.assertEqual(w.sampled_peak(probe.record, pid=31, adapter=adapter, allow_zero=True), 4)
+                if outcome == "changed-root":
+                    self.assertIn("identity changed", probe.record["error"])
+                probe.close()
+
+    def test_retries_preserve_earlier_missing_polls_and_stop_at_the_audit_limit(self):
+        from scripts.ci.scail_plural import wddm_retry
+
+        clock = patch.object(wddm_retry.time, "monotonic_ns", side_effect=count(1, 100).__next__)
+        clock.start()
+        self.addCleanup(clock.stop)
+        gauge = MagicMock()
+        gauge.record = {"samples": [], "missing_active_polls": 0, "error": None}
+        probe = runner.SameTickSamples(gauge, 250)
+        def miss(owner, *, cuda_active):
+            gauge.record["missing_active_polls"] += 1
+        def sample(owner, *, cuda_active):
+            gauge.record["samples"].append([9, 0])
+        # A new process's first actual sample can qualify; an older miss survives.
+        reads = iter([miss, miss, miss, sample])
+        gauge.poll.side_effect = lambda owner, **kwargs: next(reads)(owner, **kwargs)
+        with patch.object(wddm_retry.time, "sleep"), patch.object(
+            wddm_retry, "local_filetime", side_effect=[1, 5, 7, 10]
+        ):
+            probe.poll(object(), cuda_active=True)
+            probe.poll(object(), cuda_active=True)
+        self.assertEqual(gauge.record["missing_active_polls"], 1)
+        wddm_retry.validate_retry(probe.diagnostics, gauge.record, 250)
+        gauge.poll.side_effect = miss
+        with patch.object(wddm_retry.time, "sleep"), patch.object(wddm_retry, "local_filetime", return_value=11):
+            for _ in range(wddm_retry.MAX_RETRY_EVENTS):
+                probe.poll(object(), cuda_active=True)
+        self.assertEqual(len(probe.diagnostics["events"]), wddm_retry.MAX_RETRY_EVENTS)
+        self.assertEqual(probe.diagnostics["attempts"], wddm_retry.MAX_RETRY_EVENTS + 2)
+        wddm_retry.validate_retry(probe.diagnostics, gauge.record, 250)
+        probe.diagnostics["events"][1]["local_filetime_before"] = 10
+        with self.assertRaisesRegex(ValueError, "fresh same-tick"):
+            wddm_retry.validate_retry(probe.diagnostics, gauge.record, 250)
+
+    def test_partial_campaign_replays_each_completed_count_and_refuses_changed_results(self):
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "evidence"
+            dest.mkdir()
+            contract = {"request": {"policy": c.policy("candle-cuda")}, "head": "head",
+                        "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}}
+            receipt = {"contract": contract, "request": contract["request"], "run_id": "1",
+                       "run_attempt": "1", "accepted": False, "failure": "incomplete campaign",
+                       "logs": {}, "adapter": {"fixture": True}, "hardware": {}, "counts": {}}
+            claim = {"post_execution_verified": True, "lease_released": True}
+            gap = {"accepted": False, "telemetry_failure": "incomplete_wddm_samples"}
+            passed = {"accepted": True, "candidate_row_pending_physical_review": {"price": 200}}
+            for n, result in [(6, gap), (2, passed)]:
+                receipt["counts"][str(n)] = dict(result, native={"count": n}, body={"ok": True}, claim=claim)
+                for suffix in ["stdout.log", "stderr.log", "supervisor.json", "cuda-pool.json"]:
+                    name = f"count-{n}.{suffix}"
+                    (dest / name).write_text("{}")
+                    receipt["logs"][name] = {"sha256": runner.tier1.sha(dest / name)}
+            def verify():
+                path = dest / "receipt.json"
+                path.write_text(json.dumps(receipt))
+                with patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_RUN_ID": "1",
+                        "GITHUB_RUN_ATTEMPT": "1", "SCAIL_PLURAL_RECEIPT_SHA256": runner.tier1.sha(path)}):
+                    runner.verify(SimpleNamespace(output=dest), contract)
+            with patch.object(runner.proof, "verify_execution", return_value={"ok": True}), \
+                    patch.object(c, "measured_row", side_effect=[
+                        c.IncompleteWddmSamples(), {"price": 200},
+                        c.IncompleteWddmSamples(), {"price": 201},
+                    ]) as measured:
+                verify()
+                self.assertEqual(measured.call_count, 2)
+                with self.assertRaisesRegex(ValueError, "receipt changed"):
+                    verify()
+                receipt["accepted"] = True
+                with self.assertRaisesRegex(ValueError, "incomplete campaign"):
+                    verify()
+                receipt["accepted"] = False
+                claim["lease_released"] = False
+                with self.assertRaisesRegex(ValueError, "release unverified"):
+                    verify()
+
     def test_shared_gauge_accounts_for_a_retryable_failed_nvidia_tick(self):
         base = MagicMock()
         observer = runner.Observer.__new__(runner.Observer)
@@ -169,7 +298,6 @@ class PluralQualification(unittest.TestCase):
         observer.shared.poll.assert_called_once_with(owner, cuda_active=True)
 
     def test_physical_measurements_require_owned_gpu_pool_proc_and_shared_counters(self):
-        from types import SimpleNamespace
         from scripts.ci import wddm_process_memory as w
 
         data = native("candle-cuda", 6)
@@ -207,6 +335,7 @@ class PluralQualification(unittest.TestCase):
                 },
                 card_samples_monotonic_ns_free_owned_or_fallback_bytes=[[1, 9000, 600]],
                 wddm_shared_counter="GPU Process Memory/Shared Usage",
+                wddm_retry={k: {"attempts": 0, "events": []} for k in ("shared", "dedicated")},
                 wddm_shared=shared,
             ),
             cuda_attribution=dict(
@@ -220,7 +349,7 @@ class PluralQualification(unittest.TestCase):
         pool = dict(pid=31, cudaDeviceUuid=c.GPU, poolUsedHighBytes=299, poolReservedHighBytes=300)
         machine = dict(uuid=c.GPU, index=1, name="GPU", driver_version="driver")
         approved = SimpleNamespace(
-            sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000
+            sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000, poll_millis=250
         )
         with patch.object(c, "validate_admission"):
             row = c.measured_row(
@@ -230,6 +359,25 @@ class PluralQualification(unittest.TestCase):
             self.assertEqual(row["witness"]["gross_host_bytes"], 800)
             self.assertEqual(row["witness"]["text_tokens"], 512)
             self.assertIsNone(row["witness"]["mlx_decode_budget_bytes"])
+            missing = copy.deepcopy(guard)
+            obs = missing["fit_observation"]
+            obs["wddm_shared"]["missing_active_polls"] = 1
+            obs["wddm_retry"]["shared"] = {"attempts": 1, "events": [{
+                "start_ns": 500, "end_ns": 900, "retried": True, "previous": [2, 0],
+                "retry_sample": None, "local_filetime_before": 5, "local_filetime_after": 7,
+                "recovered": False,
+            }]}
+            def measure_missing():
+                return runner.measured_outcome(data, missing, pool, adapter, machine, "candle-cuda",
+                                               6, approved, "f" * 40)
+            self.assertEqual(measure_missing(), {"accepted": False, "telemetry_failure": "incomplete_wddm_samples"})
+            obs["windows_peak"]["peak_working_set_bytes"] = 10001
+            with self.assertRaisesRegex(ValueError, "exceeds approved cap"):
+                measure_missing()
+            obs["windows_peak"]["peak_working_set_bytes"] = 700
+            obs["wddm_shared"]["error"] = "owned process identity changed"
+            with self.assertRaisesRegex(ValueError, "ownership"):
+                measure_missing()
             for mutation in [
                 "shared_gap",
                 "pid",
