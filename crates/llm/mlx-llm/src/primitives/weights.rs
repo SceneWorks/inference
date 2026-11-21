@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Weights {
     tensors: HashMap<String, Array>,
+    rotations: RefCell<HashMap<usize, Array>>,
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
     accessed: RefCell<HashSet<String>>,
@@ -105,6 +106,7 @@ impl Weights {
     pub fn from_map(tensors: HashMap<String, Array>) -> Self {
         Self {
             tensors,
+            rotations: Default::default(),
             accessed: RefCell::new(HashSet::new()),
             released: HashSet::new(),
         }
@@ -113,7 +115,7 @@ impl Weights {
     /// Load every tensor from a single `.safetensors` file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let tensors = crate::load_progress::load(path)
+        let (mut tensors, metadata) = crate::load_progress::load_with_metadata(path)
             .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -121,6 +123,9 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &[path],
         );
+        if let Some(table) = metadata.get("_quantization_metadata") {
+            mlx_layers::convrot_int8::attach_metadata(&mut tensors, std::slice::from_ref(table))?;
+        }
         Ok(Self::from_map(tensors))
     }
 
@@ -146,10 +151,19 @@ impl Weights {
         let __input_paths = shards.clone(); // deterministic merge order
         crate::load_progress::register_files(&shards);
         let mut tensors = HashMap::new();
+        let mut declarations = Vec::new();
         for shard in shards {
-            let part = crate::load_progress::load(&shard)
+            let (part, meta) = crate::load_progress::load_with_metadata(&shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
-            tensors.extend(part);
+            declarations.extend(meta.get("_quantization_metadata").cloned());
+            for (name, tensor) in part {
+                if tensors.insert(name.clone(), tensor).is_some() {
+                    return Err(Error::Msg(format!(
+                        "duplicate key {name} in {}",
+                        shard.display()
+                    )));
+                }
+            }
         }
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -157,6 +171,7 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &__input_paths,
         );
+        mlx_layers::convrot_int8::attach_metadata(&mut tensors, &declarations)?;
         Ok(Self::from_map(tensors))
     }
 
@@ -703,5 +718,14 @@ mod tests {
         w.remove_accessed();
         assert_eq!(w.keys().collect::<Vec<_>>(), ["model.layers.0.never_read"]);
         assert_eq!(w.unused_keys(), ["model.layers.0.never_read"]);
+    }
+}
+
+impl mlx_layers::convrot_int8::ProjectionWeights for Weights {
+    fn get(&self, key: &str) -> Option<&Array> {
+        self.get(key)
+    }
+    fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>> {
+        &self.rotations
     }
 }

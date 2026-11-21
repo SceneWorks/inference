@@ -1331,15 +1331,19 @@ impl Flux2ControlBlock {
         // The control block's attn/ff/ff_context keys match a base double block 1:1; load dense
         // (the bf16 control overlay is small enough to quantize in place after load).
         let base = DoubleBlock::from_weights(w, prefix, heads, head_dim, None)?;
-        let after_proj = AdaptableLinear::dense(
-            w.require(&format!("{prefix}.after_proj.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.after_proj.bias"))?.clone()),
-        );
+        let after_proj = mlx_gen::quant::lin(
+            w,
+            &format!("{prefix}.after_proj"),
+            true,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         let before_proj = if has_before_proj {
-            Some(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.before_proj.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.before_proj.bias"))?.clone()),
-            ))
+            Some(mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.before_proj"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?)
         } else {
             None
         };

@@ -15,6 +15,7 @@
 //! against the f32-preprocessed pixels (MLX promotes the bf16 weights), then the projected features
 //! are cast to bf16 and spliced into the bf16 token embeddings before the bf16 Llama decode.
 
+use crate::primitives::Projection;
 use std::path::Path;
 
 use mlx_rs::ops::concatenate_axis;
@@ -36,7 +37,7 @@ use crate::error::{to_core, Error, Result};
 use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
-use crate::primitives::nn::{gelu, gelu_tanh, linear};
+use crate::primitives::nn::{gelu, gelu_tanh};
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
@@ -130,10 +131,8 @@ impl ProjectorActivation {
 
 /// The LLaVA multimodal projector: `linear_2(act(linear_1(x)))`, both layers with bias.
 pub struct LlavaProjector {
-    linear1_w: Array,
-    linear1_b: Array,
-    linear2_w: Array,
-    linear2_b: Array,
+    linear1: Projection,
+    linear2: Projection,
     activation: ProjectorActivation,
 }
 
@@ -147,10 +146,18 @@ impl LlavaProjector {
         let bf16 =
             |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
         let model = Self {
-            linear1_w: bf16(format!("{prefix}.linear_1.weight"))?,
-            linear1_b: bf16(format!("{prefix}.linear_1.bias"))?,
-            linear2_w: bf16(format!("{prefix}.linear_2.weight"))?,
-            linear2_b: bf16(format!("{prefix}.linear_2.bias"))?,
+            linear1: Projection::from_named(
+                w,
+                &format!("{prefix}.linear_1.weight"),
+                Some(bf16(format!("{prefix}.linear_1.bias"))?),
+                Some(Dtype::Bfloat16),
+            )?,
+            linear2: Projection::from_named(
+                w,
+                &format!("{prefix}.linear_2.weight"),
+                Some(bf16(format!("{prefix}.linear_2.bias"))?),
+                Some(Dtype::Bfloat16),
+            )?,
             activation,
         };
         w.verify_accessed_gpu_view()?;
@@ -160,10 +167,8 @@ impl LlavaProjector {
     /// Project SigLIP features `[b, seq, 1152]` to language features `[b, seq, hidden]`. The f32
     /// input promotes the bf16 weights to f32, matching the reference.
     pub fn forward(&self, features: &Array) -> Result<Array> {
-        let h =
-            self.activation
-                .apply(&linear(features, &self.linear1_w, Some(&self.linear1_b))?)?;
-        linear(&h, &self.linear2_w, Some(&self.linear2_b))
+        let h = self.activation.apply(&self.linear1.forward(features)?)?;
+        self.linear2.forward(&h)
     }
 }
 

@@ -813,10 +813,9 @@ impl AdaptableLinear {
             LinearBase::Quantized(q) => &mut q.inner.bias,
             LinearBase::ConvRot(q) => {
                 let b = q
-                    .bias
-                    .as_ref()
+                    .bias()
                     .ok_or("merge_bias_delta: ConvRot base has no bias")?;
-                q.bias = Some(add(b, &delta.as_dtype(b.dtype())?)?);
+                q.set_bias(add(b, &delta.as_dtype(b.dtype())?)?)?;
                 return Ok(());
             }
             // W4A8 packs only its WEIGHT: the bias stays a dense float vector that the
@@ -851,7 +850,7 @@ impl AdaptableLinear {
         match &self.base {
             LinearBase::Dense(l) => l.bias.value.as_ref(),
             LinearBase::Quantized(q) => q.inner.bias.value.as_ref(),
-            LinearBase::ConvRot(q) => q.bias.as_ref(),
+            LinearBase::ConvRot(q) => q.bias(),
             LinearBase::W4A8(q) => q.bias.as_ref(),
         }
     }
@@ -933,8 +932,8 @@ impl AdaptableLinear {
                 vec![s[0], s[1] * q.group_size]
             }
             LinearBase::ConvRot(q) => vec![
-                q.descriptor.out_features as i32,
-                q.descriptor.in_features as i32,
+                q.descriptor().out_features as i32,
+                q.descriptor().in_features as i32,
             ],
             LinearBase::W4A8(q) => vec![
                 q.descriptor.out_features as i32,

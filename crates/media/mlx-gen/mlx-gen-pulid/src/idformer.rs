@@ -17,7 +17,7 @@ use mlx_rs::ops::{broadcast_to, concatenate_axis, matmul, maximum, multiply};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_exact, linear};
+use mlx_gen::nn::gelu_exact;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 
@@ -36,42 +36,53 @@ fn leaky_relu(x: &Array) -> Result<Array> {
 /// The shared `Linear→LN→LeakyReLU→Linear→LN→LeakyReLU→Linear` mapping head (Sequential indices
 /// 0,1,3,4,6 in the checkpoint). All three linears are biased.
 struct MappingMlp {
-    l0_w: Array,
-    l0_b: Array,
+    l0_w: mlx_gen::adapters::AdaptableLinear,
+
     ln1_w: Array,
     ln1_b: Array,
-    l3_w: Array,
-    l3_b: Array,
+    l3_w: mlx_gen::adapters::AdaptableLinear,
+
     ln4_w: Array,
     ln4_b: Array,
-    l6_w: Array,
-    l6_b: Array,
+    l6_w: mlx_gen::adapters::AdaptableLinear,
 }
 
 impl MappingMlp {
     fn from_weights(w: &Weights, p: &str) -> Result<Self> {
         Ok(Self {
-            l0_w: w.require(&join(p, "0.weight"))?.clone(),
-            l0_b: w.require(&join(p, "0.bias"))?.clone(),
+            l0_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(p, "0"),
+                Some(w.require(&join(p, "0.bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             ln1_w: w.require(&join(p, "1.weight"))?.clone(),
             ln1_b: w.require(&join(p, "1.bias"))?.clone(),
-            l3_w: w.require(&join(p, "3.weight"))?.clone(),
-            l3_b: w.require(&join(p, "3.bias"))?.clone(),
+            l3_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(p, "3"),
+                Some(w.require(&join(p, "3.bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             ln4_w: w.require(&join(p, "4.weight"))?.clone(),
             ln4_b: w.require(&join(p, "4.bias"))?.clone(),
-            l6_w: w.require(&join(p, "6.weight"))?.clone(),
-            l6_b: w.require(&join(p, "6.bias"))?.clone(),
+            l6_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(p, "6"),
+                Some(w.require(&join(p, "6.bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let h = linear(x, &self.l0_w, &self.l0_b)?;
+        let h = self.l0_w.forward(x)?;
         let h = layer_norm(&h, Some(&self.ln1_w), Some(&self.ln1_b), EPS)?;
         let h = leaky_relu(&h)?;
-        let h = linear(&h, &self.l3_w, &self.l3_b)?;
+        let h = self.l3_w.forward(&h)?;
         let h = layer_norm(&h, Some(&self.ln4_w), Some(&self.ln4_b), EPS)?;
         let h = leaky_relu(&h)?;
-        linear(&h, &self.l6_w, &self.l6_b)
+        self.l6_w.forward(&h)
     }
 }
 
@@ -89,9 +100,9 @@ struct PerceiverAttention {
     norm1_b: Array,
     norm2_w: Array,
     norm2_b: Array,
-    to_q: Array,
-    to_kv: Array,
-    to_out: Array,
+    to_q: mlx_gen::adapters::AdaptableLinear,
+    to_kv: mlx_gen::adapters::AdaptableLinear,
+    to_out: mlx_gen::adapters::AdaptableLinear,
     heads: i32,
     dim_head: i32,
 }
@@ -103,9 +114,24 @@ impl PerceiverAttention {
             norm1_b: w.require(&join(p, "norm1.bias"))?.clone(),
             norm2_w: w.require(&join(p, "norm2.weight"))?.clone(),
             norm2_b: w.require(&join(p, "norm2.bias"))?.clone(),
-            to_q: w.require(&join(p, "to_q.weight"))?.clone(),
-            to_kv: w.require(&join(p, "to_kv.weight"))?.clone(),
-            to_out: w.require(&join(p, "to_out.weight"))?.clone(),
+            to_q: mlx_gen::quant::lin(
+                w,
+                &join(p, "to_q"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            to_kv: mlx_gen::quant::lin(
+                w,
+                &join(p, "to_kv"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            to_out: mlx_gen::quant::lin(
+                w,
+                &join(p, "to_out"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             heads,
             dim_head,
         })
@@ -118,8 +144,8 @@ impl PerceiverAttention {
         let (b, n_lat) = (lat.shape()[0], lat.shape()[1]);
         let (h, hd) = (self.heads, self.dim_head);
 
-        let q = matmul(&lat, self.to_q.t())?;
-        let kv = matmul(&concatenate_axis(&[&x, &lat], 1)?, self.to_kv.t())?;
+        let q = self.to_q.forward(&lat)?;
+        let kv = self.to_kv.forward(&concatenate_axis(&[&x, &lat], 1)?)?;
         let n_kv = kv.shape()[1];
         let kv_parts = mlx_rs::ops::split(&kv, 2, 2)?; // along last (dim) axis: [k | v]
         let to_heads = |t: &Array, n: i32| -> Result<Array> {
@@ -134,7 +160,7 @@ impl PerceiverAttention {
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, n_lat, h * hd])?;
-        Ok(matmul(&out, self.to_out.t())?)
+        Ok(self.to_out.forward(&out)?)
     }
 }
 
@@ -142,8 +168,8 @@ impl PerceiverAttention {
 struct FeedForward {
     ln_w: Array,
     ln_b: Array,
-    l1: Array,
-    l3: Array,
+    l1: mlx_gen::adapters::AdaptableLinear,
+    l3: mlx_gen::adapters::AdaptableLinear,
 }
 
 impl FeedForward {
@@ -151,16 +177,16 @@ impl FeedForward {
         Ok(Self {
             ln_w: w.require(&join(p, "0.weight"))?.clone(),
             ln_b: w.require(&join(p, "0.bias"))?.clone(),
-            l1: w.require(&join(p, "1.weight"))?.clone(),
-            l3: w.require(&join(p, "3.weight"))?.clone(),
+            l1: mlx_gen::quant::lin(w, &join(p, "1"), false, mlx_gen::quant::DEFAULT_GROUP_SIZE)?,
+            l3: mlx_gen::quant::lin(w, &join(p, "3"), false, mlx_gen::quant::DEFAULT_GROUP_SIZE)?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = layer_norm(x, Some(&self.ln_w), Some(&self.ln_b), EPS)?;
-        let h = matmul(&h, self.l1.t())?;
+        let h = self.l1.forward(&h)?;
         let h = gelu_exact(&h)?;
-        Ok(matmul(&h, self.l3.t())?)
+        Ok(self.l3.forward(&h)?)
     }
 }
 

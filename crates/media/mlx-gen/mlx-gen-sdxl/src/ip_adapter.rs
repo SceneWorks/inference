@@ -303,8 +303,18 @@ impl ResamplerFeedForward {
         Ok(Self {
             ln_w: w.require(&format!("{prefix}.0.weight"))?.clone(),
             ln_b: w.require(&format!("{prefix}.0.bias"))?.clone(),
-            fc1: AdaptableLinear::dense(w.require(&format!("{prefix}.1.weight"))?.clone(), None),
-            fc2: AdaptableLinear::dense(w.require(&format!("{prefix}.3.weight"))?.clone(), None),
+            fc1: mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.1"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            fc2: mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.3"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
         })
     }
 
@@ -344,14 +354,18 @@ impl Resampler {
     /// Load from the `image_proj` namespace of an IP-Adapter-plus checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &ResamplerConfig) -> Result<Self> {
         let latents = w.require(&format!("{prefix}.latents"))?.clone();
-        let proj_in = AdaptableLinear::dense(
-            w.require(&format!("{prefix}.proj_in.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.proj_in.bias"))?.clone()),
-        );
-        let proj_out = AdaptableLinear::dense(
-            w.require(&format!("{prefix}.proj_out.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.proj_out.bias"))?.clone()),
-        );
+        let proj_in = mlx_gen::quant::lin(
+            w,
+            &format!("{prefix}.proj_in"),
+            true,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
+        let proj_out = mlx_gen::quant::lin(
+            w,
+            &format!("{prefix}.proj_out"),
+            true,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         let layers = (0..cfg.depth)
             .map(|i| -> Result<_> {
                 let attn =

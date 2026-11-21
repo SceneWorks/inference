@@ -58,7 +58,7 @@ impl Weights {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let __input_path = path.as_ref();
-        let (tensors, metadata) = gen_core::__model_input_reader!(
+        let (mut tensors, metadata) = gen_core::__model_input_reader!(
 load_safetensors_on_cpu(path.as_ref()),
 "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543",
 TensorInput,
@@ -70,6 +70,9 @@ path.as_ref(),
             "mlx-gen::Weights::from_file",
             &[__input_path],
         );
+        if let Some(table) = metadata.get("_quantization_metadata") {
+            mlx_layers::convrot_int8::attach_metadata(&mut tensors, std::slice::from_ref(table))?;
+        }
         Ok(Self {
             tensors,
             metadata,
@@ -345,6 +348,7 @@ path.as_ref(),
         mlx_llm::load_progress::register_files(files);
         let mut tensors = HashMap::new();
         let mut metadata = HashMap::new();
+        let mut declarations = Vec::new();
         for f in files {
             // Name the offending file: the underlying mlx-c error carries only its own C++ source
             // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
@@ -369,6 +373,7 @@ f,
                     .into());
                 }
             }
+            declarations.extend(m.get("_quantization_metadata").cloned());
             metadata.extend(m);
         }
         #[cfg(feature = "model-inference-proof")]
@@ -376,6 +381,7 @@ f,
             "mlx-gen::Weights::from_paths",
             files,
         );
+        mlx_layers::convrot_int8::attach_metadata(&mut tensors, &declarations)?;
         Ok(Self {
             tensors,
             metadata,
@@ -434,15 +440,6 @@ f,
         base: &str,
     ) -> Option<gen_core::convrot_int8::ConvRotInt8> {
         self.planned_convrot.get(base).copied()
-    }
-
-    /// Share the tiny immutable ConvRot constants across every projection loaded together.
-    pub(crate) fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.convrot_rotations
-            .borrow_mut()
-            .entry(group)
-            .or_insert_with(build)
-            .clone()
     }
 
     /// Insert (or overwrite) a tensor under `key`. Used by checkpoint remapping (diffusers →
@@ -534,7 +531,14 @@ f,
     /// Consume the container into its raw tensor map (drops metadata and access bookkeeping).
     /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
     /// loader, which never has metadata to begin with.
-    pub fn into_tensors(self) -> HashMap<String, Array> {
+    pub fn into_tensors(mut self) -> HashMap<String, Array> {
+        for (base, geometry) in self.planned_convrot {
+            self.tensors
+                .entry(format!("{base}.comfy_quant"))
+                .or_insert_with(|| {
+                    mlx_layers::convrot_int8::descriptor_array(geometry.rotation_group)
+                });
+        }
         self.tensors
     }
 
@@ -550,16 +554,7 @@ f,
     /// whole checkpoint at load (e.g. the vendored SDXL `_load_safetensor_weights(..., float16=True)`
     /// applies `v.astype(mx.float16)` to every tensor). A no-op when `dtype` already matches.
     pub fn cast_all(&mut self, dtype: Dtype) -> Result<()> {
-        // Per tensor this transiently holds both the source and the cast copy until the reassignment
-        // drops the source (~2× that tensor's bytes at the moment of cast). Fine for the per-tensor
-        // granularity here; a chunked cast+eval would be the lever if a full-checkpoint downcast ever
-        // shows up as a peak-memory problem (F-089).
-        for v in self.tensors.values_mut() {
-            if v.dtype() != dtype {
-                *v = v.as_dtype(dtype)?;
-            }
-        }
-        Ok(())
+        self.cast_matching(dtype, |_| true)
     }
 
     /// Cast tensors selected by key while preserving every unselected tensor verbatim.
@@ -570,8 +565,21 @@ f,
         dtype: Dtype,
         mut selected: impl FnMut(&str) -> bool,
     ) -> Result<()> {
+        let native: std::collections::HashSet<_> = self
+            .tensors
+            .keys()
+            .filter_map(|key| key.strip_suffix(".comfy_quant"))
+            .chain(self.planned_convrot.keys().map(String::as_str))
+            .map(str::to_owned)
+            .collect();
         for (key, value) in &mut self.tensors {
-            if selected(key) && value.dtype() != dtype {
+            let encoded = [".weight", ".weight_scale", ".comfy_quant"]
+                .iter()
+                .any(|suffix| {
+                    key.strip_suffix(*suffix)
+                        .is_some_and(|base| native.contains(base))
+                });
+            if !encoded && selected(key) && value.dtype() != dtype {
                 *value = value.as_dtype(dtype)?;
             }
         }
@@ -596,7 +604,9 @@ f,
                 value.dtype(),
                 Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64
             );
-            let pack_companion = key.ends_with(".scales") || key.ends_with(".biases");
+            let pack_companion = key.ends_with(".scales")
+                || key.ends_with(".biases")
+                || key.ends_with(".weight_scale");
             if floating && !pack_companion && value.dtype() != dtype {
                 *value = value.as_dtype(dtype)?;
             }
@@ -1043,5 +1053,17 @@ mod tests {
         assert!(is_available(derived));
         let expected = Array::from_slice(&[1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0], &[3, 2]);
         assert_eq!(derived.as_dtype(Dtype::Float32).unwrap(), expected);
+    }
+}
+
+impl mlx_layers::convrot_int8::ProjectionWeights for Weights {
+    fn get(&self, key: &str) -> Option<&Array> {
+        self.get(key)
+    }
+    fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>> {
+        &self.convrot_rotations
+    }
+    fn planned_geometry(&self, base: &str) -> Option<gen_core::convrot_int8::ConvRotInt8> {
+        self.planned_convrot(base)
     }
 }

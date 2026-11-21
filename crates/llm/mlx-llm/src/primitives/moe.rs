@@ -126,6 +126,7 @@ impl SwitchLinear {
                     bits,
                 })
             }
+            Projection::ConvRot(_) => Err(Error::Unsupported("gathered MoE expert banks require a batched indexed integer GEMM; the ConvRot kernel projects one matrix".into())),
             Projection::Prism(_) => Err(Error::Unsupported(
                 "Prism packed MoE experts have no gathered matmul".into(),
             )),

@@ -18,7 +18,7 @@ impl ConvRotLinear {
         Self(base)
     }
 
-    pub(crate) fn from_native_parts(
+    pub fn from_native_parts(
         resources: &crate::weights::ProjectionResources,
         descriptor: ConvRotInt8,
         codes: Tensor,

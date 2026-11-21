@@ -270,9 +270,21 @@ pub fn verify_transformer_tensors(
         }
     }
 
+    let mut native_companions = HashSet::new();
+    if map.keys().any(|k| k.ends_with(".comfy_quant")) {
+        let weights = Weights::from_map(map.clone());
+        for base in map.keys().filter_map(|k| k.strip_suffix(".comfy_quant")) {
+            if expected_names.contains(format!("{base}.weight").as_str())
+                && mlx_gen::quant::native_lin(&weights, base, false)?.is_some()
+            {
+                native_companions.insert(format!("{base}.comfy_quant"));
+                native_companions.insert(format!("{base}.weight_scale"));
+            }
+        }
+    }
     let mut extra: Vec<String> = map
         .keys()
-        .filter(|k| !expected_names.contains(k.as_str()))
+        .filter(|k| !expected_names.contains(k.as_str()) && !native_companions.contains(k.as_str()))
         .cloned()
         .collect();
 

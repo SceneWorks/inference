@@ -7,10 +7,9 @@
 //! path (xformers absent ⇒ `xattn=False`), reproduced by MLX SDPA (softmax in f32).
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{concatenate_axis, matmul};
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -18,15 +17,15 @@ use crate::eva_clip::rope::VisionRope;
 use crate::eva_clip::{join, EPS};
 
 pub struct Attention {
-    q_proj_w: Array,
-    q_bias: Array,
-    k_proj_w: Array,
-    v_proj_w: Array,
-    v_bias: Array,
+    q_proj_w: mlx_gen::adapters::AdaptableLinear,
+
+    k_proj_w: mlx_gen::adapters::AdaptableLinear,
+    v_proj_w: mlx_gen::adapters::AdaptableLinear,
+
     inner_ln_w: Array,
     inner_ln_b: Array,
-    proj_w: Array,
-    proj_b: Array,
+    proj_w: mlx_gen::adapters::AdaptableLinear,
+
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -35,15 +34,32 @@ pub struct Attention {
 impl Attention {
     pub fn from_weights(w: &Weights, prefix: &str, num_heads: i32, head_dim: i32) -> Result<Self> {
         Ok(Self {
-            q_proj_w: w.require(&join(prefix, "q_proj.weight"))?.clone(),
-            q_bias: w.require(&join(prefix, "q_bias"))?.clone(),
-            k_proj_w: w.require(&join(prefix, "k_proj.weight"))?.clone(),
-            v_proj_w: w.require(&join(prefix, "v_proj.weight"))?.clone(),
-            v_bias: w.require(&join(prefix, "v_bias"))?.clone(),
+            q_proj_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(prefix, "q_proj"),
+                Some(w.require(&join(prefix, "q_bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            k_proj_w: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "k_proj"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            v_proj_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(prefix, "v_proj"),
+                Some(w.require(&join(prefix, "v_bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             inner_ln_w: w.require(&join(prefix, "inner_attn_ln.weight"))?.clone(),
             inner_ln_b: w.require(&join(prefix, "inner_attn_ln.bias"))?.clone(),
-            proj_w: w.require(&join(prefix, "proj.weight"))?.clone(),
-            proj_b: w.require(&join(prefix, "proj.bias"))?.clone(),
+            proj_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &join(prefix, "proj"),
+                Some(w.require(&join(prefix, "proj.bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -57,9 +73,9 @@ impl Attention {
         let (h, hd) = (self.num_heads, self.head_dim);
 
         // subln projections: q/v biased, k unbiased.
-        let q = linear(x, &self.q_proj_w, &self.q_bias)?;
-        let k = matmul(x, self.k_proj_w.t())?;
-        let v = linear(x, &self.v_proj_w, &self.v_bias)?;
+        let q = self.q_proj_w.forward(x)?;
+        let k = self.k_proj_w.forward(x)?;
+        let v = self.v_proj_w.forward(x)?;
 
         // [B, N, C] -> [B, heads, N, hd]
         let to_heads = |t: &Array| -> Result<Array> {
@@ -74,7 +90,7 @@ impl Attention {
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, n, h * hd])?;
         let out = layer_norm(&out, Some(&self.inner_ln_w), Some(&self.inner_ln_b), EPS)?;
-        linear(&out, &self.proj_w, &self.proj_b)
+        self.proj_w.forward(&out)
     }
 
     /// Apply RoPE to `x[:, :, 1:, :]` (patch tokens) only; the CLS token at index 0 is untouched.

@@ -2550,6 +2550,7 @@ dependencies = [
  "image",
  "libc",
  "memmap2",
+ "mlx-layers",
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
@@ -3261,6 +3262,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-layers"
+version = "0.1.0"
+dependencies = [
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mlx-llm"
 version = "0.0.0"
 dependencies = [
@@ -3269,6 +3279,7 @@ dependencies = [
  "half",
  "libc",
  "memmap2",
+ "mlx-layers",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-load-progress",

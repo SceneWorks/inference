@@ -9,6 +9,7 @@ use super::*;
 /// `attention_bias` check is hardcoded `True`), so `None` never appears there.
 #[derive(Clone)]
 pub(super) enum LinearKind {
+    Native(mlx_gen::adapters::AdaptableLinear, Dtype),
     Dense {
         w: Array,         // [out, in]
         b: Option<Array>, // [out]
@@ -26,6 +27,7 @@ pub(super) enum LinearKind {
 impl LinearKind {
     pub(super) fn forward(&self, x: &Array) -> Result<Array> {
         match self {
+            Self::Native(native, _) => native.forward(x),
             LinearKind::Dense { w, b: Some(b) } => linear(x, w, b),
             LinearKind::Dense { w, b: None } => Ok(matmul(x, w.t())?),
             LinearKind::Quant {
@@ -44,6 +46,7 @@ impl LinearKind {
     /// (mirrors the core `AdaptableLinear::base_shape`).
     pub(super) fn base_shape(&self) -> Vec<i32> {
         match self {
+            Self::Native(native, _) => native.base_shape(),
             LinearKind::Dense { w, .. } => w.shape().to_vec(),
             LinearKind::Quant { scales, group, .. } => {
                 let s = scales.shape();
@@ -56,6 +59,7 @@ impl LinearKind {
     /// scales (the packed `q` carries no float dtype). Lets the trainer detect a prior bf16 cast.
     pub(super) fn weight_dtype(&self) -> Dtype {
         match self {
+            Self::Native(_, dtype) => *dtype,
             LinearKind::Dense { w, .. } => w.dtype(),
             LinearKind::Quant { scales, .. } => scales.dtype(),
         }
@@ -67,6 +71,7 @@ impl LinearKind {
     /// activation. Bias casts in both arms.
     pub(super) fn cast(&mut self, dtype: Dtype) -> Result<()> {
         match self {
+            Self::Native(_, compute) => *compute = dtype,
             LinearKind::Dense { w, b } => {
                 *w = to_dtype(w, dtype)?;
                 if let Some(b) = b {
@@ -170,6 +175,12 @@ impl Linear {
         has_bias: bool,
     ) -> Result<Self> {
         let dt = prec.dtype();
+        if let Some(native) = mlx_gen::quant::native_lin(w, prefix, has_bias)? {
+            return Ok(Self {
+                kind: LinearKind::Native(native, dt),
+                lora: None,
+            });
+        }
         let b = has_bias
             .then(|| to_dtype(w.require(&format!("{prefix}.bias"))?, dt))
             .transpose()?;

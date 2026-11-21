@@ -20,9 +20,12 @@ pub const RMS_EPS: f32 = 1e-6;
 /// Load an `[out, in]` Linear as a dense [`AdaptableLinear`], auto-detecting the optional bias
 /// (`{prefix}.bias`). Quant/LoRA hang off the `AdaptableLinear` later (no separate code path).
 pub fn lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.clone();
-    let bias = w.get(&format!("{prefix}.bias")).cloned();
-    Ok(AdaptableLinear::dense(weight, bias))
+    mlx_gen::quant::lin(
+        w,
+        prefix,
+        w.peek(&format!("{prefix}.bias")).is_some(),
+        mlx_gen::quant::DEFAULT_GROUP_SIZE,
+    )
 }
 
 /// `x · rsqrt(mean(x²) + eps) · weight` over the last axis. The reference PixDiT `RMSNorm` computes

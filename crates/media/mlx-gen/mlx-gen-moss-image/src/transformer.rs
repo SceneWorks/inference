@@ -89,6 +89,7 @@ impl Norm {
 #[derive(Clone)]
 pub(crate) struct Projection {
     weight: Array,
+    native_compute: Option<Dtype>,
     bias: Option<Array>,
     adapter: Option<(Array, Array, f32)>,
     // Adapter routing only; its shared base handle is never used or mutated by this graph.
@@ -99,8 +100,11 @@ pub(crate) struct Projection {
 }
 impl Projection {
     fn load(w: &Weights, p: &str, input: i32, output: i32, bias: bool) -> Result<Self> {
+        let weight = shaped(w, &format!("{p}.weight"), &[output, input])?;
+        let native = mlx_gen::quant::native_lin(w, p, false)?;
         Ok(Self {
-            weight: shaped(w, &format!("{p}.weight"), &[output, input])?,
+            native_compute: native.as_ref().map(|_| Dtype::Bfloat16),
+            weight: weight.clone(),
             bias: if bias {
                 Some(shaped(w, &format!("{p}.bias"), &[output])?)
             } else {
@@ -108,20 +112,19 @@ impl Projection {
             },
             adapter: None,
             lokr: Vec::new(),
-            custom: AdaptableLinear::dense(
-                shaped(w, &format!("{p}.weight"), &[output, input])?,
-                None,
-            ),
+            custom: native.unwrap_or_else(|| AdaptableLinear::dense(weight, None)),
             edit_adapter: false,
             edit_fused_bias: false,
         })
     }
     fn dtype(&self) -> Dtype {
-        self.weight.dtype()
+        self.native_compute.unwrap_or_else(|| self.weight.dtype())
     }
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-        let cast = x.as_dtype(self.weight.dtype())?;
-        let base = if self.weight.dtype() == Dtype::Float32 {
+        let cast = x.as_dtype(self.dtype())?;
+        let base = if let Some(native) = self.custom.convrot_base() {
+            native.forward_with_bias(&cast, self.bias.as_ref())?
+        } else if self.weight.dtype() == Dtype::Float32 {
             let projected = linear_fp32(&cast, &self.weight)?;
             match &self.bias {
                 Some(bias) => add(projected, bias)?,
@@ -197,6 +200,10 @@ impl Projection {
         Ok(base)
     }
     fn cast(&mut self, dtype: Dtype) -> Result<()> {
+        if self.native_compute.is_some() {
+            self.native_compute = Some(dtype);
+            return Ok(());
+        }
         self.weight = self.weight.as_dtype(dtype)?;
         self.bias = self.bias.as_ref().map(|b| b.as_dtype(dtype)).transpose()?;
         // Cast before installing trainable factors; keep the host's shared handle current so
@@ -211,11 +218,15 @@ impl Projection {
         self.custom.set_adapters(adapters);
     }
     fn replace_weight_bias(&mut self, weight: Array, bias: Option<Array>) {
+        self.native_compute = None;
         self.weight = weight;
         self.bias = bias;
         self.sync_routing_base();
     }
     fn widen(&mut self) -> Result<()> {
+        if self.native_compute.is_some() {
+            return self.cast(Dtype::Float32);
+        }
         self.weight = self.weight.as_dtype(Dtype::Float32)?;
         self.bias = self
             .bias
@@ -844,7 +855,14 @@ impl Transformer {
             ]);
             projections.extend(&block.projections);
         }
+        let mut rotation_groups = std::collections::HashSet::new();
         for projection in projections {
+            if let Some(native) = projection.custom.convrot_base() {
+                arrays.push(native.scales());
+                if rotation_groups.insert(native.descriptor().rotation_group) {
+                    arrays.push(native.rotation());
+                }
+            }
             arrays.push(&projection.weight);
             arrays.extend(projection.bias.as_ref());
             if include_adapter {
