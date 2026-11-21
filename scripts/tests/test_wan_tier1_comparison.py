@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from scripts.ci import wan_tier1_comparison as pair
-from scripts.ci import wan_tier1_evidence as evidence
+from scripts.ci import video_tier1_comparison as pair
+from scripts.ci import video_tier1_evidence as evidence
 from scripts.media_campaign_supervisor import runtime_guarded_admission
 
 
@@ -176,7 +176,10 @@ class WanEvidenceTests(unittest.TestCase):
                 "fixture_contracts": {self.case: {"variant":"5b", "geometry_sha256":"1"*64,
                                     "source":{"snapshot":"v"}, "files":["tensor.safetensors"]}},
                 "toolchain_contracts": {arm: {"channel":"1.96.0","declaration_sha256":"7"*64} for arm in pair.ARMS}}
+        from scripts.ci import wddm_process_memory
         uuid = plan["request"]["policy"]["cudaDeviceUuid"]
+        adapter = {"cuda_uuid": uuid, "luid": "luid_0x00000000_0x00020c10", "node_mask": 1,
+                   "physical_node": 0, "counter": wddm_process_memory.COUNTER}
         with TemporaryDirectory() as directory, ExitStack() as patches:
             tmp = Path(directory)
             output = tmp / "evidence"
@@ -188,7 +191,8 @@ class WanEvidenceTests(unittest.TestCase):
                   "cargo_version":"cargo selected","binaries":{"rustc":"selected", "cargo":"selected"}}
             patches.enter_context(patch.object(pair.proof, "verified_toolchain", return_value=tc))
             patches.enter_context(patch.object(pair.paired, "hardware", return_value=hw))
-            receipt = {"protocol": "wan-curated-tier1-v2", **plan, "run_id": "1", "run_attempt": "1",
+            patches.enter_context(patch.object(pair, "cuda_adapter", return_value=adapter))
+            receipt = {"dedicated_adapter": adapter, "protocol": "wan-curated-tier1-v2", **plan, "run_id": "1", "run_attempt": "1",
                        "accepted": True, "host":pair.platform.platform(), "runner_name":"runner",
                        "execution_order": [], "physical_claim": {"post_execution_verified": True, "device_uuid": uuid,
                             "physical_index":1,"runner":"runner","admission_baseline":{"uuid":uuid,
@@ -203,12 +207,16 @@ class WanEvidenceTests(unittest.TestCase):
             guard = {"pid": 17, "returncode": 0, "elapsed_seconds": 1, "peak_host_bytes": 128,
                      "peak_gpu_bytes": 64, "admission": admission, "cuda_attribution": {
                         "pid_peak_bytes": 64, "unknown_pid_polls": 0, "global_upper_bytes": 0, "pool_fallback_peak_bytes": 0}}
+            guard["cuda_attribution"]["wddm_dedicated"] = {
+                "adapter": adapter, "pid": 17, "created_filetime": 12345,
+                "samples": [[14000, 64], [15000, 72]], "missing_active_polls": 0, "error": None,
+            }
             pool = {"pid": 17, "cudaDeviceUuid": uuid, "poolUsedBytes": 16,
                     "poolReservedBytes": 32, "poolUsedHighBytes": 32, "poolReservedHighBytes": 64}
             stdout = (f"MODEL_INFERENCE_DEVICE {pair.FQN} candle-cuda\nMODEL_INFERENCE_BODY_COMPLETED {pair.FQN}\n"
                       "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n")
             observed = {"result": self.output, "initial_le_f32_hex": self.raw.hex(), "terminal_le_f32_hex": self.raw.hex()}
-            result = pair.evaluate(observed, self.case, backend, policy, pair.SETTINGS, stdout, guard, pool)
+            result = pair.evaluate(observed, self.case, backend, policy, pair.SETTINGS, stdout, guard, pool, adapter)
             for counter, (_, arm, stem) in enumerate(pair.measurements(self.case)):
                 receipt["execution_order"].append({"phase":stem,"start_ns":counter*100+1,"end_ns":counter*100+2})
                 for suffix, contents in {"stdout.log": stdout, "stderr.log": "", "supervisor.json": json.dumps(guard),
@@ -250,6 +258,8 @@ class WanEvidenceTests(unittest.TestCase):
                 lambda r: r["builds"]["head"]["discovery"].update(features=["cuda"]),
                 lambda r: r["builds"]["head"]["discovery"]["target"].update(kind=["bin"]),
                 lambda r: r.update(hardware={"uuid":uuid}),
+                lambda r: r.update(dedicated_adapter=dict(adapter, node_mask=2)),
+                lambda r: r.pop("dedicated_adapter"),
                 lambda r: r.update(physical_claim={"post_execution_verified":True,"runner":"runner"}),
                 lambda r: r["execution_order"].reverse(),
                 lambda r: r["execution_order"][1].update(start_ns=1),

@@ -1,4 +1,4 @@
-"""Check raw Wan observations and compare each measured domain independently."""
+"""Check raw video observations and compare each measured domain independently."""
 import hashlib
 import json
 import math
@@ -58,15 +58,15 @@ def sample_times(rows, count, outer_steps, deadline):
 
 
 def case_spec(case):
-    from scripts.ci.wan_pair import fixture
+    from scripts.ci import video_tier1_cohorts as cohorts
 
-    return fixture.case_spec(case)
+    return cohorts.fixture(cohorts.BY_NAME[case].model).case_spec(case)
 
 
 def capture(row, initial, terminal, case, spec, settings, policy):
     # Native Wan configs report shift as a float (5.0); the Python schedule uses integer 5.
     expected_settings = dict(spec["settings"])
-    if "shift" in expected_settings:
+    if "shift" in expected_settings and spec["settings"]["shift"] is not None:
         expected_settings["shift"] = float(expected_settings["shift"])
     fields = {"case", "trace", "tensor_shape", "warmups", "samples", "allocator_peak_bytes", "settings"}
     if (not isinstance(row, dict) or set(row) != fields
@@ -89,10 +89,11 @@ def timing_metric(base, head, ceiling):
             "interval": [lo, hi], "ceiling": ceiling, "verdict": verdict}
 
 
-def cuda_process(guard, pool_high):
+def cuda_process(guard, pool_high, adapter=None):
     row = guard.get("cuda_attribution")
     fields = {"pid_peak_bytes", "unknown_pid_polls", "global_upper_bytes", "pool_fallback_peak_bytes"}
-    if not isinstance(row, dict) or set(row) != fields or any(type(n) is not int or n < 0 for n in row.values()):
+    expected = fields | ({"wddm_dedicated"} if adapter is not None else set())
+    if not isinstance(row, dict) or set(row) != expected or any(type(row[k]) is not int or row[k] < 0 for k in fields):
         raise ValueError("invalid GPU measurement provenance")
     pid, upper, pool = row["pid_peak_bytes"], row["global_upper_bytes"], row["pool_fallback_peak_bytes"]
     if guard["peak_gpu_bytes"] != max(pid, pool) or pool > pool_high:
@@ -100,11 +101,29 @@ def cuda_process(guard, pool_high):
     if row["unknown_pid_polls"] == 0:
         if not pid or upper or pool:
             raise ValueError("unexpected CUDA PID-only measurement")
-        return {"basis": "owned-pid", "lower": pid, "upper": pid, **row}
-    if upper <= 0:
-        raise ValueError("missing whole-card upper bound for an unknown owned PID")
-    return {"basis": "wddm-bounded", "lower": max(pid, pool_high),
-            "upper": max(pid, pool_high, upper), **row}
+        observed = {"basis": "owned-pid", "lower": pid, "upper": pid}
+    else:
+        if upper <= 0:
+            raise ValueError("missing whole-card upper bound for an unknown owned PID")
+        observed = {"basis": "wddm-bounded", "lower": max(pid, pool_high), "upper": max(pid, pool_high, upper)}
+    if adapter is not None:
+        from scripts.ci import wddm_process_memory
+        peak = wddm_process_memory.sampled_peak(row["wddm_dedicated"], pid=guard["pid"], adapter=adapter)
+        observed["dedicated"] = {"adapter": adapter, "sampled_peak_bytes": peak}
+    return {**observed, **{k: row[k] for k in fields}}
+
+
+def peak_verdict(pairs):
+    outcomes = {pair["verdict"] for pair in pairs}
+    if "fail" in outcomes:
+        return "fail"
+    return "inconclusive" if "inconclusive" in outcomes else "pass"
+
+
+def accepted_metric(metric):
+    if "required_pairs" in metric:
+        return all(metric["pairs"][i]["verdict"] == "pass" for i in metric["required_pairs"])
+    return metric["verdict"] == "pass"
 
 
 def compare(base, head, settings):
@@ -131,15 +150,35 @@ def compare(base, head, settings):
         metrics[domain] = {"paired_ratios": ratios, "ceiling": ceiling,
                            "verdict": "pass" if max(ratios) <= ceiling else "fail"}
     if any("cuda_process" in r for r in runs):
-        pairs = []
+        pairs, dedicated_pairs = [], []
+        has_dedicated = any("dedicated" in r["cuda_process"] for r in runs)
         for b, h in zip(base, head, strict=True):
             b, h = b["cuda_process"], h["cuda_process"]
             lower, upper = h["lower"] / b["upper"], h["upper"] / b["lower"]
             verdict = ("inconclusive" if h["basis"] != b["basis"] else "pass" if upper <= ceiling
                        else "fail" if lower > ceiling else "inconclusive")
+            if has_dedicated:
+                if "dedicated" not in b or "dedicated" not in h:
+                    raise ValueError("missing dedicated process measurement source")
+                bp, hp = b["dedicated"], h["dedicated"]
+                ratio = None
+                if (bp["adapter"] == hp["adapter"] and positive_int(bp["sampled_peak_bytes"])
+                        and positive_int(hp["sampled_peak_bytes"])):
+                    ratio = hp["sampled_peak_bytes"] / bp["sampled_peak_bytes"]
+                dedicated_pairs.append({"base": bp, "head": hp, "ratio": ratio,
+                                        "verdict": "inconclusive" if ratio is None else "pass" if ratio <= ceiling else "fail"})
+                # A pool-to-card interval is diagnostic when sampling a WDDM process.
+                # Keep any independently observed native PID regression as a required failure.
+                if b["basis"] != "owned-pid" or h["basis"] != "owned-pid":
+                    verdict = "inconclusive"
             pairs.append({"base": b, "head": h, "ratio_interval": [lower, upper], "verdict": verdict})
-        verdicts = {r["verdict"] for r in pairs}
-        metrics["cuda_process_bytes"] = {"pairs": pairs, "ceiling": ceiling,
-            "verdict": "fail" if "fail" in verdicts else "inconclusive" if "inconclusive" in verdicts else "pass"}
+        metrics["cuda_process_bytes"] = {"pairs": pairs, "ceiling": ceiling, "verdict": peak_verdict(pairs)}
+        if has_dedicated:
+            # The PDH domain applies to every pair. Additionally require the independent
+            # NVIDIA process measurement wherever both arms supplied complete PID accounting.
+            metrics["cuda_process_bytes"]["required_pairs"] = [
+                i for i, p in enumerate(pairs) if p["base"]["basis"] == p["head"]["basis"] == "owned-pid"]
+            metrics["wddm_dedicated_process_bytes"] = {"basis": "wddm-pdh-dedicated-sampled",
+                "pairs": dedicated_pairs, "ceiling": ceiling, "verdict": peak_verdict(dedicated_pairs)}
     return {"initial_noise": "pass" if same_input else "fail", "parity": parity, "metrics": metrics,
-            "accepted": parity == "pass" and all(m["verdict"] == "pass" for m in metrics.values())}
+            "accepted": parity == "pass" and all(accepted_metric(m) for m in metrics.values())}

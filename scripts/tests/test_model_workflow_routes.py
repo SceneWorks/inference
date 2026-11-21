@@ -2,6 +2,9 @@
 from pathlib import Path
 import os
 import copy
+import hashlib
+import json
+import sys
 import posixpath
 import shlex
 import re
@@ -93,21 +96,45 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertIn('github.run_id', bridge['concurrency']['group'])
         self.assertIn('github.run_attempt', bridge['concurrency']['group'])
 
+    def test_paired_cohort_routes_are_exact_and_worker_receives_the_hosted_plan_hash(self):
+        workflow = document("model-inference-proofs.yml")
+        plan = workflow["jobs"]["plan"]
+        steps = plan["steps"]
+        setup = next(s for s in steps if s.get("id") == "plan")
+        python = setup["run"].split("<<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        selectors = ("wan-curated-tier1", "mochi-svd-tier1", "scail2-tier1")
+        for selector in selectors:
+            self.assertIn(selector, workflow["env"]["MODEL_PROOF_SCRIPT"])
+            self.assertIn(selector, steps[0]["with"]["fetch-depth"])
+        for selector in (*selectors, "registered", "mochi-svd-tier1-other"):
+            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as location:
+                root = Path(location)
+                data = {"runner": ["expected"], "asset_setup": selector}
+                (root / "model-proof-plan.json").write_text(json.dumps(data))
+                output = root / "output"
+                subprocess.run([sys.executable, "-I", "-"], input=python, text=True, check=True,
+                               env=dict(os.environ, RUNNER_TEMP=location, GITHUB_OUTPUT=str(output)))
+                row, = json.loads(output.read_text().removeprefix("matrix="))["include"]
+                self.assertEqual(row["paired_source"], selector in selectors)
+                digest = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                self.assertEqual(row["video_plan_sha256"], digest if selector in selectors else "")
+        self.assertEqual(workflow["jobs"]["prove"]["env"]["VIDEO_TIER1_PLAN_SHA256"], "${{ matrix.video_plan_sha256 }}")
+
     @unittest.skipUnless(os.name == "posix", "uses local Git and Bash; does not contact Actions")
-    def test_wan_full_history_uses_fresh_attempt_and_leaves_reused_shallow_checkout(self):
+    def test_paired_full_history_uses_fresh_attempt_and_leaves_reused_shallow_checkout(self):
         job = document("model-inference-proofs.yml")["jobs"]["prove"]
         steps = job["steps"]
-        create = next(s for s in steps if s.get("id") == "wan_checkout")
+        create = next(s for s in steps if s.get("id") == "paired_checkout")
         source = next(s for s in steps if s.get("id") == "source")
-        cleanup = next(s for s in steps if s.get("name") == "Remove the owned Wan checkout")
-        self.assertEqual(create["if"], "matrix.asset_setup == 'wan-curated-tier1'")
-        self.assertIn("format('wan-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
+        cleanup = next(s for s in steps if s.get("name") == "Remove the owned paired checkout")
+        self.assertEqual(create["if"], "matrix.paired_source")
+        self.assertIn("format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
         self.assertEqual(source["with"]["path"], "${{ env.MODEL_PROOF_CWD }}")
         self.assertEqual(source["with"]["ref"], "${{ github.sha }}")
-        self.assertEqual(source["with"]["fetch-depth"], "${{ matrix.asset_setup == 'wan-curated-tier1' && '0' || '1' }}")
+        self.assertEqual(source["with"]["fetch-depth"], "${{ matrix.paired_source && '0' || '1' }}")
         self.assertIs(source["with"]["persist-credentials"], False)
         self.assertLess(steps.index(create), steps.index(source))
-        self.assertEqual(cleanup["if"], "always() && steps.wan_checkout.outcome == 'success'")
+        self.assertEqual(cleanup["if"], "always() && steps.paired_checkout.outcome == 'success'")
         for step in steps:
             if step.get("working-directory"):
                 self.assertEqual(step["working-directory"], source["with"]["path"])
@@ -135,7 +162,7 @@ class ModelWorkflowRoutes(unittest.TestCase):
             git(origin, "clone", "-q", "--depth=1", origin.as_uri(), str(workspace))
             marker = workspace / "listener-owned"
             marker.write_text("preserve")
-            env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="wan-src-42-3")
+            env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="paired-src-42-3")
             def run_step(step, check=True):
                 return subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=workspace,
                                       env=env, check=check, capture_output=True)
