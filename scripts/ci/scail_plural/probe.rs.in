@@ -36,15 +36,15 @@ fn pixels(mut rgb: impl FnMut(u32, u32) -> [u8; 3]) -> Image {
 
 fn request(count: usize) -> GenerationRequest {
     let colors = [
+        [0, 0, 255],
         [255, 0, 0],
         [0, 255, 0],
-        [0, 0, 255],
-        [255, 255, 0],
-        [0, 255, 255],
         [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 0],
     ];
     let mut conditioning = vec![];
-    for (i, color) in colors.iter().take(count).enumerate() {
+    for i in 0..count {
         let i = i as u32;
         let image = pixels(|x, y| {
             [
@@ -59,9 +59,9 @@ fn request(count: usize) -> GenerationRequest {
         });
         let mask = pixels(|x, y| {
             if (x + y / 8 + i * 37) % WIDTH < WIDTH / 2 {
-                *color
+                colors[0]
             } else {
-                [0; 3]
+                [255; 3]
             }
         });
         conditioning.push(Conditioning::Mask { image: mask });
@@ -70,7 +70,18 @@ fn request(count: usize) -> GenerationRequest {
         .map(|t| pixels(|x, y| [(x + 7 * t) as u8, (y + 3 * t) as u8, (x / 3 + y + t) as u8]))
         .collect();
     let mask = (0..FRAMES)
-        .map(|t| pixels(|x, _| colors[(((x + 2 * t) % WIDTH) * count as u32 / WIDTH) as usize]))
+        .map(|t| {
+            pixels(|x, y| {
+                let band = x * count as u32;
+                if (56..HEIGHT - 56).contains(&y)
+                    && (72 + 2 * (t % 13)..WIDTH - 72).contains(&(band % WIDTH))
+                {
+                    colors[(band / WIDTH) as usize]
+                } else {
+                    [0; 3]
+                }
+            })
+        })
         .collect();
     conditioning.push(Conditioning::ControlClip {
         frames,

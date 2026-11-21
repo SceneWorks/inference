@@ -9,7 +9,7 @@ REQUEST=$(python3.12 -c 'import json,sys; from scripts.ci.scail_plural.contract 
 gh workflow run model-inference-proofs.yml --repo SceneWorks/inference --ref "$QUALIFIED_REF" -f backend="$BACKEND" -f request="$REQUEST"
 ```
 
-Both arms render a 45-frame 832×480 driving clip and all its color masks with distinct ordered character references and masks at full resolution. Both positive and negative UMT5 branches must produce 512 tokens. The native registered provider consumes the bound video plan, runs four UniPC updates with guidance and shift 5 and seed 37, and returns RGB at 16 fps. MLX returns 48 frames. Candle returns 45. Each child reports the prepared file identities, actual axes and native execution report, including codec policy, per-character and driving carrier digests, synchronized render duration and output digest.
+Both arms render a 45-frame 832×480 driving clip and all its color masks with distinct ordered character references and masks at full resolution. Each reference paints its primary subject blue on white. Driving masks use the worker’s left-to-right person palette on black. Both positive and negative UMT5 branches must produce 512 tokens. The native registered provider consumes the bound video plan, runs four UniPC updates with guidance and shift 5 and seed 37, and returns RGB at 16 fps. MLX returns 48 frames. Candle returns 45. Each child reports the prepared file identities, actual axes and native execution report, including codec policy, per-character and driving carrier digests, synchronized render duration and output digest.
 
 | Backend | Counts in execution order | Child limit | Host cap / reserve | Device cap / reserve |
 | --- | --- | --- | --- | --- |
