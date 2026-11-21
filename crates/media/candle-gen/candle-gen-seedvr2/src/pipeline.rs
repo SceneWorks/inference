@@ -23,7 +23,7 @@ use crate::config::{DitConfig, TIMESTEP};
 use crate::dit::Seedvr2Transformer;
 use crate::vae::Seedvr2Vae;
 use crate::video::{self, Chunk, ChunkPlan};
-use crate::weights::Weights;
+use crate::weights::SourceWeights;
 use crate::{color, convert};
 
 /// Clamp an explicit chunk to the live memory plan. A request cannot bypass a fallback.
@@ -182,12 +182,10 @@ impl Seedvr2Pipeline {
         // the raw set and the cast copy never both live for all weights (peak load memory ~1× rather
         // than 2×/3× — sc-9042/F-058). VAE is fully built (and its raw map freed) before the 7B DiT is
         // read, bounding peak further. Loaded values are identical to the prior two-phase convert+cast.
-        let vae_raw = Weights::from_file(&vae_path, device)?;
-        let vae_w = convert::convert_vae(vae_raw, dt)?;
+        let vae_w = SourceWeights::open(&vae_path, device, dt, |k| vec![k.to_owned()])?;
         let vae = Seedvr2Vae::from_weights(&vae_w)?;
         drop(vae_w);
-        let dit_raw = Weights::from_file(&dit_path, device)?;
-        let dit_w = convert::convert_dit(dit_raw, dt)?;
+        let dit_w = SourceWeights::open(&dit_path, device, dt, convert::dit_targets)?;
         let transformer = Seedvr2Transformer::from_weights(&dit_w, cfg)?;
         let neg_embed = load_neg_embed(dt, device)?;
         let mut p = Self::from_parts(vae, transformer, neg_embed, dt, device.clone());

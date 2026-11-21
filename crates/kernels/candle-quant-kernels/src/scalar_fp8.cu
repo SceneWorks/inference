@@ -20,8 +20,8 @@ extern "C" __global__ void scalar_e5m2_quantize(const float* x, unsigned char* c
 // The FP8 tensor-core instruction supports E5M2 x E5M2. CUDA 12 cuBLASLt's
 // published scalar GEMM combinations require at least one E4M3 input.
 extern "C" __global__ void scalar_e5m2_gemm(const unsigned char* x, const unsigned char* w,
-                                             unsigned short* out, unsigned m, unsigned n,
-                                             unsigned k, float sx, float sw) {
+                                             void* out, unsigned m, unsigned n,
+                                             unsigned k, float sx, float sw, unsigned output_f32) {
     const unsigned lane = threadIdx.x % 32, group = lane / 4, thread = lane % 4;
     const unsigned mr = blockIdx.y * 16 + group;
     const unsigned nc = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * 8;
@@ -41,9 +41,15 @@ extern "C" __global__ void scalar_e5m2_gemm(const unsigned char* x, const unsign
     for (unsigned i = 0; i < 4; ++i) {
         const unsigned row = mr + (i/2)*8;
         if (row < m) {
-            unsigned short bits;
-            asm("cvt.rn.bf16.f32 %0,%1;" : "=h"(bits) : "f"(acc[i] * sx * sw));
-            out[(unsigned long long)row*n + nc + thread*2 + i%2] = bits;
+            const unsigned long long index = (unsigned long long)row*n + nc + thread*2 + i%2;
+            const float value = acc[i] * sx * sw;
+            if (output_f32) {
+                static_cast<float*>(out)[index] = value;
+            } else {
+                unsigned short bits;
+                asm("cvt.rn.bf16.f32 %0,%1;" : "=h"(bits) : "f"(value));
+                static_cast<unsigned short*>(out)[index] = bits;
+            }
         }
     }
 }

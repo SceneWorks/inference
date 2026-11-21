@@ -176,7 +176,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                 return Err(LogicalWeightPlanError::DescriptorConflict {
                     physical_key: weight_key,
                     tensor: descriptor,
-                    metadata,
+                    metadata: Box::new(metadata),
                     disagreement,
                 });
             }

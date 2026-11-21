@@ -712,6 +712,90 @@ impl LogicalWeightReader {
         Ok(Some(layer))
     }
 
+    /// Load one contiguous matrix from a scalar-coded stacked operand, without uploading the rest.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_matrix_slice(
+        &self,
+        key: &str,
+        first: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<(candle_quant_kernels::fp8_linear::Fp8Linear, u64)>> {
+        let Some(row) = self.planned(key) else {
+            return Ok(None);
+        };
+        let TensorCodecSpec::ScalarFp8 {
+            scale,
+            input_scale,
+            full_precision_matrix_mult: false,
+        } = &row.codec
+        else {
+            return Ok(None);
+        };
+        if row.transform.is_some() {
+            return Ok(None);
+        }
+        let Some(len) = rows.checked_mul(cols).filter(|n| *n > 0) else {
+            candle_core::bail!("{key}: invalid slice shape")
+        };
+        let view = self.st.get(&row.physical_key)?;
+        if view.shape() != row.shape
+            || view.shape().len() < 2
+            || view.shape().last() != Some(&cols)
+            || !view.data().len().is_multiple_of(len)
+            || !first.is_multiple_of(rows)
+        {
+            candle_core::bail!(
+                "{key}: matrix slice does not partition checkpoint shape {:?}",
+                view.shape()
+            );
+        }
+        let start = first
+            .checked_mul(cols)
+            .ok_or_else(|| CandleError::Msg(format!("{key}: row offset overflow")))?;
+        let end = start
+            .checked_add(len)
+            .filter(|&v| v <= view.data().len())
+            .ok_or_else(|| CandleError::Msg(format!("{key}: slice is outside checkpoint")))?;
+        if !self
+            .native_execution_capability()
+            .executes_natively(row.codec_id)
+            || !candle_quant_kernels::cublaslt::eight_bit_layout_supported(&[rows, cols])
+        {
+            return Ok(None);
+        }
+        let expected = match row.encoding {
+            WeightEncoding::Fp8E4M3 => (::safetensors::Dtype::F8_E4M3, DType::F8E4M3),
+            WeightEncoding::Fp8E5M2 => (::safetensors::Dtype::F8_E5M2, DType::U8),
+            _ => return Ok(None),
+        };
+        guard_stored(row, view.dtype(), view.shape(), expected.0, &row.shape)?;
+        let (sw, scalar_bytes) = match scale {
+            ScalarScaleSource::Unit => (1., 0),
+            ScalarScaleSource::Companion { physical_key } => (
+                scalar_f32(companion_bytes(&self.st, row, physical_key)?, physical_key)?,
+                4,
+            ),
+        };
+        let sx = input_scale
+            .as_deref()
+            .map(|key| scalar_f32(companion_bytes(&self.st, row, key)?, key))
+            .transpose()?;
+        let codes = cst::read_source_bytes(&view.data()[start..end], |bytes| {
+            Tensor::from_raw_buffer(bytes, expected.1, &[rows, cols], &self.device)
+        })?;
+        let resident = codes.elem_count() as u64 + scalar_bytes + if sx.is_some() { 4 } else { 0 };
+        let ctx = self.resources.int8_context(&self.device)?;
+        let lt = ctx.handle_for(&self.device)?.clone();
+        use candle_quant_kernels::fp8_linear::Fp8Linear;
+        let op = if expected.1 == DType::U8 {
+            Fp8Linear::from_e5m2_parts(codes, sw, sx, None, lt)?
+        } else {
+            Fp8Linear::from_parts(codes, sw, sx, None, lt)?
+        };
+        Ok(Some((op, resident)))
+    }
+
     /// Record that the provider served `logical_key` — a row the plan priced
     /// [`ResidencyMode::Packed`] — as a **dense BF16** weight holding `resident_bytes` on-device
     /// (sc-11045 fix round, epic E5).
