@@ -7,7 +7,6 @@ use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use gen_core_moss_image::moss_image::MossImageConfig;
 use std::collections::BTreeSet;
-#[cfg(test)]
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]

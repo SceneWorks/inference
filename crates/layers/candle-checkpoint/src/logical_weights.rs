@@ -461,7 +461,7 @@ pub fn read_logical_weights(
 pub struct LogicalWeightReader {
     pub(crate) st: std::sync::Arc<MmapedSafetensors>,
     resources: candle_quant_kernels::convrot_int8::ProjectionResources,
-    plan: LogicalWeightPlan,
+    plan: std::sync::Arc<LogicalWeightPlan>,
     device: Device,
     /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
     ///
@@ -469,6 +469,10 @@ pub struct LogicalWeightReader {
     /// which resolves the same key three times per projection) turns the load into O(n²) over a
     /// ~2600-tensor plan (sc-21482 review).
     by_logical_key: BTreeMap<String, usize>,
+    accounting: std::sync::Arc<ReaderAccounting>,
+}
+struct ReaderAccounting {
+    plan: std::sync::Arc<LogicalWeightPlan>,
     /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
     /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
     measured: std::sync::Mutex<BTreeMap<String, u64>>,
@@ -546,6 +550,7 @@ impl LogicalWeightReader {
             plan,
             device,
             capability,
+            &[path.to_owned()],
         ))
     }
 
@@ -554,6 +559,7 @@ impl LogicalWeightReader {
         plan: LogicalWeightPlan,
         device: &Device,
         capability: NativeExecutionCapability,
+        paths: &[std::path::PathBuf],
     ) -> Self {
         let by_logical_key = plan
             .tensors
@@ -561,15 +567,26 @@ impl LogicalWeightReader {
             .enumerate()
             .map(|(index, tensor)| (tensor.logical_key.clone(), index))
             .collect();
+        let plan = std::sync::Arc::new(plan);
+        let accounting = std::sync::Arc::new(ReaderAccounting {
+            plan: plan.clone(),
+            measured: Default::default(),
+            demoted: Default::default(),
+            capability,
+        });
+        let observer = accounting.clone();
+        gen_core::CheckpointReceiptScope::register(paths, move || {
+            observer
+                .checkpoint_weight_facts()
+                .map_err(|e| gen_core::Error::Msg(e.to_string()))
+        });
         Self {
             st,
             plan,
             device: device.clone(),
             by_logical_key,
             resources: Default::default(),
-            measured: std::sync::Mutex::new(BTreeMap::new()),
-            demoted: std::sync::Mutex::new(BTreeMap::new()),
-            capability,
+            accounting,
         }
     }
 
@@ -726,6 +743,7 @@ impl LogicalWeightReader {
             )));
         }
         let mut demoted = self
+            .accounting
             .demoted
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -748,14 +766,15 @@ impl LogicalWeightReader {
         &self.device
     }
     pub fn materialized_bytes(&self, key: &str) -> Option<u64> {
-        self.measured
+        self.accounting
+            .measured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
             .copied()
     }
     pub fn native_execution_capability(&self) -> &NativeExecutionCapability {
-        &self.capability
+        &self.accounting.capability
     }
 
     /// The plan this reader materializes.
@@ -791,7 +810,8 @@ impl LogicalWeightReader {
         })?;
         let tensor = Self::shaped_row(tensor, shape)?;
         let decoded = decode(&self.st, &tensor, &self.device)?;
-        self.measured
+        self.accounting
+            .measured
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(logical_key.to_owned(), decoded.resident_bytes());
@@ -869,7 +889,8 @@ impl LogicalWeightReader {
         let t = self.dense_coefficients(key, shape, dtype, device)?;
         let row = self.planned(key).expect("decoded planned row");
         let bytes = (t.elem_count() * t.dtype().size_in_bytes()) as u64;
-        self.measured
+        self.accounting
+            .measured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.to_owned(), bytes);
@@ -903,6 +924,16 @@ impl LogicalWeightReader {
     /// `resident_bytes` stay **per logical row** — each output is separately counted and
     /// separately occupies memory; only the source bytes are shared.
     pub fn receipt(&self) -> LogicalWeightReceipt {
+        self.accounting.receipt()
+    }
+
+    pub fn checkpoint_weight_facts(&self) -> Result<CheckpointWeightFacts> {
+        self.accounting.checkpoint_weight_facts()
+    }
+}
+
+impl ReaderAccounting {
+    fn receipt(&self) -> LogicalWeightReceipt {
         let measured = self
             .measured
             .lock()

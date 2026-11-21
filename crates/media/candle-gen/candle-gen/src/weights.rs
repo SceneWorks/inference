@@ -64,6 +64,7 @@ pub struct Weights {
     map: HashMap<String, Tensor>,
     source: Option<(candle_checkpoint::ProjectionSource, Device, DType)>,
     encoded_keys: std::collections::BTreeSet<String>,
+    companion_keys: std::collections::BTreeSet<String>,
     pub(crate) projection_resources: std::sync::Arc<ProjectionResources>,
     /// The device the set is *destined for* when some tensors were deliberately left on the host
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
@@ -242,7 +243,19 @@ impl Weights {
             Err(st) => st,
         };
         let mut weights = Self::from_map(HashMap::new());
+        if let Ok(src) = &source {
+            weights.companion_keys.extend(
+                src.reader()
+                    .plan()
+                    .companions
+                    .iter()
+                    .map(|c| c.physical_key.clone()),
+            );
+        }
         for key in names {
+            if weights.companion_keys.contains(&key) {
+                continue;
+            }
             if source
                 .as_ref()
                 .is_ok_and(|src| src.reader().planned(&key).is_some())
@@ -288,6 +301,7 @@ impl Weights {
     /// Replace one module operand without rebuilding other immutable native projections.
     pub fn replace_tensor(&mut self, key: String, value: Tensor) {
         self.encoded_keys.remove(&key);
+        self.companion_keys.remove(&key);
         self.map.insert(key, value);
     }
 
@@ -318,13 +332,7 @@ impl Weights {
 
     /// Physical descriptors/scale planes are consumed by the logical source and excluded from module key counts.
     pub fn is_checkpoint_companion(&self, key: &str) -> bool {
-        self.source.as_ref().is_some_and(|(src, _, _)| {
-            src.reader()
-                .plan()
-                .companions
-                .binary_search_by(|c| c.physical_key.as_str().cmp(key))
-                .is_ok()
-        })
+        self.companion_keys.contains(key)
     }
     /// Construct a checkpoint projection with the same codec as VarBuilder consumers.
     pub fn native_linear(&self, base: &str, bias: bool) -> Result<Option<candle_nn::Linear>> {
@@ -356,6 +364,16 @@ impl Weights {
 
     /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
+        if self.companion_keys.contains(key) {
+            let (src, device, _) = self.source.as_ref().expect("owned companion source");
+            let view = src.mmap().get(key)?;
+            if view.dtype() == safetensors::Dtype::F8_E8M0 {
+                return Ok(cst::read_tensor_bytes(&view, |bytes| {
+                    Tensor::from_raw_buffer(bytes, DType::U8, view.shape(), device)
+                })?);
+            }
+            return Ok(src.mmap().load(key, device)?);
+        }
         if self.encoded_keys.contains(key) {
             if let Some((src, device, dtype)) = &self.source {
                 return Ok(src.reader().read_dense(key, *dtype, device)?);
@@ -369,13 +387,18 @@ impl Weights {
 
     /// Whether `key` is present (e.g. the ControlNet's optional `encoder_hid_proj`).
     pub fn contains(&self, key: &str) -> bool {
-        self.map.contains_key(key) || self.encoded_keys.contains(key)
+        self.map.contains_key(key)
+            || self.encoded_keys.contains(key)
+            || self.companion_keys.contains(key)
     }
 
     /// Iterate the tensor keys (drives the `ip_adapter.{n}` index discovery in the SDXL
     /// `load_ip_kv_pairs` loader).
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.map.keys().chain(self.encoded_keys.iter())
+        self.map
+            .keys()
+            .chain(self.encoded_keys.iter())
+            .chain(self.companion_keys.iter())
     }
 
     /// Build directly from an in-memory map — tests (including cross-crate ones, e.g. the FLUX
@@ -386,6 +409,7 @@ impl Weights {
             map,
             source: None,
             encoded_keys: Default::default(),
+            companion_keys: Default::default(),
             projection_resources: Default::default(),
             target: None,
         }
@@ -437,31 +461,12 @@ impl Weights {
                 .map(str::to_owned)
             })
             .collect();
-        let is_fp8 = |key: &str| {
-            key.rsplit_once('.')
-                .is_some_and(|(base, _)| fp8_bases.contains(base))
-        };
-        let mut weights = Self::from_map(HashMap::new());
-        if !fp8_bases.is_empty() {
-            let files: Vec<_> = files.iter().map(|p| p.as_ref().to_owned()).collect();
-            let st = crate::loader::mmap_safetensors_multi(&files)?;
-            let source = candle_checkpoint::ProjectionSource::from_mapped_selected(
-                st, &files, device, is_fp8,
-            )?
-            .ok()
-            .ok_or_else(|| CandleError::Msg("FP8 checkpoint has no logical rows".into()))?;
-            weights.encoded_keys.extend(
-                source
-                    .reader()
-                    .plan()
-                    .tensors
-                    .iter()
-                    .map(|row| row.logical_key.clone()),
-            );
-            weights.source = Some((source, device.clone(), DType::BF16));
-        }
+        let mut source_bases = fp8_bases.clone();
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
-            if is_fp8(key) {
+            if key
+                .rsplit_once('.')
+                .is_some_and(|(base, _)| fp8_bases.contains(base))
+            {
                 continue;
             }
             let base = key.trim_end_matches(".comfy_quant");
@@ -550,13 +555,48 @@ impl Weights {
                 gen_core::convrot_int8::ConvRotInt8::parse(data, ws, ss)
             })
             .map_err(CandleError::Msg)?;
+            source_bases.insert(base.to_owned());
             let scales = stores[*si].get(&scale)?;
             descriptor
                 .validate_scale_values(f32_le_planes(scales.data()))
                 .map_err(CandleError::Msg)?;
         }
+        let in_source = |key: &str| {
+            key.rsplit_once('.')
+                .is_some_and(|(base, _)| source_bases.contains(base))
+        };
+        let mut weights = Self::from_map(HashMap::new());
+        if !source_bases.is_empty() {
+            let paths: Vec<_> = files.iter().map(|p| p.as_ref().to_owned()).collect();
+            let st = crate::loader::mmap_safetensors_multi(&paths)?;
+            let source = candle_checkpoint::ProjectionSource::from_mapped_selected(
+                st, &paths, device, in_source,
+            )?
+            .ok()
+            .ok_or_else(|| CandleError::Msg("source checkpoint has no logical rows".into()))?;
+            weights.encoded_keys.extend(
+                source
+                    .reader()
+                    .plan()
+                    .tensors
+                    .iter()
+                    .map(|row| row.logical_key.clone()),
+            );
+            weights.companion_keys.extend(
+                source
+                    .reader()
+                    .plan()
+                    .companions
+                    .iter()
+                    .map(|row| row.physical_key.clone()),
+            );
+            weights.source = Some((source, device.clone(), DType::BF16));
+        }
         for (key, (_, stored_dtype, _)) in &headers {
-            if is_fp8(key) {
+            if key
+                .rsplit_once('.')
+                .is_some_and(|(base, _)| fp8_bases.contains(base))
+            {
                 continue;
             }
             let native = (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
@@ -578,7 +618,7 @@ impl Weights {
             .reserve(headers.len() - weights.encoded_keys.len());
         for st in &stores {
             for (key, view) in st.tensors() {
-                if weights.encoded_keys.contains(&key) {
+                if weights.encoded_keys.contains(&key) || weights.companion_keys.contains(&key) {
                     continue;
                 }
                 let tensor = if view.dtype() == safetensors::Dtype::I8 {

@@ -34,7 +34,7 @@ pub struct ProviderRegistry {
 macro_rules! explicit_registry_kind {
     (
         $iter:ident, $load:ident, $field:ident, $registration:ty,
-        $kind:literal, $trait:ty
+        $kind:literal, $trait:ty $(, $wrap:path)?
     ) => {
         pub fn $iter(&self) -> impl ExactSizeIterator<Item = &$registration> {
             self.$field.iter()
@@ -52,9 +52,24 @@ macro_rules! explicit_registry_kind {
                 })?;
             self.ensure_quant_supported(id, spec, $kind)?;
             let _activity = spec.load_activity_context().install();
-            spec.read_prepared_files_unchanged(|| (registration.load)(spec))
+            let load = || spec.read_prepared_files_unchanged(|| (registration.load)(spec));
+            explicit_registry_kind!(@load spec, load $(, $wrap)?)
         }
     };
+    (@load $spec:ident, $load:ident, $wrap:path) => { $wrap($spec, $load) };
+    (@load $spec:ident, $load:ident) => { $load() };
+}
+
+fn load_with_receipts(
+    spec: &LoadSpec,
+    load: impl FnOnce() -> Result<Box<dyn Generator>>,
+) -> Result<Box<dyn Generator>> {
+    let scope = crate::CheckpointReceiptScope::for_load(spec)?;
+    let inner = scope.with(load)?;
+    Ok(Box::new(crate::generator::ReceiptGenerator {
+        inner,
+        scope,
+    }))
 }
 
 impl ProviderRegistry {
@@ -760,7 +775,8 @@ impl ProviderRegistry {
         generators,
         ModelRegistration,
         "generator",
-        dyn Generator
+        dyn Generator,
+        load_with_receipts
     );
     explicit_registry_kind!(
         transforms,

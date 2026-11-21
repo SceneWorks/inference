@@ -45,6 +45,8 @@ pub mod block_window;
 pub mod caption;
 pub mod checkpoint_codec;
 pub mod checkpoint_facts;
+mod receipt_scope;
+pub use receipt_scope::CheckpointReceiptScope;
 pub mod comfy_quant;
 pub mod control;
 pub mod convrot_int8;

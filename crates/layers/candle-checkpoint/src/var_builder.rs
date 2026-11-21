@@ -34,6 +34,7 @@ impl LogicalKeyMapping for SourceMapping {
 #[derive(Clone)]
 pub struct ProjectionSource(Arc<LogicalWeightReader>, Arc<SourcePlan>);
 struct SourcePlan {
+    files: Vec<PathBuf>,
     headers: Vec<SafetensorsTensorHeader>,
     descriptors: BTreeMap<String, Vec<u8>>,
     metadata: Option<String>,
@@ -56,6 +57,7 @@ impl SourcePlan {
             plan,
             dev,
             policy.native_execution_capability(),
+            &self.files,
         )))
     }
 }
@@ -231,6 +233,7 @@ impl ProjectionSource {
         }
         let meta = (!layers.is_empty()).then(|| serde_json::json!({"layers":layers}).to_string());
         let definition = Arc::new(SourcePlan {
+            files: files.to_vec(),
             headers,
             descriptors,
             metadata: meta,
