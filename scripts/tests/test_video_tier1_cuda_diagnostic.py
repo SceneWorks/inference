@@ -116,6 +116,48 @@ class TargetedCudaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             diagnostic.continuation(diagnostic.GPU0_MEMORY, proof.cohorts.WAN, previous)
 
+    def test_preflight_uses_fresh_uuid_mask_without_changing_the_runner(self):
+        from scripts.ci import wddm_process_memory as wddm
+        for selected, inherited in ((diagnostic.GPU0_HARDWARE["uuid"], followup.CUDA_UUID),
+                                    (diagnostic.GPU0_HARDWARE["uuid"], "1"),
+                                    (followup.CUDA_UUID, "-1")):
+            policy = SimpleNamespace(backend="windows-cuda", cuda_device_uuid=selected)
+            adapter = {"cuda_uuid": selected, "luid": "luid_0x00000000_0x0001e234",
+                       "node_mask": 1, "physical_node": 0, "counter": wddm.COUNTER}
+            with self.subTest(selected=selected, inherited=inherited), \
+                 patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": inherited, "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
+                                         "PYTHONPATH": "wrong-module", "SYSTEMROOT": "test-system"}), \
+                 patch.object(proof.subprocess, "check_output", return_value=json.dumps(adapter).encode()) as child:
+                self.assertEqual(proof.cuda_adapter(policy), adapter)
+                argv = child.call_args.args[0]
+                opts = child.call_args.kwargs
+                self.assertEqual(argv, [proof.sys.executable, "-I", str(proof.ROOT / "scripts/ci/wddm_process_memory.py"),
+                                        "--cuda-uuid", selected])
+                self.assertEqual(opts["env"]["CUDA_VISIBLE_DEVICES"], selected)
+                self.assertEqual(opts["env"]["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+                self.assertEqual(opts["env"]["SYSTEMROOT"], "test-system")
+                self.assertNotIn("PYTHONPATH", opts["env"])
+                self.assertEqual((opts["cwd"], opts["timeout"], opts["stdin"]), (proof.ROOT, 30, subprocess.DEVNULL))
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], inherited)
+                self.assertEqual(os.environ["CUDA_DEVICE_ORDER"], "FASTEST_FIRST")
+                for bad in (dict(adapter, cuda_uuid=followup.CUDA_UUID if selected != followup.CUDA_UUID else diagnostic.GPU0_HARDWARE["uuid"]),
+                            dict(adapter, node_mask=2), dict(adapter, extra=True)):
+                    child.return_value = json.dumps(bad).encode()
+                    with self.assertRaises(ValueError):
+                        proof.cuda_adapter(policy)
+                for bad in (b"not JSON", b" " * 4097):
+                    child.return_value = bad
+                    with self.assertRaises(ValueError):
+                        proof.cuda_adapter(policy)
+                for error in (subprocess.TimeoutExpired(argv, 30), subprocess.CalledProcessError(1, argv)):
+                    child.side_effect = error
+                    with self.assertRaises(type(error)):
+                        proof.cuda_adapter(policy)
+                child.reset_mock()
+                with self.assertRaises(ValueError):
+                    proof.cuda_adapter(SimpleNamespace(backend="windows-cuda", cuda_device_uuid="0"))
+                child.assert_not_called()
+
     def test_gpu0_role_refuses_gpu1_admission_even_with_a_matching_policy_hash(self):
         from scripts.tests.test_wan_tier1_comparison import request
         with TemporaryDirectory() as directory:

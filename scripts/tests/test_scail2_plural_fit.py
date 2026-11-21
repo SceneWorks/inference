@@ -119,9 +119,11 @@ class PluralQualification(unittest.TestCase):
         self.assertEqual(limits, {"required_cuda_device_uuid": c.GPU0, "required_cuda_physical_index": 0})
         approved = SimpleNamespace(backend="windows-cuda", cuda_device_uuid=c.GPU0)
         self.assertEqual(runner.tier1.build_env(approved)["CUDA_VISIBLE_DEVICES"], c.GPU0)
-        with patch.object(runner.wddm, "preflight") as preflight:
-            runner.tier1.cuda_adapter(approved)
-            preflight.assert_called_once_with(c.GPU0)
+        adapter = {"cuda_uuid": c.GPU0, "luid": "luid_0x00000000_0x00000001",
+                   "physical_node": 0, "node_mask": 1, "counter": runner.wddm.COUNTER}
+        with patch.object(runner.tier1.subprocess, "check_output", return_value=json.dumps(adapter).encode()) as preflight:
+            self.assertEqual(runner.tier1.cuda_adapter(approved), adapter)
+            self.assertEqual(preflight.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], c.GPU0)
         hw = {"uuid": c.GPU0, "index": "0", "memory.total": "98000"}
         claim = dict(post_execution_verified=True, lease_released=True, device_uuid=c.GPU0, physical_index=0)
         samples = [dict(sample_number=i, predicates={"unique_uuid":True}, selected_index_matches_admission=True,

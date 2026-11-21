@@ -401,7 +401,17 @@ def read_observed(output, case):
 
 def cuda_adapter(policy):
     from scripts.ci import wddm_process_memory
-    return wddm_process_memory.preflight(policy.cuda_device_uuid)
+    # CUDA can cache visibility at its first driver call. Resolve the same UUID as the
+    # supervised model child in a new interpreter, without changing the runner process.
+    uuid = policy.cuda_device_uuid
+    if policy.backend != "windows-cuda" or not isinstance(uuid, str) or not wddm_process_memory.UUID.fullmatch(uuid):
+        raise ValueError("WDDM metadata requires a Windows CUDA policy and a physical UUID")
+    command = [sys.executable, "-I", str(ROOT / "scripts/ci/wddm_process_memory.py"), "--cuda-uuid", uuid]
+    env = {k: v for k, v in build_env(policy).items() if k.upper() in RUNTIME_ENV}
+    raw = subprocess.check_output(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, timeout=30)
+    if len(raw) > 4096:
+        raise ValueError("WDDM adapter metadata exceeds the expected response size")
+    return wddm_process_memory.validate_adapter(json.loads(raw), uuid)
 
 
 def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool, adapter=None):
