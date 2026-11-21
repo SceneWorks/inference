@@ -1346,6 +1346,13 @@ jobs:
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
+      # This lane compiles every CUDA test target without executing model code. Full test
+      # debug/PDB output exceeded 100 GB and exhausted the shared runner disk while linking.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
       # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
       #
       # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
