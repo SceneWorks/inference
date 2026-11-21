@@ -24,7 +24,7 @@ pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvRotInt8 {
     pub out_features: usize,
-    /// Source shape [N], permitted only by the legacy descriptor convention.
+    /// Source shape `[N]`, permitted only by the legacy descriptor convention.
     pub flat_scales: bool,
     pub in_features: usize,
     pub rotation_group: usize,
