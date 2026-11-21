@@ -404,7 +404,7 @@ fn run(
         "out of range",
     );
     plan.check_request(&crate::raw_descriptor(), req)?;
-    plan.check_load(&gen_core::RenderLoadBinding::from_spec(spec))?;
+    plan.check_load_spec(spec)?;
     let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
     run.encode(|| Ok::<_, CandleError>(()))?;
     render_multiphase_driver(
