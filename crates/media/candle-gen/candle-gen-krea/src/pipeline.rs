@@ -36,6 +36,7 @@ use rand::{rngs::StdRng, SeedableRng};
 /// so its latent space is `qwenimage` — the same `2kto4k` 4× student Qwen-Image resolves.
 const PID_BACKBONE: &str = "qwenimage";
 
+use crate::adapters::PinnedPhaseAdapters;
 use crate::config::Krea2Config;
 use crate::loader::Weights;
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
@@ -2219,12 +2220,13 @@ fn load_dit_base_at_dtype(
 fn materialize_multiphase_adapter_set(
     dit: &mut Krea2Transformer,
     specs: &[AdapterSpec],
+    adapter_sources: &PinnedPhaseAdapters<'_>,
 ) -> Result<crate::adapters::AdditiveReport> {
     dit.clear_adapters()?;
     if specs.is_empty() {
         return Ok(crate::adapters::AdditiveReport::default());
     }
-    crate::adapters::install_additive(dit, specs, 0)
+    adapter_sources.install(dit, specs)
 }
 
 type MultiphaseAdapterStateObserver<'a> = dyn FnMut(Option<usize>, &[AdapterSpec], &crate::adapters::AdditiveReport, &mut Krea2Transformer)
@@ -2242,6 +2244,7 @@ fn render_multiphase_driver<T>(
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
+    file_pin_spec: &gen_core::LoadSpec,
     context: &Tensor,
     neg_context: Option<&Tensor>,
     req: &GenerationRequest,
@@ -2267,6 +2270,7 @@ fn render_multiphase_driver<T>(
     // Each phase's job-local adapter state can change the text-fusion leaves. Bind the
     // prepared tensors and materialization specs to the same effective request arguments.
     let mut dit = load_dit_base_at_dtype(root, native_dit, device, quant, dit_dtype)?;
+    let adapter_sources = PinnedPhaseAdapters::new(file_pin_spec, all_specs)?;
     let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
     let geometry = gen_core::MemoryGeometry {
         width: req.width,
@@ -2280,8 +2284,8 @@ fn render_multiphase_driver<T>(
             .iter()
             .map(|phase| (phase.arguments(all_specs), geometry)),
         |arguments, geometry| -> Result<_> {
-            let specs = crate::multiphase::phase_adapter_specs(arguments, all_specs);
-            materialize_multiphase_adapter_set(&mut dit, &specs)?;
+            let specs = crate::multiphase::phase_adapter_specs(arguments.adapters(), all_specs);
+            materialize_multiphase_adapter_set(&mut dit, &specs, &adapter_sources)?;
             let positive = dit.prepare_conditioning(context, geometry.width, geometry.height)?;
             let negative = if arguments.uses_classifier_free_guidance() {
                 let context = neg_context.ok_or_else(|| {
@@ -2315,7 +2319,7 @@ fn render_multiphase_driver<T>(
             // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
             // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
             // prior phase installed.
-            let report = materialize_multiphase_adapter_set(&mut dit, specs)?;
+            let report = materialize_multiphase_adapter_set(&mut dit, specs, &adapter_sources)?;
             on_adapter_state(Some(phase_index), specs, &report, &mut dit);
             let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
             let start = phase.slice.start.min(end);
@@ -2437,6 +2441,7 @@ pub(crate) fn render_multiphase(
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
+    file_pin_spec: &gen_core::LoadSpec,
     context: &Tensor,
     neg_context: Option<&Tensor>,
     req: &GenerationRequest,
@@ -2455,6 +2460,7 @@ pub(crate) fn render_multiphase(
         device,
         resolved,
         all_specs,
+        file_pin_spec,
         context,
         neg_context,
         req,
@@ -3975,6 +3981,8 @@ mod tests {
             AdapterKind::Lora,
         );
         let all_specs = vec![adapter_a.clone(), adapter_b.clone()];
+        let file_pin_spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(root.clone()))
+            .with_adapters(all_specs.clone());
         let resolved = crate::multiphase::resolve_phases(
             &[
                 GenerationPhase {
@@ -4104,6 +4112,7 @@ mod tests {
                             &Device::Cpu,
                             &resolved,
                             &all_specs,
+                            &file_pin_spec,
                             &context,
                             None,
                             &request,

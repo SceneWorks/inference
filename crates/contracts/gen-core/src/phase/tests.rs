@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::rc::Rc;
 
 use super::*;
 
@@ -94,14 +95,14 @@ fn interleaved_requests_own_distinct_model_and_conditioning_preparation() {
             second[0].parts().1,
             &("second model", "second adapter", "second prompt")
         );
-        Ok::<_, Infallible>(("first model", "first adapter", "first prompt"))
+        Ok::<_, Infallible>(Rc::new(("first model", "first adapter", "first prompt")))
     })
     .unwrap();
     assert_eq!(
-        first[0].parts().1,
+        first[0].parts().1.as_ref(),
         &("first model", "first adapter", "first prompt")
     );
-    assert!(std::ptr::eq(first[0].parts().1, first[1].parts().1));
+    assert!(Rc::ptr_eq(first[0].parts().1, first[1].parts().1));
 }
 
 #[test]
@@ -111,10 +112,9 @@ fn each_preparation_lives_only_as_long_as_the_phase_plans_using_it() {
         phase_arguments(vec![PhaseAdapterScale::new(4, 1.0)], 1.0),
         GEOMETRY,
     );
-    let mut plans = prepare_phases(
-        [base.clone(), adapted, base],
-        |_, _| Ok::<_, Infallible>(()),
-    )
+    let mut plans = prepare_phases([base.clone(), adapted, base], |_, _| {
+        Ok::<_, Infallible>(Rc::new(()))
+    })
     .unwrap()
     .into_iter();
     let first = plans.next().unwrap();

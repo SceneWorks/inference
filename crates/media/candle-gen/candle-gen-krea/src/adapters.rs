@@ -35,10 +35,11 @@
 //! text-encoder LoRAs (this is a DiT-only merge) and conv-shaped (4-D) factors (the merge folds only
 //! into the 2-D Linear projections).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, LoadSpec, PinnedWeightsFile};
 use candle_gen::quant::{AdaptLinear, LokrFactors};
 use candle_gen::train::lora::{
     parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
@@ -907,7 +908,43 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     specs: &[AdapterSpec],
     pre_applied: usize,
 ) -> Result<AdditiveReport> {
-    install_additive_inner(dit, specs, pre_applied, None)
+    install_additive_inner(dit, specs, pre_applied, None, read_adapter)
+}
+
+/// The same adapter identities guard all text-fusion and forward installs for a request.
+pub(crate) struct PinnedPhaseAdapters<'a> {
+    pins: BTreeMap<&'a Path, PinnedWeightsFile>,
+}
+
+impl<'a> PinnedPhaseAdapters<'a> {
+    pub(crate) fn new(load_spec: &LoadSpec, adapters: &'a [AdapterSpec]) -> Result<Self> {
+        let mut pins = BTreeMap::new();
+        for adapter in adapters {
+            let path = adapter.path.as_path();
+            if let Entry::Vacant(entry) = pins.entry(path) {
+                entry.insert(load_spec.file_pin_for(path)?);
+            }
+        }
+        Ok(Self { pins })
+    }
+
+    fn read(&self, path: &Path) -> Result<AdapterFile> {
+        let pin = self.pins.get(path).ok_or_else(|| {
+            CandleError::Unsupported(format!(
+                "krea: missing request adapter pin for {}",
+                path.display()
+            ))
+        })?;
+        pin.read_unchanged(read_adapter)
+    }
+
+    pub(crate) fn install<D: AdditiveDit + ?Sized>(
+        &self,
+        dit: &mut D,
+        specs: &[AdapterSpec],
+    ) -> Result<AdditiveReport> {
+        install_additive_inner(dit, specs, 0, None, |path| self.read(path))
+    }
 }
 
 /// Production composition entry point: preserves the diff-patch match count for every selected
@@ -929,6 +966,7 @@ pub fn install_additive_with_diff<D: AdditiveDit + ?Sized>(
         specs,
         diff_applied_by_spec.iter().sum(),
         Some(diff_applied_by_spec),
+        read_adapter,
     )
 }
 
@@ -937,6 +975,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
     specs: &[AdapterSpec],
     pre_applied: usize,
     diff_applied_by_spec: Option<&[usize]>,
+    mut read: impl FnMut(&Path) -> Result<AdapterFile>,
 ) -> Result<AdditiveReport> {
     let mut report = AdditiveReport::default();
 
@@ -957,7 +996,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
 
     for (source, spec) in specs.iter().enumerate() {
-        let af = read_adapter(&spec.path)?;
+        let af = read(&spec.path)?;
         let has_unstamped_lokr = has_lokr_keys(&af);
         match (spec.kind, af.declares_lokr()) {
             (AdapterKind::Lora, true) => {
@@ -1125,6 +1164,39 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn pinned_phase_adapter_refuses_replacement_between_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("adapter.safetensors");
+        let replacement = tmp.path().join("replacement.safetensors");
+        for (path, value) in [(&source, 1.0), (&replacement, 2.0)] {
+            save_tensors(
+                &HashMap::from([("projection.lora_A.weight", t2(&[value], 1, 1))]),
+                path,
+            )
+            .unwrap();
+        }
+        let specs = vec![AdapterSpec::new(source.clone(), 1.0, AdapterKind::Lora)];
+        let load_spec = LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            tmp.path().to_owned(),
+        ))
+        .with_adapters(specs.clone());
+        let pins = PinnedPhaseAdapters::new(&load_spec, &specs).unwrap();
+        assert!(pins
+            .read(&source)
+            .unwrap()
+            .tensors
+            .contains_key("projection.lora_A.weight"));
+
+        // A later phase must use the first preparation's identity even if a new, valid adapter
+        // with the same header and byte count occupies the path.
+        std::fs::rename(replacement, &source).unwrap();
+        let result = pins.read(&source);
+        assert!(
+            matches!(result, Err(CandleError::Unsupported(message)) if message.starts_with("artifact seal mismatch after load: "))
+        );
     }
 
     #[test]

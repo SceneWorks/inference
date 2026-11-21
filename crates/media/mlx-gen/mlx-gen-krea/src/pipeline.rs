@@ -312,6 +312,7 @@ pub struct KreaHeavy {
 /// Count-invariant t2i render state (F-073): the step-invariant prep(s) — the positive prep and, on the
 /// Raw CFG path, the unconditional one. Built once per request by [`KreaHeavy::prepare_t2i`], reused for
 /// every seed in the count loop.
+#[derive(Clone)]
 pub struct T2iPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
     pub(crate) guidance: f32,
@@ -330,6 +331,12 @@ pub struct MultiPhasePlan {
     pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     slice: PhaseSlice,
 }
+
+// Preserve the public plan's ability to move to a new owner by value.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MultiPhasePlan>();
+};
 
 #[cfg(test)]
 fn phase_arguments_for_test(guidance: f32) -> PhaseArguments {
@@ -1392,7 +1399,7 @@ impl KreaHeavy {
             |arguments, geometry| -> Result<_> {
                 let geom = Self::geom_latent(geometry.width, geometry.height)?;
                 // The same job-local DiT and conditioning travel together to each forward.
-                let specs = crate::multiphase::phase_adapter_specs(arguments, all_specs);
+                let specs = crate::multiphase::phase_adapter_specs(arguments.adapters(), all_specs);
                 let dit = self.dit.clone_for_multiphase(&specs)?;
                 let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
                 let prep_neg = if arguments.uses_classifier_free_guidance() {

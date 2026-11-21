@@ -1,7 +1,6 @@
 //! Tensor-free arguments shared by denoise phase preparation and forward evaluation.
 
 use std::collections::{hash_map::Entry, HashMap};
-use std::rc::Rc;
 
 use crate::MemoryGeometry;
 
@@ -150,15 +149,32 @@ impl PhaseArguments {
     }
 }
 
+/// Exactly the phase dependencies available to preparation. Guidance magnitude and any
+/// per-evaluation perturbation are forward-only inputs.
+pub struct PrepareArguments<'a> {
+    adapters: &'a [PhaseAdapterScale],
+    branches: ConditioningBranches,
+}
+
+impl<'a> PrepareArguments<'a> {
+    pub fn adapters(&self) -> &'a [PhaseAdapterScale] {
+        self.adapters
+    }
+
+    pub fn uses_classifier_free_guidance(&self) -> bool {
+        self.branches == ConditioningBranches::PositiveAndNegative
+    }
+}
+
 /// One phase's forward arguments and the conditioning prepared with them.
 pub struct PreparedPhase<T> {
     arguments: PhaseArguments,
-    prepared: Rc<T>,
+    prepared: T,
 }
 
 impl<T> PreparedPhase<T> {
     pub fn parts(&self) -> (&PhaseArguments, &T) {
-        (&self.arguments, self.prepared.as_ref())
+        (&self.arguments, &self.prepared)
     }
 }
 
@@ -177,35 +193,40 @@ struct PreparationKey {
 /// use the positive preparation if its route leaves conditioning unchanged.
 ///
 /// This is for drivers that already reserve and retain preparation across their phase plans.
-/// Identical dependencies share that existing allocation. The cache itself drops before forward;
-/// only the returned phase plans keep their prepared values alive.
-pub fn prepare_phases<T, E>(
+/// Prepared values must clone by sharing immutable allocations. Equal dependencies clone from
+/// the first phase's preparation, and the lookup only stores indices into the returned plans.
+pub fn prepare_phases<T: Clone, E>(
     phases: impl IntoIterator<Item = (PhaseArguments, MemoryGeometry)>,
-    mut prepare: impl FnMut(&PhaseArguments, MemoryGeometry) -> Result<T, E>,
+    mut prepare: impl FnMut(PrepareArguments<'_>, MemoryGeometry) -> Result<T, E>,
 ) -> Result<Vec<PreparedPhase<T>>, E> {
-    let mut cache = HashMap::new();
-    phases
-        .into_iter()
-        .map(|(arguments, geometry)| {
-            let key = PreparationKey {
-                adapters: arguments.adapters.clone(),
-                geometry,
-                branches: arguments.branches,
-            };
-            let prepared = match cache.entry(key) {
-                Entry::Occupied(entry) => Rc::clone(entry.get()),
-                Entry::Vacant(entry) => {
-                    let value = Rc::new(prepare(&arguments, geometry)?);
-                    entry.insert(Rc::clone(&value));
-                    value
-                }
-            };
-            Ok(PreparedPhase {
-                arguments,
-                prepared,
-            })
-        })
-        .collect()
+    let mut cache: HashMap<_, usize> = HashMap::new();
+    let mut plans: Vec<PreparedPhase<T>> = Vec::new();
+    for (arguments, geometry) in phases {
+        let key = PreparationKey {
+            adapters: arguments.adapters.clone(),
+            geometry,
+            branches: arguments.branches,
+        };
+        let prepared = match cache.entry(key) {
+            Entry::Occupied(entry) => plans[*entry.get()].prepared.clone(),
+            Entry::Vacant(entry) => {
+                let value = prepare(
+                    PrepareArguments {
+                        adapters: arguments.adapters(),
+                        branches: arguments.branches,
+                    },
+                    geometry,
+                )?;
+                entry.insert(plans.len());
+                value
+            }
+        };
+        plans.push(PreparedPhase {
+            arguments,
+            prepared,
+        });
+    }
+    Ok(plans)
 }
 
 #[cfg(test)]

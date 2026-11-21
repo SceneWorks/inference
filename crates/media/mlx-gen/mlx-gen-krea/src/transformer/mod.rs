@@ -1656,6 +1656,7 @@ pub(crate) struct JointInputs {
 /// fused + projected text stream (`ctx`), the joint RoPE tables, and the patchify/slice geometry.
 /// None of it depends on the noise-latent values or the timestep, so it is reused across every step
 /// (F-079).
+#[derive(Clone)]
 pub struct JointPrep {
     ctx: Array,
     rcos: Array,

@@ -76,6 +76,7 @@ pub struct Krea2Transformer {
 /// The latent itself deliberately remains outside this value: its image tokens and timestep modulation
 /// change at every step.  `forward_prepared*` validates that those changing inputs still match the
 /// request geometry that admitted this state before doing any denoise work.
+#[derive(Clone)]
 pub(crate) struct PreparedConditioning {
     context: Tensor,
     cap_len: usize,

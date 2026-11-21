@@ -238,17 +238,16 @@ pub fn resolve_phases(
 /// **Precondition:** the phase's adapter indices were resolved against `all_specs` (same length /
 /// order), so every `index` is in range — [`resolve_phase_adapters`] guarantees this.
 pub fn phase_spec_subset(phase: &ResolvedPhase, all_specs: &[AdapterSpec]) -> Vec<AdapterSpec> {
-    phase_adapter_specs(&phase.arguments(all_specs), all_specs)
+    phase_adapter_specs(phase.arguments(all_specs).adapters(), all_specs)
 }
 
 /// Materialize the phase arguments on legacy loaders that accept ordered adapter specs.
 /// `all_specs` must be the same stack used to resolve the phase arguments.
 pub fn phase_adapter_specs(
-    arguments: &PhaseArguments,
+    adapters: &[PhaseAdapterScale],
     all_specs: &[AdapterSpec],
 ) -> Vec<AdapterSpec> {
-    arguments
-        .adapters()
+    adapters
         .iter()
         .map(|adapter| {
             let mut spec = all_specs[adapter.slot()].clone();
