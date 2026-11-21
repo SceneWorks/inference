@@ -237,41 +237,67 @@ pub fn adapter_stack_upcast_resident_bytes(
     if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
         return Some(0);
     }
+    adapters.iter().try_fold(0_u64, |total, adapter| {
+        let file = upcast_adapter_file_residency(&adapter.path, compute_width, lora_copy)?;
+        Some(total.saturating_add(file.device_bytes))
+    })
+}
+
+/// Installed factor storage and the LoKr dimensions needed by consumers which keep alternate
+/// request-specific variants. Both come from the same bounded metadata read.
+pub struct UpcastAdapterFileResidency {
+    pub device_bytes: u64,
+    pub lokr: Vec<LokrKroneckerDims>,
+}
+
+pub fn upcast_adapter_file_residency(
+    path: &std::path::Path,
+    compute_width: u64,
+    lora_copy: UpcastLoraCopy,
+) -> Option<UpcastAdapterFileResidency> {
+    if safetensors_path_bytes(path) == 0 {
+        return None;
+    }
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path).ok()?;
     let lora_copy_width = match lora_copy {
         UpcastLoraCopy::Cached if compute_width != UPCAST_FACTOR_WIDTH => compute_width,
         _ => 0,
     };
     let lora_per_element = UPCAST_FACTOR_WIDTH.saturating_add(lora_copy_width);
-    adapters.iter().try_fold(0_u64, |total, adapter| {
-        if safetensors_path_bytes(&adapter.path) == 0 {
-            return None;
-        }
-        let headers = crate::weightsmeta::safetensors_path_tensor_headers(&adapter.path).ok()?;
-        let is_lokr = headers.iter().any(|h| lokr_factor(&h.name).is_some());
-        let mut bytes = 0_u64;
-        let mut modules: std::collections::BTreeMap<&str, Vec<(&str, &[usize])>> =
-            std::collections::BTreeMap::new();
-        for header in &headers {
-            match (is_lokr, lokr_factor(&header.name)) {
-                (true, Some((module, factor))) => modules
-                    .entry(module)
-                    .or_default()
-                    .push((factor, header.shape.as_slice())),
-                (true, None) => bytes = bytes.saturating_add(header.data_bytes),
-                (false, _) if header.is_float() => {
-                    let elements = header.element_count().ok()?;
-                    bytes = bytes.saturating_add(elements.saturating_mul(lora_per_element));
-                }
-                (false, _) => bytes = bytes.saturating_add(header.data_bytes),
+    let is_lokr = headers
+        .iter()
+        .any(|header| lokr_factor(&header.name).is_some());
+    let mut bytes = 0_u64;
+    let mut modules: std::collections::BTreeMap<&str, Vec<(&str, &[usize])>> =
+        std::collections::BTreeMap::new();
+    for header in &headers {
+        match (is_lokr, lokr_factor(&header.name)) {
+            (true, Some((module, factor))) => modules
+                .entry(module)
+                .or_default()
+                .push((factor, header.shape.as_slice())),
+            (true, None) => bytes = bytes.saturating_add(header.data_bytes),
+            (false, _) if header.is_float() => {
+                let elements = header.element_count().ok()?;
+                bytes = bytes.saturating_add(elements.saturating_mul(lora_per_element));
             }
+            (false, _) => bytes = bytes.saturating_add(header.data_bytes),
         }
-        for factors in modules.values() {
-            let dims = LokrKroneckerDims::from_factor_shapes(|name| {
-                factors.iter().find(|(f, _)| *f == name).map(|(_, s)| *s)
-            })?;
-            bytes = bytes.saturating_add(dims.resident_bytes(compute_width));
-        }
-        (bytes > 0).then(|| total.saturating_add(bytes))
+    }
+    let mut lokr = Vec::with_capacity(modules.len());
+    for factors in modules.values() {
+        let dims = LokrKroneckerDims::from_factor_shapes(|name| {
+            factors
+                .iter()
+                .find(|(factor, _)| *factor == name)
+                .map(|(_, shape)| *shape)
+        })?;
+        bytes = bytes.saturating_add(dims.resident_bytes(compute_width));
+        lokr.push(dims);
+    }
+    (bytes > 0).then_some(UpcastAdapterFileResidency {
+        device_bytes: bytes,
+        lokr,
     })
 }
 

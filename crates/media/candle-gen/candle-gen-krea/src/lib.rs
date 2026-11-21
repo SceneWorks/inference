@@ -93,8 +93,8 @@ mod control_registry;
 mod testfix;
 
 pub use adapters::{
-    fold_diff_patch, install_additive, merge_adapters, merge_into_weights, AdditiveReport,
-    MergeReport,
+    fold_diff_patch, install_additive, merge_adapters, merge_into_weights, phase_adapter_memory,
+    AdditiveReport, MergeReport, PhaseAdapterMemory,
 };
 pub use config::Krea2Config;
 pub use control_provider::{
@@ -374,9 +374,7 @@ pub struct KreaGenerator {
     #[cfg(any(feature = "cuda", test))]
     memory_contract: Option<gen_core::MemoryProviderContract>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
-    /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
-    /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
-    /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
+    /// The snapshot root retained for the request-staged component loaders.
     root: PathBuf,
     /// Exact text-encoder source validated at construction, retained for request-staged reloads.
     text_encoder_source: gen_core::ValidatedEncoderSource,
@@ -384,19 +382,9 @@ pub struct KreaGenerator {
     /// generator construction and retained across resident, sequential, streamed, and multi-phase
     /// materialization so no later request can silently adopt a replacement at the same path.
     native_dit: Option<gen_core::PinnedWeightsFile>,
-    /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
-    /// multi-phase render can install each phase's named subset (by index, bounds-checked against
-    /// `adapters.len()`, with an optional per-phase weight) on that phase's job-local DiT. Empty ⇒ a
-    /// base (adapter-free) model, so only base-only phases are valid. The single-phase paths still bake
-    /// these into the resident DiT at load, unchanged.
+    /// Default load-time adapters and the ordered slot namespace of each phase.
     adapters: Vec<AdapterSpec>,
-    /// `true` if any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), detected
-    /// from the adapter file keys at load ([`adapters::any_diff_patch`], sc-13887). A diff-patch delta
-    /// folds IRREVERSIBLY into the dense base at load (`W += δ`); the job-local multi-phase DiT would
-    /// inherit that mutated base and [`transformer::Krea2Transformer::clear_adapters`] (which only drops
-    /// low-rank residuals) cannot undo it — so a "base-only" phase would silently carry the diff-patch.
-    /// Multi-phase is therefore rejected loudly on such a model (low-rank LoRA/LoKr — including the
-    /// rank-64 turbo LoRA — toggle cleanly and are unaffected).
+    /// A merge-only diff patch cannot be disabled by a per-phase residual selection.
     has_diff_patch: bool,
     /// Prepared File identities retained for lazy/sequential adapter, PiD, component, and imported
     /// primary reopens. The cache key and every later provider read consume these same tokens.
@@ -753,15 +741,18 @@ impl Generator for KreaGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
-            candle_gen::execution::unobserved_adapters(
-                self.adapters.len(),
-                "candle-gen-krea/src/lib.rs",
-            );
-            candle_gen::execution::policy(
-                "loaded/loaded_quant",
-                format!("{:?}", self.loaded_quant).into(),
-            );
+        candle_gen::execution::capture_with(self, req, on_progress, || self.observe_loaded())
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            self.observe_loaded()
         })
     }
 
@@ -889,6 +880,56 @@ impl Generator for KreaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let plan = if req.phases.is_some() {
+            Some(pipeline::compile_multiphase_plan(
+                &self.descriptor,
+                &self.file_pin_spec,
+                req,
+            )?)
+        } else {
+            None
+        };
+        self.render(req, plan.as_ref(), None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+        if req.phases.is_none() || plan.adapter_phases().is_empty() {
+            return Err(gen_core::Error::Unsupported(
+                "Candle Krea's planned entry requires a multi-phase Raw render".into(),
+            ));
+        }
+        self.render(req, Some(plan), scope, on_progress)
+    }
+}
+
+impl KreaGenerator {
+    fn observe_loaded(&self) {
+        candle_gen::execution::unobserved_adapters(
+            self.adapters.len(),
+            "candle-gen-krea/src/lib.rs",
+        );
+        candle_gen::execution::policy(
+            "loaded/loaded_quant",
+            format!("{:?}", self.loaded_quant).into(),
+        );
+    }
+
+    fn render(
+        &self,
+        req: &GenerationRequest,
+        plan: Option<&gen_core::RenderPlan>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         if let Some(memory) = req.memory {
             validate_memory_parameters(self.descriptor.id, memory)?;
         }
@@ -997,8 +1038,7 @@ impl Generator for KreaGenerator {
             })?;
             let pag_report = match &resolved_pag {
                 Some(pag) => {
-                    let executed_steps =
-                        pipeline::executed_steps_for_request(false, None, None, req)?;
+                    let executed_steps = pipeline::executed_steps_for_request(false, None, req)?;
                     Some(pag.execution_report(executed_steps))
                 }
                 None => None,
@@ -1009,29 +1049,17 @@ impl Generator for KreaGenerator {
             return Ok(report);
         }
 
-        // Multi-phase denoise (epic 13879, sc-13887): resolve the phase list ONCE up-front so both the
-        // text-encode phase (whether the unconditional context is needed) and the render phase drive from
-        // the same plan. `validate_phases` has already gated this to the Raw t2i variant (no reference/PiD,
-        // non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase guidance, and
-        // per-phase adapter sets (indices bounds-checked against `self.adapters`). `None` ⇒ the ordinary
-        // single-phase render below.
-        let mp_resolved: Option<Vec<multiphase::ResolvedPhase>> = match req.phases.as_deref() {
-            Some(list) if raw && !list.is_empty() => {
-                let default_guidance = req.guidance.unwrap_or(pipeline::RAW_GUIDANCE);
-                Some(multiphase::resolve_phases(
-                    list,
-                    default_guidance,
-                    self.adapters.len(),
-                    self.descriptor.id,
-                )?)
-            }
-            _ => None,
+        let multiphase = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
+        let encode_multiphase = |run: &gen_core::RenderRun<'_, '_>, text: &pipeline::KreaText| {
+            candle_gen::synchronize_result(
+                &self.device,
+                pipeline::encode_multiphase_contexts(
+                    text,
+                    req,
+                    run.plan().adapter_phases_need_negative(),
+                ),
+            )
         };
-        // The negative (unconditional) context is encoded once iff ANY phase uses CFG.
-        let mp_need_neg = mp_resolved
-            .as_ref()
-            .map(|r| r.iter().any(|p| pipeline::krea_uses_cfg(p.guidance)))
-            .unwrap_or(false);
 
         let stage_residency = req
             .memory
@@ -1062,10 +1090,10 @@ impl Generator for KreaGenerator {
                 // Multi-phase: the `Resident` path encodes in the heavy branch from the warm text phase
                 // (stays on the `Resident` marker); the `Sequential` path must encode here, before the
                 // text phase drops.
-                KreaTextPhase::Resident if mp_resolved.is_some() => Ok(KreaEncoded::Resident),
-                KreaTextPhase::Sequential(text) if mp_resolved.is_some() => {
-                    let (context, negative) =
-                        pipeline::encode_multiphase_contexts(text, req, mp_need_neg)?;
+                KreaTextPhase::Resident if multiphase.is_some() => Ok(KreaEncoded::Resident),
+                KreaTextPhase::Sequential(text) if multiphase.is_some() => {
+                    let run = multiphase.as_ref().expect("phase run exists in this arm");
+                    let (context, negative) = run.encode(|| encode_multiphase(run, text))?;
                     Ok(KreaEncoded::MultiPhase { context, negative })
                 }
                 KreaTextPhase::Resident => Ok(KreaEncoded::Resident),
@@ -1084,28 +1112,19 @@ impl Generator for KreaGenerator {
             },
             |_| Ok(self.device.synchronize()?),
             |heavy, encoded, on_progress| match (heavy, encoded) {
-                // Multi-phase render (sc-13887): drive the resolved phases over the ONE global Raw schedule
-                // through a job-local re-adapted DiT (the shared resident is never mutated). `Sequential`
-                // carries the pre-encoded contexts; `Resident` encodes here from the warm text phase.
+                // Both physical residencies evaluate the exact DiT already selected by the
+                // loader. Only the borrowed request phase selection changes across evaluations.
                 (
                     KreaHeavyPhase::Sequential(heavy),
                     KreaEncoded::MultiPhase { context, negative },
                 ) => {
-                    let resolved = mp_resolved
-                        .as_ref()
-                        .expect("multi-phase encode implies a resolved plan");
+                    let run = multiphase.as_ref().expect("phase encoding requires a run");
                     self.file_pin_spec.read_files_unchanged(
                         self.file_pin_spec.file_source_paths(),
                         || {
                             synchronize(pipeline::render_multiphase(
-                                heavy.vae(),
-                                &self.root,
-                                self.native_dit.as_ref(),
-                                self.loaded_quant,
-                                &self.device,
-                                resolved,
-                                &self.adapters,
-                                &self.file_pin_spec,
+                                heavy.heavy(),
+                                run,
                                 &context,
                                 negative.as_ref(),
                                 req,
@@ -1115,28 +1134,22 @@ impl Generator for KreaGenerator {
                     )
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident)
-                    if mp_resolved.is_some() =>
+                    if multiphase.is_some() =>
                 {
-                    let resolved = mp_resolved
-                        .as_ref()
-                        .expect("mp_resolved is Some in this arm");
+                    let run = multiphase.as_ref().expect("phase run exists in this arm");
                     deferred_encoding.set(false);
                     let comps = &resident.components;
-                    let (context, negative) = gen_core::with_prompt_encoding(on_progress, || {
-                        pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)
+                    let (context, negative) = run.encode(|| {
+                        gen_core::with_prompt_encoding(on_progress, || {
+                            encode_multiphase(run, comps.text())
+                        })
                     })?;
                     self.file_pin_spec.read_files_unchanged(
                         self.file_pin_spec.file_source_paths(),
                         || {
                             synchronize(pipeline::render_multiphase(
-                                comps.vae(),
-                                &self.root,
-                                self.native_dit.as_ref(),
-                                self.loaded_quant,
-                                &self.device,
-                                resolved,
-                                &self.adapters,
-                                &self.file_pin_spec,
+                                &comps.heavy,
+                                run,
                                 &context,
                                 negative.as_ref(),
                                 req,
@@ -1221,12 +1234,12 @@ impl Generator for KreaGenerator {
                 } else {
                     reference.map(|(_, strength)| strength)
                 };
-                let executed_steps = pipeline::executed_steps_for_request(
-                    raw_schedule,
-                    img2img_strength,
-                    mp_resolved.as_deref(),
-                    req,
-                )?;
+                let executed_steps = match plan {
+                    Some(plan) => plan.sigmas().len().saturating_sub(1) as u32,
+                    None => {
+                        pipeline::executed_steps_for_request(raw_schedule, img2img_strength, req)?
+                    }
+                };
                 Some(pag.execution_report(executed_steps))
             }
             None => None,
@@ -1532,7 +1545,7 @@ fn ensure_multiphase_allowed_for(
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
     if req.phases.is_some() && has_diff_patch {
-        return Err(gen_core::Error::Msg(format!(
+        return Err(gen_core::Error::Unsupported(format!(
             "{id}: multi-phase denoise is not supported on a model loaded with a diff-patch \
              (.diff/.diff_b) adapter — a diff-patch folds irreversibly into the base weights at load \
              and cannot be toggled off for a base-only phase; load a low-rank LoRA/LoKr adapter for \
@@ -1733,6 +1746,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         ),
         _ => None,
     };
+    // Folded diff patches intentionally never get a runtime selection bank.
+    let has_diff_patch = spec.read_prepared_files_unchanged(|| {
+        Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
+    })?;
+    let phase_adapters = descriptor.capabilities.supports_phases && !has_diff_patch;
     let device = candle_gen::default_device()?;
     let resident_root = root.clone();
     let resident_device = device.clone();
@@ -1774,6 +1792,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let heavy_facts = checkpoint_facts.clone();
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
+            let adapters = pipeline::AdapterLoad {
+                specs: &resident_adapters,
+                phase_source: phase_adapters.then_some(&resident_file_spec),
+            };
             let components = resident_file_spec.read_files_unchanged(
                 resident_file_spec.file_source_paths(),
                 || match (resident_native.as_ref(), resident_convrot.as_ref()) {
@@ -1783,7 +1805,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             &resident_text_encoder,
                             native_dit,
                             &resident_device,
-                            &resident_adapters,
+                            adapters,
                             native_quant,
                             text_quant,
                             resident_pid.as_ref(),
@@ -1795,13 +1817,13 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                         &resident_text_encoder,
                         convrot_dit,
                         &resident_device,
-                        &resident_adapters,
+                        adapters,
                     ),
                     (None, None) => pipeline::load_components_with_encoder(
                         &resident_root,
                         &resident_text_encoder,
                         &resident_device,
-                        &resident_adapters,
+                        adapters,
                         resident_pid.as_ref(),
                     ),
                     (Some(_), Some(_)) => {
@@ -1839,6 +1861,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             Ok(KreaTextPhase::Sequential(Box::new(text)))
         },
         move |use_pid, _, cancel| {
+            let adapters = pipeline::AdapterLoad {
+                specs: &heavy_adapters,
+                phase_source: phase_adapters.then_some(&heavy_file_spec),
+            };
             let heavy = heavy_file_spec.read_files_unchanged(
                 heavy_file_spec.file_source_paths(),
                 || match (heavy_native.as_ref(), heavy_convrot.as_ref()) {
@@ -1848,7 +1874,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             &heavy_root,
                             native_dit,
                             &heavy_device,
-                            &heavy_adapters,
+                            adapters,
                             heavy_quant,
                             pipeline::PidLoad {
                                 spec: heavy_pid.as_ref(),
@@ -1871,7 +1897,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             &heavy_root,
                             convrot_dit,
                             &heavy_device,
-                            &heavy_adapters,
+                            adapters,
                         )?;
                         candle_gen::check_cancel(cancel)?;
                         Ok(heavy)
@@ -1879,7 +1905,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                     (None, None) => pipeline::load_residency_heavy_for_request(
                         &heavy_root,
                         &heavy_device,
-                        &heavy_adapters,
+                        adapters,
                         heavy_pid.as_ref(),
                         use_pid,
                         cancel,
@@ -1901,12 +1927,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         root,
         text_encoder_source,
         native_dit,
-        // The multi-phase diff-patch guard input (sc-13887): read adapter keys for every registered
-        // tier, through the prepared-file pin so a swap between prepare and load is caught. ConvRot
-        // low-rank adapters remain additive while any diff patch still drives residency policy.
-        has_diff_patch: spec.read_prepared_files_unchanged(|| {
-            Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
-        })?,
+        has_diff_patch,
         adapters: spec.adapters.clone(),
         file_pin_spec: spec.clone(),
         checkpoint_facts,
@@ -3743,6 +3764,21 @@ const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: registered_krea_begin_request,
     };
 
+fn compile_raw_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if req.phases.is_none() {
+        return Ok(None);
+    }
+    validate_phases(KREA_2_RAW_ID, req)?;
+    let has_diff_patch = spec.read_prepared_files_unchanged(|| {
+        Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
+    })?;
+    ensure_multiphase_allowed_for(KREA_2_RAW_ID, has_diff_patch, req)?;
+    pipeline::compile_multiphase_plan(&raw_descriptor(), spec, req).map(Some)
+}
+
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -3750,6 +3786,10 @@ pub fn register_providers(
     let registry = registry
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: KREA_2_RAW_ID,
+            compile: compile_raw_render_plan,
+        })
         .register_generator(EDIT_REGISTRATION)
         .register_generator(TURBO_EDIT_REGISTRATION)
         .register_generator(control_registry::REGISTRATION);
@@ -7772,6 +7812,43 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         assert!(validate_phases(KREA_2_RAW_ID, &r).is_ok());
     }
 
+    #[test]
+    fn multiphase_registry_compiles_raw_plan_and_refuses_folded_patch_before_loading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = phase_req(vec![phase(2, Some(3.5)), phase(1, Some(0.0))]);
+        let spec = LoadSpec::new(WeightsSource::Dir(tmp.path().into()));
+        let registry = provider_registry().unwrap();
+        let plan = registry
+            .compile_render_plan(KREA_2_RAW_ID, &spec, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.adapter_phases().len(), 2);
+        assert!(plan.adapter_phases_need_negative());
+        assert_eq!(plan.executed_steps(), 3);
+
+        let source = tmp.path().join("patch.safetensors");
+        let weight = candle_gen::candle_core::Tensor::zeros(
+            (1, 1),
+            candle_gen::candle_core::DType::F32,
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &std::collections::HashMap::from([("img_in.diff", weight)]),
+            &source,
+        )
+        .unwrap();
+        let spec = spec.with_adapters(vec![AdapterSpec::new(
+            source,
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        assert!(matches!(
+            registry.compile_render_plan(KREA_2_RAW_ID, &spec, &request),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("diff-patch")
+        ));
+    }
+
     /// Multi-phase is Raw-only in v1: Turbo/edit reject it (Turbo is CFG-free single-phase; edit is out
     /// of scope). Exercised through the full generator `validate`, so the whole request-gate chain runs.
     #[test]
@@ -8203,31 +8280,24 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             ..Default::default()
         };
         assert_eq!(
-            pipeline::executed_steps_for_request(false, None, None, &t2i_req).unwrap(),
+            pipeline::executed_steps_for_request(false, None, &t2i_req).unwrap(),
             8
         );
         assert_eq!(
-            pipeline::executed_steps_for_request(true, None, None, &t2i_req).unwrap(),
+            pipeline::executed_steps_for_request(true, None, &t2i_req).unwrap(),
             52
         );
         assert_eq!(
-            pipeline::executed_steps_for_request(false, Some(Some(0.5)), None, &t2i_req).unwrap(),
+            pipeline::executed_steps_for_request(false, Some(Some(0.5)), &t2i_req).unwrap(),
             4
         );
         assert_eq!(
-            pipeline::executed_steps_for_request(false, Some(Some(1.0)), None, &t2i_req).unwrap(),
+            pipeline::executed_steps_for_request(false, Some(Some(1.0)), &t2i_req).unwrap(),
             0
         );
-        let mp = multiphase::resolve_phases(
-            &[phase(20, Some(3.5)), phase(8, Some(1.0))],
-            3.5,
-            0,
-            KREA_2_RAW_ID,
-        )
-        .unwrap();
-        assert_eq!(
-            pipeline::executed_steps_for_request(true, None, Some(&mp), &t2i_req).unwrap(),
-            28
-        );
+        let request = phase_req(vec![phase(20, Some(3.5)), phase(8, Some(1.0))]);
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::new()));
+        let plan = compile_raw_render_plan(&spec, &request).unwrap().unwrap();
+        assert_eq!(plan.sigmas().len() - 1, 28);
     }
 }

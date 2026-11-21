@@ -35,12 +35,20 @@
 //! text-encoder LoRAs (this is a DiT-only merge) and conv-shaped (4-D) factors (the merge folds only
 //! into the 2-D Linear projections).
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, LoadSpec, PinnedWeightsFile};
-use candle_gen::quant::{AdaptLinear, LokrFactors};
+use candle_gen::candle_core::{self, DType, Device, Tensor, TensorId};
+use candle_gen::gen_core::memory_strategy::{
+    upcast_adapter_file_residency, UpcastAdapterFileResidency, UpcastLoraCopy,
+};
+use candle_gen::gen_core::phase::PhaseAdapterScale;
+use candle_gen::gen_core::{
+    self, AdapterKind, AdapterSpec, GenerationPhase, LoadSpec, PinnedWeightsFile,
+};
+use candle_gen::quant::{AdaptLinear, Adapter, LokrFactors};
 use candle_gen::train::lora::{
     parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
     LoraLinear,
@@ -525,22 +533,15 @@ fn resolve_diff_stem(stem: &str) -> String {
 
 /// Whether any of `specs` is a ComfyUI/lightx2v **diff-patch** (carries a `.diff`/`.diff_b` key) — the
 /// input to the multi-phase diff-patch guard (epic 13879, sc-13887). A diff-patch delta folds
-/// IRREVERSIBLY into the dense base at load ([`fold_diff_patch`], `W += δ`); every job-local DiT the
-/// multi-phase render loads from that snapshot inherits the mutated base, and
-/// [`crate::transformer::Krea2Transformer::clear_adapters`] (which only drops low-rank forward-time
-/// residuals) cannot undo it — so a "base-only" phase would silently carry the diff-patch. Multi-phase
-/// is therefore rejected loudly on such a model. Read from each adapter file's tensor keys.
-/// **Best-effort:** a file we cannot read yields `false` here, but the same file is read for real by the
-/// load-time [`fold_diff_patch`] / [`install_additive`], which surfaces the genuine error loudly — so an
-/// unreadable file never silently slips a diff-patch through into a wrong multi-phase render (mirrors
-/// mlx-gen-krea's `adapters_have_diff_patch`).
+/// into the dense base at load, so the provider refuses selectable phases with any such adapter.
+/// Read only the safetensors headers. The authoritative installer reports a malformed file.
 pub fn any_diff_patch(specs: &[AdapterSpec]) -> bool {
     specs.iter().any(|spec| {
-        read_adapter(&spec.path)
-            .map(|af| {
-                af.tensors
-                    .keys()
-                    .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+        candle_gen::gen_core::safetensors_path_tensor_headers(&spec.path)
+            .map(|headers| {
+                headers.iter().any(|tensor| {
+                    tensor.name.ends_with(".diff") || tensor.name.ends_with(".diff_b")
+                })
             })
             .unwrap_or(false)
     })
@@ -651,7 +652,275 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+    ratio: f64,
     source: usize,
+}
+
+/// Adapter allocation bound for a Candle Krea Raw phase plan. CUDA uses separate device and
+/// host domains. Costs include the original default stack and the largest active phase, even
+/// when different prepared adapter values share the same installed source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhaseAdapterMemory {
+    /// Installed default factors and their compute copies, plus the request-only device peak.
+    pub device_bytes: u64,
+    /// The largest single phase's alternate right factors and associated dtype caches.
+    pub request_device_bytes: u64,
+    /// Model-owned unscaled LoKr rights and a conservative bound on one phase's transfer sources.
+    pub host_bytes: u64,
+}
+
+pub fn phase_adapter_memory(
+    spec: &LoadSpec,
+    phases: &[GenerationPhase],
+) -> gen_core::Result<PhaseAdapterMemory> {
+    let files = spec
+        .adapters
+        .iter()
+        .map(|adapter| {
+            spec.read_file_unchanged_if_prepared(&adapter.path, |path| {
+                upcast_adapter_file_residency(path, 2, UpcastLoraCopy::Cached).ok_or_else(|| {
+                    gen_core::Error::Unsupported(format!(
+                        "Krea cannot price phase adapter {} from safetensors metadata",
+                        path.display(),
+                    ))
+                })
+            })
+        })
+        .collect::<gen_core::Result<Vec<_>>>()?;
+    phase_adapter_memory_from_files(&spec.adapters, &files, phases)
+}
+
+fn phase_adapter_memory_from_files(
+    adapters: &[AdapterSpec],
+    files: &[UpcastAdapterFileResidency],
+    phases: &[GenerationPhase],
+) -> gen_core::Result<PhaseAdapterMemory> {
+    let mut default_device = 0_u64;
+    let mut resident_host = 0_u64;
+    let variant_policy = files
+        .iter()
+        .map(|file| {
+            default_device = default_device.saturating_add(file.device_bytes);
+            let (device, host) = file
+                .lokr
+                .iter()
+                .fold((0_u64, 0_u64), |(device, host), dims| {
+                    // Original and alternate factors share the F32 left matrix. The alternate owns a
+                    // separately baked F32 right matrix and its own BF16 left/right compute preparation.
+                    let right = dims.b.saturating_mul(dims.d).saturating_mul(4);
+                    let compute_copies = dims.factor_elements().saturating_mul(2);
+                    (
+                        device.saturating_add(right).saturating_add(compute_copies),
+                        host.saturating_add(right),
+                    )
+                });
+            resident_host = resident_host.saturating_add(host);
+            (device, host)
+        })
+        .collect::<Vec<_>>();
+
+    let mut request_device_bytes = 0_u64;
+    let mut transfer_host = 0_u64;
+    for phase in phases {
+        let mut seen = HashSet::new();
+        let mut phase_device = 0_u64;
+        let mut phase_host = 0_u64;
+        for selected in &phase.adapters {
+            let Some(spec) = adapters.get(selected.adapter) else {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "Krea phase adapter slot {} exceeds the installed stack",
+                    selected.adapter,
+                )));
+            };
+            let scale = selected.weight.unwrap_or(spec.scale);
+            if !scale.is_finite() {
+                return Err(gen_core::Error::Unsupported(
+                    "Krea phase adapter scale must be finite".into(),
+                ));
+            }
+            if scale.to_bits() == spec.scale.to_bits()
+                || !seen.insert((selected.adapter, scale.to_bits()))
+            {
+                continue;
+            }
+            // Include changed zero scales conservatively. Ordinary AdaptLinear skips them,
+            // while ConvRot's historic LoKr path evaluates its baked zero factor.
+            let (device, host) = variant_policy[selected.adapter];
+            phase_device = phase_device.saturating_add(device);
+            phase_host = phase_host.saturating_add(host);
+        }
+        request_device_bytes = request_device_bytes.max(phase_device);
+        transfer_host = transfer_host.max(phase_host);
+    }
+    Ok(PhaseAdapterMemory {
+        device_bytes: default_device.saturating_add(request_device_bytes),
+        request_device_bytes,
+        host_bytes: resident_host.saturating_add(transfer_host),
+    })
+}
+
+/// Additional information kept only by models which admit runtime phase selection. The
+/// resident projection still owns its ordinary additive stack and default baked factors.
+#[derive(Default)]
+pub(crate) struct PhaseAdapterBindings {
+    projections: BTreeMap<String, ProjectionBindings>,
+    pins: Vec<PinnedWeightsFile>,
+}
+
+#[derive(Default)]
+struct ProjectionBindings {
+    lora: BTreeMap<usize, usize>,
+    lokr: BTreeMap<usize, (usize, LoKrPhaseSource)>,
+}
+
+pub(crate) struct LoKrPhaseSource {
+    right: Tensor,
+    ratio: f64,
+}
+
+impl PhaseAdapterBindings {
+    fn add_lora(&mut self, path: &str, source: usize, index: usize) {
+        self.projections
+            .entry(path.to_owned())
+            .or_default()
+            .lora
+            .insert(source, index);
+    }
+
+    fn add_lokr(&mut self, path: &str, source: usize, index: usize, raw: LoKrPhaseSource) {
+        self.projections
+            .entry(path.to_owned())
+            .or_default()
+            .lokr
+            .insert(source, (index, raw));
+    }
+
+    pub(crate) fn bind<'a>(
+        &'a self,
+        projections: impl IntoIterator<Item = (String, &'a crate::quant::QLinear)>,
+    ) -> Result<PhaseAdapterTopology<'a>> {
+        self.ensure_unchanged()?;
+        let projections: HashMap<_, _> = projections
+            .into_iter()
+            .filter_map(|(path, projection)| {
+                self.projections.get(&path).map(|value| (projection, value))
+            })
+            .map(|(projection, bindings)| (std::ptr::from_ref(projection) as usize, bindings))
+            .collect();
+        if projections.len() != self.projections.len() {
+            return Err(CandleError::Unsupported(
+                "Krea phase adapter bindings differ from the placed transformer's projection inventory".into(),
+            ));
+        }
+        Ok(PhaseAdapterTopology { projections })
+    }
+
+    pub(crate) fn ensure_unchanged(&self) -> Result<()> {
+        for pin in &self.pins {
+            pin.verify_unchanged()?;
+        }
+        Ok(())
+    }
+}
+
+/// Bind canonical load-time paths to the already-placed, borrowed model for this request only.
+/// Addresses are opaque lookup keys and never dereferenced. The borrow keeps the model in place.
+pub(crate) struct PhaseAdapterTopology<'a> {
+    projections: HashMap<usize, &'a ProjectionBindings>,
+}
+
+impl<'a> PhaseAdapterTopology<'a> {
+    pub(crate) fn phase<'b>(
+        &'b self,
+        scales: &'b [PhaseAdapterScale],
+    ) -> PhaseAdapterSelection<'b> {
+        PhaseAdapterSelection {
+            projections: &self.projections,
+            scales,
+            lokr: RefCell::default(),
+        }
+    }
+}
+
+/// One active phase's immutable source selection. Alternate LoKr w2 factors and their dtype
+/// preparations live only until this phase ends. All forwards, including text fusion, reuse them.
+pub(crate) struct PhaseAdapterSelection<'a> {
+    projections: &'a HashMap<usize, &'a ProjectionBindings>,
+    scales: &'a [PhaseAdapterScale],
+    lokr: RefCell<HashMap<(TensorId, u64), LokrFactors>>,
+}
+
+impl PhaseAdapterSelection<'_> {
+    pub(crate) fn selected(
+        &self,
+        projection: &crate::quant::QLinear,
+    ) -> impl Iterator<Item = (usize, f64, Option<&LoKrPhaseSource>)> + '_ {
+        let bindings = self
+            .projections
+            .get(&(std::ptr::from_ref(projection) as usize));
+        let scales = if bindings.is_some() { self.scales } else { &[] };
+        // Keep the legacy per-projection LoRA-before-LoKr grouping. Within each kind, the phase
+        // authored order is authoritative, including duplicates, with sparse source slots skipped.
+        scales
+            .iter()
+            .filter_map(move |phase| {
+                let &index = bindings?.lora.get(&phase.slot())?;
+                Some((index, f64::from(phase.scale()), None))
+            })
+            .chain(scales.iter().filter_map(move |phase| {
+                let (index, source) = bindings?.lokr.get(&phase.slot())?;
+                Some((
+                    *index,
+                    source.ratio * f64::from(phase.scale()),
+                    Some(source),
+                ))
+            }))
+    }
+
+    pub(crate) fn lokr(
+        &self,
+        installed: &LokrFactors,
+        source: &LoKrPhaseSource,
+        scale: f64,
+    ) -> candle_core::Result<LokrFactors> {
+        let key = (installed.w2.id(), scale.to_bits());
+        let mut factors = self.lokr.borrow_mut();
+        match factors.entry(key) {
+            std::collections::hash_map::Entry::Occupied(value) => Ok(value.get().clone()),
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(slot
+                .insert(installed.with_scaled_right(&source.right, scale)?)
+                .clone()),
+        }
+    }
+
+    pub(crate) fn forward_linear(
+        &self,
+        projection: &crate::quant::QLinear,
+        linear: &AdaptLinear,
+        input: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        linear.forward_with_selected_adapters(
+            input,
+            self.selected(projection).map(|(index, scale, source)| {
+                let adapter = linear.adapters.get(index).ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "Krea phase adapter binding does not match the installed stack".into(),
+                    )
+                })?;
+                if let (Adapter::LokrStructured { factors }, Some(source)) = (adapter, source) {
+                    if scale != 0.0 && scale.to_bits() != factors.scale.to_bits() {
+                        return Ok((
+                            Cow::Owned(Adapter::LokrStructured {
+                                factors: self.lokr(factors, source, scale)?,
+                            }),
+                            scale,
+                        ));
+                    }
+                }
+                Ok((Cow::Borrowed(adapter), scale))
+            }),
+        )
+    }
 }
 
 /// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
@@ -775,7 +1044,8 @@ fn resolve_lokr_file(
                 None => (1.0, 1.0), // both factors full ⇒ lycoris scale 1
             }
         };
-        let full = (alpha as f64 / rank as f64) * scale as f64;
+        let ratio = f64::from(alpha) / f64::from(rank);
+        let full = ratio * f64::from(scale);
         pending.entry(path).or_default().push(PendingLokr {
             w1: g.factors.get("lokr_w1").cloned(),
             w1_a: g.factors.get("lokr_w1_a").cloned(),
@@ -784,6 +1054,7 @@ fn resolve_lokr_file(
             w2_a: g.factors.get("lokr_w2_a").cloned(),
             w2_b: g.factors.get("lokr_w2_b").cloned(),
             scale: full,
+            ratio,
             source,
         });
     }
@@ -908,7 +1179,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     specs: &[AdapterSpec],
     pre_applied: usize,
 ) -> Result<AdditiveReport> {
-    install_additive_inner(dit, specs, pre_applied, None, read_adapter)
+    install_additive_inner(dit, specs, pre_applied, None, read_adapter, None)
 }
 
 /// The same adapter identities guard all text-fusion and forward installs for a request.
@@ -937,14 +1208,6 @@ impl<'a> PinnedPhaseAdapters<'a> {
         })?;
         pin.read_unchanged(read_adapter)
     }
-
-    pub(crate) fn install<D: AdditiveDit + ?Sized>(
-        &self,
-        dit: &mut D,
-        specs: &[AdapterSpec],
-    ) -> Result<AdditiveReport> {
-        install_additive_inner(dit, specs, 0, None, |path| self.read(path))
-    }
 }
 
 /// Production composition entry point: preserves the diff-patch match count for every selected
@@ -967,7 +1230,34 @@ pub fn install_additive_with_diff<D: AdditiveDit + ?Sized>(
         diff_applied_by_spec.iter().sum(),
         Some(diff_applied_by_spec),
         read_adapter,
+        None,
     )
+}
+
+pub(crate) fn install_selected_adapters(
+    dit: &mut crate::transformer::Krea2Transformer,
+    specs: &[AdapterSpec],
+    load_spec: &LoadSpec,
+    diff_applied_by_spec: &[usize],
+) -> Result<()> {
+    if diff_applied_by_spec.iter().any(|&count| count != 0) {
+        return Err(CandleError::Unsupported(
+            "a Krea phase-selectable adapter source changed to a merge-only diff patch".into(),
+        ));
+    }
+    let source = PinnedPhaseAdapters::new(load_spec, specs)?;
+    let mut bindings = PhaseAdapterBindings::default();
+    install_additive_inner(
+        dit,
+        specs,
+        diff_applied_by_spec.iter().sum(),
+        Some(diff_applied_by_spec),
+        |path| source.read(path),
+        Some(&mut bindings),
+    )?;
+    bindings.pins = source.pins.into_values().collect();
+    dit.set_phase_adapters(bindings);
+    Ok(())
 }
 
 fn install_additive_inner<D: AdditiveDit + ?Sized>(
@@ -976,6 +1266,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
     pre_applied: usize,
     diff_applied_by_spec: Option<&[usize]>,
     mut read: impl FnMut(&Path) -> Result<AdapterFile>,
+    mut phase_bindings: Option<&mut PhaseAdapterBindings>,
 ) -> Result<AdditiveReport> {
     let mut report = AdditiveReport::default();
 
@@ -997,6 +1288,16 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
 
     for (source, spec) in specs.iter().enumerate() {
         let af = read(&spec.path)?;
+        if phase_bindings.is_some()
+            && af
+                .tensors
+                .keys()
+                .any(|key| key.ends_with(".diff") || key.ends_with(".diff_b"))
+        {
+            return Err(CandleError::Unsupported(
+                "a Krea phase-selectable adapter source includes a merge-only diff patch".into(),
+            ));
+        }
         let has_unstamped_lokr = has_lokr_keys(&af);
         match (spec.kind, af.declares_lokr()) {
             (AdapterKind::Lora, true) => {
@@ -1050,6 +1351,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
     dit.visit_additive(&mut |path, proj| {
         let (out_f, in_f) = proj.out_in();
         let strict = proj.strict_admission();
+        let mut projection_index = 0;
         if let Some(list) = pending_lora.get(path) {
             matched.insert(path.to_string());
             for p in list {
@@ -1068,6 +1370,10 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
                     continue;
                 }
                 proj.add_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale)?;
+                if let Some(bindings) = phase_bindings.as_deref_mut() {
+                    bindings.add_lora(path, p.source, projection_index);
+                }
+                projection_index += 1;
                 applied += 1;
                 applied_sources.insert(p.source);
             }
@@ -1075,7 +1381,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
         if let Some(list) = pending_lokr.get(path) {
             matched.insert(path.to_string());
             for p in list {
-                match LokrFactors::build(
+                match LokrFactors::build_with_unscaled_right(
                     p.scale,
                     (out_f, in_f),
                     p.w1.as_ref(),
@@ -1086,8 +1392,12 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
                     p.w2_a.as_ref(),
                     p.w2_b.as_ref(),
                 )? {
-                    Some(factors) => {
+                    Some((factors, right)) => {
                         proj.add_lokr(factors.to_device(&device)?)?;
+                        if let Some(bindings) = phase_bindings.as_deref_mut() {
+                            bindings.add_lokr(path, p.source, projection_index, LoKrPhaseSource { right, ratio: p.ratio });
+                        }
+                        projection_index += 1;
                         applied += 1;
                         applied_sources.insert(p.source);
                     }
@@ -1164,6 +1474,118 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn phase_binding_preserves_sparse_duplicates_and_lora_before_lokr() {
+        let projection = crate::quant::QLinear::dense(candle_gen::candle_nn::Linear::new(
+            Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+            None,
+        ));
+        let mut bindings = PhaseAdapterBindings::default();
+        bindings.add_lora("projection", 1, 0);
+        bindings.add_lora("projection", 4, 1);
+        bindings.add_lokr(
+            "projection",
+            2,
+            2,
+            LoKrPhaseSource {
+                right: Tensor::zeros((1, 1), DType::F32, &Device::Cpu).unwrap(),
+                ratio: 1.5,
+            },
+        );
+        assert!(bindings.bind(std::iter::empty()).is_err());
+        let topology = bindings.bind([("projection".into(), &projection)]).unwrap();
+        let requested = [
+            PhaseAdapterScale::new(2, 0.5),
+            PhaseAdapterScale::new(4, -0.25),
+            PhaseAdapterScale::new(3, 0.99),
+            PhaseAdapterScale::new(1, 1.0),
+            PhaseAdapterScale::new(4, 0.25),
+        ];
+        let selected = topology.phase(&requested);
+        let actual = selected
+            .selected(&projection)
+            .map(|(index, scale, source)| (index, scale, source.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (1, -0.25, false),
+                (0, 1.0, false),
+                (1, 0.25, false),
+                (2, 0.75, true)
+            ]
+        );
+        assert_eq!(topology.phase(&[]).selected(&projection).count(), 0);
+    }
+
+    #[test]
+    fn phase_adapter_memory_prices_only_the_largest_simultaneous_variant_set() {
+        use gen_core::PhaseAdapter;
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("adapter.safetensors");
+        // Unscaled w1 is 2 x 3. The small low-rank source legs expand to a 4 x 5 right matrix.
+        save_tensors(
+            &HashMap::from([
+                (
+                    "projection.lokr_w1",
+                    Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "projection.lokr_w2_a",
+                    Tensor::zeros((4, 1), DType::F32, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "projection.lokr_w2_b",
+                    Tensor::zeros((1, 5), DType::F32, &Device::Cpu).unwrap(),
+                ),
+            ]),
+            &source,
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(tmp.path().into()))
+            .with_adapters(vec![AdapterSpec::new(source, 1.0, AdapterKind::Lora)]);
+        spec.prepare_file_sources().unwrap();
+        let phase = |weights: &[f32]| GenerationPhase {
+            steps: 1,
+            guidance: None,
+            adapters: weights
+                .iter()
+                .map(|&weight| PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(weight),
+                })
+                .collect(),
+        };
+        let default = phase_adapter_memory(&spec, &[phase(&[1.0])]).unwrap();
+        assert_eq!(
+            default,
+            PhaseAdapterMemory {
+                device_bytes: 156,
+                request_device_bytes: 0,
+                host_bytes: 80,
+            }
+        );
+        let consecutive =
+            phase_adapter_memory(&spec, &[phase(&[0.5, 0.5]), phase(&[-0.5])]).unwrap();
+        assert_eq!(
+            consecutive,
+            PhaseAdapterMemory {
+                device_bytes: 288,
+                request_device_bytes: 132,
+                host_bytes: 160,
+            }
+        );
+        let simultaneous = phase_adapter_memory(&spec, &[phase(&[0.5, -0.5])]).unwrap();
+        assert_eq!(
+            simultaneous,
+            PhaseAdapterMemory {
+                device_bytes: 420,
+                request_device_bytes: 264,
+                host_bytes: 240,
+            }
+        );
     }
 
     #[test]
