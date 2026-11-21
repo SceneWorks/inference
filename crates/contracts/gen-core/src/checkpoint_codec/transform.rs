@@ -12,6 +12,10 @@ pub trait LogicalKeyMapping {
     fn mapping_id(&self) -> &'static str;
 
     /// This dialect requires per-matrix scalar FP8 companions even without a Comfy descriptor.
+    /// Older projected INT8 sources imply per-row scales and accept any power-of-four rotation width.
+    fn legacy_convrot_geometry(&self) -> bool {
+        false
+    }
     fn inline_fp8_scales(&self) -> bool {
         false
     }

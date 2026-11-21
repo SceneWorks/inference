@@ -157,11 +157,9 @@ impl CheckpointReceiptScope {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         for (paths, group) in readers {
-            for reader in group {
-                let value = reader.facts()?;
-                if value.receipt().tensor_count != 0 {
-                    facts.push(self.bind(&paths, value)?);
-                }
+            let value = crate::CheckpointReadAccounting::combined(&group)?;
+            if value.receipt().tensor_count != 0 {
+                facts.push(self.bind(&paths, value)?);
             }
         }
         Ok(facts)

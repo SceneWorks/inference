@@ -16,9 +16,13 @@ use std::sync::Arc;
 
 #[derive(Default)]
 struct SourceMapping {
+    legacy_convrot: bool,
     transforms: BTreeMap<String, gen_core::checkpoint_codec::LogicalTransformDeclaration>,
 }
 impl LogicalKeyMapping for SourceMapping {
+    fn legacy_convrot_geometry(&self) -> bool {
+        self.legacy_convrot
+    }
     fn mapping_id(&self) -> &'static str {
         "candle-constructor-v1"
     }
@@ -717,9 +721,26 @@ pub fn mmap_var_builder(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
+    mmap_var_builder_with_geometry(files, dtype, device, false)
+}
+pub fn mmap_var_builder_with_geometry(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+    legacy_convrot: bool,
+) -> Result<VarBuilder<'static>> {
     // SAFETY: callers must keep the supplied checkpoint files unmodified while mapped.
     let st = unsafe { MmapedSafetensors::multi(files)? };
-    let backend: Box<dyn SimpleBackend> = match ProjectionSource::from_mapped(st, files, device)? {
+    let backend: Box<dyn SimpleBackend> = match ProjectionSource::from_mapped_for(
+        st,
+        files,
+        device,
+        |_| true,
+        SourceMapping {
+            legacy_convrot,
+            ..Default::default()
+        },
+    )? {
         Ok(source) => Box::new(source),
         Err(plain) => Box::new(plain),
     };

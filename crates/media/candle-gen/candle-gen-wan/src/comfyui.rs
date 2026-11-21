@@ -31,11 +31,11 @@
 //!
 //! * **UMT5-XXL TE** (`text_encoders/umt5_xxl_fp8_e4m3fn_scaled`) is itself the *same* companion
 //!   scaled-fp8 convention as the DiT experts, so it reuses this module's dequant
-//!   ([`dequant_comfyui_umt5`]) — but with **no** key remap: the ComfyUI file already carries the HF
+//!   ([`scaled_builder`]) — but with **no** key remap: the ComfyUI file already carries the HF
 //!   `UMT5EncoderModel` keys candle's [`crate::text_encoder::Umt5Encoder`] reads.
 //! * **Wan VAE** (`vae/wan_2.1_vae.safetensors`) is the *same physical* Wan2.1 16-channel VAE the
 //!   Qwen-Image lane reads (sc-10830); its native-key layout is remapped to the diffusers schema
-//!   [`crate::vae16::WanVae16`] reads by the shared core-crate [`remap_vae_wan_to_diffusers`].
+//!   [`crate::vae16::WanVae16`] reads by the shared core-crate [`candle_gen::comfyui_vae::wan_vae_var_builder`].
 //!
 //! When a TE or VAE file is absent the component falls back to a resident `SceneWorks/wan2.2-*-candle`
 //! snapshot tier (the sc-10671 posture); with both present a Wan generation is sourced entirely from
@@ -45,17 +45,18 @@
 //! (`sceneworks-core::base_weights`, sc-10662); this module is handed files already identified as Wan
 //! scaled-fp8 experts.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::DType;
 use candle_gen::{CandleError, Result};
 
 /// The in-place ComfyUI files for a Wan2.2 A14B load. The two DiT experts are always read in place
 /// (sc-10671); the UMT5 text encoder and the Wan VAE are read in place too when present (sc-10909),
 /// else they fall back to the resident snapshot tier. Read in place, never copied; each is remapped +
-/// dequant'd/upcast in memory at component build ([`remap_and_dequant_comfyui_expert`],
-/// [`dequant_comfyui_umt5`], [`remap_vae_wan_to_diffusers`]).
+/// dequant'd/upcast in memory at component build ([`scaled_builder`],
+/// [`scaled_builder`], [`candle_gen::comfyui_vae::wan_vae_var_builder`]).
 #[derive(Clone, Debug)]
 pub(crate) struct ComfyuiExperts {
     /// The **high-noise** expert (ComfyUI `*_high_noise_*` file) → candle `transformer/`.
@@ -63,160 +64,40 @@ pub(crate) struct ComfyuiExperts {
     /// The **low-noise** expert (ComfyUI `*_low_noise_*` file) → candle `transformer_2/`.
     pub low_file: PathBuf,
     /// The UMT5-XXL text encoder (`text_encoders/umt5_xxl_fp8_e4m3fn_scaled`, companion scaled-fp8).
-    /// `Some` ⇒ read in place ([`dequant_comfyui_umt5`]); `None` ⇒ the snapshot `text_encoder/` dir.
+    /// `Some` ⇒ read in place ([`scaled_builder`]); `None` ⇒ the snapshot `text_encoder/` dir.
     pub te_file: Option<PathBuf>,
     /// The Wan VAE (`vae/wan_2.1_vae.safetensors`, native WAN-VAE keys, bf16). `Some` ⇒ read in place
-    /// ([`remap_vae_wan_to_diffusers`]); `None` ⇒ the snapshot `vae/` dir.
+    /// ([`candle_gen::comfyui_vae::wan_vae_var_builder`]); `None` ⇒ the snapshot `vae/` dir.
     pub vae_file: Option<PathBuf>,
 }
 
-/// Native WAN-VAE → diffusers key remap for the in-place VAE (sc-10909). The ComfyUI
-/// `vae/wan_2.1_vae.safetensors` is the *same physical* Wan2.1 16-channel VAE the Qwen-Image lane
-/// reads (sc-10830) — its native-key layout is remapped to the diffusers schema
-/// [`crate::vae16::WanVae16`] reads by the shared core-crate helper (a pure key rename; values pass
-/// through as bf16, upcast to the VAE compute dtype at `VarBuilder` build). Re-exported so this
-/// module's in-place seam names it locally alongside the DiT + UMT5 transforms.
-pub use candle_gen::comfyui_vae::remap_vae_wan_to_diffusers;
-
-/// The top-level empty marker tensor ComfyUI writes to flag a scaled-fp8 checkpoint; dropped.
-const SCALED_FP8_MARKER: &str = "scaled_fp8";
-
-/// Remap + dequant a ComfyUI Wan2.2 expert tensor map into the schema
-/// [`crate::transformer::WanTransformer`] reads, ready for `VarBuilder::from_tensors`. Native-Wan DiT
-/// keys → the diffusers keys candle reads ([`remap_wan_key`]); see [`dequant_scaled_fp8_map`] for the
-/// dequant.
-///
-/// Errors when **no** `.scale_weight` companion is present — a file that is not a ComfyUI scaled-fp8
-/// Wan expert (wrong file/family/quant), surfaced rather than loaded as garbage (no silent fallback).
-pub fn remap_and_dequant_comfyui_expert(
-    src: HashMap<String, Tensor>,
+/// Construct name views over the import while keeping scale planes private to the source codec.
+pub(crate) fn scaled_builder(
+    file: &std::path::Path,
     dtype: DType,
-) -> Result<HashMap<String, Tensor>> {
-    dequant_scaled_fp8_map(src, dtype, "wan ComfyUI expert", remap_wan_key)
-}
-
-/// Dequant a ComfyUI UMT5-XXL text encoder tensor map (`umt5_xxl_fp8_e4m3fn_scaled`, the SAME companion
-/// scaled-fp8 convention as the DiT experts, sc-10909) to the schema [`crate::text_encoder::Umt5Encoder`]
-/// reads, ready for `VarBuilder::from_tensors`. The ComfyUI file already carries the HF
-/// `UMT5EncoderModel` keys candle reads (`shared.weight`, `encoder.block.N.layer.{0,1}.…`,
-/// `encoder.final_layer_norm.weight`) — so, unlike the DiT, there is **no** key remap, only the
-/// scaled-fp8 dequant (the embedding / norms / `relative_attention_bias` are dense and cast; the fp8
-/// Linears are `w = w_fp8·scale_weight`). `dtype` is the encoder compute dtype (f32).
-///
-/// Errors when **no** `.scale_weight` companion is present (not a scaled-fp8 UMT5 checkpoint).
-pub fn dequant_comfyui_umt5(
-    src: HashMap<String, Tensor>,
-    dtype: DType,
-) -> Result<HashMap<String, Tensor>> {
-    // UMT5 keys already match candle's schema — identity remap, dequant only.
-    dequant_scaled_fp8_map(src, dtype, "wan ComfyUI UMT5", |k| k.to_owned())
-}
-
-/// Shared companion-scaled-fp8 dequant over a ComfyUI tensor map, applying `remap` to each surviving
-/// key. `what` labels error messages (`"wan ComfyUI expert"` / `"wan ComfyUI UMT5"`).
-///
-/// - **Dequant**: an `F8_E4M3` `{module}.weight` with a scalar `{module}.scale_weight` sibling becomes
-///   `w = (w_fp8·scale_weight)` cast to `dtype`. `.scale_input` companions and the `scaled_fp8` marker
-///   are consumed/dropped. Non-quantized tensors are cast to `dtype` (integer buffers pass through).
-/// - **Remap**: `remap(key)` — the DiT native→diffusers rename, or identity for the already-diffusers
-///   UMT5 keys.
-///
-/// Errors when **no** `.scale_weight` companion is present — a file that is not a ComfyUI scaled-fp8
-/// checkpoint (wrong file/family/quant), surfaced rather than loaded as garbage (no silent fallback).
-fn dequant_scaled_fp8_map(
-    src: HashMap<String, Tensor>,
-    dtype: DType,
-    what: &str,
-    remap: impl Fn(&str) -> String,
-) -> Result<HashMap<String, Tensor>> {
-    // Pass 1: index the per-module `.scale_weight` scalars (base = key without the `.scale_weight`
-    // suffix, e.g. `blocks.0.self_attn.q`). A weight `{base}.weight` dequants against `scales[base]`.
-    // The scalars (shape `[]`) are cloned out — a cheap Arc bump on tiny storage — so pass 2 can *drain*
-    // `src` without an outstanding borrow, letting each fp8 source drop as its bf16 twin is inserted.
-    let mut scales: HashMap<String, Tensor> = HashMap::new();
-    for (key, tensor) in &src {
-        if let Some(base) = key.strip_suffix(".scale_weight") {
-            scales.insert(base.to_owned(), tensor.clone());
-        }
-    }
-    if scales.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "{what}: no `.scale_weight` companions found — not a ComfyUI scaled-fp8 checkpoint \
-             (wrong file/family/quant?)"
-        )));
-    }
-
-    // Pass 2: consume `src` by value (`into_iter`) so each source tensor drops at the end of its
-    // iteration rather than staying resident for the whole map — the fp8 source (~14 GB per expert)
-    // never sits alongside the *entire* bf16 output (~28 GB), only the single tensor being converted.
-    let mut out = HashMap::with_capacity(src.len());
-    for (key, tensor) in src {
-        // Drop the marker, the rope `freqs` buffer (candle recomputes it; absent on UMT5), and both
-        // scale companions.
-        if key == SCALED_FP8_MARKER || key == "freqs" || key.ends_with(".freqs") {
-            continue;
-        }
-        if key.ends_with(".scale_weight") || key.ends_with(".scale_input") {
-            continue;
-        }
-        // Dequant an fp8 Linear weight that has a scale companion; otherwise a plain cast.
-        let value = match key
-            .strip_suffix(".weight")
-            .and_then(|base| scales.get(base))
+    dev: &candle_gen::candle_core::Device,
+    rename: impl Fn(&str) -> String,
+) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
+    let mut has_scale = false;
+    let builder = candle_gen::loader::remap_file_var_builder(file, dtype, dev, |key, _| {
+        has_scale |= key.ends_with(".scale_weight") || key.ends_with(".weight_scale");
+        if key == "scaled_fp8"
+            || key == "freqs"
+            || key.ends_with(".freqs")
+            || candle_gen::gen_core::checkpoint_codec::projection_companion_base(key).is_some()
         {
-            Some(scale) => dequant_scaled_fp8(what, &key, &tensor, scale, dtype)?,
-            None => cast_dense(what, &key, &tensor, dtype)?,
-        };
-        // Free the fp8 source before the (possibly reallocating) insert, so peak host RAM tracks the
-        // shrinking source + growing output rather than both maps in full.
-        drop(tensor);
-        out.insert(remap(&key), value);
+            return Ok(Vec::new());
+        }
+        Ok(vec![candle_gen::loader::SourceView::Whole(rename(key))])
+    })?;
+    if !has_scale {
+        return Err(CandleError::Msg(
+            "Wan ComfyUI scaled checkpoint has no weight scale companion".into(),
+        ));
     }
-    Ok(out)
+    Ok(builder)
 }
 
-/// `w = (w_fp8 → f32 · scale_weight) → dtype`. `scale_weight` is a per-tensor **scalar** (shape `[]`),
-/// applied via `affine` (multiply-by-f64) — reconstructing the real weight ComfyUI stored as fp8. The
-/// f32 intermediate is per-tensor (immediately downcast), so it never accumulates: the only f32 buffer
-/// resident is the one weight mid-conversion. (Map-level peak — the shrinking fp8 source vs. the growing
-/// bf16 output — is bounded by [`dequant_scaled_fp8_map`]'s drain, not by this f32 step.)
-fn dequant_scaled_fp8(
-    what: &str,
-    key: &str,
-    w: &Tensor,
-    scale: &Tensor,
-    dtype: DType,
-) -> Result<Tensor> {
-    let s = scale
-        .to_dtype(DType::F32)?
-        .to_scalar::<f32>()
-        .map_err(|e| {
-            CandleError::Msg(format!(
-                "{what}: scale_weight for {key:?} is not a scalar: {e}"
-            ))
-        })?;
-    w.to_dtype(DType::F32)?
-        .affine(s as f64, 0.0)?
-        .to_dtype(dtype)
-        .map_err(|e| CandleError::Msg(format!("{what}: dequant {key:?} failed: {e}")))
-}
-
-/// Cast a non-quantized tensor to the compute `dtype`; integer buffers (indices/caches) pass through.
-fn cast_dense(what: &str, key: &str, t: &Tensor, dtype: DType) -> Result<Tensor> {
-    if t.dtype().is_int() {
-        return Ok(t.clone());
-    }
-    t.to_dtype(dtype)
-        .map_err(|e| CandleError::Msg(format!("{what}: cast {key:?} failed: {e}")))
-}
-
-/// Native-Wan → diffusers key rename ([`crate::transformer::WanTransformer`]'s schema). Every rule is
-/// exact/prefix/segment-scoped so no two collide; a key matching no rule (e.g. `patch_embedding.*`)
-/// passes through unchanged.
-///
-/// Hoisted to `pub(crate)` so the native-GGUF k-quant loader ([`crate::gguf`], sc-12735) reuses the
-/// SAME native→diffusers mapping the ComfyUI scaled-fp8 seam uses (QuantStack GGUF ships the native-Wan
-/// key layout too) — one source of truth for the rename, tested here and in [`crate::gguf`].
 pub(crate) fn remap_wan_key(key: &str) -> String {
     // --- top-level head ---
     if let Some(rest) = key.strip_prefix("head.head.") {
@@ -287,6 +168,36 @@ pub(crate) fn remap_wan_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    const SCALED_FP8_MARKER: &str = "scaled_fp8";
+    fn fixture(
+        src: HashMap<String, Tensor>,
+        dtype: DType,
+        rename: fn(&str) -> String,
+    ) -> Result<HashMap<String, Tensor>> {
+        let dir = tempfile::tempdir().map_err(|e| CandleError::Msg(e.to_string()))?;
+        let path = dir.path().join("model.safetensors");
+        candle_gen::candle_core::safetensors::save(&src, &path)?;
+        let names: Vec<_> = src.keys().map(|s| rename(s)).collect();
+        let vb = super::scaled_builder(&path, dtype, &Device::Cpu, rename)?;
+        names
+            .into_iter()
+            .filter(|k| vb.contains_tensor(k))
+            .map(|k| Ok((k.clone(), vb.get_unchecked(&k)?)))
+            .collect()
+    }
+    fn remap_and_dequant_comfyui_expert(
+        src: HashMap<String, Tensor>,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        fixture(src, dtype, remap_wan_key)
+    }
+    fn dequant_comfyui_umt5(
+        src: HashMap<String, Tensor>,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        fixture(src, dtype, str::to_owned)
+    }
+
     use super::*;
     use candle_gen::candle_core::{Device, Tensor};
 

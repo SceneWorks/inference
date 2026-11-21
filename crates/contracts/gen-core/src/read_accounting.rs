@@ -354,9 +354,14 @@ impl CheckpointReadAccounting {
     pub fn facts(&self) -> Result<CheckpointWeightFacts> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (mut plan, measured) = self.resolved(&state);
+        Self::apply_dense_layouts(plan.to_mut(), &state);
         let receipt = Self::receipt_for(&plan, &measured);
+        CheckpointWeightFacts::new(plan.as_ref(), self.capability.clone(), receipt)
+            .map_err(|e| Error::Msg(e.to_string()))
+    }
+    fn apply_dense_layouts(plan: &mut LogicalWeightPlan, state: &State) {
         for (&i, (shape, width)) in &state.dense_layouts {
-            let row = &mut plan.to_mut().tensors[i];
+            let row = &mut plan.tensors[i];
             row.shape = shape.clone();
             row.resident_encoding = match width {
                 2 if row.resident_encoding == WeightEncoding::DenseF16 => WeightEncoding::DenseF16,
@@ -370,7 +375,92 @@ impl CheckpointReadAccounting {
                     shape.iter().fold(*width as u64, |n, &d| n * d as u64);
             }
         }
-        CheckpointWeightFacts::new(plan.as_ref(), self.capability.clone(), receipt)
+    }
+
+    /// Several component views may cover one mapped shard set. Preserve every measured row and
+    /// attribute each physical payload to its source exactly once, even across overlapping views.
+    pub(crate) fn combined(readers: &[Arc<Self>]) -> Result<CheckpointWeightFacts> {
+        let first = readers
+            .first()
+            .ok_or_else(|| Error::Msg("empty checkpoint reader set".into()))?;
+        if readers.len() == 1 {
+            return first.facts();
+        }
+        let mut plan = LogicalWeightPlan {
+            mapping_id: first.plan.mapping_id,
+            tensors: Vec::new(),
+            companions: Vec::new(),
+            source_bytes: 0,
+        };
+        let mut measured = State::default();
+        let mut indices = BTreeMap::new();
+        let mut companions = BTreeMap::new();
+        let mut source_bytes = BTreeMap::new();
+        let mut capability = std::collections::BTreeSet::new();
+        for reader in readers {
+            capability.extend(reader.capability.native_codec_ids());
+            let state = reader.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut view, cells) = reader.resolved(&state);
+            Self::apply_dense_layouts(view.to_mut(), &state);
+            if view.mapping_id != plan.mapping_id {
+                plan.mapping_id = "combined-source-views-v1";
+            }
+            let mut sizes = BTreeMap::new();
+            for (i, row) in view.tensors.iter().enumerate() {
+                *sizes.entry(row.physical_key.clone()).or_insert(0u64) += row.source_bytes;
+                let key = (row.logical_key.clone(), row.physical_key.clone());
+                let measurement = cells.rows.get(&i).copied();
+                let dest = *indices.entry(key).or_insert_with(|| {
+                    let n = plan.tensors.len();
+                    plan.tensors.push(row.clone());
+                    n
+                });
+                if let Some(value) = measurement {
+                    if let Some(previous) = measured.rows.insert(dest, value) {
+                        if previous != value {
+                            return Err(format!(
+                                "{}: incompatible measured views of a shared source row",
+                                row.logical_key
+                            )
+                            .into());
+                        }
+                    }
+                    plan.tensors[dest] = row.clone();
+                }
+            }
+            for (name, size) in sizes {
+                let previous = source_bytes.insert(name, size);
+                if previous.is_some_and(|n| n != size) {
+                    return Err("inconsistent physical sizes across component views".into());
+                }
+            }
+            for companion in &view.companions {
+                let current = companions
+                    .entry(companion.physical_key.clone())
+                    .or_insert_with(|| companion.clone());
+                if current.source_bytes != companion.source_bytes
+                    || current.owner_physical_key != companion.owner_physical_key
+                {
+                    return Err("inconsistent physical companion across component views".into());
+                }
+                current.resident_bytes = current.resident_bytes.max(companion.resident_bytes);
+            }
+        }
+        // The original compiler assigns source bytes to one logical child in a split. Preserve
+        // that ownership if it exists. Slice partitions sum to the original physical size.
+        let mut assigned = BTreeMap::new();
+        for row in &mut plan.tensors {
+            let used = assigned.entry(row.physical_key.clone()).or_insert(0u64);
+            row.source_bytes = row
+                .source_bytes
+                .min(source_bytes[&row.physical_key] - *used);
+            *used += row.source_bytes;
+        }
+        plan.companions = companions.into_values().collect();
+        plan.source_bytes = source_bytes.values().sum::<u64>()
+            + plan.companions.iter().map(|c| c.source_bytes).sum::<u64>();
+        let receipt = Self::receipt_for(&plan, &measured);
+        CheckpointWeightFacts::new(&plan, NativeExecutionCapability::new(capability), receipt)
             .map_err(|e| Error::Msg(e.to_string()))
     }
 }

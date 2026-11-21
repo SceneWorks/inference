@@ -382,7 +382,7 @@ struct Pipeline {
     comfyui_dit: Option<gen_core::PinnedWeightsFile>,
     /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830, `vae/
     /// qwen_image_vae.safetensors`, native WAN-VAE keys). When set, the VAE is built from this file
-    /// (key-remapped, see [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE falls back to
+    /// (key-remapped, see [`candle_gen::comfyui_vae::wan_vae_var_builder`]); when `None` the VAE falls back to
     /// the snapshot's `vae/` dir. Independent of `comfyui_dit` (either can be in place).
     comfyui_vae: Option<gen_core::PinnedWeightsFile>,
 }
@@ -861,19 +861,15 @@ impl Pipeline {
                     ));
                 }
                 dit_file.read_unchanged(|path| {
-                    let mut names=Vec::new();
-                    let vb=candle_gen::loader::remap_file_var_builder(path,DIT_DTYPE,&self.device,|key,_|{
-                        if key=="scaled_fp8"{return Ok(Vec::new());}
-                        let stripped=key.strip_prefix("model.diffusion_model.").filter(|n|!n.is_empty()).ok_or_else(||CandleError::Msg(format!("qwen-image ComfyUI DiT: tensor {key} outside required namespace")))?;
-                        names.push(stripped.to_owned());
-                        Ok(vec![candle_gen::loader::SourceView::Whole(stripped.to_owned())])
-                    })?;
-                    if names.is_empty(){return Err(CandleError::Msg("qwen-image ComfyUI DiT has no prefixed tensors".into()));}
+                    let vb = comfyui::transformer_builder(path, DIT_DTYPE, &self.device)?;
                     #[cfg(test)]
                     run_comfyui_dit_load_test_hook(&vb)?;
-                    let additive=self.adapters.is_empty() || crate::adapters::adapters_additive_capable(&self.adapters)?;
-                    let dit_vb=if additive {vb} else {
-                        crate::adapters::fold_checkpoint(vb,&self.adapters)?
+                    let additive = self.adapters.is_empty()
+                        || crate::adapters::adapters_additive_capable(&self.adapters)?;
+                    let dit_vb = if additive {
+                        vb
+                    } else {
+                        crate::adapters::fold_checkpoint(vb, &self.adapters)?
                     };
                     let mut dit = QwenTransformer::new_gs(
                         &self.dit_cfg,
@@ -1759,7 +1755,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// component build.
 ///
 /// `vae_file`, when `Some`, is the tree's `vae/qwen_image_vae.safetensors` (native WAN-VAE keys,
-/// remapped to the diffusers schema by [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE
+/// remapped to the diffusers schema by [`candle_gen::comfyui_vae::wan_vae_var_builder`]); when `None` the VAE
 /// comes from `snapshot_dir`'s `vae/`. `snapshot_dir` is a resident Qwen-Image diffusers snapshot
 /// supplying the Qwen2.5-VL text encoder (still snapshot-sourced — it is scaled-fp8, sc-10671) and the
 /// tokenizer (and the VAE when `vae_file` is `None`). txt2img only; adapters apply to the remapped

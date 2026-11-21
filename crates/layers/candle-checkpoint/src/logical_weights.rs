@@ -1375,7 +1375,10 @@ fn decode(
             if tensor.residency.mode != ResidencyMode::Packed
                 || shape != source_shape
                 || companion.dtype() != StDtype::F32
-                || companion.shape() != [geometry.out_features, 1]
+                || match (geometry.flat_scales, companion.shape()) {
+                    (true, [n]) | (false, [n, 1]) => *n != geometry.out_features,
+                    _ => true,
+                }
             {
                 return Err(CandleError::Msg(format!(
                     "{}: expected native ConvRot I8 matrix and F32 row scales",
@@ -1396,12 +1399,10 @@ fn decode(
                     tensor.logical_key
                 )));
             }
-            let slice = gen_core::convrot_int8::ConvRotInt8::from_geometry(
-                geometry.rotation_group,
-                &[n, k],
-                &[n, 1],
-            )
-            .map_err(CandleError::Msg)?;
+            let slice = gen_core::convrot_int8::ConvRotInt8 {
+                out_features: n,
+                ..*geometry
+            };
             let scale_bytes = &companion.data()[start * 4..(start + n) * 4];
             cst::read_source_bytes(scale_bytes, |bytes| {
                 slice.validate_scale_values(

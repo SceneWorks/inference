@@ -57,13 +57,9 @@
 //! with **synthetic** packed fixtures built on the **real** AvDiT block-0 key layout the hf-header audit
 //! captured — they prove the packed-detect seam fires on that layout, not that a real tier was ingested.
 
-use std::sync::OnceLock;
-
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
 use candle_gen::quant as shared;
-#[cfg(feature = "cuda")]
-use candle_gen::quant::Int8Linear;
 use candle_gen::quant::{ActPrecision, LokrFactors, Nvfp4Linear, Nvfp4Regime};
 use candle_gen::train::lora::LoraLinear;
 
@@ -81,7 +77,7 @@ pub const GROUP_SIZE: usize = shared::MLX_GROUP_SIZE; // 64
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 enum QLinearBase {
     Adapt(LoraLinear),
-    ConvRot(ConvRotLinear),
+    ConvRot(Linear),
     Nvfp4(Nvfp4Linear),
 }
 
@@ -94,37 +90,6 @@ pub struct QLinear {
     out_features: usize,
     attestation: String,
     bounded_packed_training: bool,
-}
-
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct ConvRotLinear {
-    group_size: usize,
-    rotation: OnceLock<Tensor>,
-    #[cfg(feature = "cuda")]
-    linear: Int8Linear,
-}
-
-impl ConvRotLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            let rotation = if let Some(rotation) = self.rotation.get() {
-                rotation
-            } else {
-                let rotation = shared::regular_hadamard(self.group_size, x.device())?;
-                self.rotation.get_or_init(|| rotation)
-            };
-            let rotated = shared::convrot_rotate(x, rotation)?;
-            __model_proof_output!(self.linear.forward(&rotated))
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = x;
-            candle_gen::candle_core::bail!(
-                "LTX INT8-ConvRot has no dense CPU fallback; build with cuda and run its IGEMM operator"
-            )
-        }
-    }
 }
 
 impl QLinear {
@@ -312,46 +277,26 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             };
             let loaded = source.load_projection(&path, vb.device())?;
             let (base, in_features, out_features, attestation) = match loaded {
-                crate::advanced_quant::LoadedAdvancedProjection::Int8ConvRot {
-                    codes,
-                    scale,
-                    group_size,
-                    context,
-                    attestation,
-                } => {
-                    if !vb.device().is_cuda() || !context.is_int8() {
+                crate::advanced_quant::LoadedAdvancedProjection::Int8ConvRot { attestation } => {
+                    let operand = vb
+                        .native_linear_weight(&format!("{key}.weight"))?
+                        .ok_or_else(|| {
+                            candle_gen::candle_core::Error::Msg(format!(
+                                "LTX ConvRot {path} requires a native IGEMM weight"
+                            ))
+                        })?;
+                    if operand.format_id() != candle_gen::gen_core::convrot_int8::CODEC_ID {
                         candle_gen::candle_core::bail!(
-                            "LTX INT8-ConvRot projection `{path}` requires a live CUDA cuBLASLt IGEMM context; dense fallback is forbidden"
+                            "LTX {path}: incompatible native projection"
                         );
                     }
-                    let (out_features, in_features) = codes.dims2()?;
-                    #[cfg(feature = "cuda")]
-                    let linear = Int8Linear::from_per_channel_parts(
-                        codes,
-                        scale,
-                        bias_tensor,
-                        context.handle_for(vb.device())?.clone(),
-                    )?;
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        let _ = (codes, scale, bias_tensor, context);
-                        candle_gen::candle_core::bail!(
-                            "LTX INT8-ConvRot requires a cuda-enabled executable"
-                        );
-                    }
-                    #[cfg(feature = "cuda")]
-                    {
-                        (
-                            QLinearBase::ConvRot(ConvRotLinear {
-                                group_size,
-                                rotation: OnceLock::new(),
-                                linear,
-                            }),
-                            in_features,
-                            out_features,
-                            attestation,
-                        )
-                    }
+                    let (out_features, in_features) = operand.dims();
+                    (
+                        QLinearBase::ConvRot(Linear::from_native(operand, bias_tensor)),
+                        in_features,
+                        out_features,
+                        attestation,
+                    )
                 }
                 crate::advanced_quant::LoadedAdvancedProjection::Nvfp4 {
                     packed,
