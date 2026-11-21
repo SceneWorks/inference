@@ -140,10 +140,10 @@ impl LinearBias {
         let dtype = if encoded_bias {
             // With encoded bias and weight, no dense operand retains the role dtype.
             // H3 keeps its I/O and timestep projections in F32; context and final norm use BF16.
-            if matches!(prefix, "context_embedder" | "norm_out.linear") {
-                DType::BF16
-            } else {
+            if gen_core_h3::h3_projection_keeps_fp32(prefix) {
                 DType::F32
+            } else {
+                DType::BF16
             }
         } else {
             w.require(&bias_key)?.dtype()
