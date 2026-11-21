@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
-    Capabilities, Conditioning, ControlKind, GenerationMemory, Image, MemoryGeometry,
-    MemoryRunOutcome, Modality, WeightsSource,
+    AdapterKind, AdapterSpec, Capabilities, Conditioning, ControlKind, GenerationMemory,
+    GenerationPhase, Image, MemoryGeometry, MemoryRunOutcome, Modality, PhaseAdapter,
+    WeightsSource,
 };
 
 fn descriptor() -> ModelDescriptor {
@@ -32,6 +33,157 @@ fn pass(sigmas: Vec<f32>, executed_steps: usize, capture_sigma: f32) -> PackedIm
         executed_steps,
         capture_sigma,
     }
+}
+
+fn adapter_phase_request() -> GenerationRequest {
+    GenerationRequest {
+        count: 2,
+        seed: Some(11),
+        phases: Some(vec![
+            GenerationPhase {
+                steps: 1,
+                guidance: Some(0.0),
+                adapters: vec![],
+            },
+            GenerationPhase {
+                steps: 2,
+                guidance: None,
+                adapters: vec![
+                    PhaseAdapter {
+                        adapter: 1,
+                        weight: Some(-0.25),
+                    },
+                    PhaseAdapter {
+                        adapter: 0,
+                        weight: None,
+                    },
+                    PhaseAdapter {
+                        adapter: 1,
+                        weight: Some(1.25),
+                    },
+                ],
+            },
+            GenerationPhase {
+                steps: 1,
+                guidance: Some(0.0),
+                adapters: vec![],
+            },
+        ]),
+        ..Default::default()
+    }
+}
+
+fn adapter_phase_descriptor() -> ModelDescriptor {
+    let mut descriptor = descriptor();
+    descriptor.capabilities.supports_phases = true;
+    descriptor
+}
+
+fn adapter_phase_spec() -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir("/base".into())).with_adapters(vec![
+        AdapterSpec::new("/a".into(), 0.6, AdapterKind::Lora),
+        AdapterSpec::new("/b".into(), 0.8, AdapterKind::Lokr),
+    ])
+}
+
+#[test]
+fn krea_plan_lowers_ordered_phase_arguments_and_binds_the_request_and_load() {
+    let descriptor = adapter_phase_descriptor();
+    let spec = adapter_phase_spec();
+    let req = adapter_phase_request();
+    let sigmas = vec![1.0, 0.75, 0.5, 0.25, 0.0];
+    let plan = RenderPlan::krea_multiphase(&descriptor, &spec, &req, pass(sigmas, 4, 0.0)).unwrap();
+    assert_eq!(plan.denoise_spans(), [0..1, 1..3, 3..4]);
+    let [base, adapted, final_base] = plan.adapter_phases() else {
+        panic!("expected base → adapted → base");
+    };
+    assert_eq!(base.arguments(), final_base.arguments());
+    assert!(base.arguments().adapters().is_empty());
+    assert!(!base.arguments().uses_classifier_free_guidance());
+    assert_eq!(adapted.arguments().guidance(), 3.5);
+    assert!(adapted.arguments().uses_classifier_free_guidance());
+    assert_eq!(
+        adapted.arguments().adapters(),
+        [
+            PhaseAdapterScale::new(1, -0.25),
+            PhaseAdapterScale::new(0, 0.6),
+            PhaseAdapterScale::new(1, 1.25),
+        ]
+    );
+    assert!(plan.adapter_phases_need_negative());
+    let json = serde_json::to_value(&plan).unwrap();
+    assert_eq!(
+        json["pass"]["adapter_phases"]["installation"],
+        "immutable_residuals"
+    );
+    assert_eq!(
+        json["pass"]["adapter_phases"]["sampling"],
+        "reset_solver_and_reuse_image_seed"
+    );
+    assert!(plan.check_request(&descriptor, &req).is_ok());
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&spec))
+        .is_ok());
+    assert!(plan.clone().with_inert_split_at(2).is_err());
+    assert!(RenderPlan::packed_image_trajectory(
+        &descriptor,
+        &req,
+        pass(plan.sigmas().to_vec(), 4, 0.0)
+    )
+    .is_err());
+
+    let mut swapped = spec.clone();
+    swapped.adapters.swap(0, 1);
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&swapped))
+        .is_err());
+    let mut changed = req.clone();
+    changed.phases.as_mut().unwrap()[1].adapters.swap(0, 1);
+    assert!(plan.check_request(&descriptor, &changed).is_err());
+    changed = req.clone();
+    changed.pag = Some(crate::PagConfig::default());
+    assert!(plan.check_request(&descriptor, &changed).is_err());
+    changed = req;
+    changed.text_style_gain = Some(0.75);
+    assert!(plan.check_request(&descriptor, &changed).is_err());
+}
+
+#[test]
+fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
+    let descriptor = adapter_phase_descriptor();
+    let spec = adapter_phase_spec();
+    let mut req = adapter_phase_request();
+    let short =
+        RenderPlan::krea_multiphase(&descriptor, &spec, &req, pass(vec![1.0, 0.65, 0.0], 2, 0.0))
+            .unwrap();
+    assert_eq!(short.denoise_spans(), [0..1, 1..2]);
+    assert_eq!(short.capture_sigma(), 0.0);
+    req.phases.as_mut().unwrap()[2].adapters.push(PhaseAdapter {
+        adapter: 2,
+        weight: None,
+    });
+    assert!(
+        RenderPlan::krea_multiphase(
+            &descriptor,
+            &spec,
+            &req,
+            pass(short.sigmas().to_vec(), 2, 0.0),
+        )
+        .is_err(),
+        "an adapter in a clipped phase is still validated"
+    );
+    req.phases.as_mut().unwrap()[2].adapters.clear();
+    let long = RenderPlan::krea_multiphase(
+        &descriptor,
+        &spec,
+        &req,
+        pass(vec![1.0, 0.85, 0.7, 0.55, 0.4, 0.25, 0.0], 6, 0.0),
+    )
+    .unwrap();
+    assert_eq!(long.denoise_spans(), [0..1, 1..3, 3..4]);
+    assert_eq!(long.capture_sigma(), 0.4);
+    assert_eq!(long.denoise_sigmas(), &[1.0, 0.85, 0.7, 0.55, 0.4]);
+    assert_eq!(long.sigmas().len(), 7);
 }
 
 #[test]
@@ -489,6 +641,107 @@ impl MemoryRequestScope for PhaseScope {
     fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
         unreachable!()
     }
+}
+
+#[test]
+fn krea_runner_uses_contiguous_slices_and_the_original_seed_in_each_scope() {
+    let req = adapter_phase_request();
+    let plan = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &adapter_phase_spec(),
+        &req,
+        pass(vec![1.0, 0.75, 0.5, 0.25, 0.0], 4, 0.0),
+    )
+    .unwrap();
+    let mut scope = PhaseScope::default();
+    let mut trace = Vec::new();
+    let output = {
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, Error>(())).unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok::<_, Error>(1.0),
+            |seed, initial, _| {
+                run.denoise_adapter_phases(seed, initial, |phase, sigmas, phase_seed, latent| {
+                    assert_eq!(latent, sigmas[0]);
+                    run.with_active_scope(|_| Ok(()))?
+                        .expect("body runs with the admitted scope");
+                    trace.push((phase.index(), phase_seed, sigmas.to_vec()));
+                    Ok(*sigmas.last().unwrap())
+                })
+            },
+            |_, latent, _| Ok(latent),
+        )
+        .unwrap()
+    };
+    assert_eq!(output, [0.0, 0.0]);
+    assert_eq!(
+        trace,
+        [
+            (0, 11, vec![1.0, 0.75]),
+            (1, 11, vec![0.75, 0.5, 0.25]),
+            (2, 11, vec![0.25, 0.0]),
+            (0, 12, vec![1.0, 0.75]),
+            (1, 12, vec![0.75, 0.5, 0.25]),
+            (2, 12, vec![0.25, 0.0]),
+        ]
+    );
+    assert_eq!(
+        scope
+            .events
+            .iter()
+            .filter(|event| event.1 == MemoryPhase::Denoise)
+            .map(|&(enter, _, phase)| (enter, phase))
+            .collect::<Vec<_>>(),
+        [
+            (true, 0),
+            (false, 0),
+            (true, 1),
+            (false, 1),
+            (true, 2),
+            (false, 2),
+            (true, 0),
+            (false, 0),
+            (true, 1),
+            (false, 1),
+            (true, 2),
+            (false, 2),
+        ]
+    );
+}
+
+#[test]
+fn krea_runner_leaves_failed_phase_for_owner_teardown() {
+    let req = adapter_phase_request();
+    let plan = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &adapter_phase_spec(),
+        &req,
+        pass(vec![1.0, 0.75, 0.5, 0.25, 0.0], 4, 0.0),
+    )
+    .unwrap();
+    let mut scope = PhaseScope::default();
+    {
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, Error>(())).unwrap();
+        let result = run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok(()),
+            |seed, (), _| {
+                run.denoise_adapter_phases(seed, (), |phase, _, _, ()| match phase.index() {
+                    0 => Ok(()),
+                    1 => Err(Error::Canceled),
+                    _ => panic!("a later phase ran after cancellation"),
+                })
+            },
+            |_, (), _| -> Result<()> { panic!("decode started after cancellation") },
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+    }
+    assert_eq!(scope.active, Some(1));
+    scope.finish(MemoryRunOutcome::Canceled).unwrap();
+    assert_eq!(scope.terminal, [MemoryRunOutcome::Canceled]);
+    assert!(scope.active.is_none());
 }
 
 #[test]

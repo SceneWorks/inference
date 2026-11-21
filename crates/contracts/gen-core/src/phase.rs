@@ -2,6 +2,8 @@
 
 use std::collections::{hash_map::Entry, HashMap};
 
+use serde::Serialize;
+
 use crate::MemoryGeometry;
 
 /// Overrides for one projection's installed adapter order and one denoise pass.
@@ -82,7 +84,7 @@ impl<'a> ScaleContext<'a> {
 /// Effective strength for one slot in the request's installed stack. A phase's list is ordered
 /// and can reference the same slot more than once. Individual projections can have sparse
 /// installations, so the slot is not a projection-local residual index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct PhaseAdapterScale {
     slot: usize,
     scale_bits: u32,
@@ -108,7 +110,8 @@ impl PhaseAdapterScale {
 /// The text conditioning branches prepared for this phase. Routes declare their native layout
 /// independently of the guidance number (for example, an embedded guidance input needs no
 /// unconditional preparation).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConditioningBranches {
     Positive,
     PositiveAndNegative,
@@ -116,7 +119,7 @@ pub enum ConditioningBranches {
 
 /// Immutable arguments of one phase. Preparation and forward read the same ordered, effective
 /// residual stack and branch selection. An empty stack means the phase uses the bare base.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PhaseArguments {
     adapters: Vec<PhaseAdapterScale>,
     guidance: f32,
@@ -185,6 +188,51 @@ struct PreparationKey {
     branches: ConditioningBranches,
 }
 
+/// A request's preparation cache for a fixed effective model, adapter stack and encoded
+/// conditioning. Callers may prepare inside the appropriate phase's memory scope. Retained
+/// preparations stay live until the cache is dropped and must be included in that request's
+/// live-set reservation.
+pub struct PhasePreparationCache<T> {
+    entries: HashMap<PreparationKey, T>,
+}
+
+impl<T> Default for PhasePreparationCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<T> PhasePreparationCache<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_or_prepare<E>(
+        &mut self,
+        arguments: &PhaseArguments,
+        geometry: MemoryGeometry,
+        prepare: impl FnOnce(PrepareArguments<'_>, MemoryGeometry) -> Result<T, E>,
+    ) -> Result<&T, E> {
+        let key = PreparationKey {
+            adapters: arguments.adapters.clone(),
+            geometry,
+            branches: arguments.branches,
+        };
+        Ok(match self.entries.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(prepare(
+                PrepareArguments {
+                    adapters: arguments.adapters(),
+                    branches: arguments.branches,
+                },
+                geometry,
+            )?),
+        })
+    }
+}
+
 /// Prepare a request's phases with one fixed effective model, installed adapter stack and set of
 /// encoded conditioning inputs, captured by `prepare`. Use a separate call when any of those
 /// dependencies changes. The per-call cache keys also include the phase's geometry, ordered
@@ -194,39 +242,24 @@ struct PreparationKey {
 ///
 /// This is for drivers that already reserve and retain preparation across their phase plans.
 /// Prepared values must clone by sharing immutable allocations. Equal dependencies clone from
-/// the first phase's preparation, and the lookup only stores indices into the returned plans.
+/// the first phase's preparation.
 pub fn prepare_phases<T: Clone, E>(
     phases: impl IntoIterator<Item = (PhaseArguments, MemoryGeometry)>,
     mut prepare: impl FnMut(PrepareArguments<'_>, MemoryGeometry) -> Result<T, E>,
 ) -> Result<Vec<PreparedPhase<T>>, E> {
-    let mut cache: HashMap<_, usize> = HashMap::new();
-    let mut plans: Vec<PreparedPhase<T>> = Vec::new();
-    for (arguments, geometry) in phases {
-        let key = PreparationKey {
-            adapters: arguments.adapters.clone(),
-            geometry,
-            branches: arguments.branches,
-        };
-        let prepared = match cache.entry(key) {
-            Entry::Occupied(entry) => plans[*entry.get()].prepared.clone(),
-            Entry::Vacant(entry) => {
-                let value = prepare(
-                    PrepareArguments {
-                        adapters: arguments.adapters(),
-                        branches: arguments.branches,
-                    },
-                    geometry,
-                )?;
-                entry.insert(plans.len());
-                value
-            }
-        };
-        plans.push(PreparedPhase {
-            arguments,
-            prepared,
-        });
-    }
-    Ok(plans)
+    let mut cache = PhasePreparationCache::new();
+    phases
+        .into_iter()
+        .map(|(arguments, geometry)| {
+            let prepared = cache
+                .get_or_prepare(&arguments, geometry, &mut prepare)?
+                .clone();
+            Ok(PreparedPhase {
+                arguments,
+                prepared,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

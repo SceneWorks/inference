@@ -2489,8 +2489,6 @@ pub enum TransitionResidency {
     InDeviceLatentUnpackResizeRepack,
     /// Pass-0 VAE decode to RGB pixels -> host/device resize -> pass-1 `ProducedReference` conditioning.
     PixelRoundTripProducedReference,
-    /// Per-phase low-rank adapter residual swap on a job-local transformer without mutating shared base weights.
-    JobLocalAdapterResidualSwap,
     /// MoE expert weight handoff at a boundary step (shedding the inactive expert under staged residency).
     StagedExpertWeightHandoff,
 }
@@ -2907,7 +2905,7 @@ pub enum PhaseTransitionAction {
         to_width: u32,
         to_height: u32,
     },
-    /// `krea_multiphase` transition: per-phase low-rank adapter subset & guidance switch on a job-local DiT.
+    /// `krea_multiphase` transition: select an ordered residual subset and guidance without changing model weights.
     AdapterAndGuidanceSwitch {
         guidance_bits: u32,
         adapters: Vec<(usize, Option<u32>)>,
@@ -3805,15 +3803,19 @@ impl FeatureSpec for KreaMultiphaseFeature {
 
     fn relations(&self) -> FeatureRelations {
         FeatureRelations {
-            conflicts_with_features: vec![LowResStartFeature::ID, InertPhaseSplitFeature::ID],
+            conflicts_with_features: vec![
+                LowResStartFeature::ID,
+                HiresFixFeature::ID,
+                InertPhaseSplitFeature::ID,
+            ],
             conflicts_with_axes: vec![
                 "pass0_reference_conditioning",
                 "pass0_control_conditioning",
                 "pass0_edit_conditioning",
             ],
             requires_features: Vec::new(),
-            requires_capabilities: vec!["multiphase_denoise"],
-            before: vec![HiresFixFeature::ID, TrajectoryObserverFeature::ID],
+            requires_capabilities: vec!["render_plan", "multiphase_denoise"],
+            before: vec![TrajectoryObserverFeature::ID],
             after: Vec::new(),
         }
     }
@@ -3847,7 +3849,7 @@ impl FeatureSpec for KreaMultiphaseFeature {
     fn memory_effect(&self) -> FeatureMemoryEffect {
         FeatureMemoryEffect {
             extra_resident_weight_bytes: 0,
-            transition_residency: TransitionResidency::JobLocalAdapterResidualSwap,
+            transition_residency: TransitionResidency::None,
             introduces_denoise_phase_boundary: true,
             introduces_pass_boundary: false,
             retains_single_pass_schedule: true,
@@ -3859,6 +3861,15 @@ impl FeatureSpec for KreaMultiphaseFeature {
         route: &FeatureRouteStructure,
     ) -> Vec<FeatureInapplicabilityReason> {
         let mut reasons = Vec::new();
+        if !route.has_render_plan {
+            reasons.push(FeatureInapplicabilityReason {
+                code: FeatureInapplicabilityCode::MissingRenderPlan,
+                message: format!(
+                    "route '{}' does not register a pre-load RenderPlan",
+                    route.route_id
+                ),
+            });
+        }
         if !route.supports_multiphase_denoise {
             reasons.push(FeatureInapplicabilityReason {
                 code: FeatureInapplicabilityCode::MissingMultiphaseDenoiseSupport,
@@ -3896,14 +3907,8 @@ impl FeatureSpec for KreaMultiphaseFeature {
             .passes
             .first_mut()
             .ok_or_else(|| Error::Unsupported("composed plan has no pass 0".into()))?;
-        let total_steps: usize = phases.iter().map(|p| p.steps as usize).sum();
-        if total_steps != pass0.executed_steps {
-            return Err(Error::Unsupported(format!(
-                "{}: krea_multiphase total steps {total_steps} does not match pass-0 schedule executed_steps {}",
-                route.route_id, pass0.executed_steps
-            )));
-        }
         let mut cursor = 0usize;
+        let available_steps = pass0.executed_steps;
         let mut composed_phases = Vec::with_capacity(phases.len());
         let packed_tokens =
             (pass0.target_width / pass0.pixel_stride) * (pass0.target_height / pass0.pixel_stride);
@@ -3924,9 +3929,28 @@ impl FeatureSpec for KreaMultiphaseFeature {
                 }
                 adapters.push((*adapter, weight.map(f32::to_bits)));
             }
-            let first_step = cursor;
-            let end_step = cursor + phase.steps as usize;
             let guidance = phase.guidance.unwrap_or(pass0.base_guidance);
+            if !guidance.is_finite()
+                || phase
+                    .adapters
+                    .iter()
+                    .any(|a| a.weight.is_some_and(|w| !w.is_finite()))
+            {
+                return Err(Error::Unsupported(format!(
+                    "{}: krea_multiphase phase {idx} has nonfinite guidance or adapter scale",
+                    route.route_id
+                )));
+            }
+            // `beta` and `ddim_uniform` can change the resolved schedule length. Krea has
+            // always clamped authored boundaries to the available nodes, and never extends
+            // the final authored phase to consume a longer schedule.
+            let first_step = cursor;
+            let end_step = cursor
+                .saturating_add(phase.steps as usize)
+                .min(available_steps);
+            if first_step == end_step {
+                continue;
+            }
             if first_step > 0 {
                 pass0.transitions.push(ComposedPhaseTransition {
                     step: first_step,
@@ -3951,6 +3975,8 @@ impl FeatureSpec for KreaMultiphaseFeature {
             });
             cursor = end_step;
         }
+        pass0.executed_steps = cursor;
+        pass0.sigmas.truncate(cursor + 1);
         pass0.phases = composed_phases;
         Ok(())
     }
