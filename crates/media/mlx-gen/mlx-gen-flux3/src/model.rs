@@ -101,7 +101,11 @@ pub fn descriptor() -> ModelDescriptor {
             // Native MLX tiers (sc-26241): q4/q8 = MLX affine packages converted from the ORIGINAL
             // dense checkpoint (`gen_core_flux3::native_convert::convert_affine`), any of groups
             // 32/64/128 as the package declares. Distinct from Candle's GGML q4/q8 artifacts.
-            supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
+            supported_quants: &[
+                gen_core::Quant::Q4,
+                gen_core::Quant::Q8,
+                gen_core::Quant::Fp8Rowwise,
+            ],
             supports_sequential_offload: true,
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
@@ -235,19 +239,48 @@ pub fn load_dit_with_storage(
         }
     };
     // Dense and packed alike: the exact inventory before any tensor is read.
-    storage.validate_headers(
+    let encoded = storage.validate_source_headers(
         &config.dit,
+        weights,
         &gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?,
     )?;
-    let mut weights = Weights::from_file(weights)
-        .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", weights.display())))?;
+    let mut weights = Weights::from_file_with_layout(
+        weights,
+        |_| false,
+        |key, tensors| {
+            if tensors[key].ndim() < 2 {
+                Dtype::Float32
+            } else {
+                compute
+            }
+        },
+    )
+    .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", weights.display())))?;
+    if encoded {
+        for (key, tensor) in storage.expected_tensors(&config.dit)? {
+            if let (Some(base), [rows, cols]) =
+                (key.strip_suffix(".weight"), tensor.shape.as_slice())
+            {
+                let extent = |n: usize| {
+                    i32::try_from(n).map_err(|_| {
+                        Error::Msg(format!("{key}: tensor dimension exceeds MLX index range"))
+                    })
+                };
+                weights.declare_projection_shape(base, [extent(*rows)?, extent(*cols)?])?;
+            }
+        }
+    }
     // The release ships bf16. Cast every tensor to the compute dtype ONE TENSOR AT A TIME and
     // drop its source handle, so the load peak is the compute-dtype model plus a single source
     // tensor rather than both full copies (the f32 path doubles the DiT; bf16 is a no-op cast).
     let packed_targets = storage.packed_targets(&config.dit)?;
     let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();
     keys.sort();
+    let native = weights.native_tensor_keys();
     for key in keys {
+        if native.contains(&key) {
+            continue;
+        }
         let Some(array) = weights.remove(&key) else {
             continue;
         };
@@ -388,10 +421,7 @@ pub(crate) fn resolve_package(
     let config = gen_core_flux3::resolve_checkpoint(package_dir)?;
     config.validate_route(route_id)?;
     let storage = NativeDitStorage::from_package(package_dir)?;
-    let selection = quantize.or_else(|| {
-        (storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise))
-            .then_some(gen_core::Quant::Fp8Rowwise)
-    });
+    let selection = storage.source_selection(quantize);
     storage.validate_selection(selection, precision)?;
     if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) && !mlx_gen::metal_available()
     {
@@ -405,8 +435,9 @@ pub(crate) fn resolve_package(
     } else {
         config.validate_native_storage_graph()?;
     }
-    storage.validate_headers(
+    storage.validate_source_headers(
         &config.dit,
+        &package_dir.join(gen_core_flux3::DIT_WEIGHTS_FILE),
         &gen_core_flux3::checkpoint_tensor_headers(package_dir)?,
     )?;
     Ok((config, storage))
@@ -481,6 +512,8 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     // Only an optional local source path is retained here. An enabled prepare
     // phase owns the VLM load and a bounded phase drops it before image encoding.
     let upsampler_dir = gen_core_flux3::pup::UpsamplePackage::component_dir(spec)?;
+    let mut loaded_spec = spec.clone();
+    loaded_spec.quantize = storage.source_selection(spec.quantize);
     Ok(Flux3Klein {
         adapter_reports,
         descriptor: if base {
@@ -490,7 +523,7 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         },
         config,
         residency,
-        spec: spec.clone(),
+        spec: loaded_spec,
         memory_strategy,
         upsampler_dir,
         upsampler: Default::default(),

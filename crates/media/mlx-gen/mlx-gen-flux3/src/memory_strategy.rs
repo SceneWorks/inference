@@ -295,9 +295,7 @@ pub(crate) fn generation_contract(
     }
 
     let storage = NativeDitStorage::from_package(&resources.package_dir)?;
-    let selection = spec.quantize.or_else(|| {
-        (storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise)).then_some(Quant::Fp8Rowwise)
-    });
+    let selection = storage.source_selection(spec.quantize);
     storage.validate_selection(selection, precision)?;
     if let Some(calibration) = &mut contract.calibration {
         let group = match storage {
@@ -306,7 +304,11 @@ pub(crate) fn generation_contract(
         };
         calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, selection, group);
     }
-    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
+    let (transformer, encoded) =
+        native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
+    if encoded && storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        contract.calibration = None;
+    }
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
     let decoder = autoencoder_bytes(&resources.autoencoder_file)?;
     let base_bytes = conditioning
@@ -441,6 +443,7 @@ fn account_upsampler(
 
 /// Resident bytes of the DiT as [`crate::model::load_dit`] holds it, priced from the file's
 /// headers by [`dense_dit_projection`].
+#[cfg(test)]
 fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
     projected_safetensors_bytes(weights, dense_dit_projection(precision))
 }
@@ -491,12 +494,12 @@ fn native_dit_bytes(
     precision: Precision,
     storage: NativeDitStorage,
     cfg: &gen_core_flux3::DitConfig,
-) -> CoreResult<u64> {
-    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
-        return dit_bytes(weights, precision);
-    }
+) -> CoreResult<(u64, bool)> {
     let targets = storage.packed_targets(cfg)?;
-    projected_safetensors_bytes(weights, native_dit_projection(precision, &targets))
+    mlx_gen::asset_facts::projected_source_bytes(
+        weights,
+        native_dit_projection(precision, &targets),
+    )
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
@@ -542,7 +545,28 @@ pub fn safety_check(
 
 /// The FLUX 3 MLX memory profile (sc-27307): the requested tier, the still-image reference-route
 /// gate, and one staged text-to-image fixture per implemented optimized rung.
+fn resolved_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let quant = match &spec.weights {
+        gen_core::WeightsSource::Dir(path) if path.join(gen_core_flux3::CONFIG_FILE).is_file() => {
+            let storage = NativeDitStorage::from_package(path)?;
+            let selected = storage.source_selection(spec.quantize);
+            storage.validate_selection(selected, spec.precision)?;
+            selected
+        }
+        _ => spec.quantize,
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
 const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(resolved_tier),
     gates: MemoryProfileGates::within(route_gate),
     fixtures: MemoryProfileFixtures::routes(&[
         MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::Always)
@@ -1092,7 +1116,8 @@ mod tests {
                         NativeDitStorage::Publisher(DitFormat::Dense),
                         &cfg
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .0,
                     dit_bytes(&weights, precision).unwrap()
                 );
             }

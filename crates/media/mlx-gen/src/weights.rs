@@ -233,17 +233,25 @@ impl Weights {
         path: impl AsRef<Path>,
         expert_key: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::from_file_with_layout(path, expert_key, |_, _| Dtype::Bfloat16)
+    }
+    pub fn from_file_with_layout(
+        path: impl AsRef<Path>,
+        expert_key: impl Fn(&str) -> bool,
+        dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
+    ) -> Result<Self> {
         let (mut tensors, metadata) = Self::read_file(path.as_ref())?;
         let declarations: Vec<_> = metadata
             .get("_quantization_metadata")
             .cloned()
             .into_iter()
             .collect();
-        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+        let source_reads = mlx_layers::source::prepare_sources_with_layout(
             &mut tensors,
             &[path.as_ref().to_owned()],
             &declarations,
             expert_key,
+            dense_dtype,
         )?;
         Ok(Self {
             source_reads,
@@ -910,6 +918,23 @@ f,
         self.cast_matching(dtype, |_| true)
     }
 
+    /// Physical arrays owned by native projections. Eager loaders can evaluate or cast
+    /// each dense tensor separately while leaving the weight and its scales byte-exact.
+    pub fn native_tensor_keys(&self) -> std::collections::HashSet<String> {
+        self.tensors
+            .keys()
+            .filter_map(|key| key.strip_suffix(".comfy_quant"))
+            .chain(self.planned_convrot.keys().map(String::as_str))
+            .chain(self.planned_fp8.keys().map(String::as_str))
+            .flat_map(|base| {
+                [".weight", ".weight_scale", ".input_scale", ".comfy_quant"]
+                    .into_iter()
+                    .map(move |suffix| format!("{base}{suffix}"))
+            })
+            .filter(|key| self.tensors.contains_key(key))
+            .collect()
+    }
+
     /// Cast tensors selected by key while preserving every unselected tensor verbatim.
     /// This is useful for mixed-storage modules whose large projection/embedding weights use a
     /// compact dtype while norms, packed codes, scales, and unrelated subtrees retain theirs.
@@ -918,22 +943,9 @@ f,
         dtype: Dtype,
         mut selected: impl FnMut(&str) -> bool,
     ) -> Result<()> {
-        let native: std::collections::HashSet<_> = self
-            .tensors
-            .keys()
-            .filter_map(|key| key.strip_suffix(".comfy_quant"))
-            .chain(self.planned_convrot.keys().map(String::as_str))
-            .chain(self.planned_fp8.keys().map(String::as_str))
-            .map(str::to_owned)
-            .collect();
+        let native = self.native_tensor_keys();
         for (key, value) in &mut self.tensors {
-            let encoded = [".weight", ".weight_scale", ".input_scale", ".comfy_quant"]
-                .iter()
-                .any(|suffix| {
-                    key.strip_suffix(*suffix)
-                        .is_some_and(|base| native.contains(base))
-                });
-            if !encoded && selected(key) && value.dtype() != dtype {
+            if !native.contains(key) && selected(key) && value.dtype() != dtype {
                 *value = value.as_dtype(dtype)?;
             }
         }
