@@ -635,8 +635,8 @@ fn denoise_segment(
     let mut latent = apply_clean_history(noise, history)?;
     run_video_steps(&phase.sigmas, cancel, |step| -> CResult<()> {
         let x = apply_clean_history(&latent, history)?;
-        let updated = advance(step.index, &x, &latent)?;
-        latent = apply_clean_history(&updated, history)?;
+        latent = advance(step.index, &x, &latent)?;
+        latent = apply_clean_history(&latent, history)?;
         let (current, total) = segment_step_progress(segment, step.index, steps, segment_count);
         on_progress(Progress::Step { current, total });
         Ok(())

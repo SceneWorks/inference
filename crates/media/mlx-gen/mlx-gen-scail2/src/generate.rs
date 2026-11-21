@@ -777,8 +777,8 @@ fn denoise_segment(
     let mut latent = apply_clean_history(noise, history)?;
     run_video_steps(&phase.sigmas, cancel, |step| -> Result<()> {
         let x = apply_clean_history(&latent, history)?;
-        let updated = advance(step.index, &x, &latent)?;
-        latent = apply_clean_history(&updated, history)?;
+        latent = advance(step.index, &x, &latent)?;
+        latent = apply_clean_history(&latent, history)?;
         mlx_rs::transforms::eval([&latent])?;
         let current = (segment * steps + step.index + 1) as u32;
         let total = (steps * segment_count) as u32;
