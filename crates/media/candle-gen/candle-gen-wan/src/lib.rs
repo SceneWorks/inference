@@ -238,11 +238,15 @@ fn dense_video_layout(
     );
     let frame_rgb = u64::from(output.width) * u64::from(output.height) * 3;
     let clip_rgb = frame_rgb * u64::from(output.frames);
-    layout.phases[0].decoded_tensor_bytes = clip_rgb * 4;
+    // Both residency paths retain the final latent and original f32 decoded clip while
+    // frames_to_images rounds its separate scaled tensor on the decoder device.
+    let retained = bytes + clip_rgb * 4;
+    layout.phases[0].decoded_tensor_bytes =
+        gen_core_family::candle_round_rgb8_live_bytes(clip_rgb, retained)?;
     // frames_to_images retains the f32 decoded clip and its f32 scaled copy while the
     // separate CPU uint8 clip, final planar-to-interleaved frame and RGB result coexist.
     layout.output_conversion = gen_core::VideoOutputConversion {
-        device_bytes: clip_rgb * 8,
+        device_bytes: retained + clip_rgb * 4,
         host_bytes: clip_rgb + frame_rgb,
     };
     Ok(Some(layout))
@@ -1955,7 +1959,16 @@ mod tests {
             (3, 9, 4)
         );
         assert_eq!(phase.latent_bytes, 4 * 48 * 3 * 32 * 32);
-        assert_eq!(phase.decoded_tensor_bytes, 512 * 512 * 9 * 3 * 4);
+        let clip_rgb = 512 * 512 * 9 * 3;
+        assert_eq!(
+            phase.decoded_tensor_bytes,
+            clip_rgb * 29 + phase.latent_bytes
+        );
+        assert_eq!(
+            plan.minimum_decode_live_bytes(plan.layout().domain)
+                .unwrap(),
+            phase.decoded_tensor_bytes
+        );
         assert!(registry
             .compile_video_plan(config::MODEL_ID_I2V_14B, &spec, &req)
             .unwrap()

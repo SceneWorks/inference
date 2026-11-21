@@ -62,6 +62,8 @@ pub use candle_nn;
 /// Quantize an already-clamped/scaled `[0, 255]` float tensor to RGB8 with diffusers-compatible
 /// nearest-even rounding. Candle's native `round` uses half-away ties, while MLX/PyTorch use
 /// nearest-even; spelling the tie correction once keeps the two inference backends pixel-identical.
+/// Video admission tracks this eager operation's live allocations in
+/// `gen_core_family::candle_round_rgb8_live_bytes`.
 pub fn round_rgb8(scaled: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
     let floor = scaled.floor()?;
     let is_tie = scaled.sub(&floor)?.eq(0.5)?;

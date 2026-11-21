@@ -1210,6 +1210,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
+ "sceneworks-gen-core-family",
  "sceneworks-gen-core-memory-wan",
  "sceneworks-gen-core-testkit",
  "sceneworks-gen-core-tokenizer",
