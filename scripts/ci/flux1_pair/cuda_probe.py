@@ -53,6 +53,17 @@ def _read_pool_proof(path: Path):
         raise SupervisionError("probe-failure", "CUDA pool proof is unreadable") from error
 
 
+class RejectedPoolSample(SupervisionError):
+    """A real SystemProbe reading whose candidate pool receipt failed validation."""
+
+    INVALID_ALLOCATION = "CUDA pool proof has no valid owned PID/UUID allocation"
+    EXCEEDS_CURRENT_USAGE = "CUDA pool proof exceeds concurrent global use"
+
+    def __init__(self, detail, row):
+        super().__init__("probe-failure", detail)
+        self.pool = row
+
+
 class PairCudaProbe:
     def __init__(self, policy, proof_path: Path, *, dedicated_adapter=None):
         self.policy = policy
@@ -100,11 +111,11 @@ class PairCudaProbe:
                 or values[0] > values[1] or values[0] > values[2]
                 or values[1] > values[3] or values[2] > values[3]
                 or values[3] > self.policy.child_gpu_cap_bytes):
-            raise SupervisionError("probe-failure", "CUDA pool proof has no valid owned PID/UUID allocation")
+            raise RejectedPoolSample(RejectedPoolSample.INVALID_ALLOCATION, row)
         # Global use includes the owned child and any other process. Never use
         # its positive value as evidence of this child's allocation.
         if used < values[2]:
-            raise SupervisionError("probe-failure", "CUDA pool proof exceeds concurrent global use")
+            raise RejectedPoolSample(RejectedPoolSample.EXCEEDS_CURRENT_USAGE, row)
         if used > self.policy.child_gpu_cap_bytes:
             raise SupervisionError("device-memory", "WDDM global use exceeded child cap")
         self.gpu_usage_basis = "owned-process-attributed"

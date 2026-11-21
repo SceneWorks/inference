@@ -49,6 +49,7 @@ def fixture():
 
     stage = {
         "pool_ticks": 2,
+        "rejected_growth": [],
         "pool_growth": [
             dict(
                 card_index=1,
@@ -125,12 +126,109 @@ def fixture():
     }
 
 
+def fixture_with_rejected_growth():
+    guard, pool = fixture()
+    guard["admission"].update(
+        cudaDeviceUuid=GPU, childGpuCapBytes=80, gpuFreeReserveBytes=50
+    )
+    guard["cuda_attribution"]["unknown_pid_polls"] += 2
+    end = guard["fit_observation"]["cuda_render_end"]
+    event = dict(
+        cuda_uuid=GPU,
+        pid=PID,
+        created_filetime=CREATED,
+        before="live",
+        after="live",
+        reason="probe-failure",
+        detail="CUDA pool proof exceeds concurrent global use",
+        pool=pool.copy(),
+        next_card_index=3,
+        read_ns=315,
+        at_ns=320,
+        free_bytes=250,
+        child_growth_bytes=55,
+        global_used_upper_bytes=100,
+    )
+    end["rejected_growth"] = [
+        event,
+        dict(
+            event,
+            read_ns=325,
+            at_ns=340,
+            free_bytes=280,
+            child_growth_bytes=25,
+            global_used_upper_bytes=72,
+        ),
+    ]
+    return guard, pool
+
+
 class CudaRenderEnd(unittest.TestCase):
+    def test_rejected_substitutions_use_real_measurements_and_exact_outcomes(self):
+        guard, pool = fixture_with_rejected_growth()
+        peak, count = cuda_stage.tenant_growth(guard, GPU)
+        self.assertEqual((peak, count), (78, 1))
+        self.assertIsNotNone(cuda_stage.render_scope(guard, pool, GPU, count))
+        raw = guard["fit_observation"]["cuda_render_end"]
+        last = raw["rejected_growth"][-1]
+        last.update(
+            detail="CUDA pool proof has no valid owned PID/UUID allocation",
+            after="exited_empty",
+            child_growth_bytes=80,
+            global_used_upper_bytes=125,
+        )
+        raw["zero"]["before"] = "exited_empty"
+        self.assertEqual(cuda_stage.tenant_growth(guard, GPU), (80, 1))
+        self.assertIsNotNone(cuda_stage.render_scope(guard, pool, GPU, count))
+
+    def test_rejected_attempt_cannot_be_lost_crossed_underpriced_or_guessed(self):
+        for field, value in [
+            ("next_card_index", 1),
+            ("next_card_index", 4),
+            ("read_ns", 285),
+            ("at_ns", 401),
+            ("cuda_uuid", "crossed"),
+            ("pid", 1),
+            ("created_filetime", 1),
+            ("before", "exited_empty"),
+            ("after", "exited_empty"),
+            ("reason", "device-memory"),
+            ("pool", {"pid": 1}),
+            ("free_bytes", 49),
+            ("child_growth_bytes", 81),
+            ("global_used_upper_bytes", 120),
+            ("detail", "CUDA pool proof is malformed"),
+            ("detail", "CUDA pool proof has no valid owned PID/UUID allocation"),
+            ("omit", None),
+            ("no_zero", None),
+            ("foreign_pool", None),
+            ("swap", None),
+        ]:
+            with self.subTest(field=field):
+                guard, pool = fixture_with_rejected_growth()
+                end = guard["fit_observation"]["cuda_render_end"]
+                records = end["rejected_growth"]
+                if field == "omit":
+                    records.pop()
+                elif field == "swap":
+                    records.reverse()
+                elif field == "no_zero":
+                    end["zero"] = None
+                elif field == "foreign_pool":
+                    records[0]["pool"]["cudaDeviceUuid"] = "foreign"
+                else:
+                    records[0][field] = value
+                with self.assertRaises(ValueError):
+                    _, count = cuda_stage.tenant_growth(guard, GPU)
+                    cuda_stage.render_scope(guard, pool, GPU, count)
+
     def test_underlying_tenant_growth_is_retained_without_another_device_read(self):
         system, owner = MagicMock(), object()
         observer = cuda_stage.KeepSystemGrowth(system)
         system.gpu_usage_basis = "global-used-upper-bound"
         system.policy.cuda_device_uuid = GPU
+        system.policy.child_gpu_cap_bytes = 78
+        system.policy.gpu_free_reserve_bytes = 180
         system.last_global_used_upper_bound_bytes = 125
         system.gpu_free_and_tree_bytes.return_value = (190, 78)
         self.assertEqual(observer.gpu_free_and_tree_bytes(owner), (190, 78))
@@ -145,6 +243,119 @@ class CudaRenderEnd(unittest.TestCase):
         with self.assertRaises(OSError):
             observer.gpu_free_and_tree_bytes(owner)
         self.assertIsNone(observer.current)
+
+    def test_same_watchdog_tick_records_two_real_rejections_then_only_one_completed_zero(
+        self,
+    ):
+        from unittest.mock import patch
+        from scripts.ci import scail2_plural_fit as runner
+        from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
+        from scripts.media_campaign_supervisor import read_gpu
+
+        g, pool = fixture_with_rejected_growth()
+        raw = g["fit_observation"]
+        stage = raw["cuda_render_end"]
+        system, owner, policy = MagicMock(), MagicMock(), MagicMock()
+        policy.cuda_device_uuid = GPU
+        policy.gpu_free_reserve_bytes = 50
+        policy.child_gpu_cap_bytes = 80
+        system.policy = policy
+        with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=system):
+            pair = PairCudaProbe(policy, None)
+        pair.unknown_pid_polls = 3
+        pair.pid_peak_bytes = 0
+        pair.pool_fallback_peak_bytes = 60
+        pair.global_upper_bytes = 125
+        pair.system = cuda_stage.KeepSystemGrowth(system)
+        pair.dedicated = MagicMock()
+        pair.dedicated.record = g["cuda_attribution"]["wddm_dedicated"]
+        observer = runner.Observer.__new__(runner.Observer)
+        observer.base = pair
+        observer.shared = MagicMock()
+        observer.render_end = cuda_stage.RenderEnd()
+        observer.render_end.record = dict(stage, rejected_growth=[], zero=None)
+        observer.card_samples = raw[
+            "card_samples_monotonic_ns_free_owned_or_fallback_bytes"
+        ][:3]
+        owner.root_identity.return_value = (CREATED, False)
+        owner.members.return_value = {PID}
+        readings = iter(
+            [
+                ("global-used-upper-bound", 250, 55, 100),
+                ("global-used-upper-bound", 280, 25, 72),
+                ("owned-process-attributed", 275, 0, None),
+            ]
+        )
+
+        def gpu_read(_owner):
+            basis, free, used, absolute = next(readings)
+            system.gpu_usage_basis = basis
+            system.last_global_used_upper_bound_bytes = absolute
+            return free, used
+
+        system.gpu_free_and_tree_bytes.side_effect = gpu_read
+        with (
+            patch(
+                "scripts.ci.flux1_pair.cuda_probe._read_pool_proof", return_value=pool
+            ) as read_pool,
+            patch("time.monotonic_ns", side_effect=[315, 320, 325, 340, 400]),
+        ):
+            self.assertEqual(
+                read_gpu(lambda: observer.gpu_free_and_tree_bytes(owner)), (275, 0)
+            )
+        self.assertEqual(system.gpu_free_and_tree_bytes.call_count, 3)
+        self.assertEqual(read_pool.call_count, 2)
+        self.assertEqual(pair.unknown_pid_polls, 5)
+        self.assertEqual(observer.shared.poll.call_count, 3)
+        self.assertEqual(
+            observer.card_samples,
+            raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"],
+        )
+        self.assertEqual(
+            observer.render_end.record["rejected_growth"], stage["rejected_growth"]
+        )
+        raw["cuda_render_end"] = observer.render_end.record
+        _, primary = cuda_stage.tenant_growth(g, GPU)
+        self.assertIsNotNone(cuda_stage.render_scope(g, pool, GPU, primary))
+
+    def test_actual_source_guard_precedes_pool_substitution_and_all_retries(self):
+        from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
+        from scripts.media_campaign_supervisor import read_gpu, SupervisionError
+        from unittest.mock import patch
+
+        system = MagicMock()
+        policy = system.policy
+        policy.child_gpu_cap_bytes = 78
+        policy.gpu_free_reserve_bytes = 180
+        policy.cuda_device_uuid = GPU
+        probe = PairCudaProbe.__new__(PairCudaProbe)
+        probe.system = cuda_stage.KeepSystemGrowth(system)
+        probe.dedicated = None
+        probe.policy = policy
+        for basis in ("owned-process-attributed", "global-used-upper-bound"):
+            system.gpu_usage_basis = basis
+            system.last_global_used_upper_bound_bytes = 120
+            for reading in ((179, 77), (180, 79)):
+                with self.subTest(basis=basis, reading=reading):
+                    system.gpu_free_and_tree_bytes.reset_mock()
+                    system.gpu_free_and_tree_bytes.return_value = reading
+                    with patch(
+                        "scripts.ci.flux1_pair.cuda_probe._read_pool_proof"
+                    ) as pool:
+                        with self.assertRaises(SupervisionError) as caught:
+                            read_gpu(lambda: probe.gpu_free_and_tree_bytes(object()))
+                        pool.assert_not_called()
+                    system.gpu_free_and_tree_bytes.assert_called_once()
+                    self.assertEqual(caught.exception.reason, "device-memory")
+                    memory = caught.exception.watchdog_device_memory
+                    self.assertEqual(memory["gpuFreeBytes"], reading[0])
+                    self.assertEqual(memory["gpuUsageBasis"], basis)
+                    self.assertEqual(
+                        memory["ownedGpuBytes"]
+                        if basis == "owned-process-attributed"
+                        else memory["childGlobalUsedGrowthBytes"],
+                        reading[1],
+                    )
 
     def test_substituted_pool_tick_cannot_be_omitted_crossed_or_underpriced(self):
         for value, field in [
@@ -255,6 +466,22 @@ class CudaRenderEnd(unittest.TestCase):
             self.assertEqual(candidate["witness"]["gross_host_bytes"], 56)
             self.assertEqual(candidate["witness"]["gross_device_bytes"], 78)
             self.assertEqual(candidate["cuda_render_scope"]["pool_card_index"], 1)
+            repaired, _pool = fixture_with_rejected_growth()
+            g["admission"].update(repaired["admission"])
+            policy.cuda_device_uuid = GPU
+            policy.gpu_free_reserve_bytes = 50
+            end = raw["cuda_render_end"]
+            end["rejected_growth"] = repaired["fit_observation"]["cuda_render_end"][
+                "rejected_growth"
+            ]
+            g["cuda_attribution"]["unknown_pid_polls"] += 2
+            self.assertTrue(outcome()["accepted"])
+            g["admission"]["gpuFreeReserveBytes"] = 49
+            with self.assertRaisesRegex(ValueError, "approved guard"):
+                outcome()
+            g["admission"]["gpuFreeReserveBytes"] = 50
+            end["rejected_growth"] = []
+            g["cuda_attribution"]["unknown_pid_polls"] -= 2
             policy.child_gpu_cap_bytes = 76
             with self.assertRaisesRegex(ValueError, "exceeds the guard"):
                 outcome()

@@ -265,6 +265,12 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             counters["peak_working_set_bytes"],
         )
         from scripts.ci.scail_plural.cuda_stage import render_scope, tenant_growth
+        if (raw.get("cuda_render_end") or {}).get("rejected_growth"):
+            admission = guard["admission"]
+            if (admission["cudaDeviceUuid"] != approved.cuda_device_uuid
+                    or admission["gpuFreeReserveBytes"] != approved.gpu_free_reserve_bytes
+                    or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes):
+                raise ValueError("rejected CUDA attempt budget differs from the approved guard")
         growth, growth_count = tenant_growth(guard, GPU)
         stage = render_scope(guard, pool, GPU, growth_count)
         if incomplete and stage is not None:

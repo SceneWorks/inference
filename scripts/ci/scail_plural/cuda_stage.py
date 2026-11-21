@@ -2,6 +2,9 @@
 
 import time
 
+from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
+from scripts.media_campaign_supervisor import SupervisionError
+
 
 def nonnegative(value):
     return type(value) is int and value >= 0
@@ -28,6 +31,28 @@ class KeepSystemGrowth:
                 "global_used_upper_bytes": self.system.last_global_used_upper_bound_bytes,
                 "child_growth_bytes": used,
             }
+        # Apply the existing watchdog predicates to the real reading before a
+        # pool substitution (or a retryable pool error) can hide it.
+        policy = self.system.policy
+        if free < policy.gpu_free_reserve_bytes or used > policy.child_gpu_cap_bytes:
+            error = SupervisionError(
+                "device-memory", "owned CUDA use or free reserve exceeded cap"
+            )
+            error.watchdog_device_memory = {
+                "cudaDeviceUuid": policy.cuda_device_uuid,
+                "gpuUsageBasis": self.system.gpu_usage_basis,
+                "gpuFreeBytes": free,
+                "childGpuCapBytes": policy.child_gpu_cap_bytes,
+                "gpuFreeReserveBytes": policy.gpu_free_reserve_bytes,
+                "capExceeded": used > policy.child_gpu_cap_bytes,
+                "reserveBreached": free < policy.gpu_free_reserve_bytes,
+                "ownedGpuBytes": None if self.current else used,
+                "childGlobalUsedGrowthBytes": used if self.current else None,
+                "globalUsedUpperBoundBytes": self.current["global_used_upper_bytes"]
+                if self.current
+                else None,
+            }
+            raise error
         return free, used
 
 
@@ -97,6 +122,17 @@ def tenant_growth(guard, cuda_uuid):
             peak = max(peak, growth)
             last_index = i
             absolute_peak = max(absolute_peak, entry["global_used_upper_bytes"])
+        # Rejected substitutions never become completed card samples. Keep the
+        # original SystemProbe readings in the price and in the absolute ledger.
+        for entry in end.get("rejected_growth", []):
+            growth = entry["child_growth_bytes"]
+            absolute = entry["global_used_upper_bytes"]
+            if not (entry["cuda_uuid"] == cuda_uuid and valid_charge(growth, absolute)):
+                raise ValueError(
+                    "invalid selected-card growth on rejected CUDA pool attempt"
+                )
+            peak = max(peak, growth)
+            absolute_peak = max(absolute_peak, absolute)
         if absolute_peak != guard["cuda_attribution"]["global_upper_bytes"]:
             raise ValueError(
                 "CUDA growth evidence does not reproduce the card high-water mark"
@@ -133,13 +169,42 @@ def original_root(owner, pid, created):
 
 class RenderEnd:
     def __init__(self):
-        self.record = {"pool": None, "zero": None, "pool_ticks": 0, "pool_growth": []}
+        self.record = {
+            "pool": None,
+            "zero": None,
+            "pool_ticks": 0,
+            "pool_growth": [],
+            "rejected_growth": [],
+        }
 
     def before(self, owner):
         mark = self.record["pool"]
         if mark is not None:
             return original_root(owner, mark["pid"], mark["created_filetime"])
         return None
+
+    def reject(self, owner, probe, before, next_card_index, error):
+        original = probe.system.current
+        if original is None:
+            raise ValueError(
+                "missing source measurement on rejected CUDA pool attempt"
+            ) from error
+        mark = self.record["pool"]
+        after = self.before(owner)
+        self.record["rejected_growth"].append(
+            dict(
+                original,
+                next_card_index=next_card_index,
+                at_ns=time.monotonic_ns(),
+                pid=mark["pid"] if mark else None,
+                created_filetime=mark["created_filetime"] if mark else None,
+                before=before,
+                after=after,
+                reason=error.reason,
+                detail=error.detail,
+                pool=getattr(error, "pool", None),
+            )
+        )
 
     def observe(self, owner, probe, before, card_index, at_ns, used):
         raw = self.record
@@ -200,6 +265,62 @@ class RenderEnd:
                 }
 
 
+def validate_rejected_growth(guard, end, native_pool, card):
+    """Only the original Job retiring a verified post-output pool can be retried."""
+    previous = 0
+    exited_at = None
+    mark, zero = end["pool"], end["zero"]
+    for event in end.get("rejected_growth", []):
+        i, read, at = event["next_card_index"], event["read_ns"], event["at_ns"]
+        if not (
+            mark
+            and zero
+            and nonnegative(i)
+            and mark["card_index"] < i <= zero["card_index"] < len(card)
+            and nonnegative(read)
+            and nonnegative(at)
+            and max(previous, card[i - 1][0]) < read <= at <= card[i][0]
+            and type(event["pid"]) is int
+            and event["pid"] == mark["pid"]
+            and type(event["created_filetime"]) is int
+            and event["created_filetime"] == mark["created_filetime"]
+            and exited_at is None
+            and event["before"] == "live"
+            and event["after"] in ("live", "exited_empty")
+            and event["reason"] == "probe-failure"
+            and isinstance(event["pool"], dict)
+            and event["pool"].keys() == native_pool.keys()
+            and all(
+                type(event["pool"][k]) is type(v) and event["pool"][k] == v
+                for k, v in native_pool.items()
+            )
+            and nonnegative(event["free_bytes"])
+            and event["free_bytes"] >= guard["admission"]["gpuFreeReserveBytes"]
+            and event["child_growth_bytes"] <= guard["admission"]["childGpuCapBytes"]
+        ):
+            raise ValueError("unverified CUDA pool retry attempt")
+        # The first reason is issued only after checking that the pool PID is
+        # currently a Job member. For the second the sealed pool matches, and
+        # the original Job must independently attest the exit.
+        retired = (
+            event["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE
+            and event["child_growth_bytes"] < native_pool["poolReservedBytes"]
+        )
+        exited = (
+            event["detail"] == RejectedPoolSample.INVALID_ALLOCATION
+            and event["after"] == "exited_empty"
+        )
+        if not (retired or exited):
+            raise ValueError("unverified reason for rejected CUDA pool attempt")
+        if event["after"] == "exited_empty" and exited_at is None:
+            exited_at = i
+        previous = at
+    if exited_at is not None and (
+        zero["before"] != "exited_empty" or any(row[2] for row in card[exited_at:])
+    ):
+        raise ValueError("CUDA usage resumed after the original Job exited")
+
+
 def render_scope(guard, native_pool, cuda_uuid, growth_count):
     raw = guard["fit_observation"]
     end = raw.get("cuda_render_end")
@@ -208,7 +329,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count):
     unknown = guard["cuda_attribution"]["unknown_pid_polls"]
     if (
         not nonnegative(end["pool_ticks"])
-        or growth_count + end["pool_ticks"] != unknown
+        or growth_count + end["pool_ticks"] + len(end.get("rejected_growth", []))
+        != unknown
     ):
         raise ValueError(
             "CUDA fallback ticks differ from the supervisor growth records"
@@ -217,6 +339,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count):
     ded = guard["cuda_attribution"]["wddm_dedicated"]
     shared = raw["wddm_shared"]
     if mark is None:
+        if end.get("rejected_growth"):
+            raise ValueError("rejected CUDA pool attempt before verified output")
         if zero is not None:
             raise ValueError("CUDA teardown has no recorded render completion")
         return None
@@ -273,6 +397,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count):
     ):
         raise ValueError("CUDA end-of-render marker differs from the owned pool")
     if zero is None:
+        if end.get("rejected_growth"):
+            raise ValueError("rejected CUDA pool attempt without a verified owned zero")
         return None
     if (
         zero["basis"] != "owned-process-attributed"
@@ -287,7 +413,15 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count):
         }
     ):
         raise ValueError("invalid final zero reading on the original CUDA Job")
-    last_used = max(row[0] for row in card if row[2] > 0)
+    validate_rejected_growth(guard, end, native_pool, card)
+    last_used = max(
+        [row[0] for row in card if row[2] > 0]
+        + [
+            event["read_ns"]
+            for event in end.get("rejected_growth", [])
+            if event["child_growth_bytes"] > 0
+        ]
+    )
     for key, series in (("dedicated", ded), ("shared", shared)):
         misses = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]
         if len(misses) != series["missing_active_polls"]:

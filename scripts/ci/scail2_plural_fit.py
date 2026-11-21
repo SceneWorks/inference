@@ -101,13 +101,16 @@ class Observer:
 
     def gpu_free_and_tree_bytes(self, owner):
         before = self.render_end.before(owner)
+        attempted_before = self.base.unknown_pid_polls
         try:
             free, used = self.base.gpu_free_and_tree_bytes(owner)
-        except SupervisionError:
+        except SupervisionError as error:
             # The watchdog can tolerate a failed NVIDIA tick. Account for the
             # shared gauge on that tick just as PairCudaProbe does for dedicated.
             if self.shared is not None:
                 self.shared.poll(owner, cuda_active=True)
+            if self.base.unknown_pid_polls != attempted_before:
+                self.render_end.reject(owner, self.base, before, len(self.card_samples), error)
             raise
         self.shared.poll(owner, cuda_active=bool(self.base.dedicated.record["samples"]))
         at_ns = time.monotonic_ns()
