@@ -1274,25 +1274,23 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         .is_some_and(|r| r.has_native_projection(&weight_key))
     {
         let reader = w.logical.as_ref().expect("planned weight has a reader");
-        let bias_key = format!("{base}.bias");
-        let bias = bias
-            .then(|| -> Result<Tensor> {
-                if let Some(t) = w.overlay.get(&bias_key) {
-                    let dtype = reader
-                        .projection_bias_dtype(&weight_key)
-                        .unwrap_or(w.dtype());
-                    return t.to_dtype(dtype)?.to_device(reader.device());
-                }
-                if let Some(b) = w.read_source_unchanged(|| {
-                    reader.retained_projection_bias(&weight_key, &bias_key, reader.device())
-                })? {
-                    return Ok(b);
-                }
-                w.get(&bias_key)?.to_device(reader.device())
-            })
-            .transpose()?;
         let projection = w
             .read_source_unchanged(|| {
+                let bias = bias
+                    .then(|| {
+                        let key = format!("{base}.bias");
+                        if let Some(t) = w.overlay.get(&key) {
+                            let dtype = reader
+                                .projection_bias_dtype(&weight_key)
+                                .unwrap_or(w.dtype());
+                            return t.to_dtype(dtype)?.to_device(reader.device());
+                        }
+                        match reader.retained_projection_bias(&weight_key, &key, reader.device())? {
+                            Some(t) => Ok(t),
+                            None => w.get(&key)?.to_device(reader.device()),
+                        }
+                    })
+                    .transpose()?;
                 reader
                     .native_projection(&weight_key, bias)
                     .map_err(|e| Error::Msg(e.to_string()))
