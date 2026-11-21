@@ -188,6 +188,21 @@ pub trait Generator {
         Ok(None)
     }
 
+    /// Open the admitted lifecycle for an exact planned pass. Providers with no plan-specific
+    /// routes reuse the same safety check and scope as ordinary generation.
+    fn begin_planned_memory_strategy_request(
+        &self,
+        _request: &GenerationRequest,
+        _plan: &crate::RenderPlan,
+        context: &MemoryRunContext,
+    ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
+        if let MemorySafetyDecision::Reject { reason } = self.memory_strategy_safety_check(context)
+        {
+            return Err(Error::Unsupported(reason));
+        }
+        self.begin_memory_strategy_request(context)
+    }
+
     /// Reject a request this model cannot serve (unsupported conditioning, guidance on a
     /// distilled model, out-of-range size/count, …) before doing expensive work.
     fn validate(&self, req: &GenerationRequest) -> Result<()>;

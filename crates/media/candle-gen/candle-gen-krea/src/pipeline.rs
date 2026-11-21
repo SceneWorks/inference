@@ -1246,13 +1246,8 @@ pub(crate) fn render_turbo(
     run: Option<&gen_core::RenderRun<'_, '_>>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let mut encode =
-        || gen_core::with_prompt_encoding(on_progress, || encode_turbo_context(&comps.text, req));
-    let context = if let Some(run) = run {
-        run.encode(|| candle_gen::synchronize_result(device, encode()))?
-    } else {
-        encode()?
-    };
+    let context =
+        gen_core::with_prompt_encoding(on_progress, || encode_turbo_context(&comps.text, req))?;
     render_turbo_from_context(
         &comps.heavy,
         &context,
@@ -1647,6 +1642,23 @@ fn encode_negative_context(text: &KreaText, negative: &str) -> Result<Tensor> {
         .forward(&text.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?)
 }
 
+/// The text and heavy residency closures open Conditioning before loading/preparing their inputs.
+/// This common completion fence makes the prepared tensors usable after the scope closes.
+fn complete_turbo_conditioning<T>(
+    run: Option<&gen_core::RenderRun<'_, '_>>,
+    device: &Device,
+    prepare: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let prepared = prepare();
+    if let Some(run) = run {
+        let prepared = candle_gen::synchronize_result(device, prepared)?;
+        run.end_conditioning()?;
+        Ok(prepared)
+    } else {
+        prepared
+    }
+}
+
 /// The shared resident/staged Turbo trajectory. Reference and noise starts use the same
 /// conditioning, velocity predictions and decode paths.
 fn render_turbo_from_context(
@@ -1664,19 +1676,6 @@ fn render_turbo_from_context(
         || req.seed.unwrap_or_else(gen_core::default_seed),
         gen_core::RenderPlan::base_seed,
     );
-    let prepared = comps
-        .dit
-        .prepare_conditioning(&context.positive, req.width, req.height)?;
-    let prepared_neg = context
-        .negative
-        .as_ref()
-        .map(|negative| {
-            comps
-                .dit
-                .prepare_conditioning(negative, req.width, req.height)
-        })
-        .transpose()?;
-
     let unplanned;
     let (sigmas, sampler, guidance) = if let Some(plan) = plan {
         (plan.denoise_sigmas(), Some(plan.sampler()), plan.guidance())
@@ -1688,28 +1687,47 @@ fn render_turbo_from_context(
             req.guidance.unwrap_or(0.0),
         )
     };
-    let clean = reference
-        .map(|source| {
-            let pixels = preprocess_img2img_init(source.image, req.width, req.height, device)?;
-            let clean = source.encoder.encode(&pixels)?;
-            candle_gen::execution::component_runtime(
-                "krea/vae_encoder",
-                clean.device(),
-                clean.dtype(),
-            );
-            Ok::<_, CandleError>(clean.to_dtype(DType::F32)?)
-        })
-        .transpose()?;
+    let (prepared, prepared_neg, clean, pid_decoder) =
+        complete_turbo_conditioning(run, device, || {
+            let prepared =
+                comps
+                    .dit
+                    .prepare_conditioning(&context.positive, req.width, req.height)?;
+            let prepared_neg = context
+                .negative
+                .as_ref()
+                .map(|negative| {
+                    comps
+                        .dit
+                        .prepare_conditioning(negative, req.width, req.height)
+                })
+                .transpose()?;
 
-    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
-    // `None` → the native QwenVae decode. Shared across `count` images (same prompt).
-    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-        comps.pid.as_deref(),
-        req,
-        base_seed,
-        crate::KREA_2_TURBO_ID,
-    )?;
+            let clean = reference
+                .map(|source| {
+                    let pixels =
+                        preprocess_img2img_init(source.image, req.width, req.height, device)?;
+                    let clean = source.encoder.encode(&pixels)?;
+                    candle_gen::execution::component_runtime(
+                        "krea/vae_encoder",
+                        clean.device(),
+                        clean.dtype(),
+                    );
+                    Ok::<_, CandleError>(clean.to_dtype(DType::F32)?)
+                })
+                .transpose()?;
+
+            // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+            // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+            // `None` → the native QwenVae decode. Shared across `count` images (same prompt).
+            let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+                comps.pid.as_deref(),
+                req,
+                base_seed,
+                crate::KREA_2_TURBO_ID,
+            )?;
+            Ok((prepared, prepared_neg, clean, pid_decoder))
+        })?;
     let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
     let total_steps = sigmas.len().saturating_sub(1);
     let canonical_solver = gen_core::sampling::canonical_solver_or_euler(sampler);
@@ -3717,6 +3735,93 @@ mod tests {
                     if reason.starts_with("artifact seal mismatch after load: ")
             ),
             "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn turbo_conditioning_prep_finishes_before_planned_denoise() {
+        use gen_core::{MemoryGeometry, MemoryPhase, MemoryRequestScope, MemoryRunOutcome};
+        use std::cell::RefCell;
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Enter(MemoryPhase),
+            Prepare,
+            Leave(MemoryPhase),
+        }
+
+        struct Scope<'a>(&'a RefCell<Vec<Event>>);
+        impl MemoryRequestScope for Scope<'_> {
+            fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+                Ok(())
+            }
+            fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(Event::Enter(phase));
+                Ok(())
+            }
+            fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(Event::Leave(phase));
+                Ok(())
+            }
+            fn configure_decode(
+                &mut self,
+                _: u32,
+                _: u32,
+                _: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                unreachable!("ordinary Turbo does not configure bounded decode here")
+            }
+            fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+                unreachable!("ordinary Turbo does not configure bounded attention here")
+            }
+            fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+                unreachable!("ordinary Turbo does not configure streamed blocks here")
+            }
+            fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request = GenerationRequest {
+            prompt: "a courtyard".into(),
+            width: 512,
+            height: 512,
+            steps: Some(2),
+            ..Default::default()
+        };
+        let load = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir("/unused".into()));
+        let plan = compile_turbo_plan(&crate::descriptor(), &load, &request).unwrap();
+        let events = RefCell::new(Vec::new());
+        let mut scope = Scope(&events);
+        let run = gen_core::RenderRun::new(&plan, &request.cancel, Some(&mut scope));
+        run.begin_conditioning().unwrap();
+        assert!(run.begin_rendering().is_err());
+        let prepared = complete_turbo_conditioning(Some(&run), &Device::Cpu, || {
+            assert_eq!(*events.borrow(), [Event::Enter(MemoryPhase::Conditioning)]);
+            events.borrow_mut().push(Event::Prepare);
+            Ok(5_u8)
+        })
+        .unwrap();
+        let images = run
+            .images(
+                &mut |_| {},
+                |_| Ok::<_, CandleError>(prepared),
+                |_, supplied, _| Ok(supplied),
+                |_, supplied, _| Ok(supplied),
+            )
+            .unwrap();
+        assert_eq!(images, [5]);
+        assert_eq!(
+            *events.borrow(),
+            [
+                Event::Enter(MemoryPhase::Conditioning),
+                Event::Prepare,
+                Event::Leave(MemoryPhase::Conditioning),
+                Event::Enter(MemoryPhase::Denoise),
+                Event::Leave(MemoryPhase::Denoise),
+                Event::Enter(MemoryPhase::Decode),
+                Event::Leave(MemoryPhase::Decode),
+            ]
         );
     }
 

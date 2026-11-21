@@ -410,7 +410,15 @@ struct KreaMemoryScope {
     reference_count: u32,
     use_pid: bool,
     has_phases: bool,
+    produced_reference: Option<KreaProducedReferenceScope>,
     finished: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+struct KreaProducedReferenceScope {
+    geometry: gen_core::MemoryGeometry,
+    reference: gen_core::ProducedReference,
+    pass: usize,
 }
 
 #[cfg(test)]
@@ -438,6 +446,25 @@ impl KreaMemoryScope {
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
+        if let Some(refiner) = &self.produced_reference {
+            let reference_matches = matches!(
+                request.conditioning.as_slice(),
+                [Conditioning::Reference { image, strength }] if
+                    (image.width, image.height) == (refiner.reference.width, refiner.reference.height)
+                    && strength.map(f32::to_bits) == refiner.reference.strength.map(f32::to_bits)
+            );
+            if !reference_matches
+                || (request.width, request.height)
+                    != (refiner.geometry.width, refiner.geometry.height)
+                || request.source_image.is_some()
+                || request.low_res_start.is_some()
+                || request.count != 1
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Krea Turbo request does not match its admitted produced reference".into(),
+                ));
+            }
+        }
         // The pose-control route is admitted as exactly one pose control image (reference count
         // 1 in the registered behavior routes); every other route counts only image references and
         // must never accept a control image in their place.
@@ -501,7 +528,33 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
     }
 
     fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
-        self.ensure_active()
+        self.ensure_active()?;
+        if self.produced_reference.is_some() {
+            return Err(gen_core::Error::Unsupported(
+                "Krea Turbo produced-reference scope requires a planned render phase".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn enter_render_phase(
+        &mut self,
+        _phase: gen_core::MemoryPhase,
+        identity: &gen_core::render::RenderPhaseIdentity,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if let Some(refiner) = &self.produced_reference {
+            if identity.pass != refiner.pass
+                || identity.phase != 0
+                || identity.geometry != refiner.geometry
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Krea Turbo render phase does not match its admitted produced-reference pass"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
@@ -515,10 +568,12 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         _geometry: gen_core::MemoryGeometry,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if matches!(
-            self.provider_id.as_str(),
-            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
-        ) {
+        if self.produced_reference.is_some()
+            || matches!(
+                self.provider_id.as_str(),
+                KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+            )
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: bounded decode is not implemented",
                 self.provider_id
@@ -537,10 +592,12 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
 
     fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if matches!(
-            self.provider_id.as_str(),
-            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
-        ) {
+        if self.produced_reference.is_some()
+            || matches!(
+                self.provider_id.as_str(),
+                KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+            )
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: bounded attention is not implemented",
                 self.provider_id
@@ -562,10 +619,12 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         block_count: u32,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if matches!(
-            self.provider_id.as_str(),
-            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
-        ) {
+        if self.produced_reference.is_some()
+            || matches!(
+                self.provider_id.as_str(),
+                KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+            )
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: bounded transformer residency is not implemented",
                 self.provider_id
@@ -813,6 +872,7 @@ impl Generator for KreaGenerator {
                 reference_count: context.geometry.reference_count,
                 use_pid: context.use_pid,
                 has_phases: context.has_phases,
+                produced_reference: None,
                 finished: false,
             })))
         }
@@ -821,6 +881,28 @@ impl Generator for KreaGenerator {
             let _ = context;
             Ok(None)
         }
+    }
+
+    fn begin_planned_memory_strategy_request(
+        &self,
+        request: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if self.descriptor.id == KREA_2_TURBO_ID && plan.produced_reference().is_some() {
+            #[cfg(any(feature = "cuda", test))]
+            return self
+                .begin_imported_turbo_refine_scope(request, plan, context)
+                .map(|scope| Some(Box::new(scope) as Box<dyn gen_core::MemoryRequestScope>));
+            #[cfg(not(any(feature = "cuda", test)))]
+            let _ = (request, plan);
+        }
+        if let gen_core::MemorySafetyDecision::Reject { reason } =
+            self.memory_strategy_safety_check(context)
+        {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
+        self.begin_memory_strategy_request(context)
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -887,6 +969,16 @@ impl Generator for KreaGenerator {
                 ));
             }
         }
+        #[cfg(any(feature = "cuda", test))]
+        if self.descriptor.id == KREA_2_TURBO_ID
+            && self.native_dit.is_some()
+            && plan.produced_reference().is_some()
+            && scope.is_none()
+        {
+            return Err(gen_core::Error::Unsupported(
+                "imported Krea Turbo refinement requires an admitted planned request scope".into(),
+            ));
+        }
         self.render(req, Some(plan), scope, on_progress)
     }
 }
@@ -934,6 +1026,89 @@ fn validate_krea_request(
 }
 
 impl KreaGenerator {
+    #[cfg(any(feature = "cuda", test))]
+    fn begin_imported_turbo_refine_scope(
+        &self,
+        request: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<KreaMemoryScope> {
+        self.validate(request)?;
+        plan.check_request(&self.descriptor, request)?;
+        plan.check_load_spec(&self.file_pin_spec)?;
+        let reference = plan.produced_reference().ok_or_else(|| {
+            gen_core::Error::Unsupported("Krea Turbo refinement needs a produced reference".into())
+        })?;
+        let (width, height) = plan.output_size();
+        let geometry = gen_core::MemoryGeometry {
+            width,
+            height,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        };
+        let contract = self.memory_strategy_contract().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "Krea Turbo refinement has no admitted memory contract".into(),
+            )
+        })?;
+        let route_gate = || {
+            if self.native_dit.is_none()
+                || plan.pass_index() != 1
+                || reference.from_pass != 0
+                || plan.image_count() != 1
+                || request.frames.unwrap_or(1) != 1
+                || (reference.width, reference.height) != (width, height)
+                || context.selection.strategy != gen_core::MemoryStrategy::Resident
+                || context.selection.parameters != gen_core::MemoryStrategyParameters::default()
+                || context.optimization_authority != gen_core::MemoryOptimizationAuthority::Resident
+                || context.load_shape != contract.load_shape
+                || context.mode != gen_core::MemoryMode::ImageToImage
+                || context.geometry != geometry
+                || context.use_pid
+                || request.use_pid
+                || context.has_phases
+                || request.phases.is_some()
+                || context.low_res_start.is_some()
+                || context.overlay.is_some()
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Krea Turbo refinement requires the exact resident imported Hires pass".into(),
+                ));
+            }
+            Ok(())
+        };
+        if let gen_core::MemorySafetyDecision::Reject { reason } =
+            gen_core::standard_memory_strategy_safety_check(
+                contract,
+                context,
+                Some(gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant: self.loaded_quant,
+                    component_precision_floors: &[],
+                }),
+                Some(&route_gate),
+            )
+        {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
+        Ok(KreaMemoryScope {
+            device: self.device.clone(),
+            memory: contract.generation_memory(&context.selection),
+            provider_id: self.descriptor.id.to_owned(),
+            mode: context.mode.clone(),
+            reference_count: context.geometry.reference_count,
+            use_pid: context.use_pid,
+            has_phases: context.has_phases,
+            produced_reference: Some(KreaProducedReferenceScope {
+                geometry,
+                reference,
+                pass: plan.pass_index(),
+            }),
+            finished: false,
+        })
+    }
+
     fn observe_loaded(&self) {
         candle_gen::execution::unobserved_adapters(
             self.adapters.len(),
@@ -1106,13 +1281,19 @@ impl KreaGenerator {
                 on_progress(event);
             }
         };
-        let images = self.residency.run_request_scoped(
+        let images = self.residency.run_request_scoped_with_prepare(
             stage_residency,
             false,
             &req.cancel,
             req.use_pid,
             &mut progress,
-            |text| match text {
+            |_| {
+                if let Some(run) = turbo {
+                    run.begin_conditioning()?;
+                }
+                Ok(())
+            },
+            |text, ()| match text {
                 // Multi-phase: the `Resident` path encodes in the heavy branch from the warm text phase
                 // (stays on the `Resident` marker); the `Sequential` path must encode here, before the
                 // text phase drops.
@@ -1132,24 +1313,13 @@ impl KreaGenerator {
                         &self.device,
                     )?))
                 }
-                KreaTextPhase::Sequential(text) => {
-                    if let Some(run) = turbo {
-                        run.begin_conditioning()?;
-                    }
-                    Ok(KreaEncoded::Sequential(pipeline::encode_residency(
-                        text, raw, req,
-                    )?))
-                }
+                KreaTextPhase::Sequential(text) => Ok(KreaEncoded::Sequential(
+                    pipeline::encode_residency(text, raw, req)?,
+                )),
             },
-            |encoded| {
-                self.device.synchronize()?;
-                if matches!(encoded, Some(KreaEncoded::Sequential(_))) {
-                    if let Some(run) = turbo {
-                        run.end_conditioning()?;
-                    }
-                }
-                Ok(())
-            },
+            // Fence text work before the staged loader frees it. The Turbo scope stays open
+            // through the heavy/VAE handoff and closes once the DiT context and reference are ready.
+            |_| Ok(self.device.synchronize()?),
             |heavy, encoded, on_progress| match (heavy, encoded) {
                 // Both physical residencies evaluate the exact DiT already selected by the
                 // loader. Only the borrowed request phase selection changes across evaluations.
@@ -2203,6 +2373,47 @@ fn vae_resident_bytes(root: &std::path::Path, provider_id: &str) -> gen_core::Re
     gen_core::materialized_header_bytes(&kept, VAE_WIDTH, &dir)
 }
 
+/// Score allocation guard used by the imported Turbo base/reference path.
+pub const KREA_HIRES_ATTENTION_SCORE_BUDGET: u64 = candle_gen::ATTN_SCORES_BUDGET as u64;
+
+/// Source payload and device storage of the lazy encoder on an imported Turbo Hires pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KreaHiresEncoderWeights {
+    pub source_bytes: u64,
+    pub device_bytes: u64,
+}
+
+/// Read only the companion VAE headers. The encoder uses the same materialization dtype as the
+/// decoder and does not load `post_quant_conv` or the decoder subtree.
+pub fn hires_encoder_weights(spec: &LoadSpec) -> gen_core::Result<KreaHiresEncoderWeights> {
+    let (WeightsSource::File(_), Some(WeightsSource::Dir(root))) =
+        (&spec.weights, spec.components.get(BASE_SNAPSHOT_COMPONENT))
+    else {
+        return Err(gen_core::Error::Unsupported(
+            "Krea Turbo Hires encoder pricing requires a native file and companion snapshot".into(),
+        ));
+    };
+    let directory = root.join("vae");
+    let encoder = gen_core::safetensors_path_tensor_headers(&directory)?
+        .into_iter()
+        .filter(|header| vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    let source_bytes = encoder
+        .iter()
+        .try_fold(0_u64, |bytes, header| bytes.checked_add(header.data_bytes))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "Krea Turbo Hires could not price the companion VAE encoder".into(),
+            )
+        })?;
+    let device_bytes = gen_core::materialized_header_bytes(&encoder, VAE_WIDTH, &directory)?;
+    Ok(KreaHiresEncoderWeights {
+        source_bytes,
+        device_bytes,
+    })
+}
+
 /// The TE store width this snapshot resolves to, from the same probe the loader uses.
 fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
     match headers.iter().find(|header| header.name == TE_STORE_PROBE) {
@@ -3053,7 +3264,8 @@ fn text_encoder_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option
         .filter(|quant| matches!(quant, Quant::Q4 | Quant::Q8)))
 }
 
-fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+/// Resolve the numeric tier used by the native loader for this exact source.
+pub fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
     if convrot_selector(spec, id)?.is_some() {
         return Ok(Some(Quant::Q8));
     }
@@ -3211,6 +3423,7 @@ fn registered_krea_begin_request(
         reference_count: context.geometry.reference_count,
         use_pid: context.use_pid,
         has_phases: context.has_phases,
+        produced_reference: None,
         finished: false,
     })))
 }
@@ -5607,6 +5820,7 @@ mod tests {
             reference_count: 0,
             use_pid: false,
             has_phases: false,
+            produced_reference: None,
             finished: false,
         };
         scope
@@ -6209,6 +6423,7 @@ mod tests {
             reference_count: 0,
             use_pid: false,
             has_phases: false,
+            produced_reference: None,
             finished: false,
         };
         let mut request = GenerationRequest {
@@ -6243,6 +6458,7 @@ mod tests {
             reference_count: 0,
             use_pid: false,
             has_phases: false,
+            produced_reference: None,
             finished: false,
         };
         let mut img2img = GenerationRequest {
@@ -6295,6 +6511,7 @@ mod tests {
             reference_count,
             use_pid: false,
             has_phases: false,
+            produced_reference: None,
             finished: false,
         };
         let request = |conditioning| GenerationRequest {
@@ -8046,6 +8263,161 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             }
             assert!(second.check_request(&descriptor(), &live).is_err());
         }
+    }
+
+    #[test]
+    fn imported_turbo_refiner_scope_binds_only_the_admitted_produced_pass() {
+        use gen_core::{MemoryMode, MemoryOptimizationAuthority, MemoryPhase, MemoryStrategy};
+        let fixture = tempfile::tempdir().unwrap();
+        let mut spec = valid_imported_spec(fixture.path(), "fixture.safetensors");
+        spec.prepare_file_sources().unwrap();
+        let mut generator = sequential_generator(descriptor());
+        let WeightsSource::File(path) = &spec.weights else {
+            unreachable!()
+        };
+        generator.native_dit = Some(spec.file_pin_for(path).unwrap());
+        generator.file_pin_spec = spec.clone();
+        let registry = crate::provider_registry().unwrap();
+        let base = GenerationRequest {
+            prompt: "a courtyard".into(),
+            width: 512,
+            height: 512,
+            steps: Some(2),
+            ..Default::default()
+        };
+        let mut refine = GenerationRequest {
+            steps: Some(1),
+            ..base.clone()
+        };
+        let plan = registry
+            .compile_multi_pass_render_plan(
+                KREA_2_TURBO_ID,
+                &spec,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &base,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: &refine,
+                        produced_reference: Some(gen_core::ProducedReference {
+                            from_pass: 0,
+                            width: 512,
+                            height: 512,
+                            strength: Some(0.6),
+                        }),
+                    },
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let refiner = &plan.passes()[1];
+        refine.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 512,
+                height: 512,
+                pixels: vec![40; 512 * 512 * 3],
+            },
+            strength: Some(0.6),
+        });
+        let mut context =
+            resident_memory_context(generator.memory_strategy_contract().unwrap(), None);
+        context.mode = MemoryMode::ImageToImage;
+        context.optimization_authority = MemoryOptimizationAuthority::Resident;
+        context.has_reference = true;
+        context.geometry.reference_count = 1;
+
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Reject { .. }
+        ));
+        let standalone = registry
+            .compile_render_plan(KREA_2_TURBO_ID, &spec, &refine)
+            .unwrap()
+            .unwrap();
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, &standalone, &context)
+            .is_err());
+        assert!(matches!(
+            generator.generate_planned(&refine, refiner, None, &mut |_| {}),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("admitted planned request scope")
+        ));
+        let mut scope = generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &context)
+            .unwrap()
+            .unwrap();
+        let mut mutated = refine.clone();
+        if let Conditioning::Reference { strength, .. } = &mut mutated.conditioning[0] {
+            *strength = Some(0.4);
+        }
+        assert!(scope.configure_request(&mut mutated).is_err());
+        refine.memory = Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            ..Default::default()
+        });
+        scope.configure_request(&mut refine).unwrap();
+        assert_eq!(
+            refine.memory,
+            generator
+                .memory_strategy_contract()
+                .unwrap()
+                .generation_memory(&context.selection)
+        );
+        assert!(scope.enter_phase(MemoryPhase::Conditioning).is_err());
+        let mut phase = gen_core::render::RenderPhaseIdentity {
+            pass: 0,
+            phase: 0,
+            geometry: context.geometry,
+        };
+        assert!(scope
+            .enter_render_phase(MemoryPhase::Conditioning, &phase)
+            .is_err());
+        phase.pass = 1;
+        assert!(scope
+            .enter_render_phase(MemoryPhase::Conditioning, &phase)
+            .is_ok());
+        assert!(scope.configure_decode(512, 128, context.geometry).is_err());
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        drop(scope);
+
+        let mut rejected = context.clone();
+        rejected.selection.strategy = MemoryStrategy::StagedResidency;
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &rejected)
+            .is_err());
+        rejected = context.clone();
+        rejected.geometry.height = 768;
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &rejected)
+            .is_err());
+        rejected = context.clone();
+        rejected.load_shape = gen_core::LoadShape::EagerMaterialization;
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &rejected)
+            .is_err());
+        rejected = context.clone();
+        rejected.budget.total_bytes = 64;
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &rejected)
+            .is_err());
+        generator.native_dit = None;
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &context)
+            .is_err());
+    }
+
+    #[test]
+    fn imported_hires_price_reads_only_encoder_weights_at_loader_width() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_imported_spec(fixture.path(), "fixture.safetensors");
+        write_full_vae(fixture.path());
+        assert_eq!(
+            hires_encoder_weights(&spec).unwrap(),
+            KreaHiresEncoderWeights {
+                source_bytes: 160,
+                device_bytes: 320
+            }
+        );
     }
 
     #[test]
