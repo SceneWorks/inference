@@ -73,7 +73,7 @@ pub enum Projection {
     /// Prism ternary affine weight with a folded Hadamard activation rotation.
     Prism(PrismLinear),
     /// Original signed codes, F32 row scales and shared rotation.
-    ConvRot(mlx_layers::convrot_int8::ConvRotLinear),
+    Native(mlx_layers::NativeProjection),
 }
 
 impl Projection {
@@ -91,10 +91,7 @@ impl Projection {
         {
             return Ok(None);
         }
-        Ok(
-            mlx_layers::convrot_int8::ConvRotLinear::from_weights(w, base, bias)?
-                .map(Self::ConvRot),
-        )
+        Ok(mlx_layers::NativeProjection::from_weights(w, base, bias)?.map(Self::Native))
     }
 
     /// Bind the original weight before applying the model's dense compute cast.
@@ -108,13 +105,11 @@ impl Projection {
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix("_weight"))
             .unwrap_or(key);
-        if let Some(mut native) =
-            mlx_layers::convrot_int8::ConvRotLinear::from_key(w, base, key, false)?
-        {
+        if let Some(mut native) = mlx_layers::NativeProjection::from_key(w, base, key, false)? {
             if let Some(bias) = bias {
                 native.set_bias(bias)?;
             }
-            return Ok(Self::ConvRot(native));
+            return Ok(Self::Native(native));
         }
         let stored = w.require(key)?;
         let weight = match compute {
@@ -145,16 +140,16 @@ impl Projection {
         dtype: Dtype,
         quant: Option<QuantSpec>,
     ) -> Result<Vec<Self>> {
-        if let Some(Self::ConvRot(native)) = Self::native(w, key, false)? {
+        if let Some(Self::Native(native)) = Self::native(w, key, false)? {
             let mut start = 0;
             return ends
                 .iter()
                 .copied()
-                .chain(std::iter::once(native.descriptor().out_features as i32))
+                .chain(std::iter::once(native.shape()[0]))
                 .map(|end| {
                     let part = native.slice_rows(start, end)?;
                     start = end;
-                    Ok(Self::ConvRot(part))
+                    Ok(Self::Native(part))
                 })
                 .collect();
         }
@@ -219,7 +214,7 @@ impl Projection {
             Projection::Dense { weight, bias } => linear(x, weight, bias.as_ref()),
             Projection::Quantized(q) => q.forward(x),
             Projection::Prism(p) => p.forward(x),
-            Projection::ConvRot(p) => Ok(p.forward(x)?),
+            Projection::Native(p) => Ok(p.forward(x)?),
         }
     }
 
@@ -242,7 +237,7 @@ impl Projection {
                 )?
                 .as_dtype(q.scales.dtype())?
             }
-            Projection::ConvRot(_) => return Err(crate::error::Error::Unsupported("gathered embedding rows require an embedding codec; ConvRot stores rotated projections".into())),
+            Projection::Native(_) => return Err(crate::error::Error::Unsupported("gathered embedding rows require an embedding codec; ConvRot stores rotated projections".into())),
             Projection::Prism(_) => {
                 return Err(crate::error::Error::Unsupported(
                     "a Prism projection has no dense rows to gather".into(),
@@ -259,7 +254,7 @@ impl Projection {
     pub fn is_quantized(&self) -> bool {
         matches!(
             self,
-            Projection::Quantized(_) | Projection::Prism(_) | Projection::ConvRot(_)
+            Projection::Quantized(_) | Projection::Prism(_) | Projection::Native(_)
         )
     }
 
@@ -273,7 +268,7 @@ impl Projection {
         match self {
             Projection::Dense { weight, bias: b } => n(weight) + bias(b),
             Projection::Quantized(q) => n(&q.scales) + n(&q.biases) + bias(&q.bias),
-            Projection::Prism(_) | Projection::ConvRot(_) => 0,
+            Projection::Prism(_) | Projection::Native(_) => 0,
         }
     }
 
@@ -289,7 +284,7 @@ impl Projection {
                 out.extend(q.bias.iter().cloned());
             }
             Projection::Prism(p) => p.push_arrays(out),
-            Projection::ConvRot(p) => p.push_arrays(out),
+            Projection::Native(p) => p.push_arrays(out),
         }
     }
 }

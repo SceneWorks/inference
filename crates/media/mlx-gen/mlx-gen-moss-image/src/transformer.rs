@@ -122,7 +122,10 @@ impl Projection {
     }
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let cast = x.as_dtype(self.dtype())?;
-        let base = if let Some(native) = self.custom.convrot_base() {
+        let base = if let Some(fp8) = self.custom.fp8_base() {
+            fp8.forward_with_bias(&cast, self.bias.as_ref())
+                .map_err(|e| Error::Msg(e.to_string()))?
+        } else if let Some(native) = self.custom.convrot_base() {
             native.forward_with_bias(&cast, self.bias.as_ref())?
         } else if self.weight.dtype() == Dtype::Float32 {
             let projected = linear_fp32(&cast, &self.weight)?;
@@ -857,6 +860,9 @@ impl Transformer {
         }
         let mut rotation_groups = std::collections::HashSet::new();
         for projection in projections {
+            if let Some(fp8) = projection.custom.fp8_base() {
+                arrays.extend([fp8.scales(), fp8.input_scale()]);
+            }
             if let Some(native) = projection.custom.convrot_base() {
                 arrays.push(native.scales());
                 if rotation_groups.insert(native.descriptor().rotation_group) {
