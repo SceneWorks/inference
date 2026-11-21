@@ -448,6 +448,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-checkpoint"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-quant-kernels",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
 dependencies = [
@@ -493,6 +505,7 @@ dependencies = [
 name = "candle-gen"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
@@ -1284,7 +1297,6 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",

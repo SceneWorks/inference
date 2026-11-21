@@ -454,7 +454,7 @@ impl Weights {
     /// The compiled mapped-read plan for a single-file native checkpoint — the descriptor authority
     /// the NVFP4 import consults. `None` for the directory/packed-tier path.
     pub fn logical_plan(&self) -> Option<&LogicalWeightPlan> {
-        self.logical.as_ref().map(LogicalWeightReader::plan)
+        self.logical.as_ref().map(|reader| reader.plan())
     }
 
     /// The planned entry for one **diffusers** (logical) key, or `None` when the file has no plan or

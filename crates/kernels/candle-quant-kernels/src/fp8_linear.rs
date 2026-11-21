@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct Fp8Linear {
     w_fp8: crate::cublaslt::DevFp8,
     device: Device,
+    dims: (usize,usize),
     input_scale: Option<f32>,
     scale_w: f32,
     bias: Option<Tensor>,
@@ -42,6 +43,7 @@ impl Fp8Linear {
         }
         let device = codes.device().clone();
         Ok(Self {
+            dims: codes.dims2()?,
             w_fp8: lt.stage_fp8(&codes)?,
             device,
             scale_w,
@@ -50,6 +52,8 @@ impl Fp8Linear {
             lt,
         })
     }
+
+    pub fn dims(&self) -> (usize,usize) { self.dims }
 
     pub fn device(&self) -> &Device {
         &self.device
