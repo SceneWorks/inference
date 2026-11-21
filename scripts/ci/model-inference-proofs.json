@@ -180017,6 +180017,70 @@
     "package": "mlx-gen-krea",
     "target": "mlx_gen_krea",
     "target_kind": "lib",
+    "fqn": "transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Synthetic two-block Krea DiT and two case-generated safetensors targeting its text-fusion projector and a sparse attention value projection",
+    "configuration_source": "Body-local F32 model and inputs, ordered slot overrides with a duplicate, and bare and sparse phase revisits",
+    "output_contract": "Exact fused context and velocity parity with independent Raw and strict residual installs, observable projector/override/duplicate effects, actual stream device and end-only body marker",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs::transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles@e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+      "requirements": [
+        {
+          "slot": "krea_phase_projector_lora",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
+            "case_source_sha256": "e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+            "writer": "transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles writes projector.safetensors with Array::save_safetensors and reads it through PhaseAdapterSource::load and the independent strict installer."
+          }
+        },
+        {
+          "slot": "krea_phase_sparse_block_lora",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
+            "case_source_sha256": "e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+            "writer": "transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles writes block.safetensors with Array::save_safetensors and reads it through PhaseAdapterSource::load and the independent strict installer."
+          }
+        }
+      ],
+      "case_generated_inputs": true
+    }
+  },
+  {
+    "package": "mlx-gen-krea",
+    "target": "mlx_gen_krea",
+    "target_kind": "lib",
     "fqn": "transformer::tests::actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts",
     "execution_role": "direct",
     "backend": "mlx",
