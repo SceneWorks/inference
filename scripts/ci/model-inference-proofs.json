@@ -180039,7 +180039,7 @@
     "source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs::transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles@e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs::transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles@53b94ec58ebe21bc7f586804bf1b71c8024cea9fea22abc209c2de5c627ef717",
       "requirements": [
         {
           "slot": "krea_phase_projector_lora",
@@ -180053,7 +180053,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
-            "case_source_sha256": "e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+            "case_source_sha256": "53b94ec58ebe21bc7f586804bf1b71c8024cea9fea22abc209c2de5c627ef717",
             "writer": "transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles writes projector.safetensors with Array::save_safetensors and reads it through PhaseAdapterSource::load and the independent strict installer."
           }
         },
@@ -180069,7 +180069,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-krea/src/transformer/mod.rs",
-            "case_source_sha256": "e7dfe2311ed863e8e62c02d0d80b2f9792fb5e802b0744e86723e99df03bfa6f",
+            "case_source_sha256": "53b94ec58ebe21bc7f586804bf1b71c8024cea9fea22abc209c2de5c627ef717",
             "writer": "transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles writes block.safetensors with Array::save_safetensors and reads it through PhaseAdapterSource::load and the independent strict installer."
           }
         }

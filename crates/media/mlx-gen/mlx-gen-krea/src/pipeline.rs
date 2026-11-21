@@ -896,7 +896,6 @@ impl KreaHeavy {
             Some(image) => {
                 let Img2ImgPlan { denoise, clean } =
                     self.prepare_img2img(ctx_pos, ctx_neg, image, opts.width, opts.height)?;
-                mlx_rs::transforms::eval([&clean])?;
                 (denoise, Some(clean))
             }
             None => (
@@ -906,6 +905,22 @@ impl KreaHeavy {
         };
         prep.guidance = run.plan().guidance();
         prep.pag = pag.cloned();
+        if run.plan().executed_steps() > 0 {
+            mlx_rs::transforms::eval(
+                prep.prep_pos
+                    .conditioning_arrays()
+                    .into_iter()
+                    .chain(
+                        prep.prep_neg
+                            .iter()
+                            .flat_map(JointPrep::conditioning_arrays),
+                    )
+                    .chain(clean.iter()),
+            )?;
+        } else if let Some(clean) = &clean {
+            // A terminal reference pass still encodes the source and skips unused DiT text fusion.
+            mlx_rs::transforms::eval([clean])?;
+        }
         run.end_conditioning()?;
 
         let sigmas = run.plan().denoise_sigmas();
@@ -2830,8 +2845,20 @@ mod tests {
             body.find(token)
                 .unwrap_or_else(|| panic!("missing {token}"))
         };
-        assert!(offset("self.prepare_img2img(") < offset("eval([&clean])"));
-        assert!(offset("eval([&clean])") < offset("run.end_conditioning()"));
+        let active = offset("if run.plan().executed_steps() > 0");
+        let zero = offset("else if let Some(clean) = &clean");
+        let end_conditioning = offset("run.end_conditioning()");
+        assert!(offset("self.prepare_img2img(") < active);
+        assert!(offset("self.prepare_t2i(") < active);
+        for prepared in [
+            "transforms::eval(",
+            "prep.prep_pos",
+            "prep.prep_neg",
+            ".chain(clean.iter())",
+        ] {
+            assert!((active..zero).contains(&offset(prepared)));
+        }
+        assert!((zero..end_conditioning).contains(&offset("eval([clean])")));
         assert!(offset("run.end_conditioning()") < offset("run.images("));
         assert!(offset("self.denoise_turbo_from(") < offset("denoise_exit_fault("));
         assert!(offset("self.decode_latents_with_tiling(") < offset("decode_exit_fault("));

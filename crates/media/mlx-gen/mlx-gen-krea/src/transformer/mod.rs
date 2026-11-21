@@ -1803,6 +1803,13 @@ pub struct JointPrep {
     p: i32,
 }
 
+impl JointPrep {
+    /// Arrays that must be evaluated before the conditioning scope can leave.
+    pub(crate) fn conditioning_arrays(&self) -> [&Array; 3] {
+        [&self.ctx, &self.rcos, &self.rsin]
+    }
+}
+
 /// The **step-invariant** conditioning for a Kontext-style edit forward ([`Krea2Transformer::prepare_edit`]):
 /// the fused text stream (`ctx`), the CLEAN in-context reference tokens (`ref_tokens`, `None` when there
 /// are no references — then the edit forward reduces to plain text-to-image), the joint RoPE tables laid
