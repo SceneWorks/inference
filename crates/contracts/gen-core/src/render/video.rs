@@ -2,7 +2,9 @@
 //! trajectory, including at corrector evaluations between the schedule nodes.
 
 use super::RenderPhaseIdentity;
-use crate::{sampling::Solver, CancelFlag, Error, MemoryPhase, MemoryRequestScope, Result};
+use crate::{
+    sampling::Solver, CancelFlag, Error, MemoryGeometry, MemoryPhase, MemoryRequestScope, Result,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VideoModelCoordinate {
@@ -67,6 +69,59 @@ pub struct VideoDenoisePhase<S, P = Solver> {
     pub sigmas: Vec<f32>,
     pub seed: u64,
     pub models: VideoModelRule<S>,
+}
+
+impl<P> VideoDenoisePhase<(), P> {
+    /// A single-pass trajectory using the same model at every evaluation.
+    pub fn fixed(
+        geometry: MemoryGeometry,
+        latent_frames: u32,
+        solver: P,
+        sigmas: Vec<f32>,
+        seed: u64,
+    ) -> Self {
+        Self {
+            identity: RenderPhaseIdentity {
+                pass: 0,
+                phase: 0,
+                geometry,
+            },
+            latent_frames,
+            solver,
+            sigmas,
+            seed,
+            models: VideoModelRule::Fixed(()),
+        }
+    }
+}
+
+/// Two adjacent nodes in a native video schedule. The index is absolute within the pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoStep {
+    pub index: usize,
+    pub sigma: f32,
+    pub next_sigma: f32,
+}
+
+/// Drive a whole native schedule in its original direction, including an update at zero
+/// for ascending flow schedules. The backend controls materialization and the point at
+/// which it reports progress or previews within its numerical step.
+pub fn run_video_steps<E: From<Error>>(
+    sigmas: &[f32],
+    cancel: &CancelFlag,
+    mut step: impl FnMut(VideoStep) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    for (index, pair) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled.into());
+        }
+        step(VideoStep {
+            index,
+            sigma: pair[0],
+            next_sigma: pair[1],
+        })?;
+    }
+    Ok(())
 }
 
 /// Keeps a caller-owned reservation active across preparation, sampling and release.
