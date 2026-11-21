@@ -272,6 +272,10 @@ impl Fp8Linear {
         } else {
             (x.clone(), self.input_scale.clone())
         };
+        // MLX emits a scalar reference for a rank-zero Metal input and a buffer pointer for
+        // every other rank. Both kernels index their scales, including a fixed, single scale.
+        let sx = sx.at_least_1d()?;
+        let sw = self.scales.at_least_1d()?;
         let xb = (k - 1) / 32 + 1;
         let ng = ((n - 1) / 16 + 1)
             .checked_mul(128)
@@ -333,7 +337,7 @@ impl Fp8Linear {
             };
             Ok(project
                 .apply()
-                .inputs([&q, &self.codes, &self.scales, &sx])
+                .inputs([&q, &self.codes, &sw, &sx])
                 .output_shape([m, n], x.dtype())
                 .template_arg("M", m)
                 .template_arg("N", n)
