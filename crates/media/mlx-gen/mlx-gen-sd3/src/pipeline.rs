@@ -48,13 +48,13 @@ pub(crate) fn resolve_sd3_sigmas(
     steps: usize,
     shift: Option<f32>,
 ) -> Result<Vec<f32>> {
-    let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+    let native = mlx_gen::gen_core::sampling::sd3_sigmas(steps, SCHEDULE_SHIFT);
     Ok(mlx_gen::resolve_flow_schedule_with_shift(
         scheduler,
         shift,
         SCHEDULE_SHIFT.ln(),
         steps,
-        &native.sigmas,
+        &native,
     )?)
 }
 
@@ -467,6 +467,118 @@ pub(crate) fn denoise_img2img_from_clean_cfg_with_memory(
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas[start..],
+        sampler_name,
+        seed,
+        x_start,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        attention,
+        transformer_window,
+    )
+}
+
+/// Planned flow-match denoise over `run.plan().denoise_sigmas()` and `run.plan().denoise_spans()`,
+/// driving phase transitions via `run_flow_sampler_with_phase_transition_spans` (`SW-6946`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_planned_with_memory(
+    transformer: &Sd3Transformer,
+    run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
+    let sigmas = run.plan().denoise_sigmas();
+    let spans = run.plan().denoise_spans();
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
+        let window = transformer_window.map(|size| (size, cancel));
+        let pred_cond =
+            transformer.forward_inference(x, &cond.context, &cond.pooled, &t, attention, window)?;
+        match uncond {
+            Some(uc) if guidance_scale != 1.0 => {
+                let pred_uncond = transformer.forward_inference(
+                    x,
+                    &uc.context,
+                    &uc.pooled,
+                    &t,
+                    attention,
+                    window,
+                )?;
+                let delta = subtract(&pred_cond, &pred_uncond)?;
+                Ok(add(
+                    &pred_uncond,
+                    &multiply(&delta, Array::from_slice(&[guidance_scale], &[1]))?,
+                )?)
+            }
+            _ => Ok(pred_cond),
+        }
+    };
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    mlx_gen::run_flow_sampler_with_phase_transition_spans(
+        SamplerRun {
+            sampler_name: sampler_name.or_else(|| Some(run.plan().sampler())),
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
+        TimestepConvention::Sigma,
+        latents,
+        &spans,
+        Some(run),
+        |latents, sigma| {
+            crate::preview::emit_preview_for_plan(
+                preview,
+                &previews,
+                sigmas,
+                sigma,
+                latents,
+                run.plan(),
+            );
+        },
+        predict,
+        None,
+    )
+}
+
+/// Per-seed planned img2img denoise from an already encoded clean reference latent at the phase-0
+/// spatial dimensions `(phase0_width, phase0_height)` (`§6.13`, `M3`, `SW-6946`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_from_clean_planned_with_memory(
+    transformer: &Sd3Transformer,
+    run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+    sampler_name: Option<&str>,
+    seed: u64,
+    clean: &Array,
+    phase0_width: u32,
+    phase0_height: u32,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
+    let noise = create_noise(seed, phase0_width, phase0_height)?;
+    let sigmas = run.plan().denoise_sigmas();
+    let x_start = add_noise_by_interpolation(clean, &noise, sigmas[0])?;
+    denoise_planned_with_memory(
+        transformer,
+        run,
         sampler_name,
         seed,
         x_start,

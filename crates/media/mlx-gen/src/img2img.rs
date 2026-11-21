@@ -48,14 +48,7 @@ pub fn resolve_reference<'a>(
 /// Higher strength → later start → fewer denoise steps → output stays closer to the init image
 /// (the fork's convention).
 pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// Scale an RGB8 init image to `target` dims with PIL LANCZOS (the fork's `scale_to_dimensions`,

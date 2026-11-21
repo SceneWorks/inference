@@ -22,8 +22,7 @@ use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decode_and_collect,
-    denoise_with_progress_windowed_pag, encode_init_latents, encode_prompt, init_time_step,
+    add_noise_by_interpolation, create_noise, encode_init_latents, encode_prompt, init_time_step,
     negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER,
     PID_BACKBONE,
 };
@@ -97,6 +96,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(pag_capability()),
             ..Default::default()
         },
@@ -121,6 +121,7 @@ pub struct QwenImage {
     precision: Precision,
     quant: Option<Quant>,
     adapters: Vec<mlx_gen::AdapterSpec>,
+    loaded_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (the MMDiT transformer, the VAE, and the optional PiD decoder) —
@@ -195,6 +196,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         precision: spec.precision,
         quant: spec.quantize,
         adapters: spec.adapters.clone(),
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -367,9 +369,8 @@ impl Generator for QwenImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_with_report_observed(req, on_progress)
-        })
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
     }
 
     fn generate_with_execution_report(
@@ -377,6 +378,39 @@ impl Generator for QwenImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let mut report = mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed_with_run(req, Some(&run), on_progress)
+        })?;
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         mlx_gen::image_execution::complete_image_report_attempt(
             self.descriptor(),
             &req.cancel,
@@ -393,7 +427,11 @@ impl Generator for QwenImage {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_with_report_observed(req, &mut progress)
+                let mut report =
+                    self.generate_with_report_observed_with_run(req, Some(&run), &mut progress)?;
+                report.low_res_start =
+                    plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                Ok(report)
             },
         )
     }
@@ -405,19 +443,22 @@ impl QwenImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_with_report_observed(req, on_progress)?
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned(req, &plan, None, on_progress)?
             .output
             .ok_or_else(|| {
                 gen_core::Error::Msg(format!("{MODEL_ID}: the render produced no output"))
             })
     }
 
-    fn generate_with_report_observed(
+    fn generate_with_report_observed_with_run(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl_with_run(req, run, on_progress)
+            .map_err(Into::into)
     }
 }
 
@@ -430,9 +471,10 @@ impl QwenImage {
     /// → load the DiT/VAE/PiD → denoise/decode → free the heavy bundle) is driven by the shared
     /// [`Residency::run`] seam (sc-11125), which owns the eval/drop/clear discipline, the
     /// stage-boundary cancel checks, and the error-safe cache flush.
-    fn generate_impl(
+    fn generate_impl_with_run(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
@@ -446,7 +488,10 @@ impl QwenImage {
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
-        let params = resolve_run_params(req, req.width, req.height)?;
+        let mut params = resolve_run_params(req, req.width, req.height)?;
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
         mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
@@ -464,6 +509,9 @@ impl QwenImage {
                 "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
             ));
         }
+        let (phase0_w, phase0_h) = run
+            .map(|r| r.plan().phase_output_size(0))
+            .unwrap_or((req.width, req.height));
 
         let mut actual_steps = 0u32;
         // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11000; sc-11125). Under `Sequential` the
@@ -476,26 +524,32 @@ impl QwenImage {
             req.use_pid,
             on_progress,
             |te: &QwenTextEncoder| {
-                let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
-                let neg = if params.guidance == 1.0 {
-                    None
-                } else {
-                    Some(encode_prompt(
-                        &self.tokenizer,
-                        te,
-                        negative_or_fallback(req),
-                        MODEL_ID,
-                    )?)
+                let encode_body = || -> Result<_> {
+                    let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
+                    let neg = if params.guidance == 1.0 {
+                        None
+                    } else {
+                        Some(encode_prompt(
+                            &self.tokenizer,
+                            te,
+                            negative_or_fallback(req),
+                            MODEL_ID,
+                        )?)
+                    };
+                    let encoded = (pos, neg);
+                    crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                        match &encoded.1 {
+                            Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                            None => mlx_rs::transforms::eval([&encoded.0])?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(encoded)
                 };
-                let encoded = (pos, neg);
-                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
-                    match &encoded.1 {
-                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
-                        None => mlx_rs::transforms::eval([&encoded.0])?,
-                    }
-                    Ok(())
-                })?;
-                Ok(encoded)
+                match run {
+                    Some(run) => run.encode(encode_body),
+                    None => encode_body(),
+                }
             },
             // The shared post-conditioning boundary above already forces the lazy arrays while the
             // encoder is alive, for both Resident and Sequential. Nothing remains to materialize
@@ -512,9 +566,7 @@ impl QwenImage {
                 // encoder was dropped and the VAE loaded — independent of `pos`/`neg`, so byte-identical.
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
-                    Some(encode_init_latents(
-                        heavy.vae, image, req.width, req.height,
-                    )?)
+                    Some(encode_init_latents(heavy.vae, image, phase0_w, phase0_h)?)
                 } else {
                     None
                 };
@@ -548,7 +600,10 @@ impl QwenImage {
                             .alternate_decoder
                             .map(|decoder| decoder as &dyn LatentDecoder)
                     });
-                let images = decode_and_collect(
+                if let Some(run) = run {
+                    run.begin_rendering()?;
+                }
+                let images = crate::pipeline::decode_and_collect_with_run(
                     heavy.vae,
                     decoder,
                     decode_tiling.as_ref(),
@@ -558,24 +613,31 @@ impl QwenImage {
                     params.base_seed,
                     req.width,
                     req.height,
+                    run,
                     on_progress,
                     |seed, progress| {
                         // Latents stay f32 through the loop: the fork keeps txt2img/img2img noise f32, and MLX
                         // promotes the bf16 transformer weights to f32 per-op (only `prompt_embeds` is bf16).
-                        let noise = create_noise(seed, req.width, req.height)?;
+                        let noise = create_noise(seed, phase0_w, phase0_h)?;
                         let latents = match &clean {
                             // Blend the (hoisted) clean latents with this image's noise at
                             // `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
                             Some(clean) => {
-                                let sigma = params.sigmas[start_step];
+                                let sigma = run
+                                    .and_then(|r| r.plan().denoise_sigmas().first().copied())
+                                    .unwrap_or(params.sigmas[start_step]);
                                 add_noise_by_interpolation(clean, &noise, sigma)?
                             }
                             None => noise,
                         };
-                        let latents = denoise_with_progress_windowed_pag(
+                        let (active_sigmas, active_start_step) = match run {
+                            Some(run) => (run.plan().denoise_sigmas(), 0),
+                            None => (denoise_sigmas, start_step),
+                        };
+                        let latents = crate::pipeline::denoise_with_progress_windowed_pag_and_run(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
-                            denoise_sigmas,
+                            active_sigmas,
                             seed,
                             latents,
                             &pos,
@@ -583,10 +645,11 @@ impl QwenImage {
                             params.guidance,
                             req.width,
                             req.height,
-                            start_step,
+                            active_start_step,
                             attention_budget,
                             block_window,
                             resolved_pag.as_ref(),
+                            run,
                             &req.cancel,
                             &req.preview,
                             progress,
@@ -599,6 +662,9 @@ impl QwenImage {
                         Ok(latents)
                     },
                 )?;
+                if let Some(run) = run {
+                    run.finish_rendering();
+                }
                 Ok(GenerationOutput::Images(images))
             },
         )?;
@@ -610,6 +676,87 @@ impl QwenImage {
         })
     }
 }
+
+pub fn compile_trajectory_for(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    let desc = descriptor();
+    validate_request(MODEL_ID, &desc.capabilities, req)?;
+    let params = resolve_run_params(req, req.width, req.height)?;
+    let reference = resolve_reference(req, MODEL_ID)?;
+    let start_step = match reference {
+        Some((_, strength)) => init_time_step(params.steps, strength),
+        None => 0,
+    };
+    if params.is_lightning && start_step > 0 {
+        return Err(gen_core::Error::Msg(
+            "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
+        ));
+    }
+    let (_capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
+    let start = start_step.min(keep.saturating_sub(1));
+    let sliced = params.sigmas[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
+    let solver = gen_core::sampling::canonical_solver_or_euler(params.sampler_name.as_deref());
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance: params.guidance,
+        sigmas: sliced,
+        executed_steps,
+        capture_sigma,
+    };
+    if req.conditioning.is_empty() {
+        gen_core::RenderPlan::base_image(&desc, req, pass)
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)
+    }
+}
+
+pub(crate) fn validate_plan_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<()> {
+    gen_core::reject_unknown_components(spec, &[VAE_COMPONENT], id)?;
+    let _ = spec.quantize.map(Quant::affine_bits).transpose()?;
+    if spec.precision != Precision::Bf16 {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: only dense bf16 is wired in the Rust port (drop the precision override)"
+        )));
+    }
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id} expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), not a single .safetensors file"
+        )));
+    }
+    if spec.ip_adapter.is_some() || spec.identity.is_some() || !spec.extra_controls.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: IP-Adapter / identity overlays are not supported"
+        )));
+    }
+    if id != crate::model_control::MODEL_ID && spec.control.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: control overlay belongs to qwen_image_control"
+        )));
+    }
+    if id == crate::model_control::MODEL_ID && spec.control.is_none() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: requires a control checkpoint (spec.control)"
+        )));
+    }
+    Ok(())
+}
+
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec, MODEL_ID)?;
+    compile_trajectory_for(req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
 
 /// Capability-driven request validation, factored out for unit testing without loaded weights.
 pub(crate) fn validate_request(
@@ -644,6 +791,33 @@ pub(crate) fn validate_request(
                 )));
             }
         }
+    }
+    if let Some(low_res) = &req.low_res_start {
+        let params = resolve_run_params(req, req.width, req.height)?;
+        let reference = resolve_reference(req, id)?;
+        let start_step = match reference {
+            Some((_, strength)) => init_time_step(params.steps, strength),
+            None => 0,
+        };
+        if params.is_lightning && start_step > 0 {
+            return Err(Error::Msg(
+                "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
+            ));
+        }
+        let (_, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
+        let denoise_sigmas = &params.sigmas[..keep];
+        let executed_steps = denoise_sigmas
+            [start_step.min(denoise_sigmas.len().saturating_sub(1))..]
+            .len()
+            .saturating_sub(1);
+        let mut desc = descriptor();
+        desc.id = match id {
+            crate::model_edit::MODEL_ID => crate::model_edit::MODEL_ID,
+            crate::model_control::MODEL_ID => crate::model_control::MODEL_ID,
+            _ => MODEL_ID,
+        };
+        desc.capabilities = caps.clone();
+        low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
     }
     Ok(())
 }
@@ -1102,5 +1276,81 @@ mod tests {
             .execution_report(20)
             .validate_with_capability(caps.pag.as_ref().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{FeatureInapplicabilityCode, LowResStartSpec};
+
+        let mut builder = mlx_gen::gen_core::ProviderRegistryBuilder::new();
+        builder = crate::register_providers(builder);
+        let registry = builder.build().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+
+        let t2i_req = GenerationRequest {
+            prompt: "a fox in the forest".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(20),
+            seed: Some(42),
+            low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &t2i_req)
+            .unwrap()
+            .expect("qwen_image T2I low_res_start plan must compile");
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..7, 7..20]);
+
+        let img2img_req = GenerationRequest {
+            prompt: "a fox in the forest".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(20),
+            seed: Some(42),
+            conditioning: vec![Conditioning::Reference {
+                image: mlx_gen::Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        };
+        let img2img_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &img2img_req)
+            .unwrap()
+            .expect("qwen_image img2img low_res_start plan must compile");
+        assert_eq!(img2img_plan.phase_output_size(0), (512, 512));
+        assert_eq!(img2img_plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(img2img_plan.denoise_spans(), vec![0..4, 4..10]);
+
+        let base_app = registry
+            .route_feature_applicability(MODEL_ID)
+            .expect("qwen_image applicability");
+        assert!(base_app["low_res_start"].applicable);
+
+        let edit_app = registry
+            .route_feature_applicability(crate::model_edit::MODEL_ID)
+            .expect("qwen_image_edit applicability");
+        assert!(!edit_app["low_res_start"].applicable);
+        assert!(edit_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0EditConditioning));
+
+        let control_app = registry
+            .route_feature_applicability(crate::model_control::MODEL_ID)
+            .expect("qwen_image_control applicability");
+        assert!(!control_app["low_res_start"].applicable);
+        assert!(control_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
     }
 }

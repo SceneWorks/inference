@@ -71,6 +71,44 @@ pub fn emit_preview(
     });
 }
 
+/// Plan-aware preview emission that validates the `[1, 16, h, w]` latent grid against the plan's
+/// phase-0 or final output dimensions before projecting to RGB (`SW-6946`).
+pub fn emit_preview_for_plan(
+    sink: &PreviewSink,
+    counter: &mlx_gen::preview::PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    latents: &Array,
+    plan: &mlx_gen::gen_core::RenderPlan,
+) {
+    if !sink.is_active() {
+        return;
+    }
+    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
+        let shape = latents.shape();
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 16 || shape[2] <= 0 || shape[3] <= 0 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "SD3.5 preview latent must have shape [1, 16, h, w], got {shape:?}"
+            )));
+        }
+        let (h, w) = (shape[2] as u32, shape[3] as u32);
+        let (p0_w, p0_h) = plan.phase_output_size(0);
+        let (full_w, full_h) = plan.output_size();
+        let matches_phase0 = (w, h) == (p0_w / 8, p0_h / 8);
+        let matches_full = (w, h) == (full_w / 8, full_h / 8);
+        if !matches_phase0 && !matches_full {
+            return Err(mlx_gen::Error::Msg(format!(
+                "SD3.5 preview latent ({w}x{h}) does not match phase-0 ({}x{}) or full ({}x{}) latent grid",
+                p0_w / 8,
+                p0_h / 8,
+                full_w / 8,
+                full_h / 8
+            )));
+        }
+        mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

@@ -10,18 +10,16 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, ActivationMemoryAnchor,
-    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    Residency, Result, StagedHeavy, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, ActivationMemoryAnchor, Capabilities,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result,
+    StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use std::path::Path;
 
 use crate::loader;
-use crate::pipeline::{
-    self, denoise_cfg_with_progress_preview_and_pag, encode_init_latents, init_time_step,
-};
+use crate::pipeline::{self, encode_init_latents, init_time_step};
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
@@ -106,6 +104,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(turbo_pag_capability()),
             ..Default::default()
         },
@@ -121,6 +120,7 @@ pub struct ZImageTurbo {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    loaded_spec: Option<LoadSpec>,
     adapters: Vec<mlx_gen::AdapterSpec>,
     /// Request-scoped component residency (SC-15806). Construction retains the two phase loaders;
     /// each request either populates/reuses one warm pair or runs encode → drop text → load heavy →
@@ -204,6 +204,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         residency,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        loaded_spec: Some(spec.clone()),
         adapters: spec.adapters.clone(),
     }))
 }
@@ -305,6 +306,7 @@ fn build_comfyui_generator(source: ComfyUiSource) -> Result<Box<dyn Generator>> 
             quant: None,
             component_precision_floors: &[],
         },
+        loaded_spec: None,
         residency: Residency::request_scoped(
             move |streamable| {
                 if streamable {
@@ -584,14 +586,12 @@ impl Generator for ZImageTurbo {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_report_impl(req, on_progress)
-                .map_err(Into::<gen_core::Error>::into)?
-                .output
-                .ok_or_else(|| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
-                })
-        })
+        let plan = compile_turbo_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
+            })
     }
 
     fn generate_with_report(
@@ -599,15 +599,37 @@ impl Generator for ZImageTurbo {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_report_impl(req, on_progress)
-                .map_err(Into::into)
-        })
+        let plan = compile_turbo_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
     }
 
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = compile_turbo_trajectory(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.render_planned(req, plan, scope, on_progress)
+                .map_err(Into::into)
+        })
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::image_execution::complete_image_report_attempt(
@@ -620,7 +642,7 @@ impl Generator for ZImageTurbo {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_report_impl(req, &mut progress)
+                self.render_planned(req, plan, scope, &mut progress)
                     .map_err(Into::into)
             },
         )
@@ -651,20 +673,23 @@ impl Generator for ZImageTurbo {
 }
 
 impl ZImageTurbo {
-    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
-    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
-    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    /// The rich-`Result` body behind [`Generator::generate`] and [`Generator::generate_planned`].
     ///
     /// The staged residency lifecycle (encode → drop the text encoder under `Sequential` → load the
     /// DiT/VAE/PiD → denoise/decode → free the heavy bundle) is driven by the shared
-    /// [`Residency::run`] seam (sc-11125), which owns the eval/drop/clear discipline, the
-    /// stage-boundary cancel checks, and the error-safe cache flush.
-    fn generate_report_impl(
+    /// [`Residency::run_staged_request_scoped`] seam (sc-11125) and [`gen_core::RenderRun`] (`SW-6947`).
+    fn render_planned(
         &self,
         req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        if let Some(spec) = &self.loaded_spec {
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(spec))?;
+        }
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         mlx_gen::ios_quantum::diagnostic_metadata(
             MODEL_ID,
@@ -679,15 +704,22 @@ impl ZImageTurbo {
             ],
         );
 
-        let guidance = 1.0 + req.guidance.unwrap_or(0.0);
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let guidance = run.plan().guidance();
         let cfg_on = guidance != 1.0;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = run.plan().base_seed();
 
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
-            Some((_, strength)) => init_time_step(steps, strength),
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    gen_core::resolve_img2img_init_time_step(steps, strength)?
+                } else {
+                    init_time_step(steps, strength)
+                }
+            }
             None => 0,
         };
         let is_img2img = start_step > 0;
@@ -727,36 +759,36 @@ impl ZImageTurbo {
             // round the text embeddings to bf16 to match the fork's golden; f32 is sharper — flip to
             // f32 once parity is not the goal.
             |text_encoder: &TextEncoder| {
-                // Calibration-only fault injection at a physical phase boundary (SC-15449);
-                // `None` for every production request, so this is a `None` comparison.
-                pipeline::calibration_fault(
-                    req,
-                    mlx_gen::gen_core::MemoryPhase::Conditioning,
-                    MODEL_ID,
-                )?;
-                let cap = pipeline::encode_prompt(
-                    &self.tokenizer,
-                    text_encoder,
-                    &req.prompt,
-                    MODEL_ID,
-                    encoder_window,
-                )?;
-                let cap = if is_img2img {
-                    cap
-                } else {
-                    pipeline::caption_cast_quantum(&cap)?
-                };
-                let negative = if cfg_on {
-                    Some(pipeline::encode_uncond(
+                run.encode(|| {
+                    pipeline::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Conditioning,
+                        MODEL_ID,
+                    )?;
+                    let cap = pipeline::encode_prompt(
                         &self.tokenizer,
                         text_encoder,
-                        req.negative_prompt.as_deref().unwrap_or(""),
+                        &req.prompt,
+                        MODEL_ID,
                         encoder_window,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((cap, negative))
+                    )?;
+                    let cap = if is_img2img {
+                        cap
+                    } else {
+                        pipeline::caption_cast_quantum(&cap)?
+                    };
+                    let negative = if cfg_on {
+                        Some(pipeline::encode_uncond(
+                            &self.tokenizer,
+                            text_encoder,
+                            req.negative_prompt.as_deref().unwrap_or(""),
+                            encoder_window,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((cap, negative))
+                })
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated `cap` keeps the encoder referenced through the graph and the drop frees nothing.
@@ -772,22 +804,13 @@ impl ZImageTurbo {
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
             |heavy: &ZImageHeavyOwned, (cap, negative), on_progress| {
+                run.begin_rendering()?;
                 pipeline::calibration_fault(
                     req,
                     mlx_gen::gen_core::MemoryPhase::Denoise,
                     MODEL_ID,
                 )?;
-                // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
-                // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
-                // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
-                let sampling = crate::sampling::resolve_full(req)?;
-                let resolved_sigmas = sampling.sigmas().to_vec();
-                // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
-                // `use_pid` is set AND an overlay was loaded, else `None` → the native VAE. The
-                // `(capture_sigma, keep)` fold truncates the denoise to the achieved-σ step; the clean
-                // path yields `(0.0, len())` → full schedule, byte-identical.
-                let (capture_sigma, keep) =
-                    flow_capture_for_request(req, &resolved_sigmas, start_step);
+                let capture_sigma = run.plan().capture_sigma();
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid.as_ref(),
                     req,
@@ -795,44 +818,38 @@ impl ZImageTurbo {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
-                // VAE-encode the init image once (img2img): constant across the count loop (F-034).
+                // VAE-encode the init image once (img2img) at Phase-0 output dimensions.
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
-                    Some(encode_init_latents(
-                        &heavy.vae, image, req.width, req.height,
-                    )?)
+                    let (init_w, init_h) = run.plan().phase_output_size(0);
+                    Some(encode_init_latents(&heavy.vae, image, init_w, init_h)?)
                 } else {
                     None
                 };
 
-                let sampler_name = Some(sampling.solver().name());
+                let sampler_name = req.sampler.as_deref();
+                let sigmas = run.plan().denoise_sigmas();
+                let spans = run.plan().denoise_spans();
                 let resolved_pag_ref = resolved_pag.as_ref();
-                let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-                let actual_steps = scheduler
-                    .sigmas
-                    .len()
-                    .saturating_sub(1)
-                    .saturating_sub(start) as u32;
-                let latents = pipeline::denoise_batch(
-                    &scheduler,
+                let actual_steps = run.plan().executed_steps() as u32;
+                let latents = pipeline::denoise_batch_planned(
+                    &run,
+                    req.count,
                     clean.as_ref(),
-                    start_step,
-                    base_seed,
-                    req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_cfg_with_progress_preview_and_pag(
+                        pipeline::denoise_cfg_planned(
                             &heavy.transformer,
-                            &scheduler,
+                            sigmas,
+                            &spans,
+                            Some(&run),
                             sampler_name,
                             seed,
                             latents,
                             &cap,
                             negative.as_ref(),
                             guidance,
-                            start_step,
                             attention_budget,
                             block_window,
                             &req.cancel,
@@ -850,23 +867,33 @@ impl ZImageTurbo {
             },
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder, actual_steps), on_progress| {
-                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
-                let decoder: &dyn LatentDecoder = pid_decoder
-                    .as_ref()
-                    .map(|d| d as &dyn LatentDecoder)
-                    .unwrap_or(view.vae);
-                let images = pipeline::decode_batch(
-                    decoder,
-                    tiling.as_ref(),
-                    latents,
-                    &req.cancel,
-                    on_progress,
-                )?;
-                let mut report =
-                    gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
-                report.pag = resolved_pag
-                    .as_ref()
-                    .map(|resolved| resolved.execution_report(actual_steps));
+                let report = run.decode_phase(|| -> Result<_> {
+                    pipeline::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Decode,
+                        MODEL_ID,
+                    )?;
+                    let decoder: &dyn LatentDecoder = pid_decoder
+                        .as_ref()
+                        .map(|d| d as &dyn LatentDecoder)
+                        .unwrap_or(view.vae);
+                    let images = pipeline::decode_batch(
+                        decoder,
+                        tiling.as_ref(),
+                        latents,
+                        &req.cancel,
+                        on_progress,
+                    )?;
+                    let mut report =
+                        gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                    report.pag = resolved_pag
+                        .as_ref()
+                        .map(|resolved| resolved.execution_report(actual_steps));
+                    report.low_res_start =
+                        plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                    Ok(report)
+                })?;
+                run.finish_rendering();
                 Ok(report)
             },
         )?;
@@ -887,6 +914,27 @@ pub(crate) fn validate_request(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
+    if let Some(low_res) = &req.low_res_start {
+        if id == crate::model_control::MODEL_ID || id == crate::model_base_control::MODEL_ID {
+            let (desc, shift, default_steps) = if id == crate::model_base_control::MODEL_ID {
+                (
+                    crate::model_base_control::descriptor(),
+                    crate::model_base::SCHEDULE_SHIFT,
+                    crate::model_base::DEFAULT_STEPS,
+                )
+            } else {
+                (
+                    crate::model_control::descriptor(),
+                    SCHEDULE_SHIFT,
+                    DEFAULT_STEPS,
+                )
+            };
+            let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
+            let executed_steps = sampling.sigmas().len().saturating_sub(1);
+            low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
+        }
+    }
+
     // Shared capability floor (F-030): count/steps range, size range, negative_prompt/guidance/
     // true_cfg support gating + finiteness, sampler/scheduler/guidance_method membership, and accepted
     // conditioning kinds. The hand-rolled copy validated NONE of sampler/scheduler/true_cfg — a typo'd
@@ -925,7 +973,263 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
+
+    if let Some(low_res) = &req.low_res_start {
+        let (desc, shift, default_steps) = if id == crate::model_base::MODEL_ID {
+            (
+                crate::model_base::descriptor(),
+                crate::model_base::SCHEDULE_SHIFT,
+                crate::model_base::DEFAULT_STEPS,
+            )
+        } else {
+            (descriptor(), SCHEDULE_SHIFT, DEFAULT_STEPS)
+        };
+        let steps = req.steps.unwrap_or(default_steps) as usize;
+        let reference = pipeline::resolve_reference(req, id)?;
+        let start_step = match reference {
+            Some((img, strength)) => {
+                if img.width == 0
+                    || img.height == 0
+                    || img.pixels.len()
+                        != (img.width as usize)
+                            .saturating_mul(img.height as usize)
+                            .saturating_mul(3)
+                {
+                    return Err(Error::Msg(format!(
+                        "{id}: invalid img2img reference dimensions {}x{}",
+                        img.width, img.height
+                    )));
+                }
+                gen_core::resolve_img2img_init_time_step(steps, strength)?
+            }
+            None => 0,
+        };
+        let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
+        let (_, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
+        let start = start_step.min(keep.saturating_sub(1));
+        let executed_steps = keep.saturating_sub(1).saturating_sub(start);
+        low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
+    }
     Ok(())
+}
+
+/// Compile the weights-free Z-Image trajectory for `desc` (`z_image_turbo` or `z_image`) (`SW-6947`).
+pub(crate) fn compile_trajectory_for(
+    desc: ModelDescriptor,
+    shift: f32,
+    default_steps: u32,
+    guidance: f32,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    validate_request(desc.id, &desc.capabilities, req)?;
+    let steps = req.steps.unwrap_or(default_steps) as usize;
+    let reference = pipeline::resolve_reference(req, desc.id)?;
+    let start_step = match reference {
+        Some((img, strength)) => {
+            if img.width == 0
+                || img.height == 0
+                || img.pixels.len()
+                    != (img.width as usize)
+                        .saturating_mul(img.height as usize)
+                        .saturating_mul(3)
+            {
+                return Err(gen_core::Error::Msg(format!(
+                    "{}: invalid img2img reference dimensions {}x{}",
+                    desc.id, img.width, img.height
+                )));
+            }
+            if req.low_res_start.is_some() {
+                gen_core::resolve_img2img_init_time_step(steps, strength)?
+            } else {
+                init_time_step(steps, strength)
+            }
+        }
+        None => 0,
+    };
+    let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
+    let (_capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
+    let start = start_step.min(keep.saturating_sub(1));
+    let sigmas = sampling.sigmas()[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sigmas.get(executed_steps).unwrap_or(&0.0);
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 16,
+            sampler: sampling.solver().name(),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub fn compile_turbo_trajectory(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    let guidance = 1.0 + req.guidance.unwrap_or(0.0);
+    compile_trajectory_for(descriptor(), SCHEDULE_SHIFT, DEFAULT_STEPS, guidance, req)
+}
+
+pub(crate) fn compile_turbo(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec, MODEL_ID)?;
+    compile_turbo_trajectory(req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+pub fn compile_base_trajectory(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    let guidance = req.guidance.unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
+    compile_trajectory_for(
+        crate::model_base::descriptor(),
+        crate::model_base::SCHEDULE_SHIFT,
+        crate::model_base::DEFAULT_STEPS,
+        guidance,
+        req,
+    )
+}
+
+pub(crate) fn compile_base(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec, crate::model_base::MODEL_ID)?;
+    compile_base_trajectory(req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+pub(crate) fn compile_control_for(
+    desc: ModelDescriptor,
+    shift: f32,
+    default_steps: u32,
+    guidance: f32,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    validate_request(desc.id, &desc.capabilities, req)?;
+    let accepted = desc
+        .control_kinds
+        .clone()
+        .unwrap_or(gen_core::AcceptedControlKinds::Any);
+    let mut found_control = false;
+    for c in &req.conditioning {
+        if let gen_core::Conditioning::Control { kind, .. } = c {
+            if !accepted.accepts(kind) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: unsupported control kind {kind:?}",
+                    desc.id
+                )));
+            }
+            if found_control {
+                return Err(gen_core::Error::Msg(format!(
+                    "{}: a single control image is supported",
+                    desc.id
+                )));
+            }
+            found_control = true;
+        }
+    }
+    if !found_control {
+        return Err(gen_core::Error::Msg(format!(
+            "{} requires a Control conditioning (the pose/union skeleton)",
+            desc.id
+        )));
+    }
+    let steps = req.steps.unwrap_or(default_steps) as usize;
+    let reference = pipeline::resolve_reference(req, desc.id)?;
+    let start_step = match reference {
+        Some((_, strength)) => init_time_step(steps, strength),
+        None => 0,
+    };
+    let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
+    let (_capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
+    let start = start_step.min(keep.saturating_sub(1));
+    let sigmas = sampling.sigmas()[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sigmas.get(executed_steps).unwrap_or(&0.0);
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 16,
+            sampler: sampling.solver().name(),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_turbo_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let desc = crate::model_control::descriptor();
+    validate_request(desc.id, &desc.capabilities, req)?;
+    validate_plan_load_spec(spec, crate::model_control::MODEL_ID)?;
+    validate_control_load_spec(spec, crate::model_control::MODEL_ID)?;
+    let guidance = 1.0 + req.guidance.unwrap_or(0.0);
+    compile_control_for(desc, SCHEDULE_SHIFT, DEFAULT_STEPS, guidance, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+pub(crate) fn compile_base_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let desc = crate::model_base_control::descriptor();
+    validate_request(desc.id, &desc.capabilities, req)?;
+    validate_plan_load_spec(spec, crate::model_base_control::MODEL_ID)?;
+    validate_control_load_spec(spec, crate::model_base_control::MODEL_ID)?;
+    let guidance = req.guidance.unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
+    compile_control_for(
+        desc,
+        crate::model_base::SCHEDULE_SHIFT,
+        crate::model_base::DEFAULT_STEPS,
+        guidance,
+        req,
+    )
+    .map(|plan| plan.bind_load(spec))
+    .map(Some)
+}
+
+fn validate_control_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<()> {
+    match &spec.control {
+        Some(WeightsSource::File(_)) => Ok(()),
+        Some(WeightsSource::Dir(_)) => Err(gen_core::Error::Msg(format!(
+            "{id}: LoadSpec::control must be a WeightsSource::File pointing at the ControlNet .safetensors"
+        ))),
+        None => Err(gen_core::Error::Msg(format!(
+            "{id}: LoadSpec::control is required (pass the Fun-Controlnet-Union .safetensors via LoadSpec::with_control)"
+        ))),
+    }
+}
+
+fn validate_plan_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<()> {
+    if spec.precision != Precision::Bf16 {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
+             internally (drop the precision override)"
+        )));
+    }
+    if req_is_file_without_comfyui(spec) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id} expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+        )));
+    }
+    Ok(())
+}
+
+fn req_is_file_without_comfyui(spec: &LoadSpec) -> bool {
+    matches!(spec.weights, WeightsSource::File(_)) && spec.text_encoder.is_none()
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral

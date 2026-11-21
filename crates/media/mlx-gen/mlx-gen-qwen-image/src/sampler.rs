@@ -50,22 +50,8 @@ pub fn lightning(num_steps: usize) -> FlowMatchSampler {
 /// floor (vs the production schedule's `1/n`) is the whole difference — proven bit-exact vs diffusers
 /// in `tests/lightning_parity.rs` (e.g. 4-step → `[1.0, 0.857.., 0.601.., 0.00299.., 0.0]`).
 pub fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
-    let n = num_steps.max(1);
-    let e = LIGHTNING_SHIFT; // exp(μ)
-    let sigma_min = 1.0 / LIGHTNING_NUM_TRAIN_TIMESTEPS;
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            // linspace(1.0, sigma_min, n)
-            let s = if n == 1 {
-                1.0
-            } else {
-                1.0 + (sigma_min - 1.0) * (i as f32) / ((n - 1) as f32)
-            };
-            e / (e + (1.0 / s - 1.0))
-        })
-        .collect();
-    sigmas.push(0.0);
-    sigmas
+    let _ = LIGHTNING_NUM_TRAIN_TIMESTEPS;
+    mlx_gen::gen_core::sampling::qwen_lightning_sigmas(num_steps)
 }
 
 #[cfg(test)]

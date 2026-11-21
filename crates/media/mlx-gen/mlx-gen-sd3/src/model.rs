@@ -38,9 +38,8 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Conditioning, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
-    Residency, Result, WeightsSource,
+    Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
@@ -113,6 +112,23 @@ pub struct Sd3Large {
 pub(crate) struct Sd3Heavy {
     transformer: Sd3Transformer,
     vae: Vae,
+}
+
+impl mlx_gen::residency::StagedHeavy for Sd3Heavy {
+    type Light = Vae;
+    type DecodeView<'a> = &'a Vae;
+
+    fn shed_dit(self) -> Self::Light {
+        self.vae
+    }
+
+    fn decode_view(&self) -> Self::DecodeView<'_> {
+        &self.vae
+    }
+
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+        light
+    }
 }
 
 /// Seed-independent reference work for one SD3 request. The production implementation owns both
@@ -254,10 +270,14 @@ pub(crate) fn build_residency(
     let id = variant.id();
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
+    Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move || load_text_encoders_component(resolve_root(&spec_text, id)?, spec_text.quantize),
-        move |_use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, variant),
+        move |_streamable| {
+            load_text_encoders_component(resolve_root(&spec_text, id)?, spec_text.quantize)
+        },
+        move |_use_pid, _streamable| {
+            load_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, variant)
+        },
     )
 }
 
@@ -334,7 +354,38 @@ impl Generator for Sd3Large {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+            self.generate_planned(req, &plan, None, on_progress)
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = self.generate_impl(req, plan, scope, on_progress)?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_mmdit")?;
+        Ok(report)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -369,9 +420,23 @@ impl Generator for Sd3Large {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_report_attempt(
-            self.descriptor(),
-            &req.cancel,
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
             || {
                 mlx_gen::image_execution::policy_debug(
                     "Sd3Large.loaded_sequential_residency",
@@ -389,96 +454,81 @@ impl Generator for Sd3Large {
                     "Sd3Large.applied_adapter_controls",
                     &self.loaded_spec.adapters,
                 );
-                let mut progress =
-                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
             },
         )
     }
 }
 
 impl Sd3Large {
-    fn generate_observed(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
-impl Sd3Large {
-    /// The rich-`Result` body behind [`Generator::generate`]. The staged residency lifecycle (triple-TE
-    /// encode → **drop the three encoders** under `Sequential` → load the MMDiT/VAE → denoise/decode →
-    /// free the heavy bundle) is driven by the shared [`Residency::run`] seam (sc-11125), which owns the
-    /// eval/drop/clear discipline, the stage-boundary cancel checks, and the error-safe cache flush.
+    /// The rich-`Result` body behind [`Generator::generate_planned`]. The staged residency lifecycle
+    /// (triple-TE encode → **drop the three encoders** when staged → load the MMDiT/VAE → denoise →
+    /// shed MMDiT → decode → free the heavy bundle) is driven by [`Residency::run_staged_request_scoped`]
+    /// and [`mlx_gen::gen_core::RenderRun`], which own the eval/drop/clear discipline, the stage-boundary
+    /// cancel checks, phase-identity scope transitions, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
 
-        // Per-variant sampling recipe: Large = 28 steps / guidance 3.5 (true-CFG); Large-Turbo = 4
-        // steps / guidance 1.0 (distilled, guidance-baked → CFG off). The pipeline below skips the
-        // uncond forward whenever guidance == 1.0, so Turbo runs ONE forward per step.
-        let steps = req.steps.unwrap_or_else(|| self.variant.default_steps()) as usize;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        let guidance = req
-            .guidance
-            .unwrap_or_else(|| self.variant.default_guidance());
+        let base_seed = plan.base_seed();
+        let guidance = plan.guidance();
         mlx_gen::image_execution::scalar("sd3.guidance", guidance);
         let cfg_on = guidance != 1.0;
 
-        // img2img (epic 8588 slice A4, sc-10189): a single `Conditioning::Reference` seeds the denoise
-        // from the VAE-encoded reference at `strength` (the reference's own strength, else the
-        // request-level `strength`, else the 0.5 mid default — the full-range slider default the worker
-        // sends). Plain txt2img otherwise. All three variants advertise `Reference` (16-ch VAE encoder
-        // is loaded), so this routes for Large/Medium (true-CFG) and the distilled Large-Turbo alike.
-        // Seed-independent; resolved above the residency lifecycle.
+        // img2img (epic 8588 slice A4, sc-10189; SW-6946): a single `Conditioning::Reference` or
+        // `req.source_image` seeds the denoise from the VAE-encoded reference fitted directly to
+        // phase-0 output dimensions `(phase0_w, phase0_h) = run.plan().phase_output_size(0)`.
         let reference = single_reference(req)?;
         let strength = img2img_strength(reference.and_then(|(_, s)| s), req.strength);
         mlx_gen::image_execution::scalar("sd3.strength", strength);
         let sampler_name = req.sampler.as_deref();
+        let stage_residency =
+            req.memory.is_some_and(|m| m.stage_residency) || self.residency.is_sequential();
+        let transformer_window = crate::memory_strategy::transformer_window(req)?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
 
-        self.residency.run(
+        self.residency.run_staged_request_scoped(
+            stage_residency,
+            transformer_window.is_some(),
             &req.cancel,
             // SD3 has no PiD overlay; the heavy loader ignores `use_pid`.
             false,
             on_progress,
-            // ── Phase A: triple-TE conditioning. Seed-independent (no RNG) — cond = the prompt; uncond =
-            // the negative prompt (empty string when unset), used only when CFG is active (guidance !=
-            // 1.0). Under `Sequential` the shared seam LOADS all three encoders, encodes, materializes,
-            // then DROPS them + `clear_cache()` before the MMDiT/VAE load — bounding peak to
-            // `max(triple-TE, MMDiT+VAE)`. Under `Resident` it borrows the warm encoders (byte-identical
-            // to the pre-seam `encode_prompt`).
+            // ── Phase A: triple-TE conditioning inside `run.encode(|| ...)`.
             |encoders: &Sd3TextEncoders| {
-                let cond = pipeline::encode_prompt(
-                    encoders,
-                    &self.clip_tokenizer,
-                    self.clip_pad,
-                    &self.t5_tokenizer,
-                    &req.prompt,
-                )?;
-                let uncond = if cfg_on {
-                    let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(pipeline::encode_prompt(
+                run.encode(|| {
+                    let cond = pipeline::encode_prompt(
                         encoders,
                         &self.clip_tokenizer,
                         self.clip_pad,
                         &self.t5_tokenizer,
-                        neg,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((cond, uncond))
+                        &req.prompt,
+                    )?;
+                    let uncond = if cfg_on {
+                        let neg = req.negative_prompt.as_deref().unwrap_or("");
+                        Some(pipeline::encode_prompt(
+                            encoders,
+                            &self.clip_tokenizer,
+                            self.clip_pad,
+                            &self.t5_tokenizer,
+                            neg,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((cond, uncond))
+                })
             },
             // Materialize the pooled CLIP embeddings + T5 sequence context (and their uncond twins)
-            // while the encoders are still alive (Sequential only) — MLX is lazy, so an un-evaluated
-            // output keeps all three encoders referenced through the graph and the drop would free
-            // nothing. All of `context`/`pooled` (cond + optional uncond) are forced before the drop.
+            // while the encoders are still alive (staged only).
             |encoded: Option<&(Sd3Conditioning, Option<Sd3Conditioning>)>| {
                 let Some((cond, uncond)) = encoded else {
                     return Ok(());
@@ -491,50 +541,37 @@ impl Sd3Large {
                 mlx_rs::transforms::eval(arrays)?;
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle (MMDiT + VAE). Runs identically for both
-            // residencies. `on_progress` is threaded through the seam (F-179) and shadows the outer sink.
+            // ── Phase B: denoise from the heavy bundle (MMDiT + VAE).
             |heavy: &Sd3Heavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
-                // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build
-                // once. An unset req.scheduler keeps it byte-exact; a curated name re-shapes σ over the
-                // same mu=ln(3).
-                let scheduler = FlowMatchEuler::from_sigmas(pipeline::resolve_sd3_sigmas(
-                    req.scheduler.as_deref(),
-                    steps,
-                    req.scheduler_shift,
-                )?)?;
-
+                run.begin_rendering()?;
                 let attention = crate::memory_strategy::attention_plan(req);
-
                 mlx_gen::image_execution::policy_debug("sd3.attention", &attention.budget);
-                let transformer_window = crate::memory_strategy::transformer_window(req)?;
                 mlx_gen::image_execution::policy_debug(
                     "sd3.transformer_window",
                     &transformer_window,
                 );
-                let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
-                mlx_gen::image_execution::policy_debug("sd3.decode_tiling", &decode_tiling);
+                let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
                 let mut reference_preparer = MlxReferencePreparer {
                     vae: &heavy.vae,
-                    width: req.width,
-                    height: req.height,
+                    width: phase0_w,
+                    height: phase0_h,
                 };
-                let images = self.variant.map_seeded_outputs(
+                self.variant.map_seeded_outputs(
                     reference.map(|(image, _)| image),
                     base_seed,
                     req.count,
                     &mut reference_preparer,
                     |_route, seed, clean| {
+                        run.reset_image_denoise_phases();
                         let latents = if let Some(clean) = clean {
-                            pipeline::denoise_img2img_from_clean_cfg_with_memory(
+                            pipeline::denoise_img2img_from_clean_planned_with_memory(
                                 &heavy.transformer,
-                                &scheduler,
+                                &run,
                                 sampler_name,
                                 seed,
                                 clean,
-                                strength,
-                                req.width,
-                                req.height,
-                                steps,
+                                phase0_w,
+                                phase0_h,
                                 &cond,
                                 uncond.as_ref(),
                                 guidance,
@@ -545,10 +582,10 @@ impl Sd3Large {
                                 transformer_window,
                             )?
                         } else {
-                            let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                            pipeline::denoise_cfg_with_memory(
+                            let latents = pipeline::create_noise(seed, phase0_w, phase0_h)?;
+                            pipeline::denoise_planned_with_memory(
                                 &heavy.transformer,
-                                &scheduler,
+                                &run,
                                 sampler_name,
                                 seed,
                                 latents,
@@ -562,15 +599,33 @@ impl Sd3Large {
                                 transformer_window,
                             )?
                         };
-                        on_progress(Progress::Decoding);
+                        run.finish_image_denoise_phases()?;
+                        Ok(latents)
+                    },
+                )
+            },
+            // Materialize every denoised latent before shedding the MMDiT when staged.
+            |latents: &Vec<Array>| {
+                mlx_rs::transforms::eval(latents.iter())?;
+                Ok(())
+            },
+            // ── Phase C: decode from the surviving VAE.
+            |vae: &Vae, latents, on_progress: &mut dyn FnMut(Progress)| {
+                let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+                mlx_gen::image_execution::policy_debug("sd3.decode_tiling", &decode_tiling);
+                let mut images = Vec::with_capacity(latents.len());
+                for latent in &latents {
+                    on_progress(Progress::Decoding);
+                    images.push(run.decode_phase(|| {
                         pipeline::decode_to_image_tiled(
-                            &heavy.vae,
-                            &latents,
+                            vae,
+                            latent,
                             decode_tiling.as_ref(),
                             &req.cancel,
                         )
-                    },
-                )?;
+                    })?);
+                }
+                run.finish_rendering();
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -618,17 +673,96 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
         )));
     }
+    single_reference(req)?;
+    if let Some(low_res) = &req.low_res_start {
+        let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
+        let executed_steps = sigmas[start_step..].len().saturating_sub(1);
+        low_res.resolve_for_descriptor(desc, req, executed_steps, SIZE_MULTIPLE)?;
+    }
     Ok(())
 }
 
-/// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A4), or
-/// `None` for plain txt2img. SD3.5 conditions on exactly one reference image; more than one `Reference`
-/// (or a `MultiReference`) errors. Mirrors the Krea / FLUX single-reference idiom; the descriptor now
-/// advertises `Reference` on all three variants, so `validate_request` admits it before we get here.
+/// Resolve the full-pass SD3.5 sigma schedule and the `img2img` `start_step` (`0` for plain txt2img
+/// or `strength == 0`).
+pub(crate) fn resolved_schedule_for_request(
+    variant: Sd3Variant,
+    req: &GenerationRequest,
+) -> Result<(Vec<f32>, usize)> {
+    let steps = req.steps.unwrap_or_else(|| variant.default_steps()) as usize;
+    let reference = single_reference(req)?;
+    let strength = img2img_strength(reference.and_then(|(_, s)| s), req.strength);
+    let sigmas =
+        pipeline::resolve_sd3_sigmas(req.scheduler.as_deref(), steps, req.scheduler_shift)?;
+    let start_step = if reference.is_some() {
+        mlx_gen::gen_core::sampling::init_time_step(steps, Some(strength))
+            .min(sigmas.len().saturating_sub(1))
+    } else {
+        0
+    };
+    Ok((sigmas, start_step))
+}
+
+/// Compile the weights-free SD3.5 trajectory for `variant` and `req` (`SW-6946`).
+pub fn compile_trajectory_for(
+    variant: Sd3Variant,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    let desc = variant.descriptor();
+    validate_request(&desc, req)?;
+    let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
+    let sliced = sigmas[start_step..].to_vec();
+    let executed_steps = sliced.len().saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
+    let guidance = req.guidance.unwrap_or_else(|| variant.default_guidance());
+    let sampler = req
+        .sampler
+        .as_deref()
+        .unwrap_or(crate::config::DEFAULT_SAMPLER);
+    mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler,
+            guidance,
+            sigmas: sliced,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_base(
+    variant: Sd3Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    let id = variant.id();
+    if spec.precision != Precision::Bf16 {
+        return Err(mlx_gen::gen_core::Error::Msg(format!(
+            "{id}: only the default dense precision is wired (the CLIP encoders run f32 and the T5 \
+             promotes internally; drop the precision override)"
+        )));
+    }
+    resolve_root(spec, id)?;
+    if req.use_pid {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{id}: PiD decode is not supported on SD3.5"
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+/// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A4;
+/// SW-6946), supporting either `req.source_image` or a single `Conditioning::Reference`.
 fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
-    match req.conditioning.as_slice() {
-        [] => Ok(None),
-        [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
+    match (&req.source_image, req.conditioning.as_slice()) {
+        (None, []) => Ok(None),
+        (Some(image), []) => Ok(Some((image, req.strength))),
+        (None, [Conditioning::Reference { image, strength }]) => Ok(Some((image, *strength))),
         _ => Err(Error::Msg(
             "sd3: img2img supports exactly one Reference image".into(),
         )),

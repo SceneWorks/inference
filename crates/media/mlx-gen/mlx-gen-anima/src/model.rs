@@ -5,9 +5,9 @@
 //! differ only in the DiT weights file + default steps/CFG.
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result,
+    curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -62,6 +62,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -207,10 +208,38 @@ impl Generator for Anima {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         mlx_gen::image_execution::without_capture(|| {
-            self.generate_impl(req, &req.preview, on_progress)
-                .map_err(Into::into)
+            let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+            self.generate_planned(req, &plan, None, on_progress)
         })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = self.generate_planned_impl(req, plan, scope, &req.preview, on_progress)?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
     }
 
     fn generate_with_execution_report(
@@ -218,13 +247,33 @@ impl Generator for Anima {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         let preview = mlx_gen::image_execution::isolated_preview(&req.preview);
-        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
-            let mut progress =
-                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-            self.generate_impl(req, &preview, &mut progress)
-                .map_err(Into::into)
-        })
+        mlx_gen::image_execution::complete_image_report_attempt(
+            &self.descriptor,
+            &req.cancel,
+            || {
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                let output = self
+                    .generate_planned_impl(req, plan, scope, &preview, &mut progress)
+                    .map_err(mlx_gen::gen_core::Error::from)?;
+                let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+                report.low_res_start =
+                    plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                Ok(report)
+            },
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -254,8 +303,9 @@ impl Generator for Anima {
 
 impl Anima {
     /// One request, driven by the shared three-phase [`Residency::run_staged_request_scoped`] seam
-    /// (SC-15524). It owns the eval/drop/`clear_cache` discipline, the stage-boundary cancel checks
-    /// and the error-safe flush; this body only supplies Anima's phase tensors.
+    /// (SC-15524) and [`mlx_gen::gen_core::RenderRun`]. It owns the eval/drop/`clear_cache`
+    /// discipline, the stage-boundary cancel checks and the error-safe flush; this body only
+    /// supplies Anima's phase tensors.
     ///
     /// **Rung 1 is request-scoped.** `stage_residency` comes from the request's
     /// [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory) when the shared contract admitted
@@ -268,17 +318,22 @@ impl Anima {
     /// materialized while the DiT is alive, the 4.18 GB DiT + conditioner are shed, and only the
     /// ~250 MB VAE survives into the decode — which is also what makes rung 4's window worth
     /// selecting, and why rung 4 declares rung 1 as a same-request prerequisite.
-    fn generate_impl(
+    fn generate_planned_impl(
         &self,
         req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         preview: &mlx_gen::PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
         validate_request(&self.descriptor, req)?;
         // iOS: one cache-limit scope for the whole request (loads, encode, denoise, decode); inert
         // on every other target.
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         mlx_gen::ios_quantum::diagnostic_metadata(
             self.descriptor.id,
@@ -290,15 +345,9 @@ impl Anima {
             ],
         );
         let variant = self.variant;
-        let guidance = req.guidance.unwrap_or(variant.default_guidance());
+        let guidance = plan.guidance();
         let cfg_on = variant.uses_cfg() || guidance != 1.0;
         let negative = req.negative_prompt.clone().unwrap_or_default();
-        // Epic 7114 sampler/scheduler axis: `None` ⇒ the native er_sde default / native σ schedule.
-        let sampler = req
-            .sampler
-            .clone()
-            .unwrap_or_else(|| crate::pipeline::DEFAULT_SAMPLER.to_string());
-        let scheduler = req.scheduler.clone();
 
         // Resolve the whole ladder up front so an unimplementable request fails BEFORE any component
         // loads, rather than part-way through a staged schedule.
@@ -331,6 +380,7 @@ impl Anima {
                 self.descriptor.id
             )));
         }
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
 
         self.residency.run_staged_request_scoped(
             stage_residency,
@@ -346,14 +396,16 @@ impl Anima {
             // preserving the pre-seam behavior of running the uncond forward even at guidance 1.0). When
             // staged, the shared seam materializes these + DROPS the Qwen3 TE before the heavy load.
             |text: &AnimaText| {
-                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
-                let cond = text.encode_inputs(&req.prompt)?;
-                let uncond = if cfg_on {
-                    Some(text.encode_inputs(&negative)?)
-                } else {
-                    None
-                };
-                Ok((cond, uncond))
+                run.encode(|| {
+                    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
+                    let cond = text.encode_inputs(&req.prompt)?;
+                    let uncond = if cfg_on {
+                        Some(text.encode_inputs(&negative)?)
+                    } else {
+                        None
+                    };
+                    Ok((cond, uncond))
+                })
             },
             // Materialize the masked Qwen3 states + T5 ids (cond + optional uncond) while the TE is still
             // alive (staged only) — MLX is lazy, so an un-evaluated `source` keeps the TE referenced
@@ -368,6 +420,7 @@ impl Anima {
             // loop of denoise. Identical body for every residency and rung, so a staged or windowed job
             // is numerically identical to a warm unbounded one.
             |heavy: &AnimaHeavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
+                run.begin_rendering()?;
                 calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Denoise)?;
                 let window = heavy.block_window(window_size, &req.cancel)?;
                 let cond_enc = heavy.conditioner_forward(&cond)?;
@@ -376,7 +429,9 @@ impl Anima {
                     None => None,
                 };
                 let mut latents = Vec::with_capacity(req.count as usize);
-                for n in 0..req.count {
+                for (n, seed) in (0..req.count)
+                    .map(|n| (n as usize, plan.base_seed().wrapping_add(u64::from(n))))
+                {
                     mlx_gen::ios_quantum::diagnostic_metadata(
                         self.descriptor.id,
                         "serial",
@@ -393,17 +448,11 @@ impl Anima {
                     if n > 0 {
                         mlx_rs::memory::clear_cache();
                     }
-                    let seed = base_seed.wrapping_add(n as u64);
-                    latents.push(heavy.denoise_one(
+                    run.reset_image_denoise_phases();
+                    latents.push(heavy.denoise_one_planned(
+                        &run,
                         &cond_enc,
                         uncond_enc.as_ref(),
-                        req.width,
-                        req.height,
-                        steps,
-                        guidance,
-                        &sampler,
-                        scheduler.as_deref(),
-                        req.scheduler_shift,
                         seed,
                         preview,
                         &req.cancel,
@@ -411,6 +460,7 @@ impl Anima {
                         attention,
                         window,
                     )?);
+                    run.finish_image_denoise_phases()?;
                     mlx_gen::ios_quantum::diagnostic_metadata(
                         self.descriptor.id,
                         "serial_complete",
@@ -441,8 +491,11 @@ impl Anima {
                     // resident `render_one` path too. Each decode is one lazy graph forced by its
                     // own readback, so this loop is synchronous per image and the check lands
                     // between them.
-                    images.push(view.decode_one(latent, &req.cancel, decode_tiling.as_ref())?);
+                    images.push(run.decode_phase(|| {
+                        view.decode_one(latent, &req.cancel, decode_tiling.as_ref())
+                    })?);
                 }
+                run.finish_rendering();
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -522,19 +575,58 @@ fn calibration_fault(req: &GenerationRequest, phase: mlx_gen::gen_core::MemoryPh
     Ok(())
 }
 
+pub(crate) fn resolved_sampling(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> Result<(mlx_gen::Solver, Vec<f32>)> {
+    let steps = req.steps.unwrap_or(variant.default_steps()).max(1) as usize;
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    let cfg_on = variant.uses_cfg() || guidance != 1.0;
+    let sampler = req
+        .sampler
+        .as_deref()
+        .unwrap_or(crate::pipeline::DEFAULT_SAMPLER);
+    let selected = mlx_gen::sampler::canonical_solver(Some(sampler), mlx_gen::Solver::Euler);
+    let request = GenerationRequest {
+        sampler: Some(selected.name().into()),
+        scheduler: req
+            .scheduler
+            .as_deref()
+            .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
+            .map(str::to_owned),
+        scheduler_shift: req.scheduler_shift,
+        steps: Some(steps as u32),
+        guidance: Some(guidance),
+        ..Default::default()
+    };
+    let native = crate::pipeline::anima_sigmas(steps);
+    let mut defaults = crate::sampling::defaults();
+    defaults.guidance = cfg_on.then_some(guidance);
+    let sampling = mlx_gen::sampler::flow_sampling::ResolvedFlowSampling::resolve(
+        &request,
+        defaults,
+        &native,
+        crate::config::SIGMA_SHIFT.ln(),
+        mlx_gen::TimestepConvention::Sigma,
+    )?;
+    Ok((sampling.solver(), sampling.sigmas().to_vec()))
+}
+
 /// Capability-driven request validation (testable without loaded weights): non-empty prompt, size a
 /// multiple of 16, steps ≥ 1, on top of the shared [`Capabilities::validate_request`] floor.
 pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let id = desc.id;
+    if req.source_image.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{id}: source_image is not supported on this route"
+        )));
+    }
     if req.prompt.is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
-    let guidance = req.guidance.unwrap_or_else(|| {
-        Variant::from_id(id)
-            .unwrap_or(Variant::Base)
-            .default_guidance()
-    });
+    let variant = Variant::from_id(id).unwrap_or(Variant::Base);
+    let guidance = req.guidance.unwrap_or_else(|| variant.default_guidance());
     if guidance == 1.0
         && req
             .negative_prompt
@@ -551,8 +643,70 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        let (_, sigmas) = resolved_sampling(variant, req)?;
+        low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
+    }
     Ok(())
 }
+
+/// Compile the weights-free Anima trajectory for `variant` and `req`.
+pub fn compile_trajectory_for(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    let descriptor = descriptor_for(variant);
+    validate_request(&descriptor, req)?;
+    let (solver, sigmas) = resolved_sampling(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    mlx_gen::gen_core::RenderPlan::base_image(
+        &descriptor,
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: RES_MULTIPLE,
+            token_width: 64,
+            sampler: solver.name(),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+pub(crate) fn compile_variant_plan(
+    variant: Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    validate_load_precision(spec, variant.id())?;
+    if req.use_pid {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{}: anima has no PiD decoder",
+            variant.id()
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+pub(crate) const BASE_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
+    mlx_gen::gen_core::RenderPlanRegistration {
+        provider_id: "anima_base",
+        compile: |spec, req| compile_variant_plan(Variant::Base, spec, req),
+    };
+pub(crate) const AESTHETIC_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
+    mlx_gen::gen_core::RenderPlanRegistration {
+        provider_id: "anima_aesthetic",
+        compile: |spec, req| compile_variant_plan(Variant::Aesthetic, spec, req),
+    };
+pub(crate) const TURBO_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
+    mlx_gen::gen_core::RenderPlanRegistration {
+        provider_id: "anima_turbo",
+        compile: |spec, req| compile_variant_plan(Variant::Turbo, spec, req),
+    };
 
 // Explicit registration constants for all three variants.
 mlx_gen::register_generators! {

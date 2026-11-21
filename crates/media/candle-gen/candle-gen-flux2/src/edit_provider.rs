@@ -155,7 +155,38 @@ pub fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::Mo
         Flux2Variant::Klein9b => crate::sc20686_observer::PRODUCT_ROUTE_ID,
         Flux2Variant::Dev => crate::config::FLUX2_DEV_EDIT_ID,
     };
+    descriptor.capabilities.conditioning = vec![
+        candle_gen::gen_core::ConditioningKind::Reference,
+        candle_gen::gen_core::ConditioningKind::MultiReference,
+    ];
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
+}
+
+pub(crate) fn compile_edit_feature_route(
+    variant: Flux2Variant,
+    spec: &candle_gen::gen_core::LoadSpec,
+    req: &candle_gen::gen_core::GenerationRequest,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::RenderPlan>> {
+    let descriptor = edit_report_descriptor(variant);
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if req.conditioning.is_empty()
+        || !req.conditioning.iter().all(|c| {
+            matches!(
+                c,
+                candle_gen::gen_core::Conditioning::Reference { .. }
+                    | candle_gen::gen_core::Conditioning::MultiReference { .. }
+            )
+        })
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{} requires at least one reference image",
+            descriptor.id
+        )));
+    }
+    crate::compile_conditioned_plan(variant, &descriptor, spec, req).map(Some)
 }
 
 impl Flux2Edit {
@@ -823,14 +854,18 @@ impl Flux2Edit {
             candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
         let total_steps = sigmas.len().saturating_sub(1);
         let mut eval_idx = 0usize;
+        let span = 0..total_steps;
         // The driver does cancel + progress + the integrator step. The joint `[target, refs]` concat,
         // the transformer forward, the target-slice, and the guidance>1 CFG blend all live inside the
         // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
         // model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
-        let latents = candle_gen::run_flow_sampler(
+        let latents = candle_gen::run_flow_sampler_spans(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
+            std::slice::from_ref(&span),
+            None,
+            false,
             latents,
             req.seed,
             &req.cancel,

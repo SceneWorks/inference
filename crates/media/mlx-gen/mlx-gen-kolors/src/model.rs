@@ -33,6 +33,7 @@ use mlx_gen::{
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise,
     denoise_control_with_preview as denoise_control_registered,
+    denoise_curated_planned as denoise_curated_planned_registered,
     denoise_curated_with_preview as denoise_curated_registered,
     denoise_ip_control_with_preview as denoise_ip_control_registered,
     denoise_ip_with_preview as denoise_ip_registered, denoise_with_preview as denoise_registered,
@@ -975,6 +976,112 @@ impl KolorsHeavy {
             // Ladder rungs 3 and 4 (SC-15521). The curated route is a production denoise route, so a
             // bounded rung that reached only the native leading-Euler loop would be
             // declared-but-unreachable on it.
+            plan,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_curated_latents_planned(
+        &self,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        init_latents: Option<&Array>,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+        control: Option<(&ControlNet, &Image, f32)>,
+        ip_tokens: Option<(&Array, f32)>,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
+        cfg_batching: CfgBatching,
+    ) -> Result<Array> {
+        let Some(run) = run else {
+            return self.denoise_curated_latents_with_preview(
+                sampler_name,
+                scheduler_name,
+                init_latents,
+                noise,
+                pos,
+                neg,
+                num_steps,
+                strength,
+                cfg,
+                seed,
+                height,
+                width,
+                control,
+                ip_tokens,
+                run_steps,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+                cfg_batching,
+            );
+        };
+        use mlx_rs::ops::{add, multiply};
+        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let noise = noise.as_dtype(Dtype::Float32)?;
+        let run_sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
+        let init = if let Some(x0) = init_latents {
+            let strength = strength.clamp(0.0, 1.0);
+            mlx_gen::image_execution::scalar("kolors.strength", strength);
+            add(
+                &x0.as_dtype(Dtype::Float32)?,
+                &multiply(&noise, scalar(run_sigmas[0]))?,
+            )?
+        } else {
+            multiply(&noise, scalar(run_sigmas[0]))?
+        };
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
+        let controls: Vec<ControlContext> = match control {
+            Some((controlnet, control_image, scale)) => {
+                let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
+                let cimg = cfg_batch_control_image(&cimg, cfg, cfg_batching)?;
+                vec![ControlContext {
+                    cond_embed: controlnet.embed_cond(&cimg)?,
+                    controlnet,
+                    scale,
+                }]
+            }
+            None => Vec::new(),
+        };
+        let ip_batched = match ip_tokens {
+            Some((tokens, scale)) => Some((cfg_batch_ip_tokens(tokens, cfg, cfg_batching)?, scale)),
+            None => None,
+        };
+        denoise_curated_planned_registered(
+            &self.unet,
+            sampler_name,
+            &ms,
+            run_sigmas,
+            &spans,
+            Some(run),
+            init,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            seed,
+            cancel,
+            on_progress,
+            preview,
+            &controls,
+            ip_batched.as_ref().map(|(tokens, scale)| (tokens, *scale)),
+            None,
             plan,
         )
     }

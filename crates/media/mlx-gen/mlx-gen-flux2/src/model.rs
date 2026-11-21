@@ -19,7 +19,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler,
+    run_flow_sampler_with_phase_transition_spans, CancelFlag, Error, FlowMatchEuler,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor,
     OffloadPolicy, Precision, Progress, Residency, Result, SamplerRun, TimestepConvention,
     WeightsSource,
@@ -884,19 +884,7 @@ impl Flux2 {
         &self,
         req: &'a GenerationRequest,
     ) -> Result<Option<(&'a mlx_gen::media::Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let mlx_gen::Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(format!(
-                        "{}: multiple reference images are not supported (single img2img init only)",
-                        self.descriptor.id
-                    )));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
+        resolve_img2img_reference(self.descriptor.id, req)
     }
 
     /// img2img init conditioning: resize → VAE-encode → NCHW → crop-to-even → center-crop/pad to the
@@ -981,6 +969,27 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
     Ok(x)
 }
 
+pub(crate) fn resolve_img2img_reference<'a>(
+    id: &str,
+    req: &'a GenerationRequest,
+) -> Result<Option<(&'a mlx_gen::media::Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let mlx_gen::Conditioning::Reference { image, strength } = c {
+            if reference.is_some() || req.source_image.is_some() {
+                return Err(Error::Msg(format!(
+                    "{id}: multiple reference images are not supported (single img2img init only)"
+                )));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    if let Some(image) = &req.source_image {
+        reference = Some((image, req.strength));
+    }
+    Ok(reference)
+}
+
 impl Generator for Flux2 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -1014,6 +1023,32 @@ impl Generator for Flux2 {
         mlx_gen::image_execution::without_capture(|| {
             self.generate_report_observed(req, on_progress)
         })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_planned_impl(req, plan, scope, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1084,9 +1119,23 @@ impl Generator for Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_report_attempt(
-            self.descriptor(),
-            &req.cancel,
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
             || {
                 mlx_gen::image_execution::policy_debug(
                     "Flux2.memory_numeric_tier",
@@ -1108,9 +1157,6 @@ impl Generator for Flux2 {
                     "Flux2.applied_adapter_controls",
                     &self.loaded_spec.adapters,
                 );
-                let mut progress =
-                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_report_observed(req, &mut progress)
             },
         )
     }
@@ -1136,19 +1182,9 @@ impl Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        let snapshot_root = match &self.loaded_spec.weights {
-            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
-        };
-        mlx_gen::sc20686::observe_generation(
-            snapshot_root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        self.validate(req)?;
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
     }
 }
 
@@ -1224,21 +1260,28 @@ fn classify_upsample_output(
 }
 
 impl Flux2 {
-    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// The rich-`Result` body behind [`Generator::generate_planned`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
-    fn generate_impl(
+    fn generate_planned_impl(
         &self,
         req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
         let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
         mlx_gen::image_execution::policy_debug("flux2.transformer_window", &transformer_window);
-        // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
-        // sampler and diffusion. Calling `default_seed` independently in those phases makes a
-        // request irreproducible and lets its provenance name only one of two actual seeds.
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Resolve an omitted seed once in the compiled plan, then share it with both the
+        // autoregressive caption sampler and diffusion. Calling `default_seed` independently in
+        // those phases makes a request irreproducible and lets its provenance name only one of two
+        // actual seeds.
+        let base_seed = plan.base_seed();
         let mut resolved_req = req.clone();
         resolved_req.seed = Some(base_seed);
         let req = &resolved_req;
@@ -1252,8 +1295,9 @@ impl Flux2 {
             return Err(Error::Canceled);
         }
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
-        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        let guidance = plan.guidance();
         mlx_gen::image_execution::scalar("flux2.guidance", guidance);
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
 
         // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
@@ -1269,7 +1313,10 @@ impl Flux2 {
             req.use_pid,
             on_progress,
             // ── Phase A: (dev) caption upsample → prompt encode (+ base true-CFG negative).
-            |text: &Flux2TextOwned| self.encode_text_phase(tokenizer, text, req, guidance),
+            |text: &Flux2TextOwned| {
+                run.begin_conditioning()?;
+                self.encode_text_phase(tokenizer, text, req, guidance)
+            },
             // Materialize the (TE-dependent) embeds while the encoder is still alive (Sequential only) —
             // MLX is lazy, so an un-evaluated embed keeps the encoder referenced and the drop would free
             // nothing. `text_ids` are host-derived position ids (TE-independent), so evaling the embeds
@@ -1289,6 +1336,7 @@ impl Flux2 {
                 self.render_phase(
                     heavy,
                     encoded,
+                    &run,
                     Flux2RenderRequest {
                         req,
                         base_seed,
@@ -1333,6 +1381,7 @@ impl Flux2 {
         &self,
         heavy: &Flux2HeavyOwned,
         (prompt_embeds, text_ids, negative): Flux2Encoded,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
         request: Flux2RenderRequest<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<mlx_gen::gen_core::GenerationReport> {
@@ -1343,7 +1392,7 @@ impl Flux2 {
             .capabilities
             .resolve_pag(self.descriptor.id, req)?;
         mlx_gen::image_execution::policy_debug("flux2.pag", &pag);
-        let cond = self.prepare_conditioning(vae, req, request.steps)?;
+        let cond = self.prepare_conditioning(vae, req, run, request.steps)?;
         let mem = self.memory_config(&prompt_embeds, &cond, req);
         mlx_gen::image_execution::policy_debug("flux2.resolved_memory", &mem);
         let render = Flux2Render {
@@ -1351,6 +1400,7 @@ impl Flux2 {
             transformer: &heavy.transformer,
             reference: cond.reference.as_ref(),
             latent_ids: &cond.latent_ids,
+            phase0_latent_ids: cond.phase0_latent_ids.as_ref(),
             mem: &mem,
             // dev is guidance-DISTILLED: the scale is an embedded scalar fed into the transformer's
             // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
@@ -1389,53 +1439,71 @@ impl Flux2 {
             self.descriptor.id,
             capture_sigma,
         )?;
+        run.end_conditioning()?;
         let img_guidance = image_guidance(req, cond.reference.is_some());
         if let Some(scale) = img_guidance {
             mlx_gen::image_execution::scalar("flux2.image_guidance", scale);
         }
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = request.base_seed.wrapping_add(i as u64);
-            let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
-            // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
-            let latents = match &cond.clean_init {
-                Some(clean) => {
-                    add_noise_by_interpolation(clean, &noise, cond.sched.sigmas[cond.start_step])?
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let denoise_sigmas = &cond.sched.sigmas[cond.start_step..keep];
+        let images = run.images_with_denoise_phases(
+            on_progress,
+            |seed| {
+                let noise = create_noise(seed, phase0_w, phase0_h, self.config.in_channels)?;
+                // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
+                match &cond.clean_init {
+                    Some(clean) => add_noise_by_interpolation(
+                        clean,
+                        &noise,
+                        cond.sched.sigmas[cond.start_step],
+                    ),
+                    None => Ok(noise),
                 }
-                None => noise,
-            };
-            // The KV caches live to the end of the image, through its decode, as the inline loop
-            // held them.
-            let (final_latents, _kv_caches) = render.denoise(
-                latents,
-                seed,
-                &cond.sched.sigmas[cond.start_step..keep],
-                Flux2Guidance {
-                    prompt: (&prompt_embeds, &text_ids),
-                    negative: negative.as_ref(),
-                    guidance: request.guidance,
-                    image_guidance: img_guidance,
-                },
-                (cond.lat_h, cond.lat_w),
-                vae,
-                on_progress,
-            )?;
-            images.push(self.decode_image(
-                vae,
-                &final_latents,
-                pid_decoder.as_ref(),
-                (cond.lat_h, cond.lat_w),
-                req,
-                on_progress,
-            )?);
-        }
-        let executed_steps = cond.sched.sigmas[cond.start_step..keep]
-            .len()
-            .saturating_sub(1) as u32;
+            },
+            |seed, latents, on_progress| {
+                // The KV caches live to the end of the image, through its decode, as the inline loop
+                // held them.
+                let (final_latents, _kv_caches) = render.denoise(
+                    run,
+                    latents,
+                    seed,
+                    denoise_sigmas,
+                    Flux2Guidance {
+                        prompt: (&prompt_embeds, &text_ids),
+                        negative: negative.as_ref(),
+                        guidance: request.guidance,
+                        image_guidance: img_guidance,
+                    },
+                    (cond.lat_h, cond.lat_w),
+                    vae,
+                    on_progress,
+                )?;
+                Ok(final_latents)
+            },
+            |_seed, final_latents, on_progress| {
+                self.decode_image(
+                    vae,
+                    &final_latents,
+                    pid_decoder.as_ref(),
+                    (cond.lat_h, cond.lat_w),
+                    req,
+                    on_progress,
+                )
+            },
+        )?;
+        let executed_steps = denoise_sigmas.len().saturating_sub(1) as u32;
         let mut report =
             mlx_gen::gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         report.pag = pag.map(|p| p.execution_report(executed_steps));
+        let slot_config = if self.loaded_spec.adapters.is_empty() {
+            "base_dit".to_owned()
+        } else {
+            format!("base_dit+adapters:{}", self.loaded_spec.adapters.len())
+        };
+        report.low_res_start = run
+            .plan()
+            .low_res_start_execution_report("f32", 4, &slot_config)?;
         Ok(report)
     }
 
@@ -1445,6 +1513,7 @@ impl Flux2 {
         &self,
         vae: &Flux2Vae,
         req: &GenerationRequest,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
         steps: usize,
     ) -> Result<Flux2Conditioning> {
         // Edit: build the reference-image conditioning from one `Reference` or one `MultiReference`
@@ -1486,12 +1555,16 @@ impl Flux2 {
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let phase0_latent_ids = ((phase0_w, phase0_h) != (req.width, req.height))
+            .then(|| prepare_grid_ids((phase0_h / 16) as usize, (phase0_w / 16) as usize, 0));
 
-        // The img2img clean init latents are seed-independent — encode once, blend with per-seed
-        // noise below. `None` for pure txt2img (or strength ≤ 0, where `start_step == 0`).
+        // The img2img clean init latents are seed-independent — encode once at phase-0 output dims
+        // (§6.13), blend with per-seed noise below. `None` for pure txt2img (or strength ≤ 0, where
+        // `start_step == 0`).
         let clean_init = match &img2img {
             Some((image, _)) if start_step > 0 => {
-                Some(self.encode_init_latents(vae, image, req.width, req.height)?)
+                Some(self.encode_init_latents(vae, image, phase0_w, phase0_h)?)
             }
             _ => None,
         };
@@ -1502,6 +1575,7 @@ impl Flux2 {
             lat_h,
             lat_w,
             latent_ids,
+            phase0_latent_ids,
             clean_init,
         })
     }
@@ -1644,6 +1718,7 @@ struct Flux2Conditioning {
     lat_h: usize,
     lat_w: usize,
     latent_ids: Array,
+    phase0_latent_ids: Option<Array>,
     /// The img2img clean init latents; `None` for txt2img (or strength ≤ 0).
     clean_init: Option<Array>,
 }
@@ -1682,6 +1757,7 @@ struct Flux2Render<'a> {
     transformer: &'a Flux2Transformer,
     reference: Option<&'a (Array, Array)>,
     latent_ids: &'a Array,
+    phase0_latent_ids: Option<&'a Array>,
     mem: &'a MemoryConfig,
     embedded_guidance: Option<f32>,
     req: &'a GenerationRequest,
@@ -1707,15 +1783,19 @@ impl Flux2Render<'_> {
         pag_layers: Option<&[u32]>,
     ) -> Result<Array> {
         let target_seq = latents.shape()[1];
+        let active_latent_ids = self
+            .phase0_latent_ids
+            .filter(|ids| ids.shape()[1] == target_seq)
+            .unwrap_or(self.latent_ids);
         let _sc20686 = mlx_gen::sc20686::reference_forward(
             include_ref && cache.is_none() && self.reference.is_some(),
         );
         let (hidden, img_ids) = match (self.reference, include_ref) {
             (Some((ref_lat, ref_ids)), true) => (
                 concatenate_axis(&[latents, ref_lat], 1)?,
-                concatenate_axis(&[self.latent_ids, ref_ids], 1)?,
+                concatenate_axis(&[active_latent_ids, ref_ids], 1)?,
             ),
-            _ => (latents.clone(), self.latent_ids.clone()),
+            _ => (latents.clone(), active_latent_ids.clone()),
         };
         let out = self.transformer.forward_with_mem_pag(
             &Flux2ForwardInputs {
@@ -1746,6 +1826,7 @@ impl Flux2Render<'_> {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
         latents: Array,
         seed: u64,
         denoise_sigmas: &[f32],
@@ -1783,15 +1864,19 @@ impl Flux2Render<'_> {
         // transformer timestep (Sigma convention).
         let canonical_solver =
             mlx_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let low_res_plan = run.plan().low_res_start().copied();
+        let phase0_tokens = run.plan().phase_packed_tokens(0);
         let mut eval_idx = 0usize;
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = sigma * 1000.0;
-            let current_eval = eval_idx;
-            eval_idx += 1;
-            let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            let latent_tokens = latents.shape().get(1).copied().unwrap_or(0) as usize;
+            let step_idx = flux2_pag_step_index_for_eval(
                 canonical_solver,
-                current_eval,
+                &mut eval_idx,
                 total_steps,
+                low_res_plan,
+                phase0_tokens,
+                latent_tokens,
             );
             let step_pag = self
                 .pag
@@ -1872,10 +1957,10 @@ impl Flux2Render<'_> {
             }
         };
         // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
-        // `run_flow_sampler`. img2img slices the schedule from `start_step`.
+        // `run_flow_sampler_with_phase_transition_spans`. img2img slices the schedule from `start_step`.
         mlx_gen::sc20686::mark_denoise();
         let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
-        let final_latents = run_flow_sampler_with_latent_hook(
+        let final_latents = run_flow_sampler_with_phase_transition_spans(
             SamplerRun {
                 sampler_name: req.sampler.as_deref(),
                 sigmas: denoise_sigmas,
@@ -1885,22 +1970,68 @@ impl Flux2Render<'_> {
             },
             TimestepConvention::Sigma,
             latents,
+            &run.plan().denoise_spans(),
+            Some(run),
             |latents, sigma| {
+                let cur_seq = latents.shape()[1] as usize;
+                let (cur_h, cur_w) = if cur_seq == lat_h * lat_w {
+                    (lat_h as i32, lat_w as i32)
+                } else {
+                    let (p0_w, p0_h) = run.plan().phase_output_size(0);
+                    ((p0_h / 16) as i32, (p0_w / 16) as i32)
+                };
                 crate::preview::emit_flux_preview(
                     &req.preview,
                     &previews,
                     denoise_sigmas,
                     sigma,
                     latents,
-                    lat_h as i32,
-                    lat_w as i32,
+                    cur_h,
+                    cur_w,
                     vae,
                 );
             },
             predict,
+            None,
         )?;
         Ok((final_latents, kv_caches))
     }
+}
+
+pub(crate) fn resolved_schedule_for_request(
+    desc: &ModelDescriptor,
+    default_steps: u32,
+    is_edit: bool,
+    supports_pid: bool,
+    req: &GenerationRequest,
+) -> Result<(Vec<f32>, usize, usize)> {
+    let steps = req.steps.unwrap_or(default_steps) as usize;
+    let img2img = if is_edit {
+        None
+    } else {
+        resolve_img2img_reference(desc.id, req)?
+    };
+    let start_step = match &img2img {
+        Some((_, strength)) => init_time_step(steps, *strength),
+        None => 0,
+    };
+    let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mlx_gen::gen_core::sampling::compute_mu(
+            mlx_gen::gen_core::sampling::image_seq_len(req.width, req.height),
+            steps,
+        ),
+        steps,
+        &sched.sigmas,
+    )?;
+    let keep = if supports_pid {
+        flow_capture_for_request(req, &sigmas, start_step).1
+    } else {
+        sigmas.len()
+    };
+    Ok((sigmas, start_step, keep))
 }
 
 pub(crate) fn validate_request(
@@ -1930,6 +2061,12 @@ pub(crate) fn validate_request(
     // `Flux2DevControl`'s `require_control_present` — so an editor rejects a reference-less request up
     // front instead of after loading and starting the run.
     if is_edit {
+        if req.source_image.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{}: source_image is not supported on edit routes",
+                desc.id
+            )));
+        }
         let n_refs = collect_reference_images(req).len();
         if n_refs == 0 {
             return Err(Error::Msg(format!(
@@ -1967,6 +2104,16 @@ pub(crate) fn validate_request(
                 desc.id
             )));
         }
+    } else if desc.id == crate::config::FLUX2_DEV_CONTROL_ID {
+        if req.source_image.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{}: source_image is not supported on control routes",
+                desc.id
+            )));
+        }
+        resolve_img2img_reference(desc.id, req)?;
+    } else {
+        resolve_img2img_reference(desc.id, req)?;
     }
     // image_guidance (reference true-CFG) is honored ONLY on the non-kv EDIT path — it needs the
     // uncached `include_ref=false` forward against a present reference. Everywhere else a set value is
@@ -1985,7 +2132,80 @@ pub(crate) fn validate_request(
             desc.id
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        let default_steps = if desc.id == crate::config::FLUX2_DEV_ID
+            || desc.id == crate::config::FLUX2_DEV_EDIT_ID
+            || desc.id == crate::config::FLUX2_DEV_CONTROL_ID
+        {
+            crate::config::DEFAULT_STEPS_DEV
+        } else {
+            crate::config::DEFAULT_STEPS
+        };
+        let supports_pid = desc.id != crate::config::FLUX2_DEV_CONTROL_ID;
+        let (sigmas, start_step, keep) =
+            resolved_schedule_for_request(desc, default_steps, is_edit, supports_pid, req)?;
+        let executed_steps = sigmas[start_step..keep].len().saturating_sub(1);
+        low_res.resolve_for_descriptor(desc, req, executed_steps, SIZE_MULTIPLE)?;
+    }
     Ok(())
+}
+
+/// Compile the weights-free FLUX.2 trajectory for `variant` and `req`.
+pub fn compile_trajectory_for(
+    variant: Flux2Variant,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    let desc = variant.descriptor();
+    validate_request(&desc, variant.is_edit(), variant.is_kv(), req)?;
+    let (sigmas, start_step, keep) = resolved_schedule_for_request(
+        &desc,
+        variant.default_steps(),
+        variant.is_edit(),
+        true,
+        req,
+    )?;
+    let sliced = sigmas[start_step..].to_vec();
+    let executed_steps = keep.saturating_sub(start_step).saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    let sampler = req.sampler.as_deref().unwrap_or("flow_match_euler");
+    mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 128,
+            sampler,
+            guidance,
+            sigmas: sliced,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_base(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
+        validate_klein_load_axes(spec, variant.id())?;
+    }
+    resolve_root(variant, spec)?;
+    request_transformer_window(variant, spec, req)?;
+    if req.use_pid && spec.pid.is_none() {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.id()
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
 }
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
@@ -4739,6 +4959,26 @@ mod tests {
     }
 }
 
+fn flux2_pag_step_index_for_eval(
+    canonical_solver: mlx_gen::gen_core::sampling::Solver,
+    eval_idx: &mut usize,
+    total_steps: usize,
+    low_res_plan: Option<mlx_gen::gen_core::ResolvedLowResStartPlan>,
+    phase0_tokens: usize,
+    latent_tokens: usize,
+) -> usize {
+    let candidate_step =
+        mlx_gen::gen_core::sampling::step_index_for_eval(canonical_solver, *eval_idx, total_steps);
+    let is_boundary_endpoint_eval =
+        low_res_plan.is_some_and(|lr| latent_tokens == phase0_tokens && candidate_step >= lr.k);
+    if is_boundary_endpoint_eval {
+        low_res_plan.map_or(candidate_step, |lr| lr.k)
+    } else {
+        *eval_idx += 1;
+        candidate_step
+    }
+}
+
 fn observe_enhancement_outcome(outcome: &str, caption: &str) {
     use sha2::{Digest, Sha256};
     mlx_gen::image_execution::policy(
@@ -4792,5 +5032,134 @@ mod execution_policy_tests {
         assert_ne!(quality(&absent), quality(&fallback));
         assert_ne!(quality(&fallback), quality(&enhanced));
         assert_ne!(quality(&enhanced), quality(&other));
+    }
+
+    #[test]
+    fn generate_planned_activates_armed_sc20686_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_root = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_root).unwrap();
+        std::fs::write(snapshot_root.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            snapshot_root.join(".snapshot-revision"),
+            b"fedcba9876543210fedcba9876543210fedcba98",
+        )
+        .unwrap();
+        let events_path = dir.path().join("sc20686-events.jsonl");
+
+        let mut model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        model.loaded_spec = LoadSpec::new(WeightsSource::Dir(snapshot_root));
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req)
+            .unwrap()
+            .bind_load(&model.loaded_spec);
+        let _armed = mlx_gen::sc20686::request_output(
+            events_path.clone(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "resident",
+        )
+        .unwrap()
+        .arm();
+
+        let err = model
+            .generate_planned(&req, &plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not loaded"), "unexpected error: {err}");
+        let events = std::fs::read_to_string(&events_path)
+            .expect("generate_planned must activate the armed SC-20686 session and write events");
+        assert!(
+            events.contains("\"phase\":\"phase-window\"")
+                && events.contains("\"operation\":\"encode\"")
+                && events.contains("\"operation\":\"release-remnant\""),
+            "expected SC-20686 events in output, got: {events}"
+        );
+    }
+
+    #[test]
+    fn low_res_start_boundary_evaluation_does_not_shift_pag_step_counter() {
+        let desc = descriptor_klein_9b();
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 1.5,
+                start: Some(0.0),
+                stop: Some(0.625),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req).unwrap();
+        let low_res_plan = plan.low_res_start().copied();
+        assert_eq!(
+            low_res_plan.map(|lr| lr.estimate_source),
+            Some(mlx_gen::gen_core::EstimateSource::EndpointEvaluation)
+        );
+        let pag = desc
+            .capabilities
+            .resolve_pag(Flux2Variant::Klein9b.id(), &req)
+            .unwrap()
+            .expect("pag resolved");
+        let total_steps = plan.executed_steps();
+        assert_eq!(total_steps, 8);
+        let phase0_tokens = plan.phase_packed_tokens(0);
+        let phase1_tokens = plan.phase_packed_tokens(1);
+        assert_ne!(phase0_tokens, phase1_tokens);
+
+        for sampler_name in ["euler", "euler_ancestral"] {
+            let solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+            let mut eval_idx = 0usize;
+            let phase0_steps: Vec<usize> = (0..4)
+                .map(|_| {
+                    flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase0_tokens,
+                    )
+                })
+                .collect();
+            assert_eq!(phase0_steps, vec![0, 1, 2, 3]);
+            let boundary_step = flux2_pag_step_index_for_eval(
+                solver,
+                &mut eval_idx,
+                total_steps,
+                low_res_plan,
+                phase0_tokens,
+                phase0_tokens,
+            );
+            assert_eq!(boundary_step, 4);
+            assert_eq!(eval_idx, 4);
+            let phase1_steps: Vec<(usize, bool)> = (4..8)
+                .map(|_| {
+                    let step_idx = flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase1_tokens,
+                    );
+                    (step_idx, pag.step_scale(step_idx, total_steps) > 0.0)
+                })
+                .collect();
+            assert_eq!(
+                phase1_steps,
+                vec![(4, true), (5, false), (6, false), (7, false)]
+            );
+        }
     }
 }

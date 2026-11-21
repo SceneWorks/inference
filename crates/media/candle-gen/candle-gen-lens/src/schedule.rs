@@ -1,7 +1,9 @@
 //! Lens sampling schedule + CFG (sc-5114). The schedule is the core flow-match Euler verbatim: the
-//! Lens `compute_empirical_mu` is **byte-identical** to gen-core's [`compute_mu`] (same calibrated
+//! Lens `compute_empirical_mu` is **byte-identical** to gen-core's
+//! [`compute_mu`](candle_gen::gen_core::sampling::compute_mu) (same calibrated
 //! constants + `>4300` branch), and the Lens `linspace(1, 1/n, n)` → dynamic-shift `set_timesteps`
-//! is exactly [`build_flow_sigmas`], exposed as [`lens_sigmas`]. Only two pieces are Lens-specific:
+//! is exactly [`build_flow_sigmas`](candle_gen::gen_core::sampling::build_flow_sigmas), exposed as
+//! [`lens_sigmas`]. Only two pieces are Lens-specific:
 //!
 //! 1. **Timestep convention** — Lens feeds the transformer the *shifted sigma* directly (the
 //!    reference `timestep / 1000`, where `scheduler.timesteps = shifted_sigma · 1000`), **not** the
@@ -14,8 +16,7 @@
 //! per-crate flow-match Euler step within tolerance. **Lens is the standard-guidance family, NOT
 //! true-CFG**: Turbo = 4-step / guidance 1.0 (≈ no CFG), base = 20-step / guidance 5.0.
 
-use candle_gen::candle_core::{DType, Result, Tensor, D};
-use candle_gen::gen_core::sampling::{build_flow_sigmas, compute_mu};
+use candle_gen::candle_core::{DType, Result, Tensor};
 
 /// Per-variant sampling defaults (`num_steps`, `guidance_scale`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,39 +41,35 @@ pub const BASE: LensSamplingDefaults = LensSamplingDefaults {
 /// (sc-7123) can build a curated `normal`/`karras`/… schedule over the SAME shift the native schedule
 /// uses (`resolve_flow_schedule`).
 pub fn lens_mu(num_steps: usize, latent_h: usize, latent_w: usize) -> f32 {
-    compute_mu(latent_h * latent_w, num_steps)
+    candle_gen::gen_core::sampling::lens_mu(num_steps, latent_h, latent_w)
 }
 
 /// Build the Lens flow-match sigma schedule for `num_steps` at the given latent grid (length
 /// `num_steps + 1`, descending, trailing `0.0`). The empirical time-shift `mu` is fit from the latent
 /// token count `latent_h · latent_w` (== the reference `compute_empirical_mu(seq_len, num_steps)`).
 pub fn lens_sigmas(num_steps: usize, latent_h: usize, latent_w: usize) -> Vec<f32> {
-    build_flow_sigmas(num_steps, lens_mu(num_steps, latent_h, latent_w))
+    candle_gen::gen_core::sampling::lens_sigmas(num_steps, latent_h, latent_w)
 }
 
-/// Norm-rescaled classifier-free guidance (the reference per-step CFG).
+/// Norm-rescaled classifier-free guidance (the reference per-step CFG), delegated to the shared
+/// [`candle_gen::gen_core::guidance::cfg_rescale`] over [`candle_gen::CandleLatentOps`] (PIPE-8).
 ///
-/// `cond`/`uncond`: `[B, seq, C]` predictions. Returns `comb · (‖cond‖ / ‖comb‖)` per token
-/// (channel-axis L2 norm), with `comb = uncond + g·(cond − uncond)`; where `‖comb‖ = 0` the scale is
-/// `1` (matching the reference `torch.where(comb_norm > 0, cond_norm / comb_norm.clamp_min(1e-12), 1)`).
+/// Upcasts `cond` and `uncond` to `F32` before the shared norm-rescale so `1e-12` epsilon clamping
+/// and per-token L2 norms remain stable on `BF16` DiT activations, then restores `cond.dtype()`.
 pub fn cfg_rescale(cond: &Tensor, uncond: &Tensor, guidance: f32) -> Result<Tensor> {
-    let comb = (uncond + ((cond - uncond)? * guidance as f64)?)?;
-    let cond_norm = l2_over_channels(cond)?; // [B, seq, 1]
-    let comb_norm = l2_over_channels(&comb)?;
-    let ratio = cond_norm.broadcast_div(&comb_norm.maximum(1e-12)?)?;
-    let scale = comb_norm
-        .gt(0f64)?
-        .where_cond(&ratio, &Tensor::ones_like(&comb_norm)?)?;
-    comb.broadcast_mul(&scale)
-}
-
-/// Per-token L2 norm over the last (channel) axis, keepdim: `sqrt(sum(x², -1))`. Computed in f32 for
-/// stability, cast back to `x`'s dtype so it composes with a bf16 denoise loop. No epsilon inside the
-/// `sqrt` — the reference uses `torch.norm` and guards the divide separately (see [`cfg_rescale`]).
-fn l2_over_channels(x: &Tensor) -> Result<Tensor> {
-    let dt = x.dtype();
-    let xf = x.to_dtype(DType::F32)?;
-    xf.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?.to_dtype(dt)
+    let dt = cond.dtype();
+    let cond32 = cond.to_dtype(DType::F32)?;
+    let uncond32 = uncond.to_dtype(DType::F32)?;
+    let rescaled = candle_gen::gen_core::guidance::cfg_rescale(
+        &candle_gen::CandleLatentOps,
+        &cond32,
+        &uncond32,
+        guidance,
+        &[],
+        &[-1],
+    )
+    .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+    rescaled.to_dtype(dt)
 }
 
 #[cfg(test)]
@@ -116,7 +113,12 @@ mod tests {
         .unwrap();
         let out = cfg_rescale(&cond, &uncond, 2.0).unwrap();
         // Per-token output L2 norm must equal cond's per-token L2 norm (token0: 5, token1: 3).
-        let on = l2_over_channels(&out)
+        let on = out
+            .sqr()
+            .unwrap()
+            .sum_keepdim(2)
+            .unwrap()
+            .sqrt()
             .unwrap()
             .flatten_all()
             .unwrap()

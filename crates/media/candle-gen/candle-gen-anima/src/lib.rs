@@ -123,6 +123,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
             // from this crate's shipped sources whether it actually emits.
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -154,6 +155,7 @@ pub struct Anima {
     /// staging evicts it, and a subsequent resident request rebuilds the exact same variant.
     residency: candle_gen::Residency<AnimaTextPhase, AnimaHeavyPhase>,
     memory_contract: Option<gen_core::MemoryProviderContract>,
+    loaded_spec: LoadSpec,
 }
 
 enum AnimaTextPhase {
@@ -416,6 +418,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         memory_tier,
         residency,
         memory_contract,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -425,7 +428,18 @@ impl Generator for Anima {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-anima/src/lib.rs",
@@ -485,18 +499,41 @@ impl Generator for Anima {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         validate_request(&self.descriptor, req)?;
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
-        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        let guidance = plan.guidance();
         candle_gen::execution::policy("anima/lib/guidance", format!("{guidance:?}").into());
         let cfg_on = self.variant.uses_cfg() || guidance != 1.0;
         candle_gen::execution::policy("anima/lib/cfg_on", format!("{cfg_on:?}").into());
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
-        // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
-        // derivation + `Vec` collect that every provider repeats. The model body stays hand-written in
-        // the closure (captures `on_progress` + the borrowed pipeline).
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
         candle_gen::execution::policy(
             "anima/lib/stage_residency",
@@ -508,27 +545,17 @@ impl Generator for Anima {
                 self.descriptor.id
             )));
         }
-        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let opts = GenOptions {
-                width: req.width,
-                height: req.height,
-                steps,
-                guidance,
-                seed,
-                sampler: req.sampler.clone(),
-                scheduler: req.scheduler.clone(),
-                scheduler_shift: req.scheduler_shift,
-                // The caller's live preview sink (epic 16948, sc-16953). Cloning is an `Arc` bump;
-                // an absent sink is inert and the denoise never projects anything.
-                preview: req.preview.clone(),
-            };
-            self.residency.run_request_scoped(
-                stage_residency,
-                false,
-                &req.cancel,
-                false,
-                on_progress,
-                |text| match text {
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
+            &req.cancel,
+            false,
+            on_progress,
+            |text| {
+                run.begin_conditioning()
+                    .map_err(candle_gen::CandleError::from)?;
+                match text {
                     AnimaTextPhase::Resident(pipeline) => {
                         let cond = pipeline.encode_prompt(&req.prompt)?;
                         let uncond = cfg_on
@@ -546,31 +573,44 @@ impl Generator for Anima {
                             .transpose()?;
                         Ok((cond, uncond))
                     }
-                },
-                |_| Ok(self.device.synchronize()?),
-                |heavy, (cond, uncond), progress| match heavy {
-                    AnimaHeavyPhase::Resident(pipeline) => AnimaPipeline::render_encoded(
+                }
+            },
+            |_| Ok(self.device.synchronize()?),
+            |heavy, (cond, uncond), progress| {
+                run.end_conditioning()
+                    .map_err(candle_gen::CandleError::from)?;
+                match heavy {
+                    AnimaHeavyPhase::Resident(pipeline) => AnimaPipeline::render_encoded_planned(
                         pipeline.components(),
                         &self.device,
-                        cond,
-                        uncond,
-                        &opts,
+                        &run,
+                        &cond,
+                        uncond.as_ref(),
+                        &req.preview,
                         &req.cancel,
                         progress,
                     ),
-                    AnimaHeavyPhase::Staged(components) => AnimaPipeline::render_encoded(
+                    AnimaHeavyPhase::Staged(components) => AnimaPipeline::render_encoded_planned(
                         components.as_ref(),
                         &self.device,
-                        cond,
-                        uncond,
-                        &opts,
+                        &run,
+                        &cond,
+                        uncond.as_ref(),
+                        &req.preview,
                         &req.cancel,
                         progress,
                     ),
-                },
-            )
-        })?;
-        Ok(GenerationOutput::Images(images))
+                }
+            },
+        )?;
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let (dt_label, dt_bytes) = match self.memory_tier.precision {
+            gen_core::Precision::Fp32 => ("f32", 4),
+            gen_core::Precision::Bf16 => ("bf16", 2),
+        };
+        report.low_res_start =
+            plan.low_res_start_execution_report(dt_label, dt_bytes, "base_dit")?;
+        Ok(report)
     }
 }
 
@@ -581,6 +621,11 @@ pub(crate) fn validate_request(
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
     let id = desc.id;
+    if req.source_image.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: source_image is not supported on this route"
+        )));
+    }
     if req.prompt.is_empty() {
         return Err(gen_core::Error::Msg(format!(
             "{id}: prompt must not be empty"
@@ -596,11 +641,8 @@ pub(crate) fn validate_request(
         )));
     }
     desc.capabilities.validate_request(id, req)?;
-    let guidance = req.guidance.unwrap_or_else(|| {
-        Variant::from_id(id)
-            .unwrap_or(Variant::Base)
-            .default_guidance()
-    });
+    let variant = Variant::from_id(id).unwrap_or(Variant::Base);
+    let guidance = req.guidance.unwrap_or_else(|| variant.default_guidance());
     if guidance == 1.0
         && req
             .negative_prompt
@@ -617,8 +659,71 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        let sigmas = pipeline::resolved_sigmas(variant, req)?;
+        low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
+    }
     Ok(())
 }
+
+/// Compile the weights-free Anima trajectory for `variant` and `req`.
+pub fn compile_trajectory_for(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    let descriptor = descriptor_for(variant);
+    validate_request(&descriptor, req)?;
+    let sigmas = pipeline::resolved_sigmas(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    gen_core::RenderPlan::base_image(
+        &descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: RES_MULTIPLE,
+            token_width: 64,
+            sampler: req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+pub(crate) fn compile_variant_plan(
+    variant: Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let id = variant.id();
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: candle Anima is txt2img only (no control / IP-adapter)"
+        )));
+    }
+    if req.use_pid {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: anima has no PiD decoder"
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+const BASE_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: "anima_base",
+    compile: |spec, req| compile_variant_plan(Variant::Base, spec, req),
+};
+const AESTHETIC_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: "anima_aesthetic",
+    compile: |spec, req| compile_variant_plan(Variant::Aesthetic, spec, req),
+};
+const TURBO_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: "anima_turbo",
+    compile: |spec, req| compile_variant_plan(Variant::Turbo, spec, req),
+};
 
 // Link-time registration of all three variants.
 candle_gen::register_generators! {
@@ -637,8 +742,11 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(BASE_REGISTRATION)
+        .register_render_plan(BASE_RENDER_PLAN)
         .register_generator(AESTHETIC_REGISTRATION)
+        .register_render_plan(AESTHETIC_RENDER_PLAN)
         .register_generator(TURBO_REGISTRATION)
+        .register_render_plan(TURBO_RENDER_PLAN)
         .register_trainer(training::TRAINER_REGISTRATION);
     // Registration is unconditional: none of these surfaces needs a CUDA device to *construct*, and
     // gating them on `cuda` hid the whole memory-behavior seam from every CPU conformance config.
@@ -1208,5 +1316,33 @@ mod tests {
             2,
             "drop retries the pending synchronize cleanup"
         );
+    }
+
+    #[test]
+    fn sw6945_candle_anima_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "an anime character".into(),
+                width: 1024,
+                height: 1024,
+                steps: Some(6),
+                seed: Some(19),
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("anima render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..3, 3..6]);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        }
     }
 }

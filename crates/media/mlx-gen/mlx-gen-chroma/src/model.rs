@@ -20,10 +20,10 @@ use mlx_gen::attention::AttentionPlan;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec,
-    ModelDescriptor, OffloadPolicy, Precision, PreviewSink, Progress, Residency, Result,
-    SamplerRun, TimestepConvention, WeightsSource,
+    resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
+    Precision, PreviewSink, Progress, Residency, Result, SamplerRun, TimestepConvention,
+    WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -504,23 +504,7 @@ impl Chroma {
         steps: u32,
         scheduler_name: Option<&str>,
     ) -> Result<Vec<f32>> {
-        let native = if self.variant.use_beta_sigmas() {
-            crate::beta::base_sigmas(steps as usize)
-        } else {
-            let shift = self.variant.sigma_shift();
-            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
-            for v in s.iter_mut().take(steps as usize) {
-                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
-            }
-            s
-        };
-        let mu = self.variant.sigma_shift().ln();
-        Ok(resolve_flow_schedule(
-            scheduler_name,
-            mu,
-            steps as usize,
-            &native,
-        ))
+        build_schedule_for(self.variant, width, height, steps, scheduler_name, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -669,6 +653,143 @@ impl Chroma {
             attention,
             window,
             on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_prepared_planned(
+        &self,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+        tr: &ChromaTransformer,
+        encoded: &ChromaEncoded,
+        latents: Array,
+        preview: &PreviewSink,
+        seed: u64,
+        cancel: &CancelFlag,
+        attention: AttentionPlan<'_>,
+        window: Option<usize>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+        let (pos_embeds, pos_mask) = (&encoded.pos_embeds, &encoded.pos_mask);
+        let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
+        #[allow(clippy::type_complexity)]
+        let build_phase_ctx =
+            |w: u32,
+             h: u32|
+             -> Result<(RopeTable, Option<Array>, Option<(RopeTable, Option<Array>)>)> {
+                let h2 = (h / 16) as usize;
+                let w2 = (w / 16) as usize;
+                let si = (h2 * w2) as i32;
+                let img_ids = latent_image_ids(h2, w2);
+                let mask_pos = Self::full_mask(pos_mask, si)?;
+                let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
+                let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
+                let neg_ctx = match &encoded.neg {
+                    Some((neg_embeds, neg_mask)) => {
+                        let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
+                        let mask_neg = Self::full_mask(neg_mask, si)?;
+                        Some((
+                            tr.build_rope_table(&txt_ids_neg, &img_ids)?,
+                            ChromaTransformer::attention_mask2d(Some(&mask_neg))?,
+                        ))
+                    }
+                    None => None,
+                };
+                Ok((rope_pos, mask_pos2d, neg_ctx))
+            };
+
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let phase0_tokens = run.plan().phase_packed_tokens(0) as i32;
+        let phase0_ctx = build_phase_ctx(phase0_w, phase0_h)?;
+        let (full_w, full_h) = run.plan().output_size();
+        let phase1_ctx = if (phase0_w, phase0_h) != (full_w, full_h) {
+            Some(build_phase_ctx(full_w, full_h)?)
+        } else {
+            None
+        };
+
+        let window = tr.block_window(window, cancel)?;
+        let guidance = run.plan().guidance();
+        let denoise_sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
+        let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+        if let Some(low_res_report) = run
+            .plan()
+            .low_res_start_execution_report("bf16", 2, "base_dit")?
+        {
+            mlx_gen::image_execution::policy(
+                "chroma.low_res_start",
+                serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+            let (rope_pos, mask_pos2d, neg_ctx) = match &phase1_ctx {
+                Some(ctx) if latents.shape().get(1).copied() != Some(phase0_tokens) => ctx,
+                _ => &phase0_ctx,
+            };
+            let ts = Array::from_slice(&[sigma], &[1]);
+            let pooled = tr.pooled_temb(&ts)?;
+            let pos = tr.forward_prepared(
+                latents,
+                pos_embeds,
+                &pooled,
+                rope_pos,
+                mask_pos2d.as_ref(),
+                attention,
+                window,
+            )?;
+            match (&encoded.neg, neg_ctx) {
+                (Some((neg_embeds, _)), Some((rope_neg, mask_neg2d))) => {
+                    let neg = tr.forward_prepared(
+                        latents,
+                        neg_embeds,
+                        &pooled,
+                        rope_neg,
+                        mask_neg2d.as_ref(),
+                        attention,
+                        window,
+                    )?;
+                    Ok(add(
+                        &neg,
+                        &multiply(&subtract(&pos, &neg)?, scalar(guidance))?,
+                    )?)
+                }
+                _ => Ok(pos),
+            }
+        };
+
+        mlx_gen::run_flow_sampler_with_phase_transition_spans(
+            SamplerRun {
+                sampler_name: Some(run.plan().sampler()),
+                sigmas: denoise_sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            &spans,
+            Some(run),
+            |latents, sigma| {
+                let (pw, ph) = if latents.shape().get(1).copied() == Some(phase0_tokens) {
+                    (phase0_w, phase0_h)
+                } else {
+                    (full_w, full_h)
+                };
+                mlx_gen_flux::preview::emit_preview(
+                    preview,
+                    &previews,
+                    denoise_sigmas,
+                    sigma,
+                    latents,
+                    pw,
+                    ph,
+                );
+            },
+            predict,
+            None,
         )
     }
 
@@ -893,6 +1014,128 @@ fn encode_cfg(
     })
 }
 
+fn build_schedule_for(
+    variant: ChromaVariant,
+    width: u32,
+    height: u32,
+    steps: u32,
+    scheduler_name: Option<&str>,
+    scheduler_shift: Option<f32>,
+) -> Result<Vec<f32>> {
+    let native = if variant.use_beta_sigmas() {
+        crate::beta::base_sigmas(steps as usize)
+    } else {
+        let shift = variant.sigma_shift();
+        let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
+        for v in s.iter_mut().take(steps as usize) {
+            *v = shift * *v / (1.0 + (shift - 1.0) * *v);
+        }
+        s
+    };
+    let mu = variant.sigma_shift().ln();
+    let scheduled = resolve_flow_schedule(scheduler_name, mu, steps as usize, &native);
+    Ok(mlx_gen::resolve_flow_schedule_with_shift(
+        scheduler_name,
+        scheduler_shift,
+        mu,
+        steps as usize,
+        &scheduled,
+    )?)
+}
+
+fn validate_request_for_variant(variant: ChromaVariant, req: &GenerationRequest) -> Result<()> {
+    let descriptor = variant.descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if req.source_image.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: source_image is not supported on this route",
+            descriptor.id
+        )));
+    }
+    if req.prompt.trim().is_empty() {
+        return Err(Error::Msg(format!(
+            "{}: prompt must not be empty",
+            descriptor.id
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "{}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
+            descriptor.id, req.width, req.height
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(Error::Msg(format!("{}: steps must be >= 1", descriptor.id)));
+    }
+    if let Some(low_res) = &req.low_res_start {
+        let steps = req.steps.unwrap_or_else(|| variant.default_steps());
+        let sigmas = build_schedule_for(
+            variant,
+            req.width,
+            req.height,
+            steps,
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+        )?;
+        let (_capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        low_res.resolve_for_descriptor(&descriptor, req, keep.saturating_sub(1), SIZE_MULTIPLE)?;
+    }
+    Ok(())
+}
+
+/// Compile the weights-free Chroma trajectory for `variant` and `req`.
+pub fn compile_trajectory_for(
+    variant: ChromaVariant,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    validate_request_for_variant(variant, req)?;
+    let steps = req.steps.unwrap_or_else(|| variant.default_steps());
+    let guidance = req.true_cfg.unwrap_or_else(|| variant.default_true_cfg());
+    let sampler = resolve_sampler_name(variant, req.sampler.as_deref());
+    let sigmas = build_schedule_for(
+        variant,
+        req.width,
+        req.height,
+        steps,
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+    )?;
+    let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+    let executed_steps = keep.saturating_sub(1);
+    mlx_gen::gen_core::RenderPlan::base_image(
+        &variant.descriptor(),
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler,
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_base(
+    variant: ChromaVariant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    resolve_root(variant, spec)?;
+    if req.use_pid && spec.pid.is_none() {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.id()
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
 // Hand-written rather than `mlx_gen::impl_generator!`: that macro emits only
 // `descriptor`/`validate`/`generate`, so a provider using it inherits the `Generator` defaults for
 // the memory-strategy hooks — contract `None` and a safety check that rejects every optimized
@@ -911,7 +1154,38 @@ impl Generator for Chroma {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+            self.generate_planned(req, &plan, None, on_progress)
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = self.generate_planned_impl(req, plan, scope, on_progress)?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -938,9 +1212,23 @@ impl Generator for Chroma {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_report_attempt(
-            self.descriptor(),
-            &req.cancel,
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
             || {
                 mlx_gen::image_execution::policy_debug(
                     "Chroma.loaded_sequential_residency",
@@ -958,85 +1246,34 @@ impl Generator for Chroma {
                     "Chroma.applied_adapter_controls",
                     &applied_adapter_controls(&self.loaded_spec),
                 );
-                let mut progress =
-                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
             },
         )
     }
 }
 
 impl Chroma {
-    fn generate_observed(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
-impl Chroma {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        if req.prompt.trim().is_empty() {
-            return Err(Error::Msg(format!(
-                "{}: prompt must not be empty",
-                self.descriptor.id
-            )));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(Error::Msg(format!(
-                "{}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
-                self.descriptor.id, req.width, req.height
-            )));
-        }
-        // `base_sigmas`/`build_linear_sigmas` clamp `steps.max(1)`, so steps==0 would silently run one
-        // denoise step instead of erroring (sibling families like Kolors reject it). Match them (F-074).
-        if req.steps == Some(0) {
-            return Err(Error::Msg(format!(
-                "{}: steps must be >= 1",
-                self.descriptor.id
-            )));
-        }
-        Ok(())
+        validate_request_for_variant(self.variant, req)
     }
 
-    fn generate_impl(
+    fn generate_planned_impl(
         &self,
         req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate(req)?;
-        let steps = req.steps.unwrap_or_else(|| self.variant.default_steps());
-        let guidance = req
-            .true_cfg
-            .unwrap_or_else(|| self.variant.default_true_cfg());
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        self.validate_impl(req)?;
+        let guidance = plan.guidance();
         mlx_gen::image_execution::scalar("chroma.guidance", guidance);
         let negative = req.negative_prompt.as_deref().unwrap_or("").to_string();
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        let name = resolve_sampler_name(self.variant, req.sampler.as_deref());
-        // Build the flow-match σ schedule once — it is seed-independent (same steps/dims/scheduler for
-        // every image), and the PiD `from_ldm` early-stop below needs it to mint the decoder at the
-        // achieved capture σ and truncate the denoise.
-        let sigmas = self.build_schedule(req.width, req.height, steps, req.scheduler.as_deref())?;
-        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            self.variant.sigma_shift().ln(),
-            steps as usize,
-            &sigmas,
-        )?;
+        let base_seed = plan.base_seed();
 
-        // ── The request-scoped ladder selection (SC-15520) ───────────────────────────────────────
-        //
-        // Every parameter is validated here, against the domain the contract PUBLISHED, before any
-        // weights load — so an out-of-domain value is a typed rejection on the production path
-        // rather than a silently different execution than the selector chose.
-        let plan = self.rung_plan(req)?;
+        let rung_plan = self.rung_plan(req)?;
         let attention = crate::memory_strategy::attention_plan(req);
         mlx_gen::image_execution::policy_debug("chroma.attention", &attention.budget);
         let tiling = crate::memory_strategy::decode_tiling_for_contract(
@@ -1045,35 +1282,41 @@ impl Chroma {
             &self.memory_strategy,
         )?;
         mlx_gen::image_execution::policy_debug("chroma.tiling", &tiling);
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
 
-        // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 encoder,
-        // encodes pos (+neg), materializes, then DROPS it + `clear_cache()` so it frees before the
-        // DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows the warm encoder and
-        // runs the identical encode/denoise/decode with no eval/clear. The prompt encode is
-        // seed-independent, so hoisting it here (out of the per-image loop) is byte-identical to the
-        // pre-seam per-image re-encode.
         self.residency.run_request_scoped(
-            plan.stage_residency,
-            plan.streamable,
+            rung_plan.stage_residency,
+            rung_plan.streamable,
             &req.cancel,
             req.use_pid,
             on_progress,
             // ── Phase A: prompt → T5 conditioning (pos + optional neg).
             |text: &ChromaTextOwned| {
-                encode_cfg(
-                    &text.tokenizer,
-                    &text.t5,
-                    &req.prompt,
-                    &negative,
-                    guidance,
-                    plan.text_encoder_window(),
-                    &req.cancel,
-                )
+                if req.use_pid {
+                    run.begin_conditioning()?;
+                    encode_cfg(
+                        &text.tokenizer,
+                        &text.t5,
+                        &req.prompt,
+                        &negative,
+                        guidance,
+                        rung_plan.text_encoder_window(),
+                        &req.cancel,
+                    )
+                } else {
+                    run.encode(|| {
+                        encode_cfg(
+                            &text.tokenizer,
+                            &text.t5,
+                            &req.prompt,
+                            &negative,
+                            guidance,
+                            rung_plan.text_encoder_window(),
+                            &req.cancel,
+                        )
+                    })
+                }
             },
-            // Materialize the embeds while the T5 is still alive (Sequential only) — MLX is lazy, so an
-            // un-evaluated embed keeps the encoder referenced through the graph and the drop would free
-            // nothing. The masks are tokenizer-derived (independent of T5), so evaling the embeds is
-            // sufficient.
             |encoded| {
                 let Some(encoded) = encoded else {
                     return Ok(());
@@ -1084,8 +1327,6 @@ impl Chroma {
                     }
                     None => mlx_rs::transforms::eval([&encoded.pos_embeds])?,
                 }
-                // SC-15449: the conditioning phase has physically completed here — the embeds are
-                // materialized and the T5 is about to be released.
                 crate::memory_strategy::calibration_fault(
                     req,
                     mlx_gen::gen_core::MemoryPhase::Conditioning,
@@ -1095,72 +1336,62 @@ impl Chroma {
             },
             // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
             |heavy, encoded, on_progress| {
-                // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): Chroma
-                // shares the FLUX.1 VAE latent space (the `flux` student), so the decode can route
-                // through PiD when `use_pid` is set + an overlay was loaded; errors loudly if requested
-                // without one. `None` → the native VAE. When `pid_capture_sigma` asks for an early exit
-                // on this flow-match schedule (Chroma is `vp_frame=false`, so the schedule σ *is* the
-                // degrade σ), stop the denoise at the achieved-σ step and hand PiD the partially-denoised
-                // x_k; else the clean σ=0 full-denoise path (`capture_sigma = 0`, full schedule).
-                // txt2img here → `start_step = 0`. Shared across the count loop (same prompt → same
-                // caption embeds); per-image variation is the per-seed denoised latent.
-                let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid.as_ref(),
                     req,
                     base_seed,
                     self.descriptor.id,
-                    capture_sigma,
+                    run.plan().capture_sigma(),
                 )?;
-                let denoise_sigmas = &sigmas[..keep];
-
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    // Cancel between images too, so a multi-image batch stops promptly (F-096).
-                    if req.cancel.is_cancelled() {
-                        return Err(Error::Canceled);
-                    }
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let latents = create_noise(seed, req.width, req.height)?;
-                    let final_latents = self.denoise_prepared(
-                        &heavy.transformer,
-                        &encoded,
-                        req.width,
-                        req.height,
-                        guidance,
-                        latents,
-                        name,
-                        denoise_sigmas.to_vec(),
-                        &req.preview,
-                        seed,
-                        &req.cancel,
-                        attention,
-                        plan.dit_window(),
-                        on_progress,
-                    )?;
-                    // SC-15449: the denoise phase has physically completed for this image.
-                    mlx_rs::transforms::eval([&final_latents])?;
-                    crate::memory_strategy::calibration_fault(
-                        req,
-                        mlx_gen::gen_core::MemoryPhase::Denoise,
-                        self.descriptor.id,
-                    )?;
-                    on_progress(Progress::Decoding);
-                    images.push(Self::decode_with_vae(
-                        &heavy.vae,
-                        &final_latents,
-                        req.width,
-                        req.height,
-                        pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                        tiling.as_ref(),
-                        &req.cancel,
-                    )?);
-                    crate::memory_strategy::calibration_fault(
-                        req,
-                        mlx_gen::gen_core::MemoryPhase::Decode,
-                        self.descriptor.id,
-                    )?;
+                if req.use_pid {
+                    run.end_conditioning()?;
                 }
+                let images = run.images_with_denoise_phases(
+                    on_progress,
+                    |seed| {
+                        let (init_w, init_h) = run.plan().phase_output_size(0);
+                        create_noise(seed, init_w, init_h)
+                    },
+                    |seed, latents, on_progress| {
+                        let final_latents = self.denoise_prepared_planned(
+                            &run,
+                            &heavy.transformer,
+                            &encoded,
+                            latents,
+                            &req.preview,
+                            seed,
+                            &req.cancel,
+                            attention,
+                            rung_plan.dit_window(),
+                            on_progress,
+                        )?;
+                        mlx_rs::transforms::eval([&final_latents])?;
+                        crate::memory_strategy::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            self.descriptor.id,
+                        )?;
+                        Ok(final_latents)
+                    },
+                    |_seed, final_latents, on_progress| {
+                        on_progress(Progress::Decoding);
+                        let image = Self::decode_with_vae(
+                            &heavy.vae,
+                            &final_latents,
+                            req.width,
+                            req.height,
+                            pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                            tiling.as_ref(),
+                            &req.cancel,
+                        )?;
+                        crate::memory_strategy::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Decode,
+                            self.descriptor.id,
+                        )?;
+                        Ok(image)
+                    },
+                )?;
                 Ok(GenerationOutput::Images(images))
             },
         )

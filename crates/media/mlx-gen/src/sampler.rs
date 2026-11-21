@@ -656,79 +656,226 @@ pub fn run_curated_sampler_with_phase_transition_spans(
     let mut step_observer = CuratedStepObserver::new(solver);
     let mut evaluations = 0u64;
 
-    let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
-        step_gate(cancel, on_progress, sigmas, total, sigma)?;
-        // Per-eval compute boundary: force the prior step's lazy graph now (MLX is lazy, so without
-        // this the whole denoise is one un-cancellable graph that only runs at VAE decode). Output-
-        // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
-        // back here is always the fresh node to integrate from, so evaluating it is safe.
-        step_eval(&[x]).map_err(gen_core::Error::from)?;
-        crate::ios_quantum::diagnostic_metadata(
-            "curated",
-            "callback_evaluated",
-            &[
-                ("schema", 1),
-                ("completed_predict_evaluations", evaluations),
-                ("sigma_bits", sigma.to_bits() as u64),
-                ("state_dtype", sampling_dtype_code(x.dtype())),
-                ("state_logical_bytes", crate::ios_quantum::bytes(x)),
-                ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
-            ],
-        );
-        if step_observer.is_step_start(sigmas, sigma) {
-            on_latent(x, sigma);
-        }
-        gc_denoise(&ops, ms, x, sigma, |xin, t| {
-            evaluations += 1;
-            crate::ios_quantum::diagnostic_metadata(
-                "curated",
-                "predict_argument",
-                &[
-                    ("schema", 1),
-                    ("evaluation", evaluations),
-                    ("timestep_bits", t.to_bits() as u64),
-                    ("input_dtype", sampling_dtype_code(xin.dtype())),
-                    ("input_elements", xin.size() as u64),
-                ],
-            );
-            let prediction = predict(xin, t).map_err(gen_core::Error::from)?;
-            crate::ios_quantum::diagnostic_metadata(
-                "curated",
-                "predict_return",
-                &[
-                    ("schema", 1),
-                    ("evaluation", evaluations),
-                    ("output_dtype", sampling_dtype_code(prediction.dtype())),
-                    ("output_elements", prediction.size() as u64),
-                ],
-            );
-            Ok(prediction)
-        })
-    };
-
     let mut out = latents;
     for (phase, span) in spans.iter().enumerate() {
         if let Some(run) = phase_scope {
             run.begin_denoise_phase(phase).map_err(crate::Error::from)?;
         }
-        out = sampler
-            .sample_span(
-                &ops,
-                ms,
-                &mut denoise_fn,
-                out,
-                sigmas,
-                seed,
-                span.clone(),
-                &mut state,
-            )
-            .map_err(crate::Error::from)?;
+        {
+            let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
+                step_gate(cancel, on_progress, sigmas, total, sigma)?;
+                // Per-eval compute boundary: force the prior step's lazy graph now (MLX is lazy, so without
+                // this the whole denoise is one un-cancellable graph that only runs at VAE decode). Output-
+                // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
+                // back here is always the fresh node to integrate from, so evaluating it is safe.
+                step_eval(&[x]).map_err(gen_core::Error::from)?;
+                crate::ios_quantum::diagnostic_metadata(
+                    "curated",
+                    "callback_evaluated",
+                    &[
+                        ("schema", 1),
+                        ("completed_predict_evaluations", evaluations),
+                        ("sigma_bits", sigma.to_bits() as u64),
+                        ("state_dtype", sampling_dtype_code(x.dtype())),
+                        ("state_logical_bytes", crate::ios_quantum::bytes(x)),
+                        ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
+                    ],
+                );
+                if step_observer.is_step_start(sigmas, sigma) {
+                    on_latent(x, sigma);
+                }
+                gc_denoise(&ops, ms, x, sigma, |xin, t| {
+                    evaluations += 1;
+                    crate::ios_quantum::diagnostic_metadata(
+                        "curated",
+                        "predict_argument",
+                        &[
+                            ("schema", 1),
+                            ("evaluation", evaluations),
+                            ("timestep_bits", t.to_bits() as u64),
+                            ("input_dtype", sampling_dtype_code(xin.dtype())),
+                            ("input_elements", xin.size() as u64),
+                        ],
+                    );
+                    let prediction = predict(xin, t).map_err(gen_core::Error::from)?;
+                    crate::ios_quantum::diagnostic_metadata(
+                        "curated",
+                        "predict_return",
+                        &[
+                            ("schema", 1),
+                            ("evaluation", evaluations),
+                            ("output_dtype", sampling_dtype_code(prediction.dtype())),
+                            ("output_elements", prediction.size() as u64),
+                        ],
+                    );
+                    Ok(prediction)
+                })
+            };
+            out = sampler
+                .sample_span(
+                    &ops,
+                    ms,
+                    &mut denoise_fn,
+                    out,
+                    sigmas,
+                    seed,
+                    span.clone(),
+                    &mut state,
+                )
+                .map_err(crate::Error::from)?;
+        }
         if let Some(run) = phase_scope {
             evaluate_and_end_denoise_phase(run, phase, &out, |out| step_eval(&[out]))?;
         }
         if phase + 1 < spans.len() {
             if let Some(transition) = on_phase_boundary.as_deref_mut() {
                 out = transition(phase, span.end, &ops, ms, &out, &mut state)?;
+            } else if let Some(run) = phase_scope {
+                if let Some(low_res_plan) = run.plan().low_res_start().copied() {
+                    if span.end == low_res_plan.k {
+                        if cancel.is_cancelled() {
+                            return Err(crate::Error::Canceled);
+                        }
+                        let sigma_k = sigmas[span.end];
+                        let boundary_state = match low_res_plan.estimate_source {
+                            gen_core::EstimateSource::EndpointEvaluation => {
+                                let x0_low = gc_denoise(&ops, ms, &out, sigma_k, |xin, t| {
+                                    predict(xin, t).map_err(gen_core::Error::from)
+                                })
+                                .map_err(crate::Error::from)?;
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: x0_low,
+                                    source: gen_core::EstimateSource::EndpointEvaluation,
+                                }
+                            }
+                            gen_core::EstimateSource::PreviousEvaluation => {
+                                let captured = state
+                                    .take_captured_primary_estimate(span.end - 1)
+                                    .map_err(crate::Error::from)?;
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: captured.latent,
+                                    source: gen_core::EstimateSource::PreviousEvaluation,
+                                }
+                            }
+                        };
+                        let (x0_low, source) = boundary_state
+                            .into_clean_estimate()
+                            .map_err(crate::Error::from)?;
+                        let target_dtype = x0_low.dtype();
+                        let x0_f32 = crate::array::contiguous(&x0_low.as_dtype(Dtype::Float32)?)?;
+                        step_eval(&[&x0_f32])?;
+                        let low_slice = x0_f32.as_slice::<f32>();
+                        let base_seed = run.plan().base_seed();
+                        let output_index = seed.wrapping_sub(base_seed) as u32;
+                        let pass_index = run.plan().pass_index();
+                        let transitioned = match x0_low.shape() {
+                            &[b_sz, _low_tokens, packed_channels] => {
+                                let patch_size = 2usize;
+                                let vae_spatial_scale = 8usize;
+                                let channels =
+                                    (packed_channels as usize) / (patch_size * patch_size);
+                                let repacked = gen_core::transition_packed_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: low_slice,
+                                        source,
+                                    },
+                                    b_sz as usize,
+                                    channels,
+                                    patch_size as u32,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(crate::Error::from)?;
+                                let full_tokens = (((low_res_plan.full_height as usize)
+                                    / (vae_spatial_scale * patch_size))
+                                    * ((low_res_plan.full_width as usize)
+                                        / (vae_spatial_scale * patch_size)))
+                                    as i32;
+                                Array::from_slice(&repacked, &[b_sz, full_tokens, packed_channels])
+                            }
+                            &[b_sz, channels, low_h, _low_w] => {
+                                let vae_spatial_scale = ((low_res_plan.low_height as usize)
+                                    / (low_h.max(1) as usize))
+                                    .max(1);
+                                let noised = gen_core::transition_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: low_slice,
+                                        source,
+                                    },
+                                    b_sz as usize,
+                                    channels as usize,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(crate::Error::from)?;
+                                let full_h =
+                                    ((low_res_plan.full_height as usize) / vae_spatial_scale) as i32;
+                                let full_w =
+                                    ((low_res_plan.full_width as usize) / vae_spatial_scale) as i32;
+                                Array::from_slice(&noised, &[b_sz, channels, full_h, full_w])
+                            }
+                            &[b_sz, channels, 1, low_h, _low_w] => {
+                                let vae_spatial_scale = ((low_res_plan.low_height as usize)
+                                    / (low_h.max(1) as usize))
+                                    .max(1);
+                                let noised = gen_core::transition_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: low_slice,
+                                        source,
+                                    },
+                                    b_sz as usize,
+                                    channels as usize,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(crate::Error::from)?;
+                                let full_h =
+                                    ((low_res_plan.full_height as usize) / vae_spatial_scale) as i32;
+                                let full_w =
+                                    ((low_res_plan.full_width as usize) / vae_spatial_scale) as i32;
+                                Array::from_slice(&noised, &[b_sz, channels, 1, full_h, full_w])
+                            }
+                            other => {
+                                return Err(crate::Error::from(gen_core::Error::Unsupported(
+                                    format!(
+                                        "low_res_start transition does not support latent shape {other:?}"
+                                    ),
+                                )))
+                            }
+                        };
+                        out = if target_dtype == Dtype::Float32 {
+                            transitioned
+                        } else {
+                            transitioned.as_dtype(target_dtype)?
+                        };
+                        state.note_geometry_change(
+                            (low_res_plan.low_width, low_res_plan.low_height),
+                            (low_res_plan.full_width, low_res_plan.full_height),
+                        );
+                        state.note_renoise_transition();
+                        state
+                            .apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)
+                            .map_err(crate::Error::from)?;
+                    }
+                }
             }
         }
     }
@@ -786,12 +933,40 @@ pub fn run_cfgpp_sampler_with_latent_hook(
     run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
     latents: Array,
+    on_latent: impl FnMut(&Array, f32),
+    predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+) -> Result<Array> {
+    let steps = run.sigmas.len().saturating_sub(1);
+    let span = 0..steps;
+    run_cfgpp_sampler_with_phase_transition_spans(
+        run,
+        ms,
+        latents,
+        std::slice::from_ref(&span),
+        None,
+        on_latent,
+        predict_pair,
+        None,
+    )
+}
+
+/// Multi-phase CFG++ driver that preserves a single [`gen_core::sampling::SolverRunState`] across
+/// inert spans (`with_inert_split_at`) and resets history only when `on_phase_boundary` performs
+/// an actual geometry/renoise transition (`SW-6947`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_cfgpp_sampler_with_phase_transition_spans(
+    run: SamplerRun<'_>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
     mut on_latent: impl FnMut(&Array, f32),
     mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+    mut on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>>,
 ) -> Result<Array> {
     use gen_core::sampling::{
         base_supports_cfgpp, cfgpp_denoise as gc_cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler,
-        Solver,
+        Solver, SolverRunState,
     };
 
     // `seed` is unused: every shipped CFG++ solver is deterministic.
@@ -812,61 +987,91 @@ pub fn run_cfgpp_sampler_with_latent_hook(
         .unwrap_or(Solver::Euler);
     let sampler: Box<dyn CfgPpSampler<MlxLatentOps>> = cfgpp_sampler_for::<MlxLatentOps>(base)
         .expect("base_supports_cfgpp(Euler) holds, so a sampler always resolves");
+    let mut state = SolverRunState::new_cfg_pp(sampler.base_solver(), sigmas);
     let mut evaluations = 0u64;
+    let mut out = latents;
 
-    let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
-        step_gate(cancel, on_progress, sigmas, total, sigma)?;
-        step_eval(&[x]).map_err(gen_core::Error::from)?;
-        crate::ios_quantum::diagnostic_metadata(
-            "curated",
-            "callback_evaluated",
-            &[
-                ("schema", 1),
-                ("cfg_pp", 1),
-                ("completed_predict_evaluations", evaluations),
-                ("sigma_bits", sigma.to_bits() as u64),
-                ("state_dtype", sampling_dtype_code(x.dtype())),
-                ("state_logical_bytes", crate::ios_quantum::bytes(x)),
-                ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
-            ],
-        );
-        on_latent(x, sigma);
-        let denoised = gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
-            evaluations += 1;
-            let prediction = predict_pair(xin, t).map_err(gen_core::Error::from)?;
-            crate::ios_quantum::diagnostic_metadata(
-                "curated",
-                "predict_pair_return",
-                &[
-                    ("schema", 1),
-                    ("cfg_pp", 1),
-                    ("evaluation", evaluations),
-                    ("guided_dtype", sampling_dtype_code(prediction.0.dtype())),
-                    ("uncond_dtype", sampling_dtype_code(prediction.1.dtype())),
-                    ("guided_elements", prediction.0.size() as u64),
-                    ("uncond_elements", prediction.1.size() as u64),
-                ],
-            );
-            Ok(prediction)
-        })?;
-        crate::ios_quantum::diagnostic_metadata(
-            "curated",
-            "denoised_pair_return",
-            &[
-                ("schema", 1),
-                ("cfg_pp", 1),
-                ("evaluation", evaluations),
-                ("guided_dtype", sampling_dtype_code(denoised.0.dtype())),
-                ("uncond_dtype", sampling_dtype_code(denoised.1.dtype())),
-            ],
-        );
-        Ok(denoised)
-    };
-
-    let out = sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas)
-        .map_err(crate::Error::from)?;
-    step_eval(&[&out])?;
+    for (phase, span) in spans.iter().enumerate() {
+        if span.start > span.end || span.end > sigmas.len().saturating_sub(1) {
+            return Err(crate::Error::from(gen_core::Error::Unsupported(format!(
+                "invalid cfg_pp sampler span {:?} for {} sigmas",
+                span,
+                sigmas.len()
+            ))));
+        }
+        if let Some(run) = phase_scope {
+            run.begin_denoise_phase(phase).map_err(crate::Error::from)?;
+        }
+        {
+            let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
+                step_gate(cancel, on_progress, sigmas, total, sigma)?;
+                step_eval(&[x]).map_err(gen_core::Error::from)?;
+                crate::ios_quantum::diagnostic_metadata(
+                    "curated",
+                    "callback_evaluated",
+                    &[
+                        ("schema", 1),
+                        ("cfg_pp", 1),
+                        ("completed_predict_evaluations", evaluations),
+                        ("sigma_bits", sigma.to_bits() as u64),
+                        ("state_dtype", sampling_dtype_code(x.dtype())),
+                        ("state_logical_bytes", crate::ios_quantum::bytes(x)),
+                        ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
+                    ],
+                );
+                on_latent(x, sigma);
+                let denoised = gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
+                    evaluations += 1;
+                    let prediction = predict_pair(xin, t).map_err(gen_core::Error::from)?;
+                    crate::ios_quantum::diagnostic_metadata(
+                        "curated",
+                        "predict_pair_return",
+                        &[
+                            ("schema", 1),
+                            ("cfg_pp", 1),
+                            ("evaluation", evaluations),
+                            ("guided_dtype", sampling_dtype_code(prediction.0.dtype())),
+                            ("uncond_dtype", sampling_dtype_code(prediction.1.dtype())),
+                            ("guided_elements", prediction.0.size() as u64),
+                            ("uncond_elements", prediction.1.size() as u64),
+                        ],
+                    );
+                    Ok(prediction)
+                })?;
+                crate::ios_quantum::diagnostic_metadata(
+                    "curated",
+                    "denoised_pair_return",
+                    &[
+                        ("schema", 1),
+                        ("cfg_pp", 1),
+                        ("evaluation", evaluations),
+                        ("guided_dtype", sampling_dtype_code(denoised.0.dtype())),
+                        ("uncond_dtype", sampling_dtype_code(denoised.1.dtype())),
+                    ],
+                );
+                Ok(denoised)
+            };
+            out = sampler
+                .sample_span(&ops, &mut denoise_fn, out, sigmas, span.clone(), &mut state)
+                .map_err(crate::Error::from)?;
+        }
+        if let Some(run) = phase_scope {
+            evaluate_and_end_denoise_phase(run, phase, &out, |out| step_eval(&[out]))?;
+        }
+        if phase + 1 < spans.len() {
+            if let Some(transition) = on_phase_boundary.as_deref_mut() {
+                out = transition(phase, span.end, &ops, ms, &out, &mut state)?;
+            }
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(crate::Error::from(gen_core::Error::Unsupported(
+            "cfg_pp sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    if phase_scope.is_none() {
+        step_eval(&[&out])?;
+    }
     crate::ios_quantum::diagnostic_metadata(
         "curated",
         "solve_complete",

@@ -57,22 +57,14 @@ impl QwenImageProcessor {
     /// pixel count into `[min_pixels, max_pixels]`. Uses Python's round-half-to-even
     /// (`round_ties_even`) so `.5` cases match the fork exactly.
     pub fn smart_resize(&self, height: usize, width: usize) -> (usize, usize) {
-        let factor = (self.patch_size * self.merge_size) as f64;
-        let (h, w) = (height as f64, width as f64);
-        let (minp, maxp) = (self.min_pixels as f64, self.max_pixels as f64);
-
-        let mut h_bar = (h / factor).round_ties_even() * factor;
-        let mut w_bar = (w / factor).round_ties_even() * factor;
-        if h_bar * w_bar > maxp {
-            let beta = ((h * w) / maxp).sqrt();
-            h_bar = factor.max((h / beta / factor).floor() * factor);
-            w_bar = factor.max((w / beta / factor).floor() * factor);
-        } else if h_bar * w_bar < minp {
-            let beta = (minp / (h * w)).sqrt();
-            h_bar = (h * beta / factor).ceil() * factor;
-            w_bar = (w * beta / factor).ceil() * factor;
-        }
-        (h_bar as usize, w_bar as usize)
+        let factor = (self.patch_size * self.merge_size).max(1);
+        candle_gen::gen_core::imageops::smart_resize(
+            height.max(1),
+            width.max(1),
+            factor,
+            self.min_pixels.max(1) as usize,
+            self.max_pixels.max(1) as usize,
+        )
     }
 
     /// `smart_resize` → BICUBIC resize → CLIP-normalize → temporal-repeat → patchify, returning

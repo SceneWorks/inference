@@ -600,6 +600,8 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self.dit.forward(x, &t, &c.cond, &c.cond_mask)?;
         let pred = match &c.uncond {
@@ -607,14 +609,17 @@ impl BooguHeavy {
                 let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
                 add(
                     &cond_v,
-                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                    &multiply(
+                        &subtract(&cond_v, &uncond_v)?,
+                        Array::from_f32(residual_weight),
+                    )?,
                 )?
             }
             None => cond_v,
         };
         Ok(multiply(
             &pred.as_dtype(Dtype::Float32)?,
-            Array::from_f32(-1.0),
+            Array::from_f32(negate_sign),
         )?)
     }
 
@@ -628,6 +633,8 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self
             .dit
@@ -639,14 +646,17 @@ impl BooguHeavy {
                     .forward_edit_multi(x, ref_latents, &t, u_hidden, u_mask)?;
                 add(
                     &cond_v,
-                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                    &multiply(
+                        &subtract(&cond_v, &uncond_v)?,
+                        Array::from_f32(residual_weight),
+                    )?,
                 )?
             }
             None => cond_v,
         };
         Ok(multiply(
             &pred.as_dtype(Dtype::Float32)?,
-            Array::from_f32(-1.0),
+            Array::from_f32(negate_sign),
         )?)
     }
 
@@ -661,23 +671,66 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        self.render_base_t2i_with_run(c, opts, sigmas, decoder, cancel, on_progress, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_base_t2i_with_run(
+        &self,
+        c: &BooguBaseCond,
+        opts: &GenerateOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    ) -> Result<Image> {
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
-        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let (init_w, init_h) =
+            run.map_or((opts.width, opts.height), |r| r.plan().phase_output_size(0));
+        let lat = init_noise(init_h, init_w, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
-        let lat = run_flow_sampler(
-            SamplerRun {
-                sampler_name: opts.sampler.as_deref(),
-                sigmas,
-                seed: opts.seed,
-                cancel,
-                on_progress,
-            },
-            TimestepConvention::OneMinusSigma,
-            lat,
-            |x, timestep| self.base_velocity(x, timestep, c, scale),
-        )?;
+        let lat = match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let out = mlx_gen::sampler::run_flow_sampler_with_phase_transition_spans(
+                    SamplerRun {
+                        sampler_name: Some(run.plan().sampler()),
+                        sigmas: run.plan().denoise_sigmas(),
+                        seed: opts.seed,
+                        cancel,
+                        on_progress,
+                    },
+                    TimestepConvention::OneMinusSigma,
+                    lat,
+                    &spans,
+                    Some(run),
+                    |_, _| {},
+                    |x, timestep| self.base_velocity(x, timestep, c, scale),
+                    None,
+                )?;
+                run.finish_image_denoise_phases()?;
+                out
+            }
+            None => run_flow_sampler(
+                SamplerRun {
+                    sampler_name: opts.sampler.as_deref(),
+                    sigmas,
+                    seed: opts.seed,
+                    cancel,
+                    on_progress,
+                },
+                TimestepConvention::OneMinusSigma,
+                lat,
+                |x, timestep| self.base_velocity(x, timestep, c, scale),
+            )?,
+        };
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        match run {
+            Some(run) => run.decode_phase(|| self.decode_latents(&lat, decoder)),
+            None => self.decode_latents(&lat, decoder),
+        }
     }
 
     /// Render one Base (true-CFG) **img2img** image: seed the denoise from the (pre-encoded) `clean`
@@ -696,26 +749,89 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        self.render_base_img2img_with_run(
+            c,
+            clean,
+            start_step,
+            opts,
+            sigmas,
+            decoder,
+            cancel,
+            on_progress,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_base_img2img_with_run(
+        &self,
+        c: &BooguBaseCond,
+        clean: &Array,
+        start_step: usize,
+        opts: &GenerateOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    ) -> Result<Image> {
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
-        let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let (init_w, init_h) =
+            run.map_or((opts.width, opts.height), |r| r.plan().phase_output_size(0));
+        let noise = init_noise(init_h, init_w, opts.seed, 0)?;
         let start = start_step.min(sigmas.len().saturating_sub(1));
-        let lat = add_noise_by_interpolation(clean, &noise, sigmas[start])?;
+        let start_sigma = match run {
+            Some(run) => *run
+                .plan()
+                .denoise_sigmas()
+                .first()
+                .unwrap_or(&sigmas[start]),
+            None => sigmas[start],
+        };
+        let lat = add_noise_by_interpolation(clean, &noise, start_sigma)?;
         let denoise_sigmas = &sigmas[start..];
         let scale = opts.text_guidance_scale;
-        let lat = run_flow_sampler(
-            SamplerRun {
-                sampler_name: opts.sampler.as_deref(),
-                sigmas: denoise_sigmas,
-                seed: opts.seed,
-                cancel,
-                on_progress,
-            },
-            TimestepConvention::OneMinusSigma,
-            lat,
-            |x, timestep| self.base_velocity(x, timestep, c, scale),
-        )?;
+        let lat = match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let out = mlx_gen::sampler::run_flow_sampler_with_phase_transition_spans(
+                    SamplerRun {
+                        sampler_name: Some(run.plan().sampler()),
+                        sigmas: run.plan().denoise_sigmas(),
+                        seed: opts.seed,
+                        cancel,
+                        on_progress,
+                    },
+                    TimestepConvention::OneMinusSigma,
+                    lat,
+                    &spans,
+                    Some(run),
+                    |_, _| {},
+                    |x, timestep| self.base_velocity(x, timestep, c, scale),
+                    None,
+                )?;
+                run.finish_image_denoise_phases()?;
+                out
+            }
+            None => run_flow_sampler(
+                SamplerRun {
+                    sampler_name: opts.sampler.as_deref(),
+                    sigmas: denoise_sigmas,
+                    seed: opts.seed,
+                    cancel,
+                    on_progress,
+                },
+                TimestepConvention::OneMinusSigma,
+                lat,
+                |x, timestep| self.base_velocity(x, timestep, c, scale),
+            )?,
+        };
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        match run {
+            Some(run) => run.decode_phase(|| self.decode_latents(&lat, decoder)),
+            None => self.decode_latents(&lat, decoder),
+        }
     }
 
     /// Render one Turbo (DMD few-step, CFG-free) image from pure noise. A selected sampler/scheduler
@@ -888,23 +1004,76 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        self.render_edit_with_run(
+            c,
+            ref_latents,
+            opts,
+            sigmas,
+            decoder,
+            cancel,
+            on_progress,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_edit_with_run(
+        &self,
+        c: &BooguBaseCond,
+        ref_latents: &[Array],
+        opts: &EditOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    ) -> Result<Image> {
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
-        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let (init_w, init_h) =
+            run.map_or((opts.width, opts.height), |r| r.plan().phase_output_size(0));
+        let lat = init_noise(init_h, init_w, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
-        let lat = run_flow_sampler(
-            SamplerRun {
-                sampler_name: opts.sampler.as_deref(),
-                sigmas,
-                seed: opts.seed,
-                cancel,
-                on_progress,
-            },
-            TimestepConvention::OneMinusSigma,
-            lat,
-            |x, timestep| self.edit_velocity(x, ref_latents, timestep, c, scale),
-        )?;
+        let lat = match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let out = mlx_gen::sampler::run_flow_sampler_with_phase_transition_spans(
+                    SamplerRun {
+                        sampler_name: Some(run.plan().sampler()),
+                        sigmas: run.plan().denoise_sigmas(),
+                        seed: opts.seed,
+                        cancel,
+                        on_progress,
+                    },
+                    TimestepConvention::OneMinusSigma,
+                    lat,
+                    &spans,
+                    Some(run),
+                    |_, _| {},
+                    |x, timestep| self.edit_velocity(x, ref_latents, timestep, c, scale),
+                    None,
+                )?;
+                run.finish_image_denoise_phases()?;
+                out
+            }
+            None => run_flow_sampler(
+                SamplerRun {
+                    sampler_name: opts.sampler.as_deref(),
+                    sigmas,
+                    seed: opts.seed,
+                    cancel,
+                    on_progress,
+                },
+                TimestepConvention::OneMinusSigma,
+                lat,
+                |x, timestep| self.edit_velocity(x, ref_latents, timestep, c, scale),
+            )?,
+        };
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        match run {
+            Some(run) => run.decode_phase(|| self.decode_latents(&lat, decoder)),
+            None => self.decode_latents(&lat, decoder),
+        }
     }
 
     /// The native DMD student few-step loop, shared by the Turbo t2i and img2img paths so the two never
@@ -1269,28 +1438,12 @@ pub(crate) fn resolve_reference<'a>(
         .map(|(image, strength)| (image, resolve_strength(strength, None))))
 }
 
-/// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values
-/// from `conditioning_sigma` toward (but excluding) `1.0`. These are **clean-fraction** sigmas.
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let span = 1.0 - conditioning_sigma;
-    (0..steps)
-        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
-        .collect()
+    mlx_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
 
-/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
-/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
-/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
-/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
-/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
-/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
 fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
-        .iter()
-        .map(|&c| 1.0 - c)
-        .collect();
-    s.push(0.0);
-    s
+    mlx_gen::gen_core::sampling::boogu_turbo_sigmas(conditioning_sigma, steps)
 }
 
 /// Whether a Turbo request selects the curated unified-sampler framework (epic 7114): true when a
@@ -1351,21 +1504,12 @@ pub fn base_flow_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
     resolve_flow_schedule(scheduler, base_shift_mu(), steps, &native)
 }
 
-/// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
-/// `OneMinusSigma` view of [`build_timesteps_v1`]'s shifted clean-fraction timesteps: `σ_i = 1 − ts_i`.
-/// `run_flow_sampler` feeds `1 − σ = ts_i` back to the DiT, so the unified Euler default is byte-exact
-/// with the legacy `x += (ts_{i+1} − ts_i)·v` loop (the trailing `ts = 1.0` becomes the terminal `σ = 0`).
 fn base_native_sigmas(steps: usize) -> Vec<f32> {
-    build_timesteps_v1(steps)
-        .iter()
-        .map(|&t| 1.0 - t as f32)
-        .collect()
+    mlx_gen::gen_core::sampling::boogu_base_sigmas(steps)
 }
 
-/// Build the static-v1 shifted timestep schedule plus the trailing `1.0`.
-///
-/// Returns a `Vec<f64>` of length `steps + 1`: the `steps` shifted samples of
-/// `linspace(0,1,steps+1)[:-1]` followed by `1.0` (so `ts[i+1]` is always valid in the Euler step).
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_timesteps_v1(steps: usize) -> Vec<f64> {
     let mu = lin_mu(SEQ_LEN);
     let mut ts: Vec<f64> = (0..steps)
@@ -1375,22 +1519,15 @@ fn build_timesteps_v1(steps: usize) -> Vec<f64> {
     ts
 }
 
-/// Reference `_get_lin_function(x1=256,y1=base_shift,x2=4096,y2=max_shift)(seq_len)` → `mu`.
 fn lin_mu(seq_len: f64) -> f64 {
-    let (x1, y1, x2, y2) = (256.0, BASE_SHIFT, 4096.0, MAX_SHIFT);
-    let m = (y2 - y1) / (x2 - x1);
-    let b = y1 - m * x1;
-    m * seq_len + b
+    let _ = (BASE_SHIFT, MAX_SHIFT);
+    mlx_gen::gen_core::sampling::boogu_lin_mu(seq_len)
 }
 
-/// Reference `_time_shift_v1(t, mu, sigma=1.0)`: `t1=1−t` (clipped); `y = e^mu / (e^mu + (1/t1 − 1))`;
-/// return `1 − y`.
+#[cfg(test)]
+#[allow(dead_code)]
 fn time_shift_v1(t: f64, mu: f64) -> f64 {
-    let eps = 1e-8;
-    let t1 = (1.0 - t).clamp(eps, 1.0 - eps);
-    let num = mu.exp();
-    let denom = num + (1.0 / t1 - 1.0);
-    1.0 - num / denom
+    mlx_gen::gen_core::sampling::time_shift_v1(t, mu)
 }
 
 #[cfg(test)]

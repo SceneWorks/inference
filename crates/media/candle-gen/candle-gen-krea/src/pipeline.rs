@@ -3281,14 +3281,7 @@ pub(crate) fn krea_pag_combine(
 /// start → fewer denoise steps → output stays closer to the reference (the fork's reference-fidelity
 /// convention, the INVERSE of SDXL's "higher strength = more change"). Pure, so it is unit-testable.
 pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// The img2img noise-interpolation blend — the candle port of `mlx_gen::img2img::add_noise_by_interpolation`

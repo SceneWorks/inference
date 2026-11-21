@@ -91021,6 +91021,60 @@
     "package": "candle-gen-sd3",
     "target": "candle_gen_sd3",
     "target_kind": "lib",
+    "fqn": "pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution",
+    "source": "crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_sd3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Tiny/committed SD3.5 UNet-equivalent MMDiT/dual-attention/CLIP/VAE/adapter/train/perceptual learned fixtures CPU; crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs::pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution",
+    "configuration_source": "crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs::pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs::pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs::pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-sd3",
+    "target": "candle_gen_sd3",
+    "target_kind": "lib",
     "fqn": "pipeline::tests::turbo_distilled_pipeline_decodes_on_cpu",
     "source": "crates/media/candle-gen/candle-gen-sd3/src/pipeline.rs",
     "cargo_target_metadata": {

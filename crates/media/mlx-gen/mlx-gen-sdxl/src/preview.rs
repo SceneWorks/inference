@@ -73,6 +73,50 @@ pub fn emit_nhwc_ve_preview(
     });
 }
 
+/// Project and emit one raw k-diffusion VE-space SDXL-family latent for a compiled
+/// [`RenderPlan`](mlx_gen::gen_core::RenderPlan), accepting either phase-0 reduced latent
+/// dimensions or full target latent dimensions.
+pub fn emit_nhwc_ve_preview_for_plan(
+    sink: &PreviewSink,
+    plan: &mlx_gen::gen_core::RenderPlan,
+    counter: &mlx_gen::preview::PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    latents: &Array,
+) {
+    if !sink.is_active() {
+        return;
+    }
+    mlx_gen::preview::emit_preview_with_sigma(sink, counter, sigmas, sigma, |sigma| {
+        validate_plan_nhwc_shape(plan, latents)?;
+        project_ve_latents(latents, sigma)
+    });
+}
+
+fn validate_plan_nhwc_shape(
+    plan: &mlx_gen::gen_core::RenderPlan,
+    latents: &Array,
+) -> mlx_gen::Result<()> {
+    let shape = latents.shape();
+    if shape.len() != 4 || shape[0] != 1 || shape[3] != 4 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "SDXL preview latent must have shape [1, h, w, 4], got {shape:?}"
+        )));
+    }
+    let h = shape[1] as u32;
+    let w = shape[2] as u32;
+    let (p0_w, p0_h) = plan.phase_output_size(0);
+    let (full_w, full_h) = plan.output_size();
+    let matches_p0 = (w, h) == (p0_w / 8, p0_h / 8);
+    let matches_full = (w, h) == (full_w / 8, full_h / 8);
+    if !matches_p0 && !matches_full {
+        return Err(mlx_gen::Error::Msg(format!(
+            "SDXL preview latent shape {shape:?} does not match phase-0 or full plan dimensions"
+        )));
+    }
+    Ok(())
+}
+
 /// Project a raw VE-space NHWC latent after applying the SDXL-family input scaling.
 pub fn project_ve_latents(latents: &Array, sigma: Option<f32>) -> mlx_gen::Result<mlx_gen::Image> {
     let Some(sigma) = sigma else {

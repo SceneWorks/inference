@@ -24,11 +24,11 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, require_base_dir,
-    require_control, run_flow_sampler_with_latent_hook, Capabilities, Conditioning,
-    ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, SamplerRun, TimestepConvention,
+    curated_sampler_names, curated_scheduler_names, gen_core, require_base_dir, require_control,
+    run_flow_sampler_with_phase_transition_spans, Capabilities, Conditioning, ConditioningKind,
+    ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
+    SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
@@ -119,6 +119,7 @@ pub struct Flux2DevControl {
     config: Flux2Config,
     memory_strategy: gen_core::MemoryProviderContract,
     memory_numeric_tier: gen_core::MemoryNumericTier,
+    loaded_spec: LoadSpec,
     tokenizer: Option<TextTokenizer>,
     adapters: Vec<mlx_gen::AdapterSpec>,
     residency: Residency<Flux2TextOwned, Flux2ControlHeavyOwned>,
@@ -170,6 +171,7 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         config: Flux2Config::dev(),
         memory_strategy: crate::memory_strategy::registered_dev_control_contract(spec)?,
         memory_numeric_tier,
+        loaded_spec: spec.clone(),
         tokenizer: Some(tokenizer),
         adapters: spec.adapters.clone(),
         residency: build_control_residency_with_source(spec, text_encoder_source)?,
@@ -276,6 +278,7 @@ impl Flux2DevControl {
                 spec,
                 FLUX2_DEV_CONTROL_ID,
             )?,
+            loaded_spec: spec.clone(),
             tokenizer: None,
             adapters: spec.adapters.clone(),
             residency: Residency::sequential(
@@ -387,12 +390,16 @@ impl Flux2DevControl {
         Ok(cc)
     }
 
-    fn generate_impl(
+    fn generate_planned_impl(
         &self,
         req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let pag = self
             .descriptor
             .capabilities
@@ -406,12 +413,12 @@ impl Flux2DevControl {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.config_default_steps()) as usize;
-        let guidance = req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE_DEV);
+        let guidance = plan.guidance();
         mlx_gen::image_execution::scalar("flux2.guidance", guidance);
         // dev is guidance-distilled: the scale is an embedded scalar (single forward), never true-CFG.
         let embedded_guidance = Some(guidance);
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
 
         // `resolve_control` is cheap (reads `req.conditioning`), so resolve it before the residency
         // seam runs; the control-context VAE-encode happens in the heavy phase.
@@ -450,7 +457,10 @@ impl Flux2DevControl {
             // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
             req.use_pid,
             on_progress,
-            |text: &Flux2TextOwned| Self::encode(tokenizer, text, &req.prompt),
+            |text: &Flux2TextOwned| {
+                run.begin_conditioning()?;
+                Self::encode(tokenizer, text, &req.prompt)
+            },
             |encoded| {
                 let Some((prompt_embeds, _text_ids)) = encoded else {
                     return Ok(());
@@ -479,67 +489,52 @@ impl Flux2DevControl {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
+                run.end_conditioning()?;
 
                 // Compiled elementwise glue (sc-2963), shared with the base flux2 path. Scoped +
                 // restored on drop by the RAII guard (F-007).
                 let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
                 let sampler_name = req.sampler.as_deref();
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
-                    let latents = match &clean_init {
-                        Some(clean) => {
-                            add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?
+                let denoise_sigmas = &sched.sigmas[start_step..];
+                let images = run.images_with_denoise_phases(
+                    on_progress,
+                    |seed| {
+                        let noise =
+                            create_noise(seed, req.width, req.height, self.config.in_channels)?;
+                        match &clean_init {
+                            Some(clean) => {
+                                add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])
+                            }
+                            None => Ok(noise),
                         }
-                        None => noise,
-                    };
-                    // Curated unified-framework solver (epic 7114 P3); the control branch is the
-                    // `predict` closure. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma
-                    // convention). Cancellation, the per-step `eval`, and progress live in
-                    // `run_flow_sampler`.
-                    // sc-18317: the request's typed execution selections (graph-evaluation cadence /
-                    // FFN chunk) overlay the control route's historical `OFF` base. An unset
-                    // selection leaves `OFF`, so this route stays byte-for-byte the pre-sc-18317
-                    // forward; the env knobs stay scoped to the base route they were introduced on
-                    // (sc-6266), so nothing here changes for a deployment that only sets those.
-                    let mem = MemoryConfig::with_request(MemoryConfig::OFF, req.memory.as_ref());
-                    let denoise_sigmas = &sched.sigmas[start_step..];
-                    let total_steps = denoise_sigmas.len().saturating_sub(1);
-                    let canonical_solver =
-                        mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
-                    let mut eval_idx = 0usize;
-                    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-                        let ts = sigma * 1000.0;
-                        let current_eval = eval_idx;
-                        eval_idx += 1;
-                        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
-                            canonical_solver,
-                            current_eval,
-                            total_steps,
-                        );
-                        let pos = heavy.transformer.forward_with_mem_pag(
-                            latents,
-                            &prompt_embeds,
-                            &latent_ids,
-                            &text_ids,
-                            ts,
-                            embedded_guidance,
-                            &control_context,
-                            control_scale,
-                            &mem,
-                            None,
-                        )?;
-                        let step_pag = pag
-                            .as_ref()
-                            .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
-                        if step_pag > 0.0 {
-                            eval([&pos])?;
-                            let layers = pag
-                                .as_ref()
-                                .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
-                            let pert = heavy.transformer.forward_with_mem_pag(
+                    },
+                    |seed, latents, on_progress| {
+                        // Curated unified-framework solver (epic 7114 P3); the control branch is the
+                        // `predict` closure. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma
+                        // convention). Cancellation, the per-step `eval`, and progress live in
+                        // `run_flow_sampler_with_phase_transition_spans`.
+                        // sc-18317: the request's typed execution selections (graph-evaluation cadence /
+                        // FFN chunk) overlay the control route's historical `OFF` base. An unset
+                        // selection leaves `OFF`, so this route stays byte-for-byte the pre-sc-18317
+                        // forward; the env knobs stay scoped to the base route they were introduced on
+                        // (sc-6266), so nothing here changes for a deployment that only sets those.
+                        let mem =
+                            MemoryConfig::with_request(MemoryConfig::OFF, req.memory.as_ref());
+                        let total_steps = denoise_sigmas.len().saturating_sub(1);
+                        let canonical_solver =
+                            mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+                        let mut eval_idx = 0usize;
+                        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+                            let ts = sigma * 1000.0;
+                            let current_eval = eval_idx;
+                            eval_idx += 1;
+                            let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                                canonical_solver,
+                                current_eval,
+                                total_steps,
+                            );
+                            let pos = heavy.transformer.forward_with_mem_pag(
                                 latents,
                                 &prompt_embeds,
                                 &latent_ids,
@@ -549,52 +544,78 @@ impl Flux2DevControl {
                                 &control_context,
                                 control_scale,
                                 &mem,
-                                Some(layers),
+                                None,
                             )?;
-                            Ok(add(
-                                &pos,
-                                &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
-                            )?)
-                        } else {
-                            Ok(pos)
-                        }
-                    };
-                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
-                    let final_latents = run_flow_sampler_with_latent_hook(
-                        SamplerRun {
-                            sampler_name,
-                            sigmas: denoise_sigmas,
-                            seed,
-                            cancel: &req.cancel,
-                            on_progress,
-                        },
-                        TimestepConvention::Sigma,
-                        latents,
-                        |latents, sigma| {
-                            crate::preview::emit_flux_preview(
-                                &req.preview,
-                                &previews,
-                                denoise_sigmas,
-                                sigma,
-                                latents,
-                                lat_h as i32,
-                                lat_w as i32,
-                                vae,
-                            );
-                        },
-                        predict,
-                    )?;
-                    on_progress(Progress::Decoding);
-                    // The PiD decode overlay (sc-7847) is wired on the FLUX.2 txt2img/edit path;
-                    // `flux2_dev_control` is NOT in that story's model list, so it stays on the native
-                    // VAE — mirroring the sc-7846 Z-Image Fun-ControlNet scoping decision.
-                    let packed =
-                        final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
-                    let decoded = heavy.vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
-                    let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
-                    images.push(decoded_to_image(&nchw)?);
-                }
-                let executed_steps = sched.sigmas[start_step..].len().saturating_sub(1) as u32;
+                            let step_pag = pag
+                                .as_ref()
+                                .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                            if step_pag > 0.0 {
+                                eval([&pos])?;
+                                let layers = pag
+                                    .as_ref()
+                                    .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                                let pert = heavy.transformer.forward_with_mem_pag(
+                                    latents,
+                                    &prompt_embeds,
+                                    &latent_ids,
+                                    &text_ids,
+                                    ts,
+                                    embedded_guidance,
+                                    &control_context,
+                                    control_scale,
+                                    &mem,
+                                    Some(layers),
+                                )?;
+                                Ok(add(
+                                    &pos,
+                                    &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
+                                )?)
+                            } else {
+                                Ok(pos)
+                            }
+                        };
+                        let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                        run_flow_sampler_with_phase_transition_spans(
+                            SamplerRun {
+                                sampler_name,
+                                sigmas: denoise_sigmas,
+                                seed,
+                                cancel: &req.cancel,
+                                on_progress,
+                            },
+                            TimestepConvention::Sigma,
+                            latents,
+                            &run.plan().denoise_spans(),
+                            Some(&run),
+                            |latents, sigma| {
+                                crate::preview::emit_flux_preview(
+                                    &req.preview,
+                                    &previews,
+                                    denoise_sigmas,
+                                    sigma,
+                                    latents,
+                                    lat_h as i32,
+                                    lat_w as i32,
+                                    vae,
+                                );
+                            },
+                            predict,
+                            None,
+                        )
+                    },
+                    |_seed, final_latents, on_progress| {
+                        on_progress(Progress::Decoding);
+                        // The PiD decode overlay (sc-7847) is wired on the FLUX.2 txt2img/edit path;
+                        // `flux2_dev_control` is NOT in that story's model list, so it stays on the native
+                        // VAE — mirroring the sc-7846 Z-Image Fun-ControlNet scoping decision.
+                        let packed =
+                            final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
+                        let decoded = heavy.vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
+                        let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
+                        decoded_to_image(&nchw)
+                    },
+                )?;
+                let executed_steps = denoise_sigmas.len().saturating_sub(1) as u32;
                 let mut report =
                     gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
                 report.pag = pag.map(|p| p.execution_report(executed_steps));
@@ -606,6 +627,73 @@ impl Flux2DevControl {
     fn config_default_steps(&self) -> u32 {
         crate::config::DEFAULT_STEPS_DEV
     }
+}
+
+/// Compile the weights-free FLUX.2-dev control trajectory for `req`.
+pub fn compile_control_trajectory(
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    let desc = descriptor_dev_control();
+    validate_request(&desc, false, false, req)?;
+    if !req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Control { .. }))
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{FLUX2_DEV_CONTROL_ID}: requires a Control conditioning image (Conditioning::Control)"
+        )));
+    }
+    let (sigmas, start_step, keep) = crate::model::resolved_schedule_for_request(
+        &desc,
+        crate::config::DEFAULT_STEPS_DEV,
+        false,
+        false,
+        req,
+    )?;
+    let sliced = sigmas[start_step..].to_vec();
+    let executed_steps = keep.saturating_sub(start_step).saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
+    let guidance = req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE_DEV);
+    let sampler = req.sampler.as_deref().unwrap_or("flow_match_euler");
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: crate::config::SIZE_MULTIPLE,
+            token_width: 128,
+            sampler,
+            guidance,
+            sigmas: sliced,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_dev_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(gen_core::Error::Msg(format!(
+            "{FLUX2_DEV_CONTROL_ID}: only the default precision is wired; drop the precision \
+             override (Q4/Q8 = spec.quantize)"
+        )));
+    }
+    require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    require_control(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "FLUX.2-dev-Fun-Controlnet-Union",
+    )?;
+    compile_control_trajectory(req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
 }
 
 /// The Fun-Controlnet-Union is a *union* ControlNet (pose / canny / depth / … share one VAE-encoded
@@ -651,6 +739,17 @@ impl Generator for Flux2DevControl {
         })
     }
 
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_planned_impl(req, plan, scope, on_progress)
+            .map_err(Into::into)
+    }
+
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         Some(&self.memory_strategy)
     }
@@ -682,9 +781,23 @@ impl Generator for Flux2DevControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_report_attempt(
-            self.descriptor(),
-            &req.cancel,
+        let plan = compile_control_trajectory(req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
             || {
                 mlx_gen::image_execution::policy_debug(
                     "Flux2DevControl.memory_numeric_tier",
@@ -698,9 +811,6 @@ impl Generator for Flux2DevControl {
                     "Flux2DevControl.applied_adapter_controls",
                     &self.adapters,
                 );
-                let mut progress =
-                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_report_observed(req, &mut progress)
             },
         )
     }
@@ -725,7 +835,9 @@ impl Flux2DevControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.validate(req)?;
+        let plan = compile_control_trajectory(req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
     }
 }
 

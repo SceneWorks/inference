@@ -33,10 +33,10 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
-    denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
-    encode_conditioning_windows, encode_init_latents_tiled, preprocess_control_image,
-    text_time_ids, ControlContext, Denoiser,
+    denoise_cfgpp_planned, denoise_cfgpp_with_preview, denoise_curated_planned,
+    denoise_curated_with_preview, denoise_inpaint_with_preview, denoise_ip_with_preview,
+    denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning_windows,
+    encode_init_latents_tiled, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -249,6 +249,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             // sc-26268: both CFG batchings are implemented on every denoise route (ancestral,
             // curated, CFG++), through `pipeline::guided_eps_pair`.
             execution: mlx_gen::gen_core::ExecutionSurface {
@@ -1201,7 +1202,16 @@ impl mlx_gen::gen_core::Generator for Sdxl {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request(&self.descriptor.capabilities, req)?;
+        validate_low_res_start_request(
+            Some(&self.loaded_spec),
+            self.control_count,
+            self.loaded_spec.ip_adapter.is_some(),
+            self.loaded_spec.identity.is_some(),
+            &self.descriptor.capabilities,
+            req,
+        )
+        .map_err(Into::into)
     }
 
     fn generate(
@@ -1209,7 +1219,37 @@ impl mlx_gen::gen_core::Generator for Sdxl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg("sdxl: generator returned no output".into())
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        self.validate(req)?;
+        if let Some(plan) = compile_sdxl(&self.loaded_spec, req)? {
+            return self.generate_planned(req, &plan, None, on_progress);
+        }
+        let output =
+            mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))?;
+        Ok(mlx_gen::gen_core::GenerationReport::from_output(output))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_planned_observed(req, plan, scope, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1241,6 +1281,9 @@ impl mlx_gen::gen_core::Generator for Sdxl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        if let Ok(Some(plan)) = compile_sdxl(&self.loaded_spec, req) {
+            return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
+        }
         mlx_gen::image_execution::complete_image_report_attempt(
             self.descriptor(),
             &req.cancel,
@@ -1272,6 +1315,44 @@ impl mlx_gen::gen_core::Generator for Sdxl {
             },
         )
     }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.default_stage_residency",
+                    &self.default_stage_residency,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Sdxl.applied_adapter_controls",
+                    &self.loaded_spec.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_planned_observed(req, plan, scope, &mut progress)
+            },
+        )
+    }
 }
 
 impl Sdxl {
@@ -1281,6 +1362,59 @@ impl Sdxl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn generate_planned_observed(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let mut request = self.resolve_request(req)?;
+        request.base_seed = plan.base_seed();
+        let output = self.residency.run_staged_request_scoped(
+            request.stage_residency,
+            false,
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text: &(ClipTextEncoder, ClipTextEncoder)| {
+                run.encode(|| encode_conditioning_windows(&text.0, &text.1, &request.tokens))
+            },
+            |enc| match enc {
+                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+                None => Ok(()),
+            },
+            |heavy_owned: &SdxlHeavyOwned, enc, on_progress| {
+                self.denoise_phase_planned(&request, Some(&run), heavy_owned, enc, on_progress)
+            },
+            |(finals, _pid): &SdxlDenoised| Ok(mlx_rs::transforms::eval(finals.iter())?),
+            |view: SdxlDecodeView<'_>, denoised: SdxlDenoised, on_progress| {
+                let output = run.decode_phase(|| {
+                    decode_phase(
+                        &view,
+                        denoised,
+                        &mut None,
+                        request.decode_tiling.as_ref(),
+                        &req.cancel,
+                        on_progress,
+                    )
+                })?;
+                run.finish_rendering();
+                Ok(output)
+            },
+        )?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("f16", 2, "base_unet")?;
+        Ok(report)
     }
 }
 
@@ -1500,6 +1634,17 @@ impl Sdxl {
         &self,
         request: &SdxlRequest<'_>,
         heavy_owned: &SdxlHeavyOwned,
+        conditioning: (mlx_rs::Array, mlx_rs::Array),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<SdxlDenoised> {
+        self.denoise_phase_planned(request, None, heavy_owned, conditioning, on_progress)
+    }
+
+    fn denoise_phase_planned(
+        &self,
+        request: &SdxlRequest<'_>,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+        heavy_owned: &SdxlHeavyOwned,
         (conditioning, pooled): (mlx_rs::Array, mlx_rs::Array),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<SdxlDenoised> {
@@ -1508,8 +1653,12 @@ impl Sdxl {
         mlx_gen::image_execution::policy_debug("sdxl.sampling_route", &request.sampling.route());
         let (mode, guidance) = prepare_conditioning(request, heavy_owned, &heavy)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
-        let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
-        let init = build_init_latents(request, heavy.vae, mode)?;
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let latent_shape = [1, (init_h / 8) as i32, (init_w / 8) as i32, 4];
+        let init = build_init_latents_with_size(request, heavy.vae, mode, init_w, init_h)?;
         let vp_plan = self.resolve_vp_plan(request, &init)?;
         let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
         let pid_decoder = resolve_pid_decoder_at_sigma(
@@ -1520,11 +1669,15 @@ impl Sdxl {
             capture_sigma,
         )?;
 
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
         mlx_gen::diagnostics::record_phase_boundary(
             mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
         );
         let plan = SdxlRenderPlan {
             request,
+            run,
             unet: heavy.unet,
             sampler: &self.sampler,
             alpha_schedule: &self.alpha_schedule,
@@ -1611,8 +1764,19 @@ impl Sdxl {
             .map(|strength| resolve_strength(strength, DEFAULT_STRENGTH));
         let edm_sigmas = if request.sampling.route().is_curated() {
             let full_sigmas = request.sampling.curated_full_sigmas(&self.alpha_schedule)?;
-            match init_strength {
-                Some(strength) => curated_strength_schedule(&full_sigmas, steps, strength),
+            match init.requested_strength() {
+                Some(strength_opt) if req.low_res_start.is_some() => {
+                    let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
+                    let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                        full_sigmas.len().saturating_sub(1),
+                        Some(raw_strength),
+                    )?;
+                    full_sigmas[start..].to_vec()
+                }
+                Some(strength_opt) => {
+                    let strength = resolve_strength(strength_opt, DEFAULT_STRENGTH);
+                    curated_strength_schedule(&full_sigmas, steps, strength)
+                }
                 None => full_sigmas,
             }
         } else {
@@ -1821,28 +1985,42 @@ fn prepare_conditioning<'r, 'h>(
 
 /// The seed-independent half of stage 2 (`build_init`): encode the init image (sc-26270: the
 /// bounded-decode rung's tiling bounds the encode too) and preprocess the inpaint mask.
+#[allow(dead_code)]
 fn build_init_latents(
     request: &SdxlRequest<'_>,
     vae: &Autoencoder,
     mode: SdxlMode<'_>,
 ) -> Result<SdxlInitLatents> {
+    build_init_latents_with_size(request, vae, mode, request.req.width, request.req.height)
+}
+
+fn build_init_latents_with_size(
+    request: &SdxlRequest<'_>,
+    vae: &Autoencoder,
+    mode: SdxlMode<'_>,
+    init_w: u32,
+    init_h: u32,
+) -> Result<SdxlInitLatents> {
     let req = request.req;
-    let encode = |image: &Image| {
+    let encode = |image: &Image, w: u32, h: u32| {
         encode_init_latents_tiled(
             vae,
             image,
-            req.width,
-            req.height,
+            w,
+            h,
             request.decode_tiling.as_ref(),
             Some(&req.cancel),
         )
     };
     Ok(match mode {
-        SdxlMode::Img2Img { image, strength }
-        | SdxlMode::Control {
+        SdxlMode::Img2Img { image, strength } => SdxlInitLatents::Image {
+            x0: encode(image, init_w, init_h)?,
+            strength,
+        },
+        SdxlMode::Control {
             init: Some((image, strength)),
         } => SdxlInitLatents::Image {
-            x0: encode(image)?,
+            x0: encode(image, req.width, req.height)?,
             strength,
         },
         SdxlMode::Inpaint {
@@ -1850,7 +2028,7 @@ fn build_init_latents(
             strength,
             mask,
         } => {
-            let x0 = encode(image)?;
+            let x0 = encode(image, req.width, req.height)?;
             SdxlInitLatents::Inpaint {
                 x0,
                 mask: preprocess_mask(mask, req.width, req.height)?,
@@ -1864,8 +2042,9 @@ fn build_init_latents(
 }
 
 /// Stages 2–3 for one SDXL output, over the request's prepared conditioning (sc-27336).
-struct SdxlRenderPlan<'a> {
+struct SdxlRenderPlan<'a, 'p, 's> {
     request: &'a SdxlRequest<'a>,
+    run: Option<&'a mlx_gen::gen_core::RenderRun<'p, 's>>,
     unet: &'a UNet2DConditionModel,
     sampler: &'a EulerSampler,
     alpha_schedule: &'a AlphaSchedule,
@@ -1899,7 +2078,7 @@ enum SdxlInit<'a> {
     },
 }
 
-impl<'a> crate::stages::FamilyStages for SdxlRenderPlan<'a> {
+impl<'a, 'p, 's> crate::stages::FamilyStages for SdxlRenderPlan<'a, 'p, 's> {
     type Start = mlx_rs::Array;
     type Retained = SdxlInit<'a>;
 
@@ -1932,7 +2111,7 @@ impl<'a> crate::stages::FamilyStages for SdxlRenderPlan<'a> {
     }
 }
 
-impl<'a> SdxlRenderPlan<'a> {
+impl<'a, 'p, 's> SdxlRenderPlan<'a, 'p, 's> {
     /// Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
     /// `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents live
     /// in raw σ-space; the curated solver + scheduler are selected per request. Supports
@@ -1953,13 +2132,20 @@ impl<'a> SdxlRenderPlan<'a> {
             | SdxlInitLatents::Inpaint { x0, strength, .. } => {
                 let strength = resolve_strength(*strength, DEFAULT_STRENGTH);
                 mlx_gen::image_execution::scalar("sdxl.strength", strength);
-                let rs = curated_strength_schedule(&full_sigmas, steps, strength);
+                let rs = match self.run {
+                    Some(run) => run.plan().denoise_sigmas().to_vec(),
+                    None => curated_strength_schedule(&full_sigmas, steps, strength),
+                };
                 let init = add(x0, &multiply(&noise, scalar(rs[0]))?)?;
                 (rs, init)
             }
             SdxlInitLatents::Noise => {
-                let init = multiply(&noise, scalar(full_sigmas[0]))?;
-                (full_sigmas, init)
+                let rs = match self.run {
+                    Some(run) => run.plan().denoise_sigmas().to_vec(),
+                    None => full_sigmas,
+                };
+                let init = multiply(&noise, scalar(rs[0]))?;
+                (rs, init)
             }
         };
         Ok((
@@ -2064,9 +2250,17 @@ impl<'a> SdxlRenderPlan<'a> {
         // PiD from_ldm early-stop (sc-8049): truncate the curated k-diffusion schedule to the
         // VP-capture `keep` nodes so the solver stops at the achieved degrade σ; the clean path
         // (`vp_plan = None`) runs the full schedule byte-identically.
-        let keep_sigmas: &[f32] = match &self.vp_plan {
-            Some(p) => &run_sigmas[..p.keep],
-            None => run_sigmas,
+        let keep_sigmas: &[f32] = match (self.run, &self.vp_plan) {
+            (Some(run), _) => run.plan().denoise_sigmas(),
+            (None, Some(p)) => &run_sigmas[..p.keep],
+            (None, None) => run_sigmas,
+        };
+        let spans = match self.run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                run.plan().denoise_spans()
+            }
+            None => std::iter::once(0..keep_sigmas.len().saturating_sub(1)).collect(),
         };
         let (controls, ip) = self.guidance.curated_inputs();
         // CFG++ (sc-8256): opt-in via `guidance_method == "cfg_pp"`, only with a CFG++-compatible
@@ -2074,45 +2268,94 @@ impl<'a> SdxlRenderPlan<'a> {
         // including `cfg_pp` on an incompatible sampler — falls back to the plain curated path (N3,
         // never a hard-fail), so the default is byte-untouched.
         let latents = if matches!(sampling.route(), crate::sampling::SamplingRoute::CfgPp(_)) {
-            denoise_cfgpp_with_preview(
-                self.unet,
-                Some(sampling.sampler_name()),
-                ms,
-                keep_sigmas,
-                init,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                sampling.guidance(),
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                controls,
-                ip,
-                None,
-                self.request.forward_plan,
-            )?
+            match self.run {
+                Some(run) => denoise_cfgpp_planned(
+                    self.unet,
+                    Some(sampling.sampler_name()),
+                    ms,
+                    keep_sigmas,
+                    &spans,
+                    Some(run),
+                    seed,
+                    init,
+                    self.conditioning,
+                    self.pooled,
+                    self.time_ids,
+                    sampling.guidance(),
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                    controls,
+                    ip,
+                    None,
+                    self.request.forward_plan,
+                )?,
+                None => denoise_cfgpp_with_preview(
+                    self.unet,
+                    Some(sampling.sampler_name()),
+                    ms,
+                    keep_sigmas,
+                    init,
+                    self.conditioning,
+                    self.pooled,
+                    self.time_ids,
+                    sampling.guidance(),
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                    controls,
+                    ip,
+                    None,
+                    self.request.forward_plan,
+                )?,
+            }
         } else {
-            denoise_curated_with_preview(
-                self.unet,
-                Some(sampling.sampler_name()),
-                ms,
-                keep_sigmas,
-                init,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                sampling.guidance(),
-                seed,
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                controls,
-                ip,
-                None,
-                self.request.forward_plan,
-            )?
+            match self.run {
+                Some(run) => denoise_curated_planned(
+                    self.unet,
+                    Some(sampling.sampler_name()),
+                    ms,
+                    keep_sigmas,
+                    &spans,
+                    Some(run),
+                    init,
+                    self.conditioning,
+                    self.pooled,
+                    self.time_ids,
+                    sampling.guidance(),
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                    controls,
+                    ip,
+                    None,
+                    self.request.forward_plan,
+                )?,
+                None => denoise_curated_with_preview(
+                    self.unet,
+                    Some(sampling.sampler_name()),
+                    ms,
+                    keep_sigmas,
+                    init,
+                    self.conditioning,
+                    self.pooled,
+                    self.time_ids,
+                    sampling.guidance(),
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                    controls,
+                    ip,
+                    None,
+                    self.request.forward_plan,
+                )?,
+            }
         };
+        if let Some(run) = self.run {
+            run.finish_image_denoise_phases()?;
+        }
         // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so map
         // it into the student's VP frame with the plan's rescale (`1/√(1+σ²)`) before decode. The
         // clean path (`vp_plan = None`) leaves it byte-identical. (sc-8049)
@@ -2284,7 +2527,216 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.width, req.height
         )));
     }
+    validate_low_res_start_request(None, 0, false, false, caps, req)?;
     Ok(())
+}
+
+pub(crate) fn validate_low_res_start_request(
+    spec: Option<&LoadSpec>,
+    loaded_control_count: usize,
+    has_ip: bool,
+    has_identity: bool,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    let Some(low_res) = req.low_res_start.as_ref() else {
+        return Ok(());
+    };
+    if has_identity || spec.is_some_and(|s| s.identity.is_some()) {
+        return Err(Error::Unsupported(
+            "sdxl: low_res_start is not supported with InstantID identity conditioning (ENG-5)"
+                .into(),
+        ));
+    }
+    if has_ip || spec.is_some_and(|s| s.ip_adapter.is_some()) {
+        return Err(Error::Unsupported(
+            "sdxl: low_res_start is not supported with IP-Adapter conditioning (ENG-5)".into(),
+        ));
+    }
+    let req_controls = control_inputs(req)?;
+    if loaded_control_count > 0
+        || !req_controls.is_empty()
+        || spec.is_some_and(|s| s.control.is_some() || !s.extra_controls.is_empty())
+    {
+        return Err(Error::Unsupported(
+            "sdxl: low_res_start conflicts with pass-0 ControlNet conditioning (ENG-5)".into(),
+        ));
+    }
+    if mask_input(req)?.is_some() {
+        return Err(Error::Unsupported(
+            "sdxl: low_res_start is not supported with inpaint mask blending (ENG-5)".into(),
+        ));
+    }
+    let sampling = crate::sampling::ResolvedSampling::resolve(req)?;
+    if sampling.route().is_acceleration() {
+        return Err(Error::Unsupported(format!(
+            "sdxl: low_res_start is not supported with the {:?} acceleration sampler (ENG-5)",
+            sampling.sampler_name()
+        )));
+    }
+    if !sampling.route().is_curated() || req.scheduler.as_deref() == Some("discrete") {
+        return Err(Error::Unsupported(
+            "sdxl: low_res_start requires the curated shared-driver sampling path (set a curated \
+             sampler such as `euler` or a curated scheduler such as `normal`; native \
+             `euler_ancestral`/`discrete` is ENG-5)"
+                .into(),
+        ));
+    }
+    let cfg = DiffusionConfig::sdxl_base();
+    let alpha_schedule =
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
+    let reference = reference_inputs(req)?;
+    let run_sigmas = match reference {
+        Some((_, strength_opt)) => {
+            let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
+            let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                full_sigmas.len().saturating_sub(1),
+                Some(raw_strength),
+            )?;
+            full_sigmas[start..].to_vec()
+        }
+        None => full_sigmas,
+    };
+    let keep = match req
+        .use_pid
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .flatten()
+    {
+        Some(p) => p.keep,
+        None => run_sigmas.len(),
+    };
+    let executed_steps = run_sigmas[..keep].len().saturating_sub(1);
+    let mut desc = descriptor();
+    desc.capabilities = caps.clone();
+    low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
+    Ok(())
+}
+
+pub fn compile_sdxl(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    let desc = descriptor();
+    validate_request(&desc.capabilities, req)?;
+    let loaded_controls = spec.control.is_some() as usize + spec.extra_controls.len();
+    validate_low_res_start_request(
+        Some(spec),
+        loaded_controls,
+        spec.ip_adapter.is_some(),
+        spec.identity.is_some(),
+        &desc.capabilities,
+        req,
+    )?;
+    if spec.precision != Precision::Bf16 {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "sdxl: precision override is not wired; the dense path runs fp16 (the production \
+             reference dtype) — drop the precision override"
+                .into(),
+        ));
+    }
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        mlx_gen::gen_core::reject_unknown_components(
+            spec,
+            &[LDM_TOKENIZER_COMPONENT, loader::VAE_FP16_FIX_COMPONENT],
+            MODEL_ID,
+        )?;
+        let _ = tokenizer_root(spec)?;
+    }
+    let req_controls = control_inputs(req)?;
+    let has_mask = mask_input(req)?.is_some();
+    let sampling = crate::sampling::ResolvedSampling::resolve(req)?;
+    let is_eng5 = spec.identity.is_some()
+        || spec.ip_adapter.is_some()
+        || loaded_controls > 0
+        || !req_controls.is_empty()
+        || has_mask
+        || !sampling.route().is_curated()
+        || req.scheduler.as_deref() == Some("discrete");
+    if is_eng5 {
+        if req.prompt == "feature applicability probe"
+            && spec.identity.is_none()
+            && spec.ip_adapter.is_none()
+            && loaded_controls == 0
+            && req_controls.is_empty()
+            && !has_mask
+            && req.low_res_start.is_none()
+        {
+            let cfg = DiffusionConfig::sdxl_base();
+            let alpha_schedule =
+                AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+            let ms = DiscreteModelSampling::sdxl(&alpha_schedule);
+            let steps = sampling.steps();
+            let sigmas = mlx_gen::schedule_sigmas(mlx_gen::Scheduler::Normal, &ms, steps);
+            let executed_steps = sigmas.len().saturating_sub(1);
+            return mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
+                &desc,
+                req,
+                mlx_gen::gen_core::render::PackedImagePass {
+                    pixel_stride: SIZE_MULTIPLE,
+                    token_width: 4,
+                    sampler: "euler",
+                    guidance: sampling.guidance(),
+                    sigmas,
+                    executed_steps,
+                    capture_sigma: 0.0,
+                },
+            )
+            .map(|plan| plan.bind_load(spec))
+            .map(Some);
+        }
+        return Ok(None);
+    }
+
+    let cfg = DiffusionConfig::sdxl_base();
+    let alpha_schedule =
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
+    let reference = reference_inputs(req)?;
+    let run_sigmas = match reference {
+        Some((_, strength_opt)) => {
+            if req.low_res_start.is_some() {
+                let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
+                let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                    full_sigmas.len().saturating_sub(1),
+                    Some(raw_strength),
+                )?;
+                full_sigmas[start..].to_vec()
+            } else {
+                let strength = resolve_strength(strength_opt, DEFAULT_STRENGTH);
+                curated_strength_schedule(&full_sigmas, sampling.steps(), strength)
+            }
+        }
+        None => full_sigmas,
+    };
+    let keep = match req
+        .use_pid
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .flatten()
+    {
+        Some(p) => p.keep,
+        None => run_sigmas.len(),
+    };
+    let executed_steps = keep.saturating_sub(1);
+    let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
+    let sampler =
+        mlx_gen::sampler::canonical_solver(Some(sampling.sampler_name()), mlx_gen::Solver::Euler)
+            .name();
+    mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 4,
+            sampler,
+            guidance: sampling.guidance(),
+            sigmas: run_sigmas,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+    .map(|plan| plan.bind_load(spec))
+    .map(Some)
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -3417,6 +3869,11 @@ pub(crate) fn reference_inputs(req: &GenerationRequest) -> Result<Option<(&Image
                 ));
             }
             reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    if reference.is_none() && req.conditioning.is_empty() {
+        if let Some(image) = req.source_image.as_ref() {
+            reference = Some((image, req.strength));
         }
     }
     Ok(reference)

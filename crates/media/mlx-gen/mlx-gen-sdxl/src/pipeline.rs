@@ -1092,13 +1092,213 @@ pub fn denoise_curated_with_preview(
     // declared-but-unreachable on them.
     plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
-    // Same SiLU-fusion compile scope as the ancestral loop (sc-2963) — bit-exact in fp16.
+    let span = 0..sigmas.len().saturating_sub(1);
+    denoise_curated_planned(
+        unet,
+        sampler_name,
+        ms,
+        sigmas,
+        std::slice::from_ref(&span),
+        None,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        controls,
+        ip,
+        control_encoder,
+        plan,
+    )
+}
+
+fn transition_nhwc_clean_estimate(
+    x0_low: &Array,
+    source: gen_core::EstimateSource,
+    low_res_plan: &gen_core::ResolvedLowResStartPlan,
+    sigma_k: f32,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    run: &gen_core::RenderRun<'_, '_>,
+    seed: u64,
+) -> Result<Array> {
+    let target_dtype = x0_low.dtype();
+    let shape = x0_low.shape();
+    if shape.len() != 4 || shape[3] != 4 {
+        return Err(Error::from(gen_core::Error::Unsupported(format!(
+            "SDXL low_res_start transition expects NHWC [B, H, W, 4], got {shape:?}"
+        ))));
+    }
+    let b_sz = shape[0] as usize;
+    let low_h = shape[1] as usize;
+    let nchw_low = mlx_gen::array::contiguous(
+        &x0_low
+            .transpose_axes(&[0, 3, 1, 2])?
+            .as_dtype(mlx_rs::Dtype::Float32)?,
+    )?;
+    nchw_low.eval()?;
+    let low_slice = nchw_low.as_slice::<f32>();
+    let vae_spatial_scale = ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
+    let base_seed = run.plan().base_seed();
+    let output_index = seed.wrapping_sub(base_seed) as u32;
+    let pass_index = run.plan().pass_index();
+    let noised = gen_core::transition_clean_estimate_f32(
+        gen_core::BoundaryState::CleanEstimate {
+            latent: low_slice,
+            source,
+        },
+        b_sz,
+        4,
+        vae_spatial_scale as u32,
+        low_res_plan,
+        sigma_k,
+        ms,
+        base_seed,
+        output_index,
+        pass_index,
+        0,
+    )?;
+    let full_h = ((low_res_plan.full_height as usize) / vae_spatial_scale) as i32;
+    let full_w = ((low_res_plan.full_width as usize) / vae_spatial_scale) as i32;
+    let nchw_full = Array::from_slice(&noised, &[b_sz as i32, 4, full_h, full_w]);
+    let nhwc_full = mlx_gen::array::contiguous(&nchw_full.transpose_axes(&[0, 2, 3, 1])?)?;
+    if target_dtype == mlx_rs::Dtype::Float32 {
+        Ok(nhwc_full)
+    } else {
+        Ok(nhwc_full.as_dtype(target_dtype)?)
+    }
+}
+
+/// Planned multi-span curated unified-sampler denoise with NHWC-aware `low_res_start` transition.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated_planned(
+    unet: &UNet2DConditionModel,
+    sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+    plan: crate::plan::SdxlForwardPlan<'_>,
+) -> Result<Array> {
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
-    let mut evaluation = 0u64;
-    let out = mlx_gen::run_curated_sampler_with_latent_hook(
+    let evaluation = std::cell::Cell::new(0u64);
+    let predict_eps = |x_in: &Array, timestep: f32| -> Result<Array> {
+        let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
+        let current = evaluation.get();
+        evaluation.set(current + 1);
+        diagnostic_curated_input(current, timestep, cfg_on, false, plan, x_in, &x16);
+        let eps = if cfg_on {
+            let (eps_text, eps_neg) = guided_eps_pair(
+                unet,
+                &x16,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                plan,
+            )?;
+            gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
+        } else {
+            forward_eps(
+                unet,
+                &x16,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                plan,
+            )?
+        };
+        mlx_gen::sampler::diagnostic_sampling_tensor("sdxl", "curated-epsilon", current, 1, &eps);
+        Ok(eps)
+    };
+    let mut transition_fn = |_phase: usize,
+                             boundary_step: usize,
+                             ops: &MlxLatentOps,
+                             ms_dyn: &dyn gen_core::sampling::ModelSampling,
+                             out: &Array,
+                             state: &mut gen_core::sampling::SolverRunState<MlxLatentOps>|
+     -> Result<Array> {
+        let Some(run) = phase_scope else {
+            return Ok(out.clone());
+        };
+        let Some(low_res_plan) = run.plan().low_res_start().copied() else {
+            return Ok(out.clone());
+        };
+        if boundary_step != low_res_plan.k {
+            return Ok(out.clone());
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let sigma_k = sigmas[boundary_step];
+        let boundary_state = match low_res_plan.estimate_source {
+            gen_core::EstimateSource::EndpointEvaluation => {
+                let x0_low = gen_core::sampling::denoise(ops, ms_dyn, out, sigma_k, |xin, t| {
+                    predict_eps(xin, t).map_err(gen_core::Error::from)
+                })?;
+                gen_core::BoundaryState::CleanEstimate {
+                    latent: x0_low,
+                    source: gen_core::EstimateSource::EndpointEvaluation,
+                }
+            }
+            gen_core::EstimateSource::PreviousEvaluation => {
+                let captured = state.take_captured_primary_estimate(boundary_step - 1)?;
+                gen_core::BoundaryState::CleanEstimate {
+                    latent: captured.latent,
+                    source: gen_core::EstimateSource::PreviousEvaluation,
+                }
+            }
+        };
+        let (x0_low, source) = boundary_state.into_clean_estimate()?;
+        let transitioned = transition_nhwc_clean_estimate(
+            &x0_low,
+            source,
+            &low_res_plan,
+            sigma_k,
+            ms_dyn,
+            run,
+            seed,
+        )?;
+        state.note_geometry_change(
+            (low_res_plan.low_width, low_res_plan.low_height),
+            (low_res_plan.full_width, low_res_plan.full_height),
+        );
+        state.note_renoise_transition();
+        state.apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)?;
+        Ok(transitioned)
+    };
+    let on_phase_boundary: Option<&mut mlx_gen::sampler::MlxPhaseTransitionFn<'_>> =
+        if spans.len() > 1 {
+            Some(&mut transition_fn)
+        } else {
+            None
+        };
+    let out = mlx_gen::run_curated_sampler_with_phase_transition_spans(
         mlx_gen::SamplerRun {
             sampler_name,
             sigmas,
@@ -1108,56 +1308,27 @@ pub fn denoise_curated_with_preview(
         },
         ms,
         latents,
-        |latents, sigma| {
-            crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
+        spans,
+        phase_scope,
+        |latents, sigma| match phase_scope {
+            Some(run) => crate::preview::emit_nhwc_ve_preview_for_plan(
+                preview,
+                run.plan(),
+                &preview_counter,
+                sigmas,
+                sigma,
+                latents,
+            ),
+            None => crate::preview::emit_nhwc_ve_preview(
+                preview,
+                &preview_counter,
+                sigmas,
+                sigma,
+                latents,
+            ),
         },
-        |x_in, timestep| {
-            // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
-            let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let current = evaluation;
-            evaluation += 1;
-            diagnostic_curated_input(current, timestep, cfg_on, false, plan, x_in, &x16);
-            // CFG combine via the shared `gen_core::guidance::cfg` over `MlxLatentOps` (the sc-7443
-            // migration `denoise_core` already carries, F-082): byte-identical to the retired hand
-            // `eps_neg + cfg·(eps_text − eps_neg)` form — the dtype-preserving `axpy` casts the
-            // scale to the eps dtype so the blend runs in the compute dtype (fp16).
-            let eps = if cfg_on {
-                let (eps_text, eps_neg) = guided_eps_pair(
-                    unet,
-                    &x16,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    controls,
-                    cn_enc,
-                    ip,
-                    plan,
-                )?;
-                gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
-            } else {
-                forward_eps(
-                    unet,
-                    &x16,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    controls,
-                    cn_enc,
-                    ip,
-                    plan,
-                )?
-            };
-            mlx_gen::sampler::diagnostic_sampling_tensor(
-                "sdxl",
-                "curated-epsilon",
-                current,
-                1,
-                &eps,
-            );
-            Ok(eps)
-        },
+        predict_eps,
+        on_phase_boundary,
     )?;
     observe_denoise_policy(plan, cfg, controls, ip, false);
     mlx_gen::image_execution::sampled_native_from_primary_seed(
@@ -1237,59 +1408,167 @@ pub fn denoise_cfgpp_with_preview(
     // declared-but-unreachable on them.
     plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
+    let span = 0..sigmas.len().saturating_sub(1);
+    denoise_cfgpp_planned(
+        unet,
+        base_sampler_name,
+        ms,
+        sigmas,
+        std::slice::from_ref(&span),
+        None,
+        0,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        controls,
+        ip,
+        control_encoder,
+        plan,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfgpp_planned(
+    unet: &UNet2DConditionModel,
+    base_sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    seed: u64,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+    plan: crate::plan::SdxlForwardPlan<'_>,
+) -> Result<Array> {
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
-    let mut evaluation = 0u64;
-    let out = mlx_gen::run_cfgpp_sampler_with_latent_hook(
+    let evaluation = std::cell::Cell::new(0u64);
+    let predict_pair = |x_in: &Array, timestep: f32| -> Result<(Array, Array)> {
+        let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
+        let current = evaluation.get();
+        evaluation.set(current + 1);
+        diagnostic_curated_input(current, timestep, true, true, plan, x_in, &x16);
+        let (eps_text, eps_neg) = guided_eps_pair(
+            unet,
+            &x16,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            controls,
+            cn_enc,
+            ip,
+            plan,
+        )?;
+        let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "curated-epsilon",
+            current,
+            1,
+            &guided,
+        );
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "cfgpp-unconditional-epsilon",
+            current,
+            1,
+            &eps_neg,
+        );
+        Ok((guided, eps_neg))
+    };
+    let mut transition_fn = |_phase: usize,
+                             boundary_step: usize,
+                             ops: &MlxLatentOps,
+                             ms_dyn: &dyn gen_core::sampling::ModelSampling,
+                             out: &Array,
+                             state: &mut gen_core::sampling::SolverRunState<MlxLatentOps>|
+     -> Result<Array> {
+        let Some(run) = phase_scope else {
+            return Ok(out.clone());
+        };
+        let Some(low_res_plan) = run.plan().low_res_start().copied() else {
+            return Ok(out.clone());
+        };
+        if boundary_step != low_res_plan.k {
+            return Ok(out.clone());
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let sigma_k = sigmas[boundary_step];
+        let x0_low = gen_core::sampling::denoise(ops, ms_dyn, out, sigma_k, |xin, t| {
+            Ok(predict_pair(xin, t)?.0)
+        })?;
+        let transitioned = transition_nhwc_clean_estimate(
+            &x0_low,
+            gen_core::EstimateSource::EndpointEvaluation,
+            &low_res_plan,
+            sigma_k,
+            ms_dyn,
+            run,
+            seed,
+        )?;
+        state.note_geometry_change(
+            (low_res_plan.low_width, low_res_plan.low_height),
+            (low_res_plan.full_width, low_res_plan.full_height),
+        );
+        state.note_renoise_transition();
+        state.apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)?;
+        Ok(transitioned)
+    };
+    let on_phase_boundary: Option<&mut mlx_gen::sampler::MlxPhaseTransitionFn<'_>> =
+        if spans.len() > 1 {
+            Some(&mut transition_fn)
+        } else {
+            None
+        };
+    let out = mlx_gen::run_cfgpp_sampler_with_phase_transition_spans(
         mlx_gen::SamplerRun {
             sampler_name: base_sampler_name,
             sigmas,
-            seed: 0,
+            seed,
             cancel,
             on_progress,
         },
         ms,
         latents,
-        |latents, sigma| {
-            crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
+        spans,
+        phase_scope,
+        |latents, sigma| match phase_scope {
+            Some(run) => crate::preview::emit_nhwc_ve_preview_for_plan(
+                preview,
+                run.plan(),
+                &preview_counter,
+                sigmas,
+                sigma,
+                latents,
+            ),
+            None => crate::preview::emit_nhwc_ve_preview(
+                preview,
+                &preview_counter,
+                sigmas,
+                sigma,
+                latents,
+            ),
         },
-        |x_in, timestep| {
-            // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
-            let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let current = evaluation;
-            evaluation += 1;
-            diagnostic_curated_input(current, timestep, true, true, plan, x_in, &x16);
-            let (eps_text, eps_neg) = guided_eps_pair(
-                unet,
-                &x16,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                controls,
-                cn_enc,
-                ip,
-                plan,
-            )?;
-            // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
-            let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
-            mlx_gen::sampler::diagnostic_sampling_tensor(
-                "sdxl",
-                "curated-epsilon",
-                current,
-                1,
-                &guided,
-            );
-            mlx_gen::sampler::diagnostic_sampling_tensor(
-                "sdxl",
-                "cfgpp-unconditional-epsilon",
-                current,
-                1,
-                &eps_neg,
-            );
-            Ok((guided, eps_neg))
-        },
+        predict_pair,
+        on_phase_boundary,
     )?;
     observe_denoise_policy(plan, cfg, controls, ip, false);
     mlx_gen::image_execution::sampled_native_from_primary_seed(
@@ -2120,6 +2399,229 @@ mod tests {
             plain.as_slice::<f32>(),
             controlled.as_slice::<f32>(),
             "a nonzero ControlNet residual must alter the Lightning trajectory"
+        );
+    }
+
+    #[test]
+    fn transition_nhwc_clean_estimate_materializes_transposed_nhwc_planes() {
+        let req = mlx_gen::GenerationRequest {
+            prompt: "nhwc low_res_start transition".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        let plan = crate::model::compile_sdxl(&spec, &req)
+            .unwrap()
+            .expect("compiled sdxl plan");
+        let low_res_plan = *plan.low_res_start().unwrap();
+        let sigma_k = plan.denoise_sigmas()[low_res_plan.k];
+        let cfg = crate::DiffusionConfig::sdxl_base();
+        let alpha = AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+        let ms = mlx_gen::gen_core::sampling::DiscreteModelSampling::sdxl(&alpha);
+
+        // Build a spatially varying, channel-distinct [1, 64, 64, 4] NHWC f32 fixture and its
+        // matching planar [1, 4, 64, 64] NCHW vector. Without `contiguous`, `transpose_axes`
+        // followed by `as_dtype(Float32)` and `as_slice` reads the physical NHWC layout as NCHW.
+        let low_h = 64usize;
+        let low_w = 64usize;
+        let mut nhwc_vec = vec![0.0f32; low_h * low_w * 4];
+        let mut nchw_vec = vec![0.0f32; 4 * low_h * low_w];
+        for y in 0..low_h {
+            for x in 0..low_w {
+                for c in 0..4 {
+                    let val = (c as f32) * 10.0 + (y as f32) * 0.1 + (x as f32) * 0.01;
+                    nhwc_vec[(y * low_w + x) * 4 + c] = val;
+                    nchw_vec[c * (low_h * low_w) + y * low_w + x] = val;
+                }
+            }
+        }
+        let x0_nhwc = Array::from_slice(&nhwc_vec, &[1, low_h as i32, low_w as i32, 4]);
+        let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+        let got_nhwc = transition_nhwc_clean_estimate(
+            &x0_nhwc,
+            gen_core::EstimateSource::EndpointEvaluation,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            &run,
+            plan.base_seed(),
+        )
+        .unwrap();
+        assert_eq!(got_nhwc.shape(), &[1, 128, 128, 4]);
+        let got_nchw =
+            mlx_gen::array::contiguous(&got_nhwc.transpose_axes(&[0, 3, 1, 2]).unwrap()).unwrap();
+        got_nchw.eval().unwrap();
+
+        let expected_nchw = gen_core::transition_clean_estimate_f32(
+            gen_core::BoundaryState::CleanEstimate {
+                latent: &nchw_vec,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            plan.base_seed(),
+            0,
+            plan.pass_index(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(got_nchw.as_slice::<f32>(), expected_nchw.as_slice());
+    }
+
+    #[test]
+    fn cfgpp_dpmpp_2m_preserves_multistep_history_across_inert_split() {
+        use mlx_gen::gen_core::sampling::{cfgpp_denoise, cfgpp_sampler_for, CpuLatentOps, Solver};
+
+        let req = mlx_gen::GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(7),
+            guidance: Some(7.0),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            guidance_method: Some("cfg_pp".into()),
+            ..Default::default()
+        };
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        let unsplit_plan = crate::model::compile_sdxl(&spec, &req)
+            .unwrap()
+            .expect("compiled sdxl cfg_pp plan");
+        assert_eq!(unsplit_plan.denoise_spans(), vec![0..8]);
+        let split_plan = unsplit_plan.clone().with_inert_split_at(4).unwrap();
+        assert_eq!(split_plan.denoise_spans(), vec![0..4, 4..8]);
+        assert!(split_plan.low_res_start().is_none());
+
+        let cfg = crate::DiffusionConfig::sdxl_base();
+        let alpha = AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+        let ms = mlx_gen::gen_core::sampling::DiscreteModelSampling::sdxl(&alpha);
+        let init_vals = [0.4f32, -0.25, 0.15, 0.8];
+        let init = Array::from_slice(&init_vals, &[1, 1, 1, 4]);
+
+        let run_for_plan = |plan: &gen_core::RenderPlan| -> Vec<f32> {
+            let cancel = mlx_gen::CancelFlag::default();
+            let run = gen_core::RenderRun::new(plan, &cancel, None);
+            run.encode(|| Ok::<_, Error>(())).unwrap();
+            run.begin_rendering().unwrap();
+            let mut progress = |_| {};
+            let mut transition_fn = |_phase: usize,
+                                     boundary_step: usize,
+                                     _ops: &MlxLatentOps,
+                                     _ms_dyn: &dyn gen_core::sampling::ModelSampling,
+                                     out: &Array,
+                                     state: &mut gen_core::sampling::SolverRunState<
+                MlxLatentOps,
+            >|
+             -> Result<Array> {
+                if run
+                    .plan()
+                    .low_res_start()
+                    .is_some_and(|lr| boundary_step == lr.k)
+                {
+                    state.note_renoise_transition();
+                    state.apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)?;
+                }
+                Ok(out.clone())
+            };
+            let spans = plan.denoise_spans();
+            let on_phase_boundary: Option<&mut mlx_gen::sampler::MlxPhaseTransitionFn<'_>> =
+                if spans.len() > 1 {
+                    Some(&mut transition_fn)
+                } else {
+                    None
+                };
+            let out = mlx_gen::run_cfgpp_sampler_with_phase_transition_spans(
+                mlx_gen::SamplerRun {
+                    sampler_name: Some(plan.sampler()),
+                    sigmas: plan.denoise_sigmas(),
+                    seed: plan.base_seed(),
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
+                &ms,
+                init.clone(),
+                &spans,
+                Some(&run),
+                |_, _| {},
+                |x_in, t| {
+                    x_in.eval()?;
+                    let xs = x_in.as_slice::<f32>();
+                    let tf = (t * 1e-3).sin();
+                    let guided: Vec<f32> = xs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| 0.65 * v + 0.12 * tf + (i as f32) * 0.03)
+                        .collect();
+                    let uncond: Vec<f32> = xs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| 0.35 * v - 0.07 * tf - (i as f32) * 0.02)
+                        .collect();
+                    Ok((
+                        Array::from_slice(&guided, &[1, 1, 1, 4]),
+                        Array::from_slice(&uncond, &[1, 1, 1, 4]),
+                    ))
+                },
+                on_phase_boundary,
+            )
+            .unwrap();
+            let out = run
+                .decode_phase(|| {
+                    out.eval()?;
+                    Ok::<_, Error>(out.as_slice::<f32>().to_vec())
+                })
+                .unwrap();
+            run.finish_rendering();
+            out
+        };
+
+        let unsplit_out = run_for_plan(&unsplit_plan);
+        let split_out = run_for_plan(&split_plan);
+        assert_eq!(
+            split_out, unsplit_out,
+            "inert phase split must preserve CFG++ DPM++ 2M multistep history"
+        );
+
+        // Sanity check: resetting CFG++ solver state at step 4 (as per-span `sample` did) diverges.
+        let sigmas = split_plan.denoise_sigmas();
+        let ops = CpuLatentOps;
+        let sampler = cfgpp_sampler_for::<CpuLatentOps>(Solver::Dpmpp2m).unwrap();
+        let predict_cpu = |x_in: &Vec<f32>, t: f32| -> gen_core::Result<(Vec<f32>, Vec<f32>)> {
+            let tf = (t * 1e-3).sin();
+            let guided = x_in
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| 0.65 * v + 0.12 * tf + (i as f32) * 0.03)
+                .collect();
+            let uncond = x_in
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| 0.35 * v - 0.07 * tf - (i as f32) * 0.02)
+                .collect();
+            Ok((guided, uncond))
+        };
+        let mut denoise_fn =
+            |x: &Vec<f32>, sigma: f32| cfgpp_denoise(&ops, &ms, x, sigma, predict_cpu);
+        let mid = sampler
+            .sample(&ops, &mut denoise_fn, init_vals.to_vec(), &sigmas[0..=4])
+            .unwrap();
+        let reset_out = sampler
+            .sample(&ops, &mut denoise_fn, mid, &sigmas[4..=8])
+            .unwrap();
+        assert_ne!(
+            reset_out, unsplit_out,
+            "per-span reset must differ from preserved multistep history"
         );
     }
 }

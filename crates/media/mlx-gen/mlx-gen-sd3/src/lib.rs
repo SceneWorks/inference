@@ -76,7 +76,9 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
-pub use model::{Sd3Large, MEDIUM_MODEL_ID, MODEL_ID, SIZE_MULTIPLE, TURBO_MODEL_ID};
+pub use model::{
+    compile_trajectory_for, Sd3Large, MEDIUM_MODEL_ID, MODEL_ID, SIZE_MULTIPLE, TURBO_MODEL_ID,
+};
 
 pub use config::{
     Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,
@@ -114,6 +116,10 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::LARGE_REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: |spec, req| model::compile_base(Sd3Variant::Large, spec, req),
+        })
         .register_memory_strategy(model::LARGE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -122,6 +128,10 @@ pub fn register_providers(
         })
         .register_memory_behavior(model::LARGE_MEMORY_BEHAVIOR)
         .register_generator(model::TURBO_REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: TURBO_MODEL_ID,
+            compile: |spec, req| model::compile_base(Sd3Variant::LargeTurbo, spec, req),
+        })
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -130,6 +140,10 @@ pub fn register_providers(
         })
         .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_generator(model::MEDIUM_REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: MEDIUM_MODEL_ID,
+            compile: |spec, req| model::compile_base(Sd3Variant::Medium, spec, req),
+        })
         .register_memory_strategy(model::MEDIUM_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -253,6 +267,188 @@ mod explicit_registry_tests {
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
+    #[test]
+    fn sw6946_mlx_sd3_m3_non_square_plain_img2img_low_res_start_fixture_and_pricing() {
+        use mlx_gen::gen_core::{
+            latent::SpatialCompression,
+            memory_strategy::trace_planned_low_res_scope_lifecycle,
+            sampling::{init_time_step, sd3_sigmas, FlowModelSampling, TimestepConvention},
+            transition_clean_estimate_f32, BoundaryState, CancelFlag, Conditioning, EstimateSource,
+            GenerationRequest, Image, LatentNormalization, LatentPatchLayout, LoadShape, LoadSpec,
+            LowResStartSpec, MemoryBehaviorRoute, MemoryMode, MemoryStrategy, OffloadPolicy,
+            WeightsSource, SD3_LATENT_SPACE,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        // Verify SD3_LATENT_SPACE contract: unpacked 16-ch /8, Unpacked (SIZE_MULTIPLE=16), Affine(1.5305, 0.0609).
+        assert_eq!(SD3_LATENT_SPACE.channels, 16);
+        assert_eq!(
+            SD3_LATENT_SPACE.spatial_compression,
+            SpatialCompression {
+                height: 8,
+                width: 8
+            }
+        );
+        assert_eq!(SD3_LATENT_SPACE.patch_layout, LatentPatchLayout::Unpacked);
+        assert_eq!(
+            SD3_LATENT_SPACE.normalization,
+            LatentNormalization::affine(1.5305, 0.0609)
+        );
+
+        let source_1200x700 = Image {
+            width: 1200,
+            height: 700,
+            pixels: vec![112; 1200 * 700 * 3],
+        };
+        let steps = 10_usize;
+        let strength = 0.4_f32;
+        assert_eq!(init_time_step(steps, Some(strength)), 4);
+        let full_sigmas = sd3_sigmas(steps, crate::pipeline::SCHEDULE_SHIFT);
+        assert_eq!(full_sigmas.len(), 11);
+
+        for provider_id in [
+            super::MODEL_ID,
+            super::TURBO_MODEL_ID,
+            super::MEDIUM_MODEL_ID,
+        ] {
+            let app = &all_features[provider_id]["low_res_start"];
+            assert!(
+                app.applicable,
+                "mlx {provider_id} must support low_res_start"
+            );
+
+            for via_source_image in [false, true] {
+                let mut m3_req = GenerationRequest {
+                    prompt: "a vintage locomotive crossing a stone viaduct".into(),
+                    width: 1024,
+                    height: 768,
+                    steps: Some(steps as u32),
+                    seed: Some(1234),
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                };
+                if via_source_image {
+                    m3_req.source_image = Some(source_1200x700.clone());
+                    m3_req.strength = Some(strength);
+                } else {
+                    m3_req.conditioning = vec![Conditioning::Reference {
+                        image: source_1200x700.clone(),
+                        strength: Some(strength),
+                    }];
+                }
+
+                let plan = registry
+                    .compile_render_plan(provider_id, &spec, &m3_req)
+                    .unwrap_or_else(|e| panic!("{provider_id} (source={via_source_image}): {e}"))
+                    .expect("compiled SD3.5 RenderPlan");
+
+                assert_eq!(plan.executed_steps(), 6, "{provider_id}");
+                assert_eq!(plan.denoise_spans(), vec![0..3, 3..6], "{provider_id}");
+                assert_eq!(plan.phase_output_size(0), (512, 384), "{provider_id}");
+                assert_eq!(plan.phase_output_size(1), (1024, 768), "{provider_id}");
+                assert_eq!(plan.phase_packed_tokens(0), 32 * 24, "{provider_id}");
+                assert_eq!(plan.phase_packed_tokens(1), 64 * 48, "{provider_id}");
+
+                let denoise_sigmas = plan.denoise_sigmas();
+                assert_eq!(denoise_sigmas.len(), 7, "{provider_id}");
+                assert_eq!(denoise_sigmas, &full_sigmas[4..=10], "{provider_id}");
+                assert_eq!(denoise_sigmas[0], full_sigmas[4], "{provider_id}");
+                assert_eq!(denoise_sigmas[3], full_sigmas[7], "{provider_id}");
+
+                let low_res_plan = plan.low_res_start().expect("low_res_start active");
+
+                // Verify transition_clean_estimate_f32 transitions [1, 16, 48, 64] (512x384) -> [1, 16, 96, 128] (1024x768)
+                // at full_sigmas[7] (node 7 = start_step 4 + K 3).
+                let phase0_clean = vec![0.25_f32; 16 * 48 * 64];
+                let transitioned = transition_clean_estimate_f32(
+                    BoundaryState::CleanEstimate {
+                        latent: &phase0_clean,
+                        source: EstimateSource::PreviousEvaluation,
+                    },
+                    1,
+                    16,
+                    8,
+                    low_res_plan,
+                    full_sigmas[7],
+                    &FlowModelSampling::new(TimestepConvention::Sigma),
+                    1234,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("SD3.5 phase-0 -> phase-1 clean estimate transition at node 7");
+                assert_eq!(transitioned.len(), 16 * 96 * 128);
+                assert!(transitioned.iter().all(|v| v.is_finite()));
+
+                let contract =
+                    crate::memory_strategy::weights_free_contract(provider_id, &spec).unwrap();
+                let priced = crate::memory_strategy::price_sd3_low_res_img2img_live_set_plan(
+                    &contract,
+                    low_res_plan,
+                    source_1200x700.width,
+                    source_1200x700.height,
+                    &full_sigmas,
+                    4,
+                )
+                .expect("SD3.5 initial codec live-set pricing");
+                assert_eq!(priced.raw_source_rgb8_bytes, 1200 * 700 * 3);
+                assert_eq!(priced.fitted_phase0_input_f32_bytes, 512 * 384 * 3 * 4);
+                assert_eq!(priced.retained_clean_init_latent_bytes, 16 * 48 * 64 * 4);
+                assert_eq!(
+                    priced.transition_ceiling.total_six_buffer_ceiling_bytes,
+                    3_538_944
+                );
+                assert_eq!(priced.init_sigma, full_sigmas[4]);
+                assert_eq!(priced.transition_sigma, full_sigmas[7]);
+
+                // Verify MemoryRequestScope lifecycle for the M3 img2img request across all rungs.
+                let tier = mlx_gen::request_scope::loaded_tier(&spec);
+                let ref_count = m3_req.memory_reference_count();
+                let mut ctx = mlx_gen::gen_core::standard_memory_behavior_context(
+                    &contract,
+                    MemoryStrategy::BoundedTransformerResidency,
+                    tier,
+                    MemoryBehaviorRoute {
+                        mode: if ref_count > 0 {
+                            MemoryMode::ImageToImage
+                        } else {
+                            MemoryMode::TextToImage
+                        },
+                        reference_count: ref_count,
+                        use_pid: false,
+                        has_phases: true,
+                        overlay: None,
+                    },
+                )
+                .unwrap();
+                ctx.geometry.width = 1024;
+                ctx.geometry.height = 768;
+                let mut scope =
+                    crate::memory_strategy::registered_begin_request(&spec, &contract, &ctx)
+                        .unwrap()
+                        .expect("SD3.5 optimized request scope");
+                let events = trace_planned_low_res_scope_lifecycle(
+                    &plan,
+                    &CancelFlag::new(),
+                    scope.as_mut(),
+                    Some(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
+                    Some((0, crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)),
+                    Some((
+                        crate::memory_strategy::DECODE_TILE_EDGE,
+                        crate::memory_strategy::DECODE_OVERLAP,
+                    )),
+                )
+                .expect("SD3.5 img2img low_res_start scope lifecycle");
+                assert!(!events.is_empty());
+            }
+        }
     }
 }
 

@@ -27,8 +27,8 @@
 //! the real sampler.
 
 pub use candle_gen_flux::preview::{
-    hook, project_packed_tokens, project_raw_latents, token_grid, PACKED_LATENT_CHANNELS,
-    PREVIEW_LATENT_CHANNELS,
+    hook, hook_for_plan, project_packed_tokens, project_raw_latents, token_grid,
+    PACKED_LATENT_CHANNELS, PREVIEW_LATENT_CHANNELS,
 };
 
 #[cfg(test)]

@@ -350,6 +350,7 @@ pub(crate) enum StagedCondition {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_encode_base(
     text: &StagedText,
     encoder: Option<&Encoder>,
@@ -358,47 +359,56 @@ pub(crate) fn stage_encode_base(
     default_steps: usize,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<StagedCondition> {
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_ID)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
     let start_step = reference
         .map(|(_, strength)| init_time_step(steps, Some(strength)))
         .unwrap_or(0);
+    let (encode_w, encode_h) =
+        run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
     let clean = match (reference, start_step) {
         (Some((image, _)), start) if start > 0 => Some(encode_reference(
             encoder.ok_or_else(|| {
                 CandleError::Msg("boogu: active reference omitted the staged VAE encoder".into())
             })?,
             image,
-            req.width,
-            req.height,
+            encode_w,
+            encode_h,
             device,
         )?),
         _ => None,
     };
     let guidance = resolved_guidance(req.guidance, false);
-    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-        on_progress,
-        || -> std::result::Result<_, candle_gen::CandleError> {
-            let cond = text
-                .te
-                .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
-            let uncond = if guidance != 1.0 {
-                let negative = preflight.negative.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "boogu base: CFG-negative conditioning was not admitted".into(),
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let cond = text
+                    .te
+                    .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
+                let uncond = if guidance != 1.0 {
+                    let negative = preflight.negative.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "boogu base: CFG-negative conditioning was not admitted".into(),
+                        )
+                    })?;
+                    Some(
+                        text.te
+                            .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
                     )
-                })?;
-                Some(
-                    text.te
-                        .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
-                )
-            } else {
-                None
-            };
-            Ok((cond, uncond))
-        },
-    )?;
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+        )
+    };
+    let (cond, uncond) = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     Ok(StagedCondition::Base {
         cond,
         uncond,
@@ -456,6 +466,7 @@ pub(crate) fn stage_encode_turbo(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_encode_edit(
     text: &StagedText,
     edit: &EditComponents,
@@ -464,34 +475,41 @@ pub(crate) fn stage_encode_edit(
     preflight: &EditPreflight,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<StagedCondition> {
     validate_edit_reference_dims(references)?;
     let ref_latents = references
         .iter()
         .map(|reference| vae_encode(&edit.vae_encoder, reference, device))
         .collect::<Result<Vec<_>>>()?;
-    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-        on_progress,
-        || -> std::result::Result<_, candle_gen::CandleError> {
-            let cond = encode_image_instruction_parts(
-                &text.tok, &text.te, edit, references, preflight, device,
-            )?;
-            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) != 1.0 {
-                let negative = preflight.negative.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "boogu edit: CFG-negative conditioning was not admitted".into(),
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let cond = encode_image_instruction_parts(
+                    &text.tok, &text.te, edit, references, preflight, device,
+                )?;
+                let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) != 1.0 {
+                    let negative = preflight.negative.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "boogu edit: CFG-negative conditioning was not admitted".into(),
+                        )
+                    })?;
+                    Some(
+                        text.te
+                            .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
                     )
-                })?;
-                Some(
-                    text.te
-                        .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
-                )
-            } else {
-                None
-            };
-            Ok((cond, uncond))
-        },
-    )?;
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+        )
+    };
+    let (cond, uncond) = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     Ok(StagedCondition::Edit {
         cond,
         uncond,
@@ -505,6 +523,7 @@ pub(crate) fn stage_denoise_base(
     encoded: StagedCondition,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Tensor>> {
     let StagedCondition::Base {
         cond,
@@ -519,7 +538,10 @@ pub(crate) fn stage_denoise_base(
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -530,32 +552,66 @@ pub(crate) fn stage_denoise_base(
     )?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let run_sigmas = &sigmas[start..];
+    let start_sigma = run
+        .and_then(|r| r.plan().denoise_sigmas().first().copied())
+        .unwrap_or(sigmas[start]);
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    if let Some(run) = run {
+        run.begin_rendering()
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+    }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let noise = init_noise(req.height, req.width, seed, 0, device)?;
-        let x_t = blend_reference(clean.as_ref(), noise, sigmas[start])?;
+        let noise = init_noise(init_h, init_w, seed, 0, device)?;
+        let x_t = blend_reference(clean.as_ref(), noise, start_sigma)?;
         let preview_hook = crate::preview::hook(&req.preview);
-        candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
-            run_sigmas,
-            x_t,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview_hook),
-            |x, timestep| {
-                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond_v = heavy.dit.forward(x, &t, &cond)?;
-                let pred = match &uncond {
-                    Some(uncond) => {
-                        let uncond_v = heavy.dit.forward(x, &t, uncond)?;
-                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
-                    }
-                    None => cond_v,
-                };
-                Ok(pred.to_dtype(DType::F32)?.neg()?)
-            },
-        )
+        let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+            let cond_v = heavy.dit.forward(x, &t, &cond)?;
+            let pred = match &uncond {
+                Some(uncond) => {
+                    let uncond_v = heavy.dit.forward(x, &t, uncond)?;
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
+                }
+                None => cond_v,
+            };
+            Ok(pred.to_dtype(DType::F32)?.neg()?)
+        };
+        match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let lat = candle_gen::run_flow_sampler_with_phase_transition_spans(
+                    Some(run.plan().sampler()),
+                    TimestepConvention::OneMinusSigma,
+                    run.plan().denoise_sigmas(),
+                    &spans,
+                    Some(run),
+                    false,
+                    x_t,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview_hook),
+                    predict,
+                    None,
+                )?;
+                run.finish_image_denoise_phases()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                Ok(lat)
+            }
+            None => candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                run_sigmas,
+                x_t,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview_hook),
+                predict,
+            ),
+        }
     })
 }
 
@@ -721,6 +777,7 @@ pub(crate) fn stage_denoise_edit(
     encoded: StagedCondition,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Tensor>> {
     let StagedCondition::Edit {
         cond,
@@ -734,7 +791,10 @@ pub(crate) fn stage_denoise_edit(
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -743,31 +803,62 @@ pub(crate) fn stage_denoise_edit(
         steps,
         &native,
     )?;
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    if let Some(run) = run {
+        run.begin_rendering()
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+    }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let noise = init_noise(init_h, init_w, seed, 0, device)?;
         let preview_hook = crate::preview::hook(&req.preview);
-        candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
-            &sigmas,
-            noise,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview_hook),
-            |x, timestep| {
-                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond_v = heavy.dit.forward_edit(x, &ref_latents, &t, &cond)?;
-                let pred = match &uncond {
-                    Some(uncond) => {
-                        let uncond_v = heavy.dit.forward_edit(x, &ref_latents, &t, uncond)?;
-                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
-                    }
-                    None => cond_v,
-                };
-                Ok(pred.to_dtype(DType::F32)?.neg()?)
-            },
-        )
+        let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+            let cond_v = heavy.dit.forward_edit(x, &ref_latents, &t, &cond)?;
+            let pred = match &uncond {
+                Some(uncond) => {
+                    let uncond_v = heavy.dit.forward_edit(x, &ref_latents, &t, uncond)?;
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
+                }
+                None => cond_v,
+            };
+            Ok(pred.to_dtype(DType::F32)?.neg()?)
+        };
+        match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let lat = candle_gen::run_flow_sampler_with_phase_transition_spans(
+                    Some(run.plan().sampler()),
+                    TimestepConvention::OneMinusSigma,
+                    run.plan().denoise_sigmas(),
+                    &spans,
+                    Some(run),
+                    false,
+                    noise,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview_hook),
+                    predict,
+                    None,
+                )?;
+                run.finish_image_denoise_phases()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                Ok(lat)
+            }
+            None => candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                noise,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview_hook),
+                predict,
+            ),
+        }
     })
 }
 
@@ -777,25 +868,40 @@ pub(crate) fn stage_decode(
     provider: &str,
     latents: Vec<Tensor>,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Image>> {
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let pid = candle_gen_pid::resolve_pid_decoder(
         decode_components.pid.as_deref(),
         req,
-        req.seed.unwrap_or_else(gen_core::default_seed),
+        base_seed,
         provider,
     )?;
-    if req.seed.is_none() && pid.is_some() {
+    if req.seed.is_none() && run.is_none() && pid.is_some() {
         candle_gen::execution::non_deterministic("Boogu staged PiD resolves an independent default seed; one request seed cannot reproduce both initial and decoder streams");
     }
-    latents
-        .into_iter()
-        .enumerate()
-        .map(|(output_index, latent)| {
-            candle_gen::execution::output_index(output_index);
-            on_progress(Progress::Decoding);
-            decode(&decode_components.vae, pid.as_ref(), &latent)
-        })
-        .collect()
+    let decode_all = || -> Result<Vec<Image>> {
+        latents
+            .into_iter()
+            .enumerate()
+            .map(|(output_index, latent)| {
+                candle_gen::execution::output_index(output_index);
+                on_progress(Progress::Decoding);
+                decode(&decode_components.vae, pid.as_ref(), &latent)
+            })
+            .collect()
+    };
+    let images = match run {
+        Some(run) => run.decode_phase(decode_all)?,
+        None => decode_all()?,
+    };
+    if let Some(run) = run {
+        run.finish_rendering();
+    }
+    Ok(images)
 }
 
 /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot's `vae/` dir at the VAE dtype.
@@ -812,6 +918,7 @@ fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 /// output stays closer to the reference (the fork's [`init_time_step`] convention). `start_step == 0`
 /// (`clean` is `None`) is pure txt2img — byte-identical to the pre-sc-11786 path. Mirrors
 /// `mlx-gen-boogu`'s `generate_base_img2img_with_progress` (sc-10191).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_base(
     comps: &Components,
     req: &GenerationRequest,
@@ -820,36 +927,46 @@ pub(crate) fn render_base(
     start_step: usize,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
-    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-        on_progress,
-        || -> std::result::Result<_, candle_gen::CandleError> {
-            let cond = comps
-                .te
-                .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
-            let do_cfg = guidance != 1.0;
-            let uncond = if do_cfg {
-                let negative = preflight.negative.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "boogu base: CFG-negative conditioning was not admitted".into(),
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let cond = comps
+                    .te
+                    .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
+                let do_cfg = guidance != 1.0;
+                let uncond = if do_cfg {
+                    let negative = preflight.negative.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "boogu base: CFG-negative conditioning was not admitted".into(),
+                        )
+                    })?;
+                    Some(
+                        comps
+                            .te
+                            .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
                     )
-                })?;
-                Some(
-                    comps
-                        .te
-                        .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
-                )
-            } else {
-                None
-            };
-            Ok((cond, uncond))
-        },
-    )?;
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+        )
+    };
+    let (cond, uncond) = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -875,37 +992,78 @@ pub(crate) fn render_base(
     // full schedule from pure noise — byte-identical to the pre-sc-11786 path.
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let run_sigmas = &sigmas[start..];
+    let start_sigma = run
+        .and_then(|r| r.plan().denoise_sigmas().first().copied())
+        .unwrap_or(sigmas[start]);
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    if let Some(run) = run {
+        run.begin_rendering()
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+    }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
 
-    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let noise = init_noise(req.height, req.width, seed, 0, device)?;
-        let x_t = blend_reference(clean, noise, sigmas[start])?;
+    let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(init_h, init_w, seed, 0, device)?;
+        let x_t = blend_reference(clean, noise, start_sigma)?;
         let preview_hook = crate::preview::hook(&req.preview);
-        let lat = candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
-            run_sigmas,
-            x_t,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview_hook),
-            |x, timestep| -> Result<Tensor> {
-                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond_v = comps.dit.forward(x, &t, &cond)?;
-                let pred = match &uncond {
-                    Some(u_hidden) => {
-                        let uncond_v = comps.dit.forward(x, &t, u_hidden)?;
-                        // pred = cond + (scale − 1)·(cond − uncond)
-                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
-                    }
-                    None => cond_v,
-                };
-                Ok(pred.to_dtype(DType::F32)?.neg()?)
-            },
-        )?;
+        let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+            let cond_v = comps.dit.forward(x, &t, &cond)?;
+            let pred = match &uncond {
+                Some(u_hidden) => {
+                    let uncond_v = comps.dit.forward(x, &t, u_hidden)?;
+                    // pred = cond + (scale − 1)·(cond − uncond)
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
+                }
+                None => cond_v,
+            };
+            Ok(pred.to_dtype(DType::F32)?.neg()?)
+        };
+        let lat = match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let out = candle_gen::run_flow_sampler_with_phase_transition_spans(
+                    Some(run.plan().sampler()),
+                    TimestepConvention::OneMinusSigma,
+                    run.plan().denoise_sigmas(),
+                    &spans,
+                    Some(run),
+                    false,
+                    x_t,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview_hook),
+                    predict,
+                    None,
+                )?;
+                run.finish_image_denoise_phases()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                out
+            }
+            None => candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                run_sigmas,
+                x_t,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview_hook),
+                predict,
+            )?,
+        };
         on_progress(Progress::Decoding);
-        decode(&comps.vae, pid_decoder.as_ref(), &lat)
-    })
+        match run {
+            Some(run) => run.decode_phase(|| decode(&comps.vae, pid_decoder.as_ref(), &lat)),
+            None => decode(&comps.vae, pid_decoder.as_ref(), &lat),
+        }
+    })?;
+    if let Some(run) = run {
+        run.finish_rendering();
+    }
+    Ok(images)
 }
 
 /// img2img latent-init blend: `x_t = (1 − σ_start)·clean + σ_start·noise` when a reference `clean`
@@ -1119,6 +1277,7 @@ pub(crate) fn load_vae_encoder(root: &Path, device: &Device) -> Result<Encoder> 
 /// instruction drives the edit). Same static-v1 scheduler / true-CFG as the Base path. The CFG-negative
 /// is the text-only empty/drop instruction (`use_input_images_4_neg_instruct = false`, the reference
 /// default). `references` must be non-empty (the caller validates 1..=5).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_edit(
     comps: &Components,
     edit: &EditComponents,
@@ -1127,6 +1286,7 @@ pub(crate) fn render_edit(
     preflight: &EditPreflight,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Image>> {
     // Each reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
     // an /8 latent ⇒ multiple of 16), matching the mlx twin's
@@ -1134,7 +1294,10 @@ pub(crate) fn render_edit(
     validate_edit_reference_dims(references)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
 
     // Each reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
     let ref_latents: Vec<Tensor> = references
@@ -1145,28 +1308,34 @@ pub(crate) fn render_edit(
     // Condition encoding (seed-independent): image-conditioned edit instruction (the MLLM sees every
     // reference) + text-only CFG-negative (empty/drop instruction). Both DiT passes carry the same
     // reference latents.
-    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-        on_progress,
-        || -> std::result::Result<_, candle_gen::CandleError> {
-            let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
-            let do_cfg = guidance != 1.0;
-            let uncond = if do_cfg {
-                let negative = preflight.negative.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "boogu edit: CFG-negative conditioning was not admitted".into(),
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
+                let do_cfg = guidance != 1.0;
+                let uncond = if do_cfg {
+                    let negative = preflight.negative.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "boogu edit: CFG-negative conditioning was not admitted".into(),
+                        )
+                    })?;
+                    Some(
+                        comps
+                            .te
+                            .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
                     )
-                })?;
-                Some(
-                    comps
-                        .te
-                        .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
-                )
-            } else {
-                None
-            };
-            Ok((cond, uncond))
-        },
-    )?;
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+        )
+    };
+    let (cond, uncond) = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -1186,35 +1355,74 @@ pub(crate) fn render_edit(
         crate::BOOGU_IMAGE_EDIT_ID,
     )?;
 
-    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    if let Some(run) = run {
+        run.begin_rendering()
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+    }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
+
+    let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(init_h, init_w, seed, 0, device)?;
         let preview_hook = crate::preview::hook(&req.preview);
-        let lat = candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
-            &sigmas,
-            noise,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview_hook),
-            |x, timestep| -> Result<Tensor> {
-                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
-                let pred = match &uncond {
-                    Some(u_hidden) => {
-                        let uncond_v = comps.dit.forward_edit(x, &ref_latents, &t, u_hidden)?;
-                        // pred = cond + (scale − 1)·(cond − uncond)
-                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
-                    }
-                    None => cond_v,
-                };
-                Ok(pred.to_dtype(DType::F32)?.neg()?)
-            },
-        )?;
+        let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+            let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
+            let pred = match &uncond {
+                Some(u_hidden) => {
+                    let uncond_v = comps.dit.forward_edit(x, &ref_latents, &t, u_hidden)?;
+                    // pred = cond + (scale − 1)·(cond − uncond)
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
+                }
+                None => cond_v,
+            };
+            Ok(pred.to_dtype(DType::F32)?.neg()?)
+        };
+        let lat = match run {
+            Some(run) => {
+                run.reset_image_denoise_phases();
+                let spans = run.plan().denoise_spans();
+                let out = candle_gen::run_flow_sampler_with_phase_transition_spans(
+                    Some(run.plan().sampler()),
+                    TimestepConvention::OneMinusSigma,
+                    run.plan().denoise_sigmas(),
+                    &spans,
+                    Some(run),
+                    false,
+                    noise,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview_hook),
+                    predict,
+                    None,
+                )?;
+                run.finish_image_denoise_phases()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?;
+                out
+            }
+            None => candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                noise,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview_hook),
+                predict,
+            )?,
+        };
         on_progress(Progress::Decoding);
-        decode(&comps.vae, pid_decoder.as_ref(), &lat)
-    })
+        match run {
+            Some(run) => run.decode_phase(|| decode(&comps.vae, pid_decoder.as_ref(), &lat)),
+            None => decode(&comps.vae, pid_decoder.as_ref(), &lat),
+        }
+    })?;
+    if let Some(run) = run {
+        run.finish_rendering();
+    }
+    Ok(images)
 }
 
 fn validate_edit_reference_dims(references: &[&Image]) -> Result<()> {
@@ -1332,13 +1540,7 @@ fn encode_mean_latent(encoder: &Encoder, pixels: &Tensor) -> Result<Tensor> {
 /// (candle) Boogu lanes. `floor` because Python `int(steps · strength)` truncates toward zero. Pure
 /// function so the cross-backend-parity law is unit-testable without a GPU.
 pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// The single img2img reference for the Base/Turbo t2i path (sc-11786): at most one
@@ -1515,70 +1717,37 @@ const MAX_SHIFT: f64 = 1.15;
 
 /// The Base/Edit static-shift `mu` (`lin_mu(4096) = 1.15`), fed to the epic-7114 scheduler axis so a
 /// curated schedule re-shapes σ over the SAME shift the native schedule uses.
-fn base_shift_mu() -> f32 {
+pub(crate) fn base_shift_mu() -> f32 {
     lin_mu(SEQ_LEN) as f32
 }
 
-/// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
-/// `OneMinusSigma` view of the v1 shifted clean-fraction timesteps (`σ_i = 1 − ts_i`).
-fn base_native_sigmas(steps: usize) -> Vec<f32> {
-    build_timesteps_v1(steps)
-        .iter()
-        .map(|&t| 1.0 - t as f32)
-        .collect()
+pub(crate) fn base_native_sigmas(steps: usize) -> Vec<f32> {
+    candle_gen::gen_core::sampling::boogu_base_sigmas(steps)
 }
 
-/// Build the static-v1 shifted timestep schedule plus the trailing `1.0` (length `steps + 1`).
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_timesteps_v1(steps: usize) -> Vec<f64> {
-    let mu = lin_mu(SEQ_LEN);
-    let mut ts: Vec<f64> = (0..steps)
-        .map(|i| time_shift_v1(i as f64 / steps as f64, mu))
-        .collect();
-    ts.push(1.0);
-    ts
+    candle_gen::gen_core::sampling::boogu_timesteps_v1(steps)
 }
 
-/// Reference `_get_lin_function(x1=256,y1=base_shift,x2=4096,y2=max_shift)(seq_len)` → `mu`.
 fn lin_mu(seq_len: f64) -> f64 {
-    let (x1, y1, x2, y2) = (256.0, BASE_SHIFT, 4096.0, MAX_SHIFT);
-    let m = (y2 - y1) / (x2 - x1);
-    let b = y1 - m * x1;
-    m * seq_len + b
+    let _ = (BASE_SHIFT, MAX_SHIFT);
+    candle_gen::gen_core::sampling::boogu_lin_mu(seq_len)
 }
 
-/// Reference `_time_shift_v1(t, mu, sigma=1.0)`: `t1 = 1 − t` (clipped); `y = e^mu / (e^mu + (1/t1 − 1))`;
-/// return `1 − y`.
+#[cfg(test)]
+#[allow(dead_code)]
 fn time_shift_v1(t: f64, mu: f64) -> f64 {
-    let eps = 1e-8;
-    let t1 = (1.0 - t).clamp(eps, 1.0 - eps);
-    let num = mu.exp();
-    let denom = num + (1.0 / t1 - 1.0);
-    1.0 - num / denom
+    candle_gen::gen_core::sampling::time_shift_v1(t, mu)
 }
 
-/// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending
-/// **clean-fraction** sigmas from `conditioning_sigma` toward (but excluding) `1.0`.
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let span = 1.0 - conditioning_sigma;
-    (0..steps)
-        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
-        .collect()
+    candle_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
 
-/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
-/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
-/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
-/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
-/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
-/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
-/// Verbatim mirror of `mlx-gen-boogu`'s `turbo_native_sigmas`.
 fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
-        .iter()
-        .map(|&c| 1.0 - c)
-        .collect();
-    s.push(0.0);
-    s
+    candle_gen::gen_core::sampling::boogu_turbo_sigmas(conditioning_sigma, steps)
 }
 
 /// Whether a Turbo request selects the curated unified-sampler framework. An unset sampler and

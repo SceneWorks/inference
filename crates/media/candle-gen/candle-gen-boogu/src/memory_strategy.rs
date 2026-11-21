@@ -932,7 +932,7 @@ impl RequestBinding {
                 height: request.height,
                 batch: request.count,
                 frames: request.frames.unwrap_or(1),
-                reference_count: request.image_reference_count(),
+                reference_count: request.memory_reference_count(),
             },
             memory: request.memory,
             use_pid: request.use_pid,
@@ -1143,7 +1143,7 @@ pub(crate) fn validate_generation_request(
     request: &GenerationRequest,
 ) -> gen_core::Result<()> {
     let route = Route::for_provider(provider)?;
-    let refs = request.image_reference_count();
+    let refs = request.memory_reference_count();
     let expected_mode = match route {
         Route::Base | Route::Turbo if refs == 0 => "t2i",
         Route::Base | Route::Turbo if refs == 1 => "i2i",
@@ -1232,7 +1232,7 @@ impl MemoryRequestScope for BooguRequestScope {
                 self.provider
             )));
         }
-        let references = request.image_reference_count();
+        let references = request.memory_reference_count();
         match (Route::for_provider(self.provider)?, &self.mode) {
             (Route::Base | Route::Turbo, MemoryMode::TextToImage)
                 if references == 0 && self.overlay.is_none() =>

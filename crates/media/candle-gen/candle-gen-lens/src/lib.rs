@@ -176,6 +176,7 @@ struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    loaded_spec: Option<LoadSpec>,
 }
 
 impl Pipeline {
@@ -192,7 +193,13 @@ impl Pipeline {
             adapters,
             quant,
             pid_spec,
+            loaded_spec: None,
         }
+    }
+
+    fn with_load_spec(mut self, spec: LoadSpec) -> Self {
+        self.loaded_spec = Some(spec);
+        self
     }
 
     /// The sorted `.safetensors` files of a snapshot sub-dir (errors if the dir or its weights are
@@ -547,34 +554,34 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         comps: &HeavyComponents,
         features: &[Tensor],
         mask: &Tensor,
         init_latents: &Tensor,
         latent_h: usize,
         latent_w: usize,
-        num_steps: usize,
+        sigmas: &[f32],
+        spans: &[std::ops::Range<usize>],
         guidance: f32,
         guided: bool,
         sampler: Option<&str>,
-        scheduler: Option<&str>,
-        scheduler_shift: Option<f32>,
         seed: u64,
         cancel: &gen_core::CancelFlag,
         memory: gen_core::GenerationMemory,
         preview: Option<&candle_gen::preview::PreviewHook<'_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
-        let mu = lens_mu(num_steps, latent_h, latent_w);
-        let native = lens_sigmas(num_steps, latent_h, latent_w);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            scheduler,
-            scheduler_shift,
-            mu,
-            num_steps,
-            &native,
-        )
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let (phase0_latent_h, phase0_latent_w) = match run {
+            Some(run) => {
+                let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+                (
+                    (phase0_h / VAE_SCALE_FACTOR) as usize,
+                    (phase0_w / VAE_SCALE_FACTOR) as usize,
+                )
+            }
+            None => (latent_h, latent_w),
+        };
         let init = init_latents.to_dtype(DIT_DTYPE)?;
         let attention_budget = if memory.chunk_attention {
             let size = memory.attention_chunk_size.ok_or_else(|| {
@@ -593,13 +600,6 @@ impl Pipeline {
         );
         let attention_plan = gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
             .with_cancel(cancel);
-        // sc-17719 — an all-valid mask makes `build_joint_mask` an all-zero additive term that is then
-        // broadcast onto the FULL score matrix `[B, heads, q, k]` in every block, every step. At 2048²
-        // that matrix is ~16.4k × 16.4k per head, so adding a known zero to it is the largest piece of
-        // pure waste in the denoise. `forward` documents `text_valid: None` as the skip path. After
-        // sc-8993's CFG-off gate the all-valid case is the common one (a single unpadded prompt, or a
-        // cond-only encode); zeros appear only when the two prompts differ in length and the shorter
-        // one is padded. Resolved once here — one host sync per render, never per step.
         let text_valid = if mask.min_all()?.to_scalar::<f32>()? == 1.0 {
             None
         } else {
@@ -616,42 +616,48 @@ impl Pipeline {
             "lens/lib/transformer_window",
             format!("{transformer_window:?}").into(),
         );
-        candle_gen::run_flow_sampler(
+        candle_gen::run_flow_sampler_spans(
             sampler,
             TimestepConvention::Sigma,
-            &sigmas,
+            sigmas,
+            spans,
+            run,
+            false,
             init,
             seed,
             cancel,
             on_progress,
             preview,
             |latents, sigma| -> CResult<Tensor> {
+                let seq = latents.dim(1)?;
+                let (step_h, step_w) = if seq == latent_h * latent_w {
+                    (latent_h, latent_w)
+                } else {
+                    (phase0_latent_h, phase0_latent_w)
+                };
                 if !guided {
-                    // Guidance disabled: cfg_rescale(cond, ·, 1.0) == cond, so run a single
-                    // cond-only (batch-1) forward and skip the wasted uncond half (sc-8993).
                     return comps.transformer.forward_with_memory(
                         latents,
                         features,
                         text_valid,
                         sigma,
                         1,
-                        latent_h,
-                        latent_w,
+                        step_h,
+                        step_w,
                         attention_plan,
                         transformer_window,
                         cancel,
                     );
                 }
-                // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
-                let hidden = Tensor::cat(&[latents, latents], 0)?; // [2, seq, 128]
+                let hidden = Tensor::cat(&[latents, latents], 0)?;
                 let noise = comps.transformer.forward_with_memory(
                     &hidden,
                     features,
                     text_valid,
                     sigma,
                     1,
-                    latent_h,
-                    latent_w,
+                    step_h,
+                    step_w,
                     attention_plan,
                     transformer_window,
                     cancel,
@@ -663,42 +669,46 @@ impl Pipeline {
         )
     }
 
-    fn render(
+    fn render_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         comps: &Components,
         defaults: Defaults,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(defaults.steps as usize);
-        let guidance = req.guidance.unwrap_or(defaults.guidance);
+        let guidance = run.plan().guidance();
         candle_gen::execution::policy("lens/lib/guidance", format!("{guidance:?}").into());
         // Standard CFG with the Lens `cfg_rescale`: at guidance == 1.0 the combine reduces exactly to
         // cond, so guidance is effectively off — skip the uncond encode/forward entirely (sc-8993).
         let guided = guidance != 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.plan().base_seed();
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let init_latent_h = (phase0_h / VAE_SCALE_FACTOR) as usize;
+        let init_latent_w = (phase0_w / VAE_SCALE_FACTOR) as usize;
+        let sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
 
-        let (features, mask) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let (features, mask) = self.encode_prompt(
-                    &comps.text,
-                    &req.prompt,
-                    negative,
-                    DEFAULT_DATE,
-                    guided,
-                    None,
-                    &req.cancel,
-                )?;
-                Ok((features, mask))
-            },
-        )?;
+        let (features, mask) = run.encode(|| -> CResult<_> {
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (features, mask) = self.encode_prompt(
+                        &comps.text,
+                        &req.prompt,
+                        negative,
+                        DEFAULT_DATE,
+                        guided,
+                        None,
+                        &req.cancel,
+                    )?;
+                    Ok((features, mask))
+                },
+            )
+        })?;
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
         // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
@@ -711,70 +721,72 @@ impl Pipeline {
 
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("lens/lib/memory", format!("{memory:?}").into());
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let init = create_noise(seed, latent_h, latent_w, &self.device)?;
-            // Per-step latent preview (epic 16948, sc-16955), bound to the same `(latent_h, latent_w)`
-            // the decode tail below builds its packed grid from. Built per image so each seed's
-            // trajectory starts at frame 1.
-            let preview = preview::hook(&req.preview, &comps.heavy.vae, latent_h, latent_w);
-            let latents = self.denoise(
-                &comps.heavy,
-                &features,
-                &mask,
-                &init,
-                latent_h,
-                latent_w,
-                steps,
-                guidance,
-                guided,
-                req.sampler.as_deref(),
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                seed,
-                &req.cancel,
-                memory,
-                Some(&preview),
-                on_progress,
-            )?;
-            on_progress(Progress::Decoding);
-            // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. PiD
-            // consumes the packed BN-normalized `[1,128,h,w]` latent directly — the *same* packed grid
-            // `vae::decode` builds from the DiT output `[1, seq, 128]` (reshape → permute → contiguous),
-            // then BN-de-normalizes; here PiD gets that grid before de-normalization. Returns `[1,3,4H,4W]`.
-            let decoded = match &pid_decoder {
-                Some(pid) => {
-                    candle_gen::ensure_decoder_layout(
-                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-                        pid,
-                    )?;
-                    let (b, _seq, c) = latents.dims3()?;
-                    let packed = latents
-                        .reshape((b, latent_h, latent_w, c))?
-                        .permute((0, 3, 1, 2))?
-                        .contiguous()?;
-                    let decoded = pid.decode(&packed)?;
-                    candle_gen::execution::component_runtime(
-                        "lens/pid_decoder",
-                        decoded.device(),
-                        decoded.dtype(),
-                    );
-                    decoded
-                }
-                None => vae::decode_with_tiling(
-                    &comps.heavy.vae,
-                    &latents,
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| {
+                create_noise(seed, init_latent_h, init_latent_w, &self.device)
+                    .map_err(CandleError::from)
+            },
+            |seed, init, on_progress| {
+                let preview = preview::hook_for_plan(&req.preview, &comps.heavy.vae, run.plan());
+                self.denoise(
+                    Some(run),
+                    &comps.heavy,
+                    &features,
+                    &mask,
+                    &init,
                     latent_h,
                     latent_w,
-                    decode_tile(memory, defaults.id)?,
-                )?,
-            };
-            to_image(&decoded)
-        })
+                    sigmas,
+                    &spans,
+                    guidance,
+                    guided,
+                    req.sampler.as_deref(),
+                    seed,
+                    &req.cancel,
+                    memory,
+                    Some(&preview),
+                    on_progress,
+                )
+            },
+            |_seed, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let decoded = match &pid_decoder {
+                    Some(pid) => {
+                        candle_gen::ensure_decoder_layout(
+                            Some(&candle_gen::gen_core::LENS_LATENT_SPACE),
+                            pid,
+                        )?;
+                        let (b, _seq, c) = latents.dims3()?;
+                        let packed = latents
+                            .reshape((b, latent_h, latent_w, c))?
+                            .permute((0, 3, 1, 2))?
+                            .contiguous()?;
+                        let decoded = pid.decode(&packed)?;
+                        candle_gen::execution::component_runtime(
+                            "lens/pid_decoder",
+                            decoded.device(),
+                            decoded.dtype(),
+                        );
+                        decoded
+                    }
+                    None => vae::decode_with_tiling(
+                        &comps.heavy.vae,
+                        &latents,
+                        latent_h,
+                        latent_w,
+                        decode_tile(memory, defaults.id)?,
+                    )?,
+                };
+                to_image(&decoded)
+            },
+        )
     }
 
-    fn render_sequential(
+    fn render_sequential_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         defaults: Defaults,
         stream_text: bool,
         on_progress: &mut dyn FnMut(Progress),
@@ -787,18 +799,20 @@ impl Pipeline {
             None
         };
 
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(defaults.steps as usize);
-        let guidance = req.guidance.unwrap_or(defaults.guidance);
+        let guidance = run.plan().guidance();
         candle_gen::execution::policy("lens/lib/guidance", format!("{guidance:?}").into());
         let guided = guidance != 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.plan().base_seed();
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let init_latent_h = (phase0_h / VAE_SCALE_FACTOR) as usize;
+        let init_latent_w = (phase0_w / VAE_SCALE_FACTOR) as usize;
+        let sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
 
+        run.begin_conditioning().map_err(CandleError::from)?;
         let text = if stream_text {
             self.load_streamable_text_components(&req.cancel)?
         } else {
@@ -821,6 +835,7 @@ impl Pipeline {
         )?;
         drop(text);
         self.device.synchronize()?;
+        run.end_conditioning().map_err(CandleError::from)?;
 
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("lens/lib/memory", format!("{memory:?}").into());
@@ -828,60 +843,66 @@ impl Pipeline {
         let heavy = self.load_heavy_components(stream_transformer_blocks, &req.cancel)?;
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, defaults.id)?;
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let init = create_noise(seed, latent_h, latent_w, &self.device)?;
-            // Per-step latent preview (epic 16948, sc-16955) — the sequential-residency twin of the
-            // resident lane's hook, bound to the same grid this lane decodes against.
-            let preview = preview::hook(&req.preview, &heavy.vae, latent_h, latent_w);
-            let latents = self.denoise(
-                &heavy,
-                &features,
-                &mask,
-                &init,
-                latent_h,
-                latent_w,
-                steps,
-                guidance,
-                guided,
-                req.sampler.as_deref(),
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                seed,
-                &req.cancel,
-                memory,
-                Some(&preview),
-                on_progress,
-            )?;
-            on_progress(Progress::Decoding);
-            let decoded = match &pid_decoder {
-                Some(pid) => {
-                    candle_gen::ensure_decoder_layout(
-                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-                        pid,
-                    )?;
-                    let (b, _seq, c) = latents.dims3()?;
-                    let packed = latents
-                        .reshape((b, latent_h, latent_w, c))?
-                        .permute((0, 3, 1, 2))?
-                        .contiguous()?;
-                    let decoded = pid.decode(&packed)?;
-                    candle_gen::execution::component_runtime(
-                        "lens/pid_decoder",
-                        decoded.device(),
-                        decoded.dtype(),
-                    );
-                    decoded
-                }
-                None => vae::decode_with_tiling(
-                    &heavy.vae,
-                    &latents,
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| {
+                create_noise(seed, init_latent_h, init_latent_w, &self.device)
+                    .map_err(CandleError::from)
+            },
+            |seed, init, on_progress| {
+                let preview = preview::hook_for_plan(&req.preview, &heavy.vae, run.plan());
+                self.denoise(
+                    Some(run),
+                    &heavy,
+                    &features,
+                    &mask,
+                    &init,
                     latent_h,
                     latent_w,
-                    decode_tile(memory, defaults.id)?,
-                )?,
-            };
-            to_image(&decoded)
-        })
+                    sigmas,
+                    &spans,
+                    guidance,
+                    guided,
+                    req.sampler.as_deref(),
+                    seed,
+                    &req.cancel,
+                    memory,
+                    Some(&preview),
+                    on_progress,
+                )
+            },
+            |_seed, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let decoded = match &pid_decoder {
+                    Some(pid) => {
+                        candle_gen::ensure_decoder_layout(
+                            Some(&candle_gen::gen_core::LENS_LATENT_SPACE),
+                            pid,
+                        )?;
+                        let (b, _seq, c) = latents.dims3()?;
+                        let packed = latents
+                            .reshape((b, latent_h, latent_w, c))?
+                            .permute((0, 3, 1, 2))?
+                            .contiguous()?;
+                        let decoded = pid.decode(&packed)?;
+                        candle_gen::execution::component_runtime(
+                            "lens/pid_decoder",
+                            decoded.device(),
+                            decoded.dtype(),
+                        );
+                        decoded
+                    }
+                    None => vae::decode_with_tiling(
+                        &heavy.vae,
+                        &latents,
+                        latent_h,
+                        latent_w,
+                        decode_tile(memory, defaults.id)?,
+                    )?,
+                };
+                to_image(&decoded)
+            },
+        )
     }
 }
 
@@ -1827,6 +1848,44 @@ impl LensGenerator {
         !stage_residency && !self.sequential
     }
 
+    fn effective_load_spec(&self) -> LoadSpec {
+        if let Some(spec) = &self.pipeline.loaded_spec {
+            return spec.clone();
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(self.pipeline.root.clone()))
+            .with_offload_policy(if self.sequential {
+                OffloadPolicy::Sequential
+            } else {
+                OffloadPolicy::Resident
+            });
+        spec.precision = self.loaded_precision;
+        spec.quantize = self.loaded_quant;
+        spec.adapters = self.pipeline.adapters.clone();
+        spec.pid = self.pipeline.pid_spec.clone();
+        spec
+    }
+
+    fn record_execution_policies(&self) {
+        candle_gen::execution::unobserved_adapters(
+            self.pipeline.adapters.len(),
+            "candle-gen-lens/src/lib.rs",
+        );
+        candle_gen::execution::policy("loaded/sequential", format!("{:?}", self.sequential).into());
+        candle_gen::execution::policy(
+            "loaded/stream_text",
+            format!("{:?}", self.stream_text).into(),
+        );
+        candle_gen::execution::policy("loaded/stream_dit", format!("{:?}", self.stream_dit).into());
+        candle_gen::execution::policy(
+            "loaded/loaded_precision",
+            format!("{:?}", self.loaded_precision).into(),
+        );
+        candle_gen::execution::policy(
+            "loaded/loaded_quant",
+            format!("{:?}", self.loaded_quant).into(),
+        );
+    }
+
     /// e2e-parity hook (sc-5115): encode → denoise from **injected** latents → decode, factoring out
     /// the RNG so a cross-build comparison isolates the wiring. Returns the final patch latents
     /// `[1, seq, 128]` and the decoded image `[1, 3, H, W]` in `[-1, 1]`.
@@ -1860,18 +1919,24 @@ impl LensGenerator {
         // Parity hook drives the default (euler over the native flow_match schedule), no cancel, and
         // no preview: this seam takes injected latents rather than a `GenerationRequest`, so there is
         // no `PreviewSink` to emit into and a frame here would have no consumer.
+        let mu = lens_mu(num_steps, latent_h, latent_w);
+        let native = lens_sigmas(num_steps, latent_h, latent_w);
+        let sigmas =
+            candle_gen::resolve_flow_schedule_with_shift(None, None, mu, num_steps, &native)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let span = 0..sigmas.len().saturating_sub(1);
         let latents = self.pipeline.denoise(
+            None,
             &comps.heavy,
             &features,
             &mask,
             init_latents,
             latent_h,
             latent_w,
-            num_steps,
+            &sigmas,
+            std::slice::from_ref(&span),
             guidance,
             guided,
-            None,
-            None,
             None,
             0,
             &cancel,
@@ -1890,31 +1955,20 @@ impl Generator for LensGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
-            candle_gen::execution::unobserved_adapters(
-                self.pipeline.adapters.len(),
-                "candle-gen-lens/src/lib.rs",
-            );
-            candle_gen::execution::policy(
-                "loaded/sequential",
-                format!("{:?}", self.sequential).into(),
-            );
-            candle_gen::execution::policy(
-                "loaded/stream_text",
-                format!("{:?}", self.stream_text).into(),
-            );
-            candle_gen::execution::policy(
-                "loaded/stream_dit",
-                format!("{:?}", self.stream_dit).into(),
-            );
-            candle_gen::execution::policy(
-                "loaded/loaded_precision",
-                format!("{:?}", self.loaded_precision).into(),
-            );
-            candle_gen::execution::policy(
-                "loaded/loaded_quant",
-                format!("{:?}", self.loaded_quant).into(),
-            );
+        let spec = self.effective_load_spec();
+        let plan = compile_trajectory_for(self.defaults.id, req)?.bind_load(&spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            self.record_execution_policies()
         })
     }
 
@@ -1991,9 +2045,40 @@ impl Generator for LensGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let spec = self.effective_load_spec();
+        let plan = compile_trajectory_for(self.defaults.id, req)?.bind_load(&spec);
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        plan.check_request(&self.descriptor, req)?;
+        let spec = self.effective_load_spec();
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))?;
         self.validate(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let (stage_residency, stream_text) = self.execution_mode(req)?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let images = if stage_residency {
             // A prior resident request may have populated the lazy cache. Drop it before entering
             // the staged phase envelope; the lifecycle lock proves no concurrent request holds a
@@ -2007,21 +2092,33 @@ impl Generator for LensGenerator {
                     .synchronize()
                     .map_err(CandleError::from)?;
             }
-            self.pipeline
-                .render_sequential(req, self.defaults, stream_text, on_progress)?
+            self.pipeline.render_sequential_planned(
+                req,
+                &run,
+                self.defaults,
+                stream_text,
+                on_progress,
+            )?
         } else if !self.cache_components_for_request(stage_residency) {
             // A Sequential-loaded generator may be asked for a resident baseline, but that resident
             // stack is request-local. Caching it would leave the full encoder/heavy bundle alive and
             // invalidate a later rung-4 request's cold calibrated bound on the same generator.
             let comps = self.pipeline.load_components()?;
             self.pipeline
-                .render(req, &comps, self.defaults, on_progress)?
+                .render_planned(req, &run, &comps, self.defaults, on_progress)?
         } else {
             let comps = self.components()?;
             self.pipeline
-                .render(req, &comps, self.defaults, on_progress)?
+                .render_planned(req, &run, &comps, self.defaults, on_progress)?
         };
-        Ok(GenerationOutput::Images(images))
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let (dt_label, dt_bytes) = match self.loaded_precision {
+            Precision::Fp32 => ("f32", 4),
+            Precision::Bf16 => ("bf16", 2),
+        };
+        report.low_res_start =
+            plan.low_res_start_execution_report(dt_label, dt_bytes, "base_dit")?;
+        Ok(report)
     }
 }
 
@@ -2033,7 +2130,7 @@ impl Generator for LensGenerator {
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::LENS_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
@@ -2071,6 +2168,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
             // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -2084,6 +2182,30 @@ pub fn descriptor_base() -> ModelDescriptor {
     descriptor_for(MODEL_ID_BASE)
 }
 
+fn defaults_for(id: &str) -> Defaults {
+    if id == MODEL_ID_BASE {
+        BASE_DEFAULTS
+    } else {
+        TURBO_DEFAULTS
+    }
+}
+
+fn build_schedule_for(defaults: Defaults, req: &GenerationRequest) -> gen_core::Result<Vec<f32>> {
+    let steps = req.steps.unwrap_or(defaults.steps) as usize;
+    let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
+    let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+    let mu = lens_mu(steps, latent_h, latent_w);
+    let native = lens_sigmas(steps, latent_h, latent_w);
+    candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )
+    .map_err(|error| gen_core::Error::Msg(error.to_string()))
+}
+
 /// Capability-driven request validation (unit-testable without loaded weights).
 fn validate_request(
     id: &str,
@@ -2091,6 +2213,11 @@ fn validate_request(
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
     caps.validate_request(id, req)?;
+    if req.source_image.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: source_image is not supported on this route"
+        )));
+    }
     if req.prompt.is_empty() {
         return Err(gen_core::Error::Msg(format!(
             "{id}: prompt must not be empty"
@@ -2105,7 +2232,60 @@ fn validate_request(
             req.width, req.height
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        let defaults = defaults_for(id);
+        let desc = descriptor_for(defaults.id);
+        let sigmas = build_schedule_for(defaults, req)?;
+        low_res.resolve_for_descriptor(
+            &desc,
+            req,
+            sigmas.len().saturating_sub(1),
+            VAE_SCALE_FACTOR,
+        )?;
+    }
     Ok(())
+}
+
+/// Compile the weights-free Lens trajectory for `id` (`"lens_turbo"` or `"lens"`).
+pub fn compile_trajectory_for(
+    id: &'static str,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    let defaults = defaults_for(id);
+    let descriptor = descriptor_for(defaults.id);
+    validate_request(defaults.id, &descriptor.capabilities, req)?;
+    let sigmas = build_schedule_for(defaults, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req.guidance.unwrap_or(defaults.guidance);
+    gen_core::RenderPlan::base_image(
+        &descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: VAE_SCALE_FACTOR,
+            token_width: 128,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+pub(crate) fn compile_base(
+    id: &'static str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_load_spec(id, spec)?;
+    if req.use_pid && spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
+        )));
+    }
+    compile_trajectory_for(id, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
 }
 
 fn packed_text_encoder_config(spec: &LoadSpec) -> Option<candle_gen::quant::PackedConfig> {
@@ -2494,6 +2674,39 @@ fn static_behavior_identity(
     )
 }
 
+fn validate_load_spec(id: &str, spec: &LoadSpec) -> gen_core::Result<PathBuf> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: expects a Lens snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+                 not a single .safetensors file"
+            )));
+        }
+    };
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: ControlNet / IP-Adapter conditioning is not part of the Lens port"
+        )));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: identity weights are not part of the Lens port"
+        )));
+    }
+    if spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: an external text encoder is not part of the Lens port"
+        )));
+    }
+    if !spec.components.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: named external components are not part of the Lens port"
+        )));
+    }
+    Ok(root)
+}
+
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
 /// a `microsoft/Lens` / `microsoft/Lens-Turbo` diffusers snapshot dir (`tokenizer/`, `text_encoder/`,
 /// `transformer/`, `vae/`). DiT LoRA/LoKr adapters (`spec.adapters`) are merged into the transformer
@@ -2502,42 +2715,7 @@ fn static_behavior_identity(
 /// and the DiT's compute-heavy linears (sc-5117, folded in after the adapter merge). ControlNet /
 /// IP-Adapter are not part of the Lens port and are rejected here.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{}: expects a Lens snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
-                 not a single .safetensors file",
-                defaults.id
-            )));
-        }
-    };
-    // `spec.quantize` (encoder + DiT) and `spec.adapters` (DiT additive install, sc-11105) are both
-    // applied downstream in `load_components`, so neither is rejected here.
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
-            defaults.id
-        )));
-    }
-    if spec.identity.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: identity weights are not part of the Lens port",
-            defaults.id
-        )));
-    }
-    if spec.text_encoder.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: an external text encoder is not part of the Lens port",
-            defaults.id
-        )));
-    }
-    if !spec.components.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: named external components are not part of the Lens port",
-            defaults.id
-        )));
-    }
+    let root = validate_load_spec(defaults.id, spec)?;
     let device = candle_gen::default_device()?;
     #[cfg(feature = "cuda")]
     let memory_contract = Some(build_lens_memory_strategy_contract(defaults.id, spec));
@@ -2555,7 +2733,8 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             spec.adapters.clone(),
             spec.quantize,
             spec.pid.clone(),
-        ),
+        )
+        .with_load_spec(spec.clone()),
         components: Mutex::new(None),
         lifecycle: Mutex::new(()),
         sequential: matches!(spec.offload_policy, OffloadPolicy::Sequential),
@@ -3202,13 +3381,38 @@ const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: registered_lens_begin_request,
     };
 
+fn compile_lens_turbo(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_base(MODEL_ID_TURBO, spec, req)
+}
+
+fn compile_lens_base(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_base(MODEL_ID_BASE, spec, req)
+}
+
+const TURBO_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: MODEL_ID_TURBO,
+    compile: compile_lens_turbo,
+};
+const BASE_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: MODEL_ID_BASE,
+    compile: compile_lens_base,
+};
+
 /// Add all Candle Lens generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(TURBO_REGISTRATION)
-        .register_generator(BASE_REGISTRATION);
+        .register_render_plan(TURBO_RENDER_PLAN)
+        .register_generator(BASE_REGISTRATION)
+        .register_render_plan(BASE_RENDER_PLAN);
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
@@ -4842,6 +5046,34 @@ mod fingerprint_pin_tests {
                 expected,
                 "{provider_id} {tier:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sw6945_candle_lens_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["lens_turbo", "lens"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "a mountain lake".into(),
+                width: 1024,
+                height: 1024,
+                steps: Some(4),
+                seed: Some(91),
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("lens render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..2, 2..4]);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.phase_output_size(1), (1024, 1024));
         }
     }
 }

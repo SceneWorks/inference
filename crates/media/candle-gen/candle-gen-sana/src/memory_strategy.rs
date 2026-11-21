@@ -745,7 +745,7 @@ impl Binding {
                 height: req.height,
                 batch: req.count,
                 frames: req.frames.unwrap_or(1),
-                reference_count: req.image_reference_count(),
+                reference_count: req.memory_reference_count(),
             },
             memory: req.memory,
             use_pid: req.use_pid,

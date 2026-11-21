@@ -107,13 +107,7 @@ pub(crate) fn observe_pag_policy(pag: Option<&candle_gen::gen_core::PagResolved>
 /// no reference blend). Higher strength means a later start and fewer denoise steps, so the output
 /// stays closer to the reference. `floor` matches Python's truncation toward zero for `s >= 0`.
 pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// How a site fits a source image to the render size before the `[0,255] → [-1,1]` normalize — a

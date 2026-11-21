@@ -97,6 +97,7 @@ pub fn register_providers(
     register_memory_contract_surfaces(registry)
         .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR)
         .register_memory_behavior(memory_strategy::SPRINT_MEMORY_BEHAVIOR)
+        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
 }
 
 /// Register SANA's pre-load memory contract and its weights-free contract fixture for both routes.

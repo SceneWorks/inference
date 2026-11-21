@@ -21,22 +21,7 @@ pub const DEFAULT_SAMPLER: &str = "er_sde";
 /// The Anima sigma schedule: `linspace(1.0, 1/N, N)` (**NOT** the diffusers default) time-shifted by
 /// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0`. Length `N + 1`, descending.
 pub fn anima_sigmas(steps: usize) -> Vec<f32> {
-    let n = steps.max(1);
-    let shift = SIGMA_SHIFT as f64;
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            // linspace(1.0, 1/n, n)
-            let s = if n == 1 {
-                1.0
-            } else {
-                1.0 + (i as f64) * (1.0 / n as f64 - 1.0) / ((n - 1) as f64)
-            };
-            // static time-shift: shift·s / (1 + (shift−1)·s)
-            (shift * s / (1.0 + (shift - 1.0) * s)) as f32
-        })
-        .collect();
-    sigmas.push(0.0);
-    sigmas
+    candle_gen::gen_core::sampling::anima_sigmas(steps)
 }
 
 /// Seeded initial latent noise `[1, 16, 1, H/8, W/8]` (f32 standard normal, CPU-drawn for launch
@@ -130,6 +115,30 @@ impl AnimaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         render_encoded_components(render, device, cond, uncond, opts, cancel, on_progress)
+    }
+
+    /// Render a planned batch of images from already-materialized conditioning under [`RenderRun`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_encoded_planned(
+        render: &impl RenderComponents,
+        device: &Device,
+        run: &candle_gen::gen_core::RenderRun<'_, '_>,
+        cond: &Tensor,
+        uncond: Option<&Tensor>,
+        preview_sink: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        render_encoded_components_planned(
+            render,
+            device,
+            run,
+            cond,
+            uncond,
+            preview_sink,
+            cancel,
+            on_progress,
+        )
     }
 
     /// Encode with the conditioning-only staged phase.
@@ -331,6 +340,153 @@ fn encode_prompt_components(
     c.conditioner().forward(&source, &target_ids, dtype)
 }
 
+pub(crate) fn resolved_sigmas(
+    variant: Variant,
+    req: &candle_gen::gen_core::GenerationRequest,
+) -> candle_gen::gen_core::Result<Vec<f32>> {
+    let steps = req.steps.unwrap_or(variant.default_steps()).max(1) as usize;
+    let native = anima_sigmas(steps);
+    candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        SIGMA_SHIFT.ln(),
+        steps,
+        &native,
+    )
+    .map_err(|error| candle_gen::gen_core::Error::Msg(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_image(
+    dit: &crate::transformer::CosmosDiT,
+    device: &Device,
+    dtype: DType,
+    cond: &Tensor,
+    uncond: Option<&Tensor>,
+    guidance: f64,
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
+    noise: Tensor,
+    phase0_w: u32,
+    phase0_h: u32,
+    full_w: u32,
+    full_h: u32,
+    seed: u64,
+    preview_sink: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Tensor> {
+    let phase0_dims = noise.dims().to_vec();
+    let phase0_rope = dit.prepare_rope(&noise)?;
+    let phase1_rope = if (phase0_w, phase0_h) != (full_w, full_h) {
+        let dummy = Tensor::zeros(
+            (
+                1,
+                VAE_CHANNELS,
+                1,
+                (full_h / VAE_COMPRESSION) as usize,
+                (full_w / VAE_COMPRESSION) as usize,
+            ),
+            DType::F32,
+            device,
+        )?;
+        Some(dit.prepare_rope(&dummy)?)
+    } else {
+        None
+    };
+    let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
+        let s = Tensor::from_vec(vec![sigma], (1,), device)?;
+        observe_component_compute("dit", device, dtype);
+        let rope = if x.dims() == phase0_dims.as_slice() {
+            &phase0_rope
+        } else {
+            phase1_rope.as_ref().unwrap_or(&phase0_rope)
+        };
+        let v_cond = dit.forward_prepared(x, &s, cond, dtype, rope)?;
+        let v = match uncond {
+            Some(u) => {
+                let v_u = dit.forward_prepared(x, &s, u, dtype, rope)?;
+                (&v_u + ((v_cond - &v_u)? * guidance)?)?
+            }
+            None => v_cond,
+        };
+        Ok(v.to_dtype(DType::F32)?)
+    };
+    let preview = crate::preview::hook(preview_sink);
+    candle_gen::run_flow_sampler_spans(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        spans,
+        run,
+        false,
+        noise,
+        seed,
+        cancel,
+        on_progress,
+        Some(&preview),
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_encoded_components_planned(
+    render: &impl RenderComponents,
+    device: &Device,
+    run: &candle_gen::gen_core::RenderRun<'_, '_>,
+    cond: &Tensor,
+    uncond: Option<&Tensor>,
+    preview_sink: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let dtype = render.dtype();
+    let sigmas = run.plan().denoise_sigmas();
+    let spans = run.plan().denoise_spans();
+    let guidance = run.plan().guidance() as f64;
+    candle_gen::execution::policy("anima/pipeline/guidance", format!("{guidance:?}").into());
+    let sampler = Some(run.plan().sampler());
+    let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+    let (full_w, full_h) = run.plan().output_size();
+    let dit = render.dit();
+
+    run.images_with_denoise_phases(
+        on_progress,
+        |seed| create_noise(seed, phase0_w, phase0_h, device),
+        |seed, noise, on_progress| {
+            denoise_image(
+                dit,
+                device,
+                dtype,
+                cond,
+                uncond,
+                guidance,
+                sampler,
+                sigmas,
+                &spans,
+                Some(run),
+                noise,
+                phase0_w,
+                phase0_h,
+                full_w,
+                full_h,
+                seed,
+                preview_sink,
+                cancel,
+                on_progress,
+            )
+        },
+        |_seed, latent, on_progress| {
+            on_progress(Progress::Decoding);
+            let latent_nchw = latent.squeeze(LATENT_TEMPORAL_AXIS)?;
+            let decoded = render.vae().decode(&latent_nchw)?;
+            to_image(&decoded)
+        },
+    )
+}
+
 fn render_encoded_components(
     render: &impl RenderComponents,
     device: &Device,
@@ -349,65 +505,34 @@ fn render_encoded_components(
         opts.steps,
         &native,
     )?;
-    // Keep the initial latent in **f32** — the sampler integrates in f32 (`predict` returns the
-    // velocity as f32; the VAE is loaded + decodes in f32), and the DiT casts its input to the
-    // compute dtype internally (`CosmosDiT::forward`). Casting the noise to `dtype` here is a no-op
-    // on the CPU/f32 parity lane but yields a **bf16** latent on the GPU lanes, so the sampler's
-    // `x + (σ_next − σ)·v` add mixes a bf16 `x` with an f32 `v` → "dtype mismatch in add" on the
-    // very first step. This never fired on the CPU-only goldens; it only bites on real CUDA/Metal
-    // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
     let noise = create_noise(opts.seed, opts.width, opts.height, device)?;
     let guidance = opts.guidance as f64;
     candle_gen::execution::policy("anima/pipeline/guidance", format!("{guidance:?}").into());
     let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
-
-    let dit = render.dit();
-    // Latent geometry and dtype are fixed for this render, including both CFG branches.
-    let prepared_rope = dit.prepare_rope(&noise)?;
-    // The DiT is a **standard flow denoiser**: it predicts the flow velocity `v ≈ ε − x0` and
-    // embeds the **raw σ** as its timestep. So `run_flow_sampler` (`TimestepConvention::Sigma`,
-    // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
-    let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
-        let s = Tensor::from_vec(vec![sigma], (1,), device)?;
-        observe_component_compute("dit", device, dtype);
-        let v_cond = dit.forward_prepared(x, &s, &cond, dtype, &prepared_rope)?;
-        let v = match &uncond {
-            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
-            Some(u) => {
-                let v_u = dit.forward_prepared(x, &s, u, dtype, &prepared_rope)?;
-                (&v_u + ((v_cond - &v_u)? * guidance)?)?
-            }
-            None => v_cond,
-        };
-        // Integrate in f32 (the reference keeps latents f32).
-        Ok(v.to_dtype(DType::F32)?)
-    };
-
-    // Per-step latent preview (epic 16948, sc-16953). Opting in is the sc-16949 projector hook
-    // and nothing else: the driver owns frame numbering, multi-eval dedup and the
-    // swallow-on-failure contract, so this loop is unchanged and an inert sink costs one branch
-    // per evaluation. The running latent is the 5-D Cosmos `[1, 16, 1, H/8, W/8]` — the projector
-    // drops the same length-1 temporal axis the decode tail below squeezes, then applies the
-    // reused QwenVae fit. Built here, per driver call, so a batched request's second image starts
-    // a fresh trajectory at frame 1. CFG (when `uncond` is `Some`) runs entirely inside `predict`
-    // and returns one combined velocity, so no unconditional half ever becomes the running latent.
-    let preview = crate::preview::hook(&opts.preview);
-
-    let latent = candle_gen::run_flow_sampler(
+    let span = 0..sigmas.len().saturating_sub(1);
+    let latent = denoise_image(
+        render.dit(),
+        device,
+        dtype,
+        &cond,
+        uncond.as_ref(),
+        guidance,
         sampler,
-        TimestepConvention::Sigma,
         &sigmas,
+        std::slice::from_ref(&span),
+        None,
         noise,
+        opts.width,
+        opts.height,
+        opts.width,
+        opts.height,
         opts.seed,
+        &opts.preview,
         cancel,
         on_progress,
-        Some(&preview),
-        predict,
     )?;
 
     on_progress(Progress::Decoding);
-    // The Cosmos latent is 5-D `[1,16,1,H/8,W/8]`; the QwenVae decode is NCHW — drop the length-1
-    // temporal axis. VAE applies the baked latents_mean/std de-norm → `[1,3,H,W]` f32 in `[-1,1]`.
     let latent_nchw = latent.squeeze(LATENT_TEMPORAL_AXIS)?;
     let decoded = render.vae().decode(&latent_nchw)?;
     to_image(&decoded)

@@ -293,9 +293,12 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_render_plan(model::RENDER_PLAN_REGISTRATION)
         .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::REGISTRATION)
+        .register_render_plan(model_control::RENDER_PLAN_REGISTRATION)
         .register_generator(model_edit::REGISTRATION)
+        .register_render_plan(model_edit::RENDER_PLAN_REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,

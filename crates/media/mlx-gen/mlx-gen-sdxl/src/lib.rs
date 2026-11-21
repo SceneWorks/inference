@@ -113,7 +113,8 @@ pub use model::{
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
-    denoise_cfgpp_with_preview, denoise_control, denoise_control_with_preview, denoise_curated,
+    denoise_cfgpp_planned, denoise_cfgpp_with_preview, denoise_control,
+    denoise_control_with_preview, denoise_curated, denoise_curated_planned,
     denoise_curated_with_preview, denoise_inpaint, denoise_inpaint_with_preview, denoise_ip,
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
@@ -212,6 +213,10 @@ pub fn register_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: model::compile_sdxl,
+        })
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 mlx_gen::gen_core::CheckpointBackendBindingRegistration {
@@ -353,6 +358,240 @@ mod explicit_registry_tests {
                 &registry, &spec,
             );
         }
+    }
+
+    #[test]
+    fn sdxl_curated_shared_driver_render_plan_and_eng5_refusals() {
+        use mlx_gen::gen_core::{
+            BoundaryState, Conditioning, ControlKind, EstimateSource, GenerationRequest, Image,
+            LoadSpec, LowResStartSpec, WeightsSource,
+        };
+        use mlx_gen::{AlphaSchedule, DiscreteModelSampling};
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        assert!(
+            all_features[super::MODEL_ID]["low_res_start"].applicable,
+            "sdxl curated route must advertise low_res_start applicability"
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/tmp/sdxl".into()));
+        let t2i_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("normal".into()),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &t2i_req)
+            .unwrap()
+            .expect("compiled curated plan");
+        assert_eq!(plan.executed_steps(), 8);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..2, 2..8]);
+
+        let img2img_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            ..Default::default()
+        };
+        let img_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &img2img_req)
+            .unwrap()
+            .expect("compiled curated img2img plan");
+        assert_eq!(img_plan.executed_steps(), 4);
+        assert_eq!(img_plan.phase_output_size(0), (512, 512));
+        assert_eq!(img_plan.denoise_spans(), vec![0..1, 1..4]);
+
+        let low_res_plan = *img_plan.low_res_start().unwrap();
+        let sigma_k = img_plan.denoise_sigmas()[low_res_plan.k];
+        let cfg = crate::DiffusionConfig::sdxl_base();
+        let alpha = AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+        let ms = DiscreteModelSampling::sdxl(&alpha);
+        let low_latent = vec![0.25f32; 4 * 64 * 64];
+        let transitioned = mlx_gen::gen_core::transition_clean_estimate_f32(
+            BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            img_plan.base_seed(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transitioned.len(), 4 * 128 * 128);
+        assert!(transitioned.iter().all(|v| v.is_finite()));
+
+        // Native ancestral/discrete, accel, inpaint, control, IP, and InstantID refuse low_res_start
+        // with typed Error::Unsupported.
+        let dummy_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        for (bad_spec, bad_req) in [
+            (
+                spec.clone(),
+                GenerationRequest {
+                    sampler: None,
+                    scheduler: None,
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone(),
+                GenerationRequest {
+                    sampler: Some("lightning".into()),
+                    scheduler: None,
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone(),
+                GenerationRequest {
+                    conditioning: vec![
+                        Conditioning::Reference {
+                            image: dummy_img.clone(),
+                            strength: Some(0.5),
+                        },
+                        Conditioning::Mask {
+                            image: dummy_img.clone(),
+                        },
+                    ],
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone()
+                    .with_control(WeightsSource::Dir("/tmp/ctrl".into())),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Control {
+                        image: dummy_img,
+                        kind: ControlKind::Canny,
+                        scale: Some(0.8),
+                    }],
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone()
+                    .with_ip_adapter(WeightsSource::Dir("/tmp/ip".into())),
+                t2i_req.clone(),
+            ),
+        ] {
+            let err = registry
+                .compile_render_plan(super::MODEL_ID, &bad_spec, &bad_req)
+                .unwrap_err();
+            assert!(
+                matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                "expected typed Unsupported error, got {err:?}"
+            );
+        }
+
+        // Curated PiD early-stop (`use_pid = true`, `pid_capture_sigma = Some(0.35)`) compiles a
+        // valid RenderPlan preserving the full EDM schedule ending at 0.0 and expressing the
+        // early stop through `executed_steps`.
+        let pid_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            use_pid: true,
+            pid_capture_sigma: Some(0.35),
+            ..Default::default()
+        };
+        let pid_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &pid_req)
+            .unwrap()
+            .expect("compiled curated PiD early-stop plan");
+        assert_eq!(pid_plan.sigmas().last(), Some(&0.0));
+        assert_eq!(pid_plan.sigmas().len(), 9);
+        assert!(pid_plan.executed_steps() < 8);
+        assert_eq!(
+            pid_plan.denoise_sigmas().len(),
+            pid_plan.executed_steps() + 1
+        );
+        assert_eq!(
+            pid_plan.capture_sigma(),
+            pid_plan.sigmas()[pid_plan.executed_steps()]
+        );
+
+        // Planned execution rejects a mutated request or mismatched load binding before
+        // materializing heavy components.
+        let snap_a = tempfile::tempdir().unwrap();
+        let tok_dir_a = snap_a.path().join("tokenizer");
+        std::fs::create_dir_all(&tok_dir_a).unwrap();
+        std::fs::write(
+            tok_dir_a.join("vocab.json"),
+            r#"{"<|startoftext|>":49406,"<|endoftext|>":49407,"a</w>":1}"#,
+        )
+        .unwrap();
+        std::fs::write(tok_dir_a.join("merges.txt"), "#version\n").unwrap();
+        let seq_spec_a = LoadSpec::new(WeightsSource::Dir(snap_a.path().to_path_buf()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let gen = crate::load(&seq_spec_a).expect("sequential load defers heavy weights");
+        let base_req = GenerationRequest {
+            prompt: "a".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            ..Default::default()
+        };
+        let bound_plan = registry
+            .compile_render_plan(super::MODEL_ID, &seq_spec_a, &base_req)
+            .unwrap()
+            .expect("compiled bound plan");
+        let mut mutated_req = base_req.clone();
+        mutated_req.steps = Some(12);
+        let req_err = gen
+            .generate_planned(&mutated_req, &bound_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            req_err.contains("compiled render plan does not match"),
+            "unexpected error: {req_err}"
+        );
+        let other_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &base_req)
+            .unwrap()
+            .expect("compiled plan for other spec");
+        let load_err = gen
+            .generate_planned(&base_req, &other_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            load_err.contains("different model or adapter stack"),
+            "unexpected error: {load_err}"
+        );
     }
 }
 

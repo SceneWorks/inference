@@ -333,15 +333,25 @@ impl LowResStartSpec {
                 descriptor.id
             )));
         }
-        if !req.conditioning.is_empty() {
+        let pass0_conditioning = classify_descriptor_pass0_conditioning(descriptor);
+        let is_plain_single_reference_img2img = pass0_conditioning
+            == Pass0ConditioningRequirement::NoiseStartSupported
+            && descriptor.family != "flux"
+            && !descriptor.id.starts_with("flux1_")
+            && !descriptor.id.contains("ip_adapter")
+            && descriptor
+                .capabilities
+                .accepts(crate::ConditioningKind::Reference)
+            && req.source_image.is_none()
+            && req.conditioning.len() == 1
+            && matches!(req.conditioning[0], Conditioning::Reference { .. });
+        if !req.conditioning.is_empty() && !is_plain_single_reference_img2img {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with pass-0 edit/reference/control conditioning",
                 descriptor.id
             )));
         }
-        if classify_descriptor_pass0_conditioning(descriptor)
-            != Pass0ConditioningRequirement::NoiseStartSupported
-        {
+        if pass0_conditioning != Pass0ConditioningRequirement::NoiseStartSupported {
             return Err(Error::Unsupported(format!(
                 "{}: route requires pass-0 conditioning and does not support low_res_start",
                 descriptor.id
@@ -354,7 +364,7 @@ impl LowResStartSpec {
         )?;
         let space = descriptor.denoiser_output_latent_space.ok_or_else(|| {
             Error::Unsupported(format!(
-                "{}: route does not declare a packed spatial latent space for low_res_start",
+                "{}: route does not declare a spatial latent space for low_res_start",
                 descriptor.id
             ))
         })?;
@@ -366,20 +376,34 @@ impl LowResStartSpec {
                 descriptor.id
             )));
         }
-        let vae_spatial_scale = u32::from(space.spatial_compression.width);
-        let patch_size = match space.patch_layout {
+        let raw_spatial_scale = u32::from(space.spatial_compression.width);
+        let (vae_spatial_scale, patch_size) = match space.patch_layout {
             LatentPatchLayout::Packed {
                 patch_height,
                 patch_width,
-            } if patch_height == patch_width && patch_width > 0 => u32::from(patch_width),
+            } if patch_height == patch_width && patch_width > 0 => {
+                let p = u32::from(patch_width);
+                let vae_scale = if raw_spatial_scale == pixel_stride
+                    && pixel_stride >= p
+                    && pixel_stride.is_multiple_of(p)
+                {
+                    pixel_stride / p
+                } else {
+                    raw_spatial_scale
+                };
+                (vae_scale, p)
+            }
             LatentPatchLayout::Unpacked
-                if pixel_stride > 0 && pixel_stride.is_multiple_of(vae_spatial_scale) =>
+                if pixel_stride > 0 && pixel_stride.is_multiple_of(raw_spatial_scale) =>
             {
-                (pixel_stride / vae_spatial_scale).max(1)
+                (
+                    raw_spatial_scale,
+                    (pixel_stride / raw_spatial_scale).max(1),
+                )
             }
             _ => {
                 return Err(Error::Unsupported(format!(
-                    "{}: route latent space does not declare a 2x2-packed spatial layout",
+                    "{}: route latent space does not declare a supported spatial layout for low_res_start",
                     descriptor.id
                 )))
             }
@@ -1292,6 +1316,100 @@ pub fn transition_packed_clean_estimate_f32(
         batch,
         channels,
         patch_size,
+        vae_spatial_scale,
+        plan,
+        sigma_k,
+        model_sampling,
+        &eps_trans,
+    )
+}
+
+/// Execute the full typed boundary transition from an unpacked spatial `[B, C, H_low, W_low]`
+/// (or singleton-time `[B, C, 1, H_low, W_low]`) clean estimate at `sigma_K` using an explicit
+/// full-resolution `[B, C, H_full, W_full]` unit Gaussian noise buffer (`PIPE-4`, `§6.1`).
+///
+/// Refuses [`BoundaryState::XSigma`] and [`BoundaryState::RouteSpecific`] with a typed
+/// [`Error::Unsupported`] so a transition can never double-noise a noisy latent.
+#[allow(clippy::too_many_arguments)]
+pub fn transition_clean_estimate_with_noise_f32(
+    boundary_state: BoundaryState<&[f32]>,
+    batch: usize,
+    channels: usize,
+    vae_spatial_scale: u32,
+    plan: &ResolvedLowResStartPlan,
+    sigma_k: f32,
+    model_sampling: &dyn ModelSampling,
+    eps_trans_nchw: &[f32],
+) -> Result<Vec<f32>> {
+    let (unpacked_x0_low, _source) = boundary_state.into_clean_estimate()?;
+    if vae_spatial_scale == 0 {
+        return Err(Error::Unsupported(
+            "transition_clean_estimate_with_noise_f32: vae_spatial_scale must be non-zero".into(),
+        ));
+    }
+    let h_low = (plan.low_height / vae_spatial_scale) as usize;
+    let w_low = (plan.low_width / vae_spatial_scale) as usize;
+    let h_full = (plan.full_height / vae_spatial_scale) as usize;
+    let w_full = (plan.full_width / vae_spatial_scale) as usize;
+
+    let resized_full = resize_bilinear_half_pixel_clamp_f32(
+        unpacked_x0_low,
+        batch,
+        channels,
+        h_low,
+        w_low,
+        h_full,
+        w_full,
+    )?;
+    apply_destination_noise_law_f32(&resized_full, eps_trans_nchw, sigma_k, model_sampling)
+}
+
+/// Execute the full typed boundary transition from an unpacked spatial `[B, C, H_low, W_low]`
+/// (or singleton-time `[B, C, 1, H_low, W_low]`) clean estimate at `sigma_K`, drawing
+/// $\epsilon_{\text{trans}} \sim \mathcal{N}(0, I)$ in `[B, C, H_full, W_full]` with the
+/// deterministic domain-separated seed derived from
+/// `(request_seed, output_index, pass_index, phase_index, "low_res_start_transition_v1")` (`PIPE-4`, `§6.1`).
+#[allow(clippy::too_many_arguments)]
+pub fn transition_clean_estimate_f32(
+    boundary_state: BoundaryState<&[f32]>,
+    batch: usize,
+    channels: usize,
+    vae_spatial_scale: u32,
+    plan: &ResolvedLowResStartPlan,
+    sigma_k: f32,
+    model_sampling: &dyn ModelSampling,
+    request_seed: u64,
+    output_index: u32,
+    pass_index: usize,
+    phase_index: usize,
+) -> Result<Vec<f32>> {
+    let (unpacked_x0_low, source) = boundary_state.into_clean_estimate()?;
+    if vae_spatial_scale == 0 {
+        return Err(Error::Unsupported(
+            "transition_clean_estimate_f32: vae_spatial_scale must be non-zero".into(),
+        ));
+    }
+    let h_full = (plan.full_height / vae_spatial_scale) as usize;
+    let w_full = (plan.full_width / vae_spatial_scale) as usize;
+    let full_len = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(h_full))
+        .and_then(|v| v.checked_mul(w_full))
+        .ok_or_else(|| Error::Unsupported("transition_clean_estimate_f32: size overflow".into()))?;
+    let eps_trans = low_res_start_transition_noise_f32(
+        request_seed,
+        output_index,
+        pass_index,
+        phase_index,
+        full_len,
+    );
+    transition_clean_estimate_with_noise_f32(
+        BoundaryState::CleanEstimate {
+            latent: unpacked_x0_low,
+            source,
+        },
+        batch,
+        channels,
         vae_spatial_scale,
         plan,
         sigma_k,
@@ -2480,12 +2598,12 @@ impl FeatureRouteStructure {
                     has_render_plan = false;
                 }
                 Err(_) => {
-                    // Probe conditioned trajectories (Control, then Reference/Identity) to derive
+                    // Probe conditioned trajectories (Control, then Reference/Identity/Edit) to derive
                     // the exact reason pass 0 did not compile as noise-start.
                     let probe_img = Image {
-                        width: 16,
-                        height: 16,
-                        pixels: vec![0; 16 * 16 * 3],
+                        width: probe_size,
+                        height: probe_size,
+                        pixels: vec![0; (probe_size as usize) * (probe_size as usize) * 3],
                     };
                     let control_spec = base_spec.clone().with_control(WeightsSource::File(
                         "/__feature_probe_control__.safetensors".into(),
@@ -2506,6 +2624,13 @@ impl FeatureRouteStructure {
                         pixel_stride = Some(plan.pixel_stride());
                         token_width = Some(plan.token_width());
                     } else {
+                        let ref_req = GenerationRequest {
+                            conditioning: vec![Conditioning::Reference {
+                                image: probe_img,
+                                strength: Some(0.7),
+                            }],
+                            ..noise_req
+                        };
                         let mut ref_spec = base_spec
                             .clone()
                             .with_ip_adapter(WeightsSource::File(
@@ -2524,17 +2649,20 @@ impl FeatureRouteStructure {
                             )),
                             face_dir: Some(WeightsSource::Dir("/__feature_probe_face__".into())),
                         });
-                        let ref_req = GenerationRequest {
-                            conditioning: vec![Conditioning::Reference {
-                                image: probe_img,
-                                strength: Some(0.7),
-                            }],
-                            ..noise_req
-                        };
-                        if let Ok(Some(plan)) = (planner.compile)(&ref_spec, &ref_req) {
+                        let compiled_ref = (planner.compile)(&base_spec, &ref_req)
+                            .ok()
+                            .flatten()
+                            .or_else(|| (planner.compile)(&ref_spec, &ref_req).ok().flatten());
+                        if let Some(plan) = compiled_ref {
                             has_render_plan = true;
                             has_packed_image_trajectory = true;
-                            pass0_conditioning = Pass0ConditioningRequirement::RequiresReference;
+                            pass0_conditioning =
+                                match classify_descriptor_pass0_conditioning(descriptor) {
+                                    Pass0ConditioningRequirement::RequiresEdit => {
+                                        Pass0ConditioningRequirement::RequiresEdit
+                                    }
+                                    _ => Pass0ConditioningRequirement::RequiresReference,
+                                };
                             default_executed_steps = u32::try_from(plan.executed_steps()).ok();
                             pixel_stride = Some(plan.pixel_stride());
                             token_width = Some(plan.token_width());
@@ -2549,19 +2677,22 @@ impl FeatureRouteStructure {
                 .denoiser_output_latent_space
                 .is_some_and(|space| {
                     space.is_well_formed()
+                        && space.spatial_compression.width == space.spatial_compression.height
                         && match space.patch_layout {
                             LatentPatchLayout::Packed {
-                                patch_height: 2,
-                                patch_width: 2,
-                            } => true,
+                                patch_height,
+                                patch_width,
+                            } => patch_height == patch_width && patch_width > 0,
                             LatentPatchLayout::Unpacked => {
-                                let expected_stride =
-                                    u32::from(space.spatial_compression.width) * 2;
-                                let expected_tokens = u32::from(space.channels) * 4;
-                                pixel_stride == Some(expected_stride)
-                                    && token_width == Some(expected_tokens)
+                                let vae_scale = u32::from(space.spatial_compression.width).max(1);
+                                let ch = u32::from(space.channels);
+                                pixel_stride
+                                    .is_some_and(|s| s >= vae_scale && s.is_multiple_of(vae_scale))
+                                    && token_width.is_some_and(|w| {
+                                        let ratio = pixel_stride.unwrap_or(vae_scale) / vae_scale;
+                                        w == ch || w == ch * ratio * ratio
+                                    })
                             }
-                            _ => false,
                         }
                 });
         let supports_spatial_unpack_repack = descriptor.modality == Modality::Image
@@ -6543,5 +6674,158 @@ mod tests {
         assert!(mp_img2img.passes()[1]
             .check_request(&migrated_desc, &pass1_img2img)
             .is_ok());
+    }
+
+    #[test]
+    fn low_res_start_supports_flux2_packed_and_unpacked_latent_spaces() {
+        let flux2_desc = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&crate::FLUX2_PACKED_LATENT_SPACE),
+            control_kinds: None,
+            required_components: &[],
+            id: "flux2_dev",
+            family: "flux2",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities {
+                conditioning: vec![ConditioningKind::Reference],
+                min_size: 256,
+                max_size: 2048,
+                max_count: 8,
+                supports_low_res_start: true,
+                ..Default::default()
+            },
+        };
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let resolved_f2 = req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux2_desc, &req, 4, 16)
+            .unwrap();
+        assert_eq!(resolved_f2.legal_quantum, 16);
+        assert_eq!((resolved_f2.low_width, resolved_f2.low_height), (512, 512));
+
+        // Multiple references on flux2_dev must be refused on low_res_start.
+        let mut multi_ref_req = req.clone();
+        multi_ref_req.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            strength: Some(0.5),
+        });
+        assert!(req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux2_desc, &multi_ref_req, 4, 16)
+            .is_err());
+
+        // FLUX.1 descriptors treat `Conditioning::Reference` as XLabs IP-Adapter conditioning
+        // (plain img2img uses `req.source_image`), so `Conditioning::Reference` + `low_res_start`
+        // must be rejected on both `flux1_dev` and `flux1_dev_ip_adapter`.
+        let mut flux1_desc = flux2_desc.clone();
+        flux1_desc.id = "flux1_dev";
+        flux1_desc.family = "flux";
+        flux1_desc.capabilities.conditioning = vec![ConditioningKind::Reference];
+        flux1_desc.capabilities.supports_low_res_start = true;
+        assert!(req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux1_desc, &req, 4, 16)
+            .is_err());
+        assert!(flux1_desc
+            .capabilities
+            .validate_request(flux1_desc.id, &req)
+            .is_err());
+        let mut flux1_ip_desc = flux1_desc.clone();
+        flux1_ip_desc.id = "flux1_dev_ip_adapter";
+        flux1_ip_desc.capabilities.supports_low_res_start = false;
+        assert!(req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux1_ip_desc, &req, 4, 16)
+            .is_err());
+        assert!(flux1_ip_desc
+            .capabilities
+            .validate_request(flux1_ip_desc.id, &req)
+            .is_err());
+
+        // Unpacked latent space (Anima QWEN_KREA_Z16_LATENT_SPACE) + transition_clean_estimate_f32.
+        let mut anima_desc = flux2_desc.clone();
+        anima_desc.id = "anima_base";
+        anima_desc.family = "anima";
+        anima_desc.denoiser_output_latent_space = Some(&crate::QWEN_KREA_Z16_LATENT_SPACE);
+        anima_desc.capabilities.conditioning = vec![];
+        anima_desc.capabilities.supports_low_res_start = true;
+        let t2i_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let resolved_anima = t2i_req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&anima_desc, &t2i_req, 4, 16)
+            .unwrap();
+        assert_eq!(resolved_anima.legal_quantum, 16);
+        assert_eq!(
+            (resolved_anima.low_width, resolved_anima.low_height),
+            (256, 256)
+        );
+        let low_latent = vec![0.25_f32; 16 * 32 * 32];
+        let ms =
+            crate::sampling::FlowModelSampling::new(crate::sampling::TimestepConvention::Sigma);
+        let noised = transition_clean_estimate_f32(
+            BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            1,
+            16,
+            8,
+            &resolved_anima,
+            0.5,
+            &ms,
+            42,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(noised.len(), 16 * 64 * 64);
+        assert!(transition_clean_estimate_f32(
+            BoundaryState::XSigma(&low_latent),
+            1,
+            16,
+            8,
+            &resolved_anima,
+            0.5,
+            &ms,
+            42,
+            0,
+            0,
+            0,
+        )
+        .is_err());
     }
 }

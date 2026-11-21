@@ -52,6 +52,8 @@ pub fn register_providers(
         .register_generator(model::BASE_REGISTRATION)
         .register_generator(model::TURBO_REGISTRATION)
         .register_generator(model::EDIT_REGISTRATION)
+        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
+        .register_render_plan(model::EDIT_RENDER_PLAN_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Boogu provider catalog.
