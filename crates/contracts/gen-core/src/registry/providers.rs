@@ -6,6 +6,7 @@ use super::*;
 pub struct ProviderRegistry {
     pub(super) generators: Box<[ModelRegistration]>,
     pub(super) render_plans: Box<[crate::RenderPlanRegistration]>,
+    pub(super) video_plans: Box<[crate::VideoPlanRegistration]>,
     pub(super) feature_routes: Box<[FeatureRouteRegistration]>,
     pub(super) checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
     pub(super) checkpoint_codecs: CheckpointCodecRegistry,
@@ -180,6 +181,24 @@ impl ProviderRegistry {
         };
         self.ensure_quant_supported(id, spec, "generator")?;
         Ok((planner.compile)(spec, request)?.map(|plan| plan.bind_load(spec)))
+    }
+
+    /// Resolve physical video execution and decode windows with the provider's metadata-only compiler.
+    pub fn compile_video_plan(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        request: &crate::GenerationRequest,
+    ) -> Result<Option<crate::VideoRenderPlan>> {
+        let Some(registration) = self
+            .video_plans
+            .iter()
+            .find(|entry| entry.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        self.ensure_quant_supported(id, spec, "generator")?;
+        crate::VideoRenderPlan::compile(registration, spec, request)
     }
 
     /// Compile an ordered multi-pass request (Hires.fix: a base pass, then a pass whose reference

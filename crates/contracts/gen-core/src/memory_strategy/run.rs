@@ -318,6 +318,14 @@ pub trait MemoryRequestScope {
     ) -> Result<()> {
         self.enter_phase(phase)
     }
+    /// The actual temporal latent extent can differ from the physical frame count in the phase identity.
+    fn enter_video_phase(
+        &mut self,
+        identity: &crate::render::RenderPhaseIdentity,
+        _latent_frames: u32,
+    ) -> Result<()> {
+        self.enter_render_phase(MemoryPhase::Denoise, identity)
+    }
     fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(
         &mut self,

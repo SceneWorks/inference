@@ -388,6 +388,17 @@ impl From<&str> for CandleError {
 /// bodies bridge the tail into `gen_core::Result` via `?` + the [`From`] above).
 pub type Result<T> = std::result::Result<T, CandleError>;
 
+/// Physical memory budget used by the process-default device, without constructing a device.
+pub const fn default_memory_budget_domain() -> gen_core::MemoryBudgetDomain {
+    if cfg!(feature = "cuda") {
+        gen_core::MemoryBudgetDomain::DeviceVram
+    } else if cfg!(feature = "metal") {
+        gen_core::MemoryBudgetDomain::UnifiedMemory
+    } else {
+        gen_core::MemoryBudgetDomain::HostRam
+    }
+}
+
 /// The process-default compute device, selected at compile time by feature:
 /// CUDA (`cuda`) → Metal (`metal`) → CPU (default). Exercising this proves candle links and a
 /// `Device` constructs on whatever backend the build selected (CPU/Metal on Mac).

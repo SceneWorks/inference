@@ -3,6 +3,7 @@
 pub mod conditional;
 mod passes;
 pub mod video;
+pub mod video_plan;
 
 pub use passes::{MultiPassRenderPlan, PlannedPassRequest, ProducedReference};
 
@@ -346,6 +347,8 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
 /// its prepared source pins and admitted offload policy. Neither pins nor tensors are cloned.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RenderLoadBinding {
+    #[serde(skip)]
+    video_source: Option<Box<VideoSourceBinding>>,
     weights: crate::WeightsSource,
     resolved_route: Option<String>,
     quant: Option<crate::Quant>,
@@ -363,9 +366,31 @@ pub struct RenderLoadBinding {
     pid: Option<crate::PidWeights>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct VideoSourceBinding {
+    pins: crate::PreparedFilePins,
+    policies: Vec<crate::MemoryDecodeGeometryPolicy>,
+    authoritative: bool,
+    runtime: Option<crate::MemoryDecodeQualityRuntimeIdentity>,
+}
+
 impl RenderLoadBinding {
+    /// Capture the same source and decode-policy metadata at pre-load and at factory entry.
+    pub fn from_video_spec(spec: &LoadSpec) -> Self {
+        Self {
+            video_source: Some(Box::new(VideoSourceBinding {
+                pins: spec.prepared_file_pins().clone(),
+                policies: spec.decode_geometry_policies.clone(),
+                authoritative: spec.decode_geometry_policy_authoritative,
+                runtime: spec.decode_quality_runtime_identity.clone(),
+            })),
+            ..Self::from_spec(spec)
+        }
+    }
+
     pub fn from_spec(spec: &LoadSpec) -> Self {
         Self {
+            video_source: None,
             weights: spec.weights.clone(),
             resolved_route: spec.resolved_route.clone(),
             quant: spec.quantize,

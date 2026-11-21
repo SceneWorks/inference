@@ -105,6 +105,9 @@ pub mod moss_image_edit;
 pub mod numeric;
 pub mod registry;
 pub mod render;
+pub use render::video_plan::{
+    VideoPhaseLayout, VideoPlanLayout, VideoPlanRegistration, VideoReferenceLayout, VideoRenderPlan,
+};
 pub use render::{
     MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,
     RenderPlanRegistration, RenderRun, RenderStage,

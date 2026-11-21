@@ -161,7 +161,7 @@ impl<S, P> VideoDenoisePhase<S, P> {
         }
         self.validate()?;
         if let Some(scope) = scope.as_deref_mut() {
-            scope.enter_render_phase(MemoryPhase::Denoise, &self.identity)?;
+            scope.enter_video_phase(&self.identity, self.latent_frames)?;
         }
         Ok(ActiveVideoDenoiseScope(scope))
     }
