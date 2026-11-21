@@ -89,6 +89,7 @@ class WanPlanningTests(unittest.TestCase):
             env = pair.build_env(SimpleNamespace(backend="darwin-mlx"))
         self.assertEqual(env, {"CARGO_INCREMENTAL": "0", "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
                                "MACOSX_DEPLOYMENT_TARGET": "26.2"})
+        self.assertIn("mlx-gen/test-support", pair.case_row("mlx")["cargo_features"])
         self.assertEqual(pair.LANES["candle-cuda"], ["self-hosted", "windows", "cuda", "real-weights"])
         self.assertEqual(len(pair.CASES["candle-cuda"]), 1)
         self.assertEqual(pair.fixture_directory(Path("work"), pair.CASES["mlx"][1]),

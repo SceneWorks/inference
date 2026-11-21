@@ -86,7 +86,7 @@ def case_row(backend):
     package = PACKAGE[backend]
     target = package.replace("-", "_")
     return {"package": package, "target": target, "target_kind": "lib", "fqn": FQN,
-            "cargo_features": ["model-inference-proof"] + (["cuda"] if backend == "candle-cuda" else []),
+            "cargo_features": ["model-inference-proof", "cuda" if backend == "candle-cuda" else "mlx-gen/test-support"],
             "cargo_target_metadata": {"name": target, "kind": ["lib"], "crate_types": ["lib"]},
             "backend": backend, "expected_devices": ["mlx-metal" if backend == "mlx" else "candle-cuda"],
             "execution_role": "direct"}
