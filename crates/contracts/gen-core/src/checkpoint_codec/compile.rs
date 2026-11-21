@@ -228,6 +228,17 @@ pub fn compile_logical_weight_plan_with_metadata(
                 continue;
             }
             let format = match header.dtype {
+                Dtype::F8_E4M3
+                    if header.shape.len() == 2
+                        && header.shape[0] > 1
+                        && by_name
+                            .get(format!("{base}.weight_scale").as_str())
+                            .is_some_and(|s| {
+                                s.shape == [header.shape[0]] && s.dtype == Dtype::F32
+                            }) =>
+                {
+                    ComfyQuantFormat::Fp8Rowwise
+                }
                 Dtype::F8_E4M3 => ComfyQuantFormat::Float8E4M3Fn,
                 Dtype::F8_E5M2 => ComfyQuantFormat::Float8E5M2,
                 _ => continue,
@@ -410,7 +421,9 @@ pub fn compile_logical_weight_plan_with_metadata(
         if let Some(descriptor) = descriptor {
             let expected_dtype = match descriptor.format {
                 ComfyQuantFormat::Int8TensorwisePerRow | ComfyQuantFormat::ConvRotInt8 => Dtype::I8,
-                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
+                ComfyQuantFormat::Float8E4M3Fn
+                | ComfyQuantFormat::Fp8Rowwise
+                | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
                 ComfyQuantFormat::Float8E5M2 => Dtype::F8_E5M2,
                 // NVFP4 packs two E2M1 codes per byte; the file has no 4-bit dtype to declare.
                 ComfyQuantFormat::Nvfp4 => Dtype::U8,
@@ -518,6 +531,20 @@ pub fn compile_logical_weight_plan_with_metadata(
                     }
                 }
                 match descriptor.format {
+                    ComfyQuantFormat::Fp8Rowwise => {
+                        if header.shape.len() != 2
+                            || scale.shape != [header.shape[0]]
+                            || scale.dtype != Dtype::F32
+                            || input_scale.is_some()
+                            || descriptor.full_precision_matrix_mult
+                        {
+                            return Err(LogicalWeightPlanError::CompanionMalformed{physical_key:scale_key,defect:"FP8R requires one F32 scale per output row and dynamic input calibration".to_owned()});
+                        }
+                        (
+                            TensorCodecSpec::RowwiseFp8 { scale: scale_key },
+                            header.shape.clone(),
+                        )
+                    }
                     ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2 => {
                         if !scalar_dtype(scale) || !scalar_scale_shape_ok(&scale.shape) {
                             return Err(LogicalWeightPlanError::CompanionMalformed {
@@ -832,7 +859,8 @@ pub fn compile_logical_weight_plan_with_metadata(
                         consume_companion(companion_header, role, &header.name, retained);
                     }
                 }
-                TensorCodecSpec::Mxfp8 { scale, .. }
+                TensorCodecSpec::RowwiseFp8 { scale }
+                | TensorCodecSpec::Mxfp8 { scale, .. }
                 | TensorCodecSpec::ConvRotInt8 { scale, .. }
                 | TensorCodecSpec::Int8PerRow { scale, .. } => {
                     let scale_header = by_name[scale.as_str()];

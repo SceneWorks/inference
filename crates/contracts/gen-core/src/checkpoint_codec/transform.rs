@@ -528,7 +528,9 @@ pub(super) fn resolve_logical_transform(
             if output.half_swap
                 && !matches!(
                     codec,
-                    TensorCodecSpec::ConvRotInt8 { .. } | TensorCodecSpec::ScalarFp8 { .. }
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                        | TensorCodecSpec::RowwiseFp8 { .. }
+                        | TensorCodecSpec::ScalarFp8 { .. }
                 )
             {
                 return Err(LogicalTransformError::HalfSwapOnPackedResidency {

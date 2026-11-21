@@ -162,8 +162,8 @@ pub use checkpoint_codec::{
     LogicalWeightPlan, LogicalWeightPlanError, LogicalWeightReceipt, PlannedResidency,
     ResidencyMode, ResidentTensorHeadersError, ScalarScaleSource, StoredTensorFormat,
     TensorCodecSpec, WeightEncoding, COMFY_QUANT_CODECS, DENSE_BF16_CODEC, DENSE_CODECS,
-    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
-    GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
+    FP8_E5M2_SCALAR_CODEC, GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 pub use checkpoint_facts::{
     CheckpointFactsSink, CheckpointWeightFacts, CheckpointWeightFactsError,

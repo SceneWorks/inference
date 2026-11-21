@@ -17,7 +17,7 @@ impl Generator for ReceiptGenerator {
         inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<crate::moss_image::MossImageAdvancedOutput> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .generate_moss_image_edit(request, inputs, progress)
         })
@@ -28,7 +28,7 @@ impl Generator for ReceiptGenerator {
         inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedMossImageEdit> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .generate_moss_image_edit_with_execution_report(request, inputs, progress)
         })
@@ -92,20 +92,21 @@ impl Generator for ReceiptGenerator {
         context: &MemoryRunContext,
     ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
         self.scope
-            .with(|| self.inner.begin_memory_strategy_request(context))
+            .with_prepared(|| self.inner.begin_memory_strategy_request(context))
     }
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
         self.inner.validate(req)
     }
     fn plan_execution(&self, req: &GenerationRequest) -> Result<ExecutionIdentity> {
-        self.scope.with(|| self.inner.plan_execution(req))
+        self.scope.with_prepared(|| self.inner.plan_execution(req))
     }
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.scope.with(|| self.inner.generate(req, on_progress))
+        self.scope
+            .with_prepared(|| self.inner.generate(req, on_progress))
     }
     fn generate_planned(
         &self,
@@ -114,7 +115,7 @@ impl Generator for ReceiptGenerator {
         scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .generate_planned(request, plan, scope, on_progress)
         })
@@ -126,7 +127,7 @@ impl Generator for ReceiptGenerator {
         scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedGeneration> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .generate_planned_with_execution_report(request, plan, scope, on_progress)
         })
@@ -138,7 +139,7 @@ impl Generator for ReceiptGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.scope
-            .with(|| self.inner.generate_streaming(req, on_chunk, on_progress))
+            .with_prepared(|| self.inner.generate_streaming(req, on_chunk, on_progress))
     }
     fn generate_streaming_with_execution_report(
         &self,
@@ -146,7 +147,7 @@ impl Generator for ReceiptGenerator {
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedGeneration> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .generate_streaming_with_execution_report(req, on_chunk, on_progress)
         })
@@ -157,7 +158,7 @@ impl Generator for ReceiptGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.scope
-            .with(|| self.inner.generate_with_report(req, on_progress))
+            .with_prepared(|| self.inner.generate_with_report(req, on_progress))
     }
     fn generate_with_execution_report(
         &self,
@@ -165,13 +166,15 @@ impl Generator for ReceiptGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedGeneration> {
         self.scope
-            .with(|| self.inner.generate_with_execution_report(req, on_progress))
+            .with_prepared(|| self.inner.generate_with_execution_report(req, on_progress))
     }
     fn open_conversation(
         &self,
         req: &GenerationRequest,
     ) -> Result<Box<dyn ConversationSession + '_>> {
-        let inner = self.scope.with(|| self.inner.open_conversation(req))?;
+        let inner = self
+            .scope
+            .with_prepared(|| self.inner.open_conversation(req))?;
         Ok(Box::new(ReceiptConversation {
             inner,
             scope: self.scope.clone(),
@@ -199,7 +202,7 @@ impl ConversationSession for ReceiptConversation<'_> {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<AudioTrack> {
         self.scope
-            .with(|| self.inner.step(turn, on_chunk, on_progress))
+            .with_prepared(|| self.inner.step(turn, on_chunk, on_progress))
     }
     fn step_with_execution_report(
         &mut self,
@@ -207,12 +210,12 @@ impl ConversationSession for ReceiptConversation<'_> {
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedAudioTurn> {
-        self.scope.with(|| {
+        self.scope.with_prepared(|| {
             self.inner
                 .step_with_execution_report(turn, on_chunk, on_progress)
         })
     }
     fn finish(&mut self) -> Result<()> {
-        self.scope.with(|| self.inner.finish())
+        self.scope.with_prepared(|| self.inner.finish())
     }
 }
