@@ -1,0 +1,95 @@
+// Installed only into each disposable same-job checkout by sga_adapter_comparison.py.
+use mlx_gen::{array::contiguous, weights::Weights, AdapterKind, AdapterSpec, Result};
+use mlx_gen_ltx::{
+    adapters::apply_ltx25_adapters,
+    config::LtxConfig,
+    transformer::{AvDiT, Precision},
+};
+use mlx_rs::{transforms::eval, Array, DeviceType, Dtype, Stream};
+use serde_json::{json, Map, Value};
+use std::{env, fs, path::PathBuf};
+
+#[allow(clippy::too_many_arguments)]
+fn forward_pass(
+    dit: &AvDiT,
+    pass: usize,
+    epoch: u64,
+    v: &Array,
+    a: &Array,
+    vt: &Array,
+    at: &Array,
+    vc: &Array,
+    ac: &Array,
+    vp: &Array,
+    ap: &Array,
+) -> Result<(Array, Array)> {
+    unreachable!("install the source-bound pass bridge")
+}
+
+fn read_bits(array: &Array, shape: &[i32]) -> Result<Vec<u32>> {
+    assert_eq!(array.shape(), shape);
+    let array = contiguous(&array.as_dtype(Dtype::Float32)?)?;
+    eval([&array])?;
+    let actual = Stream::task_local_or_default().get_device()?;
+    assert!(matches!(actual.get_type()?, DeviceType::Gpu));
+    assert_eq!(actual.get_index()?, 0);
+    Ok(array
+        .as_slice::<f32>()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect())
+}
+
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(env::var_os("PAIR_SGA_FIXTURE").ok_or("missing fixture")?);
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing proof output")?);
+    let actual = Stream::task_local_or_default().get_device()?;
+    assert!(matches!(actual.get_type()?, DeviceType::Gpu));
+    assert_eq!(actual.get_index()?, 0);
+    let config = LtxConfig::from_embedded_transformer(&serde_json::from_slice(&fs::read(
+        root.join("config.json"),
+    )?)?);
+    assert_eq!(config.num_layers, 1);
+    let weights = Weights::from_file(root.join("transformer.safetensors"))?;
+    let mut dit = AvDiT::from_weights(&weights, &config, Precision::quant_bf16(4, 64))?;
+    assert_eq!(dit.num_blocks(), 1);
+    let inputs = Weights::from_file(root.join("inputs.safetensors"))?;
+    let v = inputs.require("video")?;
+    let a = inputs.require("audio")?;
+    let vc = inputs.require("video_text")?;
+    let ac = inputs.require("audio_text")?;
+    let vt = Array::from_slice(&[0.5_f32; 2], &[1, 2]);
+    let at = Array::from_slice(&[0.5_f32; 3], &[1, 3]);
+    let vp = Array::from_slice(
+        &[0_f32, 1., 0., 1., 0., 32., 0., 32., 0., 32., 32., 64.],
+        &[1, 3, 2, 2],
+    );
+    let ap = Array::from_slice(&[0_f32, 0.04, 0.04, 0.08, 0.08, 0.12], &[1, 1, 3, 2]);
+    let measure = |dit: &AvDiT, pass, epoch| -> Result<Value> {
+        let (video, audio) = forward_pass(dit, pass, epoch, v, a, &vt, &at, vc, ac, &vp, &ap)?;
+        Ok(
+            json!({"video": read_bits(&video, &[1, 2, 128])?, "audio": read_bits(&audio, &[1, 3, 128])?}),
+        )
+    };
+    let mut results = Map::new();
+    let pass_zero = dit.next_rope_epoch();
+    results.insert("bare".to_owned(), measure(&dit, 0, pass_zero)?);
+
+    let adapter = AdapterSpec::new(root.join("adapter.safetensors"), 1.0, AdapterKind::Lora)
+        .with_pass_scales(vec![0.0, 0.75]);
+    let report = apply_ltx25_adapters(&mut dit, &[adapter], 2)?;
+    assert_eq!(report.applied, 6);
+    assert!(report.skipped.is_empty());
+    for (label, pass) in [("base", 0), ("refine", 1), ("reused", 0)] {
+        results.insert(label.to_owned(), measure(&dit, pass, pass_zero)?);
+    }
+    let result = json!({"device":{"kind":"mlx-metal","index":0}, "applied":report.applied,
+                        "shapes":{"video":[1,2,128],"audio":[1,3,128]}, "passes":[0,1,0], "velocity_bits":results});
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(file, &result)?;
+    println!("SGA_ADAPTER_TIER1_BODY ltx25-av-pass-scales");
+    Ok(())
+}

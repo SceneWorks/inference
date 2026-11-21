@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from scripts.ci import sga_adapter_comparison as compare
+from scripts.ci import ltx_adapter_tier1_fixture as ltx
 from scripts.ci import wan_adapter_tier1_fixture as wan
 
 
@@ -125,6 +126,63 @@ class HeaderTests(unittest.TestCase):
                 (root / other).symlink_to(item)
             with self.assertRaises(ValueError):
                 wan.identify(root)
+
+
+class LtxTests(unittest.TestCase):
+    CUDA = {"selection": "sga-adapter-tier1", "profile": ltx.PROFILE, "download_missing": True,
+            "cuda_device_uuid": "GPU-a123bcde-4321-abcd-abcd-0123456789ab"}
+
+    def test_both_accelerator_lanes_have_explicit_device_authority(self):
+        self.assertIs(compare.request_value("mlx", dict(REQUEST, profile=ltx.PROFILE)), ltx)
+        self.assertIs(compare.request_value("candle-cuda", self.CUDA), ltx)
+        policy = compare.policy_value("candle-cuda", self.CUDA)
+        self.assertEqual((policy["cudaDeviceUuid"], policy["childGpuCapBytes"]),
+                         (self.CUDA["cuda_device_uuid"], 12 * compare.GIB))
+        for invalid in ("0", "../../gpu", None):
+            with self.assertRaises(ValueError):
+                compare.request_value("candle-cuda", dict(self.CUDA, cuda_device_uuid=invalid))
+
+    def test_candle_cuda_pool_is_owned_and_bound_to_device(self):
+        policy = compare.policy_value("candle-cuda", self.CUDA)
+        guard = {"pid": 17, "returncode": 0, "elapsed_seconds": 6, "peak_host_bytes": 20, "peak_gpu_bytes": 8}
+        compare.validate_guard(guard, policy)
+        with self.assertRaises(ValueError):
+            compare.validate_guard(dict(guard, peak_gpu_bytes=None), policy)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.json"
+            pool = {"pid": 17, "cudaDeviceUuid": policy["cudaDeviceUuid"], "poolUsedBytes": 1,
+                    "poolUsedHighBytes": 2, "poolReservedBytes": 3, "poolReservedHighBytes": 5}
+            path.write_text(json.dumps(pool), encoding="utf-8")
+            compare.validate_cuda_pool(path, guard, policy)
+            for changes in ({"pid": 28}, {"cudaDeviceUuid": "wrong"}, {"poolUsedBytes": 0}, {"poolUsedHighBytes": 7}):
+                path.write_text(json.dumps(dict(pool, **changes)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    compare.validate_cuda_pool(path, guard, policy)
+
+    def test_overlay_only_exposes_the_exact_private_forward(self):
+        signature = b"    pub(crate) fn forward_controlled_with_scales(\n"
+        profile = ltx.overlay(lambda _: signature, "head", "mlx", "probe")
+        path = "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/av_dit.rs"
+        self.assertEqual(profile[path], b"    pub fn forward_controlled_with_scales(\n")
+        self.assertEqual(set(profile), {path, "crates/media/mlx-gen/mlx-gen-ltx/src/bin/probe.rs"})
+        with self.assertRaises(ValueError):
+            ltx.overlay(lambda _: signature + signature, "head", "mlx", "probe")
+
+    def test_both_streams_change_only_for_the_later_pass(self):
+        trace = {name: [0] * count for name, count in (("video", 256), ("audio", 384))}
+        later = {name: [1] * len(bits) for name, bits in trace.items()}
+        row = {"device": {"kind": "mlx-metal", "index": 0}, "applied": 6, "shapes": ltx.SHAPES,
+               "passes": [0, 1, 0], "velocity_bits": {"bare": trace, "base": trace, "refine": later, "reused": trace}}
+        out = "SGA_ADAPTER_TIER1_BODY " + ltx.PROFILE
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(json.dumps(row), encoding="utf-8")
+            self.assertEqual(ltx.observe(out, path, "mlx"), row)
+            for stage, wrong in (("refine", dict(later, audio=trace["audio"])), ("reused", later), ("base", later)):
+                velocities = dict(row["velocity_bits"], **{stage: wrong})
+                path.write_text(json.dumps(dict(row, velocity_bits=velocities)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    ltx.observe(out, path, "mlx")
 
 
 if __name__ == "__main__":
