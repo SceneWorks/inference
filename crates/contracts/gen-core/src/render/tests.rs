@@ -1134,6 +1134,37 @@ fn reference(width: u32, height: u32, strength: Option<f32>) -> Conditioning {
     }
 }
 
+#[derive(Default)]
+struct RenderPhaseEntries(Vec<(MemoryPhase, RenderPhaseIdentity)>);
+
+impl MemoryRequestScope for RenderPhaseEntries {
+    fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+        Ok(())
+    }
+    fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+        Ok(())
+    }
+    fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+        Ok(())
+    }
+    fn enter_render_phase(&mut self, phase: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
+        self.0.push((phase, *id));
+        Ok(())
+    }
+    fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
+        Ok(())
+    }
+    fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+        unreachable!()
+    }
+    fn configure_attention(&mut self, _: u32) -> Result<()> {
+        unreachable!()
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+        unreachable!()
+    }
+}
+
 #[test]
 fn multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape() {
     let (base, refine) = hires_requests();
@@ -1191,48 +1222,176 @@ fn multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape() 
     live.conditioning = vec![reference(64, 48, Some(0.3))];
     live.steps = Some(4);
     assert!(second.check_request(&descriptor(), &live).is_err());
+    live.steps = refine.steps;
+    live.source_image = Some(Image {
+        width: 16,
+        height: 16,
+        pixels: vec![0; 16 * 16 * 3],
+    });
+    assert!(second.check_request(&descriptor(), &live).is_err());
+    live.source_image = None;
+    if let Conditioning::Reference { image, .. } = &mut live.conditioning[0] {
+        image.pixels.pop().unwrap();
+    }
+    assert!(second.check_request(&descriptor(), &live).is_err());
 
     // The phase identity of the second pass names its own pass and geometry.
-    struct Identities(Vec<RenderPhaseIdentity>);
-    impl MemoryRequestScope for Identities {
-        fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
-            Ok(())
-        }
-        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
-            Ok(())
-        }
-        fn enter_render_phase(&mut self, _: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
-            self.0.push(*id);
-            Ok(())
-        }
-        fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
-            Ok(())
-        }
-        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
-            unreachable!()
-        }
-        fn configure_attention(&mut self, _: u32) -> Result<()> {
-            unreachable!()
-        }
-        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
-            unreachable!()
-        }
-    }
-    let mut scope = Identities(Vec::new());
+    let mut scope = RenderPhaseEntries::default();
     let cancel = CancelFlag::new();
     {
         let run = RenderRun::new(second, &cancel, Some(&mut scope));
         run.encode(|| Ok::<_, Error>(())).unwrap();
     }
-    assert_eq!(scope.0[0].pass, 1);
+    let [(phase, identity)] = scope.0.as_slice() else {
+        panic!("expected one phase");
+    };
+    assert_eq!(*phase, MemoryPhase::Conditioning);
+    assert_eq!(identity.pass, 1);
     assert_eq!(
-        (scope.0[0].geometry.width, scope.0[0].geometry.height),
+        (identity.geometry.width, identity.geometry.height),
         (64, 48)
     );
-    assert_eq!(scope.0[0].geometry.reference_count, 1);
+    assert_eq!(identity.geometry.reference_count, 1);
+}
+
+#[test]
+fn exact_multi_pass_plan_retains_pins_and_terminal_reference_controls_across_placement() {
+    use crate::{LoadShape, LoadShapeDeclarationResult, OffloadPolicy};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dit.safetensors");
+    std::fs::write(&path, [1]).unwrap();
+    let mut spec = LoadSpec::new(WeightsSource::File(path.clone()));
+    let unprepared = spec.clone();
+    spec.prepare_file_sources().unwrap();
+    let (base, refine) = hires_requests();
+    let produced = ProducedReference {
+        strength: Some(1.0),
+        ..produced(refine.width, refine.height)
+    };
+    let passes = [
+        PlannedPassRequest {
+            request: &base,
+            produced_reference: None,
+        },
+        PlannedPassRequest {
+            request: &refine,
+            produced_reference: Some(produced),
+        },
+    ];
+    let compile = |spec: &LoadSpec, req: &GenerationRequest| {
+        let schedule = if req.conditioning.is_empty() {
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0)
+        } else {
+            pass(vec![0.0], 0, 0.0)
+        };
+        RenderPlan::packed_image_trajectory_with_exact_load(&descriptor(), spec, req, schedule)
+            .map(Some)
+    };
+    assert!(matches!(
+        compile(&unprepared, &base),
+        Err(Error::Unsupported(message)) if message.contains("finalized file source pins")
+    ));
+    assert!(trajectory(&base)
+        .unwrap()
+        .unwrap()
+        .check_load_spec(&spec)
+        .is_err());
+    let plan = MultiPassRenderPlan::compile(&passes, |req| compile(&spec, req))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.total_executed_steps(), 2);
+    plan.check_load_spec(&spec).unwrap();
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&spec))
+        .is_err());
+    let mut placed = spec.clone().with_offload_policy(OffloadPolicy::Sequential);
+    placed.load_shape = LoadShape::DeferredMaterialization;
+    placed.load_shape_declaration_result = LoadShapeDeclarationResult::Eligible;
+    assert!(plan.check_load_spec(&placed).is_err());
+    let rebound = plan.clone().rebind_load_placement(&placed).unwrap();
+    rebound.check_load_spec(&placed).unwrap();
+    assert!(rebound.check_load_spec(&spec).is_err());
+
+    let [first, second] = rebound.passes() else {
+        panic!("expected two passes");
+    };
+    assert_eq!((first.reference_count(), second.reference_count()), (0, 1));
+    assert_eq!(second.produced_reference(), Some(produced));
+    assert_eq!(second.denoise_sigmas(), &[0.0]);
+    assert_eq!(second.executed_steps(), 0);
+    let mut scope = RenderPhaseEntries::default();
+    let cancel = CancelFlag::new();
+    {
+        let run = RenderRun::new(second, &cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, Error>(())).unwrap();
+        let images = run
+            .images(
+                &mut |_| panic!("terminal reference should not report denoise progress"),
+                Ok::<_, Error>,
+                |seed, initial, _| {
+                    assert_eq!(initial, seed);
+                    Ok(initial)
+                },
+                |seed, terminal, _| {
+                    assert_eq!(terminal, seed);
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+        assert_eq!(images, [second.base_seed()]);
+    }
+    assert_eq!(
+        scope
+            .0
+            .into_iter()
+            .map(|(phase, id)| (phase, id.pass))
+            .collect::<Vec<_>>(),
+        [(MemoryPhase::Conditioning, 1), (MemoryPhase::Decode, 1)]
+    );
+    let live = GenerationRequest {
+        conditioning: vec![reference(refine.width, refine.height, Some(1.0))],
+        ..refine.clone()
+    };
+    second.check_request(&descriptor(), &live).unwrap();
+    for changed in [
+        GenerationRequest {
+            strength: Some(0.8),
+            ..live.clone()
+        },
+        GenerationRequest {
+            text_style_gain: Some(0.8),
+            ..live.clone()
+        },
+        GenerationRequest {
+            pag: Some(crate::PagConfig::default()),
+            ..live.clone()
+        },
+        GenerationRequest {
+            output_channels: crate::OutputChannels::Rgba,
+            ..live
+        },
+    ] {
+        assert!(second.check_request(&descriptor(), &changed).is_err());
+    }
+
+    std::fs::write(path, [2, 3]).unwrap();
+    let mut repinned = unprepared;
+    repinned.prepare_file_sources().unwrap();
+    assert!(plan.clone().rebind_load_placement(&repinned).is_err());
+    assert!(first
+        .clone()
+        .bind_load(&repinned)
+        .check_load_spec(&repinned)
+        .is_err());
+    assert!(
+        MultiPassRenderPlan::compile(&passes, |req| if req.conditioning.is_empty() {
+            compile(&spec, req)
+        } else {
+            compile(&repinned, req)
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -1283,6 +1442,35 @@ fn multi_pass_plan_refuses_invalid_pass_shapes_before_load() {
         },
     ])
     .is_err());
+    let with_source_image = GenerationRequest {
+        source_image: Some(Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0; 16 * 16 * 3],
+        }),
+        ..refine.clone()
+    };
+    assert!(compile(&[
+        first,
+        PlannedPassRequest {
+            request: &with_source_image,
+            produced_reference: Some(produced(64, 48)),
+        },
+    ])
+    .is_err());
+    assert!(matches!(
+        compile(&[
+            first,
+            PlannedPassRequest {
+                request: &refine,
+                produced_reference: Some(ProducedReference {
+                    strength: Some(f32::NAN),
+                    ..produced(64, 48)
+                }),
+            },
+        ]),
+        Err(Error::Unsupported(message)) if message.contains("produced reference strength")
+    ));
     // An oversized placeholder and a prompt batch are refused.
     assert!(compile(&[
         first,

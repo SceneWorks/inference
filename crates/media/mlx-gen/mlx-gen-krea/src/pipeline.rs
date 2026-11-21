@@ -364,11 +364,7 @@ fn phase_arguments_for_test(guidance: f32) -> PhaseArguments {
 /// Count-invariant img2img render state (F-073): the seed-independent clean reference latent (VAE-encoded
 /// once) plus the step-invariant prep(s). Built once by [`KreaHeavy::prepare_img2img`].
 pub struct Img2ImgPlan {
-    pub(crate) sigmas: Option<Vec<f32>>,
-    pub(crate) guidance: f32,
-    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
-    prep_pos: JointPrep,
-    prep_neg: Option<JointPrep>,
+    pub(crate) denoise: T2iPlan,
     clean: Array,
 }
 
@@ -617,8 +613,8 @@ impl KreaHeavy {
             dit,
             latent,
             timestep,
-            &plan.prep_pos,
-            plan.prep_neg.as_ref(),
+            &plan.denoise.prep_pos,
+            plan.denoise.prep_neg.as_ref(),
             guidance,
             pag_step,
             window,
@@ -811,6 +807,32 @@ impl KreaHeavy {
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let sigmas = &full[..keep.min(full.len())];
+        let lat = self.denoise_turbo_from(
+            plan,
+            sigmas,
+            noise,
+            opts,
+            opts.seed,
+            cancel,
+            preview,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder, opts, cancel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_turbo_from(
+        &self,
+        plan: &T2iPlan,
+        sigmas: &[f32],
+        latent: Array,
+        opts: &TurboOptions,
+        seed: u64,
+        cancel: &CancelFlag,
+        preview: &PreviewSink,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
@@ -821,11 +843,11 @@ impl KreaHeavy {
         let canonical_solver =
             mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
         let mut eval_idx = 0usize;
-        let lat = run_krea_sampler(
+        run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
-            noise,
-            opts.seed,
+            latent,
+            seed,
             cancel,
             &previews,
             on_progress,
@@ -852,9 +874,106 @@ impl KreaHeavy {
                 )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
-        )?;
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder, opts, cancel)
+        )
+    }
+
+    /// Run the ordinary Turbo body with the compiled schedule and seed sequence. Reference
+    /// encoding and text prep are shared across the count loop, including a zero-step reference.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_turbo_planned(
+        &self,
+        run: &RenderRun<'_, '_>,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        reference: Option<&Image>,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let (mut prep, clean) = match reference {
+            Some(image) => {
+                let Img2ImgPlan { denoise, clean } =
+                    self.prepare_img2img(ctx_pos, ctx_neg, image, opts.width, opts.height)?;
+                (denoise, Some(clean))
+            }
+            None => (
+                self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?,
+                None,
+            ),
+        };
+        prep.guidance = run.plan().guidance();
+        prep.pag = pag.cloned();
+        let denoise = run.plan().executed_steps() > 0;
+        if denoise {
+            mlx_rs::transforms::eval(
+                prep.prep_pos
+                    .conditioning_arrays()
+                    .into_iter()
+                    .chain(
+                        prep.prep_neg
+                            .iter()
+                            .flat_map(JointPrep::conditioning_arrays),
+                    )
+                    .chain(clean.iter()),
+            )?;
+        } else if let Some(clean) = &clean {
+            // A terminal reference pass still encodes the source and skips unused DiT text fusion.
+            mlx_rs::transforms::eval([clean])?;
+        }
+        run.end_conditioning()?;
+
+        let sigmas = run.plan().denoise_sigmas();
+        let output_index = Cell::new(0usize);
+        run.images(
+            on_progress,
+            |seed| {
+                let noise = init_noise(opts.height, opts.width, seed)?;
+                match &clean {
+                    Some(clean) => add_noise_by_interpolation(clean, &noise, sigmas[0]),
+                    None => Ok(noise),
+                }
+            },
+            |seed, initial, progress| {
+                if !denoise {
+                    return Ok(initial);
+                }
+                mlx_gen::image_execution::with_output_index(output_index.get(), || {
+                    let latent = self.denoise_turbo_from(
+                        &prep,
+                        sigmas,
+                        initial,
+                        opts,
+                        seed,
+                        &req.cancel,
+                        &req.preview,
+                        progress,
+                    )?;
+                    run.with_active_scope(|_| {
+                        mlx_rs::transforms::eval([&latent]).map_err(Error::from)?;
+                        Ok(())
+                    })?;
+                    denoise_exit_fault(&latent, opts)?;
+                    Ok(latent)
+                })
+            },
+            |_, latent, progress| {
+                let index = output_index.get();
+                output_index.set(index + 1);
+                mlx_gen::image_execution::with_output_index(index, || {
+                    progress(Progress::Decoding);
+                    let image = self.decode_latents_with_tiling(
+                        &latent,
+                        decoder,
+                        opts.decode_tiling()?.as_ref(),
+                        &req.cancel,
+                    )?;
+                    decode_exit_fault(opts)?;
+                    Ok(image)
+                })
+            },
+        )
     }
 
     /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
@@ -1122,19 +1241,8 @@ impl KreaHeavy {
         // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
         let image_nchw = preprocess_init_image(init, width, height)?;
         let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
-        // Preps built from the geometry latent (shape-identical to the per-seed blended `x_start`).
-        let geom = Self::geom_latent(width, height)?;
-        let prep_pos = self.dit.prepare(ctx_pos, None, &geom)?;
-        let prep_neg = match ctx_neg {
-            Some(nc) => Some(self.dit.prepare(nc, None, &geom)?),
-            None => None,
-        };
         Ok(Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos,
-            prep_neg,
+            denoise: self.prepare_t2i(ctx_pos, ctx_neg, width, height)?,
             clean,
         })
     }
@@ -1158,7 +1266,7 @@ impl KreaHeavy {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         // Start step from strength; blend the clean latent with noise at σ_k, then denoise the window.
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
+        let full = plan.denoise.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): the caller resolved `keep` against THIS full schedule
         // with THIS `start` (via `flow_capture_for_request`'s `start_step`), so truncating the img2img
@@ -1168,49 +1276,16 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
-        let block_window = self
-            .dit
-            .block_window(opts.transformer_window_size, cancel)?;
-        let attention = opts.attention_plan(cancel);
-        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
-        let previews = KreaPreview::new(preview, sigmas);
-        let total_steps = sigmas.len().saturating_sub(1);
-        let canonical_solver =
-            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
-        let mut eval_idx = 0usize;
-        let lat = run_krea_sampler(
-            opts.sampler.as_deref(),
+        let lat = self.denoise_turbo_from(
+            &plan.denoise,
             sigmas,
             x_start,
+            opts,
             opts.seed,
             cancel,
-            &previews,
+            preview,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let current_eval = eval_idx;
-                eval_idx += 1;
-                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
-                    canonical_solver,
-                    current_eval,
-                    total_steps,
-                );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
-                let v = Self::prepared_cfg_velocity(
-                    &self.dit,
-                    x,
-                    &t,
-                    &plan.prep_pos,
-                    plan.prep_neg.as_ref(),
-                    plan.guidance,
-                    pag_step,
-                    block_window,
-                    attention,
-                )?;
-                Ok(v.as_dtype(Dtype::Float32)?)
-            },
         )?;
-
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder, opts, cancel)
     }
@@ -1716,7 +1791,7 @@ impl KreaHeavy {
             opts.height,
             opts.scheduler.as_deref(),
         );
-        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
+        let full = plan.denoise.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): `keep` was resolved against THIS schedule + `start`, so
         // `full[start..keep]` exits at `full[keep-1]` — the decoder's degrade σ. `keep == full.len()`
@@ -1752,7 +1827,7 @@ impl KreaHeavy {
                     current_eval,
                     total_steps,
                 );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
+                let pag_step = PagStep::for_step(plan.denoise.pag.as_ref(), step_idx, total_steps);
                 let v = Self::base_img2img_velocity_budgeted(
                     &self.dit,
                     x,
@@ -2764,6 +2839,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planned_turbo_prepares_reference_and_records_actual_phase_exits() {
+        let (_, body) = include_str!("pipeline.rs")
+            .split_once("    pub(crate) fn render_turbo_planned(")
+            .expect("planned Turbo production route");
+        let (body, _) = body.split_once("\n    }\n").expect("function end");
+        let offset = |token: &str| {
+            body.find(token)
+                .unwrap_or_else(|| panic!("missing {token}"))
+        };
+        let active = offset("if denoise {");
+        assert!(offset("let denoise = run.plan().executed_steps() > 0;") < active);
+        let zero = offset("else if let Some(clean) = &clean");
+        let end_conditioning = offset("run.end_conditioning()");
+        assert!(offset("self.prepare_img2img(") < active);
+        assert!(offset("self.prepare_t2i(") < active);
+        for prepared in [
+            "transforms::eval(",
+            "prep.prep_pos",
+            "prep.prep_neg",
+            ".chain(clean.iter())",
+        ] {
+            assert!((active..zero).contains(&offset(prepared)));
+        }
+        assert!((zero..end_conditioning).contains(&offset("eval([clean])")));
+        let run_images = offset("run.images(");
+        let identity = offset("if !denoise {\n                    return Ok(initial);");
+        let sample = offset("self.denoise_turbo_from(");
+        assert!(end_conditioning < run_images);
+        assert!(run_images < identity && identity < sample);
+        assert!(sample < offset("denoise_exit_fault("));
+        assert!(offset("self.decode_latents_with_tiling(") < offset("decode_exit_fault("));
+    }
+
     /// sc-22738: every non-control route reaches the exit pair, because each one calls the sampler
     /// and then hands the produced latent straight to `decode_latents` — nothing between them.
     #[test]
@@ -2791,8 +2900,11 @@ mod tests {
             // occurrence count of the sampler call in this file, so these probes must not add to it.
             let sampler = concat!("run_krea_sampler", "(");
             let phase = concat!("Self::denoise_phase_from", "(");
+            let turbo = concat!("self.denoise_turbo_from", "(");
             assert!(
-                body[..decode].contains(sampler) || body[..decode].contains(phase),
+                [sampler, phase, turbo]
+                    .iter()
+                    .any(|seam| body[..decode].contains(seam)),
                 "{route} must denoise before it reaches the exit pair"
             );
         }
@@ -2912,19 +3024,11 @@ mod tests {
         let cfg_t2i = t2i_plan(true).unwrap();
         let plain_t2i = t2i_plan(false).unwrap();
         let cfg_img2img = Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
-            prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
+            denoise: cfg_t2i.clone(),
             clean: latent.clone(),
         };
         let plain_img2img = Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
-            prep_neg: None,
+            denoise: plain_t2i.clone(),
             clean: latent.clone(),
         };
         let reference = Array::from_slice(
@@ -3588,8 +3692,8 @@ mod tests {
         );
         assert_eq!(
             source.matches("run_krea_sampler(").count(),
-            13,
-            "seven production sites, five weight-free test calls, and this literal"
+            12,
+            "six production sites, five weight-free test calls, and this literal"
         );
     }
 

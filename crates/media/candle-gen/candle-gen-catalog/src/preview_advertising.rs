@@ -796,10 +796,8 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
             dir: "candle-gen-krea",
             register: candle_gen_krea::register_providers,
             denoise: Denoise::Shared,
-            // sc-16950's inventory, restated as counts so a blanked route is a diff here too: the
-            // pose-control route, the seven `pipeline` render routes (Turbo three-stage / t2i /
-            // img2img, Raw t2i / multi-phase / img2img, and the shared Turbo+Raw edit), and the one
-            // deliberately dark trainer site.
+            // The preview calls cover pose-control, six pipeline sampler sites, and the separate
+            // trainer render. Turbo text-to-image and img2img use one shared sampler site.
             routes: &[
                 FileRoutes {
                     file: "control_provider.rs",
@@ -809,7 +807,7 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
                 },
                 FileRoutes {
                     file: "pipeline.rs",
-                    hooked: 7,
+                    hooked: 6,
                     direct: 0,
                     dark: &[],
                 },
@@ -3104,9 +3102,9 @@ fn the_source_scan_resolves_the_krea_wiring_it_claims_to_verify() {
         tally(true),
         [
             ("control_provider.rs".to_string(), 1),
-            ("pipeline.rs".to_string(), 7),
+            ("pipeline.rs".to_string(), 6),
         ],
-        "the seven pipeline render routes plus the pose-control route must all pass a hook"
+        "all six pipeline sampler sites and the pose-control route must pass a hook"
     );
     assert_eq!(
         tally(false),
