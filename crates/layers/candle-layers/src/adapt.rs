@@ -1223,7 +1223,7 @@ impl AdaptLinear {
         }
     }
 
-    /// Whether the base is a CUDA [`crate::eight_bit_linear::Fp8Linear`].
+    /// Whether the base is a CUDA `Fp8Linear`.
     pub fn is_fp8(&self) -> bool {
         self.base.is_fp8()
     }
@@ -1240,7 +1240,7 @@ impl AdaptLinear {
         }
     }
 
-    /// Whether the base is a CUDA [`crate::eight_bit_linear::Int8Linear`].
+    /// Whether the base is a CUDA `Int8Linear`.
     pub fn is_int8(&self) -> bool {
         self.base.is_int8()
     }
