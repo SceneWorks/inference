@@ -159,7 +159,7 @@ impl Fp8Linear {
         self.forward_with_bias(x, self.bias.as_ref())
     }
 
-    /// Checkpoint execution rounds the scaled accumulator and optional bias once to the consuming dtype.
+    /// Checkpoint matmul rounds to the consuming dtype before adding bias, as in candle_nn::Linear.
     /// The legacy dynamically quantized recipe returns BF16 as before.
     pub fn forward_with_bias(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         use candle_core::DType;
@@ -168,7 +168,7 @@ impl Fp8Linear {
         if !matches!(output_dtype, DType::BF16 | DType::F16 | DType::F32) {
             candle_core::bail!("unsupported FP8 projection output {output_dtype:?}");
         }
-        let f32_accumulator = source && (output_dtype != DType::BF16 || bias.is_some());
+        let f32_accumulator = source && output_dtype != DType::BF16;
         let (flat, restore) = flatten_tokens(x)?;
         if flat.dim(1)? != self.dims.1 || !flat.device().same_device(self.device()) {
             candle_core::bail!("FP8 input width or device differs from weight");
@@ -197,12 +197,12 @@ impl Fp8Linear {
                     .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)?
             }
         };
-        let y = restore(y)?;
+        let y = restore(y)?.to_dtype(output_dtype)?;
         let y = match bias {
             Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?)?,
             None => y,
         };
-        __model_proof_output!(y.to_dtype(output_dtype))
+        __model_proof_output!(Ok(y))
     }
 }
 

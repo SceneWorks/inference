@@ -784,7 +784,8 @@ impl ProviderRegistry {
         transforms,
         TransformRegistration,
         "transform",
-        dyn Transform
+        dyn Transform,
+        super::media_receipts::load_transform
     );
     explicit_registry_kind!(
         audio_transforms,
@@ -809,7 +810,8 @@ impl ProviderRegistry {
         captioners,
         CaptionerRegistration,
         "captioner",
-        dyn Captioner
+        dyn Captioner,
+        super::media_receipts::load_captioner
     );
     explicit_registry_kind!(
         transcribers,
@@ -826,7 +828,8 @@ impl ProviderRegistry {
         image_embedders,
         ImageEmbedderRegistration,
         "image embedder",
-        dyn ImageEmbedder
+        dyn ImageEmbedder,
+        super::media_receipts::load_image_embedder
     );
     explicit_registry_kind!(
         text_embedders,
@@ -834,7 +837,8 @@ impl ProviderRegistry {
         text_embedders,
         TextEmbedderRegistration,
         "text embedder",
-        dyn TextEmbedder
+        dyn TextEmbedder,
+        super::media_receipts::load_text_embedder
     );
     explicit_registry_kind!(
         voice_embedders,

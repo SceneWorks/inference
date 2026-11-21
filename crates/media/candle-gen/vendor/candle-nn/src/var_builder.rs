@@ -83,6 +83,16 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    fn native_linear_weight_flattened(
+        &self,
+        _name: &str,
+        _shape: &[usize],
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
+
     fn contains_tensor(&self, name: &str) -> bool;
 }
 
@@ -114,6 +124,16 @@ pub trait SimpleBackend: Send + Sync {
         &self,
         _name: &str,
         _shape: (usize, usize),
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
+
+    fn native_linear_weight_flattened(
+        &self,
+        _name: &str,
+        _shape: &[usize],
         _dtype: DType,
         _dev: &Device,
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
@@ -159,6 +179,17 @@ impl Backend for Box<dyn SimpleBackend + '_> {
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         self.as_ref()
             .native_linear_weight_transposed(name, shape, dtype, dev)
+    }
+
+    fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        self.as_ref()
+            .native_linear_weight_flattened(name, shape, dtype, dev)
     }
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
@@ -273,6 +304,19 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         shape: (usize, usize),
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         self.data.backend.native_linear_weight_transposed(
+            &self.path(name),
+            shape,
+            self.dtype,
+            self.device(),
+        )
+    }
+
+    pub fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        self.data.backend.native_linear_weight_flattened(
             &self.path(name),
             shape,
             self.dtype,
@@ -999,6 +1043,22 @@ impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         let name = self.renamer.rename(name);
         self.inner.data.backend.native_linear_weight_transposed(
+            &self.inner.path(&name),
+            shape,
+            dtype,
+            dev,
+        )
+    }
+
+    fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        let name = self.renamer.rename(name);
+        self.inner.data.backend.native_linear_weight_flattened(
             &self.inner.path(&name),
             shape,
             dtype,
