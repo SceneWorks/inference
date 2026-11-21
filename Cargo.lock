@@ -458,6 +458,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

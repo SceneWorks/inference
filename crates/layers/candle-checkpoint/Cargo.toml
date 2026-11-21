@@ -13,6 +13,9 @@ sceneworks-gen-core.workspace = true
 safetensors = "0.7"
 serde_json.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]

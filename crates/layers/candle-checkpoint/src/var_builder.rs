@@ -255,21 +255,23 @@ impl ProjectionSource {
         selected: impl Fn(&str) -> bool,
         mapping: SourceMapping,
     ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
-        // The common dense path needs only the mmap's existing index. Source schemas and
-        // companion/metadata scope are validated once by the portable shard planner.
-        if !st.tensors().into_iter().any(|(k, v)| {
-            (selected(&k) && matches!(v.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2))
-                || k.ends_with(".comfy_quant")
-                || (k.ends_with(".weight_scale")
-                    && st
-                        .get(&format!("{}.weight", k.trim_end_matches(".weight_scale")))
-                        .is_ok())
+        // A plain checkpoint needs only the mmap's existing index. This is a conservative
+        // fast path: only the portable selector resolves companion ownership, metadata and
+        // physical key spelling across shards.
+        let tensors = st.tensors();
+        if !tensors.iter().any(|(name, view)| {
+            (selected(name)
+                && matches!(
+                    view.dtype(),
+                    Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::I8 | Dtype::U8
+                ))
+                || gen_core::checkpoint_codec::projection_companion_base(name).is_some()
         }) {
             return Ok(Err(st));
         }
         let tables = st.quantization_tables()?;
         let mut headers = BTreeMap::new();
-        for (name, view) in st.tensors() {
+        for (name, view) in tensors {
             let header = gen_core::weightsmeta::SafetensorsTensorHeader {
                 name: name.clone(),
                 dtype: gen_core::weightsmeta::Dtype::parse(&format!("{:?}", view.dtype()))
@@ -1002,6 +1004,71 @@ pub fn mmap_var_builder_with_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_builder_recognizes_metadata_only_convrot_on_underscore_projection() {
+        use safetensors::tensor::{serialize_to_file, TensorView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mixed.safetensors");
+        let codes = [0u8; 16 * 64];
+        let scales = 1f32.to_le_bytes().repeat(16);
+        let dense = 3.5f32.to_le_bytes();
+        let key = "attn.in_proj_weight";
+        let spec = serde_json::json!({"layers": {"attn.in_proj": {
+            "format": "int8_tensorwise", "convrot": true, "per_row": true, "convrot_groupsize": 64
+        }}});
+        serialize_to_file(
+            [
+                (
+                    key,
+                    TensorView::new(Dtype::I8, vec![16, 64], &codes).unwrap(),
+                ),
+                (
+                    "attn.in_proj.weight_scale",
+                    TensorView::new(Dtype::F32, vec![16, 1], &scales).unwrap(),
+                ),
+                (
+                    "dense.weight",
+                    TensorView::new(Dtype::F32, vec![1, 1], &dense).unwrap(),
+                ),
+            ],
+            Some(std::collections::HashMap::from([(
+                "_quantization_metadata".to_owned(),
+                spec.to_string(),
+            )])),
+            &file,
+        )
+        .unwrap();
+        let files = [file];
+        // A component may select just the unrelated plain parameter in this same mapped file.
+        // SAFETY: this test owns the file and keeps it unchanged while mapped.
+        let st = unsafe { MmapedSafetensors::multi(&files).unwrap() };
+        let plain = ProjectionSource::from_mapped_selected(st, &files, &Device::Cpu, |key| {
+            key == "dense.weight"
+        })
+        .unwrap()
+        .err()
+        .expect("unrelated dense selection must stay plain");
+        assert_eq!(
+            plain
+                .load("dense.weight", &Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            [[3.5]]
+        );
+        // The full normal constructor must dispatch to the codec planner and refuse the CPU's
+        // missing native integer operator before a plain Candle reader sees the original I8 codes.
+        let error = mmap_var_builder(&files, DType::F32, &Device::Cpu)
+            .err()
+            .expect("ConvRot cannot execute on the CPU")
+            .to_string();
+        assert!(
+            error.contains(key) && error.contains("ConvRot INT8 requires native"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn failed_convrot_projection_does_not_publish_packed_execution() {
         use safetensors::tensor::TensorView;
