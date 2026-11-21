@@ -77,12 +77,35 @@ fn reference_kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>)
 
 /// Source operands and load-scoped rotation cache. Both engines mark operands through their
 /// normal access-tracking weight map so block eviction and materialization keep their semantics.
-pub trait ProjectionWeights {
+pub trait MlxWeightSource {
+    fn require(&self, key: &str) -> Result<&Array> {
+        self.get(key)
+            .ok_or_else(|| crate::Error::Msg(format!("missing tensor {key}")))
+    }
+    fn planned_fp8(&self, _base: &str) -> Option<&crate::fp8::Fp8Linear> {
+        None
+    }
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.rotation_cache()
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
+    }
     fn get(&self, key: &str) -> Option<&Array>;
     fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>>;
     fn planned_geometry(&self, _base: &str) -> Option<ConvRotInt8> {
         None
     }
+}
+
+pub fn descriptor(blob: &Array, base: &str) -> Result<gen_core::comfy_quant::ComfyQuantDescriptor> {
+    if blob.dtype() != Dtype::Uint8 || blob.ndim() != 1 || blob.size() > MAX_DESCRIPTOR_BYTES {
+        return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
+    }
+    blob.eval()?;
+    gen_core::comfy_quant::parse_comfy_quant_descriptor(blob.as_slice::<u8>())
+        .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))
 }
 
 /// Restore a complete declaration for consumers that rename keys through a raw MLX map.
@@ -126,14 +149,27 @@ pub fn attach_metadata(
                         format!("{base}: contradictory descriptor fields {conflict:?}").into(),
                     );
                 }
-            } else if entry.convrot == Some(true) {
-                let descriptor = entry
+            } else if entry.convrot == Some(true)
+                || matches!(
+                    entry.format,
+                    gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn
+                        | gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2
+                        | gen_core::comfy_quant::ComfyQuantFormat::Mxfp8
+                )
+            {
+                let d = entry
                     .into_complete()
                     .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
-                let group = descriptor
-                    .rotation_group
-                    .ok_or_else(|| crate::Error::Msg(format!("{base}: missing rotation group")))?;
-                tensors.insert(key, descriptor_array(group));
+                let blob = if let Some(group) = d.rotation_group {
+                    descriptor_array(group)
+                } else {
+                    crate::fp8::descriptor_array(
+                        d.format,
+                        d.full_precision_matrix_mult,
+                        d.orig_shape.as_deref(),
+                    )
+                };
+                tensors.insert(key, blob);
             }
         }
     }
@@ -214,7 +250,7 @@ impl ConvRotLinear {
 
     /// Admit only a complete authoritative descriptor plus I8/F32 operands. No dequantization.
     pub fn from_weights(
-        w: &impl ProjectionWeights,
+        w: &(impl MlxWeightSource + ?Sized),
         base: &str,
         bias: bool,
     ) -> Result<Option<Self>> {
@@ -223,7 +259,7 @@ impl ConvRotLinear {
 
     /// Bind the physical weight key for architectures with nonstandard names.
     pub fn from_key(
-        w: &impl ProjectionWeights,
+        w: &(impl MlxWeightSource + ?Sized),
         base: &str,
         weight_key: &str,
         bias: bool,

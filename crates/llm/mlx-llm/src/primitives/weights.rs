@@ -123,9 +123,12 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &[path],
         );
-        if let Some(table) = metadata.get("_quantization_metadata") {
-            mlx_layers::convrot_int8::attach_metadata(&mut tensors, std::slice::from_ref(table))?;
-        }
+        let declarations: Vec<_> = metadata
+            .get("_quantization_metadata")
+            .cloned()
+            .into_iter()
+            .collect();
+        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.to_owned()], &declarations)?;
         Ok(Self::from_map(tensors))
     }
 
@@ -152,7 +155,7 @@ impl Weights {
         crate::load_progress::register_files(&shards);
         let mut tensors = HashMap::new();
         let mut declarations = Vec::new();
-        for shard in shards {
+        for shard in &shards {
             let (part, meta) = crate::load_progress::load_with_metadata(&shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
             declarations.extend(meta.get("_quantization_metadata").cloned());
@@ -171,7 +174,7 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &__input_paths,
         );
-        mlx_layers::convrot_int8::attach_metadata(&mut tensors, &declarations)?;
+        mlx_layers::fp8::prepare_sources(&mut tensors, &shards, &declarations)?;
         Ok(Self::from_map(tensors))
     }
 
@@ -721,7 +724,7 @@ mod tests {
     }
 }
 
-impl mlx_layers::convrot_int8::ProjectionWeights for Weights {
+impl mlx_layers::MlxWeightSource for Weights {
     fn get(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }

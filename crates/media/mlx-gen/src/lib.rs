@@ -25,6 +25,8 @@ pub use gen_core::{
 };
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
+pub use mlx_layers::NativeProjection;
+
 pub mod adapters;
 // Narrowing helpers for the provider-declared architecture axes (epic SC-22657): shared so a
 // fabricated or zeroed axis cannot appear in one family and not another.
