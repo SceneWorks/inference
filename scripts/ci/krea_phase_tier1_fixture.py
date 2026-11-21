@@ -1,6 +1,7 @@
-"""Candle Krea Raw comparison using the repository's pinned-native DiT fixture shape."""
+"""Candle Krea Raw phase comparison at production widths with one image DiT block."""
 
 import json
+import math
 from pathlib import Path
 import re
 
@@ -20,7 +21,18 @@ FIXTURE_FILES = {
     "trunk.safetensors", "fold-only.safetensors",
 }
 CASE_ORDER = ("resident-selected", "resident-base", "staged-selected", "staged-base")
-TARGETS = (("text", "txt_in.linear_2", 32), ("trunk", "final_layer.linear", 64))
+# Krea2Config::turbo() is the published Raw/Turbo architecture in both source arms.
+# The Rust probe checks the materialized config against that constructor on the device run.
+CONFIG = {
+    "num_attention_heads": 48, "num_key_value_heads": 12, "attention_head_dim": 128,
+    "intermediate_size": 16384, "num_layers": 1, "in_channels": 64, "norm_eps": 1e-5,
+    "axes_dims_rope": [32, 48, 48], "rope_theta": 1000.0, "timestep_embed_dim": 256,
+    "num_text_layers": 12, "num_layerwise_text_blocks": 2, "num_refiner_text_blocks": 2,
+    "text_hidden_dim": 2560, "text_intermediate_size": 6912,
+    "text_num_attention_heads": 20, "text_num_key_value_heads": 20,
+}
+HIDDEN = CONFIG["num_attention_heads"] * CONFIG["attention_head_dim"]
+TARGETS = (("text", "txt_in.linear_2", HIDDEN), ("trunk", "final_layer.linear", CONFIG["in_channels"]))
 
 
 def package(backend):
@@ -32,10 +44,12 @@ def package(backend):
 def contract(backend):
     package(backend)
     return {
-        "geometry": {"block_depth": 1, "text_fusion_depths": [1, 1], "hidden": 32,
-                     "image": [256, 256], "latent": [1, 16, 32, 32], "patch": 2},
+        "geometry": {"published_raw_revision": "4ad9f4b627a647fad78b3dfeebb09f2654aeb494",
+                     "config": CONFIG, "published_block_depth": 28, "hidden": HIDDEN,
+                     "image": [256, 256], "latent": [1, 16, 32, 32], "patch": 2,
+                     "bf16_weight_payload_bytes": 2 * sum(map(math.prod, native_shapes().values()))},
         "settings": {"model": "krea_2_raw", "source": "pinned native single-file",
-                     "compute_dtype": "F32", "storage_dtype": "BF16", "device": "cuda",
+                     "compute_dtype": "BF16", "storage_dtype": "BF16", "device": "cuda",
                      "sampler": "dpmpp_2m_sde", "image_seed": SEED, "steps": [2, 3, 2],
                      "cfg": [0.0, 2.0, 0.0], "selected_slots": [[], [1, 0, 1], []],
                      "selected_scales": [[], [-0.5, 1.5, 0.25], []],
@@ -50,61 +64,61 @@ def contract(backend):
 
 
 def native_shapes():
-    """The pinned-native testfix.rs topology, including its 16-channel latent adjustment."""
+    """The native checkpoint key layout with Raw widths and one image DiT block."""
     shapes = {}
+    head_dim = CONFIG["attention_head_dim"]
+    text_hidden = CONFIG["text_hidden_dim"]
 
     def linear(key, out_features, in_features, bias=False):
         shapes[f"{key}.weight"] = [out_features, in_features]
         if bias:
             shapes[f"{key}.bias"] = [out_features]
 
-    def block(key, kv_heads):
+    def block(key, hidden, kv_heads, intermediate):
         for norm in ("prenorm", "postnorm"):
-            shapes[f"{key}.{norm}.scale"] = [32]
+            shapes[f"{key}.{norm}.scale"] = [hidden]
         for norm in ("qnorm", "knorm"):
-            shapes[f"{key}.attn.qknorm.{norm}.scale"] = [16]
-        for projection, out_features in (("wq", 32), ("wk", kv_heads * 16),
-                                         ("wv", kv_heads * 16), ("gate", 32), ("wo", 32)):
-            linear(f"{key}.attn.{projection}", out_features, 32)
-        linear(f"{key}.mlp.gate", 16, 32)
-        linear(f"{key}.mlp.up", 16, 32)
-        linear(f"{key}.mlp.down", 32, 16)
+            shapes[f"{key}.attn.qknorm.{norm}.scale"] = [head_dim]
+        kv_width = kv_heads * head_dim
+        for projection, out_features in (("wq", hidden), ("wk", kv_width),
+                                         ("wv", kv_width), ("gate", hidden), ("wo", hidden)):
+            linear(f"{key}.attn.{projection}", out_features, hidden)
+        linear(f"{key}.mlp.gate", intermediate, hidden)
+        linear(f"{key}.mlp.up", intermediate, hidden)
+        linear(f"{key}.mlp.down", hidden, intermediate)
 
-    linear("first", 32, 64, True)
-    linear("tmlp.0", 32, 8, True)
-    linear("tmlp.2", 32, 32, True)
-    linear("tproj.1", 192, 32, True)
-    shapes["txtmlp.0.scale"] = [32]
-    linear("txtmlp.1", 32, 32, True)
-    linear("txtmlp.3", 32, 32, True)
-    for stack in ("layerwise_blocks", "refiner_blocks"):
-        block(f"txtfusion.{stack}.0", 2)
-    linear("txtfusion.projector", 1, 2)
-    block("blocks.0", 1)
-    shapes["blocks.0.mod.lin"] = [6, 32]
-    shapes["last.modulation.lin"] = [2, 32]
-    shapes["last.norm.scale"] = [32]
-    linear("last.linear", 64, 32, True)
+    linear("first", HIDDEN, CONFIG["in_channels"], True)
+    linear("tmlp.0", HIDDEN, CONFIG["timestep_embed_dim"], True)
+    linear("tmlp.2", HIDDEN, HIDDEN, True)
+    linear("tproj.1", 6 * HIDDEN, HIDDEN, True)
+    shapes["txtmlp.0.scale"] = [text_hidden]
+    linear("txtmlp.1", HIDDEN, text_hidden, True)
+    linear("txtmlp.3", HIDDEN, HIDDEN, True)
+    for stack, depth in (("layerwise_blocks", CONFIG["num_layerwise_text_blocks"]),
+                         ("refiner_blocks", CONFIG["num_refiner_text_blocks"])):
+        for index in range(depth):
+            block(f"txtfusion.{stack}.{index}", text_hidden,
+                  CONFIG["text_num_key_value_heads"], CONFIG["text_intermediate_size"])
+    linear("txtfusion.projector", 1, CONFIG["num_text_layers"])
+    block("blocks.0", HIDDEN, CONFIG["num_key_value_heads"], CONFIG["intermediate_size"])
+    shapes["blocks.0.mod.lin"] = [6, HIDDEN]
+    shapes["last.modulation.lin"] = [2, HIDDEN]
+    shapes["last.norm.scale"] = [HIDDEN]
+    linear("last.linear", CONFIG["in_channels"], HIDDEN, True)
     return {"model.diffusion_model." + key: shape for key, shape in sorted(shapes.items())}
 
 
 def materialize(root):
     root.mkdir()
     (root / "transformer").mkdir()
-    config = {"num_attention_heads": 2, "num_key_value_heads": 1, "attention_head_dim": 16,
-              "intermediate_size": 16, "num_layers": 1, "in_channels": 64, "norm_eps": 1e-5,
-              "axes_dims_rope": [4, 6, 6], "rope_theta": 1000.0, "timestep_embed_dim": 8,
-              "num_text_layers": 2, "num_layerwise_text_blocks": 1, "num_refiner_text_blocks": 1,
-              "text_hidden_dim": 32, "text_intermediate_size": 16,
-              "text_num_attention_heads": 2, "text_num_key_value_heads": 2}
-    (root / "transformer/config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "transformer/config.json").write_text(json.dumps(CONFIG), encoding="utf-8")
     fixture.write_component(root / "native.safetensors", native_shapes())
     for name, target, out_features in TARGETS:
         fixture.write_component(root / f"{name}.safetensors", {
-            f"{target}.lora_A.weight": [4, 32], f"{target}.lora_B.weight": [out_features, 4],
+            f"{target}.lora_A.weight": [4, HIDDEN], f"{target}.lora_B.weight": [out_features, 4],
         })
     fixture.write_component(root / "fold-only.safetensors", {
-        "text_fusion.projector.diff": [1, 2],
+        "text_fusion.projector.diff": [1, CONFIG["num_text_layers"]],
     })
     return identify(root)
 

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const SEED: u64 = 0x5eed;
 const PROVIDER: &str = crate::KREA_2_RAW_ID;
+const CAPTION_TOKENS: usize = 3;
 
 #[derive(Default)]
 struct Trace {
@@ -33,7 +34,7 @@ pub(crate) fn tensor(kind: &str, value: &Tensor) -> Result<()> {
         "{kind} must be on the selected device"
     );
     match kind {
-        "prepare" => assert_eq!(value.dims(), &[1, 3, 32]),
+        "prepare" => assert_eq!(value.dims(), &[1, CAPTION_TOKENS, 6144]),
         "velocity" | "latent" => assert_eq!(value.dims(), &[1, 16, 32, 32]),
         _ => panic!("unknown traced tensor {kind}"),
     }
@@ -193,6 +194,15 @@ pub fn compare_native_phases() -> Result<()> {
     );
     let source = root.join("native.safetensors");
     assert!(!root.join("transformer/model.safetensors").exists());
+    let cfg = Krea2Config::from_snapshot(&root)?;
+    assert_eq!(
+        cfg,
+        Krea2Config {
+            num_layers: 1,
+            ..Krea2Config::turbo()
+        }
+    );
+    assert_eq!(DIT_DTYPE, DType::BF16);
     let mut spec = LoadSpec::new(WeightsSource::File(source.clone()))
         .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()))
         .with_adapters(vec![
@@ -204,10 +214,14 @@ pub fn compare_native_phases() -> Result<()> {
     let registry = crate::provider_registry()?;
     verify_route(&registry, &root)?;
     let make_context = |offset: i32| -> Result<Tensor> {
-        let values = (0..192)
-            .map(|index| (((index + offset) * 17 % 37) - 18) as f32 / 32.0)
+        let values = (0..CAPTION_TOKENS * cfg.num_text_layers * cfg.text_hidden_dim)
+            .map(|index| (((index as i32 + offset) * 17 % 37) - 18) as f32 / 32.0)
             .collect::<Vec<_>>();
-        Ok(Tensor::from_vec(values, (1, 3, 2, 32), &device)?)
+        Ok(Tensor::from_vec(
+            values,
+            (1, CAPTION_TOKENS, cfg.num_text_layers, cfg.text_hidden_dim),
+            &device,
+        )?)
     };
     let positive = make_context(1)?;
     let negative = make_context(23)?;
@@ -280,7 +294,7 @@ fn load(
         &spec.adapters,
         None,
         false,
-        DType::F32,
+        DIT_DTYPE,
         &gen_core::CheckpointFactsSink::new(),
     )
 }
@@ -326,7 +340,7 @@ fn run(
         Some(negative),
         req,
         progress,
-        DType::F32,
+        DIT_DTYPE,
         &mut |phase, specs, report, _| {
             if phase == Some(1) && !specs.is_empty() {
                 assert_eq!(specs.len(), 3);
@@ -356,7 +370,7 @@ fn load(
         },
         None,
         false,
-        DType::F32,
+        DIT_DTYPE,
         &gen_core::CheckpointFactsSink::new(),
     )
 }
