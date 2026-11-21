@@ -271,6 +271,26 @@ impl Wan {
         }
 
         // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
+        let curated = req
+            .sampler
+            .as_deref()
+            .filter(|name| is_wan_curated(Some(name)))
+            .map(|name| {
+                crate::pipeline::curated_phase(
+                    name,
+                    crate::scheduler::compute_sigmas(steps, shift, cfg.num_train_timesteps),
+                    seed,
+                    &lat,
+                    Ti2vProviderVae::VAE_TILING,
+                    0,
+                    mlx_gen::gen_core::render::video::VideoModelRule::Fixed(()),
+                )
+            })
+            .transpose()?;
+        let active = curated
+            .as_ref()
+            .map(|phase| phase.enter(&req.cancel, scope))
+            .transpose()?;
         let latents = {
             let mut w = Weights::from_file(self.root.join("model.safetensors"))?;
             // Adapter routing (sc-2683 / sc-2393 / sc-10045), two mutually-exclusive paths:
@@ -310,8 +330,8 @@ impl Wan {
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
             // single-eval curated-sampler hook, so it stays native-only.
-            match (&ti2v, is_wan_curated(req.sampler.as_deref())) {
-                (Some(_), true) => {
+            match (&ti2v, &curated) {
+                (Some(_), Some(_)) => {
                     // Unreachable via requests — `validate_impl` rejects curated × mask-blend up
                     // front (F-074a); kept as a defensive backstop for direct callers.
                     return Err(Error::Unsupported(
@@ -320,7 +340,7 @@ impl Wan {
                             .into(),
                     ));
                 }
-                (Some((z_img, mask, mask_tokens)), false) => {
+                (Some((z_img, mask, mask_tokens)), None) => {
                     // Unwired for the denoise feature cache: the mask-blend re-mixes the conditioning
                     // latent into the trajectory after every step (sc-18322).
                     refuse_unwired_approximation(
@@ -351,7 +371,7 @@ impl Wan {
                         &mut on_step,
                     )?
                 }
-                (None, true) => {
+                (None, Some(phase)) => {
                     // Unwired: a curated solver evaluates the model 1..N times per solver step, so
                     // "the previous step's residual" has no single meaning (sc-18322).
                     refuse_unwired_approximation(
@@ -359,23 +379,20 @@ impl Wan {
                         "curated unified solver",
                         &approximation,
                     )?;
-                    crate::pipeline::denoise_curated_scoped(
+                    crate::pipeline::denoise_curated_prepared(
                         &dit,
-                        req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                        phase,
+                        req.sampler.as_deref().expect("curated sampler"),
                         cfg.num_train_timesteps,
-                        steps,
-                        shift,
                         guidance,
                         &ctx_cond,
                         ctx_uncond.as_ref(),
                         &latents_init,
-                        seed,
                         &req.cancel,
-                        scope,
                         on_progress,
                     )?
                 }
-                (None, false) => {
+                (None, None) => {
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
                             current: i as u32,
@@ -422,6 +439,11 @@ impl Wan {
         // `vae22` decode is the heavy stage, so keeping its dead buffers off-GPU is the point.
         if sequential {
             mlx_rs::memory::clear_cache();
+        }
+
+        if let Some(active) = active {
+            drop((context, context_null, latents_init, init_noise, ti2v));
+            active.finish()?;
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---

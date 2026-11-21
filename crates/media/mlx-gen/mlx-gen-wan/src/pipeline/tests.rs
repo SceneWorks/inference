@@ -1470,3 +1470,36 @@ fn curated_video_phase_cancellation_after_evict_precedes_the_incoming_load() {
     assert_eq!(tracker.peak.get(), 1);
     assert_eq!(*tracker.log.borrow(), ["load-high", "drop-high", "evict"]);
 }
+
+#[test]
+fn curated_video_phase_first_low_still_validates_high_adapters() {
+    let phase = curated_phase(
+        "heun",
+        compute_sigmas(4, 0.001, 1000),
+        41,
+        &[16, 1, 1, 1],
+        WanVae::VAE_TILING,
+        0,
+        wan_expert_rule(1000, 875.0),
+    )
+    .unwrap();
+    assert_eq!(phase.models.slot(phase.sigmas[0]), mlx_gen::MoeExpert::Low);
+    let sigil = "high adapter validation";
+    let result = denoise_moe_curated_swapped(
+        &phase,
+        "heun",
+        1000,
+        &Array::from_f32(0.),
+        None,
+        &CancelFlag::new(),
+        &mut |_| panic!("no solver evaluation"),
+        |high| {
+            assert!(
+                high,
+                "validate High before selecting Low for the first prediction"
+            );
+            Err(Error::Msg(sigil.into()))
+        },
+    );
+    assert!(matches!(result, Err(Error::Msg(message)) if message == sigil));
+}

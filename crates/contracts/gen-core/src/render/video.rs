@@ -69,27 +69,46 @@ pub struct VideoDenoisePhase<S, P = Solver> {
     pub models: VideoModelRule<S>,
 }
 
+/// Keeps a caller-owned reservation active across preparation, sampling and release.
+pub struct ActiveVideoDenoiseScope<'s>(Option<&'s mut dyn MemoryRequestScope>);
+
+impl ActiveVideoDenoiseScope<'_> {
+    pub fn finish(self) -> Result<()> {
+        if let Some(scope) = self.0 {
+            scope.leave_phase(MemoryPhase::Denoise)?;
+        }
+        Ok(())
+    }
+}
+
 impl<S, P> VideoDenoisePhase<S, P> {
     /// Scope a complete trajectory under its selected memory rung. As in RenderRun, a
     /// failed phase returns the original error and lets the request owner handle teardown.
     pub fn run<T, E: From<Error>>(
         &self,
         cancel: &CancelFlag,
-        mut scope: Option<&mut dyn MemoryRequestScope>,
+        scope: Option<&mut dyn MemoryRequestScope>,
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
+        let active = self.enter(cancel, scope)?;
+        let output = body()?;
+        active.finish()?;
+        Ok(output)
+    }
+
+    pub fn enter<'s>(
+        &self,
+        cancel: &CancelFlag,
+        mut scope: Option<&'s mut dyn MemoryRequestScope>,
+    ) -> Result<ActiveVideoDenoiseScope<'s>> {
         if cancel.is_cancelled() {
-            return Err(Error::Canceled.into());
+            return Err(Error::Canceled);
         }
         self.validate()?;
         if let Some(scope) = scope.as_deref_mut() {
             scope.enter_render_phase(MemoryPhase::Denoise, &self.identity)?;
         }
-        let output = body()?;
-        if let Some(scope) = scope {
-            scope.leave_phase(MemoryPhase::Denoise)?;
-        }
-        Ok(output)
+        Ok(ActiveVideoDenoiseScope(scope))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -130,8 +149,17 @@ impl<S, P> VideoDenoisePhase<S, P> {
 impl<S> VideoDenoisePhase<S> {
     /// The curated flow solver spans descend to a terminal zero. Other numerical
     /// policies, including an ascending native schedule, own their schedule laws.
-    pub fn validate_descending_schedule(&self) -> Result<()> {
-        if self.sigmas.last() != Some(&0.0) || self.sigmas.windows(2).any(|pair| pair[0] < pair[1])
+    pub fn validate_descending_schedule(&self, first_before_guard: Option<f32>) -> Result<()> {
+        self.validate()?;
+        // A native log-SNR scheduler can nudge only its first evaluation away from 1.
+        // Use the unguarded start for the ordering check, never for integration.
+        let initial = first_before_guard.unwrap_or(self.sigmas[0]);
+        let tail = self.sigmas.get(1..).unwrap_or_default();
+        if !initial.is_finite()
+            || initial < self.sigmas[0]
+            || self.sigmas.last() != Some(&0.0)
+            || tail.first().is_some_and(|&next| next > initial)
+            || tail.windows(2).any(|pair| pair[0] < pair[1])
         {
             return Err(Error::Unsupported(
                 "curated video sampling needs descending sigma nodes ending in zero".into(),

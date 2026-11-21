@@ -2,7 +2,7 @@
 
 use super::denoise::curated_phase;
 use super::*;
-use mlx_gen::gen_core::render::video::{VideoModelCoordinate, VideoModelRule};
+use mlx_gen::gen_core::render::video::VideoModelCoordinate;
 use mlx_gen::MoeExpert;
 
 pub fn wan_expert_rule(
@@ -181,37 +181,38 @@ pub fn denoise_moe_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    denoise_moe_curated_scoped(
+    let phase = curated_phase(
+        sampler_name,
+        compute_sigmas(steps, shift, num_train_timesteps),
+        seed,
+        init_noise.shape(),
+        WanVae::VAE_TILING,
+        u32::from(y.is_some()),
+        wan_expert_rule(num_train_timesteps, boundary_timestep),
+    )?;
+    denoise_moe_curated_prepared(
         low,
         high,
-        boundary_timestep,
+        &phase,
         sampler_name,
         num_train_timesteps,
-        steps,
-        shift,
         init_noise,
         y,
-        seed,
         cancel,
-        None,
         on_progress,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn denoise_moe_curated_scoped(
+pub(crate) fn denoise_moe_curated_prepared(
     low: &Expert,
     high: &Expert,
-    boundary_timestep: f32,
+    phase: &VideoDenoisePhase<MoeExpert>,
     sampler_name: &str,
     num_train_timesteps: usize,
-    steps: usize,
-    shift: f32,
     init_noise: &Array,
     y: Option<&Array>,
-    seed: u64,
     cancel: &CancelFlag,
-    scope: Option<&mut dyn MemoryRequestScope>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -228,31 +229,21 @@ pub(crate) fn denoise_moe_curated_scoped(
         high.ctx_uncond.as_ref(),
         grid,
     )?;
-    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     mlx_gen::video_execution::curated_sampling(
         "wan_curated",
         sampler_name,
         "flow_velocity",
         serde_json::json!({"low_guidance_bits":low.guidance.to_bits(),"high_guidance_bits":high.guidance.to_bits()}),
     );
-    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
+    mlx_gen::video_execution::schedule("wan_curated", &phase.sigmas);
     let time = VideoModelCoordinate::TruncatedTimestep {
         num_train_timesteps,
     };
-    let phase = curated_phase(
-        sampler_name,
-        sigmas,
-        seed,
-        init_noise.shape(),
-        WanVae::VAE_TILING,
-        u32::from(y.is_some()),
-        wan_expert_rule(num_train_timesteps, boundary_timestep),
-    )?;
     mlx_gen::sampler::run_video_flow_sampler(
-        &phase,
+        phase,
+        None,
         init_noise.clone(),
         cancel,
-        scope,
         on_progress,
         |x, sigma, slot| {
             let t = time.at_sigma(sigma);
@@ -299,34 +290,19 @@ pub(super) fn select_curated_expert<'a, E>(
 /// is dropped and its MLX buffers are flushed before the incoming expert is loaded.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn denoise_moe_curated_swapped(
-    boundary_timestep: f32,
+    phase: &VideoDenoisePhase<MoeExpert>,
     sampler_name: &str,
     num_train_timesteps: usize,
-    steps: usize,
-    shift: f32,
     init_noise: &Array,
     y: Option<&Array>,
-    seed: u64,
     cancel: &CancelFlag,
-    scope: Option<&mut dyn MemoryRequestScope>,
     on_progress: &mut dyn FnMut(Progress),
     mut load: impl FnMut(bool) -> Result<(WanTransformer, Array, Option<Array>, f32)>,
 ) -> Result<Array> {
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let time = VideoModelCoordinate::TruncatedTimestep {
         num_train_timesteps,
     };
-    let phase = curated_phase(
-        sampler_name,
-        sigmas,
-        seed,
-        init_noise.shape(),
-        WanVae::VAE_TILING,
-        u32::from(y.is_some()),
-        wan_expert_rule(num_train_timesteps, boundary_timestep),
-    )?;
-    let first = phase.models.slot(phase.sigmas[0]);
     let mut prepare = |slot| {
         let (transformer, cond, uncond, guidance) = load(slot == MoeExpert::High)?;
         if cancel.is_cancelled() {
@@ -342,7 +318,9 @@ pub(crate) fn denoise_moe_curated_swapped(
         mlx_rs::memory::clear_cache();
     };
     let mut active = None;
-    let guidance = select_curated_expert(&mut active, first, cancel, release, &mut prepare)?.2;
+    // High owns its adapter match receipt even when the first model evaluation selects Low.
+    let guidance =
+        select_curated_expert(&mut active, MoeExpert::High, cancel, release, &mut prepare)?.2;
     mlx_gen::video_execution::curated_sampling(
         "wan_curated",
         sampler_name,
@@ -351,10 +329,10 @@ pub(crate) fn denoise_moe_curated_swapped(
     );
     mlx_gen::video_execution::schedule("wan_curated", &phase.sigmas);
     let result = mlx_gen::sampler::run_video_flow_sampler(
-        &phase,
+        phase,
+        None,
         init_noise.clone(),
         cancel,
-        scope,
         on_progress,
         |x, sigma, slot| {
             let t = time.at_sigma(sigma);

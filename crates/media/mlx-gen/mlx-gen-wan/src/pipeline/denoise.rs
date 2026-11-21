@@ -341,8 +341,7 @@ pub fn curated_phase<S>(
         sigmas,
         seed,
     };
-    phase.validate()?;
-    phase.validate_descending_schedule()?;
+    phase.validate_descending_schedule(None)?;
     Ok(phase)
 }
 
@@ -373,65 +372,58 @@ pub fn denoise_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    denoise_curated_scoped(
-        transformer,
-        sampler_name,
-        num_train_timesteps,
-        steps,
-        shift,
-        guidance,
-        ctx_cond,
-        ctx_uncond,
-        init_noise,
-        seed,
-        cancel,
-        None,
-        on_progress,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn denoise_curated_scoped(
-    transformer: &WanTransformer,
-    sampler_name: &str,
-    num_train_timesteps: usize,
-    steps: usize,
-    shift: f32,
-    guidance: f32,
-    ctx_cond: &Array,
-    ctx_uncond: Option<&Array>,
-    init_noise: &Array,
-    seed: u64,
-    cancel: &CancelFlag,
-    scope: Option<&mut dyn MemoryRequestScope>,
-    on_progress: &mut dyn FnMut(Progress),
-) -> Result<Array> {
-    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let grid = transformer.patch_grid(init_noise);
-    let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
-    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
-    mlx_gen::video_execution::curated_sampling(
-        "wan_curated",
-        sampler_name,
-        "flow_velocity",
-        serde_json::json!({"guidance_bits":guidance.to_bits()}),
-    );
-    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
-    let nt = num_train_timesteps as f32;
     let phase = curated_phase(
         sampler_name,
-        sigmas,
+        compute_sigmas(steps, shift, num_train_timesteps),
         seed,
         init_noise.shape(),
         Wan22Vae::VAE_TILING,
         0,
         mlx_gen::gen_core::render::video::VideoModelRule::Fixed(()),
     )?;
-    mlx_gen::sampler::run_video_flow_sampler(
+    denoise_curated_prepared(
+        transformer,
         &phase,
+        sampler_name,
+        num_train_timesteps,
+        guidance,
+        ctx_cond,
+        ctx_uncond,
+        init_noise,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_curated_prepared(
+    transformer: &WanTransformer,
+    phase: &VideoDenoisePhase<()>,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+    let grid = transformer.patch_grid(init_noise);
+    let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
+    mlx_gen::video_execution::curated_sampling(
+        "wan_curated",
+        sampler_name,
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan_curated", &phase.sigmas);
+    let nt = num_train_timesteps as f32;
+    mlx_gen::sampler::run_video_flow_sampler(
+        phase,
+        None,
         init_noise.clone(),
         cancel,
-        scope,
         on_progress,
         |x, sigma, ()| {
             // Wan feeds the DiT the integer-valued timestep `(σ·num_train).trunc()`, not raw σ.

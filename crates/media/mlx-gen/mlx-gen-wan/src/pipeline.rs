@@ -19,7 +19,7 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::MemoryRequestScope;
+use mlx_gen::gen_core::render::video::{VideoDenoisePhase, VideoModelRule};
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{
     budgeted_plan, SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingBudgetError,

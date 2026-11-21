@@ -341,22 +341,40 @@ impl Wan14b {
         // --- Stage 2: dual-expert MoE denoise (→ freed). Under `Sequential`, native solvers swap at
         // the step boundary and curated solvers at the exact model-evaluation boundary; both keep one
         // expert resident. `Resident` keeps both experts for byte-identical legacy behavior. ---
-        let latents = if sequential && is_wan_curated(req.sampler.as_deref()) {
-            let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
+        let curated = req
+            .sampler
+            .as_deref()
+            .filter(|name| is_wan_curated(Some(name)))
+            .map(|name| {
+                crate::pipeline::curated_phase(
+                    name,
+                    crate::scheduler::compute_sigmas(steps, shift, cfg.num_train_timesteps),
+                    seed,
+                    &lat,
+                    A14bProviderVae::VAE_TILING,
+                    u32::from(y.is_some()),
+                    crate::pipeline::wan_expert_rule(
+                        cfg.num_train_timesteps,
+                        cfg.boundary * cfg.num_train_timesteps as f32,
+                    ),
+                )
+            })
+            .transpose()?;
+        let active = curated
+            .as_ref()
+            .map(|phase| phase.enter(&req.cancel, scope))
+            .transpose()?;
+        let latents = if let (true, Some(phase)) = (sequential, curated.as_ref()) {
             let low_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
             let high_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
             on_progress(Progress::Loading(LoadPhase::Renderer));
             let latents = denoise_moe_curated_swapped(
-                boundary_timestep,
+                phase,
                 req.sampler.as_deref().expect("curated sampler"),
                 cfg.num_train_timesteps,
-                steps,
-                shift,
                 &init_noise,
                 y.as_ref(),
-                seed,
                 &req.cancel,
-                scope,
                 on_progress,
                 |high| {
                     if req.cancel.is_cancelled() {
@@ -458,20 +476,16 @@ impl Wan14b {
             // `denoise_moe_curated` (the boundary expert swap happens inside its predict closure); the
             // native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). Works for both T2V (`y = None`)
             // and I2V (`y = Some` channel-concat conditioning).
-            if is_wan_curated(req.sampler.as_deref()) {
-                crate::pipeline::denoise_moe_curated_scoped(
+            if let Some(phase) = &curated {
+                crate::pipeline::denoise_moe_curated_prepared(
                     &low,
                     &high,
-                    boundary_timestep,
-                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                    phase,
+                    req.sampler.as_deref().expect("curated sampler"),
                     cfg.num_train_timesteps,
-                    steps,
-                    shift,
                     &init_noise,
                     y.as_ref(),
-                    seed,
                     &req.cancel,
-                    scope,
                     on_progress,
                 )?
             } else {
@@ -496,6 +510,11 @@ impl Wan14b {
                 )?
             }
         };
+
+        if let Some(active) = active {
+            drop((context, context_null, init_noise, y));
+            active.finish()?;
+        }
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
