@@ -20,7 +20,7 @@ if (MX) {
     exponent = clamp(exponent - int(mantissa == 0.5f), -127, 127);
     rounded = ldexp(sc_round_fp8(ldexp(xval, -exponent), false), exponent);
 } else {
-    rounded = sc_round_fp8(xval / sx[0], E5);
+    rounded = sc_round_fp8(xval / float(sx[0]), E5);
 }
 if (col < uint(K)) q[row * uint(K) + col] = rounded;
 "#;
@@ -65,7 +65,7 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint i=tid; i < 256u; i+=128u) {
     uint row=row0+i/16u, col=col0+i%16u;
     if (row < uint(M) && col < uint(N))
-        y[row*uint(N)+col] = bfloat(MX ? tile[i] : (tile[i]*sx[0])*float(sw[0]));
+        y[row*uint(N)+col] = bfloat(MX ? tile[i] : (tile[i]*float(sx[0]))*float(sw[0]));
 }
 "#;
 
@@ -82,6 +82,7 @@ pub struct Fp8Linear {
     bias: Option<Array>,
     shape: [i32; 2],
     scale_row: i32,
+    observation: Option<crate::source::Observation>,
 }
 
 impl Fp8Linear {
@@ -136,6 +137,7 @@ impl Fp8Linear {
             bias: None,
             shape: [logical[0] as i32, logical[1] as i32],
             scale_row: 0,
+            observation: None,
         };
         if let Some(bias) = bias {
             this.set_bias(bias)?;
@@ -143,6 +145,11 @@ impl Fp8Linear {
         Ok(this)
     }
 
+    pub fn observe(&mut self, obs: crate::source::Observation) -> Result<()> {
+        obs.bind(&self.codes, &self.scales, Some(&self.input_scale))?;
+        self.observation = Some(obs);
+        Ok(())
+    }
     pub fn shape(&self) -> [i32; 2] {
         self.shape
     }
@@ -179,6 +186,9 @@ impl Fp8Linear {
         let mut a = Vec::new();
         self.push_arrays(&mut a);
         mlx_rs::transforms::eval(a.iter())?;
+        if let Some(obs) = &self.observation {
+            obs.record_packed()?;
+        }
         Ok(())
     }
     pub fn slice_rows(&self, lo: i32, hi: i32) -> Result<Self> {
@@ -210,6 +220,9 @@ impl Fp8Linear {
             || (u64::from(m as u32) * n as u64) > u32::MAX as u64
         {
             return Err("native FP8 matrix exceeds Metal index geometry".into());
+        }
+        if self.observation.as_ref().is_some_and(|obs| obs.pending()) {
+            self.materialize()?;
         }
         let mx = i32::from(self.format == ComfyQuantFormat::Mxfp8);
         let e5 = i32::from(self.format == ComfyQuantFormat::Float8E5M2);
@@ -292,11 +305,12 @@ impl Fp8Linear {
 }
 
 fn scalar(a: &Array, positive: bool) -> Result<()> {
-    if a.dtype() != Dtype::Float32 || a.size() != 1 {
-        return Err("FP8 scale must be one F32 value".into());
+    if !matches!(a.dtype(), Dtype::Float32 | Dtype::Bfloat16 | Dtype::Float16) || a.size() != 1 {
+        return Err("FP8 scale must be a single floating value".into());
     }
-    a.eval()?;
-    let value = a.as_slice::<f32>()[0];
+    let checked = a.as_dtype(Dtype::Float32)?;
+    checked.eval()?;
+    let value = checked.as_slice::<f32>()[0];
     if !value.is_finite() || (positive && value <= 0.) {
         return Err("invalid FP8 scale".into());
     }
@@ -333,128 +347,63 @@ pub fn decoded_codes(codes: &Array, format: ComfyQuantFormat) -> Result<Array> {
 }
 
 impl Fp8Linear {
+    /// Decode the requested row coefficients, without evaluating the full vocab/expert table.
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
+        let flat = ids.reshape(&[-1])?;
+        let codes = self.codes.take_axis(&flat, 0)?;
+        let values = self.decode_rows(&codes, Some(&flat))?;
+        let mut shape = ids.shape().to_vec();
+        shape.push(self.shape[1]);
+        Ok(values.reshape(&shape)?)
+    }
     pub fn dense_weight(&self) -> Result<Array> {
-        let decoded = decoded_codes(&self.codes, self.format)?;
+        self.decode_rows(&self.codes, None)
+    }
+    fn decode_rows(&self, codes: &Array, indices: Option<&Array>) -> Result<Array> {
+        let decoded = decoded_codes(codes, self.format)?;
+        let rows = codes.shape()[0];
         let values = if self.format == ComfyQuantFormat::Mxfp8 {
-            let rows = self.codes.shape()[0];
             let columns = self.codes.shape()[1];
-            let block_count = columns / 32;
-            let scale_shape = self.scales.shape();
-            let rt = scale_shape[0] / 128;
-            let ct = scale_shape[1] / 4;
+            let blocks = columns / 32;
+            let [sr, sc] = [self.scales.shape()[0], self.scales.shape()[1]];
             let grid = self
                 .scales
-                .reshape(&[rt * ct, 32, 4, 4])?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[rt, ct, 128, 4])?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(scale_shape)?;
-            let grid = grid
-                .index((self.scale_row..self.scale_row + rows, ..block_count))
-                .as_dtype(Dtype::Float32)?;
-            let scales = mlx_rs::ops::power(
+                .reshape(&[sr / 128, sc / 4, 32, 4, 4])?
+                .transpose_axes(&[0, 3, 2, 1, 4])?
+                .reshape(&[sr, sc])?;
+            let grid = if let Some(ids) = indices {
+                let ids = mlx_rs::ops::add(ids, Array::from_int(self.scale_row))?;
+                grid.take_axis(&ids, 0)?.index((.., ..blocks))
+            } else {
+                grid.index((self.scale_row..self.scale_row + rows, ..blocks))
+            };
+            let exp = grid.as_dtype(Dtype::Float32)?;
+            let scale = mlx_rs::ops::power(
                 Array::from_f32(2.0),
-                mlx_rs::ops::subtract(&grid, Array::from_f32(127.0))?,
+                mlx_rs::ops::subtract(&exp, Array::from_f32(127.0))?,
             )?;
-            let scales = mlx_rs::ops::r#where(
-                mlx_rs::ops::eq(&grid, Array::from_f32(255.))?,
+            let scale = mlx_rs::ops::r#where(
+                mlx_rs::ops::eq(&exp, Array::from_f32(255.))?,
                 Array::from_f32(f32::NAN),
-                scales,
+                scale,
             )?;
             mlx_rs::ops::multiply(
-                decoded.reshape(&[rows, block_count, 32])?,
-                scales.reshape(&[rows, block_count, 1])?,
+                decoded.reshape(&[rows, blocks, 32])?,
+                scale.reshape(&[rows, blocks, 1])?,
             )?
             .reshape(&[rows, columns])?
         } else {
             mlx_rs::ops::multiply(decoded, &self.scales)?
         };
+        let limit = if indices.is_some() {
+            rows
+        } else {
+            self.shape[0]
+        };
         Ok(values
-            .index((..self.shape[0], ..self.shape[1]))
+            .index((..limit, ..self.shape[1]))
             .as_dtype(Dtype::Bfloat16)?)
     }
-}
-
-/// Reconcile original file dtype with MLX's U8 storage view before any provider renames its
-/// keys. Plain FP8 casts have a unit scale; 1D norms, biases and true convolution filters use
-/// their dense operator contract. A described projection must have a genuine matching file dtype.
-pub fn prepare_sources(
-    tensors: &mut std::collections::HashMap<String, Array>,
-    paths: &[std::path::PathBuf],
-    tables: &[String],
-) -> Result<()> {
-    use gen_core::weightsmeta::Dtype as Stored;
-    use ComfyQuantFormat::{Float8E4M3Fn, Float8E5M2, Mxfp8};
-    crate::convrot_int8::attach_metadata(tensors, tables)?;
-    if !tensors.values().any(|v| v.dtype() == Dtype::Uint8) {
-        return Ok(());
-    }
-    for path in paths {
-        let headers = gen_core::safetensors_path_tensor_headers(path)
-            .map_err(|e| Error::Msg(e.to_string()))?;
-        for h in headers {
-            let Some(array) = tensors.get(&h.name).cloned() else {
-                continue;
-            };
-            let format = match h.dtype {
-                Stored::F8_E4M3 => Float8E4M3Fn,
-                Stored::F8_E5M2 => Float8E5M2,
-                _ => continue,
-            };
-            // The low-precision scale of another codec is never a scalar FP8 weight.
-            if h.name.ends_with(".weight_scale") || h.name.ends_with(".input_scale") {
-                continue;
-            }
-            let Some(base) = h
-                .name
-                .strip_suffix(".weight")
-                .filter(|_| h.shape.len() == 2)
-            else {
-                tensors.insert(
-                    h.name,
-                    decoded_codes(&array, format)?.as_dtype(Dtype::Bfloat16)?,
-                );
-                continue;
-            };
-            let dk = format!("{base}.comfy_quant");
-            let sk = format!("{base}.weight_scale");
-            let ik = format!("{base}.input_scale");
-            if let Some(blob) = tensors.get(&dk) {
-                let desc = crate::convrot_int8::descriptor(blob, base)?;
-                if desc.format != format && !(desc.format == Mxfp8 && format == Float8E4M3Fn) {
-                    return Err(format!("{base}: FP8 dtype contradicts descriptor").into());
-                }
-                if desc.full_precision_matrix_mult {
-                    let sw = tensors
-                        .get(&sk)
-                        .cloned()
-                        .ok_or_else(|| Error::Msg(format!("{base}: missing FP8 scale")))?;
-                    let shape = desc.orig_shape.as_deref().unwrap_or(&h.shape);
-                    let p = Fp8Linear::new(
-                        desc.format,
-                        array,
-                        Some(sw),
-                        tensors.get(&ik).cloned(),
-                        shape,
-                        None,
-                    )?;
-                    tensors.insert(h.name, p.dense_weight()?);
-                    tensors.remove(&dk);
-                    tensors.remove(&sk);
-                    tensors.remove(&ik);
-                }
-            } else {
-                if tensors.contains_key(&sk) || tensors.contains_key(&ik) {
-                    return Err(
-                        format!("{base}: FP8 scale requires an authoritative descriptor").into(),
-                    );
-                }
-                tensors.insert(dk, descriptor_array(format, false, None));
-                tensors.insert(sk, unit_scale());
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn unit_scale() -> Array {

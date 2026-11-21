@@ -31,10 +31,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use gen_core::checkpoint_codec::{
-    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyReport, LogicalKeyMapping,
+    CheckpointCodecRegistration, CodecResidencyReport, LogicalKeyMapping,
     LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
     ResidencyMode, ScalarScaleSource, TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC,
     DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
@@ -76,44 +76,7 @@ pub fn register_checkpoint_codecs(mut builder: ProviderRegistryBuilder) -> Provi
 }
 
 /// The validated registry the loaders plan against.
-pub fn baseline_codec_registry() -> &'static CheckpointCodecRegistry {
-    static REGISTRY: OnceLock<CheckpointCodecRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
-        CheckpointCodecRegistry::new(BASELINE_CODECS.iter().copied())
-            .expect("the engine codec table is a valid registry")
-    })
-}
-
-/// Native MLX projections consume the stored bytes. Scalar non-matrix tensors and
-/// producer-requested full-precision GEMMs keep their existing dense decoding contract.
-pub struct MlxCodecResidency;
-impl gen_core::checkpoint_codec::CodecResidencyPolicy for MlxCodecResidency {
-    fn residency(
-        &self,
-        _: &CheckpointCodecRegistration,
-        spec: &TensorCodecSpec,
-        shape: &[usize],
-    ) -> ResidencyMode {
-        if shape.len() == 2
-            && matches!(
-                spec,
-                TensorCodecSpec::ConvRotInt8 { .. }
-                    | TensorCodecSpec::ScalarFp8 {
-                        full_precision_matrix_mult: false,
-                        ..
-                    }
-                    | TensorCodecSpec::Mxfp8 {
-                        full_precision_matrix_mult: false,
-                        ..
-                    }
-            )
-        {
-            ResidencyMode::Packed
-        } else {
-            ResidencyMode::Dense
-        }
-    }
-}
+pub use mlx_layers::source::{registry as baseline_codec_registry, MlxCodecResidency};
 
 /// Header-plus-descriptors plan for one safetensors file under the given mapping. Refuses before
 /// any array is created. Native row-scaled ConvRot projections are priced at stored width.
@@ -167,7 +130,14 @@ pub fn read_logical_weights(
     // transformed plan is not a plan this engine can honour, and silently reading only the first
     // output would hand the model a fused matrix under a split key's name.
     if let Some(transformed) = plan.tensors.iter().find(|tensor| {
-        tensor.transform.is_some() && !matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. })
+        tensor.transform.is_some()
+            && !(tensor.residency.mode == ResidencyMode::Packed
+                && matches!(
+                    tensor.codec,
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                        | TensorCodecSpec::ScalarFp8 { .. }
+                        | TensorCodecSpec::Mxfp8 { .. }
+                ))
     }) {
         return Err(Error::Msg(format!(
             "logical weight read of {}: logical key {:?} is a declared transform of physical \
@@ -203,6 +173,8 @@ pub fn read_logical_weights(
 
     let eager = matches!(mode, LogicalReadMode::Eager(_));
     let mut logical = Weights::empty();
+    logical.source_reads =
+        mlx_layers::source::SourceReads::new(Arc::new(plan.clone()), &[path.to_owned()]);
     for tensor in &plan.tensors {
         let array = if tensor.transform.is_some() {
             physical.get(&tensor.physical_key).cloned()
@@ -222,7 +194,10 @@ pub fn read_logical_weights(
                     tensor.logical_key
                 ))
             })?;
-            let (fp8, scale, input) = bind_fp8(tensor, array, &physical)?;
+            let (mut fp8, scale, input) = bind_fp8(tensor, array, &physical)?;
+            if let Some(obs) = logical.source_reads.get(&tensor.logical_key) {
+                fp8.observe(obs)?;
+            }
             if eager {
                 fp8.materialize()?;
             }
@@ -290,6 +265,9 @@ pub fn read_logical_weights(
             } else {
                 (array, scales.clone(), *geometry)
             };
+            if let Some(obs) = logical.source_reads.get(&tensor.logical_key) {
+                obs.bind(&codes, &scales, None)?;
+            }
             if eager {
                 codes.eval()?;
                 scales.eval()?;
@@ -764,7 +742,13 @@ fn measure_residency(
     // counts and resident bytes stay per-logical: each output is separately decoded and separately
     // occupies memory.
     for tensor in &plan.tensors {
-        let representation = if tensor.residency.mode == ResidencyMode::Packed {
+        let native = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .is_some_and(|base| {
+                logical.planned_fp8(base).is_some() || logical.planned_convrot(base).is_some()
+            });
+        let representation = if native {
             ExecutionRepresentation::NativePacked
         } else {
             ExecutionRepresentation::DenseFallback
@@ -772,6 +756,9 @@ fn measure_residency(
         let row_key = (tensor.codec_id, representation);
         codec_by_owner.insert(tensor.physical_key.as_str(), row_key);
         let array = logical.require(&tensor.logical_key)?;
+        logical
+            .source_reads
+            .materialized(&tensor.logical_key, array)?;
         let scale_bytes = if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
             let base = tensor
                 .logical_key
@@ -939,6 +926,19 @@ mod tests {
         assert!(load_planned_file(&invalid).is_err());
     }
 
+    // These reference-decode fixtures specifically exercise the announced dense representation.
+    // Native source/direct-constructor tests use the production residency policy.
+    fn plan_logical_weights(
+        path: &Path,
+        mapping: &dyn LogicalKeyMapping,
+    ) -> Result<LogicalWeightPlan> {
+        Ok(gen_core::checkpoint_codec::plan_safetensors(
+            path,
+            mapping,
+            baseline_codec_registry(),
+            &gen_core::checkpoint_codec::DenseResidencyPolicy,
+        )?)
+    }
     struct StripModel;
 
     impl LogicalKeyMapping for StripModel {

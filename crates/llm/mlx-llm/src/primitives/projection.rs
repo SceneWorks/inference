@@ -237,7 +237,7 @@ impl Projection {
                 )?
                 .as_dtype(q.scales.dtype())?
             }
-            Projection::Native(_) => return Err(crate::error::Error::Unsupported("gathered embedding rows require an embedding codec; ConvRot stores rotated projections".into())),
+            Projection::Native(p) => p.rows(&flat)?,
             Projection::Prism(_) => {
                 return Err(crate::error::Error::Unsupported(
                     "a Prism projection has no dense rows to gather".into(),

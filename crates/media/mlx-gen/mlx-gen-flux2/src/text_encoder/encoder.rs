@@ -190,7 +190,7 @@ impl Qwen3TextEncoder {
                 group_size,
                 bits,
             } => Some((wq, scales, biases, *group_size, *bits)),
-            TokenEmbedding::Dense(_) => None,
+            TokenEmbedding::Dense(_) | TokenEmbedding::Native(_) => None,
         }
     }
 
@@ -565,6 +565,9 @@ fn gen_head_missing() -> Error {
 /// `.scales` / `.biases`, mirroring [`lin`](super::lin) for the embedding case. `base` is the
 /// embedding's prefix (`….embed_tokens`).
 fn load_embed(w: &Weights, base: &str, quant: Option<Flux2Quant>) -> Result<TokenEmbedding> {
+    if let Some(p) = mlx_gen::NativeProjection::from_weights(w, base, false)? {
+        return Ok(TokenEmbedding::Native(p));
+    }
     if let Some(q) = quant {
         if let Some(scales) = w.get(&format!("{base}.scales")) {
             return Ok(TokenEmbedding::from_quantized_parts(

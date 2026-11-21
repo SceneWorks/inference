@@ -30,6 +30,7 @@ impl FluxTextEncoders {
 
 enum TokenEmbedding {
     Dense(Array),
+    Native(mlx_gen::NativeProjection),
     Quantized {
         wq: Array,
         scales: Array,
@@ -46,6 +47,9 @@ impl TokenEmbedding {
     /// enum (sc-8669), so a published Q4/Q8 text encoder loads its token/position/relative-bias
     /// tables packed with no dense bf16 transient.
     fn from_weights(w: &Weights, base: &str, group_size: i32) -> Result<Self> {
+        if let Some(p) = mlx_gen::NativeProjection::from_weights(w, base, false)? {
+            return Ok(Self::Native(p));
+        }
         if let Some(scales) = w.get(&format!("{base}.scales")) {
             let wq = w.require(&format!("{base}.weight"))?.clone();
             // F-011: reuse the shared, validated bit-width derivation (mlx_gen::quant::packed_bits)
@@ -65,6 +69,7 @@ impl TokenEmbedding {
     fn forward(&self, ids: &Array) -> Result<Array> {
         let out = match self {
             Self::Dense(w) => w.take_axis(ids, 0)?,
+            Self::Native(p) => p.rows(ids)?,
             Self::Quantized {
                 wq,
                 scales,

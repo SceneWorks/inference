@@ -6,7 +6,8 @@ use gen_core::convrot_int8::{ConvRotInt8, MAX_DESCRIPTOR_BYTES};
 #[cfg(any(test, feature = "test-support"))]
 use mlx_rs::fast::MetalKernel;
 use mlx_rs::{ops::matmul, transforms::eval, Array, Dtype};
-use std::{cell::RefCell, collections::HashMap};
+#[cfg(any(test, feature = "test-support"))]
+use std::cell::RefCell;
 
 /// The original serial kernels (sc-26683), kept ONLY as the parity reference for the tiled path in
 /// [`crate::int8_gemm`]: one row per thread for the quantizer and one 32-lane SIMD group per output
@@ -85,15 +86,11 @@ pub trait MlxWeightSource {
     fn planned_fp8(&self, _base: &str) -> Option<&crate::fp8::Fp8Linear> {
         None
     }
-    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.rotation_cache()
-            .borrow_mut()
-            .entry(group)
-            .or_insert_with(build)
-            .clone()
-    }
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array;
     fn get(&self, key: &str) -> Option<&Array>;
-    fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>>;
+    fn observation(&self, _key: &str) -> Option<crate::source::Observation> {
+        None
+    }
     fn planned_geometry(&self, _base: &str) -> Option<ConvRotInt8> {
         None
     }
@@ -116,70 +113,11 @@ pub fn descriptor_array(group: usize) -> Array {
     Array::from_slice(json.as_bytes(), &[json.len() as i32])
 }
 
-/// Resolve file-level declarations against the complete shard-set key inventory before a
-/// provider can rename its keys or drop file metadata. Per-layer payloads remain authoritative.
-pub fn attach_metadata(
-    tensors: &mut HashMap<String, Array>,
-    declarations: &[String],
-) -> Result<()> {
-    use gen_core::comfy_quant::{parse_comfy_quant_descriptor, parse_quantization_metadata};
-    use std::collections::BTreeMap;
-    for declaration in declarations {
-        let table = parse_quantization_metadata(declaration)
-            .map_err(|e| crate::Error::Msg(e.to_string()))?;
-        let names: BTreeMap<_, _> = tensors.keys().map(|k| (k.as_str(), ())).collect();
-        let prefix = gen_core::checkpoint_codec::resolve_metadata_prefix(&names, &table)
-            .map_err(|e| crate::Error::Msg(e.to_string()))?;
-        for (name, entry) in table {
-            let base = format!("{prefix}{name}");
-            let key = format!("{base}.comfy_quant");
-            if let Some(blob) = tensors.get(&key) {
-                if blob.dtype() != Dtype::Uint8
-                    || blob.ndim() != 1
-                    || blob.size() > MAX_DESCRIPTOR_BYTES
-                {
-                    return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
-                }
-                blob.eval()?;
-                let parsed = parse_comfy_quant_descriptor(blob.as_slice::<u8>())
-                    .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
-                let conflict = entry.disagreement_with(&parsed);
-                if !conflict.is_empty() {
-                    return Err(
-                        format!("{base}: contradictory descriptor fields {conflict:?}").into(),
-                    );
-                }
-            } else if entry.convrot == Some(true)
-                || matches!(
-                    entry.format,
-                    gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn
-                        | gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2
-                        | gen_core::comfy_quant::ComfyQuantFormat::Mxfp8
-                )
-            {
-                let d = entry
-                    .into_complete()
-                    .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
-                let blob = if let Some(group) = d.rotation_group {
-                    descriptor_array(group)
-                } else {
-                    crate::fp8::descriptor_array(
-                        d.format,
-                        d.full_precision_matrix_mult,
-                        d.orig_shape.as_deref(),
-                    )
-                };
-                tensors.insert(key, blob);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Compact native integer base, shareable by adapter-bearing projections.
 #[derive(Clone, Debug)]
 pub struct ConvRotLinear {
     descriptor: ConvRotInt8,
+    observation: Option<crate::source::Observation>,
     codes: Array,
     scales: Array,
     bias: Option<Array>,
@@ -202,6 +140,7 @@ impl ConvRotLinear {
         .map_err(crate::Error::Msg)?;
         Ok(Self {
             descriptor: layout,
+            observation: self.observation.clone(),
             codes: self.codes.index((lo..hi, ..)),
             scales: self.scales.index((lo..hi, ..)),
             bias: self.bias.as_ref().map(|b| b.index(lo..hi)),
@@ -224,6 +163,28 @@ impl ConvRotLinear {
         }
         self.bias = Some(bias);
         Ok(())
+    }
+
+    pub(crate) fn observe(&mut self, obs: crate::source::Observation) -> Result<()> {
+        obs.bind(&self.codes, &self.scales, None)?;
+        self.observation = Some(obs);
+        Ok(())
+    }
+    pub fn codes(&self) -> &Array {
+        &self.codes
+    }
+    /// Invert the orthonormal activation rotation on the requested coefficient rows.
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
+        let flat = ids.reshape(&[-1])?;
+        let weight = self.codes.take_axis(&flat, 0)?.as_dtype(Dtype::Float32)?;
+        let scales = self.scales.take_axis(&flat, 0)?;
+        let g = self.descriptor.rotation_group as i32;
+        let k = self.descriptor.in_features as i32;
+        let rotated = matmul(&weight.reshape(&[-1, g])?, &self.rotation)?.reshape(&[-1, k])?;
+        let values = mlx_rs::ops::multiply(rotated, &scales)?.as_dtype(Dtype::Bfloat16)?;
+        let mut shape = ids.shape().to_vec();
+        shape.push(k);
+        Ok(values.reshape(&shape)?)
     }
 
     pub fn scales(&self) -> &Array {
@@ -335,33 +296,29 @@ impl ConvRotLinear {
             return Err(format!("{base}: invalid ConvRot bias").into());
         }
         let g = descriptor.rotation_group;
-        let rotation = w
-            .rotation_cache()
-            .borrow_mut()
-            .entry(g)
-            .or_insert_with(|| {
-                let h4 = [
-                    [1f32, 1., 1., -1.],
-                    [1., 1., -1., 1.],
-                    [1., -1., 1., 1.],
-                    [-1., 1., 1., 1.],
-                ];
-                let values: Vec<f32> = (0..g * g)
-                    .map(|i| {
-                        let (mut r, mut c, mut s) = (i / g, i % g, 1f32);
-                        while r != 0 || c != 0 {
-                            s *= h4[r % 4][c % 4];
-                            r /= 4;
-                            c /= 4;
-                        }
-                        s / (g as f32).sqrt()
-                    })
-                    .collect();
-                Array::from_slice(&values, &[g as i32, g as i32])
-            })
-            .clone();
+        let rotation = w.convrot_rotation(g, || {
+            let h4 = [
+                [1f32, 1., 1., -1.],
+                [1., 1., -1., 1.],
+                [1., -1., 1., 1.],
+                [-1., 1., 1., 1.],
+            ];
+            let values: Vec<f32> = (0..g * g)
+                .map(|i| {
+                    let (mut r, mut c, mut s) = (i / g, i % g, 1f32);
+                    while r != 0 || c != 0 {
+                        s *= h4[r % 4][c % 4];
+                        r /= 4;
+                        c /= 4;
+                    }
+                    s / (g as f32).sqrt()
+                })
+                .collect();
+            Array::from_slice(&values, &[g as i32, g as i32])
+        });
         Ok(Some(Self {
             descriptor,
+            observation: None,
             codes: codes.clone(),
             scales: scales.clone(),
             bias,
@@ -428,6 +385,9 @@ impl ConvRotLinear {
             return Err("ConvRot bias requires one floating value per output row".into());
         }
         let d = self.descriptor;
+        if self.observation.as_ref().is_some_and(|obs| obs.pending()) {
+            self.materialize()?;
+        }
         let (rotated, rows) = self.rotate(x)?;
         let (codes, scales) = crate::int8_gemm::quantize_rows(
             &rotated,
@@ -503,6 +463,9 @@ impl ConvRotLinear {
                 .into_iter()
                 .chain(self.bias.iter()),
         )?;
+        if let Some(obs) = &self.observation {
+            obs.record_packed()?;
+        }
         Ok(())
     }
     /// Projection-owned bytes; the two immutable rotation constants are shared per load.

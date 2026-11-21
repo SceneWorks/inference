@@ -324,6 +324,10 @@ impl MiniMaxH3TextEncoder {
     /// view of the table. A packed table is gathered per row and dequantized on the same stream.
     fn cpu_token_lookup(&self, input_ids: &Array, stream: &StreamOrDevice) -> Result<Array> {
         let rows = match &self.embed_tokens {
+            TokenEmbedding::Native(p) => {
+                mlx_rs::with_new_default_stream(stream.as_ref().clone(), || p.rows(input_ids))
+                    .map_err(mlx_gen::Error::from)?
+            }
             TokenEmbedding::Dense(weight) => weight.take_axis_device(input_ids, 0, stream)?,
             TokenEmbedding::Quantized {
                 wq,
@@ -345,6 +349,7 @@ impl MiniMaxH3TextEncoder {
     /// one — named for the sc-22414 coherence check.
     fn token_table_sources(&self) -> Vec<(&'static str, &Array)> {
         match &self.embed_tokens {
+            TokenEmbedding::Native(p) => p.operands(),
             TokenEmbedding::Dense(weight) => vec![("minimax-h3 embed_tokens.weight", weight)],
             TokenEmbedding::Quantized {
                 wq, scales, biases, ..
@@ -506,6 +511,7 @@ impl MiniMaxH3TextEncoder {
     fn embed_tokens_nbytes(&self) -> usize {
         use mlx_gen::nn::TokenEmbedding;
         match &self.embed_tokens {
+            TokenEmbedding::Native(p) => p.operands().iter().map(|(_, a)| a.nbytes()).sum(),
             TokenEmbedding::Dense(w) => w.nbytes(),
             TokenEmbedding::Quantized {
                 wq, scales, biases, ..

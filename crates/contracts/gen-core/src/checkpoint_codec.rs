@@ -53,6 +53,9 @@ pub use plan::*;
 mod compile;
 pub use compile::*;
 
+mod source;
+pub use source::*;
+
 mod receipt;
 pub use receipt::*;
 
