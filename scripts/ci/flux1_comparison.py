@@ -146,7 +146,7 @@ def retain_logs(work, artifact, receipt, phases=PHASES):
 
 
 def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None,
-           arguments=(), capture_cuda_basis=False, dedicated_adapter=None):
+           arguments=(), capture_cuda_basis=False, dedicated_adapter=None, observer=None):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -158,6 +158,8 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
     stderr_path = out / "stderr.log"
     probe = (PairCudaProbe(policy, out / "cuda-pool.json", dedicated_adapter=dedicated_adapter)
              if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
+    if observer is not None:
+        probe = observer(probe, policy)
     try:
         guard = run_guarded([str(binary), *(["--preflight"] if preflight else []), *arguments],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
@@ -169,6 +171,7 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
             "host_memory": error.watchdog_host_memory, "child_footprint": error.watchdog_child_footprint,
             "device_memory": error.watchdog_device_memory,
+            **({"fit_observation": probe.fit_observation()} if observer is not None else {}),
         }, owned=out.parent)
         # The supervisor can refuse before spawn. Preserve its reason whether or not
         # it created a log; a failing child may have filled its entire stderr budget.
@@ -188,6 +191,8 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         if probe is not None:
             probe.close()
     summary = asdict(guard)
+    if observer is not None:
+        summary["fit_observation"] = probe.fit_observation()
     if capture_cuda_basis and probe is not None:
         summary["cuda_attribution"] = probe.measurement()
     proof.write_json(out / "supervisor.json", summary, owned=out.parent)

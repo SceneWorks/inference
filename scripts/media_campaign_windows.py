@@ -281,7 +281,7 @@ class WindowsJob:
         pids = self.members()
         if not pids:
             raise WindowsJobError("owned Job disappeared during memory sample")
-        total = 0
+        total = working_peak = private_peak = 0
         for pid in pids:
             process = self.kernel.OpenProcess(0x0400 | 0x0010, False, pid)  # QUERY_INFO|VM_READ
             if not process:
@@ -297,12 +297,18 @@ class WindowsJob:
                         continue  # Exited during the sample.
                     raise _failed(f"GetProcessMemoryInfo({pid})")
                 total += max(counters.WorkingSetSize, counters.PrivateUsage)
+                working_peak += counters.PeakWorkingSetSize
+                private_peak += counters.PeakPagefileUsage
             finally:
                 self.kernel.CloseHandle(process)
         limits = _ExtendedLimits()
         if not self.kernel.QueryInformationJobObject(self.handle, 9, ctypes.byref(limits),
                                                       ctypes.sizeof(limits), None):
             raise _failed("QueryInformationJobObject/peak-memory")
+        self.last_memory_counters = {
+            "owned_process_count": len(pids), "peak_working_set_bytes": working_peak,
+            "peak_private_commit_bytes": private_peak, "peak_job_commit_bytes": limits.PeakJobMemoryUsed,
+        }
         return max(total, limits.PeakJobMemoryUsed)
 
     def _accounting(self) -> dict[str, int]:

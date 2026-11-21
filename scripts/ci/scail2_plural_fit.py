@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""One candidate-only, explicitly guarded SCAIL-2 plural qualification campaign per native backend."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.ci import flux1_comparison as paired, model_inference_proofs as proof
+from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as evidence
+from scripts.ci import wddm_process_memory as wddm
+from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.scail_plural import contract as c
+from scripts.media_campaign_supervisor import SystemProbe
+
+
+def row(backend):
+    return dict(tier1.case_row(backend, "scail2"), fqn=c.FQN)
+
+
+def source(backend):
+    directory = ROOT / "scripts/ci/scail_plural"
+    shim = (directory / ("mlx.rs.in" if backend == "mlx" else "cuda.rs.in")).read_text()
+    if backend == "candle-cuda":
+        shim = shim.replace("@POOL@", (ROOT / "scripts/ci/wan_pair/cuda_pool.rs.in").read_text())
+    return (
+        (directory / "probe.rs.in")
+        .read_text()
+        .replace("@BACKEND@", shim)
+        .replace("@CARRIERS@", json.dumps(c.CARRIERS, separators=(",", ":")))
+        .replace("@PINS@", ",\n".join(f'("{n}","{d}")' for n, (_, d) in c.FILES.items()))
+    )
+
+
+def plan(backend, request, head):
+    identity = proof.repository_identity(head)
+    if c.digest_json(request) != c.digest_json(
+        {"selection": c.SELECTION, "policy": c.policy(backend)}
+    ):
+        raise ValueError(
+            "plural campaign requires its complete fixed count set and exact guard policy"
+        )
+    return {
+        "protocol": c.PROTOCOL,
+        "head": identity["revision"],
+        "tree": identity["tree"],
+        "request": request,
+        "backend": backend,
+        "runner": tier1.LANES[backend],
+        "counts": c.COUNTS[backend],
+        "asset_setup": "hub-snapshots",
+        "hub_snapshots": {c.SLOT: {"repository": c.REPO, "revision": c.REV, "subfolder": "q4"}},
+        "fixture_module_sha256": hashlib.sha256(source(backend).encode()).hexdigest(),
+        "inventory_sha256": c.INVENTORY,
+        "files": c.FILES,
+        "case": row(backend),
+    }
+
+
+class Observer:
+    def __init__(self, cuda, approved):
+        self.base = cuda if cuda is not None else SystemProbe(approved)
+        self.host_baseline = None
+        self.host_samples = []
+        self.card_samples = []
+        self.windows_peak = {}
+        self.shared = (
+            wddm.DedicatedSamples(cuda.dedicated_adapter, approved.cuda_device_uuid, shared=True)
+            if cuda
+            else None
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def tree_footprint(self, owner):
+        value = self.base.tree_footprint(owner)
+        if value and self.host_baseline is None:
+            self.host_baseline = value
+        if value:
+            self.host_samples.append([time.monotonic_ns(), value])
+            if self.shared:
+                counters = owner.last_memory_counters
+                if counters["owned_process_count"] != 1:
+                    raise ValueError("plural render spawned an unexpected process")
+                for key, observed in counters.items():
+                    self.windows_peak[key] = max(self.windows_peak.get(key, 0), observed)
+        return value
+
+    def gpu_free_and_tree_bytes(self, owner):
+        free, used = self.base.gpu_free_and_tree_bytes(owner)
+        self.shared.poll(owner, cuda_active=bool(self.base.dedicated.record["samples"]))
+        self.card_samples.append([time.monotonic_ns(), free, used])
+        return free, used
+
+    def close(self):
+        if self.shared:
+            self.shared.close()
+            self.base.close()
+
+    def fit_observation(self):
+        return {
+            "host_baseline": self.host_baseline,
+            "host_samples_monotonic_ns_bytes": self.host_samples,
+            "card_samples_monotonic_ns_free_owned_or_fallback_bytes": self.card_samples,
+            "windows_peak": self.windows_peak,
+            "wddm_shared_counter": "GPU Process Memory/Shared Usage" if self.shared else None,
+            "wddm_shared": self.shared.record if self.shared else None,
+        }
+
+
+def build(work, contract, policy):
+    backend = contract["backend"]
+    scratch = work / "src"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(scratch)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--detach", contract["head"]], cwd=scratch, check=True
+    )
+    if paired.git(scratch, "rev-parse", "HEAD^{tree}") != contract["tree"]:
+        raise ValueError("wrong checkout tree")
+    package = contract["case"]["package"]
+    lib = (
+        scratch
+        / "crates/media"
+        / ("mlx-gen" if backend == "mlx" else "candle-gen")
+        / package
+        / "src/lib.rs"
+    )
+    with lib.open("a", encoding="utf8") as f:
+        f.write("\n#[cfg(test)]\nmod plural_fit;\n")
+    native = lib.with_name("plural_fit.rs")
+    native.write_bytes(source(backend).encode())
+    if tier1.sha(native) != contract["fixture_module_sha256"]:
+        raise ValueError("wrong native fixture")
+    env = tier1.build_env(policy)
+    env["CARGO_TARGET_DIR"] = str(work / "target")
+    toolchain = proof.verified_toolchain(env, root=scratch)
+    cmd = proof.command(contract["case"], discover=True)
+    cmd.insert(2, "--release")
+    result = subprocess.run(
+        cmd, cwd=scratch, env=env, stdout=subprocess.PIPE, encoding="utf8", check=True
+    )
+    discovery = proof.verify_discovery(contract["case"], result.stdout)
+    binary = Path(discovery["executable"])
+    if not binary.resolve().is_relative_to((work / "target").resolve()):
+        raise ValueError("test executable escaped owned build root")
+    return (
+        scratch,
+        binary,
+        env,
+        {
+            "command": cmd,
+            "discovery": discovery,
+            "binary_sha256": tier1.sha(binary),
+            "toolchain": toolchain,
+        },
+    )
+
+
+def execute(args, contract):
+    backend = contract["backend"]
+    proof.require_host(backend, os.environ, "nax")
+    if os.environ.get("MODEL_PROOF_RUNNER_ENVIRONMENT") != "self-hosted":
+        raise ValueError("plural fits require an owned physical execution lease")
+    temp = Path(os.environ["RUNNER_TEMP"])
+    dest = proof.owned_output(args.output, temp)
+    work = temp / f"scail-plural-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+    proof.unlinked_path(work, temp)
+    work.mkdir()
+    phases = [f"count-{n}" for n in contract["counts"]]
+    receipt = {
+        "contract": contract,
+        "request": contract["request"],
+        "accepted": False,
+        "counts": {},
+        "logs": {},
+        "run_id": os.environ["GITHUB_RUN_ID"],
+        "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+        "runner": os.environ["RUNNER_NAME"],
+        "coverage": {
+            "status": "native observations; coordinator physical review required before import",
+            "allocator": "native lifetime high-water",
+            "host": "Darwin kernel lifetime footprint or Windows Job private commit and process working set",
+            "cuda_nonpool": "owned WDDM dedicated/shared and whole-card samples at the guard cadence",
+            "cuda_nonpool_unsampled_overshoot_upper_bytes": None,
+        },
+    }
+    try:
+        approved = tier1.read_policy(work, "policy.json", contract["request"]["policy"])
+        hw = receipt["hardware"] = paired.hardware(backend, approved)
+        adapter = receipt["adapter"] = (
+            tier1.cuda_adapter(approved) if backend == "candle-cuda" else None
+        )
+        if backend == "mlx" and (
+            receipt["runner"] != "nax-macos-2" or hw["chip"] != "Apple M5 Max"
+        ):
+            raise ValueError("wrong secondary Mac")
+        if backend == "candle-cuda" and (hw["uuid"] != c.GPU or int(hw["index"]) != 1):
+            raise ValueError("wrong Windows GPU")
+        stage = json.loads(Path(os.environ["MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"]).read_text())[
+            "snapshots"
+        ][c.SLOT]
+        snapshot = Path(os.environ[c.SLOT])
+        c.validate_stage(stage, snapshot)
+        receipt["stage"] = stage
+        root, binary, build_env, receipt["build"] = build(work, contract, approved)
+        for count, name in zip(contract["counts"], phases):
+            claim_dir = work / (name + "-claim")
+            claim_dir.mkdir()
+            claim_policy = tier1.read_policy(
+                claim_dir, "policy.json", dict(contract["request"]["policy"], deadlineSeconds=2520)
+            )
+            record = receipt["counts"][str(count)] = {"accepted": False}
+            deadline = time.monotonic() + 2520
+            with execution_claim(
+                backend, claim_policy, claim_dir, build_env, original_deadline_monotonic=deadline
+            ) as claim:
+                record["claim"] = claim
+                env = {k: v for k, v in build_env.items() if k.upper() in tier1.RUNTIME_ENV}
+                # The paired timing harness fixes cuBLAS's workspace for bit comparison.
+                # Normal resident worker qualification uses the native default allocator.
+                env.pop("CUBLAS_WORKSPACE_CONFIG", None)
+                env.update(
+                    {
+                        c.SLOT: str(snapshot),
+                        "SCAIL_PLURAL_COUNT": str(count),
+                        "MODEL_INFERENCE_CASE_FQN": c.FQN,
+                    }
+                )
+                if backend == "mlx":
+                    env["WAN_VAE_BUDGET_GIB"] = "28"
+                out = work / name
+                _, stdout = paired.invoke(
+                    binary,
+                    root,
+                    out,
+                    env,
+                    approved,
+                    build_env,
+                    last_child_start=deadline - 2430,
+                    arguments=["--exact", c.FQN, "--ignored", "--nocapture", "--test-threads=1"],
+                    capture_cuda_basis=backend == "candle-cuda",
+                    dedicated_adapter=adapter,
+                    observer=Observer,
+                )
+                native = json.loads(evidence.owned_file(out, "native.json", c.MIB).read_bytes())
+                record["native"] = native
+                record["body"] = proof.verify_execution(contract["case"], stdout)
+                guard = json.loads(
+                    evidence.owned_file(out, "supervisor.json", 16 * c.MIB).read_bytes()
+                )
+                pool = (
+                    json.loads(evidence.owned_file(out, "cuda-pool.json", 4096).read_bytes())
+                    if adapter
+                    else None
+                )
+                record["candidate_row_pending_physical_review"] = c.measured_row(
+                    native, guard, pool, adapter, hw, backend, count, approved, contract["head"]
+                )
+            if not claim.get("post_execution_verified"):
+                raise ValueError("physical resource release unverified")
+            record["accepted"] = True
+        receipt["accepted"] = True
+    except BaseException as exc:
+        receipt["failure"] = proof.redact(str(exc), dict(os.environ))
+        raise
+    finally:
+        errors = paired.retain_logs(work, dest, receipt, phases)
+        if errors:
+            receipt.update(accepted=False, log_errors=errors)
+        paired.remove_work(work, temp)
+        proof.write_json(dest / "receipt.json", receipt)
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf8") as f:
+            f.write("SCAIL_PLURAL_RECEIPT_SHA256=" + tier1.sha(dest / "receipt.json") + "\n")
+    if not receipt["accepted"]:
+        raise ValueError("incomplete plural memory measurements")
+
+
+def verify(args, contract):
+    dest = args.output
+    proof.unlinked_path(dest, Path(os.environ["RUNNER_TEMP"]))
+    file = evidence.owned_file(dest, "receipt.json", 8 * c.MIB)
+    if tier1.sha(file) != os.environ.get("SCAIL_PLURAL_RECEIPT_SHA256"):
+        raise ValueError("unsealed producer receipt")
+    receipt = json.loads(file.read_bytes())
+    if (
+        c.digest_json(contract) != c.digest_json(receipt["contract"])
+        or receipt["request"] != contract["request"]
+        or receipt["run_id"] != os.environ["GITHUB_RUN_ID"]
+        or receipt["run_attempt"] != os.environ["GITHUB_RUN_ATTEMPT"]
+    ):
+        raise ValueError("receipt belongs to another plan")
+    backend = contract["backend"]
+    limits = paired.retained_log_limits(receipt["request"]["policy"])
+    if backend == "candle-cuda":
+        limits["cuda-pool.json"] = 4096
+    allowed = {
+        f"count-{n}.{suffix}": cap for n in contract["counts"] for suffix, cap in limits.items()
+    }
+    if not set(receipt["logs"]).issubset(allowed) or set(p.name for p in dest.iterdir()) != set(
+        receipt["logs"]
+    ) | {"receipt.json"}:
+        raise ValueError("unexpected evidence files")
+    for name, published in receipt["logs"].items():
+        if tier1.sha(evidence.owned_file(dest, name, allowed[name])) != published["sha256"]:
+            raise ValueError("changed published evidence")
+    if not receipt["accepted"]:
+        if not (receipt.get("failure") or receipt.get("log_errors")):
+            raise ValueError("unexplained partial campaign")
+        return
+    required = {name for name in allowed if not name.endswith(".guard.jsonl")}
+    if not required.issubset(receipt["logs"]) or set(receipt["counts"]) != set(
+        map(str, contract["counts"])
+    ):
+        raise ValueError("incomplete campaign")
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as d:
+        approved = tier1.read_policy(Path(d), "policy.json", contract["request"]["policy"])
+    for count in contract["counts"]:
+        record = receipt["counts"][str(count)]
+        name = f"count-{count}"
+        guard = json.loads((dest / (name + ".supervisor.json")).read_bytes())
+        pool = (
+            json.loads((dest / (name + ".cuda-pool.json")).read_bytes())
+            if receipt["adapter"]
+            else None
+        )
+        body = proof.verify_execution(contract["case"], (dest / (name + ".stdout.log")).read_text())
+        if (
+            not record["accepted"]
+            or not record["claim"]["post_execution_verified"]
+            or record["body"] != body
+            or record["candidate_row_pending_physical_review"]
+            != c.measured_row(
+                record["native"],
+                guard,
+                pool,
+                receipt["adapter"],
+                receipt["hardware"],
+                backend,
+                count,
+                approved,
+                contract["head"],
+            )
+        ):
+            raise ValueError("physical/model receipt changed")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--plan", action="store_true")
+    mode.add_argument("--verify-artifacts", action="store_true")
+    parser.add_argument("--backend", choices=c.COUNTS, required=True)
+    parser.add_argument("--expected-sha", required=True)
+    parser.add_argument("--request-env", required=True)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    contract = plan(args.backend, json.loads(os.environ[args.request_env]), args.expected_sha)
+    if args.plan:
+        print(json.dumps(contract))
+        return
+    if not args.output or c.digest_json(contract) != os.environ.get("VIDEO_TIER1_PLAN_SHA256"):
+        raise ValueError("campaign differs from hosted plan")
+    (verify if args.verify_artifacts else execute)(args, contract)
+
+
+if __name__ == "__main__":
+    main()

@@ -34,7 +34,7 @@ env:
   CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
-  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'wan-curated-tier1' && 'wan_tier1_comparison.py' || inputs.flux1_pair == 'none' && contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection) && 'video_tier1_comparison.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
+  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'scail2-plural-fit' && 'scail2_plural_fit.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'wan-curated-tier1' && 'wan_tier1_comparison.py' || inputs.flux1_pair == 'none' && contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection) && 'video_tier1_comparison.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -83,9 +83,9 @@ jobs:
           plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "model-proof-plan.json").read_text())
           setup = plan["asset_setup"]
           paired = setup in ("wan-curated-tier1", "mochi-svd-tier1", "scail2-tier1")
-          canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() if paired else b""
+          canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() if paired or plan.get("protocol") == "scail2-plural-fit-v1" else b""
           row = {"runner": plan["runner"], "asset_setup": setup, "paired_source": paired,
-                 "video_plan_sha256": hashlib.sha256(canonical).hexdigest() if paired else ""}
+                 "video_plan_sha256": hashlib.sha256(canonical).hexdigest() if canonical else ""}
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               print("matrix=" + json.dumps({"include": [row]}, separators=(",", ":")), file=output)
           PYTHON
@@ -276,7 +276,7 @@ jobs:
           MODEL_PROOF_HUB_ROOT: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
+          "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
           "$PYTHON" -I scripts/ci/stage_pinned_hub_snapshots.py --plan "$RUNNER_TEMP/model-proof-plan.json"
       - name: Stage and bind declared pinned Hub snapshots (Windows)
         if: matrix.asset_setup == 'hub-snapshots' && runner.os == 'Windows'
@@ -284,7 +284,7 @@ jobs:
         env:
           MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
         run: |
-          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
+          "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
           if errorlevel 1 exit /b %ERRORLEVEL%
           "%REVIEWED_PYTHON%" -I scripts\ci\stage_pinned_hub_snapshots.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
       - name: Run exact registered model tests under external guards (Linux/macOS)

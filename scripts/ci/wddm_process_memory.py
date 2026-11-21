@@ -140,7 +140,7 @@ class _Pdh:
 
 
 @contextmanager
-def _query(adapter, pid=None, *, diagnostic=None):
+def _query(adapter, pid=None, *, diagnostic=None, usage="Dedicated Usage"):
     instance = f"{adapter['luid']}_phys_{adapter['physical_node']}"
     category = "GPU Adapter Memory"
     if pid is not None:
@@ -151,7 +151,7 @@ def _query(adapter, pid=None, *, diagnostic=None):
     try:
         def counter(name):
             handle = HANDLE()
-            path = rf"\{category}({name})\Dedicated Usage"
+            path = rf"\{category}({name})\{usage}"
             _check(api.add(query, path, 0, C.byref(handle)), "PdhAddEnglishCounterW")
             return handle
 
@@ -219,7 +219,8 @@ def _creation_time(owner, pid, expected):
 
 
 class DedicatedSamples:
-    def __init__(self, adapter, cuda_uuid):
+    def __init__(self, adapter, cuda_uuid, *, shared=False):
+        self.shared = shared
         self.record = {"adapter": validate_adapter(adapter, cuda_uuid), "pid": None, "created_filetime": None,
                        "samples": [], "missing_active_polls": 0, "error": None}
         self.query = None
@@ -253,7 +254,8 @@ class DedicatedSamples:
             if created is None:  # original root exited before this read; no new observation
                 return
             if self.query is None:
-                context = _query(row["adapter"], pid)
+                context = (_query(row["adapter"], pid, usage="Shared Usage") if self.shared
+                           else _query(row["adapter"], pid))
                 self.read = context.__enter__()
                 self.query = context
                 row.update(pid=pid, created_filetime=created)
@@ -281,7 +283,7 @@ class DedicatedSamples:
             row["error"] = str(exc)
 
 
-def sampled_peak(record, *, pid, adapter):
+def sampled_peak(record, *, pid, adapter, allow_zero=False):
     """Recompute a sampled high-water mark; zero-only or incomplete measurement is inconclusive."""
     if (not isinstance(record, dict) or set(record) != {"adapter", "pid", "created_filetime", "samples",
                                                         "missing_active_polls", "error"}
@@ -304,7 +306,7 @@ def sampled_peak(record, *, pid, adapter):
         last = sample[0]
         positive += int(sample[1] > 0)
         peak = max(peak, sample[1])
-    if record["error"] is not None or record["missing_active_polls"] or positive < 2:
+    if record["error"] is not None or record["missing_active_polls"] or (len(record["samples"]) if allow_zero else positive) < 2:
         return None
     return peak
 

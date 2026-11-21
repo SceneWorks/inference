@@ -1,0 +1,241 @@
+// Native test module installed only into the dedicated proof's throwaway checkout.
+use gen_core::generator::ExecutionIdentity;
+use gen_core::{
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, ReplacementMode,
+    WeightsSource,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const WIDTH: u32 = 832;
+const HEIGHT: u32 = 480;
+const FRAMES: u32 = 45;
+const STEPS: u32 = 4;
+const FQN: &str = "plural_fit::measure_real_weights";
+
+@BACKEND@
+
+fn pixels(mut rgb: impl FnMut(u32, u32) -> [u8; 3]) -> Image {
+    let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 3) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            pixels.extend_from_slice(&rgb(x, y));
+        }
+    }
+    Image {
+        width: WIDTH,
+        height: HEIGHT,
+        pixels,
+    }
+}
+
+fn request(count: usize) -> GenerationRequest {
+    let colors = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 0],
+        [0, 255, 255],
+        [255, 0, 255],
+    ];
+    let mut conditioning = vec![];
+    for (i, color) in colors.iter().take(count).enumerate() {
+        let i = i as u32;
+        let image = pixels(|x, y| {
+            [
+                (x + i * 23) as u8,
+                (y + i * 41) as u8,
+                (x / 3 + y / 2 + i * 59) as u8,
+            ]
+        });
+        conditioning.push(Conditioning::Reference {
+            image,
+            strength: None,
+        });
+        let mask = pixels(|x, y| {
+            if (x + y / 8 + i * 37) % WIDTH < WIDTH / 2 {
+                *color
+            } else {
+                [0; 3]
+            }
+        });
+        conditioning.push(Conditioning::Mask { image: mask });
+    }
+    let frames = (0..FRAMES)
+        .map(|t| pixels(|x, y| [(x + 7 * t) as u8, (y + 3 * t) as u8, (x / 3 + y + t) as u8]))
+        .collect();
+    let mask = (0..FRAMES)
+        .map(|t| pixels(|x, _| colors[(((x + 2 * t) % WIDTH) * count as u32 / WIDTH) as usize]))
+        .collect();
+    conditioning.push(Conditioning::ControlClip {
+        frames,
+        mask,
+        masking_strength: 1.0,
+        start_frame: 0,
+        mode: ReplacementMode::default(),
+    });
+    GenerationRequest {
+        prompt: " person".repeat(530),
+        negative_prompt: Some(" blur".repeat(530)),
+        video_mode: Some("animation".into()),
+        width: WIDTH,
+        height: HEIGHT,
+        frames: Some(FRAMES),
+        fps: Some(16),
+        steps: Some(STEPS),
+        guidance: Some(5.0),
+        scheduler_shift: Some(5.0),
+        sampler: Some("unipc".into()),
+        seed: Some(37),
+        conditioning,
+        ..Default::default()
+    }
+}
+
+type CarrierHashes = (Vec<[String; 2]>, [String; 2]);
+
+fn carrier_hashes(req: &GenerationRequest, count: usize) -> Result<CarrierHashes> {
+    let pairs = gen_core::generator::Scail2CharacterReferences::from_request(
+        crate::pipeline::MODEL_ID,
+        req,
+    )?;
+    let image_hash = |image: &Image| format!("{:x}", Sha256::digest(&image.pixels));
+    let mut pairs_sha = vec![];
+    for pair in std::iter::once(&pairs.primary).chain(pairs.additional.iter()) {
+        pairs_sha.push([image_hash(pair.image), image_hash(pair.mask)]);
+    }
+    let driving = req.control_clip().ok_or("missing accepted control clip")?;
+    let clip_hash = |frames: &[Image]| {
+        let mut h = Sha256::new();
+        for frame in frames {
+            h.update(&frame.pixels);
+        }
+        format!("{:x}", h.finalize())
+    };
+    let driving_hashes = [clip_hash(driving.frames), clip_hash(driving.mask)];
+    let fixed: serde_json::Value = serde_json::from_str(r#"@CARRIERS@"#)?;
+    assert_eq!(
+        serde_json::to_value(&pairs_sha)?
+            .as_array()
+            .unwrap()
+            .as_slice(),
+        &fixed["ordered_pairs"].as_array().unwrap()[..count]
+    );
+    assert_eq!(driving_hashes[0], fixed["driving_rgb"].as_str().unwrap());
+    assert_eq!(
+        driving_hashes[1],
+        fixed["driving_masks"][count.to_string()].as_str().unwrap()
+    );
+    Ok((pairs_sha, driving_hashes))
+}
+
+#[test]
+fn ordered_rgb_fixture_digests_match_pinned_bytes() -> Result<()> {
+    for count in 2..=6 {
+        carrier_hashes(&request(count), count)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn measure_real_weights() -> Result<()> {
+    let count = env::var("SCAIL_PLURAL_COUNT")?.parse::<usize>()?;
+    assert!((2..=6).contains(&count));
+    let out = PathBuf::from(env::var("PAIR_OUT")?);
+    let root = PathBuf::from(env::var("SCAIL_PLURAL_Q4")?);
+    let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+    configure(&mut spec);
+    let baseline = start_allocator()?;
+    let mut allocator_samples = vec![json!({"at":"initial","bytes":allocator_state()})];
+    let began = std::time::Instant::now();
+    let req = request(count);
+    use gen_core::generator::scail2_fit::Scail2FitProfile;
+    Scail2FitProfile::prepare_load(&mut spec, &req)?;
+    let mut files = Vec::new();
+    for (name, sha) in [@PINS@] {
+        let pin = spec
+            .prepared_file_pins()
+            .get(&root.join(name))
+            .ok_or("missing prepared member")?;
+        assert_eq!(pin.content_sha256_hex(), sha, "changed {name}");
+        files.push(json!({"name":name,"sha256":pin.content_sha256_hex()}));
+    }
+    let pos = text_len(&root, &req.prompt)?;
+    let neg = text_len(&root, req.negative_prompt.as_deref().unwrap())?;
+    assert_eq!((pos, neg), (512, 512));
+    let registry = crate::provider_registry()?;
+    let id = crate::pipeline::MODEL_ID;
+    let plan = registry
+        .compile_video_plan(id, &spec, &req)?
+        .ok_or("unregistered plural plan")?;
+    let plan = plan.bind_admission(&spec, None, &req)?;
+    let profile =
+        Scail2FitProfile::from_plan(&spec, &plan, &req)?.ok_or("missing plural profile")?;
+    let (pairs_sha, driving_hashes) = carrier_hashes(&req, count)?;
+    let provider = registry.load(id, &spec)?;
+    profile.validate_load(&spec)?;
+    let render_began = std::time::Instant::now();
+    let mut steps = Vec::new();
+    let completed =
+        provider.generate_video_planned_with_execution_report(&req, &plan, None, &mut |p| {
+            if let Progress::Step { current, total } = p {
+                steps.push((current, total));
+                allocator_samples.push(json!({"step":current,"bytes":allocator_state()}));
+            }
+        })?;
+    assert_eq!(steps, [(1, 4), (2, 4), (3, 4), (4, 4)]);
+    let ExecutionIdentity::Resolved { identity } = &completed.execution else {
+        return Err("missing actual native execution policy".into());
+    };
+    let GenerationOutput::Video { frames, fps, audio } =
+        completed.generation.output.ok_or("missing video")?
+    else {
+        return Err("different output modality".into());
+    };
+    assert_eq!(
+        (frames.len(), fps, audio.is_none()),
+        (EXPECTED_FRAMES, 16, true)
+    );
+    let mut output = Sha256::new();
+    for frame in &frames {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (WIDTH, HEIGHT, (WIDTH * HEIGHT * 3) as usize)
+        );
+        output.update(&frame.pixels);
+    }
+    let render_ns = render_began.elapsed().as_nanos() as u64;
+    let device = if BACKEND == "mlx" {
+        assert!(
+            identity.runtime_id.to_lowercase().contains("gpu"),
+            "MLX sampling did not observe its GPU stream"
+        );
+        "mlx-metal"
+    } else {
+        let policy = serde_json::to_value(&identity.quality_policy)?;
+        let compute = policy["value"]["compute"]
+            .as_array()
+            .ok_or("no actual Candle compute records")?;
+        assert!(compute.iter().any(|entry| entry["device"]
+            .as_str()
+            .is_some_and(|d| d.to_lowercase().starts_with("cuda"))));
+        "candle-cuda"
+    };
+    allocator_samples.push(json!({"at":"output","bytes":allocator_state()}));
+    let allocator = finish_allocator(&out)?;
+    profile.validate_load(&spec)?;
+    let layout = plan.layout();
+    let phases: Vec<_> = layout.phases.iter().map(|p| json!({"width":p.identity.geometry.width,"height":p.identity.geometry.height,"frames":p.identity.geometry.frames,"references":p.identity.geometry.reference_count,"latent_frames":p.latent_frames,"latent_bytes":p.latent_bytes,"retained_bytes":p.retained_bytes,"decoded_tensor_bytes":p.decoded_tensor_bytes,"decoded_frames":p.decoded_frames,"chunk":p.decode_chunk_frames,"source":[p.source.start,p.source.end],"history":p.history_frames})).collect();
+    let result = json!({"schema":1,"pid":std::process::id(),"backend":BACKEND,"count":count,"axes":profile.axes(),"character_hashes":pairs_sha,"driving_hashes":driving_hashes,"render_ns":render_ns,"process_work_ns":began.elapsed().as_nanos() as u64,"prompt_tokens":[pos,neg],"files":files,"allocator_baseline":baseline,"allocator_peak":allocator,"allocator_samples":allocator_samples,"phases":phases,"source_bytes":plan.source_bytes(gen_core::MemoryBudgetDomain::HostRam)+plan.source_bytes(gen_core::MemoryBudgetDomain::UnifiedMemory),
+        "execution":identity,"steps":steps,"output":{"width":WIDTH,"height":HEIGHT,"frames":frames.len(),"fps":fps,"sha256":format!("{:x}",output.finalize())}});
+    println!("\nMODEL_INFERENCE_DEVICE {FQN} {device}");
+    fs::write(out.join("native.json"), serde_json::to_vec(&result)?)?;
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED {FQN}");
+    Ok(())
+}

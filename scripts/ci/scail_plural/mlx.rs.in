@@ -1,0 +1,22 @@
+use mlx_gen::gen_core;
+const BACKEND: &str = "mlx";
+const EXPECTED_FRAMES: usize = 48;
+fn configure(_: &mut LoadSpec) {}
+fn text_len(root: &Path, prompt: &str) -> Result<usize> {
+    Ok(
+        mlx_gen_wan::text_encoder::load_tokenizer(root.join("tokenizer.json"), 512)?
+            .tokenize(prompt)?
+            .ids
+            .len(),
+    )
+}
+fn start_allocator() -> Result<u64> {
+    mlx_rs::memory::reset_peak_memory();
+    Ok(mlx_rs::memory::get_active_memory() as u64)
+}
+fn finish_allocator(_: &Path) -> Result<u64> {
+    Ok(mlx_rs::memory::get_peak_memory() as u64)
+}
+fn allocator_state() -> serde_json::Value {
+    json!({"active":mlx_rs::memory::get_active_memory(), "cached":mlx_rs::memory::get_cache_memory(), "active_high":mlx_rs::memory::get_peak_memory()})
+}
