@@ -463,6 +463,35 @@ impl LoadSpec {
         Ok(())
     }
 
+    /// Add newly discovered members of configured source directories to the cache identity.
+    /// Existing finalized pins and receipts are immutable; this operation can only add
+    /// verified directory members, before a consumer derives a render/cache binding.
+    pub(crate) fn include_directory_member_pins(
+        &mut self,
+        extra: &[PinnedWeightsFile],
+    ) -> crate::Result<()> {
+        self.validate_prepared_file_pins()?;
+        let mut candidate = self.prepared_file_pins.clone();
+        for pin in extra {
+            pin.ensure_unchanged()?;
+            let path = pin.loader_path().to_owned();
+            match candidate.pins.binary_search_by(|(p, _)| p.cmp(&path)) {
+                Ok(i) if candidate.pins[i].1 == *pin => (),
+                Ok(_) => {
+                    return Err(crate::Error::Unsupported(
+                        "prepared source identity changed".into(),
+                    ))
+                }
+                Err(i) => candidate.pins.insert(i, (path, pin.clone())),
+            }
+        }
+        candidate.prepared = true;
+        candidate.finalized = true;
+        self.validate_prepared_file_pin_set_for(&candidate)?;
+        self.prepared_file_pins = candidate;
+        Ok(())
+    }
+
     /// Install the complete exact-file set retained by a crate-validated component receipt.
     ///
     /// Kept crate-private so an external caller cannot bless arbitrary paths as cache/load identity.

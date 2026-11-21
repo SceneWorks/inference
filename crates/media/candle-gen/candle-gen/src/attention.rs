@@ -116,7 +116,8 @@ pub fn repeat_kv_bshd(x: &Tensor, groups: usize) -> Result<Tensor> {
 ///
 /// This is the **same planner** as the memory rung's [`CONSTRAINED_ATTN_SCORES_BUDGET`] at a different
 /// setting — a correctness guard rather than a memory operating point, which is why it is much larger.
-pub const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
+pub const ATTN_SCORES_BUDGET: usize =
+    gen_core::attention_budget::VIDEO_ATTENTION_SCORE_ELEMENTS as usize;
 
 /// The largest query-block length whose `[…, block, Sk]` scores element count stays within `budget`.
 /// Returns the whole `sq` (single un-chunked pass) when the full scores tensor already fits — so the

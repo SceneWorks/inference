@@ -29,7 +29,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core::{FfnChunk, GraphEvalCadence};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
-use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
+use mlx_gen_wan::pipeline::capped_z16_quality_overlap;
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
 };
@@ -51,7 +51,12 @@ fn decode_tiling(
     width: i32,
     out_frames: i32,
 ) -> Result<Option<mlx_gen::tiling::TilingConfig>> {
-    auto_tiling_budgeted_z16_quality_overlap(height, width, out_frames)
+    capped_z16_quality_overlap(
+        height,
+        width,
+        out_frames,
+        mlx_gen::gen_core::generator::scail2_fit::mlx_decode_budget_bytes(),
+    )
 }
 /// SCAIL-2 DiT-denoise activation-memory defaults (sc-5681). NOTE: measurement showed the 832×480/5s
 /// high-resolution OOM is the **VAE decode** (see the per-segment decode), not the DiT denoise — MLX's

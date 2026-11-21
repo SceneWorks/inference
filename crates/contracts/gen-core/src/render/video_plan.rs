@@ -146,6 +146,7 @@ struct VideoInputs {
     shift: Option<u32>,
     decode_chunk: Option<u32>,
     carrier_bytes: u64,
+    reference_rgb_digests: Vec<[u8; 32]>,
     content: [u8; 32],
     strength: Option<u32>,
     scheduler: Option<String>,
@@ -170,6 +171,7 @@ impl VideoInputs {
         // The request keeps these original, owned RGB buffers live through decode. Prepared
         // (resized or padded) reference roles are separately resolved by the family compiler.
         let mut carrier_bytes = 0u64;
+        let mut reference_rgb_digests = Vec::new();
         let mut content = Sha256::new();
         for prompt in [Some(req.prompt.as_str()), req.negative_prompt.as_deref()] {
             content.update([u8::from(prompt.is_some())]);
@@ -177,21 +179,22 @@ impl VideoInputs {
             content.update((prompt.len() as u64).to_le_bytes());
             content.update(prompt);
         }
-        let mut count_image = |content: &mut Sha256, im: &crate::Image| -> Result<()> {
+        let mut count_image = |content: &mut Sha256, im: &crate::Image| -> Result<[u8; 32]> {
             content.update(im.width.to_le_bytes());
             content.update(im.height.to_le_bytes());
-            content.update(super::image_digest(im)?);
+            let digest = super::image_digest(im)?;
+            content.update(digest);
             carrier_bytes = carrier_bytes
                 .checked_add(im.pixels.len() as u64)
                 .ok_or_else(|| Error::Unsupported("video input size overflow".into()))?;
-            Ok(())
+            Ok(digest)
         };
         for c in &req.conditioning {
             match c {
                 Conditioning::Reference { image, strength } => {
                     content.update([0, u8::from(strength.is_some())]);
                     content.update(strength.unwrap_or_default().to_bits().to_le_bytes());
-                    count_image(&mut content, image)?;
+                    reference_rgb_digests.push(count_image(&mut content, image)?);
                 }
                 Conditioning::Mask { image } => {
                     content.update([1]);
@@ -236,6 +239,7 @@ impl VideoInputs {
             shift: req.scheduler_shift.map(f32::to_bits),
             decode_chunk: req.decode_chunk_size,
             carrier_bytes,
+            reference_rgb_digests,
             content: content.finalize().into(),
             strength: req.strength.map(f32::to_bits),
             scheduler: req.scheduler.clone(),
@@ -300,6 +304,21 @@ impl VideoRenderPlan {
             context: None,
             memory: req.memory,
         }))
+    }
+    /// Ordered SHA-256 of the native RGB24 bytes for every Reference in the sealed request.
+    pub fn reference_rgb_digests(&self) -> &[[u8; 32]] {
+        &self.inputs.reference_rgb_digests
+    }
+    pub(crate) fn provider_id(&self) -> &str {
+        self.registration.provider_id
+    }
+    pub(crate) fn check_fit_load(&self, spec: &LoadSpec) -> Result<()> {
+        if self.load != RenderLoadBinding::from_video_spec(spec) {
+            return Err(Error::Unsupported(
+                "plural video fit crossed its prepared load".into(),
+            ));
+        }
+        Ok(())
     }
     pub fn layout(&self) -> &VideoPlanLayout {
         &self.layout

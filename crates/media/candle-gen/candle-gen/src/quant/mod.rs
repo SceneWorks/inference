@@ -549,6 +549,29 @@ impl std::fmt::Debug for QLinear {
 }
 
 impl QLinear {
+    /// Device storage owned by this projection between calls. Counts only the weight,
+    /// excludes its bias and any transient dequantization or allocator cache.
+    pub fn resident_weight_bytes(&self) -> usize {
+        let tensor = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        match self {
+            Self::Dense(DenseLinear::Linear(l)) => tensor(l.weight()),
+            Self::Dense(DenseLinear::Transposed { weight_t, .. }) => tensor(weight_t),
+            Self::Quantized {
+                weight: QuantWeight::Dequant(q),
+                ..
+            }
+            | Self::Quantized {
+                weight: QuantWeight::Matmul(QMatMul::QTensor(q)),
+                ..
+            } => q.storage_size_in_bytes(),
+            Self::Quantized {
+                weight: QuantWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)),
+                ..
+            } => tensor(t),
+            Self::W4A8(_) => 0,
+        }
+    }
+
     /// Copy an already prepared projection without repacking or changing its arithmetic.
     /// Block streaming keeps the host copy alive and uploads only runtime-format bytes.
     pub fn copy_to_device(&self, device: &Device) -> Result<Self> {
