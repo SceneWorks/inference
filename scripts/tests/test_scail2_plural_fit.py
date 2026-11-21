@@ -310,6 +310,7 @@ class PluralQualification(unittest.TestCase):
         base = MagicMock()
         observer = runner.Observer.__new__(runner.Observer)
         observer.base = base
+        observer.render_end = runner.RenderEnd()
         observer.shared = MagicMock()
         owner = object()
         base.gpu_free_and_tree_bytes.side_effect = runner.SupervisionError("probe-failure", "NVIDIA timeout")
@@ -342,6 +343,7 @@ class PluralQualification(unittest.TestCase):
             returncode=0,
             elapsed_seconds=10,
             admission={},
+            samples=[],
             peak_host_bytes=800,
             peak_gpu_bytes=600,
             fit_observation=dict(

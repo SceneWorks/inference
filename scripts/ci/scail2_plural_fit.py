@@ -17,6 +17,7 @@ from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as 
 from scripts.ci import wddm_process_memory as wddm
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.ci.scail_plural import contract as c
+from scripts.ci.scail_plural.cuda_stage import RenderEnd
 from scripts.ci.scail_plural.wddm_retry import SameTickSamples
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
@@ -71,6 +72,7 @@ class Observer:
         self.host_samples = []
         self.card_samples = []
         self.windows_peak = {}
+        self.render_end = RenderEnd() if cuda else None
         self.shared = None
         if cuda is not None:
             cuda.dedicated = SameTickSamples(cuda.dedicated, approved.poll_millis)
@@ -97,6 +99,7 @@ class Observer:
         return value
 
     def gpu_free_and_tree_bytes(self, owner):
+        before = self.render_end.before(owner)
         try:
             free, used = self.base.gpu_free_and_tree_bytes(owner)
         except SupervisionError:
@@ -106,7 +109,9 @@ class Observer:
                 self.shared.poll(owner, cuda_active=True)
             raise
         self.shared.poll(owner, cuda_active=bool(self.base.dedicated.record["samples"]))
-        self.card_samples.append([time.monotonic_ns(), free, used])
+        at_ns = time.monotonic_ns()
+        self.render_end.observe(owner, self.base, before, len(self.card_samples), at_ns, used)
+        self.card_samples.append([at_ns, free, used])
         return free, used
 
     def close(self):
@@ -122,7 +127,7 @@ class Observer:
             "windows_peak": self.windows_peak,
             "wddm_shared_counter": "GPU Process Memory/Shared Usage" if self.shared else None,
             "wddm_shared": self.shared.record if self.shared else None,
-            **({"wddm_retry": {"dedicated": self.base.dedicated.diagnostics,
+            **({"cuda_render_end": self.render_end.record, "wddm_retry": {"dedicated": self.base.dedicated.diagnostics,
                                "shared": self.shared.diagnostics}} if self.shared else {}),
         }
 
@@ -217,7 +222,7 @@ def execute(args, contract):
             "status": "native observations; coordinator physical review required before import",
             "allocator": "native lifetime high-water",
             "host": "Darwin kernel lifetime footprint or Windows Job private commit and process working set",
-            "cuda_nonpool": "owned WDDM dedicated/shared and whole-card samples at the guard cadence",
+            "cuda_nonpool": "owned WDDM dedicated/shared and tenant-aware child growth; absolute card occupancy includes external pressure",
             "cuda_nonpool_unsampled_overshoot_upper_bytes": None,
         },
     }

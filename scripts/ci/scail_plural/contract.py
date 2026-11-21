@@ -187,6 +187,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
     samples = guard["fit_observation"]["host_samples_monotonic_ns_bytes"]
     if not samples or samples[0][1] != guard["fit_observation"]["host_baseline"]:
         raise ValueError("missing owned host baseline or trace")
+    scope = None
     host = guard["peak_host_bytes"]
     if backend == "mlx":
         if (
@@ -221,6 +222,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         if (
             not shared["created_filetime"]
             or shared["created_filetime"] != guard["cuda_attribution"]["wddm_dedicated"]["created_filetime"]
+            or adapter["cuda_uuid"] != GPU
             or hardware["uuid"] != GPU
             or int(hardware["index"]) != 1
         ):
@@ -238,8 +240,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
                     or sum(allow_zero or sample[1] > 0 for sample in series["samples"]) < 2
                 ):
                     raise ValueError("invalid WDDM ownership or missing process observations")
-            # A missing poll cannot erase an observed guard violation. These values
-            # are used only for refusal; no incomplete high-water becomes a price.
+            # Preserve all real readings for the hard limits. They can price the
+            # render only when its entire measurement interval is independently covered.
             dedicated = max(value for _, value in dedicated_record["samples"])
             shared_peak = max(value for _, value in shared["samples"])
         raw = guard["fit_observation"]
@@ -262,8 +264,14 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             counters["peak_private_commit_bytes"],
             counters["peak_working_set_bytes"],
         )
+        from scripts.ci.scail_plural.cuda_stage import render_scope, tenant_growth
+        growth, growth_count = tenant_growth(guard, GPU)
+        stage = render_scope(guard, pool, GPU, growth_count)
+        if incomplete and stage is not None:
+            scope = stage
+            incomplete = False
         device = max(
-            cuda["upper"], dedicated, data["allocator_peak"], data["axes"]["floor_device_bytes"]
+            cuda["pid_peak_bytes"], dedicated, data["allocator_peak"], growth, data["axes"]["floor_device_bytes"]
         )
         if device > approved.child_gpu_cap_bytes:
             raise ValueError("observed CUDA peak exceeds the guard")
@@ -281,6 +289,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         raise IncompleteWddmSamples("incomplete owned WDDM poll series")
     return dict(
         machine,
+        **({"cuda_render_scope": scope} if scope is not None else {}),
         inference_revision=revision,
         witness=dict(
             axes=data["axes"],
