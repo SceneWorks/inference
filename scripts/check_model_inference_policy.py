@@ -860,7 +860,9 @@ class RunGraph:
             # Include W4A8-owner delegation and Candle metadata-only owner construction
             # controls; both inspect source storage and pre-load refusals without forwards.
             # Exact bare-parameter declarations remain attached under component selection.
-            controls_sha = '3f1f56e054f33695e86090e9bd9b557a18d3b348b7e2c3fc30e68deb31f3b2cc'
+            # The adapter file installer uses a CPU metadata-native base whose forward
+            # and dense-materialization methods panic; only installation/routing is exercised.
+            controls_sha = 'f18ad05cd8beec0962738d595e68320d506ef775cafff6bf41647d55bc94a741'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

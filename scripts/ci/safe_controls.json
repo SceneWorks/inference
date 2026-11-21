@@ -1579,6 +1579,20 @@
         "win32"
       ],
       "reason": "Temporary safetensors header and bounded descriptor read only. Exact bare-parameter selection must retain its declaration and reject malformed/unknown descriptors; no backend tensors, model forward or inference computation."
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "adapters::tests::install_additive_applies_selected_lora_to_convrot_host",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/adapters.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Loads a tiny real adapter file into a metadata-only CPU NativeLinearWeight through the production additive installer. Preserves apply/skip/base-kind assertions; explicit panic guards prohibit base forward and dense materialization. No learned or GPU execution."
     }
   ]
 }

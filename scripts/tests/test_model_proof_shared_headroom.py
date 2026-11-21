@@ -420,7 +420,7 @@ class SharedHeadroom(unittest.TestCase):
     def test_projection_proofs_bind_only_the_registered_device_uuid_and_index(self):
         rows = [row for row in proof.load_registry()
                 if (row['package'], row['target'], row['fqn']) in proof.PROJECTION_PROOF_DEVICES]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 6)
         for row in rows:
             with self.subTest(case=proof.identity(row)):
                 configured = proof.configured_case(row, 'fixed_cuda')
@@ -429,6 +429,8 @@ class SharedHeadroom(unittest.TestCase):
                 self.assertEqual(configured['required_cuda_device_uuid'], expected_uuid)
                 self.assertEqual(configured['required_cuda_physical_index'], expected_index)
                 self.assertEqual(resources.bound_cuda_activity_profile(configured), PROFILE)
+                with self.assertRaises(ValueError):
+                    proof.select((row,), proof.identity(row), 'candle-cpu')
                 for key, value in [('uuid', OTHER), ('index', 1 - expected_index)]:
                     modified = copy.deepcopy(row)
                     if key == 'uuid':

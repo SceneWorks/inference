@@ -71,6 +71,10 @@ SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
 PROJECTION_PROOF_DEVICES = {
     ('candle-gen', 'integration', 'cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16'): 'gpu0',
     ('candle-gen-minimax-h3', 'integration', 'convrot_int8::native_projections_match_pinned_kitchen'): 'gpu1',
+    ('candle-gen-krea', 'candle_gen_krea', 'loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'quant::tests::convrot_int8_constructor_is_typed_error_not_panic'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk'): 'gpu0',
 }
 # A product-pinned Hub snapshot: `org/name@<40-hex revision>` plus an optional subfolder path.
 HUB_PIN = re.compile(r'^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@([0-9a-f]{40})((?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)$')
