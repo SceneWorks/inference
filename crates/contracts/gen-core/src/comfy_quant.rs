@@ -820,6 +820,46 @@ pub fn mxfp8_swizzled_scale_index(stored: [usize; 2], row: usize, block: usize) 
     blocked_scale_index(stored[0], stored[1] / MXFP8_BLOCK, row, block)
 }
 
+/// Reorder complete output rows of an MXFP8 scale plane. Both planes use the producer's
+/// 128-by-4 scale swizzle; unused cells in the new plane receive E8M0 unit scale (127).
+pub fn remap_mxfp8_scales(
+    source: &[u8],
+    stored: [usize; 2],
+    source_rows: &[usize],
+) -> Result<Vec<u8>, String> {
+    if stored.contains(&0)
+        || !stored.iter().all(|n| n.is_multiple_of(MXFP8_PAD))
+        || source_rows.is_empty()
+    {
+        return Err("MXFP8 row remap requires a nonempty 32-aligned stored matrix".into());
+    }
+    let blocks = stored[1] / MXFP8_BLOCK;
+    let plane_bytes = |rows: usize| -> Option<usize> {
+        let rows = rows
+            .div_ceil(MXFP8_SCALE_ROW_TILE)
+            .checked_mul(MXFP8_SCALE_ROW_TILE)?;
+        let cols = blocks
+            .div_ceil(MXFP8_SCALE_COL_TILE)
+            .checked_mul(MXFP8_SCALE_COL_TILE)?;
+        rows.checked_mul(cols)
+    };
+    if plane_bytes(stored[0]) != Some(source.len()) || source_rows.iter().any(|&r| r >= stored[0]) {
+        return Err("MXFP8 row remap scale size or source row outside stored geometry".into());
+    }
+    let bytes = plane_bytes(source_rows.len()).ok_or("MXFP8 destination plane size overflow")?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes)
+        .map_err(|e| format!("MXFP8 scale plane: {e}"))?;
+    out.resize(bytes, 127);
+    for (dest, &src) in source_rows.iter().enumerate() {
+        for block in 0..blocks {
+            out[blocked_scale_index(source_rows.len(), blocks, dest, block)] =
+                source[blocked_scale_index(stored[0], blocks, src, block)];
+        }
+    }
+    Ok(out)
+}
+
 /// Why an MXFP8 layer's geometry is not decodable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mxfp8GeometryError {
@@ -1381,6 +1421,30 @@ mod tests {
         (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
     }
 
+    #[test]
+    fn mx_remap_copies_swizzled_scale_bytes_across_both_tile_axes() {
+        let stored = [160, 192];
+        let mut source = vec![255; mxfp8_scale_shape(stored).iter().product()];
+        for r in 0..160 {
+            for b in 0..6 {
+                source[mxfp8_swizzled_scale_index(stored, r, b)] = (r + 13 * b) as u8;
+            }
+        }
+        let rows = [155, 1, 129, 0, 64, 128, 63, 32, 31, 159, 0];
+        let out = remap_mxfp8_scales(&source, stored, &rows).unwrap();
+        for (r, &s) in rows.iter().enumerate() {
+            for b in 0..6 {
+                assert_eq!(
+                    out[mxfp8_swizzled_scale_index([32, 192], r, b)],
+                    (s + 13 * b) as u8
+                );
+            }
+        }
+        assert_eq!(out[mxfp8_swizzled_scale_index([32, 192], 20, 5)], 127);
+        assert!(remap_mxfp8_scales(&source[1..], stored, &rows).is_err());
+        assert!(remap_mxfp8_scales(&source, stored, &[160]).is_err());
+        assert!(remap_mxfp8_scales(&source, [160, 191], &rows).is_err());
+    }
     #[test]
     fn e4m3fn_decoder_matches_the_spec_for_all_256_codes_and_the_canonical_table() {
         for code in 0..=255_u8 {
