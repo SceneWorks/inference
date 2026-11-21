@@ -228,7 +228,7 @@ fn is_fp8_operand(h: &SafetensorsTensorHeader) -> bool {
 
 /// When both parameters are encoded, H3 supplies the role's compute dtype. A surviving
 /// ordinary weight or bias otherwise retains the checkpoint's mixed precision.
-fn encoded_head_width(
+pub fn encoded_head_width(
     key: &str,
     headers: &BTreeMap<&str, &SafetensorsTensorHeader>,
 ) -> Option<u64> {
