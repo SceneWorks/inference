@@ -35,6 +35,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
+use crate::gen_core::phase::ScaleContext;
 use crate::quant::{AdaptLinear, Base as SpineBase, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
@@ -133,29 +134,28 @@ enum AdditiveResidual {
 }
 
 impl AdditiveResidual {
-    /// A zero user strength is an exact disabled adapter. Check it before evaluating the factors so
-    /// unused non-finite data cannot contaminate the host output.
-    fn scale_at(&self, pass: usize) -> candle_core::Result<f64> {
-        let scales = match self {
+    fn scale_at(&self, index: usize, context: &ScaleContext<'_>) -> candle_core::Result<f64> {
+        let installed = match self {
             AdditiveResidual::Lora { scales, .. }
             | AdditiveResidual::LokrStructured { scales, .. } => scales,
         };
-        scales
-            .get(pass.min(scales.len().saturating_sub(1)))
+        installed
+            .get(context.pass.min(installed.len().saturating_sub(1)))
             .copied()
+            .map(|scale| context.scale_for_f64(index, scale))
             .ok_or_else(|| {
                 candle_core::Error::Msg("additive adapter pass scales must not be empty".into())
             })
     }
 
-    fn is_zero(&self, pass: usize) -> candle_core::Result<bool> {
-        let selected_scale = self.scale_at(pass)?;
+    /// Check before evaluating factors so an unused non-finite value cannot contaminate the output.
+    fn is_zero(&self, selected_scale: f64) -> bool {
         // Structured LoKr keeps its alpha/rank component baked into the shared factors. The
         // single-scale API can therefore be disabled either by that legacy effective scale or by
         // the newly-added selected per-pass strength. Both checks must happen before evaluating
         // the factors: `0 * NaN` is NaN, not an inert adapter.
-        Ok(selected_scale == 0.0
-            || matches!(self, AdditiveResidual::LokrStructured { factors, .. } if factors.scale == 0.0))
+        selected_scale == 0.0
+            || matches!(self, AdditiveResidual::LokrStructured { factors, .. } if factors.scale == 0.0)
     }
 
     fn validate_scales(scales: &[f64]) -> Result<()> {
@@ -170,8 +170,7 @@ impl AdditiveResidual {
     /// The residual this adapter contributes, in the activation dtype of `x` (factors are held f32 and
     /// cast per forward — they are tiny). Identical to [`crate::quant::AdaptLinear`]'s residual so the
     /// packed-additive SDXL path and the dense-fold path agree to f32 tolerance.
-    fn residual(&self, x: &Tensor, pass: usize) -> candle_core::Result<Tensor> {
-        let scale = self.scale_at(pass)?;
+    fn residual(&self, x: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
         match self {
             AdditiveResidual::Lora { a, b, .. } => {
                 let xd = x.dtype();
@@ -206,8 +205,8 @@ pub struct LoraLinear {
     /// identical to before. Valid on a **packed** base — the SDXL packed-tier distill-LoRA path pushes
     /// these instead of dequant-folding, so the q4/q8 footprint survives.
     additive: Vec<AdditiveResidual>,
-    /// Active distilled denoise pass for additive inference residuals. `Arc<AtomicUsize>` keeps
-    /// `LoraLinear` cloneable and `Sync`, which Candle's shared `Arc<AvDiT>` requires.
+    /// Legacy pass selection for callers using the `Module` forward. Request-scoped callers
+    /// provide their own immutable context instead.
     additive_pass: Arc<AtomicUsize>,
 }
 
@@ -475,7 +474,7 @@ impl LoraLinear {
     }
 
     /// Attach a LoRA residual with one scale per distilled denoise pass. A one-entry vector is
-    /// intentionally uniform; longer vectors select by [`set_additive_pass`](Self::set_additive_pass).
+    /// intentionally uniform; the active request pass selects from longer vectors.
     pub fn push_additive_lora_per_pass(
         &mut self,
         a: Tensor,
@@ -617,6 +616,15 @@ impl LoraLinear {
     /// cotangent is needed, while live adapter factors keep ordinary autograd.
     /// Other packed operators and graph-retaining backward keep their native path.
     pub fn forward_bounded_packed(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_bounded_packed_with_scales(x, &self.legacy_scale_context())
+    }
+
+    /// Bounded packed training tape with request-owned scales for additive residuals.
+    pub fn forward_bounded_packed_with_scales(
+        &self,
+        x: &Tensor,
+        scales: &ScaleContext<'_>,
+    ) -> candle_core::Result<Tensor> {
         let y = match &self.base {
             SpineBase::Packed(QLinear::Quantized {
                 weight: crate::quant::QuantWeight::Dequant(weight),
@@ -625,7 +633,7 @@ impl LoraLinear {
             }) => super::projection::frozen_packed_forward(x, weight, bias.as_ref())?,
             _ => self.base.forward(x)?,
         };
-        self.apply_residuals(x, y)
+        self.apply_residuals_with_scales(x, y, scales)
     }
 
     /// Dense base inspection without dequantizing packed weights.
@@ -643,6 +651,21 @@ impl LoraLinear {
     /// Apply live adapters to an externally computed frozen base output.
     /// No factor cast or transpose is cached across optimizer steps.
     pub fn apply_residuals(&self, x: &Tensor, y: Tensor) -> candle_core::Result<Tensor> {
+        self.apply_residuals_with_scales(x, y, &self.legacy_scale_context())
+    }
+
+    fn legacy_scale_context(&self) -> ScaleContext<'static> {
+        ScaleContext::new().with_pass(self.additive_pass.load(Ordering::Relaxed))
+    }
+
+    /// Apply live adapters with immutable request arguments to a computed frozen base output.
+    /// Trainable factors keep their optimizer-owned scales and gradient paths.
+    pub fn apply_residuals_with_scales(
+        &self,
+        x: &Tensor,
+        y: Tensor,
+        scales: &ScaleContext<'_>,
+    ) -> candle_core::Result<Tensor> {
         let mut y = match &self.adapter {
             None => y,
             Some(Adapter::Lora { scale, .. }) if *scale == 0.0 => y,
@@ -682,15 +705,24 @@ impl LoraLinear {
         // trainable adapter. Disabled residuals are skipped; live residuals retain their x-dtype math
         // and cast only to the current host output dtype at the add. Empty on the plain / trainable
         // path, so this loop is a no-op there.
-        let pass = self.additive_pass.load(Ordering::Relaxed);
-        for ar in &self.additive {
-            if ar.is_zero(pass)? {
+        for (index, ar) in self.additive.iter().enumerate() {
+            let scale = ar.scale_at(index, scales)?;
+            if ar.is_zero(scale) {
                 continue;
             }
-            let residual = ar.residual(x, pass)?.to_dtype(y.dtype())?;
+            let residual = ar.residual(x, scale)?.to_dtype(y.dtype())?;
             y = (y + residual)?;
         }
         Ok(y)
+    }
+
+    /// Compute the frozen base and live residuals using immutable request arguments.
+    pub fn forward_with_scales(
+        &self,
+        x: &Tensor,
+        scales: &ScaleContext<'_>,
+    ) -> candle_core::Result<Tensor> {
+        self.apply_residuals_with_scales(x, self.base.forward(x)?, scales)
     }
 }
 
@@ -2184,6 +2216,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn additive_pass_selection_retains_f64_strength_and_clamps_without_mutation() {
+        let factor = Tensor::ones((1, 1), DType::F32, &Device::Cpu).unwrap();
+        let base_scale = 1.000_000_000_1;
+        let refinement_scale = 0.400_000_000_1;
+        let residual = AdditiveResidual::Lora {
+            a: factor.clone(),
+            b: factor,
+            scales: vec![base_scale, refinement_scale],
+        };
+        let base = ScaleContext::new();
+        let refinement = base.with_pass(1);
+        assert_eq!(residual.scale_at(0, &base).unwrap(), base_scale);
+        assert_eq!(residual.scale_at(0, &refinement).unwrap(), refinement_scale);
+        assert_eq!(residual.scale_at(0, &base).unwrap(), base_scale);
+        assert_eq!(
+            residual.scale_at(0, &base.with_pass(9)).unwrap(),
+            refinement_scale
+        );
+        let selected = ScaleContext::with_uniform_scale(0.0).with_pass(1);
+        assert!(residual.is_zero(residual.scale_at(0, &selected).unwrap()));
+    }
+
     /// An explicit two-stage adapter must change the actual forward residual when the LTX pipeline
     /// moves from stage one to stage two; merely accepting `[1.0, 0.4]` at load time is insufficient.
     #[test]
@@ -2199,6 +2254,20 @@ mod tests {
         )
         .unwrap();
         let x = Tensor::from_vec(vec![5.0f32], (1, 1), &dev).unwrap();
+
+        let base_scales = ScaleContext::new();
+        let refinement_scales = base_scales.with_pass(1);
+        // Interleave two requests through a shared projection. Neither may change the other's
+        // scales, even when a legacy consumer has selected a conflicting pass.
+        lin.set_additive_pass(1);
+        for (context, expected) in [
+            (&base_scales, 5.0),
+            (&refinement_scales, 2.0),
+            (&base_scales, 5.0),
+        ] {
+            let output = lin.forward_with_scales(&x, context).unwrap();
+            assert_eq!(output.to_vec2::<f32>().unwrap(), vec![vec![expected]]);
+        }
 
         lin.set_additive_pass(0);
         assert_eq!(
