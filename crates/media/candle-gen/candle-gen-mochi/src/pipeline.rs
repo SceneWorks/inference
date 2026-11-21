@@ -156,7 +156,7 @@ impl Pipeline {
             req.seed.unwrap_or_else(gen_core::default_seed),
         )?;
         let active = phase.enter(&req.cancel, scope)?;
-        let comps = components()?;
+        let comps = acquire_components(&req.cancel, components)?;
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
         let (_pos, _neg, enc, enc_mask) = candle_gen::gen_core::with_prompt_encoding(
             on_progress,
@@ -218,6 +218,14 @@ impl Pipeline {
         let images = frames_to_images(&frames_arr)?;
         Ok((images, req.fps.unwrap_or(DEFAULT_FPS)))
     }
+}
+
+/// A cold load can outlive a cancellation request. Check again before emitting
+/// prompt progress or running either T5 branch, as the resident-only render did.
+fn acquire_components<T>(cancel: &CancelFlag, load: impl FnOnce() -> CResult<T>) -> CResult<T> {
+    let components = load()?;
+    candle_gen::check_cancel(cancel)?;
+    Ok(components)
 }
 
 /// Deterministic N(0,1) init latent `[1, 12, F_lat, H_lat, W_lat]` (f32) — CPU `StdRng`, launch-portable.
@@ -344,6 +352,26 @@ pub fn frames_to_images(frames: &Tensor) -> CResult<Vec<Image>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_during_component_acquisition_skips_prompt_encoding() {
+        let cancel = CancelFlag::new();
+        let mut prompts = Vec::new();
+        let mut encoded = false;
+        let result = acquire_components(&cancel, || {
+            cancel.cancel();
+            Ok(())
+        })
+        .and_then(|()| {
+            gen_core::with_prompt_encoding(&mut |p| prompts.push(p), || {
+                encoded = true;
+                Ok(())
+            })
+        });
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert!(prompts.is_empty());
+        assert!(!encoded);
+    }
 
     #[test]
     fn scoped_render_enters_physical_clip_once_before_requesting_components() {
