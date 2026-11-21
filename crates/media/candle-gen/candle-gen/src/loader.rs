@@ -26,7 +26,33 @@
 //! `from_mmaped_safetensors`. Do NOT change the sort key (e.g. to a numeric shard index): it would
 //! silently pick a different shard's copy of a duplicated key and corrupt weight loading.
 
-pub use candle_checkpoint::{MappedWeights, ProjectionSource};
+pub use candle_checkpoint::{MappedWeights, ProjectionSource, SourceView};
+
+/// Map checkpoint names and structural row/reshape views before tensor I/O.
+pub fn remap_file_var_builder(
+    file: &Path,
+    dtype: DType,
+    dev: &Device,
+    mut mapping: impl FnMut(&str, &[usize]) -> Result<Vec<SourceView>>,
+) -> Result<VarBuilder<'static>> {
+    let st = mmap_safetensors(file)?;
+    let mut views = std::collections::BTreeMap::new();
+    for (name, tensor) in st.tensors() {
+        let outputs = mapping(&name, tensor.shape())?;
+        if !outputs.is_empty() {
+            views.insert(name, outputs);
+        }
+    }
+    let files = [file.to_owned()];
+    let builder = candle_checkpoint::remapped_var_builder(st, &files, dtype, dev, views)?;
+    #[cfg(feature = "model-inference-proof")]
+    gen_core::model_input_proof::record_reader_paths(
+        "candle-gen::loader::remap_file_var_builder",
+        gen_core::model_input_proof::InputRole::ModelWeights,
+        &files,
+    );
+    Ok(builder)
+}
 use std::path::{Path, PathBuf};
 
 use candle_core::safetensors::MmapedSafetensors;
@@ -34,6 +60,103 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 
 use crate::{CandleError, Result};
+
+/// Replace only the dense operands that a coefficient-folding adapter actually changed.
+/// Every untouched key still resolves from the original checkpoint and native operand backend.
+pub fn overlay_var_builder(
+    base: VarBuilder<'static>,
+    overrides: std::collections::HashMap<String, candle_core::Tensor>,
+) -> VarBuilder<'static> {
+    use candle_core::{Result as CoreResult, Shape, Tensor};
+    use candle_nn::var_builder::SimpleBackend;
+    use std::sync::Arc;
+    type Native = Arc<dyn candle_nn::linear::NativeLinearWeight>;
+    struct Overlay {
+        base: VarBuilder<'static>,
+        overrides: std::collections::HashMap<String, Tensor>,
+    }
+    impl SimpleBackend for Overlay {
+        fn get_unchecked(&self, key: &str, dtype: DType, dev: &Device) -> CoreResult<Tensor> {
+            if let Some(t) = self.overrides.get(key) {
+                return t.to_dtype(dtype)?.to_device(dev);
+            }
+            self.base
+                .clone()
+                .set_device(dev.clone())
+                .get_unchecked_dtype(key, dtype)
+        }
+        fn get(
+            &self,
+            shape: Shape,
+            key: &str,
+            init: candle_nn::Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> CoreResult<Tensor> {
+            if self.overrides.contains_key(key) {
+                return SimpleBackend::get(&self.overrides, shape, key, init, dtype, dev);
+            }
+            self.base
+                .clone()
+                .set_device(dev.clone())
+                .get_with_hints_dtype(shape, key, init, dtype)
+        }
+        fn contains_tensor(&self, key: &str) -> bool {
+            self.overrides.contains_key(key) || self.base.contains_tensor(key)
+        }
+        fn native_linear_weight(
+            &self,
+            key: &str,
+            shape: Option<(usize, usize)>,
+            dtype: DType,
+            dev: &Device,
+        ) -> CoreResult<Option<Native>> {
+            if self.overrides.contains_key(key) {
+                return Ok(None);
+            }
+            self.base
+                .clone()
+                .set_device(dev.clone())
+                .to_dtype(dtype)
+                .native_linear_weight_with_shape(key, shape)
+        }
+        fn native_linear_weight_transposed(
+            &self,
+            key: &str,
+            shape: (usize, usize),
+            dtype: DType,
+            dev: &Device,
+        ) -> CoreResult<Option<Native>> {
+            if self.overrides.contains_key(key) {
+                return Ok(None);
+            }
+            self.base
+                .clone()
+                .set_device(dev.clone())
+                .to_dtype(dtype)
+                .native_linear_weight_transposed(key, shape)
+        }
+        fn native_linear_weight_flattened(
+            &self,
+            key: &str,
+            shape: &[usize],
+            dtype: DType,
+            dev: &Device,
+        ) -> CoreResult<Option<Native>> {
+            if self.overrides.contains_key(key) {
+                return Ok(None);
+            }
+            self.base
+                .clone()
+                .set_device(dev.clone())
+                .to_dtype(dtype)
+                .native_linear_weight_flattened(key, shape)
+        }
+    }
+    let dev = base.device().clone();
+    let dtype = base.dtype();
+    VarBuilder::from_backend(Box::new(Overlay { base, overrides }), dtype, dev)
+}
 
 /// The deterministic, sorted list of every `*.safetensors` file directly under `dir`.
 ///

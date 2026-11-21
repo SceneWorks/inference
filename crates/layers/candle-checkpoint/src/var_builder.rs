@@ -14,13 +14,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct SourceMapping;
+#[derive(Default)]
+struct SourceMapping {
+    transforms: BTreeMap<String, gen_core::checkpoint_codec::LogicalTransformDeclaration>,
+}
 impl LogicalKeyMapping for SourceMapping {
     fn mapping_id(&self) -> &'static str {
         "candle-constructor-v1"
     }
     fn logical_key(&self, key: &str) -> Option<String> {
         Some(key.to_owned())
+    }
+    fn logical_transform(
+        &self,
+        key: &str,
+    ) -> Option<gen_core::checkpoint_codec::LogicalTransformDeclaration> {
+        self.transforms.get(key).cloned()
     }
     fn accepts_descriptor_shape(&self) -> bool {
         true
@@ -34,6 +43,7 @@ impl LogicalKeyMapping for SourceMapping {
 #[derive(Clone)]
 pub struct ProjectionSource(Arc<LogicalWeightReader>, Arc<SourcePlan>);
 struct SourcePlan {
+    mapping: SourceMapping,
     files: Vec<PathBuf>,
     headers: Vec<SafetensorsTensorHeader>,
     descriptors: BTreeMap<String, Vec<u8>>,
@@ -47,7 +57,7 @@ impl SourcePlan {
             &self.headers,
             &self.descriptors,
             self.metadata.as_deref(),
-            &SourceMapping,
+            &self.mapping,
             baseline_codec_registry(),
             &policy,
         )
@@ -166,11 +176,27 @@ impl ProjectionSource {
         dev: &Device,
         selected: impl Fn(&str) -> bool,
     ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
+        Self::from_mapped_for(st, files, dev, selected, SourceMapping::default())
+    }
+    fn from_mapped_for(
+        st: MmapedSafetensors,
+        files: &[PathBuf],
+        dev: &Device,
+        selected: impl Fn(&str) -> bool,
+        mapping: SourceMapping,
+    ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
         let views: BTreeMap<_, _> = st.tensors().into_iter().collect();
         let mut bases = BTreeSet::new();
         for (name, view) in &views {
             if !selected(name) {
                 continue;
+            }
+            if matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                && [".scale_weight", ".weight_scale"]
+                    .iter()
+                    .any(|suffix| views.contains_key(&format!("{name}{suffix}")))
+            {
+                bases.insert(name.clone());
             }
             if let Some(base) = name.strip_suffix(".comfy_quant") {
                 bases.insert(base.to_owned());
@@ -271,6 +297,7 @@ impl ProjectionSource {
         }
         let meta = (!layers.is_empty()).then(|| serde_json::json!({"layers":layers}).to_string());
         let definition = Arc::new(SourcePlan {
+            mapping,
             files: files.to_vec(),
             headers,
             descriptors,
@@ -484,6 +511,39 @@ impl SimpleBackend for ProjectionSource {
     ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
         self.native_oriented(key, Some(shape), dtype, dev, true)
     }
+    fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        let Some(row) = self.reader().planned(name) else {
+            return Ok(None);
+        };
+        if shape.len() < 2 {
+            candle_core::bail!(
+                "{name}: expected patch kernel {shape:?}, got {:?}",
+                row.shape
+            );
+        }
+        let cols = shape[1..]
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| Error::Msg(format!("{name}: contraction overflow")))?;
+        if row.shape == [shape[0], cols] {
+            return self.native_linear_weight(name, Some((shape[0], cols)), dtype, dev);
+        }
+        if row.shape != shape {
+            candle_core::bail!(
+                "{name}: expected patch kernel {shape:?}, got {:?}",
+                row.shape
+            );
+        }
+        Ok(self
+            .native_linear_slice(name, dev, dtype, 0, shape[0], cols)?
+            .and_then(|layer| layer.native_weight()))
+    }
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         if self.0.planned(name).is_some() {
             return self.on_device(dev)?.reader().read_dense(name, dtype, dev);
@@ -560,6 +620,183 @@ impl MappedWeights {
         }
         Ok(candle_nn::Linear::new(self.read(&w, dtype, dev)?, b))
     }
+}
+
+/// One provider-declared matrix view. Names and geometry are the provider's responsibility.
+/// Source interpretation, packed row slicing and residency are the shared reader's.
+#[derive(Debug, Clone)]
+pub enum SourceView {
+    Whole(String),
+    Rows {
+        name: String,
+        first: usize,
+        rows: usize,
+    },
+    Matrix {
+        name: String,
+        rows: usize,
+        cols: usize,
+    },
+}
+impl SourceView {
+    fn name(&self) -> &str {
+        match self {
+            Self::Whole(name) | Self::Rows { name, .. } | Self::Matrix { name, .. } => name,
+        }
+    }
+}
+struct Remapped {
+    source: MappedWeights,
+    names: BTreeMap<String, (String, SourceView)>,
+}
+impl Remapped {
+    fn lookup(&self, name: &str) -> Result<&(String, SourceView)> {
+        self.names.get(name).ok_or_else(|| {
+            Error::CannotFindTensor {
+                path: name.to_owned(),
+            }
+            .bt()
+        })
+    }
+    fn logical<'a>(source: &ProjectionSource, physical: &'a str, name: &'a str) -> &'a str {
+        if source
+            .reader()
+            .planned(name)
+            .is_some_and(|r| r.physical_key == physical)
+        {
+            name
+        } else {
+            physical
+        }
+    }
+}
+impl SimpleBackend for Remapped {
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        let (physical, view) = self.lookup(name)?;
+        if let MappedWeights::Checkpoint(src) = &self.source {
+            let logical = Self::logical(src, physical, name);
+            if src.reader().planned(logical).is_some() {
+                let t = src
+                    .on_device(dev)?
+                    .reader()
+                    .read_dense(logical, dtype, dev)?;
+                return match view {
+                    SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+                    _ => Ok(t),
+                };
+            }
+        }
+        let t = self.source.read(physical, dtype, dev)?;
+        match view {
+            SourceView::Whole(_) => Ok(t),
+            SourceView::Rows { first, rows, .. } => t.narrow(0, *first, *rows)?.contiguous(),
+            SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+        }
+    }
+    fn get(&self, shape: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
+        let t = self.get_unchecked(name, dtype, dev)?;
+        if t.shape() != &shape {
+            return Err(Error::UnexpectedShape {
+                msg: format!("remapped weight {name}"),
+                expected: shape,
+                got: t.shape().clone(),
+            }
+            .bt());
+        }
+        Ok(t)
+    }
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.names.contains_key(name)
+    }
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        let Some((physical, view)) = self.names.get(name) else {
+            return Ok(None);
+        };
+        let MappedWeights::Checkpoint(src) = &self.source else {
+            return Ok(None);
+        };
+        if let SourceView::Matrix { rows, cols, .. } = view {
+            if shape.is_some_and(|s| s != (*rows, *cols)) {
+                candle_core::bail!(
+                    "{name}: requested projection shape disagrees with checkpoint matrix"
+                );
+            }
+            if src.mmap().get(physical)?.shape().len() != 2 {
+                return Ok(src
+                    .native_linear_slice(physical, dev, dtype, 0, *rows, *cols)?
+                    .and_then(|layer| layer.native_weight()));
+            }
+        }
+        src.native_linear_weight(Self::logical(src, physical, name), shape, dtype, dev)
+    }
+}
+
+/// Bind a catalog's namespace/shape conversion to an existing mmap, retaining packed matrix operands.
+pub fn remapped_var_builder(
+    st: MmapedSafetensors,
+    files: &[PathBuf],
+    dtype: DType,
+    dev: &Device,
+    views: BTreeMap<String, Vec<SourceView>>,
+) -> Result<VarBuilder<'static>> {
+    use gen_core::checkpoint_codec::{
+        LogicalTransformDeclaration, LogicalTransformOutput, RowRange,
+    };
+    let mut mapping = SourceMapping::default();
+    let mut names = BTreeMap::new();
+    for (physical, outputs) in &views {
+        let mut rows = Vec::new();
+        for view in outputs {
+            if names
+                .insert(view.name().to_owned(), (physical.clone(), view.clone()))
+                .is_some()
+            {
+                candle_core::bail!("multiple checkpoint tensors map to {}", view.name());
+            }
+            if let SourceView::Rows {
+                name,
+                first,
+                rows: n,
+            } = view
+            {
+                rows.push(LogicalTransformOutput {
+                    logical_key: name.clone(),
+                    rows: Some(RowRange::new(*first, *n)),
+                    half_swap: false,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            mapping.transforms.insert(
+                physical.to_owned(),
+                LogicalTransformDeclaration {
+                    source_logical_shape: Some(st.get(physical)?.shape().to_vec()),
+                    outputs: rows,
+                },
+            );
+        }
+    }
+    let source = match ProjectionSource::from_mapped_for(
+        st,
+        files,
+        dev,
+        |k| views.contains_key(k),
+        mapping,
+    )? {
+        Ok(src) => MappedWeights::Checkpoint(src),
+        Err(st) => MappedWeights::Plain(st),
+    };
+    Ok(VarBuilder::from_backend(
+        Box::new(Remapped { source, names }),
+        dtype,
+        dev.clone(),
+    ))
 }
 
 pub fn mmap_var_builder(

@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::{CandleError, Result};
 
 /// The four external inputs for an in-place ComfyUI Z-Image load (sc-10668): the
@@ -91,47 +91,60 @@ impl ComfyuiSources {
         }
     }
 
-    pub(crate) fn transformer_map(&self) -> Result<HashMap<String, Tensor>> {
+    pub(crate) fn builder(
+        &self,
+        component: CombinedComponent,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
         self.ensure_unchanged()?;
-        match &self.weights {
-            ComfyuiWeights::Separate(files) => files
-                .transformer_file
-                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
-            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
-                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.transformer)
-            }),
-        }
-    }
-
-    pub(crate) fn text_encoder_map(&self) -> Result<HashMap<String, Tensor>> {
-        self.ensure_unchanged()?;
-        match &self.weights {
-            ComfyuiWeights::Separate(files) => files
-                .text_encoder_file
-                .as_ref()
-                .ok_or_else(|| {
-                    CandleError::Msg(
-                        "ComfyUI Z-Image text encoder is supplied by the validated external source"
-                            .into(),
-                    )
-                })?
-                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
-            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
-                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.text_encoder)
-            }),
-        }
-    }
-
-    pub(crate) fn vae_map(&self) -> Result<HashMap<String, Tensor>> {
-        self.ensure_unchanged()?;
-        match &self.weights {
-            ComfyuiWeights::Separate(files) => files
-                .vae_file
-                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
-            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
-                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.vae)
-            }),
-        }
+        let (pin, combined) = match &self.weights {
+            ComfyuiWeights::Combined(file) => (file.as_ref(), true),
+            ComfyuiWeights::Separate(files) => (
+                match component {
+                    CombinedComponent::Transformer => &files.transformer_file,
+                    CombinedComponent::TextEncoder => {
+                        files.text_encoder_file.as_ref().ok_or_else(|| {
+                            CandleError::Msg("Z-Image text encoder provided externally".into())
+                        })?
+                    }
+                    CombinedComponent::Vae => &files.vae_file,
+                },
+                false,
+            ),
+        };
+        pin.read_unchanged(|path|{
+            let mut seen=[false;3];
+            let builder=candle_gen::loader::remap_file_var_builder(path,dtype,dev,|name,shape|{
+                let key=if combined{
+                    if name=="scaled_fp8"{return Ok(Vec::new());}
+                    let (role,key)=combined_component_key(name).ok_or_else(||CandleError::Msg(format!("z-image combined checkpoint tensor {name:?} has no component mapping")))?;
+                    if key.is_empty(){return Err(CandleError::Msg(format!("empty component tensor name {name}")));}
+                    seen[role as usize]=true;
+                    if role!=component{return Ok(Vec::new());}
+                    key
+                }else{name};
+                use candle_gen::loader::SourceView;
+                Ok(match component {
+                    CombinedComponent::Transformer=>{
+                        if let Some(prefix)=key.strip_suffix(".attention.qkv.weight"){
+                            if shape!=[3*DIT_DIM,DIT_DIM]{return Err(CandleError::Msg(format!("{key}: invalid fused QKV shape {shape:?}")));}
+                            ["to_q","to_k","to_v"].iter().enumerate().map(|(i,leaf)|SourceView::Rows{name:format!("{prefix}.attention.{leaf}.weight"),first:i*DIT_DIM,rows:DIT_DIM}).collect()
+                        } else if key.ends_with(".attention.qkv.bias"){return Err(CandleError::Msg(format!("unexpected fused attention bias {key}")));}
+                        else {vec![SourceView::Whole(remap_dit_key(key))]}
+                    }
+                    CombinedComponent::TextEncoder=>vec![SourceView::Whole(key.to_owned())],
+                    CombinedComponent::Vae=>{
+                        let name=remap_vae_key(key)?;
+                        if is_vae_attn_proj_weight(&name){
+                            match shape { [rows,cols,1,1]|[rows,cols]=>vec![SourceView::Matrix{name,rows:*rows,cols:*cols}],_=>return Err(CandleError::Msg(format!("{key}: unexpected VAE projection shape {shape:?}"))) }
+                        }else{vec![SourceView::Whole(name)]}
+                    }
+                })
+            })?;
+            if combined && !seen.into_iter().all(|v|v){return Err(CandleError::Msg("z-image combined checkpoint is missing a component".into()));}
+            Ok(builder)
+        })
     }
 }
 
@@ -148,6 +161,7 @@ pub(crate) struct SeparateComfyuiWeights {
     vae_file: candle_gen::gen_core::PinnedWeightsFile,
 }
 
+#[cfg(test)]
 pub(crate) struct ComponentMaps {
     pub transformer: HashMap<String, Tensor>,
     pub text_encoder: HashMap<String, Tensor>,
@@ -195,6 +209,7 @@ pub(crate) fn combined_component_key(key: &str) -> Option<(CombinedComponent, &s
 /// prefixes are accepted. Unprefixed tensors are intentionally rejected: in a
 /// fused file their ownership is ambiguous and guessing can silently assemble a
 /// model from the wrong family.
+#[cfg(test)]
 pub(crate) fn split_combined_checkpoint(src: HashMap<String, Tensor>) -> Result<ComponentMaps> {
     let mut transformer = HashMap::new();
     let mut text_encoder = HashMap::new();
@@ -243,6 +258,7 @@ pub(crate) fn split_combined_checkpoint(src: HashMap<String, Tensor>) -> Result<
 /// requested compute dtype. Supported scale spellings are ComfyUI
 /// `.scale_weight` and inline `.weight_scale`; activation-scale companions are
 /// consumed but never applied.
+#[cfg(test)]
 pub(crate) fn normalize_fp8_map(
     mut src: HashMap<String, Tensor>,
     dtype: DType,

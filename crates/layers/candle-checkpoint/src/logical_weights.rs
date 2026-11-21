@@ -46,11 +46,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use gen_core::checkpoint_codec::{
-    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyPolicy,
-    CodecResidencyReport, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
-    LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource, TensorCodecSpec,
-    WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
-    FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyPolicy, LogicalKeyMapping,
+    LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource,
+    TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC,
+    FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::{
     CheckpointWeightFacts, ExecutionRepresentation, NativeExecutionCapability,
@@ -393,6 +392,11 @@ pub struct LogicalWeights {
     pub receipt: LogicalWeightReceipt,
 }
 
+fn decode_scaled_fp8(bytes: &[u8], element: fn(u8) -> f32, scale: f32) -> Vec<f32> {
+    let table: [f32; 256] = std::array::from_fn(|i| element(i as u8) * scale);
+    bytes.iter().map(|&b| table[b as usize]).collect()
+}
+
 fn scalar_f32(bytes: &[u8], what: &str) -> Result<f32> {
     if bytes.len() != 4 {
         return Err(CandleError::Msg(format!(
@@ -405,6 +409,26 @@ fn scalar_f32(bytes: &[u8], what: &str) -> Result<f32> {
     }))
 }
 
+// Legacy companion-scaled checkpoints may store calibration scalars in either half type.
+fn scalar_at(st: &MmapedSafetensors, key: &str) -> Result<f32> {
+    let view = st.get(key)?;
+    match view.dtype() {
+        ::safetensors::Dtype::F32 => scalar_f32(view.data(), key),
+        ::safetensors::Dtype::F16 | ::safetensors::Dtype::BF16 if view.data().len() == 2 => {
+            let dtype = if view.dtype() == ::safetensors::Dtype::F16 {
+                DType::F16
+            } else {
+                DType::BF16
+            };
+            cst::read_tensor_bytes(&view, |bytes| {
+                Tensor::from_raw_buffer(bytes, dtype, &[], &Device::Cpu)
+            })?
+            .to_dtype(DType::F32)?
+            .to_scalar()
+        }
+        other => candle_core::bail!("{key}: invalid checkpoint scalar type {other:?}"),
+    }
+}
 fn companion_bytes<'a>(
     st: &'a MmapedSafetensors,
     tensor: &LogicalTensorPlan,
@@ -469,26 +493,8 @@ pub struct LogicalWeightReader {
     /// which resolves the same key three times per projection) turns the load into O(n²) over a
     /// ~2600-tensor plan (sc-21482 review).
     by_logical_key: BTreeMap<String, usize>,
-    accounting: std::sync::Arc<ReaderAccounting>,
+    accounting: std::sync::Arc<gen_core::CheckpointReadAccounting>,
 }
-struct ReaderAccounting {
-    plan: std::sync::Arc<LogicalWeightPlan>,
-    /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
-    /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
-    measured: std::sync::Mutex<BTreeMap<String, u64>>,
-    /// Logical key → resident dense bytes for every `Packed`-planned row the provider **demoted**
-    /// to a dense-BF16 execution after construction settled its real regime
-    /// ([`Self::demote_to_dense_fallback`], sc-11045 fix round). The receipt reports such a row as
-    /// [`ExecutionRepresentation::DenseFallback`] carrying these measured bytes, with a matching
-    /// typed [`gen_core::checkpoint_codec::RegimeDemotion`] entry so the facts validator can
-    /// reconcile it against the plan's packed pricing instead of diagnosing drift.
-    demoted: std::sync::Mutex<BTreeMap<String, u64>>,
-    /// The host's native-execution declaration, carried from the same
-    /// [`CandleCodecResidency`] that priced the plan (sc-21484). A native receipt row is only
-    /// representable when this licenses it.
-    capability: NativeExecutionCapability,
-}
-
 impl LogicalWeightReader {
     /// mmap `path` and verify its tensor surface equals the plan's before anything materializes.
     ///
@@ -568,18 +574,7 @@ impl LogicalWeightReader {
             .map(|(index, tensor)| (tensor.logical_key.clone(), index))
             .collect();
         let plan = std::sync::Arc::new(plan);
-        let accounting = std::sync::Arc::new(ReaderAccounting {
-            plan: plan.clone(),
-            measured: Default::default(),
-            demoted: Default::default(),
-            capability,
-        });
-        let observer = accounting.clone();
-        gen_core::CheckpointReceiptScope::register(paths, move || {
-            observer
-                .checkpoint_weight_facts()
-                .map_err(|e| gen_core::Error::Msg(e.to_string()))
-        });
+        let accounting = gen_core::CheckpointReadAccounting::new(plan.clone(), capability, paths);
         Self {
             st,
             plan,
@@ -741,7 +736,8 @@ impl LogicalWeightReader {
         let view = self.st.get(&row.physical_key)?;
         if view.shape() != row.shape
             || view.shape().len() < 2
-            || view.shape().last() != Some(&cols)
+            || !(view.shape().last() == Some(&cols)
+                || (first == 0 && view.shape().first() == Some(&rows) && view.data().len() == len))
             || !view.data().len().is_multiple_of(len)
             || !first.is_multiple_of(rows)
         {
@@ -772,14 +768,13 @@ impl LogicalWeightReader {
         guard_stored(row, view.dtype(), view.shape(), expected.0, &row.shape)?;
         let (sw, scalar_bytes) = match scale {
             ScalarScaleSource::Unit => (1., 0),
-            ScalarScaleSource::Companion { physical_key } => (
-                scalar_f32(companion_bytes(&self.st, row, physical_key)?, physical_key)?,
-                4,
-            ),
+            ScalarScaleSource::Companion { physical_key } => {
+                (scalar_at(&self.st, physical_key)?, 4)
+            }
         };
         let sx = input_scale
             .as_deref()
-            .map(|key| scalar_f32(companion_bytes(&self.st, row, key)?, key))
+            .map(|key| scalar_at(&self.st, key))
             .transpose()?;
         let codes = cst::read_source_bytes(&view.data()[start..end], |bytes| {
             Tensor::from_raw_buffer(bytes, expected.1, &[rows, cols], &self.device)
@@ -793,6 +788,9 @@ impl LogicalWeightReader {
         } else {
             Fp8Linear::from_parts(codes, sw, sx, None, lt)?
         };
+        self.accounting
+            .record_matrix_slice(key, first, rows, cols, resident)
+            .map_err(CandleError::wrap)?;
         Ok(Some((op, resident)))
     }
 
@@ -826,23 +824,13 @@ impl LogicalWeightReader {
                  no packed pricing to demote from"
             )));
         }
-        let mut demoted = self
-            .accounting
-            .demoted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = demoted.get(logical_key) {
-            if *previous != resident_bytes {
-                return Err(CandleError::Msg(format!(
-                    "logical weight demotion: `{logical_key}` was already demoted at {previous} \
-                     resident byte(s); re-demoting it at {resident_bytes} contradicts the first \
-                     measurement"
-                )));
-            }
-            return Ok(());
-        }
-        demoted.insert(logical_key.to_owned(), resident_bytes);
-        Ok(())
+        self.accounting
+            .record(
+                logical_key,
+                ExecutionRepresentation::DenseFallback,
+                resident_bytes,
+            )
+            .map_err(CandleError::wrap)
     }
 
     /// This host's native-execution declaration — the capability the plan was priced under.
@@ -850,15 +838,10 @@ impl LogicalWeightReader {
         &self.device
     }
     pub fn materialized_bytes(&self, key: &str) -> Option<u64> {
-        self.accounting
-            .measured
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .copied()
+        self.accounting.materialized_bytes(key)
     }
     pub fn native_execution_capability(&self) -> &NativeExecutionCapability {
-        &self.accounting.capability
+        self.accounting.capability()
     }
 
     /// The plan this reader materializes.
@@ -894,11 +877,14 @@ impl LogicalWeightReader {
         })?;
         let tensor = Self::shaped_row(tensor, shape)?;
         let decoded = decode(&self.st, &tensor, &self.device)?;
+        let repr = if tensor.residency.mode == ResidencyMode::Packed {
+            ExecutionRepresentation::NativePacked
+        } else {
+            ExecutionRepresentation::DenseFallback
+        };
         self.accounting
-            .measured
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(logical_key.to_owned(), decoded.resident_bytes());
+            .record(logical_key, repr, decoded.resident_bytes())
+            .map_err(CandleError::wrap)?;
         Ok(decoded)
     }
 
@@ -951,6 +937,31 @@ impl LogicalWeightReader {
             .planned(key)
             .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
         let mut dense = Self::shaped_row(row, shape)?.into_owned();
+        if let TensorCodecSpec::ScalarFp8 { scale, .. } = &dense.codec {
+            let view = self.st.get(&dense.physical_key)?;
+            let element = match dense.encoding {
+                WeightEncoding::Fp8E4M3 => gen_core::fp8_e4m3fn_to_f32 as fn(u8) -> f32,
+                WeightEncoding::Fp8E5M2 => gen_core::fp8_e5m2_to_f32 as fn(u8) -> f32,
+                _ => candle_core::bail!("{key}: invalid scalar FP8 encoding"),
+            };
+            let sw = match scale {
+                ScalarScaleSource::Unit => 1.,
+                ScalarScaleSource::Companion { physical_key } => scalar_at(&self.st, physical_key)?,
+            };
+            if view.shape() != dense.source_shape() {
+                candle_core::bail!("{key}: FP8 source geometry changed");
+            }
+            let values =
+                cst::read_tensor_bytes(&view, |bytes| decode_scaled_fp8(bytes, element, sw));
+            let t = Tensor::from_vec(values, view.shape(), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(device)?;
+            let logical = apply_transform(&dense, LogicalTensor::Dense(t))?;
+            if let LogicalTensor::Dense(t) = logical {
+                return Ok(t);
+            }
+            unreachable!()
+        }
         dense.residency.mode = ResidencyMode::Dense;
         let LogicalTensor::Dense(t) = decode(&self.st, &dense, device)? else {
             candle_core::bail!("{key}: checkpoint operand has no dense coefficient representation")
@@ -970,17 +981,18 @@ impl LogicalWeightReader {
         dtype: DType,
         device: &Device,
     ) -> Result<Tensor> {
+        let row = self
+            .planned(key)
+            .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
+        let shaped = Self::shaped_row(row, shape)?;
+        self.accounting
+            .declare_dense_layout(key, &shaped.shape, dtype.size_in_bytes())
+            .map_err(CandleError::wrap)?;
         let t = self.dense_coefficients(key, shape, dtype, device)?;
-        let row = self.planned(key).expect("decoded planned row");
         let bytes = (t.elem_count() * t.dtype().size_in_bytes()) as u64;
         self.accounting
-            .measured
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_owned(), bytes);
-        if row.residency.mode == ResidencyMode::Packed {
-            self.demote_to_dense_fallback(key, bytes)?;
-        }
+            .record(key, ExecutionRepresentation::DenseFallback, bytes)
+            .map_err(CandleError::wrap)?;
         Ok(t)
     }
 
@@ -1012,121 +1024,7 @@ impl LogicalWeightReader {
     }
 
     pub fn checkpoint_weight_facts(&self) -> Result<CheckpointWeightFacts> {
-        self.accounting.checkpoint_weight_facts()
-    }
-}
-
-impl ReaderAccounting {
-    fn receipt(&self) -> LogicalWeightReceipt {
-        let measured = self
-            .measured
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let demoted = self
-            .demoted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut residency: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
-            BTreeMap::new();
-        let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
-            BTreeMap::new();
-        let mut tensor_count = 0usize;
-        let mut source_bytes = 0u64;
-        let mut demotions: Vec<gen_core::checkpoint_codec::RegimeDemotion> = Vec::new();
-        for tensor in &self.plan.tensors {
-            let Some(resident) = measured.get(&tensor.logical_key) else {
-                continue;
-            };
-            // The representation this row was *actually* materialized as. It is read from the
-            // planned residency because that is what `decode` dispatched on — the reader never
-            // substitutes one for the other (a `Packed` fp8 plan on a non-`cuda` build is a typed
-            // refusal, not a dense decode), so plan mode and outcome cannot disagree here —
-            // EXCEPT for a provider-demoted row (sc-11045 fix round): construction resolved a
-            // `Packed`-priced row to the dense-BF16 regime (W4A16 role table, or a transparent
-            // fallback), the provider said so through `demote_to_dense_fallback`, and the receipt
-            // reports the dense truth with a typed `RegimeDemotion` alongside it.
-            let demotion = demoted.get(&tensor.logical_key);
-            let representation = match demotion {
-                Some(_) => ExecutionRepresentation::DenseFallback,
-                None => ExecutionRepresentation::from_residency(tensor.residency.mode),
-            };
-            let resident = match demotion {
-                // The dense bytes measured off the constructed layer, not the packed decode.
-                Some(dense_bytes) => {
-                    demotions.push(gen_core::checkpoint_codec::RegimeDemotion {
-                        logical_key: tensor.logical_key.clone(),
-                        codec_id: tensor.codec_id,
-                        resident_bytes: *dense_bytes,
-                    });
-                    dense_bytes
-                }
-                None => resident,
-            };
-            let key = (tensor.codec_id, representation);
-            codec_by_owner.insert(tensor.physical_key.as_str(), key);
-            tensor_count += 1;
-            source_bytes = source_bytes.saturating_add(tensor.source_bytes);
-            let report = residency.entry(key).or_insert(CodecResidencyReport {
-                codec_id: tensor.codec_id,
-                representation,
-                tensor_count: 0,
-                source_bytes: 0,
-                resident_bytes: 0,
-            });
-            report.tensor_count += 1;
-            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
-            // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] read
-            // it off the decoded value itself — including the scale companions a packed load
-            // retained, which the packed variant *owns* (it holds them as f32 values, not as file
-            // rows). The companion loop below therefore attributes source bytes only. Reading the
-            // retained half back off `plan.companions` would make `receipt == plan`
-            // self-referential on exactly the packed row the pair exists to cross-check.
-            report.resident_bytes = report.resident_bytes.saturating_add(*resident);
-        }
-        // A companion's source bytes belong to the codec row of the layer that owns it, and only
-        // once that layer has actually materialized.
-        for companion in &self.plan.companions {
-            let Some(key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
-                continue;
-            };
-            source_bytes = source_bytes.saturating_add(companion.source_bytes);
-            if let Some(report) = residency.get_mut(key) {
-                report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-            }
-        }
-        // Honest coverage label (sc-11045 fix round): `Materialized` claims every planned tensor
-        // was evaluated, so it is only stated when that is true. A front-only snapshot of a
-        // block-streamed load is `Partial`; a reader nothing has consumed yet is `Deferred` (its
-        // payloads are, at this instant, exactly as lazy as a deferred read's).
-        let materialization = if tensor_count == self.plan.tensor_count() {
-            LogicalReadMaterialization::Materialized
-        } else if tensor_count == 0 {
-            LogicalReadMaterialization::Deferred
-        } else {
-            LogicalReadMaterialization::Partial
-        };
-        LogicalWeightReceipt {
-            mapping_id: self.plan.mapping_id,
-            tensor_count,
-            source_bytes,
-            materialization,
-            residency: residency.into_values().collect(),
-            demotions,
-        }
-    }
-
-    /// The **three correlated facts** about this load (sc-21484): the source-codec inventory
-    /// compiled from the plan, the measured receipt split per execution representation, and this
-    /// host's native-execution capability — validated against each other by
-    /// [`CheckpointWeightFacts::new`].
-    ///
-    /// This is the surface a consumer across the worker boundary reads instead of joining a plan
-    /// and a receipt by hand: it answers "the source is stored `nvfp4-v1`" and "this run executed
-    /// it dense" as *separate* questions that cannot contradict one another. It errors only when
-    /// they already do, which on this reader means a contract bug rather than input.
-    pub fn checkpoint_weight_facts(&self) -> Result<CheckpointWeightFacts> {
-        CheckpointWeightFacts::new(&self.plan, self.capability.clone(), self.receipt())
-            .map_err(|error| CandleError::Msg(error.to_string()))
+        self.accounting.facts().map_err(CandleError::wrap)
     }
 }
 
@@ -1238,18 +1136,14 @@ fn decode(
             )?;
             let (weight_scale, weight_scale_from_companion) = match scale {
                 ScalarScaleSource::Unit => (1.0_f32, false),
-                ScalarScaleSource::Companion { physical_key } => (
-                    scalar_f32(companion_bytes(st, tensor, physical_key)?, physical_key)?,
-                    true,
-                ),
+                ScalarScaleSource::Companion { physical_key } => {
+                    (scalar_at(st, physical_key)?, true)
+                }
             };
             match tensor.residency.mode {
                 ResidencyMode::Dense => {
                     let values: Vec<f32> = cst::read_tensor_bytes(&view, |bytes| {
-                        bytes
-                            .iter()
-                            .map(|&byte| element(byte) * weight_scale)
-                            .collect()
+                        decode_scaled_fp8(bytes, element, weight_scale)
                     });
                     LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
                 }
@@ -1258,7 +1152,7 @@ fn decode(
                     {
                         let input_scale = input_scale
                             .as_deref()
-                            .map(|key| scalar_f32(companion_bytes(st, tensor, key)?, key))
+                            .map(|key| scalar_at(st, key))
                             .transpose()?;
                         let codes = if tensor.encoding == WeightEncoding::Fp8E5M2 {
                             Tensor::from_raw_buffer(view.data(), DType::U8, source_shape, device)?
@@ -1422,7 +1316,7 @@ fn decode(
                     })?;
                     let input_scale = input_scale
                         .as_deref()
-                        .map(|key| scalar_f32(companion_bytes(st, tensor, key)?, key))
+                        .map(|key| scalar_at(st, key))
                         .transpose()?;
                     LogicalTensor::PackedNvfp4 {
                         tensor: Box::new(tensor_packed),

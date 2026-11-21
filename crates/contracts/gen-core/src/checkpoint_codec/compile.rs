@@ -132,10 +132,11 @@ pub fn compile_logical_weight_plan_with_metadata(
     // ---- classify companions and validate descriptors, per layer ----------------------------
     let mut descriptors: BTreeMap<String, ComfyQuantDescriptor> = BTreeMap::new(); // by layer base
     for header in by_name.values() {
-        if header.name == LEGACY_MARKER_KEY
-            || LEGACY_SCALE_SUFFIXES
-                .iter()
-                .any(|suffix| header.name.ends_with(suffix))
+        if !mapping.inline_fp8_scales()
+            && (header.name == LEGACY_MARKER_KEY
+                || LEGACY_SCALE_SUFFIXES
+                    .iter()
+                    .any(|suffix| header.name.ends_with(suffix)))
         {
             return Err(LogicalWeightPlanError::LegacyScaledFp8 {
                 physical_key: header.name.clone(),
@@ -199,12 +200,31 @@ pub fn compile_logical_weight_plan_with_metadata(
         descriptors.insert(base, descriptor);
     }
 
+    let scalar_key =
+        |base: &str, modern: &str, legacy: &str| -> Result<String, LogicalWeightPlanError> {
+            let modern_key = format!("{base}{modern}");
+            let legacy_key = format!("{base}{legacy}");
+            if mapping.inline_fp8_scales() && by_name.contains_key(legacy_key.as_str()) {
+                if by_name.contains_key(modern_key.as_str()) {
+                    return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                        physical_key: legacy_key,
+                        reason: "both legacy and modern spellings describe the same scale",
+                    });
+                }
+                Ok(legacy_key)
+            } else {
+                Ok(modern_key)
+            }
+        };
     if mapping.inline_fp8_scales() {
         for header in by_name.values() {
-            let Some(base) = header.name.strip_suffix(".weight") else {
+            if !matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
                 continue;
-            };
-            if !by_name.contains_key(format!("{base}{WEIGHT_SCALE_SUFFIX}").as_str()) {
+            }
+            let base = header.name.strip_suffix(".weight").unwrap_or(&header.name);
+            if !by_name
+                .contains_key(scalar_key(base, WEIGHT_SCALE_SUFFIX, ".scale_weight")?.as_str())
+            {
                 continue;
             }
             let format = match header.dtype {
@@ -224,6 +244,14 @@ pub fn compile_logical_weight_plan_with_metadata(
     }
 
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
+        if mapping.inline_fp8_scales() {
+            if let Some(base) = name.strip_suffix(".scale_weight") {
+                return Some((base.to_owned(), CompanionRole::WeightScale));
+            }
+            if let Some(base) = name.strip_suffix(".scale_input") {
+                return Some((base.to_owned(), CompanionRole::InputScale));
+            }
+        }
         if let Some(base) = name.strip_suffix(DESCRIPTOR_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::Descriptor));
         }
@@ -262,6 +290,19 @@ pub fn compile_logical_weight_plan_with_metadata(
     let mut source_bytes = 0_u64;
     for header in by_name.values() {
         source_bytes = source_bytes.saturating_add(header.data_bytes);
+        if mapping.inline_fp8_scales() && header.name == LEGACY_MARKER_KEY {
+            let owner = by_name
+                .values()
+                .find(|h| {
+                    h.name != LEGACY_MARKER_KEY
+                        && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                })
+                .ok_or_else(|| LogicalWeightPlanError::LegacyScaledFp8 {
+                    physical_key: header.name.clone(),
+                })?;
+            consume_companion(header, CompanionRole::Descriptor, &owner.name, 0);
+            continue;
+        }
         if let Some((base, role)) = companion_owner(&header.name) {
             if role == CompanionRole::Descriptor {
                 // Validated above; recorded when its weight is planned.
@@ -352,7 +393,10 @@ pub fn compile_logical_weight_plan_with_metadata(
                 dtype: format!("{:?}", header.dtype),
             }
         })?;
-        let base = header.name.strip_suffix(".weight");
+        let base = header.name.strip_suffix(".weight").or_else(|| {
+            (mapping.inline_fp8_scales() && descriptors.contains_key(&header.name))
+                .then_some(header.name.as_str())
+        });
         let descriptor = base.and_then(|base| descriptors.get(base));
         let declared_source_shape = declared_source_shape.or_else(|| {
             if mapping.accepts_descriptor_shape() {
@@ -429,25 +473,41 @@ pub fn compile_logical_weight_plan_with_metadata(
             None => (TensorCodecSpec::Dense, header.shape.clone()),
             Some(descriptor) => {
                 let base = base.expect("descriptor implies a `.weight` suffix");
-                if header.shape.len() != 2 {
+                if header.shape.len() != 2
+                    && !(mapping.inline_fp8_scales()
+                        && matches!(
+                            descriptor.format,
+                            ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+                        ))
+                {
                     return Err(LogicalWeightPlanError::QuantizedWeightRank {
                         physical_key: header.name.clone(),
                         format: descriptor.format,
                         shape: header.shape.clone(),
                     });
                 }
-                let scale_key = format!("{base}{WEIGHT_SCALE_SUFFIX}");
+                let scale_key = scalar_key(base, WEIGHT_SCALE_SUFFIX, ".scale_weight")?;
                 let scale = *by_name.get(scale_key.as_str()).ok_or_else(|| {
                     LogicalWeightPlanError::MissingCompanion {
                         physical_key: header.name.clone(),
                         companion: scale_key.clone(),
                     }
                 })?;
-                let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
+                let input_scale_key = scalar_key(base, INPUT_SCALE_SUFFIX, ".scale_input")?;
                 let input_scale = by_name.get(input_scale_key.as_str()).copied();
+                let scalar_dtype = |h: &SafetensorsTensorHeader| {
+                    h.dtype == Dtype::F32
+                        || (mapping.inline_fp8_scales()
+                            && (h.name.ends_with(".scale_weight")
+                                || h.name.ends_with(".scale_input"))
+                            && matches!(
+                                descriptor.format,
+                                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+                            )
+                            && matches!(h.dtype, Dtype::F16 | Dtype::BF16))
+                };
                 if let Some(input_scale) = input_scale {
-                    if input_scale.dtype != Dtype::F32 || !scalar_scale_shape_ok(&input_scale.shape)
-                    {
+                    if !scalar_dtype(input_scale) || !scalar_scale_shape_ok(&input_scale.shape) {
                         return Err(LogicalWeightPlanError::CompanionMalformed {
                             physical_key: input_scale.name.clone(),
                             defect: format!(
@@ -459,7 +519,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                 }
                 match descriptor.format {
                     ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2 => {
-                        if scale.dtype != Dtype::F32 || !scalar_scale_shape_ok(&scale.shape) {
+                        if !scalar_dtype(scale) || !scalar_scale_shape_ok(&scale.shape) {
                             return Err(LogicalWeightPlanError::CompanionMalformed {
                                 physical_key: scale.name.clone(),
                                 defect: format!(
@@ -717,9 +777,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let ScalarScaleSource::Companion { physical_key } = scale {
                         let scale_header = by_name[physical_key.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => {
-                                scale_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
+                            ResidencyMode::Packed => 4_u64.saturating_mul(scalar_scale_copies),
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -732,9 +790,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let Some(input_scale) = input_scale {
                         let input_header = by_name[input_scale.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => {
-                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
+                            ResidencyMode::Packed => 4_u64.saturating_mul(scalar_scale_copies),
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
