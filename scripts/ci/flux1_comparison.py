@@ -18,14 +18,15 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import model_inference_proofs as proof
-from scripts.ci.flux1_pair import evidence, fixture, overlay
+from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
 ENG4B = fixture.ENG4B
-TIERS = ("tier1", "tier2", ENG4B)
+ENG4B_REAL = fixture.ENG4B_REAL
+TIERS = ("tier1", "tier2", *fixture.ENG4B_TIERS)
 LANES = {"mlx": ["self-hosted", "macOS", "ARM64", "rw-llm"],
          "candle-cuda": ["self-hosted", "windows", "cuda", "real-weights"]}
 
@@ -43,21 +44,27 @@ def variants(tier):
 
 
 def planned_arms(tier):
-    return evidence.ARMS if tier == ENG4B else ("head",)
+    return evidence.ARMS if tier in fixture.ENG4B_TIERS else ("head",)
 
 
 def preflight_key(tier, arm, variant):
-    return f"{arm}-{variant}" if tier == ENG4B else variant
+    return f"{arm}-{variant}" if tier in fixture.ENG4B_TIERS else variant
 
 
 def phase_names(tier):
     return tuple(f"preflight-{preflight_key(tier, arm, variant)}"
                  for arm in planned_arms(tier) for variant in variants(tier)) + tuple(
-                     f"{arm}-{variant}" for arm in evidence.ARMS for variant in variants(tier))
+                     f"{arm}-{variant}" for variant in variants(tier) for arm in evidence.ARMS) + tuple(
+                         name for name, _, _ in measured_cases(tier))
+
+
+def measured_cases(tier):
+    return performance.cases(variants(tier)) if tier == ENG4B_REAL else ()
 
 
 def plan(backend, value, head, tier):
-    eng4b = tier == ENG4B
+    eng4b = tier in fixture.ENG4B_TIERS
+    measured = tier == ENG4B_REAL
     baseline = overlay.ENG4B_BASE if eng4b else BASE
     if backend not in LANES or tier not in TIERS or head == baseline:
         raise ValueError("select distinct head and supported proof tier/backend")
@@ -73,8 +80,11 @@ def plan(backend, value, head, tier):
         path = Path(tmp) / "policy.json"
         write(path, value["policy"])
         policy = load_policy(path)
-        if policy.deadline_seconds > 1200 or policy.child_footprint_cap_bytes > 24 * 1024**3:
-            raise ValueError("proof child exceeds frozen 20 minute/24 GiB budget")
+        deadline = performance.MAX_CHILD_SECONDS if measured else 1200
+        if policy.deadline_seconds > deadline or policy.child_footprint_cap_bytes > 24 * 1024**3:
+            raise ValueError(f"proof child exceeds frozen {deadline} second/24 GiB budget")
+        if measured and policy.poll_millis != 1000:
+            raise ValueError("terminal comparison requires the frozen one-second guard poll")
         if backend == "candle-cuda" and policy.child_gpu_cap_bytes > 18 * 1024**3:
             raise ValueError("proof exceeds 18 GiB GPU child cap")
     source = proof.repository_identity(head)
@@ -84,10 +94,18 @@ def plan(backend, value, head, tier):
     identity = {}
     if eng4b:
         identity["base_tree"] = overlay.ENG4B_BASE_TREE
+    if tier == ENG4B:
         settings = dict(settings, guidance={"dev": 3.5},
                         weights="synthetic MLX affine Q4 transformer, CLIP-L and T5; dense BF16 VAE",
                         depth={"double": 1, "single": 1, "clip": 1, "t5": 1},
                         fixture_seed=fixture.SEED, plans="compiled and used on both arms")
+    if measured:
+        identity["performance_contract"] = performance.CONTRACT
+        identity["pinned_fixtures"] = {variant: fixture.real_snapshot_identity(variant, tier)
+                                       for variant in variants(tier)}
+        settings = dict(settings, weights="complete provisioned Q4 snapshots from the pinned file hashes",
+                        depth={"double": 19, "single": 38, "clip": 12, "t5": 24},
+                        plans="compiled and used on both arms", scope="Candle CUDA resident plain T2I")
     return {"runner": LANES[backend],
             "asset_setup": "flux1-eng4b-comparison" if eng4b else "flux1-comparison",
             "backend": backend, "base": baseline, "head": source["revision"], "head_tree": source["tree"],
@@ -107,21 +125,26 @@ def build(work, sources, arm, backend, tier, env):
     # Record the exact controlled source delta, including the untracked binary.
     probe_source = f"crates/media/{'mlx-gen' if backend == 'mlx' else 'candle-gen'}/{package}/src/bin/flux1-pair.rs"
     git(root, "add", "-N", probe_source)
-    if tier == ENG4B:
+    if tier in fixture.ENG4B_TIERS:
         common = "crates/media/candle-gen/"
         text = "candle-gen-flux/src/packed_te.rs" if arm == "base" else "candle-gen/src/text_encoder.rs"
-        allowed = {probe_source, common + text, common + "candle-gen/src/sampler.rs"}
+        allowed = {probe_source, common + "candle-gen/src/sampler.rs"}
+        if tier == ENG4B:
+            allowed.add(common + text)
         if set(git(root, "diff", "--name-only", "HEAD").splitlines()) != allowed:
             raise ValueError("ENG-4b overlay did not modify exactly the expected source paths")
     changes = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=root)
     tc = proof.verified_toolchain(env, root=root)
     target = work / (arm + "-target")
     env["CARGO_TARGET_DIR"] = str(target)
-    cmd = ["cargo", "build", "--locked", "-p", package, "--bin", "flux1-pair"]
-    if backend == "candle-cuda":
-        cmd += ["--features", "cuda"]
+    if tier == ENG4B_REAL:
+        cmd, profile = list(performance.BUILD), "release"
+    else:
+        cmd, profile = ["cargo", "build", "--locked", "-p", package, "--bin", "flux1-pair"], "debug"
+        if backend == "candle-cuda":
+            cmd += ["--features", "cuda"]
     subprocess.run(cmd, env=env, cwd=root, check=True)
-    binary = target / "debug" / ("flux1-pair.exe" if os.name == "nt" else "flux1-pair")
+    binary = target / profile / ("flux1-pair.exe" if os.name == "nt" else "flux1-pair")
     return binary, {"revision": sha, "tree": git(root, "rev-parse", "HEAD^{tree}"),
                     "overlay_sha256": hashlib.sha256(changes).hexdigest(), "toolchain": tc,
                     "binary_sha256": fixture.sha(binary), "build_command": cmd,
@@ -161,14 +184,20 @@ def retained_log_limits(policy):
             "guard.jsonl": policy["eventCapBytes"], "supervisor.json": 16 * 1024**2}
 
 
+def retained_phase_limits(phase, policy):
+    limits = retained_log_limits(policy)
+    if policy["backend"] == "windows-cuda" and not phase.startswith("preflight-"):
+        limits["cuda-pool.json"] = 4096
+    if phase.startswith("measure-"):
+        limits.update(performance.RESULT_LIMITS)
+    return limits
+
+
 def retain_logs(work, artifact, receipt):
     records = receipt["logs"]
     errors = []
     for phase in phase_names(receipt["tier"]):
-        limits = retained_log_limits(receipt["request"]["policy"])
-        if (receipt["request"]["policy"]["backend"] == "windows-cuda"
-                and not phase.startswith("preflight-")):
-            limits["cuda-pool.json"] = 4096
+        limits = retained_phase_limits(phase, receipt["request"]["policy"])
         for suffix, cap in limits.items():
             source = work / phase / suffix
             name = phase + "." + suffix
@@ -177,14 +206,15 @@ def retain_logs(work, artifact, receipt):
                     if receipt["accepted"] and suffix != "guard.jsonl":
                         errors.append(f"{name}: missing completed child log")
                     continue
-                records[name] = proof.publish_file(source, artifact / name, work, cap, log=True,
+                records[name] = proof.publish_file(source, artifact / name, work, cap,
+                                                   log=suffix not in performance.RESULT_LIMITS,
                                                    destination_root=artifact)
             except (OSError, ValueError) as error:
                 errors.append(f"{name}: {error}")
     return errors
 
 
-def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None):
+def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, measure=False, last_child_start=None):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -195,7 +225,8 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         fds = (int(fd),)
     stderr_path = out / "stderr.log"
     try:
-        guard = run_guarded([str(binary), *(["--preflight"] if preflight else [])],
+        mode = ["--preflight"] if preflight else ["--measure"] if measure else []
+        guard = run_guarded([str(binary), *mode],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
@@ -241,6 +272,20 @@ def hardware(backend, policy):
     return dict(zip(fields, values))
 
 
+def capture_measured_output(out, reference):
+    raw = out / "output.rgb"
+    proof.unlinked_path(raw, out)
+    size = 256 * 256 * 3
+    if not raw.is_file() or raw.stat().st_size != size or raw.stat().st_nlink != 1:
+        raise ValueError("incomplete measured RGB8 image")
+    with raw.open("rb") as source:
+        rgb = source.read(size + 1)
+    if hashlib.sha256(rgb).hexdigest() != reference["rgb_sha256"]:
+        raise ValueError("measured RGB8 differs from fidelity")
+    with (out / "output.png").open("xb") as image:
+        image.write(evidence.png(rgb))
+
+
 def remove_work(work, temporary):
     """Remove only the tree created by this attempt. Git packs can be read-only on Windows."""
     if work.parent != temporary:
@@ -280,6 +325,7 @@ def remove_work(work, temporary):
 
 def execute(args, contract):
     backend, tier = args.backend, contract["tier"]
+    measured = tier == ENG4B_REAL
     proof.require_host(backend, dict(os.environ), "nax" if backend == "mlx" else "hosted")
     tmp = Path(os.environ["RUNNER_TEMP"])
     artifact = proof.owned_output(args.output, tmp)
@@ -296,7 +342,7 @@ def execute(args, contract):
         sources = {"head": ROOT, "base": ROOT / "flux1-baseline"}
         if git(sources["base"], "rev-parse", "HEAD") != contract.get("base", BASE):
             raise ValueError("baseline is not the profile's exact reviewed engine")
-        if tier == ENG4B and git(sources["base"], "rev-parse", "HEAD^{tree}") != contract["base_tree"]:
+        if tier in fixture.ENG4B_TIERS and git(sources["base"], "rev-parse", "HEAD^{tree}") != contract["base_tree"]:
             raise ValueError("ENG-4b baseline tree differs from the reviewed merge")
         paths, receipt["fixtures"] = snapshots(work, tier)
         policy_path = work / "policy.json"
@@ -318,6 +364,8 @@ def execute(args, contract):
             binary, build_info = build(work, sources, arm, backend, tier, env)
             exes[arm], environments[arm] = binary, env
             receipt["arms"][arm] = {"build": build_info, "renders": {}}
+        if measured:
+            performance.require_matched_builds(receipt["arms"])
         receipt["allocator"] = {"scope": "fresh process per revision and variant on the same physical device",
                                 "mlx": "provider default MLX allocator; unified host memory",
                                 "candle": "provider default CUDA allocator; device memory tracked separately",
@@ -353,6 +401,8 @@ def execute(args, contract):
                     if stdout.splitlines().count("FLUX1_PAIR_PREFLIGHT " + model) != 1:
                         raise ValueError("missing compiled native preflight")
                     receipt["preflight"][key] = plan_data
+            if measured:
+                require_equal_plans(receipt["preflight"], tier)
             write(artifact / "receipt.json", receipt)
             for variant in variants(tier):
                 for arm in evidence.ARMS:
@@ -367,11 +417,27 @@ def execute(args, contract):
                         raise ValueError("render plan differs from preflight")
                     receipt["arms"][arm]["renders"][variant] = dict(observed, guard=asdict(guard))
                 evidence.compare(*(receipt["arms"][arm]["renders"][variant] for arm in evidence.ARMS))
+            if measured:
+                receipt["performance_samples"] = {}
+                for name, variant, arm in measured_cases(tier):
+                    out = work / name
+                    env = dict(environments[arm], PAIR_MODEL="flux1_" + variant,
+                               PAIR_SNAPSHOT=str(paths[variant]))
+                    invoke(exes[arm], work / arm, out, env, policy, lease_env, measure=True,
+                           last_child_start=last_child_start)
+                    reference = receipt["arms"][arm]["renders"][variant]
+                    capture_measured_output(out, reference)
+                    receipt["performance_samples"][name] = read_measured_sample(receipt, name, variant, arm, out)
         if not claim.get("post_execution_verified"):
             raise ValueError("physical release not verified")
         for variant in variants(tier):
             if fixture.snapshot_identity(paths[variant], variant, tier) != receipt["fixtures"][variant]:
                 raise ValueError("snapshot changed during A/B")
+        if measured:
+            receipt["performance"] = performance.evaluate(receipt["performance_samples"], variants(tier))
+            status = receipt["performance"]["status"]
+            if status != "pass":
+                raise ValueError("FLUX.1 terminal performance is " + status + " at the frozen sample budget")
         receipt["accepted"] = True
     except BaseException as exc:
         primary_error = exc
@@ -417,10 +483,7 @@ def verify(args, contract):
     tier = contract["tier"]
     phases = phase_names(tier)
     limits = {phase + "." + suffix: cap for phase in phases
-              for suffix, cap in retained_log_limits(contract["request"]["policy"]).items()}
-    if contract["request"]["policy"]["backend"] == "windows-cuda":
-        limits.update({phase + ".cuda-pool.json": 4096 for phase in phases
-                       if not phase.startswith("preflight-")})
+              for suffix, cap in retained_phase_limits(phase, contract["request"]["policy"]).items()}
     for name, item in r["logs"].items():
         if name not in limits or item["path"] != name:
             raise ValueError("unexpected comparison log identity")
@@ -432,17 +495,14 @@ def verify(args, contract):
         allowed.add(name)
     # guard.jsonl is the optional observer stream monitored by run_guarded.
     # The actual supervisor result is captured for every completed child.
-    required = {phase + "." + suffix for phase in phases
-                for suffix in ("stdout.log", "stderr.log", "supervisor.json")}
-    if contract["request"]["policy"]["backend"] == "windows-cuda":
-        required.update(phase + ".cuda-pool.json" for phase in phases
-                        if not phase.startswith("preflight-"))
-    if r["accepted"] and (r.get("log_errors") or not required <= r["logs"].keys()):
+    required = {name for name in limits if not name.endswith(".guard.jsonl")}
+    completed = r["accepted"] or (tier == ENG4B_REAL and "performance" in r)
+    if completed and (r.get("log_errors") or not required <= r["logs"].keys()):
         raise ValueError("accepted comparison lacks complete verified child logs")
     for arm in evidence.ARMS:
         for variant in variants(tier):
             row = r["arms"].get(arm, {}).get("renders", {}).get(variant)
-            if not row and not r["accepted"]:
+            if not row and not completed:
                 continue
             name = arm + "-" + variant + ".png"
             png = args.output / name
@@ -452,23 +512,63 @@ def verify(args, contract):
             allowed.add(name)
     if {p.name for p in args.output.iterdir()} != allowed:
         raise ValueError("unexpected upload file")
-    if r["accepted"]:
+    if completed:
         if not r["physical_claim"]["post_execution_verified"]:
             raise ValueError("unreleased accepted comparison")
-        if tier == ENG4B:
+        if tier in fixture.ENG4B_TIERS:
             verify_eng4b_identity(r, contract, args.backend)
         for variant in variants(tier):
             evidence.compare(*(r["arms"][arm]["renders"][variant] for arm in evidence.ARMS))
+        if tier == ENG4B_REAL:
+            samples = {name: read_measured_sample(r, name, variant, arm, args.output, published=True)
+                       for name, variant, arm in measured_cases(tier)}
+            report = performance.evaluate(samples, variants(tier))
+            if r["performance_samples"] != samples or r["performance"] != report:
+                raise ValueError("performance report disagrees with verified measurement artifacts")
+            if r["accepted"] != (report["status"] == "pass" and "cleanup_failure" not in r):
+                raise ValueError("terminal comparison acceptance disagrees with measured results")
+
+
+def read_measured_sample(receipt, name, variant, arm, directory, *, published=False):
+    preflight = receipt["preflight"][preflight_key(ENG4B_REAL, arm, variant)]
+    reference = receipt["arms"][arm]["renders"][variant]
+    policy = receipt["request"]["policy"]
+    limits = retained_phase_limits(name, policy)
+
+    def read(suffix):
+        path = directory / (f"{name}.{suffix}" if published else suffix)
+        proof.unlinked_path(path, directory)
+        if not path.is_file() or path.stat().st_nlink != 1 or path.stat().st_size > limits[suffix]:
+            raise ValueError("invalid measurement artifact: " + path.name)
+        with path.open("rb") as source:
+            return source.read(limits[suffix] + 1)
+
+    return performance.read_sample(read, variant, preflight, reference, policy)
+
+
+def require_equal_plans(plans, tier):
+    for variant in variants(tier):
+        if plans[preflight_key(tier, "base", variant)] != plans[preflight_key(tier, "head", variant)]:
+            raise ValueError("terminal comparison requires equivalent base and head plans")
 
 
 def verify_eng4b_identity(receipt, contract, backend):
-    if set(receipt["preflight"]) != {"base-dev", "head-dev"} or set(receipt["fixtures"]) != {"dev"}:
+    tier = contract["tier"]
+    models = variants(tier)
+    keys = {preflight_key(tier, arm, variant) for arm in evidence.ARMS for variant in models}
+    if receipt["preflight"].keys() != keys or set(receipt["fixtures"]) != set(models):
         raise ValueError("ENG-4b receipt does not bind both plans and the exact fixture")
-    fixture_row = receipt["fixtures"]["dev"]
-    if (fixture_row["fixture_storage"] != dict(Q4=fixture.Q4, dense_vae="BF16")
-            or fixture_row["tier"] != ENG4B or fixture_row["variant"] != "dev"
-            or fixture_row["depths"] != [1, 1]):
-        raise ValueError("ENG-4b fixture storage or depths differ from the profile")
+    if tier == ENG4B:
+        fixture_row = receipt["fixtures"]["dev"]
+        if (fixture_row["fixture_storage"] != dict(Q4=fixture.Q4, dense_vae="BF16")
+                or fixture_row["tier"] != ENG4B or fixture_row["variant"] != "dev"
+                or fixture_row["depths"] != [1, 1]):
+            raise ValueError("ENG-4b fixture storage or depths differ from the profile")
+    else:
+        if receipt["fixtures"] != contract["pinned_fixtures"]:
+            raise ValueError("terminal comparison snapshot differs from the published hashes")
+        require_equal_plans(receipt["preflight"], tier)
+        performance.require_matched_builds(receipt["arms"])
     for arm in evidence.ARMS:
         row = receipt["arms"][arm]
         build = row["build"]
@@ -476,10 +576,11 @@ def verify_eng4b_identity(receipt, contract, backend):
                 or not all(re.fullmatch(r"[0-9a-f]{64}", build[field])
                            for field in ("overlay_sha256", "binary_sha256"))):
             raise ValueError("ENG-4b build identity differs from the paired revisions")
-        plan = receipt["preflight"][arm + "-dev"]
-        evidence.validate_plan(plan, "dev", backend)
-        if row["renders"]["dev"]["planned_route"] != plan:
-            raise ValueError("ENG-4b render plan differs from that arm's preflight")
+        for variant in models:
+            plan = receipt["preflight"][preflight_key(tier, arm, variant)]
+            evidence.validate_plan(plan, variant, backend)
+            if row["renders"][variant]["planned_route"] != plan:
+                raise ValueError("ENG-4b render plan differs from that arm's preflight")
 
 
 def main():

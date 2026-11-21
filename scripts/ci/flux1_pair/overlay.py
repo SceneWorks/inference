@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess
 
-from scripts.ci.flux1_pair.fixture import ENG4B
+from scripts.ci.flux1_pair.fixture import ENG4B, ENG4B_REAL, ENG4B_TIERS
 
 HERE = Path(__file__).resolve().parent
 MLX = "crates/media/mlx-gen/"
@@ -23,7 +23,8 @@ def replace_once(root, path, old, new):
 def install(root, backend, arm, tier):
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip():
         raise ValueError("overlay requires a fresh clean proof checkout")
-    eng4b = tier == ENG4B
+    eng4b = tier in ENG4B_TIERS
+    measured = tier == ENG4B_REAL
     if eng4b:
         if backend != "candle-cuda" or arm not in ("base", "head"):
             raise ValueError("ENG-4b overlay requires the Candle CUDA comparison arms")
@@ -119,6 +120,40 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     println!("FLUX1_PAIR_STATE {id:08x} {dtype} {device}");
 }
 """
+    if measured:
+        # No readbacks, hashes or output writes inside the measured sampler.
+        start = 'fn pair_observe(x: &Tensor, sigma: f32) {\n'
+        helper = helper.replace(start, start + """    static MEASURE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::args().nth(1).as_deref() == Some("--measure"));
+    if *MEASURE {
+        pair_measure_step(x, sigma);
+        return;
+    }
+""", 1)
+        helper += """thread_local! {
+    static PAIR_STEP_CLOCK: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static PAIR_STEP_SAMPLE: std::cell::Cell<Option<(u128, candle_core::DType)>> = const { std::cell::Cell::new(None) };
+}
+
+fn pair_measure_step(x: &Tensor, sigma: f32) {
+    if sigma == 1.0 {
+        assert!(x.device().is_cuda());
+        assert_eq!(x.dims(), &[1, 256, 64]);
+        x.device().synchronize().unwrap();
+        PAIR_STEP_CLOCK.with(|clock| assert!(clock.replace(Some(std::time::Instant::now())).is_none()));
+    } else if sigma == 0.0 {
+        assert!(x.device().is_cuda());
+        x.device().synchronize().unwrap();
+        let elapsed = PAIR_STEP_CLOCK.with(|clock| clock.take().expect("started step clock").elapsed());
+        PAIR_STEP_SAMPLE.with(|sample| assert!(sample.replace(Some((elapsed.as_nanos(), x.dtype()))).is_none()));
+    }
+}
+
+#[doc(hidden)]
+pub fn pair_take_step_sample() -> Option<(u128, candle_core::DType)> {
+    PAIR_STEP_SAMPLE.with(|sample| sample.take())
+}
+"""
     with (root / path).open("a", encoding="utf-8") as handle:
         handle.write("\n" + helper)
     engine = "mlx_gen" if mlx else "candle_gen"
@@ -134,6 +169,37 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     let generator = registry.load(&model, &spec)?;
     let report = generator.generate_planned(&request, &plan, None, &mut progress)?;
     let output = report.output.ok_or("missing planned output")?;"""
+    if measured:
+        generate = generate.replace(
+            "    let report =",
+            """    let measure = std::env::args().nth(1).as_deref() == Some("--measure");
+    let warmed = if measure {
+        let mut warm_steps = Vec::new();
+        let warm = generator.generate_planned(&request, &plan, None, &mut |event| {
+            if let Progress::Step { current, total } = event {
+                warm_steps.push([current, total]);
+            }
+        })?;
+        if warm_steps != [[1, 3], [2, 3], [3, 3]] {
+            return Err("warmup did not complete three Euler steps".into());
+        }
+        let Some(GenerationOutput::Images(mut images)) = warm.output else {
+            return Err("warmup did not generate images".into());
+        };
+        if images.len() != 1 || (images[0].width, images[0].height) != (256, 256) {
+            return Err("wrong warmup render count or geometry".into());
+        }
+        emit_step_sample()?;
+        Some(images.remove(0).pixels)
+    } else {
+        None
+    };
+    let started = std::time::Instant::now();
+    let report =""", 1)
+        generate = generate.replace(
+            "    let output =",
+            """    let elapsed = started.elapsed();
+    let output =""", 1)
     template = (HERE / "probe.rs.in").read_text(encoding="utf-8")
     cuda_proof = ""
     if not mlx:
@@ -172,6 +238,17 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     }
     let model =""", 1)
         cuda_proof = '#[cfg(feature = "cuda")] {\n' + cuda_proof + '\n}'
+    if measured:
+        body = body.replace("    @TIER_SPEC@\n", "", 1)
+        body = body.replace('    fs::write(dir.join("output.rgb")', '''    if let Some(warmed) = warmed {
+        if warmed != images[0].pixels {
+            return Err("resident warmup changed the seeded RGB8 result".into());
+        }
+        emit_step_sample()?;
+        println!("FLUX1_PAIR_TIMING {} {}", elapsed.as_nanos(), peak_working_set()?);
+    }
+    fs::write(dir.join("output.rgb")''', 1)
+        body += (HERE / "performance.rs.in").read_text(encoding="utf-8")
     destination = root / family / "src/bin/flux1-pair.rs"
     destination.parent.mkdir(exist_ok=True)
     with destination.open("x", encoding="utf-8") as out:

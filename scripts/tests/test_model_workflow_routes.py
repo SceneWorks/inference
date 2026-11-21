@@ -68,8 +68,9 @@ class ModelWorkflowRoutes(unittest.TestCase):
         inputs = events['workflow_dispatch']['inputs']
         self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair', 'stage_pinned_assets'})
         self.assertEqual(inputs['flux1_pair']['options'],
-                         ['none', 'tier1', 'tier2', 'conditional-tier1', 'eng4b-tier1'])
+                         ['none', 'tier1', 'tier2', 'conditional-tier1', 'eng4b-tier1', 'eng4b-tier2'])
         self.assertIn("inputs.flux1_pair == 'eng4b-tier1'", proof['env']['MODEL_PROOF_SCRIPT'])
+        self.assertIn("inputs.flux1_pair == 'eng4b-tier2'", proof['env']['MODEL_PROOF_SCRIPT'])
         baselines = {step['if']: step['with']['ref'] for step in proof['jobs']['prove']['steps']
                      if step.get('with', {}).get('path') == 'flux1-baseline'}
         self.assertEqual(baselines, {

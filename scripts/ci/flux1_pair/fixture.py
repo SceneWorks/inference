@@ -12,6 +12,8 @@ HERE = Path(__file__).resolve().parent
 COMPONENTS = ("transformer", "text_encoder", "text_encoder_2", "vae")
 SEED = 104729
 ENG4B = "eng4b-tier1"
+ENG4B_REAL = "eng4b-tier2"
+ENG4B_TIERS = (ENG4B, ENG4B_REAL)
 Q4 = {"bits": 4, "group_size": 64}
 
 
@@ -139,6 +141,15 @@ def make_snapshot(root, variant, *, q4=False):
     (directory / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
 
 
+def real_snapshot_identity(variant, tier):
+    provenance = json.loads((HERE / "headers.json").read_text(encoding="utf-8"))[variant]
+    return {
+        "tier": tier, "variant": variant, "depths": [19, 38],
+        "source_snapshot": {"repo": provenance["repo"], "snapshot": provenance["snapshot"], "tier": "q4"},
+        "files": {name: row["sha256"] for name, row in provenance["q4_files"].items()},
+    }
+
+
 def snapshot_identity(root, variant, tier):
     """Hash the exact component files, tokenizer and configuration consumed by both arms."""
     files = []
@@ -156,18 +167,15 @@ def snapshot_identity(root, variant, tier):
     depths = [dt_config["num_layers"], dt_config["num_single_layers"]]
     if depths != ([1, 1] if tier in ("tier1", ENG4B) else [19, 38]):
         raise ValueError("wrong DiT depth for proof tier")
-    if tier == "tier2" and dt_config.get("quantization", {}).get("bits") != 4:
-        raise ValueError("real snapshot must be the four-bit published tier")
+    if tier in ("tier2", ENG4B_REAL):
+        identity = real_snapshot_identity(variant, tier)
+        if dt_config.get("quantization", {}).get("bits") != 4 or digests != identity["files"]:
+            raise ValueError("installed Q4 snapshot differs from pinned files")
+        return identity
     if tier == ENG4B:
         validate_q4_snapshot(root, variant)
     provenance = json.loads((HERE / "headers.json").read_text(encoding="utf-8"))[variant]
-    if tier == "tier2":
-        expected = {name: row["sha256"] for name, row in provenance["q4_files"].items()}
-        if digests != expected:
-            raise ValueError("installed Q4 snapshot differs from pinned files")
-        provenance = {"repo": provenance["repo"], "snapshot": provenance["snapshot"], "tier": "q4"}
-    else:
-        provenance = {k: v for k, v in provenance.items() if k != "q4_files"}
+    provenance = {k: v for k, v in provenance.items() if k != "q4_files"}
     identity = {"tier": tier, "variant": variant, "source_snapshot": provenance,
                 "depths": depths, "files": digests}
     if tier == ENG4B:

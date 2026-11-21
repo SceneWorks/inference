@@ -73,3 +73,48 @@ Only select Tier 2 for the feature-end real-weight campaign. A mismatch, skipped
 body, timeout, asset or setup error leaves the comparison unaccepted and retains
 the failure receipt where available. The two probe checkouts and generated
 weights are private temporary job files.
+
+## ENG-4b terminal real-weight comparison
+
+Select `eng4b-tier2` and request `flux1-eng4b-pair` on `candle-cuda`.
+Both arms use locked Cargo release builds and the planned route. The reference is the merged
+ENG-4a engine `e86b8d5fc493c16b2d9d852e0c9ecbdefee58294`. The head is the
+exact dispatched revision and tree. Both use the full Q4 Dev and Schnell
+snapshots and the request settings above. The controller verifies the
+published file hashes before and after the comparison. One instrumented
+pair per variant checks bit-exact states and RGB8 before the performance
+samples start.
+
+The SGA PERF-1 and PERF-2 contract uses six fixed pairs per variant. Each
+pair uses fresh processes and alternates which revision goes first. Each
+measured process loads once, completes one identical warm-up, then times
+one warm resident generation. Its end-to-end timer covers planned generation
+through materialized host RGB. Its seconds per outer step come from the
+synchronized interval from the first Euler evaluation through the terminal
+state, divided by three. Evidence writes occur outside the timed intervals.
+Every measured run completes the frozen plan and produces the fidelity
+pair's RGB8. One physical CUDA claim covers the entire comparison.
+
+The timing statistic is the median of the six paired head/base ratios.
+The smallest and largest observed ratios bound the population median with
+96.875% coverage for independent pairs. Each two-sided interval passes
+when its upper bound is at most 1.02 and fails when its lower bound exceeds
+1.02. Crossing the ceiling is inconclusive. A result at the fixed sample
+budget requires a decision before any new run. Host memory uses the Windows
+process peak working set. Device memory uses the CUDA allocator's continuous
+live and driver-reserved pool high-water counters. These matched process
+peaks cover load, warm-up and generation. The head maximum for each domain
+must be at most 1.02 times the base maximum. External guard samples and the
+driver-wide allocation bound remain diagnostics and safety controls.
+
+The fixed budget is two builds, four model-free preflights, four fidelity
+renders, and 24 measured processes, each with one warm-up and one timed
+render. Set the child deadline to at most 360 seconds and keep the existing
+one-second guard poll, 24 GiB child host cap and 18 GiB child GPU cap. At the
+360-second limit the physical claim allows 198 minutes plus the existing
+release reserve. The existing six-hour job timeout also covers builds and
+asset verification. The workflow requires provisioned cache entries.
+The profile measures CUDA resident Q4 Dev and Schnell. FLUX.1 conditional
+modes use `conditional-tier1` and its separate immutable asset bindings.
+Native BFL and the ControlNet and PuLID injection routes retain their
+own model proof cases. Their evidence applies to those cases' settings.

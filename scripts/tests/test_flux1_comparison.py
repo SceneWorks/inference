@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from scripts.ci.flux1_pair import evidence, fixture, overlay
+from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci import flux1_comparison as comparison
 from scripts.ci.model_proof_resources import CudaClaimRejected
 from scripts.media_campaign_supervisor import RunResult
@@ -115,7 +115,7 @@ class FluxPairTests(unittest.TestCase):
                          "phase": {"first_step": 0, "end_step": 3, "sampler": "euler",
                                    "guidance": 3.5, "stream": dict(width=256, height=256, patch_stride=16,
                                                                    tokens=256, token_width=64)}}}
-        contract = {"base": overlay.ENG4B_BASE, "base_tree": overlay.ENG4B_BASE_TREE,
+        contract = {"tier": fixture.ENG4B, "base": overlay.ENG4B_BASE, "base_tree": overlay.ENG4B_BASE_TREE,
                     "head": "d" * 40, "head_tree": "e" * 40}
         receipt = {"preflight": {arm + "-dev": copy.deepcopy(plan) for arm in evidence.ARMS},
                    "fixtures": {"dev": {"tier": fixture.ENG4B, "variant": "dev", "depths": [1, 1],
@@ -128,6 +128,79 @@ class FluxPairTests(unittest.TestCase):
         receipt["arms"]["base"]["renders"]["dev"]["planned_route"] = None
         with self.assertRaisesRegex(ValueError, "render plan differs"):
             comparison.verify_eng4b_identity(receipt, contract, "candle-cuda")
+
+    def test_eng4b_real_plan_uses_published_inputs_and_frozen_serial_budget(self):
+        policy = json.loads((comparison.ROOT / "docs/evidence/sga-eng-1a/cuda-route-plan.json")
+                            .read_text(encoding="utf-8"))["request"]["policy"]
+        head = "f" * 40
+        request = {"selection": "flux1-eng4b-pair", "policy": policy}
+        with patch.object(comparison.proof, "repository_identity",
+                          return_value={"revision": head, "tree": "a" * 40}):
+            with self.assertRaisesRegex(ValueError, "360 second"):
+                comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
+            policy["deadlineSeconds"] = 360
+            contract = comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
+        self.assertEqual((contract["base"], contract["head"]), (overlay.ENG4B_BASE, head))
+        refs = contract["pinned_fixtures"]
+        self.assertEqual(refs["dev"]["source_snapshot"]["snapshot"], "323fd12d79f78ad444e882e8d8e871914584f2b9")
+        self.assertEqual(refs["schnell"]["source_snapshot"]["snapshot"], "bba3ae01dfd94089f173c05edd4e1a4c551f2599")
+        self.assertTrue(all(row["depths"] == [19, 38] and len(row["files"]) > 4 for row in refs.values()))
+        phases = comparison.phase_names(fixture.ENG4B_REAL)
+        self.assertEqual(len(phases), 32)
+        self.assertEqual(phases[:4], ("preflight-base-dev", "preflight-base-schnell",
+                                      "preflight-head-dev", "preflight-head-schnell"))
+        self.assertEqual(phases[8:12], ("measure-dev-1-base", "measure-dev-1-head",
+                                       "measure-dev-2-head", "measure-dev-2-base"))
+        self.assertEqual(phases[-1], "measure-schnell-6-base")
+        self.assertLess(contract["cuda_claim_budget_seconds"], 200 * 60)
+
+    def test_paired_timing_distinguishes_pass_fail_and_inconclusive(self):
+        rows = {phase: dict.fromkeys((*performance.TIMING, *performance.MEMORY), 100)
+                for phase, _, _ in performance.cases(("dev",))}
+        for phase, _, arm in performance.cases(("dev",)):
+            if arm == "head":
+                rows[phase] = dict.fromkeys(rows[phase], 102)
+        self.assertEqual(performance.evaluate(rows, ("dev",))["status"], "pass")
+        rows["measure-dev-2-head"][performance.TIMING[0]] = 103
+        inconclusive = performance.evaluate(rows, ("dev",))
+        self.assertEqual(inconclusive["status"], "inconclusive")
+        self.assertEqual(inconclusive["variants"]["dev"][performance.TIMING[0]]["interval"], [1.02, 1.03])
+        for phase, _, arm in performance.cases(("dev",)):
+            if arm == "head":
+                rows[phase][performance.TIMING[0]] = 104
+        self.assertEqual(performance.evaluate(rows, ("dev",))["status"], "fail")
+        rows["measure-dev-1-head"][performance.MEMORY[0]] = 103
+        self.assertEqual(performance.evaluate(rows, ("dev",))["variants"]["dev"][performance.MEMORY[0]]["status"],
+                         "fail")
+
+    def test_measured_output_requires_a_warmed_completed_matching_body(self):
+        payload = b"finished PNG fixture"
+        preflight = {"provider": "flux1_dev"}
+        reference = {"states": [{"dtype": "BF16"}], "steps": [[1, 3], [2, 3], [3, 3]],
+                     "png_sha256": hashlib.sha256(payload).hexdigest()}
+        policy = {"deadlineSeconds": 360, "childFootprintCapBytes": 1000,
+                  "childGpuCapBytes": 1000, "cudaDeviceUuid": "test"}
+        pool = dict(pid=34, cudaDeviceUuid="test", poolUsedBytes=250,
+                    poolUsedHighBytes=300, poolReservedBytes=400, poolReservedHighBytes=500)
+        files = {"stdout.log": b"FLUX1_PAIR_DENOISE 800 BF16 candle-cuda\r\n"
+                               b"FLUX1_PAIR_DENOISE 600 BF16 candle-cuda\r\n"
+                               b"FLUX1_PAIR_TIMING 1000 700\r\nFLUX1_PAIR_COMPLETE flux1_dev\r\n",
+                 "plan.json": json.dumps(preflight).encode(),
+                 "progress.json": json.dumps(reference["steps"]).encode(),
+                 "output.png": payload,
+                 "supervisor.json": b'{"returncode": 0, "pid": 34}',
+                 "cuda-pool.json": json.dumps(pool).encode()}
+        self.assertEqual(performance.read_sample(files.__getitem__, "dev", preflight, reference, policy),
+                         dict(zip((*performance.TIMING, *performance.MEMORY), (2e-7, 1e-6, 700, 300, 500))))
+        for name, value, reason in (
+            ("stdout.log", files["stdout.log"].split(b"\n", 1)[1], "warm-up"),
+            ("plan.json", b'{"provider": "other"}', "route"),
+            ("output.png", b"mismatch", "RGB8"),
+            ("cuda-pool.json", json.dumps(dict(pool, pid=99)).encode(), "allocation high-water"),
+        ):
+            observed = dict(files, **{name: value})
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, reason):
+                performance.read_sample(observed.__getitem__, "dev", preflight, reference, policy)
 
     def test_guard_failure_preserves_reason_and_prints_only_available_stderr_tail(self):
         for reason, log in [("child-exit", b"not-in-tail" + b"x" * 4000 + b"failure-\xff"),
@@ -151,8 +224,10 @@ class FluxPairTests(unittest.TestCase):
                     self.assertEqual(err.getvalue(), log[-4000:].decode("utf-8", errors="replace") + "\n")
 
     def test_partial_and_complete_comparisons_retain_logs_under_one_aggregate_claim(self):
-        for tier, failure in ((tier, failure) for tier in ("tier1", fixture.ENG4B)
-                              for failure in (None, "child", "cleanup")):
+        scenarios = [(tier, failure) for tier in ("tier1", *fixture.ENG4B_TIERS)
+                     for failure in (None, "child", "cleanup")]
+        scenarios.append((fixture.ENG4B_REAL, "noise"))
+        for tier, failure in scenarios:
             fail = failure == "child"
             with self.subTest(tier=tier, failure=failure), TemporaryDirectory() as tmp, ExitStack() as mocks:
                 root = Path(tmp).resolve()
@@ -160,13 +235,19 @@ class FluxPairTests(unittest.TestCase):
                                     .read_text(encoding="utf-8"))["request"]["policy"]
                 policy["deadlineSeconds"] = 120
                 contract = {"tier": tier, "request": {"policy": policy}}
-                eng4b = tier == fixture.ENG4B
+                eng4b = tier in fixture.ENG4B_TIERS
+                measured = tier == fixture.ENG4B_REAL
                 if eng4b:
                     contract.update(base=overlay.ENG4B_BASE, base_tree=overlay.ENG4B_BASE_TREE,
                                     head="a" * 40, head_tree="b" * 40)
                 profiles = comparison.variants(tier)
-                shape = ({"tier": tier, "variant": "dev", "depths": [1, 1],
-                          "fixture_storage": dict(Q4=fixture.Q4, dense_vae="BF16")} if eng4b else {})
+                shapes = {v: {} for v in profiles}
+                if tier == fixture.ENG4B:
+                    shapes["dev"] = {"tier": tier, "variant": "dev", "depths": [1, 1],
+                                     "fixture_storage": dict(Q4=fixture.Q4, dense_vae="BF16")}
+                if measured:
+                    shapes = {v: fixture.real_snapshot_identity(v, tier) for v in profiles}
+                    contract["pinned_fixtures"] = shapes
                 args = SimpleNamespace(backend="candle-cuda", output=root / "artifact")
                 clock = [1000.]
                 phase_order = []
@@ -203,10 +284,16 @@ class FluxPairTests(unittest.TestCase):
                         stdout_path.write_text("FLUX1_PAIR_PREFLIGHT " + model + "\n", encoding="utf-8")
                     else:
                         lines = []
-                        for i, sigma in enumerate(sigmas):
-                            bits = struct.pack(">f", sigma).hex()
-                            (out / f"state-{bits}.bin").write_bytes(struct.pack("<f", float(i)) * 16384)
-                            lines.append(f"FLUX1_PAIR_STATE {bits} BF16 candle-cuda")
+                        if "--measure" in argv:
+                            duration = 1100 if failure == "noise" and out.name == "measure-dev-2-head" else 1000
+                            lines.extend(("FLUX1_PAIR_DENOISE 900 BF16 candle-cuda",
+                                          "FLUX1_PAIR_DENOISE 600 BF16 candle-cuda",
+                                          f"FLUX1_PAIR_TIMING {duration} 4096"))
+                        else:
+                            for i, sigma in enumerate(sigmas):
+                                bits = struct.pack(">f", sigma).hex()
+                                (out / f"state-{bits}.bin").write_bytes(struct.pack("<f", float(i)) * 16384)
+                                lines.append(f"FLUX1_PAIR_STATE {bits} BF16 candle-cuda")
                         lines.append("FLUX1_PAIR_COMPLETE " + model)
                         stdout_path.write_text("\n".join(lines), encoding="utf-8")
                         comparison.write(out / "cuda-pool.json", {"pid": 1, "cudaDeviceUuid": policy.cuda_device_uuid,
@@ -231,14 +318,17 @@ class FluxPairTests(unittest.TestCase):
                     self.assertEqual(selected_tier, tier)
                     identity = ({"revision": contract[arm], "tree": contract[arm + "_tree"],
                                  "overlay_sha256": "a" * 64, "binary_sha256": "b" * 64} if eng4b else {})
+                    if measured:
+                        identity.update(build_command=list(performance.BUILD), toolchain={"channel": "1.96.0"})
                     return root / "probe", identity
 
                 mocks.enter_context(patch.object(comparison, "git", side_effect=git_identity))
                 mocks.enter_context(patch.object(comparison, "build", side_effect=build))
                 mocks.enter_context(patch.object(comparison, "hardware", return_value={}))
                 mocks.enter_context(patch.object(comparison, "snapshots", return_value=(
-                    {v: root for v in profiles}, {v: shape for v in profiles})))
-                mocks.enter_context(patch.object(comparison.fixture, "snapshot_identity", return_value=shape))
+                    {v: root for v in profiles}, shapes)))
+                mocks.enter_context(patch.object(comparison.fixture, "snapshot_identity",
+                                                 side_effect=lambda path, variant, tier: shapes[variant]))
                 mocks.enter_context(patch.object(comparison.proof, "require_host"))
                 mocks.enter_context(patch.object(comparison, "execution_claim", claim))
                 mocks.enter_context(patch.object(comparison, "time", SimpleNamespace(monotonic=lambda: clock[0]), create=True))
@@ -249,6 +339,9 @@ class FluxPairTests(unittest.TestCase):
                 elif failure == "cleanup":
                     with (patch.object(comparison, "remove_work", side_effect=PermissionError("pack in use")),
                           self.assertRaisesRegex(PermissionError, "pack in use")):
+                        comparison.execute(args, contract)
+                elif failure == "noise":
+                    with self.assertRaisesRegex(ValueError, "performance is inconclusive"):
                         comparison.execute(args, contract)
                 else:
                     comparison.execute(args, contract)
@@ -262,6 +355,11 @@ class FluxPairTests(unittest.TestCase):
                 self.assertEqual((root / "f1p-7-1").exists(), failure == "cleanup")
                 if failure == "cleanup":
                     self.assertEqual(receipt["cleanup_failure"], "pack in use")
+                if measured and not fail:
+                    self.assertEqual(receipt["performance"]["status"],
+                                     "inconclusive" if failure == "noise" else "pass")
+                    self.assertEqual(len(receipt["performance_samples"]), 24)
+                    self.assertEqual(tuple(phase_order), comparison.phase_names(tier))
                 self.assertIn("logs", receipt)
                 for phase in phase_order:
                     for suffix in ("stdout.log", "stderr.log", "guard.jsonl", "supervisor.json"):
