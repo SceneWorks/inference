@@ -341,9 +341,12 @@ impl ZImageEdit {
         let cap_feats = prepared.cap_feats;
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
-        let dit_prepared = self
-            .transformer
-            .prepare_conditioning(&latents, &cap_feats, &cap_mask)?;
+        let dit_prepared = self.transformer.prepare_conditioning(
+            &latents,
+            &cap_feats,
+            &cap_mask,
+            Default::default(),
+        )?;
 
         // Reduced schedule: run steps `start..steps`. Reading scheduler.sigmas/timesteps directly (both
         // pub) and doing the Euler step inline is byte-identical to the txt2img loop's

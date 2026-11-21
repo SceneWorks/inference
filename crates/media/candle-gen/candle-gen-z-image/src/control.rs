@@ -62,9 +62,8 @@ use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEnc
 
 // Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
 use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
-use crate::dit::ZImageTransformerBlock;
-use crate::packed_dit::ZImageTransformer2DModel as PackedTransformer;
-use crate::pipeline::{DiT, Pipeline, TextEnc};
+use crate::dit::{ZImageTransformer2DModel, ZImageTransformerBlock};
+use crate::pipeline::{Pipeline, TextEnc};
 
 /// The control transformer + context run bf16 (Z-Image native, candle txt2img dtype); the VAE encoder
 /// runs f32 (the encode path's dtype) and its output is cast to bf16 for the control context.
@@ -246,7 +245,7 @@ impl Default for ZImageControlRequest {
 /// The VACE control transformer: the vendored base DiT + the Fun-Controlnet-Union control stack
 /// (`control_all_x_embedder` + 15 `control_layers` + 2 `control_noise_refiner`).
 struct ZImageControlTransformer {
-    base: PackedTransformer,
+    base: ZImageTransformer2DModel,
     control_x_embedder: Linear,
     control_layers: ControlLayers,
     control_noise_refiner: Vec<ZImageControlBlock>,
@@ -278,7 +277,7 @@ enum ControlLayers {
 impl ZImageControlTransformer {
     /// Build from an already-loaded base transformer + the Fun-Controlnet-Union checkpoint VarBuilder.
     fn from_weights(
-        base: PackedTransformer,
+        base: ZImageTransformer2DModel,
         cfg: &DitConfig,
         vb: VarBuilder<'static>,
         stream_layers: bool,
@@ -480,17 +479,13 @@ impl ZImageControlTransformer {
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let (c_patches, _) = patchify(control_context, patch_size, f_patch_size)?;
         let control = __model_proof_output!(c_patches.apply(&self.control_x_embedder))?;
-        let mut cap = self.base.control_embed_caption(cap_feats)?;
+        let mut cap = self.base.embed_caption(cap_feats)?;
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
         let (cap_cos, cap_sin) = self.base.control_rope(&cap_pos_ids)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        cap = self.base.control_refine_context(
-            cap,
-            &cap_attn_mask,
-            &cap_cos,
-            &cap_sin,
-            attention_plan,
-        )?;
+        cap = self
+            .base
+            .refine_caption(cap, &cap_attn_mask, &cap_cos, &cap_sin, attention_plan)?;
         let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
         let (unified_cos, unified_sin) = self.base.control_rope(&unified_pos_ids)?;
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
@@ -576,7 +571,7 @@ impl ZImageControlTransformer {
         )?;
 
         // 6. Base noise refiner, injecting the control refiner hints.
-        x_emb = base.control_refine_noise(
+        x_emb = base.refine_image(
             x_emb,
             &prepared.x_attn_mask,
             &prepared.x_cos,
@@ -692,14 +687,7 @@ impl ZImageControl {
         let pipeline = control_pipeline(paths, &device)?;
         let text = pipeline.load_text_phase()?;
         let dit_cfg = DitConfig::z_image_turbo();
-        let base =
-            match pipeline.load_transformer(false, false)? {
-                DiT::Packed(base) => *base,
-                DiT::Dense(_) => return Err(CandleError::Msg(
-                    "z-image control: packed-aware transformer loader returned a dense-only model"
-                        .into(),
-                )),
-            };
+        let base = pipeline.load_transformer(false, false)?;
         let control_file = resolve_control_file(&paths.control)?;
         let control_vb =
             candle_gen::mmap_var_builder(std::slice::from_ref(&control_file), DTYPE, &device)?;
@@ -870,17 +858,9 @@ impl ZImageControl {
         &self,
         stream_transformer_blocks: bool,
     ) -> Result<ZImageControlTransformer> {
-        let base =
-            match self
-                .pipeline
-                .load_transformer(false, stream_transformer_blocks)?
-            {
-                DiT::Packed(base) => *base,
-                DiT::Dense(_) => return Err(CandleError::Msg(
-                    "z-image control: packed-aware transformer loader returned a dense-only model"
-                        .into(),
-                )),
-            };
+        let base = self
+            .pipeline
+            .load_transformer(false, stream_transformer_blocks)?;
         let cfg = DitConfig::z_image_turbo();
         let control_vb = candle_gen::mmap_var_builder(
             std::slice::from_ref(&self.control_file),
@@ -1799,9 +1779,11 @@ mod tests {
         cfg.cap_feat_dim = 64;
         cfg.use_accelerated_attn = false;
         let base_vars = VarMap::new();
-        let base =
-            PackedTransformer::new(&cfg, VarBuilder::from_varmap(&base_vars, DType::F32, &dev))
-                .unwrap();
+        let base = ZImageTransformer2DModel::new_inference(
+            &cfg,
+            VarBuilder::from_varmap(&base_vars, DType::F32, &dev),
+        )
+        .unwrap();
         let control_vars = VarMap::new();
         let transformer = ZImageControlTransformer::from_weights(
             base,
