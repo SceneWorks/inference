@@ -384,18 +384,15 @@ fn compare_with_golden(
          run with QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill"
     );
     let path = golden.join(file_name);
-    #[cfg(feature = "model-inference-proof")]
-    let result = candle_gen::gen_core::__model_input_reader!(
-        std::fs::read(&path),
-        "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::std::fs::read@18439",
-        TensorInput,
-        &path,
-        |golden_path| std::fs::read(golden_path),
-        origin = golden_origin
-    );
-    #[cfg(not(feature = "model-inference-proof"))]
-    let result = std::fs::read(&path);
-    let (line, failure) = match result {
+    let (line, failure) = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::std::fs::read@18439",
+TensorInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = golden_origin
+) {
         Err(e) => {
             let failure = format!(
                 "{file_name}: {RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",

@@ -325,18 +325,15 @@ fn compare_with_golden(
          run with QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill"
     );
     let path = golden.join(file_name);
-    #[cfg(feature = "model-inference-proof")]
-    let result = mlx_gen::gen_core::__model_input_reader!(
-        image::open(&path),
-        "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::image::open@15349",
-        TensorInput,
-        &path,
-        |golden_path| image::open(golden_path),
-        origin = golden_origin
-    );
-    #[cfg(not(feature = "model-inference-proof"))]
-    let result = image::open(&path);
-    let (line, failure) = match result {
+    let (line, failure) = match mlx_gen::gen_core::__model_input_reader!(
+image::open(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::image::open@15349",
+TensorInput,
+&path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = golden_origin
+) {
         Err(e) => {
             let failure = format!(
                 "{file_name}: {RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",
