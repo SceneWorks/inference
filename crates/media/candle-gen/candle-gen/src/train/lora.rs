@@ -35,7 +35,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{AdaptLinear, Base as SpineBase, DenseLinear, LokrFactors, QLinear};
+use crate::quant::{AdaptLinear, Base as SpineBase, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -264,17 +264,17 @@ impl LoraLinear {
         let mut additive = Vec::new();
         for a in adapt.adapters {
             match a {
-                candle_layers::adapt::Adapter::Lora { a, b, scale } => {
+                candle_layers::adapt::Adapter::Lora { a, b, scale, .. } => {
                     additive.push(AdditiveResidual::Lora {
                         a,
                         b,
                         scales: vec![scale],
                     });
                 }
-                candle_layers::adapt::Adapter::LokrStructured { factors, scale } => {
+                candle_layers::adapt::Adapter::LokrStructured { factors } => {
                     additive.push(AdditiveResidual::LokrStructured {
                         factors,
-                        scales: vec![scale],
+                        scales: vec![1.0],
                     });
                 }
                 candle_layers::adapt::Adapter::TrainableLora {
@@ -298,36 +298,44 @@ impl LoraLinear {
                 }
                 candle_layers::adapt::Adapter::TrainableLokr {
                     w1,
-                    w2_a,
-                    w2_b,
+                    w2,
+                    base_shape: (out_f, in_f),
                     scale,
                     frozen: is_frozen,
                 } => {
                     let live = Adapter::Lokr {
                         w1: w1.clone(),
-                        w2: match &w2_b {
-                            Some(b) => LokrW2::LowRank {
-                                a: w2_a.clone(),
-                                b: b.clone(),
-                            },
-                            None => LokrW2::Full(w2_a.clone()),
+                        w2: match &w2 {
+                            candle_layers::adapt::TrainableLokrW2::Full(t) => {
+                                LokrW2::Full(t.clone())
+                            }
+                            candle_layers::adapt::TrainableLokrW2::LowRank { a, b } => {
+                                LokrW2::LowRank {
+                                    a: a.clone(),
+                                    b: b.clone(),
+                                }
+                            }
                         },
-                        out_f: out_features,
-                        in_f: in_features,
+                        out_f,
+                        in_f,
                         scale,
                     };
                     if is_frozen {
                         let detached = Adapter::Lokr {
                             w1: w1.detach(),
-                            w2: match w2_b {
-                                Some(b) => LokrW2::LowRank {
-                                    a: w2_a.detach(),
-                                    b: b.detach(),
-                                },
-                                None => LokrW2::Full(w2_a.detach()),
+                            w2: match w2 {
+                                candle_layers::adapt::TrainableLokrW2::Full(t) => {
+                                    LokrW2::Full(t.detach())
+                                }
+                                candle_layers::adapt::TrainableLokrW2::LowRank { a, b } => {
+                                    LokrW2::LowRank {
+                                        a: a.detach(),
+                                        b: b.detach(),
+                                    }
+                                }
                             },
-                            out_f: out_features,
-                            in_f: in_features,
+                            out_f,
+                            in_f,
                             scale,
                         };
                         frozen = Some(live);
