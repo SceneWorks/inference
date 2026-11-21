@@ -1442,6 +1442,8 @@ impl<'p, 's> RenderRun<'p, 's> {
             );
         }
         self.begin(RunState::Encoded, RunState::Rendering)?;
+        let terminal_reference =
+            self.plan.produced_reference().is_some() && self.plan.executed_steps() == 0;
         let images = self
             .plan
             .count
@@ -1451,6 +1453,13 @@ impl<'p, 's> RenderRun<'p, 's> {
                     return Err(Error::Canceled.into());
                 }
                 let initial = init(seed)?;
+                if terminal_reference {
+                    // The backend still materializes the initialized reference before decoding.
+                    return self.phase(MemoryPhase::Decode, || {
+                        let terminal = denoise(seed, initial, progress)?;
+                        decode(seed, terminal, progress)
+                    });
+                }
                 let denoised =
                     self.phase(MemoryPhase::Denoise, || denoise(seed, initial, progress))?;
                 self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))

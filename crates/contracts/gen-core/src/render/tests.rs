@@ -1134,6 +1134,37 @@ fn reference(width: u32, height: u32, strength: Option<f32>) -> Conditioning {
     }
 }
 
+#[derive(Default)]
+struct RenderPhaseEntries(Vec<(MemoryPhase, RenderPhaseIdentity)>);
+
+impl MemoryRequestScope for RenderPhaseEntries {
+    fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+        Ok(())
+    }
+    fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+        Ok(())
+    }
+    fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+        Ok(())
+    }
+    fn enter_render_phase(&mut self, phase: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
+        self.0.push((phase, *id));
+        Ok(())
+    }
+    fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
+        Ok(())
+    }
+    fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+        unreachable!()
+    }
+    fn configure_attention(&mut self, _: u32) -> Result<()> {
+        unreachable!()
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+        unreachable!()
+    }
+}
+
 #[test]
 fn multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape() {
     let (base, refine) = hires_requests();
@@ -1205,46 +1236,22 @@ fn multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape() 
     assert!(second.check_request(&descriptor(), &live).is_err());
 
     // The phase identity of the second pass names its own pass and geometry.
-    struct Identities(Vec<RenderPhaseIdentity>);
-    impl MemoryRequestScope for Identities {
-        fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
-            Ok(())
-        }
-        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
-            Ok(())
-        }
-        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
-            Ok(())
-        }
-        fn enter_render_phase(&mut self, _: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
-            self.0.push(*id);
-            Ok(())
-        }
-        fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
-            Ok(())
-        }
-        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
-            unreachable!()
-        }
-        fn configure_attention(&mut self, _: u32) -> Result<()> {
-            unreachable!()
-        }
-        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
-            unreachable!()
-        }
-    }
-    let mut scope = Identities(Vec::new());
+    let mut scope = RenderPhaseEntries::default();
     let cancel = CancelFlag::new();
     {
         let run = RenderRun::new(second, &cancel, Some(&mut scope));
         run.encode(|| Ok::<_, Error>(())).unwrap();
     }
-    assert_eq!(scope.0[0].pass, 1);
+    let [(phase, identity)] = scope.0.as_slice() else {
+        panic!("expected one phase");
+    };
+    assert_eq!(*phase, MemoryPhase::Conditioning);
+    assert_eq!(identity.pass, 1);
     assert_eq!(
-        (scope.0[0].geometry.width, scope.0[0].geometry.height),
+        (identity.geometry.width, identity.geometry.height),
         (64, 48)
     );
-    assert_eq!(scope.0[0].geometry.reference_count, 1);
+    assert_eq!(identity.geometry.reference_count, 1);
 }
 
 #[test]
@@ -1313,6 +1320,35 @@ fn exact_multi_pass_plan_retains_pins_and_terminal_reference_controls_across_pla
     assert_eq!(second.produced_reference(), Some(produced));
     assert_eq!(second.denoise_sigmas(), &[0.0]);
     assert_eq!(second.executed_steps(), 0);
+    let mut scope = RenderPhaseEntries::default();
+    let cancel = CancelFlag::new();
+    {
+        let run = RenderRun::new(second, &cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, Error>(())).unwrap();
+        let images = run
+            .images(
+                &mut |_| panic!("terminal reference should not report denoise progress"),
+                Ok::<_, Error>,
+                |seed, initial, _| {
+                    assert_eq!(initial, seed);
+                    Ok(initial)
+                },
+                |seed, terminal, _| {
+                    assert_eq!(terminal, seed);
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+        assert_eq!(images, [second.base_seed()]);
+    }
+    assert_eq!(
+        scope
+            .0
+            .into_iter()
+            .map(|(phase, id)| (phase, id.pass))
+            .collect::<Vec<_>>(),
+        [(MemoryPhase::Conditioning, 1), (MemoryPhase::Decode, 1)]
+    );
     let live = GenerationRequest {
         conditioning: vec![reference(refine.width, refine.height, Some(1.0))],
         ..refine.clone()
