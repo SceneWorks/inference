@@ -1894,6 +1894,10 @@ jobs:
           if (-not ($response -is [string]) -or [Text.Encoding]::UTF8.GetByteCount($response) -gt 8192) { throw 'Invalid PDH diagnostic output' }
           [IO.File]::WriteAllText((Join-Path $out 'pdh.json'), $response, [Text.UTF8Encoding]::new($false))
           exit $status
+      - name: Verify owned process exit during a dedicated-memory poll
+        shell: cmd
+        timeout-minutes: 1
+        run: '"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_wddm_process_memory.WindowsDedicatedMemoryTests -v'
       - name: Upload diagnostic evidence including incomplete results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
