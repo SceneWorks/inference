@@ -32,6 +32,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -116,7 +117,36 @@ def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:
     return files
 
 
-def hub_root(env: dict[str, str]) -> Path:
+def runner_account_home() -> Path:
+    # This branch runs only on the secondary macOS runner. Use the OS account, not a workflow input.
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+
+
+def hub_root(env: dict[str, str], plan: dict) -> Path:
+    if plan.get("protocol") == "scail2-plural-fit-v1" and plan.get("backend") == "mlx":
+        from scripts.ci.scail_plural import contract as plural
+
+        if (plan["request"]["selection"] != plural.SELECTION
+                or env.get("RUNNER_NAME") != "nax-macos-2" or env.get("RUNNER_OS") != "macOS"
+                or env.get("MODEL_PROOF_RUNNER_ENVIRONMENT") != "self-hosted"):
+            raise ValueError("SCAIL-2 MLX qualification requires the secondary nax-macos-2 runner")
+        home = runner_account_home()
+        hub = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+        tier = snapshot_dir(hub, plural.REPO, plural.REV) / "q4"
+        if tier.resolve() != tier:
+            raise ValueError("SCAIL-2 native cache must resolve directly beneath the runner account home")
+        existing = next(parent for parent in (tier, *tier.parents) if parent.exists())
+        if existing.stat().st_dev != home.stat().st_dev:
+            raise ValueError("SCAIL-2 native cache must be on the runner home volume")
+        tier.mkdir(parents=True, exist_ok=True)
+        # Probe the actual target directory before contacting the Hub or fetching a large file.
+        with tempfile.TemporaryDirectory(dir=tier, prefix=".publish-check-") as scratch:
+            source = Path(scratch) / "source"
+            source.touch()
+            os.link(source, Path(scratch) / "published")
+        return hub
     configured = env.get("MODEL_PROOF_HUB_ROOT", "")
     if not configured:
         raise ValueError("MODEL_PROOF_HUB_ROOT (the runner model root variable) is unset")
@@ -179,7 +209,7 @@ def main() -> int:
     github_env, temporary = env.get("GITHUB_ENV", ""), env.get("RUNNER_TEMP", "")
     if not github_env or not temporary:
         raise ValueError("GitHub Actions environment file and RUNNER_TEMP are required")
-    hub = hub_root(env)
+    hub = hub_root(env, plan)
     receipt = {"hub_root": str(hub), "snapshots": stage(snapshots, hub)}
     receipt_path = Path(temporary) / "model-proof-hub-snapshots.json"
     receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")

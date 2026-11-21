@@ -2,6 +2,8 @@
 
 Run the manual `model-inference-proofs.yml` workflow on the published candidate that includes the native fit profile and proof. The existing workflow stages and authenticates the six files in `SceneWorks/scail2-mlx@ce88cfdb1008f395e9c820e525e6db7b6695f7b3/q4` on each runner. A cold cache requires 23,993,093,306 bytes plus build space. Shader execution takes place under the host's existing Metal or physical CUDA execution lease.
 
+On `nax-macos-2`, the MLX proof stores its Hub snapshot in `~/Library/Caches/SceneWorks/model-proof/huggingface/hub` under the runner account. The setup probes hard-link publication in the selected tier before any download. A cold cache needs 23,993,093,306 free bytes above the 20 GiB staging reserve. The authenticated model directory is `models--SceneWorks--scail2-mlx/snapshots/ce88cfdb1008f395e9c820e525e6db7b6695f7b3/q4` beneath that hub. To reuse it in the SceneWorks Tier 2 product proof, include the absolute `hub_root` from the staging receipt in the dispatch option `hubs`. Keep the other roots needed for product inputs in that ordered list.
+
 Generate the exact dispatch input for a backend from the checked-out candidate and submit once per backend. Set `BACKEND` to `mlx` or `candle-cuda` and `QUALIFIED_REF` to the reviewed feature branch. Check the resulting run's `headSha` against the approved commit before treating its evidence as the candidate.
 
 ```bash

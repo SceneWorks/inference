@@ -356,6 +356,56 @@ class Staging(unittest.TestCase):
             self.assertNotIn("QWEN38_FULL_TIER_SNAPSHOT", proofs.staged_hub_snapshots(draft, bound, env))
 
 
+class ScailPluralCache(unittest.TestCase):
+    def setUp(self):
+        from scripts.ci.scail_plural import contract as plural
+
+        self.plan = {"asset_setup": "hub-snapshots", "protocol": plural.PROTOCOL, "backend": "mlx",
+                     "request": {"selection": plural.SELECTION}, "hub_snapshots": {
+                         plural.SLOT: {"repository": plural.REPO, "revision": plural.REV, "subfolder": "q4"}}}
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name).resolve()
+        self.env = {"RUNNER_NAME": "nax-macos-2", "RUNNER_OS": "macOS",
+                    "MODEL_PROOF_RUNNER_ENVIRONMENT": "self-hosted",
+                    "MODEL_PROOF_HUB_ROOT": str(self.home / "configured")}
+        self.cache = self.home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+
+    def test_only_exact_secondary_mac_plan_uses_the_persistent_cache(self):
+        with patch.object(staging, "runner_account_home", return_value=self.home):
+            for _ in range(2):
+                self.assertEqual(staging.hub_root(self.env, self.plan), self.cache)
+            self.assertEqual(list(self.cache.rglob(".publish-check-*")), [])
+            for name, value in (("RUNNER_NAME", "nax-macos"), ("RUNNER_OS", "Linux"),
+                                ("MODEL_PROOF_RUNNER_ENVIRONMENT", "github-hosted")):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "nax-macos-2"):
+                    staging.hub_root(dict(self.env, **{name: value}), self.plan)
+        for other in (dict(self.plan, backend="candle-cuda"), {"asset_setup": "hub-snapshots"}):
+            self.assertEqual(staging.hub_root(self.env, other), Path(self.env["MODEL_PROOF_HUB_ROOT"]))
+
+    @unittest.skipIf(os.name == "nt", "secondary macOS symlink route")
+    def test_linked_cache_does_not_publish_outside_the_runner_home(self):
+        with tempfile.TemporaryDirectory() as other, patch.object(staging, "runner_account_home", return_value=self.home):
+            (self.home / "Library").symlink_to(other, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "directly beneath"):
+                staging.hub_root(self.env, self.plan)
+            self.assertEqual(list(Path(other).iterdir()), [])
+
+    def test_failed_native_link_probe_aborts_before_hub_staging(self):
+        plan_file = self.home / "plan.json"
+        plan_file.write_text(json.dumps(self.plan))
+        with (patch.dict(os.environ, dict(self.env, GITHUB_ENV=str(self.home / "env"),
+                                          RUNNER_TEMP=str(self.home))),
+              patch.object(sys, "argv", ["stage", "--plan", str(plan_file)]),
+              patch.object(staging, "runner_account_home", return_value=self.home),
+              patch.object(staging.os, "link", side_effect=OSError(errno.ENOTSUP, "hard link unavailable")),
+              patch.object(staging, "stage") as stage):
+            with self.assertRaisesRegex(OSError, "hard link unavailable"):
+                staging.main()
+            stage.assert_not_called()
+        self.assertEqual(list(self.cache.rglob(".publish-check-*")), [])
+
+
 class WorkflowStaging(unittest.TestCase):
     def test_staging_runs_before_the_proof_on_every_platform_from_the_validated_plan(self):
         steps = yaml.safe_load((ROOT / ".github/workflows/model-inference-proofs.yml").read_text(encoding="utf-8"))["jobs"]["prove"]["steps"]
