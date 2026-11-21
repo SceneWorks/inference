@@ -140,6 +140,16 @@ impl NativeDitStorage {
         })
     }
 
+    /// A published encoded source declares its own precision. An explicit conversion
+    /// selection is still checked against that physical marker by validate_selection.
+    pub fn source_selection(self, requested: Option<Quant>) -> Option<Quant> {
+        requested.or(match self {
+            Self::Publisher(DitFormat::Fp8Rowwise) => Some(Quant::Fp8Rowwise),
+            Self::Publisher(DitFormat::Nvfp4) => Some(Quant::Nvfp4),
+            _ => None,
+        })
+    }
+
     pub fn validate_selection(self, requested: Option<Quant>, precision: Precision) -> Result<()> {
         self.validate_parameters()?;
         if self.quant()? != requested {
@@ -320,6 +330,87 @@ impl NativeDitStorage {
             .get("quantization")
             .ok_or_else(|| invalid(format!("{}: missing `quantization`", path.display())))?;
         Self::from_marker(marker)
+    }
+
+    /// Validate a component file in the ordinary FLUX3 package. An explicit publisher
+    /// marker owns its entire physical inventory. With no package-wide quantizer, a
+    /// validated per-tensor codec may supply one of the architecture's exact logical operands.
+    /// Returns whether the file uses any such per-tensor encoding.
+    pub fn validate_source_headers(
+        self,
+        cfg: &DitConfig,
+        path: &std::path::Path,
+        headers: &[SafetensorsTensorHeader],
+    ) -> Result<bool> {
+        use gen_core::checkpoint_codec::*;
+        if self != Self::Publisher(DitFormat::Dense)
+            || !headers.iter().any(|h| {
+                matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::I8)
+                    || h.name.ends_with(".comfy_quant")
+            })
+        {
+            return self.validate_headers(cfg, headers).map(|_| false);
+        }
+        struct Geometry(BTreeMap<String, TensorSpec>);
+        impl LogicalKeyMapping for Geometry {
+            fn mapping_id(&self) -> &'static str {
+                "flux3-native-package-v1"
+            }
+            fn logical_key(&self, key: &str) -> Option<String> {
+                self.0.contains_key(key).then(|| key.to_owned())
+            }
+            fn logical_shape(&self, key: &str) -> Option<Vec<usize>> {
+                self.0.get(key).map(|v| v.shape.clone())
+            }
+            fn inline_fp8_scales(&self) -> bool {
+                true
+            }
+        }
+        let geometry = Geometry(self.expected_tensors(cfg)?);
+        let tables: Vec<_> = gen_core::safetensors_path_quantization_metadata(path)?
+            .into_iter()
+            .collect();
+        let Some(input) = ProjectionSourceHeaders::read(&[path.to_owned()], |_| true, &tables)?
+        else {
+            return self.validate_headers(cfg, headers).map(|_| false);
+        };
+        let registry = CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied())?;
+        let plan = input.compile(&geometry, &registry, &SourceCodecResidency)?;
+        let rows: BTreeMap<_, _> = plan
+            .tensors
+            .iter()
+            .map(|r| (r.physical_key.as_str(), r))
+            .collect();
+        let consumed: std::collections::BTreeSet<_> = plan
+            .companions
+            .iter()
+            .map(|c| c.physical_key.as_str())
+            .collect();
+        let mut logical = Vec::new();
+        for header in headers {
+            if consumed.contains(header.name.as_str()) {
+                continue;
+            }
+            if let Some(row) = rows.get(header.name.as_str()) {
+                let expected = &geometry.0[&row.logical_key];
+                if row.shape != expected.shape {
+                    return Err(invalid(format!(
+                        "{} geometry {:?} disagrees with model {:?}",
+                        row.logical_key, row.shape, expected.shape
+                    )));
+                }
+                logical.push(SafetensorsTensorHeader {
+                    name: row.logical_key.clone(),
+                    dtype: expected.dtype,
+                    shape: row.shape.clone(),
+                    data_bytes: expected.bytes()?,
+                });
+            } else {
+                logical.push(header.clone());
+            }
+        }
+        self.validate_headers(cfg, &logical)?;
+        Ok(true)
     }
 
     pub fn validate_headers(
