@@ -400,8 +400,8 @@ pub(crate) fn fold(quanta: &[PricedQuantum]) -> IosPricing {
 }
 
 /// The MLX dtype of a stored tensor.
-fn mlx_dtype(dtype: StoredDtype) -> Result<Dtype> {
-    Ok(match dtype {
+fn mlx_dtype(dtype: StoredDtype) -> Dtype {
+    match dtype {
         StoredDtype::BOOL => Dtype::Bool,
         StoredDtype::U8 | StoredDtype::F8_E4M3 | StoredDtype::F8_E5M2 | StoredDtype::F8_E8M0 => {
             Dtype::Uint8
@@ -417,12 +417,7 @@ fn mlx_dtype(dtype: StoredDtype) -> Result<Dtype> {
         StoredDtype::U64 => Dtype::Uint64,
         StoredDtype::I64 => Dtype::Int64,
         StoredDtype::F64 => Dtype::Float64,
-        other => {
-            return Err(Error::Unsupported(format!(
-                "anima pricing: no MLX dtype for stored {other:?}"
-            )))
-        }
-    })
+    }
 }
 
 /// Shape-only placeholders for every header: lazy `zeros`, never evaluated (nothing is allocated
@@ -439,7 +434,7 @@ fn placeholders(
             .map(|&d| i32::try_from(d))
             .collect::<std::result::Result<Vec<i32>, _>>()
             .map_err(|_| Error::Unsupported(format!("{}: dimension overflow", h.name)))?;
-        let dtype = mlx_dtype(h.dtype)?;
+        let dtype = mlx_dtype(h.dtype);
         let companion = plan.is_some_and(|p| {
             p.companions
                 .binary_search_by(|c| c.physical_key.cmp(&h.name))
