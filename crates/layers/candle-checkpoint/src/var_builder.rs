@@ -2,15 +2,15 @@
 //! Constructors asking for a Linear select the native GEMM; coefficient reads use the reference
 //! codec. Plain tensors retain Candle's original lookup, shape and dtype behavior.
 use crate::logical_weights::{baseline_codec_registry, CandleCodecResidency, LogicalWeightReader};
-use candle_core::safetensors::{self as st, MmapedSafetensors};
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Error, Result, Shape, Tensor};
 use candle_nn::linear::NativeLinearWeight;
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::{Init, VarBuilder};
 use gen_core::checkpoint_codec::LogicalKeyMapping;
-use gen_core::SafetensorsTensorHeader;
+use gen_core::checkpoint_codec::ProjectionSourceHeaders;
 use safetensors::Dtype;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,23 +45,16 @@ pub struct ProjectionSource(Arc<LogicalWeightReader>, Arc<SourcePlan>);
 struct SourcePlan {
     mapping: SourceMapping,
     files: Vec<PathBuf>,
-    headers: Vec<SafetensorsTensorHeader>,
-    descriptors: BTreeMap<String, Vec<u8>>,
-    metadata: Option<String>,
+    headers: ProjectionSourceHeaders,
     other_devices: std::sync::Mutex<Vec<Arc<LogicalWeightReader>>>,
 }
 impl SourcePlan {
     fn open(&self, st: Arc<MmapedSafetensors>, dev: &Device) -> Result<Arc<LogicalWeightReader>> {
         let policy = CandleCodecResidency::probe(dev);
-        let plan = gen_core::compile_logical_weight_plan_with_metadata(
-            &self.headers,
-            &self.descriptors,
-            self.metadata.as_deref(),
-            &self.mapping,
-            baseline_codec_registry(),
-            &policy,
-        )
-        .map_err(Error::wrap)?;
+        let plan = self
+            .headers
+            .compile(&self.mapping, baseline_codec_registry(), &policy)
+            .map_err(Error::wrap)?;
         Ok(Arc::new(LogicalWeightReader::from_mapped(
             st,
             plan,
@@ -185,123 +178,35 @@ impl ProjectionSource {
         selected: impl Fn(&str) -> bool,
         mapping: SourceMapping,
     ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
-        let views: BTreeMap<_, _> = st.tensors().into_iter().collect();
-        let mut bases = BTreeSet::new();
-        for (name, view) in &views {
-            if !selected(name) {
-                continue;
-            }
-            if matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
-                && [".scale_weight", ".weight_scale"]
-                    .iter()
-                    .any(|suffix| views.contains_key(&format!("{name}{suffix}")))
-            {
-                bases.insert(name.clone());
-            }
-            if let Some(base) = name.strip_suffix(".comfy_quant") {
-                bases.insert(base.to_owned());
-            }
-            if let Some(base) = name.strip_suffix(".weight") {
-                if matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
-                    || (matches!(view.dtype(), Dtype::I8 | Dtype::U8)
-                        && views.contains_key(&format!("{base}.weight_scale")))
-                {
-                    bases.insert(base.to_owned());
-                }
-            }
-        }
-        let bare_fp8 = views.iter().any(|(key, view)| {
-            selected(key)
-                && matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
-                && !matches!(
-                    key.rsplit('.').next(),
-                    Some("weight_s_rel" | "weight_scale" | "weight_scale_2" | "scales")
-                )
-        });
-        if bases.is_empty() && !bare_fp8 {
+        // The common dense path needs only the mmap's existing index. Source schemas and
+        // companion/metadata scope are validated once by the portable shard planner.
+        if !st.tensors().into_iter().any(|(k, v)| {
+            (selected(&k) && matches!(v.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2))
+                || k.ends_with(".comfy_quant")
+                || (k.ends_with(".weight_scale")
+                    && st
+                        .get(&format!("{}.weight", k.trim_end_matches(".weight_scale")))
+                        .is_ok())
+        }) {
             return Ok(Err(st));
         }
-        let mut headers = Vec::new();
-        let mut descriptors = BTreeMap::new();
-        for (name, view) in &views {
-            let base = name.rsplit_once('.').map(|(b, _)| b);
-            let part = base.is_some_and(|b| bases.contains(b));
-            let float8 = matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2);
-            let companion = matches!(
-                name.rsplit('.').next(),
-                Some(
-                    "comfy_quant"
-                        | "weight_scale"
-                        | "weight_scale_2"
-                        | "input_scale"
-                        | "scales"
-                        | "biases"
-                        | "scale_weight"
-                        | "scale_input"
-                        | "weight_s_rel"
-                        | "weight_s_channel"
-                        | "weight_codebook"
-                )
-            );
-            if !(part && (companion || name.ends_with(".weight")))
-                && !(float8 && !companion && selected(name))
-                && name != "scaled_fp8"
-            {
-                continue;
-            }
-            if name.ends_with(".comfy_quant") {
-                if view.data().len() > 65_536 {
-                    candle_core::bail!("{name}: oversized checkpoint descriptor");
-                }
-                descriptors.insert(
-                    name.clone(),
-                    st::read_tensor_bytes(view, |bytes| bytes.to_vec()),
-                );
-            }
-            headers.push(SafetensorsTensorHeader {
-                name: name.clone(),
-                dtype: gen_core::weightsmeta::Dtype::parse(&format!("{:?}", view.dtype()))
-                    .ok_or_else(|| Error::Msg(format!("{name}: unsupported {:?}", view.dtype())))?,
-                shape: view.shape().to_vec(),
-                data_bytes: view.data().len() as u64,
-            });
-        }
-        let mut layers = serde_json::Map::new();
+        let mut tables = Vec::new();
         for path in files {
-            if let Some(raw) =
+            if let Some(table) =
                 gen_core::safetensors_path_quantization_metadata(path).map_err(Error::wrap)?
             {
-                gen_core::comfy_quant::parse_quantization_metadata(&raw).map_err(Error::wrap)?;
-                let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(Error::wrap)?;
-                for (name, entry) in parsed["layers"]
-                    .as_object()
-                    .expect("validated layers")
-                    .iter()
-                {
-                    if !bases.contains(name)
-                        && !bases.iter().any(|b| {
-                            b.strip_suffix(name.as_str())
-                                .is_some_and(|prefix| prefix.ends_with('.'))
-                        })
-                    {
-                        continue;
-                    }
-                    if layers
-                        .insert(name.clone(), entry.clone())
-                        .is_some_and(|previous| previous != *entry)
-                    {
-                        candle_core::bail!("conflicting shard descriptors for {name}");
-                    }
-                }
+                tables.push(table);
             }
         }
-        let meta = (!layers.is_empty()).then(|| serde_json::json!({"layers":layers}).to_string());
+        let Some(headers) =
+            ProjectionSourceHeaders::read(files, selected, &tables).map_err(Error::wrap)?
+        else {
+            return Ok(Err(st));
+        };
         let definition = Arc::new(SourcePlan {
             mapping,
             files: files.to_vec(),
             headers,
-            descriptors,
-            metadata: meta,
             other_devices: Default::default(),
         });
         let reader = definition.open(Arc::new(st), dev)?;

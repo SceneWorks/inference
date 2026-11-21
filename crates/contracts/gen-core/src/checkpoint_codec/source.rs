@@ -49,105 +49,147 @@ pub fn plan_projection_sources(
     registry: &CheckpointCodecRegistry,
     residency: &dyn CodecResidencyPolicy,
 ) -> crate::Result<Option<LogicalWeightPlan>> {
-    let mut source = BTreeMap::new();
-    for path in paths {
-        for h in crate::safetensors_path_tensor_headers(path)? {
-            if source.insert(h.name.clone(), h).is_some() {
-                return Err(format!(
-                    "duplicate tensor across checkpoint shards in {}",
-                    path.display()
-                )
-                .into());
-            }
-        }
-    }
-    let by_name: BTreeMap<_, _> = source.keys().map(|s| (s.as_str(), ())).collect();
-    let mut declarations = serde_json::Map::new();
-    let mut bases = BTreeSet::new();
-    for table in tables {
-        let entries = crate::comfy_quant::parse_quantization_metadata(table)
-            .map_err(|e| crate::Error::Msg(e.to_string()))?;
-        let prefix = resolve_metadata_prefix(&by_name, &entries)
-            .map_err(|e| crate::Error::Msg(e.to_string()))?;
-        let json: serde_json::Value =
-            serde_json::from_str(table).map_err(|e| crate::Error::Msg(e.to_string()))?;
-        for name in entries.keys() {
-            let base = format!("{prefix}{name}");
-            if selected(&format!("{base}.weight")) {
-                bases.insert(base.clone());
-                let descriptor = &json["layers"][name];
-                if declarations
-                    .insert(base.clone(), descriptor.clone())
-                    .is_some_and(|old| old != *descriptor)
-                {
-                    return Err(
-                        format!("{base}: conflicting source declarations across shards").into(),
-                    );
+    let Some(input) = ProjectionSourceHeaders::read(paths, selected, tables)? else {
+        return Ok(None);
+    };
+    input
+        .compile(&ConstructorMapping, registry, residency)
+        .map(Some)
+}
+
+/// Validated physical rows and sidecars, reusable on relocation without rescanning shard headers.
+pub struct ProjectionSourceHeaders {
+    headers: Vec<SafetensorsTensorHeader>,
+    descriptors: BTreeMap<String, Vec<u8>>,
+    metadata: Option<String>,
+}
+
+impl ProjectionSourceHeaders {
+    pub fn read(
+        paths: &[PathBuf],
+        selected: impl Fn(&str) -> bool,
+        tables: &[String],
+    ) -> crate::Result<Option<Self>> {
+        let mut source = BTreeMap::new();
+        for path in paths {
+            for h in crate::safetensors_path_tensor_headers(path)? {
+                if source.insert(h.name.clone(), h).is_some() {
+                    return Err(format!(
+                        "duplicate tensor across checkpoint shards in {}",
+                        path.display()
+                    )
+                    .into());
                 }
             }
         }
-    }
-    for h in source.values() {
-        if let Some(base) = h.name.strip_suffix(".comfy_quant") {
-            if selected(&format!("{base}.weight")) || selected(&h.name) {
-                bases.insert(base.to_owned());
+        let by_name: BTreeMap<_, _> = source.keys().map(|s| (s.as_str(), ())).collect();
+        let mut declarations = serde_json::Map::new();
+        let mut bases = BTreeSet::new();
+        for table in tables {
+            let entries = crate::comfy_quant::parse_quantization_metadata(table)
+                .map_err(|e| crate::Error::Msg(e.to_string()))?;
+            let prefix = resolve_metadata_prefix(&by_name, &entries)
+                .map_err(|e| crate::Error::Msg(e.to_string()))?;
+            let json: serde_json::Value =
+                serde_json::from_str(table).map_err(|e| crate::Error::Msg(e.to_string()))?;
+            for name in entries.keys() {
+                let base = format!("{prefix}{name}");
+                if selected(&format!("{base}.weight")) {
+                    bases.insert(base.clone());
+                    let descriptor = &json["layers"][name];
+                    if declarations
+                        .insert(base.clone(), descriptor.clone())
+                        .is_some_and(|old| old != *descriptor)
+                    {
+                        return Err(format!(
+                            "{base}: conflicting source declarations across shards"
+                        )
+                        .into());
+                    }
+                }
             }
         }
-        if let Some(base) = h.name.strip_suffix(".weight") {
+        for h in source.values() {
             if selected(&h.name)
-                && (matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
-                    || (h.dtype == Dtype::I8
-                        && source.contains_key(&format!("{base}.weight_scale"))))
+                && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                && [".scale_weight", ".weight_scale"]
+                    .iter()
+                    .any(|suffix| source.contains_key(&format!("{}{suffix}", h.name)))
             {
-                bases.insert(base.to_owned());
+                bases.insert(h.name.clone());
+            }
+            if let Some(base) = h.name.strip_suffix(".comfy_quant") {
+                if selected(&format!("{base}.weight")) || selected(&h.name) {
+                    bases.insert(base.to_owned());
+                }
+            }
+            if let Some(base) = h.name.strip_suffix(".weight") {
+                if selected(&h.name)
+                    && (matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                        || (h.dtype == Dtype::I8
+                            && source.contains_key(&format!("{base}.weight_scale"))))
+                {
+                    bases.insert(base.to_owned());
+                }
             }
         }
-    }
-    let mut headers: Vec<_> = source
-        .into_values()
-        .filter(|h| {
-            let companion = projection_companion_base(&h.name);
-            h.name
-                .strip_suffix(".weight")
-                .or(companion)
-                .is_some_and(|b| bases.contains(b))
-                || (companion.is_none()
-                    && selected(&h.name)
-                    && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2))
-                || (!bases.is_empty() && h.name == "scaled_fp8")
-        })
-        .collect();
-    if headers.is_empty() {
-        return Ok(None);
-    }
-    headers.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: BTreeSet<_> = headers
-        .iter()
-        .filter(|h| h.name.ends_with(".comfy_quant"))
-        .map(|h| h.name.as_str())
-        .collect();
-    let mut descriptors = BTreeMap::new();
-    if !names.is_empty() {
-        for path in paths {
-            descriptors.extend(crate::read_safetensors_tensor_payloads(
-                path,
-                |h| names.contains(h.name.as_str()),
-                65_536,
-            )?);
+        let mut headers: Vec<_> = source
+            .into_values()
+            .filter(|h| {
+                let companion = projection_companion_base(&h.name);
+                h.name
+                    .strip_suffix(".weight")
+                    .or(companion)
+                    .is_some_and(|b| bases.contains(b))
+                    || (companion.is_none()
+                        && selected(&h.name)
+                        && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2))
+                    || (!bases.is_empty() && h.name == "scaled_fp8")
+            })
+            .collect();
+        if headers.is_empty() {
+            return Ok(None);
         }
+        headers.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: BTreeSet<_> = headers
+            .iter()
+            .filter(|h| h.name.ends_with(".comfy_quant"))
+            .map(|h| h.name.as_str())
+            .collect();
+        let mut descriptors = BTreeMap::new();
+        if !names.is_empty() {
+            for path in paths {
+                descriptors.extend(crate::read_safetensors_tensor_payloads(
+                    path,
+                    |h| names.contains(h.name.as_str()),
+                    65_536,
+                )?);
+            }
+        }
+        let metadata = (!declarations.is_empty())
+            .then(|| serde_json::json!({"layers":declarations}).to_string());
+        Ok(Some(Self {
+            headers,
+            descriptors,
+            metadata,
+        }))
     }
-    let metadata =
-        (!declarations.is_empty()).then(|| serde_json::json!({"layers":declarations}).to_string());
-    compile_logical_weight_plan_with_metadata(
-        &headers,
-        &descriptors,
-        metadata.as_deref(),
-        &ConstructorMapping,
-        registry,
-        residency,
-    )
-    .map(Some)
-    .map_err(|e| crate::Error::Msg(e.to_string()))
+    pub fn compile(
+        &self,
+        mapping: &dyn LogicalKeyMapping,
+        registry: &CheckpointCodecRegistry,
+        residency: &dyn CodecResidencyPolicy,
+    ) -> crate::Result<LogicalWeightPlan> {
+        compile_logical_weight_plan_with_metadata(
+            &self.headers,
+            &self.descriptors,
+            self.metadata.as_deref(),
+            mapping,
+            registry,
+            residency,
+        )
+        .map_err(|e| crate::Error::Msg(e.to_string()))
+    }
 }
 
 #[cfg(test)]

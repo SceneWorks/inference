@@ -876,7 +876,7 @@ impl LogicalWeightReader {
             ))
         })?;
         let tensor = Self::shaped_row(tensor, shape)?;
-        let decoded = decode(&self.st, &tensor, &self.device)?;
+        let decoded = decode(&self.st, &tensor, &self.device, DType::BF16)?;
         let repr = if tensor.residency.mode == ResidencyMode::Packed {
             ExecutionRepresentation::NativePacked
         } else {
@@ -937,33 +937,8 @@ impl LogicalWeightReader {
             .planned(key)
             .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
         let mut dense = Self::shaped_row(row, shape)?.into_owned();
-        if let TensorCodecSpec::ScalarFp8 { scale, .. } = &dense.codec {
-            let view = self.st.get(&dense.physical_key)?;
-            let element = match dense.encoding {
-                WeightEncoding::Fp8E4M3 => gen_core::fp8_e4m3fn_to_f32 as fn(u8) -> f32,
-                WeightEncoding::Fp8E5M2 => gen_core::fp8_e5m2_to_f32 as fn(u8) -> f32,
-                _ => candle_core::bail!("{key}: invalid scalar FP8 encoding"),
-            };
-            let sw = match scale {
-                ScalarScaleSource::Unit => 1.,
-                ScalarScaleSource::Companion { physical_key } => scalar_at(&self.st, physical_key)?,
-            };
-            if view.shape() != dense.source_shape() {
-                candle_core::bail!("{key}: FP8 source geometry changed");
-            }
-            let values =
-                cst::read_tensor_bytes(&view, |bytes| decode_scaled_fp8(bytes, element, sw));
-            let t = Tensor::from_vec(values, view.shape(), &Device::Cpu)?
-                .to_dtype(dtype)?
-                .to_device(device)?;
-            let logical = apply_transform(&dense, LogicalTensor::Dense(t))?;
-            if let LogicalTensor::Dense(t) = logical {
-                return Ok(t);
-            }
-            unreachable!()
-        }
         dense.residency.mode = ResidencyMode::Dense;
-        let LogicalTensor::Dense(t) = decode(&self.st, &dense, device)? else {
+        let LogicalTensor::Dense(t) = decode(&self.st, &dense, device, dtype)? else {
             candle_core::bail!("{key}: checkpoint operand has no dense coefficient representation")
         };
         t.to_dtype(dtype)
@@ -1053,9 +1028,14 @@ fn guard_stored(
     Ok(())
 }
 
-fn upload_bf16(values: Vec<f32>, shape: &[usize], device: &Device) -> Result<Tensor> {
+fn upload_values(
+    values: Vec<f32>,
+    shape: &[usize],
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
-        .to_dtype(DType::BF16)?
+        .to_dtype(dtype)?
         .to_device(device)?)
 }
 
@@ -1064,6 +1044,7 @@ fn decode(
     st: &MmapedSafetensors,
     tensor: &LogicalTensorPlan,
     device: &Device,
+    dtype: DType,
 ) -> Result<LogicalTensor> {
     use ::safetensors::Dtype as StDtype;
 
@@ -1145,7 +1126,7 @@ fn decode(
                     let values: Vec<f32> = cst::read_tensor_bytes(&view, |bytes| {
                         decode_scaled_fp8(bytes, element, weight_scale)
                     });
-                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+                    LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
                 }
                 ResidencyMode::Packed => {
                     #[cfg(feature = "cuda")]
@@ -1223,7 +1204,7 @@ fn decode(
                     tensor.codec_id, tensor.physical_key
                 ))
             })?;
-            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+            LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
         }
         TensorCodecSpec::Nvfp4 {
             block_scale,
@@ -1262,7 +1243,7 @@ fn decode(
                             tensor.codec_id, tensor.physical_key
                         ))
                     })?;
-                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+                    LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
                 }
                 ResidencyMode::Packed => {
                     // The repack into the container `Nvfp4Linear` consumes: nibble-order swap plus
@@ -1445,7 +1426,7 @@ fn decode(
                 cols,
                 &mut values,
             );
-            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+            LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
         }
     };
     apply_transform(tensor, decoded)

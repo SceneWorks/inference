@@ -419,6 +419,59 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             }
         }
     }
+    // One term distinguishes native F16/F32 output from a BF16 intermediate and bias-before-rounding.
+    for (format, dtype, unit) in [
+        (
+            "float8_e4m3fn",
+            Dtype::F8_E4M3,
+            F8E4M3::from_f32(1.).to_bits(),
+        ),
+        (
+            "float8_e5m2",
+            Dtype::F8_E5M2,
+            F8E5M2::from_f32(1.).to_bits(),
+        ),
+    ] {
+        let path = tmp.path().join(format!("{format}-bias.safetensors"));
+        let mut codes = [0u8; 16 * 16];
+        for row in 0..16 {
+            codes[row * 16 + row] = unit;
+        }
+        let scale = (1.0_f32 + 1.0 / 512.).to_le_bytes();
+        let bias = (-1.0_f32).to_le_bytes().repeat(16);
+        let desc = format!(r#"{{"format":"{format}"}}"#);
+        safetensors::tensor::serialize_to_file(
+            [
+                (
+                    "linear.weight",
+                    TensorView::new(dtype, vec![16, 16], &codes)?,
+                ),
+                (
+                    "linear.weight_scale",
+                    TensorView::new(Dtype::F32, vec![], &scale)?,
+                ),
+                ("linear.bias", TensorView::new(Dtype::F32, vec![16], &bias)?),
+                (
+                    "linear.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![desc.len()], desc.as_bytes())?,
+                ),
+            ],
+            None,
+            &path,
+        )?;
+        for output in [DType::BF16, DType::F16, DType::F32] {
+            let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+            let op = candle_gen::candle_nn::linear(16, 16, vb.pp("linear"))?;
+            assert!(op.native_format_id().is_some());
+            let y = op.forward(&Tensor::ones((1, 16), output, &dev)?)?;
+            assert_eq!(y.dtype(), output);
+            let expected = if output == DType::BF16 { 0. } else { 1. / 512. };
+            assert_eq!(
+                y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                vec![expected; 16]
+            );
+        }
+    }
     let (m, n, k) = (17usize, 23usize, 61usize);
     let mut codes = vec![0u8; 32 * 64];
     let mut scales = vec![127u8; 128 * 4];
@@ -455,7 +508,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     let lin = candle_gen::candle_nn::linear_no_bias(k, n, vb.pp("linear"))?;
     assert_eq!(lin.native_format_id(), Some("mxfp8-v1"));
     let input: Vec<bf16> = (0..(m + 1) * k)
-        .map(|i| bf16::from_f32([0.25, 0.5, -1., 2.][i % 4]))
+        .map(|i| bf16::from_f32([0.25, 0.5, -1., 1.875][i % 4]))
         .collect();
     let x = Tensor::from_slice(&input, (m + 1, k), &dev)?.narrow(0, 1, m)?;
     let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
