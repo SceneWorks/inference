@@ -159,6 +159,27 @@ class SharedHeadroom(unittest.TestCase):
         self.assertEqual(locks, [1, 2, 1, 2])
         self.assertEqual(caught.exception.diagnostic['admission_error'], 'invalid selected primary identity/metadata')
 
+    def test_malformed_selected_utilization_refuses_initial_and_fresh_windows_after_timeout(self):
+        ready = ([self.card()], [])
+        timeout = TimeoutError('GPU inventory sampling deadline exhausted')
+        for utilization in (-5, 101, False, 4.0, '5'):
+            malformed = ([self.card(utilization)], [])
+            for initial, before, expected_locks in (
+                (True, [], [1, 2]), (False, [ready, timeout], [1, 2, 1, 2]),
+                (False, [ready, timeout, ready], [1, 2, 1, 2]),
+            ):
+                locks = []
+                with self.subTest(utilization=utilization, reads=len(before)), self.assertRaises(resources.CudaClaimRejected) as caught:
+                    self.claim([*before, *[malformed] * 5], clock=FakeClock(), lock_trace=locks,
+                               body=lambda _: self.fail('malformed utilization entered the body'))
+                diagnostic = caught.exception.diagnostic
+                self.assertIn('invalid selected primary identity/metadata', diagnostic['admission_error'])
+                self.assertEqual(locks, expected_locks)
+                self.assertEqual(diagnostic['admission_wait']['stable_sample_restarts'], 0 if initial else 1)
+        unknown = ([self.card(None)], [])
+        receipt, _ = self.claim([ready, timeout, *[unknown] * 11], clock=FakeClock())
+        self.assertEqual(receipt['admission_utilization_percent'], [None] * 5)
+
     def test_shared_wait_timeout_invalid_metadata_and_query_failures_never_enter_body(self):
         busy = self.card(100, used_mib=87648, free_mib=10239)
         policy = SimpleNamespace(**{**vars(POLICY),'deadline_seconds':.003})

@@ -90,6 +90,14 @@ def proof_cuda_shared_release(device: dict, uuid: str, physical_index: int, tota
             and 0 <= free <= total and used + free <= total + 2)
 
 
+def _valid_shared_admission_card(device: dict, uuid: str, physical_index: int, total_mib: int) -> bool:
+    # The selected inventory reader maps an explicit [N/A] to None.
+    utilization = device.get('utilization_percent')
+    return (proof_cuda_shared_release(device, uuid, physical_index, total_mib)
+            and 'utilization_percent' in device
+            and (utilization is None or type(utilization) is int and 0 <= utilization <= 100))
+
+
 def shared_owned_completion(record: dict) -> bool:
     """Validate observations retained from run_guarded's existing owned Job completion."""
     observed = record.get('owned_execution_completion')
@@ -484,7 +492,7 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
             physical_index = matches[0].get('index')
         # Identity/counter sanity only: the unchanged cap+reserve check below
         # remains the sole readiness decision; release policy never admits work.
-        if len(matches) != 1 or not proof_cuda_shared_release(
+        if len(matches) != 1 or not _valid_shared_admission_card(
                 matches[0], uuid, physical_index,
                 observation.get('admitted_total_mib', matches[0].get('total_mib'))):
             raise CudaClaimRejected({**diagnostic, 'admission_error': 'invalid selected primary identity/metadata',
@@ -530,8 +538,8 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
                 card = sample.get('selected_card') or {}
                 return (sample.get('predicates', {}).get('unique_uuid') is True
                         and sample.get('selected_index_matches_admission') is True
-                        and proof_cuda_shared_release(dict(card, uuid=uuid), uuid, physical_index,
-                                                      baseline['admitted_total_mib']))
+                        and _valid_shared_admission_card(dict(card, uuid=uuid), uuid, physical_index,
+                                                         baseline['admitted_total_mib']))
             if timed_out and facts.get('status') == 'retained-existing-samples' and all(map(valid_identity, samples)):
                 observation['inventory_window_timeouts'] = observation.get('inventory_window_timeouts', 0) + 1
                 observation['last_inventory_window_timeout'] = {'error': str(error), 'discarded_samples': len(samples)}
@@ -755,8 +763,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             check = idle_check
             if shared_headroom:
                 def valid_card(card, rows):
-                    return (proof_cuda_shared_release(card, uuid, matched[0]['index'], context_baseline['admitted_total_mib'])
-                            and idle_check(card, rows))
+                    if not _valid_shared_admission_card(card, uuid, matched[0]['index'],
+                                                        context_baseline['admitted_total_mib']):
+                        raise RuntimeError('invalid selected primary identity/metadata during admission sampling')
+                    return idle_check(card, rows)
                 check, window['state'] = veda_cuda_guard.stable_window(valid_card)
             return veda_cuda_guard.sample_baseline(
                 matched[0], output, 'model-proof-admission', dict(context_baseline), idle_check=check,
