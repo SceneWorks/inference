@@ -1929,6 +1929,20 @@ mod tests {
     }
 
     #[test]
+    fn curated_video_phase_preserves_finite_first_sigma_above_one_for_small_shift_ddim() {
+        let req = GenerationRequest {
+            sampler: Some("ddim".into()),
+            scheduler_shift: Some(2.6e-16),
+            steps: Some(50),
+            ..Default::default()
+        };
+        let phase = dense_curated_phase(&req, 37).unwrap().unwrap();
+        assert!(phase.sigmas[0] > 1.0);
+        phase.validate_descending_schedule(None).unwrap();
+        assert_video_solver_matches_legacy(&req, &phase, 50);
+    }
+
+    #[test]
     fn curated_video_phase_refusal_precedes_resident_component_load() {
         use candle_gen::request_scope::{CandleRequestScopeConfig, CandleRequestScopeCore};
         let req = GenerationRequest {

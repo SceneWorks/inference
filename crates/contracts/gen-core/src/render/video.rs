@@ -154,11 +154,11 @@ impl<S> VideoDenoisePhase<S> {
         // A native log-SNR scheduler can nudge only its first evaluation away from 1.
         // Use the unguarded start for the ordering check, never for integration.
         let initial = first_before_guard.unwrap_or(self.sigmas[0]);
-        let tail = self.sigmas.get(1..).unwrap_or_default();
+        let tail = &self.sigmas[1..];
         if !initial.is_finite()
-            || initial < self.sigmas[0]
+            || initial < 0.0
             || self.sigmas.last() != Some(&0.0)
-            || tail.first().is_some_and(|&next| next > initial)
+            || tail[0] > initial.max(self.sigmas[0])
             || tail.windows(2).any(|pair| pair[0] < pair[1])
         {
             return Err(Error::Unsupported(
