@@ -155,20 +155,29 @@ pub fn compile_logical_weight_plan_with_metadata(
             });
         }
         let weight_key = format!("{base}.weight");
+        let parameter_key = format!("{base}_weight");
         let bare = mapping.inline_fp8_scales()
             && by_name
                 .get(base)
                 .is_some_and(|h| matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2));
-        let weight_key = match (by_name.contains_key(weight_key.as_str()), bare) {
-            (true, false) => weight_key,
-            (false, true) => base.to_owned(),
-            (true, true) => {
+        let parameter = mapping.inline_fp8_scales() && by_name.contains_key(parameter_key.as_str());
+        let candidates = [
+            by_name
+                .contains_key(weight_key.as_str())
+                .then_some(weight_key),
+            parameter.then_some(parameter_key),
+            bare.then(|| base.to_owned()),
+        ];
+        let mut candidates = candidates.into_iter().flatten();
+        let weight_key = match (candidates.next(), candidates.next()) {
+            (Some(key), None) => key,
+            (Some(_), Some(_)) => {
                 return Err(LogicalWeightPlanError::UnexpectedCompanion {
                     physical_key: header.name.clone(),
-                    reason: "the descriptor has both a bare FP8 owner and a .weight owner",
+                    reason: "the descriptor has multiple physical weight owners",
                 })
             }
-            (false, false) => {
+            (None, _) => {
                 return Err(LogicalWeightPlanError::OrphanDescriptor {
                     physical_key: header.name.clone(),
                 })
@@ -237,15 +246,28 @@ pub fn compile_logical_weight_plan_with_metadata(
             }
         };
     if mapping.inline_fp8_scales() {
+        let mut inferred_owners = BTreeMap::new();
         for header in by_name.values() {
             if !matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
                 continue;
             }
-            let base = header.name.strip_suffix(".weight").unwrap_or(&header.name);
+            let base = if by_name.contains_key(format!("{}.scale_weight", header.name).as_str())
+                || by_name.contains_key(format!("{}.weight_scale", header.name).as_str())
+            {
+                header.name.as_str()
+            } else {
+                super::source::projection_weight_base(&header.name).unwrap_or(&header.name)
+            };
             if !by_name
                 .contains_key(scalar_key(base, WEIGHT_SCALE_SUFFIX, ".scale_weight")?.as_str())
             {
                 continue;
+            }
+            if inferred_owners.insert(base, &header.name).is_some() {
+                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                    physical_key: header.name.clone(),
+                    reason: "multiple physical FP8 weights share one scale owner",
+                });
             }
             let format = match header.dtype {
                 Dtype::F8_E4M3
@@ -424,10 +446,16 @@ pub fn compile_logical_weight_plan_with_metadata(
                 dtype: format!("{:?}", header.dtype),
             }
         })?;
-        let base = header.name.strip_suffix(".weight").or_else(|| {
-            (mapping.inline_fp8_scales() && descriptors.contains_key(&header.name))
-                .then_some(header.name.as_str())
-        });
+        let base = if mapping.inline_fp8_scales() && descriptors.contains_key(&header.name) {
+            Some(header.name.as_str())
+        } else {
+            header.name.strip_suffix(".weight").or_else(|| {
+                mapping
+                    .inline_fp8_scales()
+                    .then(|| super::source::projection_weight_base(&header.name))
+                    .flatten()
+            })
+        };
         let descriptor = base.and_then(|base| descriptors.get(base));
         let declared_source_shape = declared_source_shape.or_else(|| {
             if mapping.accepts_descriptor_shape() {
@@ -989,17 +1017,31 @@ pub fn compile_logical_weight_plan_with_metadata(
     })
 }
 
-/// Normalize the bare FP8 parameter spelling for the opted-in constructor mapping. Reuse
-/// the metadata resolver's unique-prefix and whole-inventory checks for both spellings.
+/// Normalize layer-owned `.weight`/`_weight` and bare FP8 parameter spellings for the opted-in
+/// constructor mapping. Retain the metadata resolver's unique-prefix and whole-inventory checks.
 pub(super) fn resolve_projection_metadata_prefix(
     by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
     table: &BTreeMap<String, PartialComfyQuantDescriptor>,
 ) -> Result<String, LogicalWeightPlanError> {
     let mut names = BTreeSet::new();
     for (key, header) in by_name {
-        if key.ends_with(".weight") {
-            names.insert((*key).to_owned());
-        } else if matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
+        if let Some(base) = super::source::projection_weight_base(key) {
+            let weight = format!("{base}.weight");
+            if !names.insert(weight)
+                && table.keys().any(|layer| {
+                    base == layer
+                        || base
+                            .strip_suffix(layer.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+            {
+                return Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+                    layer: base.to_owned(),
+                    reason: "multiple physical weight spellings resolve to one layer".into(),
+                });
+            }
+        }
+        if !key.ends_with(".weight") && matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
             let weight = format!("{key}.weight");
             if by_name.contains_key(weight.as_str())
                 && table.keys().any(|layer| {

@@ -40,6 +40,13 @@ pub fn projection_companion_base(name: &str) -> Option<&str> {
     .then_some(base)
 }
 
+/// Layer-owned matrix spellings, including fused OpenCLIP parameters. The physical key is
+/// retained in the plan; only companion ownership uses the normalized layer base.
+pub(super) fn projection_weight_base(name: &str) -> Option<&str> {
+    name.strip_suffix(".weight")
+        .or_else(|| name.strip_suffix("_weight"))
+}
+
 /// Compile the selected encoded rows without imposing checkpoint-codec constraints on other
 /// providers' dense, affine, codebook or integer-control fields in the same file.
 pub fn plan_projection_sources(
@@ -356,6 +363,8 @@ impl ProjectionSourceHeaders {
             for name in entries.keys() {
                 let base = format!("{prefix}{name}");
                 if selected(&format!("{base}.weight"))
+                    || (by_name.contains_key(format!("{base}_weight").as_str())
+                        && selected(&format!("{base}_weight")))
                     || (by_name.contains_key(base.as_str()) && selected(&base))
                 {
                     bases.insert(base.clone());
@@ -382,11 +391,15 @@ impl ProjectionSourceHeaders {
                 bases.insert(h.name.clone());
             }
             if let Some(base) = h.name.strip_suffix(".comfy_quant") {
-                if selected(&format!("{base}.weight")) || selected(&h.name) {
+                if selected(&format!("{base}.weight"))
+                    || (source.contains_key(&format!("{base}_weight"))
+                        && selected(&format!("{base}_weight")))
+                    || selected(&h.name)
+                {
                     bases.insert(base.to_owned());
                 }
             }
-            if let Some(base) = h.name.strip_suffix(".weight") {
+            if let Some(base) = projection_weight_base(&h.name) {
                 if selected(&h.name)
                     && (matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
                         || (h.dtype == Dtype::I8
@@ -401,8 +414,7 @@ impl ProjectionSourceHeaders {
             .into_values()
             .filter(|h| {
                 let companion = projection_companion_base(&h.name);
-                h.name
-                    .strip_suffix(".weight")
+                projection_weight_base(&h.name)
                     .or(companion)
                     .is_some_and(|b| bases.contains(b))
                     || (companion.is_none()
@@ -541,6 +553,132 @@ mod tests {
             &SourceCodecResidency
         )
         .is_err());
+    }
+
+    #[test]
+    fn named_projection_parameters_bind_original_file_owners_and_reject_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("openclip.safetensors");
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let base = "model.attn.in_proj";
+        let desc =
+            br#"{"format":"int8_tensorwise","convrot":true,"per_row":true,"convrot_groupsize":64}"#;
+        let scale = [1f32.to_le_bytes(), 2f32.to_le_bytes()].concat();
+        let descriptor_shape = [desc.len()];
+        for suffix in [".weight", "_weight"] {
+            let key = format!("{base}{suffix}");
+            let descriptor_key = format!("{base}.comfy_quant");
+            let scale_key = format!("{base}.weight_scale");
+            for blob in [false, true] {
+                let mut rows = vec![
+                    (key.as_str(), "I8", &[2, 64][..], &[0x80; 128][..]),
+                    (scale_key.as_str(), "F32", &[2, 1][..], scale.as_slice()),
+                ];
+                if blob {
+                    rows.push((descriptor_key.as_str(), "U8", &descriptor_shape, desc));
+                }
+                write(&path, &rows);
+                let tables = vec![format!(
+                    "{{\"layers\":{{\"attn.in_proj\":{}}}}}",
+                    std::str::from_utf8(desc).unwrap()
+                )];
+                let plan = plan_projection_sources(
+                    std::slice::from_ref(&path),
+                    |name| name == key,
+                    &tables,
+                    &registry,
+                    &SourceCodecResidency,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(plan.tensors.len(), 1);
+                assert_eq!(plan.tensors[0].physical_key, key);
+                assert!(matches!(
+                    plan.tensors[0].codec,
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                ));
+                assert!(plan.companions.iter().all(|c| c.owner_physical_key == key));
+                // Descriptor-only checkpoints must resolve the same owner without a file table.
+                if blob {
+                    assert!(plan_projection_sources(
+                        std::slice::from_ref(&path),
+                        |name| name == key,
+                        &[],
+                        &registry,
+                        &SourceCodecResidency,
+                    )
+                    .unwrap()
+                    .is_some());
+                }
+            }
+        }
+        write(
+            &path,
+            &[
+                ("model.attn.in_proj.weight", "I8", &[2, 64], &[0x80; 128]),
+                ("model.attn.in_proj_weight", "I8", &[2, 64], &[0x80; 128]),
+                ("model.attn.in_proj.weight_scale", "F32", &[2, 1], &scale),
+                ("model.attn.in_proj.comfy_quant", "U8", &[desc.len()], desc),
+            ],
+        );
+        assert!(
+            plan_projection_sources(&[path], |_| true, &[], &registry, &SourceCodecResidency,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn named_fp8_parameters_keep_layer_and_parameter_scale_conventions_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("openclip-fp8.safetensors");
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let key = "model.attn.in_proj_weight";
+        let scale = 1.25f32.to_le_bytes();
+        for base in ["model.attn.in_proj", key] {
+            let scale_key = format!("{base}.weight_scale");
+            write(
+                &path,
+                &[
+                    (key, "F8_E4M3", &[2, 64], &[0x38; 128]),
+                    (&scale_key, "F32", &[], &scale),
+                ],
+            );
+            let plan = plan_projection_sources(
+                std::slice::from_ref(&path),
+                |name| name == key,
+                &[],
+                &registry,
+                &SourceCodecResidency,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.tensors[0].physical_key, key);
+            assert!(matches!(
+                plan.tensors[0].codec,
+                TensorCodecSpec::ScalarFp8 { .. }
+            ));
+            assert_eq!(plan.companions[0].physical_key, scale_key);
+            assert_eq!(plan.companions[0].owner_physical_key, key);
+        }
+        write(
+            &path,
+            &[
+                (key, "F8_E4M3", &[2, 64], &[0x38; 128]),
+                (
+                    "model.attn.in_proj.weight",
+                    "F8_E4M3",
+                    &[2, 64],
+                    &[0x38; 128],
+                ),
+                ("model.attn.in_proj.weight_scale", "F32", &[], &scale),
+            ],
+        );
+        assert!(
+            plan_projection_sources(&[path], |_| true, &[], &registry, &SourceCodecResidency,)
+                .is_err()
+        );
     }
 
     #[test]
