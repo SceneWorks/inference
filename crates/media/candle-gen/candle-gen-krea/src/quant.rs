@@ -455,6 +455,7 @@ impl QLinear {
     /// library built without `cfg(test)` and asserts on it.
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self, Self::ConvRotInt8(_))
+            || matches!(self, Self::Adapt(linear) if linear.is_convrot_int8())
     }
 
     /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its

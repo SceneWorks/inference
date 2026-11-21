@@ -348,7 +348,9 @@ impl PlannedDitWeights {
             .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
         {
             LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype)?.to_device(&self.device),
-            LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedNvfp4 { .. }
+            | LogicalTensor::PackedFp8E4M3 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "flux2 single-file: `{logical_key}` was planned packed but is read as a dense \
                      leaf; the mapping and the model disagree about this tensor's role"
@@ -375,6 +377,18 @@ impl PlannedDitWeights {
         } else {
             None
         };
+        if let Some(projection) = self
+            .reader
+            .convrot_projection(&weight_key, dense_bias.clone())
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?
+        {
+            if projection.base_shape() != (out_dim, in_dim) {
+                candle_gen::candle_core::bail!(
+                    "{weight_key}: ConvRot geometry differs from model [{out_dim},{in_dim}]"
+                );
+            }
+            return Ok(projection);
+        }
         match self
             .reader
             .read(&weight_key)
@@ -431,7 +445,7 @@ impl PlannedDitWeights {
                 }
                 Ok(QLinear::from_nvfp4(lin))
             }
-            LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "flux2 single-file: `{weight_key}` was planned as packed fp8, which this \
                      loader does not construct; replan with a dense residency policy"

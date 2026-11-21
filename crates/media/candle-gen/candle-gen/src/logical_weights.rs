@@ -63,9 +63,6 @@ use crate::candle_core::safetensors::{self as cst, MmapedSafetensors};
 use crate::candle_core::{DType, Device, Tensor};
 use crate::{CandleError, Result};
 
-/// Descriptor payloads are tiny JSON blobs; anything above this is not a `.comfy_quant` tensor.
-const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
-
 /// The codec rows this engine implements and registers — identical to the MLX table (codecs are
 /// backend-portable declarations; each engine owns its implementation).
 pub const BASELINE_CODECS: &[CheckpointCodecRegistration] =
@@ -80,6 +77,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     FP8_E4M3_SCALAR_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
+    gen_core::convrot_int8::CODEC_ID,
     INT8_PER_ROW_CODEC.codec_id,
     NVFP4_CODEC.codec_id,
 ];
@@ -134,6 +132,7 @@ impl CandleCodecResidency {
         let mut ids: Vec<&'static str> = Vec::new();
         if self.fp8_e4m3_native {
             ids.push(FP8_E4M3_SCALAR_CODEC.codec_id);
+            ids.push(gen_core::convrot_int8::CODEC_ID);
         }
         if self.nvfp4_native {
             ids.push(NVFP4_CODEC.codec_id);
@@ -205,6 +204,13 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         // here keeps this predicate honest if that ever moved.
         if spec.full_precision_matrix_mult() {
             return ResidencyMode::Dense;
+        }
+        if let TensorCodecSpec::ConvRotInt8 { geometry, .. } = spec {
+            return if self.fp8_e4m3_native && geometry.out_features.is_multiple_of(16) {
+                ResidencyMode::Packed
+            } else {
+                ResidencyMode::Dense
+            };
         }
         // The scalar E4M3 row. The plain undescribed cast (unit scale) qualifies too:
         // `matmul_fp8` takes any f32 weight scale.
@@ -308,38 +314,23 @@ pub fn plan_logical_weights(
     mapping: &dyn LogicalKeyMapping,
     residency: &dyn CodecResidencyPolicy,
 ) -> Result<LogicalWeightPlan> {
-    let headers = gen_core::safetensors_path_tensor_headers(path)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    let descriptors = gen_core::read_safetensors_tensor_payloads(
+    gen_core::checkpoint_codec::plan_safetensors(
         path,
-        |header| header.name.ends_with(".comfy_quant"),
-        MAX_DESCRIPTOR_BYTES,
-    )
-    .map_err(|error| CandleError::Msg(error.to_string()))?;
-    // A checkpoint declares its quantization per layer (`.comfy_quant` tensors), file-wide
-    // (`__metadata__._quantization_metadata`, sc-20641), or not at all; both routes are read and
-    // the compiler refuses a layer the two disagree about.
-    let quantization_metadata = gen_core::safetensors_path_quantization_metadata(path)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    gen_core::compile_logical_weight_plan_with_metadata(
-        &headers,
-        &descriptors,
-        quantization_metadata.as_deref(),
         mapping,
         baseline_codec_registry(),
         residency,
     )
-    .map_err(|error| {
-        CandleError::Msg(format!(
-            "logical weight plan for {} ({}): {error}",
-            path.display(),
-            mapping.mapping_id()
-        ))
-    })
+    .map_err(|e| CandleError::Msg(e.to_string()))
 }
 
 /// One decoded logical tensor.
 pub enum LogicalTensor {
+    /// Exact two's-complement storage bytes, F32 row scales, and required online rotation.
+    PackedConvRot {
+        codes: Tensor,
+        scales: Tensor,
+        geometry: gen_core::convrot_int8::ConvRotInt8,
+    },
     /// The dense resident form (pass-through dtype for dense rows, bf16 for dequantized rows).
     Dense(Tensor),
     /// The packed-native fp8 E4M3 form: the stored codes (dtype `F8E4M3`, on device) plus the
@@ -390,6 +381,9 @@ impl LogicalTensor {
         /// One retained `f32` scale.
         const SCALE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
         match self {
+            Self::PackedConvRot { codes, scales, .. } => {
+                (codes.elem_count() + scales.elem_count() * scales.dtype().size_in_bytes()) as u64
+            }
             Self::Dense(tensor) => (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64,
             Self::PackedFp8E4M3 {
                 codes,
@@ -503,6 +497,7 @@ pub fn read_logical_weights(
 ///   receipt remain the independent pair the contract requires. A companion's source bytes are
 ///   attributed to its owner's codec row only once that owner has materialized.
 pub struct LogicalWeightReader {
+    projection_resources: crate::weights::ProjectionResources,
     st: MmapedSafetensors,
     plan: LogicalWeightPlan,
     device: Device,
@@ -590,6 +585,7 @@ impl LogicalWeightReader {
             .map(|(index, tensor)| (tensor.logical_key.clone(), index))
             .collect();
         Ok(Self {
+            projection_resources: Default::default(),
             st,
             plan,
             device: device.clone(),
@@ -598,6 +594,43 @@ impl LogicalWeightReader {
             demoted: std::sync::Mutex::new(BTreeMap::new()),
             capability,
         })
+    }
+
+    /// Seed a model's shared cuBLASLt context after the provider checked the device.
+    pub fn set_int8_context(&mut self, context: crate::quant::Int8Context) {
+        self.projection_resources.set_int8_context(context);
+    }
+
+    /// Materialize and bind a planned ConvRot projection to this reader's shared device resources.
+    pub fn convrot_projection(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+    ) -> Result<Option<crate::quant::AdaptLinear>> {
+        if !self
+            .planned(key)
+            .is_some_and(|p| matches!(p.codec, TensorCodecSpec::ConvRotInt8 { .. }))
+        {
+            return Ok(None);
+        }
+        let LogicalTensor::PackedConvRot {
+            codes,
+            scales,
+            geometry,
+        } = self.read(key)?
+        else {
+            return Err(CandleError::Msg(format!(
+                "{key}: expected native ConvRot operands"
+            )));
+        };
+        let linear = crate::quant::convrot_int8::ConvRotLinear::from_native_parts(
+            &self.projection_resources,
+            geometry,
+            codes,
+            scales,
+            bias,
+        )?;
+        Ok(Some(crate::quant::AdaptLinear::from_convrot(linear)))
     }
 
     /// Record that the provider served `logical_key` — a row the plan priced
@@ -1102,6 +1135,85 @@ fn decode(
                 }
             }
         }
+        TensorCodecSpec::ConvRotInt8 { scale, geometry } => {
+            guard_stored(
+                tensor,
+                view.dtype(),
+                view.shape(),
+                StDtype::I8,
+                source_shape,
+            )?;
+            let companion = st.get(scale)?;
+            let shape = [geometry.out_features, geometry.in_features];
+            if tensor.residency.mode != ResidencyMode::Packed
+                || shape != source_shape
+                || companion.dtype() != StDtype::F32
+                || companion.shape() != [geometry.out_features, 1]
+            {
+                return Err(CandleError::Msg(format!(
+                    "{}: expected native ConvRot I8 matrix and F32 row scales",
+                    tensor.physical_key
+                )));
+            }
+            let (start, n) = match &tensor.transform {
+                None => (0, geometry.out_features),
+                Some(t) => (t.rows.start, t.rows.len),
+            };
+            let k = geometry.in_features;
+            if start > geometry.out_features
+                || n > geometry.out_features - start
+                || tensor.shape.as_slice() != [n, k]
+            {
+                return Err(CandleError::Msg(format!(
+                    "{}: ConvRot row slice is outside stored weights",
+                    tensor.logical_key
+                )));
+            }
+            let slice = gen_core::convrot_int8::ConvRotInt8::from_geometry(
+                geometry.rotation_group,
+                &[n, k],
+                &[n, 1],
+            )
+            .map_err(CandleError::Msg)?;
+            let scale_bytes = &companion.data()[start * 4..(start + n) * 4];
+            cst::read_source_bytes(scale_bytes, |bytes| {
+                slice.validate_scale_values(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                )
+            })
+            .map_err(CandleError::Msg)?;
+            let codes = Tensor::from_raw_buffer(
+                &view.data()[start * k..(start + n) * k],
+                DType::U8,
+                &[n, k],
+                device,
+            )?;
+            let scales = Tensor::from_raw_buffer(scale_bytes, DType::F32, &[n, 1], device)?;
+            let (codes, scales) = if tensor.transform.as_ref().is_some_and(|t| t.half_swap) {
+                if !n.is_multiple_of(2) {
+                    return Err(CandleError::Msg(format!(
+                        "{}: odd ConvRot half swap",
+                        tensor.logical_key
+                    )));
+                }
+                let half_swap = |x: Tensor| {
+                    candle_core::Tensor::cat(
+                        &[x.narrow(0, n / 2, n / 2)?, x.narrow(0, 0, n / 2)?],
+                        0,
+                    )
+                };
+                (half_swap(codes)?, half_swap(scales)?)
+            } else {
+                (codes, scales)
+            };
+            return Ok(LogicalTensor::PackedConvRot {
+                codes,
+                scales,
+                geometry: slice,
+            });
+        }
         TensorCodecSpec::Int8PerRow { scale, .. } => {
             guard_stored(
                 tensor,
@@ -1168,6 +1280,9 @@ fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result
     };
     let (start, len) = (transform.rows.start, transform.rows.len);
     match decoded {
+        LogicalTensor::PackedConvRot { .. } => Err(CandleError::Msg(
+            "ConvRot slices are read directly from the source".into(),
+        )),
         LogicalTensor::Dense(dense) => {
             let sliced = dense.narrow(0, start, len)?;
             let out = if transform.half_swap {

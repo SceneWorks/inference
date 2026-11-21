@@ -26,6 +26,7 @@ pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
     accessed: RefCell<std::collections::HashSet<String>>,
+    planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
     convrot_rotations: RefCell<HashMap<usize, Array>>,
 }
 
@@ -36,6 +37,7 @@ impl Weights {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            planned_convrot: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
@@ -47,6 +49,7 @@ impl Weights {
             tensors: HashMap::new(),
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            planned_convrot: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
@@ -71,6 +74,7 @@ path.as_ref(),
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            planned_convrot: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -306,6 +310,7 @@ path.as_ref(),
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            planned_convrot: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -375,6 +380,7 @@ f,
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            planned_convrot: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -405,6 +411,31 @@ f,
         self.metadata.get(key).map(String::as_str)
     }
 
+    pub(crate) fn insert_convrot(
+        &mut self,
+        base: &str,
+        geometry: gen_core::convrot_int8::ConvRotInt8,
+        codes: Array,
+        scales: Array,
+    ) {
+        self.insert(format!("{base}.weight"), codes);
+        self.insert(format!("{base}.weight_scale"), scales);
+        self.planned_convrot.insert(base.to_owned(), geometry);
+    }
+
+    /// Whether a physical companion belongs to a validated native projection in this map.
+    pub fn is_native_companion(&self, key: &str) -> bool {
+        key.strip_suffix(".weight_scale")
+            .is_some_and(|base| self.planned_convrot.contains_key(base))
+    }
+
+    pub(crate) fn planned_convrot(
+        &self,
+        base: &str,
+    ) -> Option<gen_core::convrot_int8::ConvRotInt8> {
+        self.planned_convrot.get(base).copied()
+    }
+
     /// Share the tiny immutable ConvRot constants across every projection loaded together.
     pub(crate) fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
         self.convrot_rotations
@@ -417,14 +448,33 @@ f,
     /// Insert (or overwrite) a tensor under `key`. Used by checkpoint remapping (diffusers →
     /// internal names + conv-weight transposes) when loading real weights.
     pub fn insert(&mut self, key: impl Into<String>, tensor: Array) {
-        self.tensors.insert(key.into(), tensor);
+        let key = key.into();
+        if let Some(base) = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix(".weight_scale"))
+        {
+            self.planned_convrot.remove(base);
+        }
+        self.tensors.insert(key, tensor);
     }
 
     /// Copy the tensor at `from` to the new key `to` (no-op if `from` is absent). A convenience
     /// for the identity-but-renamed entries in a checkpoint→internal mapping.
     pub fn alias(&mut self, from: &str, to: &str) {
         if let Some(t) = self.tensors.get(from).cloned() {
-            self.tensors.insert(to.to_string(), t);
+            if let (Some(source), Some(dest)) =
+                (from.strip_suffix(".weight"), to.strip_suffix(".weight"))
+            {
+                if let Some(geometry) = self.planned_convrot(source) {
+                    if let Some(scale) =
+                        self.tensors.get(&format!("{source}.weight_scale")).cloned()
+                    {
+                        self.insert_convrot(dest, geometry, t, scale);
+                        return;
+                    }
+                }
+            }
+            self.insert(to, t);
         }
     }
 
@@ -434,6 +484,12 @@ f,
     /// unified-memory transient to ~the built size (sc-11030; the gpt-oss encoder is otherwise a
     /// 13 GB-source + 21/63 GB-built spike). MLX returns the dropped buffer to its reuse pool.
     pub fn remove(&mut self, key: &str) -> Option<Array> {
+        if let Some(base) = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix(".weight_scale"))
+        {
+            self.planned_convrot.remove(base);
+        }
         self.tensors.remove(key)
     }
 
@@ -441,6 +497,10 @@ f,
     /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
     pub fn remove_prefix(&mut self, prefix: &str) {
         self.tensors.retain(|k, _| !k.starts_with(prefix));
+        self.planned_convrot.retain(|base, _| {
+            self.tensors.contains_key(&format!("{base}.weight"))
+                && self.tensors.contains_key(&format!("{base}.weight_scale"))
+        });
     }
 
     /// Remove every tensor successfully read through [`require`](Self::require) since the previous
@@ -449,7 +509,7 @@ f,
     pub fn remove_accessed(&mut self) {
         let accessed = std::mem::take(self.accessed.get_mut());
         for key in accessed {
-            self.tensors.remove(&key);
+            self.remove(&key);
         }
     }
 

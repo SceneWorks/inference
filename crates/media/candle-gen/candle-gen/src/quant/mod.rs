@@ -521,6 +521,7 @@ pub enum QLinear {
     Dense(DenseLinear),
     /// Native packed codebook W4A8; never folded into a GGUF or dense weight.
     W4A8(std::sync::Arc<W4A8Linear>),
+    ConvRot(std::sync::Arc<convrot_int8::ConvRotLinear>),
     Quantized {
         /// The GGUF-quantized weight (`Q4_1` from a packed tier, or `Q4_0`/`Q8_0` from a load-time
         /// quantize), stored in the form its [`MatmulStrategy`] needs ([`QuantWeight`]).
@@ -538,6 +539,7 @@ impl std::fmt::Debug for QLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Dense(_) => f.write_str("QLinear::Dense"),
+            Self::ConvRot(q) => f.debug_tuple("QLinear::ConvRot").field(q).finish(),
             Self::W4A8(q) => f.debug_tuple("QLinear::W4A8").field(q).finish(),
             Self::Quantized { weight, bias, .. } => f
                 .debug_struct("QLinear::Quantized")
@@ -719,6 +721,7 @@ impl QLinear {
         match self {
             Self::Dense(l) => __model_proof_output!(l.forward(x)),
             Self::W4A8(q) => __model_proof_output!(q.forward(x)),
+            Self::ConvRot(q) => q.forward(x),
             Self::Quantized {
                 weight: QuantWeight::Dequant(weight),
                 bias,
@@ -783,7 +786,7 @@ impl QLinear {
     pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward_upcast(x),
-            Self::Quantized { .. } | Self::W4A8(_) => self.forward(x),
+            Self::Quantized { .. } | Self::ConvRot(_) | Self::W4A8(_) => self.forward(x),
         }
     }
 
@@ -883,6 +886,9 @@ impl QLinear {
         skip_indivisible: bool,
     ) -> Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
+        if matches!(self, Self::ConvRot(_)) {
+            candle_core::bail!("ConvRot refuses re-quantization to {quant:?}");
+        }
         if matches!(self, Self::W4A8(_)) {
             candle_core::bail!("W4A8 refuses re-quantization to {quant:?}");
         }
@@ -954,6 +960,12 @@ impl QLinear {
     /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
     /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::ConvRot(q) = self {
+            if !q.device().same_device(device) {
+                candle_core::bail!("ConvRot refuses cross-device migration of its packed base");
+            }
+            return Ok(());
+        }
         if let Self::W4A8(q) = self {
             if !q.device().same_device(device) {
                 candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
@@ -988,7 +1000,10 @@ impl QLinear {
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized { .. } | Self::W4A8(_))
+        matches!(
+            self,
+            Self::Quantized { .. } | Self::ConvRot(_) | Self::W4A8(_)
+        )
     }
 
     /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a
@@ -997,7 +1012,7 @@ impl QLinear {
     pub fn quant_dtype(&self) -> Option<GgmlDType> {
         match self {
             Self::Quantized { weight, .. } => Some(weight.dtype()),
-            Self::Dense(_) | Self::W4A8(_) => None,
+            Self::Dense(_) | Self::ConvRot(_) | Self::W4A8(_) => None,
         }
     }
 
@@ -1013,7 +1028,7 @@ impl QLinear {
                 weight: QuantWeight::Matmul(_),
                 ..
             } => Some(MatmulStrategy::Int8Fast),
-            Self::Dense(_) | Self::W4A8(_) => None,
+            Self::Dense(_) | Self::ConvRot(_) | Self::W4A8(_) => None,
         }
     }
 }
@@ -1417,6 +1432,13 @@ pub fn linear_from_weights_gs(
     bias: bool,
     group_size: usize,
 ) -> crate::Result<QLinear> {
+    if weights.contains(&format!("{base}.comfy_quant"))
+        && weights.contains(&format!("{base}.weight_scale"))
+    {
+        if let Some(projection) = convrot_int8::ConvRotLinear::from_weights(weights, base, bias)? {
+            return Ok(QLinear::ConvRot(std::sync::Arc::new(projection)));
+        }
+    }
     let scales_key = format!("{base}.scales");
     if weights.contains(&scales_key) {
         let weight_key = format!("{base}.weight");

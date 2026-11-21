@@ -514,7 +514,7 @@ pub(super) fn resolve_logical_transform(
             TensorCodecSpec::Mxfp8 { .. } | TensorCodecSpec::Nvfp4 { .. }
         );
         for output in &resolved {
-            if output.half_swap {
+            if output.half_swap && !matches!(codec, TensorCodecSpec::ConvRotInt8 { .. }) {
                 return Err(LogicalTransformError::HalfSwapOnPackedResidency {
                     logical_key: output.logical_key.clone(),
                     codec_id,

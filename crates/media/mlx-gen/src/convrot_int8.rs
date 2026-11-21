@@ -95,7 +95,8 @@ impl ConvRotLinear {
         let dk = format!("{base}.comfy_quant");
         let sk = format!("{base}.weight_scale");
         let codes = w.require(&format!("{base}.weight"))?;
-        if w.get(&dk).is_none() {
+        let planned = w.planned_convrot(base);
+        if planned.is_none() && w.get(&dk).is_none() {
             if w.get(&sk).is_some() || codes.dtype() == Dtype::Int8 {
                 return Err(format!(
                     "{base}: INT8 requires an authoritative .comfy_quant descriptor"
@@ -108,13 +109,6 @@ impl ConvRotLinear {
         {
             return Err(format!("{base}: contradictory affine and ConvRot operands").into());
         }
-        let payload = w.require(&dk)?;
-        if payload.dtype() != Dtype::Uint8
-            || payload.ndim() != 1
-            || payload.size() > MAX_DESCRIPTOR_BYTES
-        {
-            return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
-        }
         let scales = w.require(&sk)?;
         if codes.dtype() != Dtype::Int8 || scales.dtype() != Dtype::Float32 {
             return Err(format!(
@@ -122,11 +116,28 @@ impl ConvRotLinear {
             )
             .into());
         }
-        eval([payload, scales])?;
+        scales.eval()?;
         let shape: Vec<usize> = codes.shape().iter().map(|&v| v as usize).collect();
         let scale_shape: Vec<usize> = scales.shape().iter().map(|&v| v as usize).collect();
-        let descriptor = ConvRotInt8::parse(payload.as_slice::<u8>(), &shape, &scale_shape)
-            .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
+        let descriptor = if let Some(plan) = planned {
+            let loaded = ConvRotInt8::from_geometry(plan.rotation_group, &shape, &scale_shape)
+                .map_err(crate::Error::Msg)?;
+            if loaded != plan {
+                return Err(format!("{base}: ConvRot operands changed since planning").into());
+            }
+            loaded
+        } else {
+            let payload = w.require(&dk)?;
+            if payload.dtype() != Dtype::Uint8
+                || payload.ndim() != 1
+                || payload.size() > MAX_DESCRIPTOR_BYTES
+            {
+                return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
+            }
+            payload.eval()?;
+            ConvRotInt8::parse(payload.as_slice::<u8>(), &shape, &scale_shape)
+                .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?
+        };
         descriptor
             .validate_scales(scales.as_slice::<f32>())
             .map_err(crate::Error::Msg)?;

@@ -830,7 +830,10 @@ impl AdaptLinear {
     /// keeps its footprint.
     pub fn from_packed(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
         Self {
-            base: Base::Packed(base),
+            base: match base {
+                QLinear::ConvRot(q) => Base::ConvRot(q),
+                other => Base::Packed(other),
+            },
             out_features: out_dim,
             in_features: in_dim,
             adapters: Vec::new(),

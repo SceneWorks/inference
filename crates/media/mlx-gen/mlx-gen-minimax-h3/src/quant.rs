@@ -40,9 +40,6 @@ pub fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
     if let Some(q) = mlx_gen::w4a8_int8::W4A8Linear::from_weights(w, base, bias)? {
         return Ok(AdaptableLinear::from_w4a8(q));
     }
-    if let Some(q) = mlx_gen::convrot_int8::ConvRotLinear::from_weights(w, base, bias)? {
-        return Ok(AdaptableLinear::from_convrot(q));
-    }
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
 

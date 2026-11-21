@@ -659,7 +659,7 @@ fn codec_registry_rejects_duplicate_ids_and_double_claimed_formats() {
 #[test]
 fn comfy_codec_table_separates_the_two_fp8_e4m3_rows_by_descriptor() {
     let registry = full();
-    assert_eq!(registry.len(), 8);
+    assert_eq!(registry.len(), 9);
     // NVFP4 is the one `U8`-stored codec, separated from an undescribed `U8` tensor (which has
     // no codec at all) by its descriptor half.
     assert_eq!(
@@ -1954,4 +1954,58 @@ fn a_packed_block_scaled_slice_must_respect_the_scale_row_tile() {
         ),
         other => panic!("expected a packed half-swap refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn convrot_descriptor_sources_preserve_basis_group_and_native_residency() {
+    let blob =
+        br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256,"per_row":true}"#;
+    let headers = [
+        header("q.weight", Dtype::I8, &[16, 256]),
+        header("q.weight_scale", Dtype::F32, &[16, 1]),
+        header("q.comfy_quant", Dtype::U8, &[blob.len()]),
+    ];
+    let payloads = BTreeMap::from([("q.comfy_quant".into(), blob.to_vec())]);
+    let registry = full();
+    let plan = |group, policy: &dyn CodecResidencyPolicy| {
+        let metadata = format!(
+            r#"{{"layers":{{"q":{{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":{group}}}}}}}"#
+        );
+        compile_logical_weight_plan_with_metadata(
+            &headers,
+            &payloads,
+            Some(&metadata),
+            &IdentityKeyMapping,
+            &registry,
+            policy,
+        )
+    };
+    let actual = plan(256, &SourceCodecResidency).unwrap();
+    let t = &actual.tensors[0];
+    assert_eq!(t.codec_id, crate::convrot_int8::CODEC_ID);
+    assert_eq!(
+        t.residency,
+        PlannedResidency {
+            mode: ResidencyMode::Packed,
+            resident_bytes: 16 * 256
+        }
+    );
+    assert!(
+        matches!(&t.codec, TensorCodecSpec::ConvRotInt8 { geometry, .. } if geometry.rotation_group == 256)
+    );
+    assert_eq!(
+        actual
+            .companions
+            .iter()
+            .map(|p| p.resident_bytes)
+            .sum::<u64>(),
+        64
+    );
+    assert!(
+        matches!(plan(64, &SourceCodecResidency), Err(LogicalWeightPlanError::DescriptorConflict { disagreement, .. }) if disagreement == ["convrot_groupsize"])
+    );
+    assert!(matches!(
+        plan(256, &DenseResidencyPolicy),
+        Err(LogicalWeightPlanError::UnsupportedFormat { .. })
+    ));
 }
