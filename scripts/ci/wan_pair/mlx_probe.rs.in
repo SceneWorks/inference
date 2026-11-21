@@ -189,7 +189,8 @@ fn curated_tier1() -> ProofResult<()> {
             stream.synchronize_and_retire()?;
             let elapsed = start.elapsed().as_nanos().try_into()?;
             assert_eq!(latent.shape(), &shape);
-            let values = latent.as_slice::<f32>().to_vec();
+            // MLX may return a strided view. Serialize logical C/F/H/W order.
+            let values = mlx_gen::array::contiguous(&latent)?.as_slice::<f32>().to_vec();
             Ok((
                 elapsed,
                 trace.lock().unwrap().clone(),
