@@ -85,7 +85,7 @@ impl Default for ImageEncoderConfig {
             num_hidden_layers: 32,
             num_attention_heads: 16,
             patch_size: 14,
-            image_size: 224,
+            image_size: gen_core_family::svd::CLIP_SIZE,
             projection_dim: 1024,
             layer_norm_eps: 1e-5,
         }
@@ -123,7 +123,7 @@ pub const DEFAULT_FRAMES: u32 = 25;
 /// Default motion-conditioning cadence (the `fps_id` SVD was trained on).
 pub const DEFAULT_CONDITIONING_FPS: u32 = 7;
 /// VAE spatial compression (8×).
-pub const VAE_SCALE: u32 = 8;
+pub use gen_core_family::svd::VAE_SCALE;
 /// Output `width`/`height` must be divisible by this: VAE 8× × UNet 8× (3 stride-2 stages). Exposed
 /// as the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors
 /// mlx's `mlx_gen_svd::SIZE_ALIGN` (same `= 64` on both backends).

@@ -55,6 +55,10 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_video_plan(mlx_gen::gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: model::compile_video_plan,
+        })
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }

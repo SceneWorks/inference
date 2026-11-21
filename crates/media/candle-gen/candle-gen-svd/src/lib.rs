@@ -57,6 +57,7 @@ use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result a
 use config::{
     ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig, MODEL_ID, SIZE_ALIGN, VAE_SCALE,
 };
+use gen_core_family::svd::CLIP_SIZE;
 use image_encoder::SvdImageEncoder;
 use pipeline::SvdParams;
 use scheduler::EdmSchedule;
@@ -71,7 +72,6 @@ pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = ProviderVae::VAE
 const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 #[allow(clippy::excessive_precision)]
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
-const CLIP_SIZE: usize = 224;
 
 /// The lazily-loaded SVD components (image encoder + VAE + UNet), cached behind the generator's
 /// `Mutex` for the worker's `Arc<dyn Generator>` reuse.
@@ -305,7 +305,85 @@ pub struct SvdGenerator {
     /// conditioner → UNet → VAE in disjoint phases through the shared Candle lifecycle.
     offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
+    load_binding: gen_core::RenderLoadBinding,
     memory: Option<memory_strategy::PreparedSvdMemory>,
+}
+
+fn validated_reference<'a>(
+    descriptor: &ModelDescriptor,
+    req: &'a GenerationRequest,
+) -> gen_core::Result<&'a Image> {
+    // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
+    // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
+    // — it overrides the frame-wise CFG ceiling.
+    descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    validate_output_params(req)?;
+    let img = SvdGenerator::reference(req)?;
+    validate_reference_image(img)?;
+    Ok(img)
+}
+
+pub(crate) fn compile_video_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    validate_load_options(spec)?;
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(gen_core::Error::Unsupported(
+            "SVD video plans require directory weights".into(),
+        ));
+    }
+    let reference = validated_reference(&descriptor(), req)?;
+    let params = SvdParams::from_request(req);
+    let frames = params.num_frames as u32;
+    let schedule = EdmSchedule::karras(params.num_inference_steps, &SchedulerConfig::default());
+    gen_core_family::svd::plan_layout(
+        req,
+        reference,
+        frames,
+        params.decode_chunk_size.max(1) as u32,
+        schedule.sigmas,
+        candle_gen::default_memory_budget_domain(),
+        (
+            gen_core_family::svd::Execution::Candle {
+                cfg: params.max_guidance_scale > 1.0,
+            },
+            ImageEncoderConfig::default().projection_dim,
+        ),
+    )
+    .map(Some)
+}
+
+impl SvdParams {
+    fn from_request(req: &GenerationRequest) -> Self {
+        let mut params = SvdParams::default();
+        if let Some(f) = req.frames {
+            params.num_frames = f as usize;
+            // Default the decode chunk to the full clip unless the request overrides it below.
+            params.decode_chunk_size = f as usize;
+        }
+        if let Some(s) = req.steps {
+            params.num_inference_steps = s as usize;
+        }
+        // `params.fps` is the MOTION-conditioning cadence (from `conditioning_fps`), distinct from
+        // `req.fps` (the output/playback cadence applied at return time).
+        if let Some(cfps) = req.conditioning_fps {
+            params.fps = cfps;
+        }
+        if let Some(g) = req.guidance {
+            params.max_guidance_scale = g;
+        }
+        if let Some(m) = req.motion_bucket_id {
+            params.motion_bucket_id = m;
+        }
+        if let Some(n) = req.noise_aug_strength {
+            params.noise_aug_strength = n;
+        }
+        if let Some(c) = req.decode_chunk_size {
+            params.decode_chunk_size = c as usize;
+        }
+        params
+    }
 }
 
 /// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
@@ -369,7 +447,7 @@ fn validate_reference_image(img: &Image) -> gen_core::Result<()> {
 
 impl SvdGenerator {
     /// Resolve the single conditioning reference image (image→video input).
-    fn reference<'a>(&self, req: &'a GenerationRequest) -> gen_core::Result<&'a Image> {
+    fn reference(req: &GenerationRequest) -> gen_core::Result<&Image> {
         match req.conditioning.as_slice() {
             [Conditioning::Reference {
                 image,
@@ -522,15 +600,7 @@ impl Generator for SvdGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
-        // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
-        // — it overrides the frame-wise CFG ceiling.
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        validate_output_params(req)?;
-        let img = self.reference(req)?;
-        validate_reference_image(img)?;
+        validated_reference(&self.descriptor, req)?;
         if req.memory.is_some() {
             let memory = self.memory.as_ref().ok_or_else(|| {
                 gen_core::Error::Unsupported(
@@ -571,6 +641,41 @@ impl Generator for SvdGenerator {
         self.generate_scoped(req, None, on_progress)
     }
 
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        let Some(prepared) = &self.memory else {
+            return Ok(None);
+        };
+        if crate::memory_strategy::validate_memory_request(req).is_err() {
+            return Ok(None);
+        }
+        prepared.ensure_unchanged()?;
+        Ok(Some(prepared.numeric_tier()))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        context: &mut gen_core::MemoryRunContext,
+    ) -> gen_core::Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        let Some(prepared) = &self.memory else {
+            return Ok(false);
+        };
+        crate::memory_strategy::project_video_context(prepared, plan, req, context)
+    }
+
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         self.memory.as_ref().map(|prepared| &prepared.contract)
     }
@@ -608,34 +713,9 @@ impl SvdGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let img = self.reference(req)?;
+        let img = Self::reference(req)?;
 
-        let mut params = SvdParams::default();
-        if let Some(f) = req.frames {
-            params.num_frames = f as usize;
-            // Default the decode chunk to the full clip unless the request overrides it below.
-            params.decode_chunk_size = f as usize;
-        }
-        if let Some(s) = req.steps {
-            params.num_inference_steps = s as usize;
-        }
-        // `params.fps` is the MOTION-conditioning cadence (from `conditioning_fps`), distinct from
-        // `req.fps` (the output/playback cadence applied at return time).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps;
-        }
-        if let Some(g) = req.guidance {
-            params.max_guidance_scale = g;
-        }
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as usize;
-        }
+        let params = SvdParams::from_request(req);
         candle_gen::execution::policy(
             "svd_resolved",
             serde_json::json!({
@@ -693,7 +773,12 @@ impl SvdGenerator {
             .map_err(CandleError::from)?;
         dbg("init_latents", &latents);
 
-        let phase = pipeline::video_phase(&latents, req.sampler.as_deref(), sched.sigmas, seed)?;
+        let phase = pipeline::video_phase(
+            latents.dims5().map_err(CandleError::from)?,
+            req.sampler.as_deref(),
+            sched.sigmas,
+            seed,
+        )?;
         let denoise = |unet: &unet::SvdUnet,
                        latents: &Tensor,
                        embeds: &Tensor,
@@ -853,22 +938,7 @@ impl SvdGenerator {
     }
 }
 
-fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
-    let memory = if spec.prepared_file_pins().is_prepared() {
-        Some(memory_strategy::PreparedSvdMemory::prepare(spec)?)
-    } else {
-        None
-    };
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "svd_xt: expected a checkpoint directory (vae/ + unet/ + image_encoder/), not a \
-                 single .safetensors file"
-                    .into(),
-            ));
-        }
-    };
+fn validate_load_options(spec: &LoadSpec) -> gen_core::Result<()> {
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "candle svd does not support LoRA/LoKr".into(),
@@ -891,6 +961,26 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
             "candle svd does not support control / IP-adapter overlays".into(),
         ));
     }
+    Ok(())
+}
+
+fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(
+                "svd_xt: expected a checkpoint directory (vae/ + unet/ + image_encoder/), not a \
+                 single .safetensors file"
+                    .into(),
+            ));
+        }
+    };
+    validate_load_options(spec)?;
     let device = candle_gen::default_device()?;
     // The public prepared route advertises request-scoped Resident authority. Materialize its
     // sealed components inside the admitted cache load transaction so the cache's before/after
@@ -910,6 +1000,7 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
         device,
         offload: spec.offload_policy,
         components: Mutex::new(components),
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         memory,
     })
 }
@@ -930,7 +1021,14 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+    register_memory_contract_surfaces(
+        registry
+            .register_generator(REGISTRATION)
+            .register_video_plan(gen_core::VideoPlanRegistration {
+                provider_id: MODEL_ID,
+                compile: compile_video_plan,
+            }),
+    )
 }
 
 /// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.

@@ -511,7 +511,7 @@ pub fn validate_memory_request(request: &GenerationRequest) -> gen_core::Result<
     let motion = request.motion_bucket_id.unwrap_or(f32::NAN);
     let noise = request.noise_aug_strength.unwrap_or(f32::NAN);
     let chunk = request.decode_chunk_size.unwrap_or_default();
-    if request.video_mode.as_deref() != Some("image_to_video")
+    if !matches!(request.video_mode.as_deref(), None | Some("image_to_video"))
         || !request.prompt.is_empty()
         || request.negative_prompt.is_some()
         || request.guidance.is_some()
@@ -591,6 +591,21 @@ pub fn request_evidence_revision(
         prepared.artifact_identity,
         hash.finalize()
     ))
+}
+
+pub(crate) fn project_video_context(
+    prepared: &PreparedSvdMemory,
+    plan: &gen_core::VideoRenderPlan,
+    request: &GenerationRequest,
+    context: &mut MemoryRunContext,
+) -> gen_core::Result<bool> {
+    gen_core_family::svd::project_resident_context(
+        plan,
+        context,
+        prepared.numeric_tier(),
+        request_evidence_revision(prepared, request),
+        |projected| validate_context(prepared, projected),
+    )
 }
 
 fn validate_context(
@@ -766,6 +781,171 @@ mod tests {
     ///
     /// The two axes a conv U-Net cannot express stay absent rather than being fabricated, while
     /// `vae_temporal_scale` is a real `Some(1)`: one latent unit is one output frame.
+    #[test]
+    fn selected_resident_context_binds_the_shipping_single_still_without_repricing() {
+        let (_tmp, spec) = fixture();
+        let prepared = PreparedSvdMemory::prepare(&spec).unwrap();
+        let mut req = request();
+        let revision = request_evidence_revision(&prepared, &req).unwrap();
+        req.video_mode = None;
+        let plan = crate::provider_registry()
+            .unwrap()
+            .compile_video_plan(crate::MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let mut context = gen_core::MemoryRunContext {
+            selection: prepared
+                .contract
+                .representative_selection(MemoryStrategy::Resident, prepared.numeric_tier(), false)
+                .unwrap(),
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Resident,
+            calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: String::new(),
+            load_shape: prepared.contract.load_shape,
+            mode: gen_core::MemoryMode::Other("image_to_video".into()),
+            has_reference: true,
+            use_pid: false,
+            has_phases: false,
+            geometry: plan.geometry(),
+            reference_resources: None,
+            overlay: Some("provider_video_mode:image_to_video".into()),
+            budget: gen_core::MemoryBudget {
+                total_bytes: 8192,
+                committed_bytes: 512,
+                reclaimable_bytes: 128,
+                reserved_headroom_bytes: 256,
+            },
+            predicted_peak_bytes: 2048,
+            cache_state: gen_core::MemoryCacheState::Cold,
+            evidence_revision: "selector".into(),
+            low_res_start: None,
+        };
+        let mut expected = context.clone();
+        expected.overlay = None;
+        expected.evidence_revision = revision;
+        assert!(project_video_context(&prepared, &plan, &req, &mut context).unwrap());
+        assert_eq!(context, expected);
+        validate_context(&prepared, &context).unwrap();
+        let bound = plan.bind_admission(&spec, Some(&context), &req).unwrap();
+        bound
+            .check_provider(
+                &crate::descriptor(),
+                Some(&gen_core::RenderLoadBinding::from_video_spec(&spec)),
+            )
+            .unwrap();
+        let mut crossed = context.clone();
+        crossed.mode = gen_core::MemoryMode::Edit;
+        let original = crossed.clone();
+        assert!(project_video_context(&prepared, &plan, &req, &mut crossed).is_err());
+        assert_eq!(crossed, original);
+        context.geometry.frames += 1;
+        assert!(project_video_context(&prepared, &plan, &req, &mut context).is_err());
+        req.video_mode = Some("replacement".into());
+        assert!(!project_video_context(&prepared, &plan, &req, &mut expected).unwrap());
+    }
+
+    #[test]
+    fn registered_video_plan_uses_actual_source_latent_and_decoder_geometry() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/unloaded-svd".into()));
+        let mut req = GenerationRequest {
+            width: 256,
+            height: 320,
+            frames: Some(5),
+            decode_chunk_size: Some(64),
+            steps: Some(3),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 3,
+                    height: 2,
+                    pixels: vec![7; 18],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_video_plan(crate::MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let layout = plan.layout();
+        assert_eq!(layout.domain, gen_core::MemoryBudgetDomain::UnifiedMemory);
+        assert_eq!(
+            layout.output,
+            gen_core::MemoryGeometry {
+                width: 256,
+                height: 320,
+                frames: 5,
+                batch: 1,
+                reference_count: 1
+            }
+        );
+        assert_eq!(layout.admission, layout.output);
+        assert_eq!(layout.phases.len(), 1);
+        let phase = &layout.phases[0];
+        assert_eq!(phase.identity.geometry, layout.output);
+        assert_eq!(
+            (
+                phase.latent_frames,
+                phase.decoded_frames,
+                phase.decode_chunk_frames
+            ),
+            (5, 5, 5)
+        );
+        assert_eq!(phase.latent_bytes, 5 * 32 * 40 * 4 * 4);
+        let embed = 1024 * 4;
+        let ids = 3 * 4;
+        let guidance = 5 * 4;
+        assert_eq!(
+            phase.retained_bytes,
+            phase.latent_bytes / 5
+                + embed
+                + ids
+                + 2 * (phase.latent_bytes + embed + ids)
+                + guidance
+        );
+        assert_eq!(phase.source, 0..5);
+        assert_eq!(
+            layout
+                .references
+                .iter()
+                .map(|r| (r.role, r.width, r.height, r.frames))
+                .collect::<Vec<_>>(),
+            [
+                ("source", 3, 2, 1),
+                ("image_encoder", 224, 224, 1),
+                ("vae_encoder", 256, 320, 1)
+            ]
+        );
+        req.sampler = Some("euler".into());
+        assert!(plan.bind_admission(&spec, None, &req).is_err());
+        req.decode_chunk_size = Some(1);
+        req.frames = None;
+        let other = registry
+            .compile_video_plan(crate::MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                other.layout().output.frames,
+                other.layout().phases[0].decode_chunk_frames
+            ),
+            (25, 1)
+        );
+        assert_eq!(
+            other.layout().phases[0].decoded_tensor_bytes,
+            25 * 256 * 320 * 3 * 4
+        );
+        if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(other.bind_admission(&spec, None, &req).is_err());
+        req.conditioning.push(req.conditioning[0].clone());
+        assert!(registry
+            .compile_video_plan(crate::MODEL_ID, &spec, &req)
+            .is_err());
+    }
+
     #[test]
     fn architecture_facts_follow_the_static_unet_and_vae_defaults() {
         for surface in resident_only_surface_specs() {

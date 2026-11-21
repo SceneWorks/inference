@@ -11,7 +11,7 @@ use mlx_rs::Array;
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::{
     render::video::{run_video_steps, VideoDenoisePhase},
-    MemoryGeometry, MemoryRequestScope,
+    MemoryRequestScope,
 };
 use mlx_gen::{CancelFlag, EdmModelSampling, Error, Progress, Result};
 
@@ -204,15 +204,12 @@ impl SvdPipeline {
         let &[batch, frames, height, width, _] = latents.shape() else {
             return Err(Error::Msg("svd expects B,F,H,W,C latents".into()));
         };
-        let geometry = MemoryGeometry {
-            width: width as u32 * crate::VAE_SCALE,
-            height: height as u32 * crate::VAE_SCALE,
-            frames: frames as u32,
-            batch: batch as u32,
-            reference_count: 1,
-        };
-        let phase =
-            VideoDenoisePhase::fixed(geometry, frames as u32, sampler, schedule.sigmas, seed);
+        let phase = gen_core_family::svd::phase(
+            [batch as u32, frames as u32, height as u32, width as u32],
+            sampler,
+            schedule.sigmas,
+            seed,
+        )?;
         let active = phase.enter(cancel, scope)?;
         let guide = serde_json::json!({
             "min_guidance_bits": min_g.to_bits(),
@@ -358,6 +355,7 @@ fn sample_edm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core::MemoryGeometry;
     use std::cell::RefCell;
 
     #[derive(Debug, PartialEq)]

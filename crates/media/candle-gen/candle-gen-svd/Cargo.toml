@@ -9,6 +9,7 @@ keywords = ["candle", "cuda", "video", "svd", "inference"]
 categories = ["science"]
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 candle-gen = { path = "../candle-gen" }
 # SVD has NO candle-transformers reference: the UNetSpatioTemporalConditionModel, the
 # AutoencoderKLTemporalDecoder temporal VAE (candle ships no conv3d — the temporal taps are written

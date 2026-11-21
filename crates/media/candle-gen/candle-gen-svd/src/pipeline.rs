@@ -8,7 +8,6 @@
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::render::video::VideoDenoisePhase;
 use candle_gen::gen_core::sampling::EdmModelSampling;
-use candle_gen::gen_core::MemoryGeometry;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{check_cancel, CandleError, Result as CResult};
 use rand::rngs::StdRng;
@@ -176,7 +175,7 @@ pub fn denoise(
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
     let schedule = EdmSchedule::karras(steps, scheduler);
-    let phase = video_phase(latents, sampler, schedule.sigmas, seed)?;
+    let phase = video_phase(latents.dims5()?, sampler, schedule.sigmas, seed)?;
     phase.run(cancel, None, || {
         denoise_phase(
             &phase,
@@ -195,27 +194,19 @@ pub fn denoise(
     })
 }
 
-pub(crate) fn video_phase<'a>(
-    latents: &Tensor,
-    sampler: Option<&'a str>,
+pub(crate) fn video_phase(
+    shape: (usize, usize, usize, usize, usize),
+    sampler: Option<&str>,
     sigmas: Vec<f32>,
     seed: u64,
-) -> CResult<VideoDenoisePhase<(), Option<&'a str>>> {
-    let (batch, frames, _, height, width) = latents.dims5()?;
-    let geometry = MemoryGeometry {
-        width: width as u32 * crate::config::VAE_SCALE,
-        height: height as u32 * crate::config::VAE_SCALE,
-        frames: frames as u32,
-        batch: batch as u32,
-        reference_count: 1,
-    };
-    Ok(VideoDenoisePhase::fixed(
-        geometry,
-        frames as u32,
+) -> CResult<VideoDenoisePhase<(), Option<&str>>> {
+    let (batch, frames, _, height, width) = shape;
+    Ok(gen_core_family::svd::phase(
+        [batch as u32, frames as u32, height as u32, width as u32],
         sampler,
         sigmas,
         seed,
-    ))
+    )?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,6 +398,7 @@ pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::MemoryGeometry;
     use std::cell::Cell;
 
     #[test]
@@ -417,7 +409,13 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let phase = video_phase(&latents, Some("heun"), vec![700., 0.002, 0.], 41).unwrap();
+        let phase = video_phase(
+            latents.dims5().unwrap(),
+            Some("heun"),
+            vec![700., 0.002, 0.],
+            41,
+        )
+        .unwrap();
         assert_eq!(phase.latent_frames, 5);
         assert_eq!(
             phase.identity.geometry,
@@ -443,7 +441,7 @@ mod tests {
         )
         .unwrap();
         let embeds = Tensor::zeros((1, 1, 2), x.dtype(), x.device()).unwrap();
-        let phase = video_phase(&x, None, vec![2., 0.], 4).unwrap();
+        let phase = video_phase(x.dims5().unwrap(), None, vec![2., 0.], 4).unwrap();
         let cancel = CancelFlag::new();
         let calls = Cell::new(0);
         let mut steps = Vec::new();

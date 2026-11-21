@@ -21,6 +21,7 @@ pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
 pub mod sdxl_ldm;
 pub mod seedvr2_video;
+pub mod svd;
 
 pub use sd3_encoder_artifacts::{
     resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,

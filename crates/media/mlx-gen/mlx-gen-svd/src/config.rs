@@ -70,7 +70,7 @@ impl Default for ImageEncoderConfig {
             num_hidden_layers: 32,
             num_attention_heads: 16,
             patch_size: 14,
-            image_size: 224,
+            image_size: gen_core_family::svd::CLIP_SIZE,
             projection_dim: 1024,
             layer_norm_eps: 1e-5,
         }

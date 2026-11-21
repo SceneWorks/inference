@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 serde_json = { workspace = true }
 mlx-gen = { path = ".." }
 # SVD reuses SDXL's 2D VAE encoder + CLIP-vision encoder + conv/attn UNet patterns (epic 3040 spike).
