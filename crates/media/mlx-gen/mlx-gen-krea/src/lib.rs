@@ -119,6 +119,10 @@ pub fn register_providers(
         .register_generator(model::TURBO_REGISTRATION)
         .register_activation_memory(TURBO_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::RAW_REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: KREA_2_RAW_ID,
+            compile: model::compile_raw_render_plan,
+        })
         .register_generator(model::EDIT_REGISTRATION)
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)

@@ -5,7 +5,7 @@
 //! the resident block's quantization and forward-time adapters, and drain the lazy view of the tensors
 //! that constructor read.
 
-use mlx_gen::adapters::{AdaptableHost, Adapter};
+use mlx_gen::adapters::{AdaptableHost, AdapterStack};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, PinnedWeightsFile, Result, WeightsSource};
 
@@ -43,7 +43,7 @@ pub fn block_stream_diagnostics() -> BlockStreamDiagnostics {
 
 #[derive(Clone, Default)]
 struct BlockAdapters {
-    per_path: Vec<(String, Vec<Adapter>)>,
+    per_path: Vec<(String, AdapterStack)>,
 }
 
 impl BlockAdapters {
@@ -55,7 +55,7 @@ impl BlockAdapters {
                     "krea block stream: adapter target `{path}` is absent from a materialized block"
                 ))
             })?;
-            target.set_adapters(adapters.clone());
+            target.restore_adapter_stack(adapters);
         }
         Ok(())
     }
@@ -150,8 +150,7 @@ impl KreaBlockStream {
                         let adapters = block
                             .adaptable_mut(&segments)
                             .expect("resolved through the probe above")
-                            .adapters()
-                            .to_vec();
+                            .snapshot_adapter_stack();
                         per_path.push((path, adapters));
                     }
                 }

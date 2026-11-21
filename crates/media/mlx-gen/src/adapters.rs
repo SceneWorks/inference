@@ -8,8 +8,8 @@ pub use mlx_layers::adapters::{
     build_lokr_factors, conv_lora_delta, install_adapter, lokr_structured_layout, prefixed_paths,
     quantized_matmul_with_bias, read_scalar_alpha, reconstruct_loha_delta, reconstruct_lokr_delta,
     reconstruct_lokr_delta_scaled, validate_lokr_metadata_scale, AdaptableConv2d, AdaptableHost,
-    AdaptableLinear, Adapter, BflTarget, DiffPatchPart, Linear, LinearBase, LinearFacts,
-    LokrFactors, LoraRowSlice, ScaleContext, DEFAULT_LYCORIS_DTYPE,
+    AdaptableLinear, Adapter, AdapterStack, BflTarget, DiffPatchPart, Linear, LinearBase,
+    LinearFacts, LokrFactors, LoraRowSlice, ScaleContext, DEFAULT_LYCORIS_DTYPE,
 };
 
 #[cfg(test)]
