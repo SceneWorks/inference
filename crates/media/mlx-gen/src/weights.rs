@@ -543,6 +543,13 @@ path.as_ref(),
         dir: impl AsRef<Path>,
         expert_key: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::from_dir_with_layout(dir, expert_key, |_, _| Dtype::Bfloat16)
+    }
+    pub fn from_dir_with_layout(
+        dir: impl AsRef<Path>,
+        expert_key: impl Fn(&str) -> bool,
+        dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
         let mut files: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -553,18 +560,24 @@ path.as_ref(),
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", dir.display()).into());
         }
-        Self::from_paths_with_projection_layout(&files, dir, expert_key)
+        Self::from_paths_with_projection_layout(&files, dir, expert_key, dense_dtype)
     }
 
     /// Load a previously selected shard set with the same disjoint-key and metadata behavior as
     /// [`Self::from_dir`]. The caller chooses and validates the complete path list before loading.
     pub fn from_paths(files: &[PathBuf], source_dir: &Path) -> Result<Self> {
-        Self::from_paths_with_projection_layout(files, source_dir, |_| false)
+        Self::from_paths_with_projection_layout(
+            files,
+            source_dir,
+            |_| false,
+            |_, _| Dtype::Bfloat16,
+        )
     }
     fn from_paths_with_projection_layout(
         files: &[PathBuf],
         source_dir: &Path,
         expert_key: impl Fn(&str) -> bool,
+        dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
     ) -> Result<Self> {
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", source_dir.display()).into());
@@ -605,11 +618,12 @@ f,
             "mlx-gen::Weights::from_paths",
             files,
         );
-        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+        let source_reads = mlx_layers::source::prepare_sources_with_layout(
             &mut tensors,
             files,
             &declarations,
             expert_key,
+            dense_dtype,
         )?;
         Ok(Self {
             source_reads,

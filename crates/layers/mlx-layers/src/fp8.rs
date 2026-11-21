@@ -417,15 +417,18 @@ impl Fp8Linear {
         }
         let flat = ids.reshape(&[-1])?;
         let codes = self.codes.take_axis(&flat, 0)?;
-        let values = self.decode_rows(&codes, Some(&flat))?;
+        let values = self.decode_rows(&codes, Some(&flat), Dtype::Bfloat16)?;
         let mut shape = ids.shape().to_vec();
         shape.push(self.shape[1]);
         Ok(values.reshape(&shape)?)
     }
     pub fn dense_weight(&self) -> Result<Array> {
-        self.decode_rows(&self.codes, None)
+        self.dense_weight_as(Dtype::Bfloat16)
     }
-    fn decode_rows(&self, codes: &Array, indices: Option<&Array>) -> Result<Array> {
+    pub fn dense_weight_as(&self, dtype: Dtype) -> Result<Array> {
+        self.decode_rows(&self.codes, None, dtype)
+    }
+    fn decode_rows(&self, codes: &Array, indices: Option<&Array>, dtype: Dtype) -> Result<Array> {
         let decoded = decoded_codes(codes, self.format)?;
         let rows = codes.shape()[0];
         let values = if self.format == ComfyQuantFormat::Mxfp8 {
@@ -472,9 +475,7 @@ impl Fp8Linear {
         } else {
             self.shape[0]
         };
-        Ok(values
-            .index((..limit, ..self.shape[1]))
-            .as_dtype(Dtype::Bfloat16)?)
+        Ok(values.index((..limit, ..self.shape[1])).as_dtype(dtype)?)
     }
 }
 

@@ -245,7 +245,7 @@ impl MiniMaxH3Dit {
         let stream = DitBlockStream::new(dir, dtype, cfg.clone())?;
 
         let (projections, refiner, pruned, unverified) = {
-            let mut w = Weights::from_dir(dir)?;
+            let mut w = crate::dit::heads::open_dit_weights(dir)?;
             let pruned = match crate::dit::pruned_adaln::inspect(&w, &cfg)? {
                 None => None,
                 Some(topology) => Some(PrunedAdaLnRuntime::from_weights(&w, &topology, &cfg)?),
@@ -335,7 +335,7 @@ impl MiniMaxH3Dit {
             ))
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
-        let mut w = Weights::from_dir(dir)?;
+        let mut w = crate::dit::heads::open_dit_weights(dir)?;
         Self::from_weights(&mut w, &cfg, dtype)
     }
 

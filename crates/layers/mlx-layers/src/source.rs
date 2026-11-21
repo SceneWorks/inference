@@ -306,6 +306,18 @@ pub fn prepare_sources_with_experts(
     tables: &[String],
     expert_key: impl Fn(&str) -> bool,
 ) -> Result<SourceReads> {
+    prepare_sources_with_layout(tensors, paths, tables, expert_key, |_, _| Dtype::Bfloat16)
+}
+
+/// Determine dense consumer precision from the original storage handles, before decoding either
+/// operand of a mixed-precision module. Encoded matrices selected for native execution stay packed.
+pub fn prepare_sources_with_layout(
+    tensors: &mut HashMap<String, Array>,
+    paths: &[PathBuf],
+    tables: &[String],
+    expert_key: impl Fn(&str) -> bool,
+    dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
+) -> Result<SourceReads> {
     struct Layout<F>(F);
     impl<F: Fn(&str) -> bool> CodecResidencyPolicy for Layout<F> {
         fn residency(
@@ -358,7 +370,20 @@ pub fn prepare_sources_with_experts(
     else {
         return Ok(SourceReads::default());
     };
-    bind_source_layout(tensors, &plan, expert_key)?;
+    let dtypes: HashMap<_, _> = plan
+        .tensors
+        .iter()
+        .filter(|row| row.residency.mode == ResidencyMode::Dense)
+        .map(|row| {
+            (
+                row.logical_key.as_str(),
+                dense_dtype(&row.logical_key, tensors),
+            )
+        })
+        .collect();
+    bind_layout_with_dtypes(tensors, &plan, expert_key, |key| {
+        dtypes.get(key).copied().unwrap_or(Dtype::Bfloat16)
+    })?;
     Ok(SourceReads::new(Arc::new(plan), paths))
 }
 
@@ -368,6 +393,15 @@ pub fn bind_source_layout(
     tensors: &mut HashMap<String, Array>,
     plan: &LogicalWeightPlan,
     expert_key: impl Fn(&str) -> bool,
+) -> Result<()> {
+    bind_layout_with_dtypes(tensors, plan, expert_key, |_| Dtype::Bfloat16)
+}
+
+fn bind_layout_with_dtypes(
+    tensors: &mut HashMap<String, Array>,
+    plan: &LogicalWeightPlan,
+    expert_key: impl Fn(&str) -> bool,
+    dense_dtype: impl Fn(&str) -> Dtype,
 ) -> Result<()> {
     use gen_core::comfy_quant::ComfyQuantFormat;
     for t in &plan.tensors {
@@ -429,14 +463,16 @@ pub fn bind_source_layout(
             tensors.remove(&format!("{physical_base}{suffix}"));
         }
         if t.residency.mode == ResidencyMode::Dense || base.is_none() {
+            let dtype = dense_dtype(key);
             let value = if array.ndim() == 2 {
-                crate::fp8::Fp8Linear::new(format, array, sw, sx, &t.shape, None)?.dense_weight()?
+                crate::fp8::Fp8Linear::new(format, array, sw, sx, &t.shape, None)?
+                    .dense_weight_as(dtype)?
             } else {
                 let mut value = crate::fp8::decoded_codes(&array, format)?;
                 if let Some(scale) = sw {
                     value = mlx_rs::ops::multiply(&value, &scale)?;
                 }
-                value.as_dtype(Dtype::Bfloat16)?
+                value.as_dtype(dtype)?
             };
             tensors.insert(key.clone(), value);
             for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
