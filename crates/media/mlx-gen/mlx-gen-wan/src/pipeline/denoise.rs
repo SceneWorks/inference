@@ -306,11 +306,26 @@ pub fn curated_phase<S>(
     references: u32,
     models: mlx_gen::gen_core::render::video::VideoModelRule<S>,
 ) -> Result<mlx_gen::gen_core::render::video::VideoDenoisePhase<S>> {
-    use mlx_gen::gen_core::{
-        render::{video::VideoDenoisePhase, RenderPhaseIdentity},
-        sampling::Solver,
-        MemoryGeometry,
+    use mlx_gen::gen_core::{render::video::VideoDenoisePhase, sampling::Solver};
+    let (identity, latent_frames) = curated_phase_geometry(noise_shape, vae, references)?;
+    let phase = VideoDenoisePhase {
+        identity,
+        latent_frames,
+        models,
+        solver: mlx_gen::sampler::canonical_solver(Some(sampler), Solver::Euler),
+        sigmas,
+        seed,
     };
+    phase.validate_descending_schedule(None)?;
+    Ok(phase)
+}
+
+pub(crate) fn curated_phase_geometry(
+    noise_shape: &[i32],
+    vae: VaeTiling,
+    references: u32,
+) -> Result<(mlx_gen::gen_core::render::RenderPhaseIdentity, u32)> {
+    use mlx_gen::gen_core::{render::RenderPhaseIdentity, MemoryGeometry};
     let &[_, frames, height, width] = noise_shape else {
         return Err(Error::Msg("Wan expects C,F,H,W noise".into()));
     };
@@ -323,8 +338,8 @@ pub fn curated_phase<S>(
         .ok()
         .filter(|&f| f > 0)
         .ok_or_else(|| Error::Msg("Wan expects positive latent frames".into()))?;
-    let phase = VideoDenoisePhase {
-        identity: RenderPhaseIdentity {
+    Ok((
+        RenderPhaseIdentity {
             pass: 0,
             phase: 0,
             geometry: MemoryGeometry {
@@ -336,13 +351,7 @@ pub fn curated_phase<S>(
             },
         },
         latent_frames,
-        models,
-        solver: mlx_gen::sampler::canonical_solver(Some(sampler), Solver::Euler),
-        sigmas,
-        seed,
-    };
-    phase.validate_descending_schedule(None)?;
-    Ok(phase)
+    ))
 }
 
 /// The dense denoise loop driven by a **curated unified solver** (epic 7114, sc-7121) — the additive

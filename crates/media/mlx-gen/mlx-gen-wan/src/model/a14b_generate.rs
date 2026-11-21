@@ -23,6 +23,54 @@ impl Wan14b {
 }
 
 impl Generator for Wan14b {
+    fn video_load_binding(&self) -> Option<&mlx_gen::gen_core::RenderLoadBinding> {
+        self.load_binding.as_ref()
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<()> {
+        if &video_layout(&self.descriptor, &self.config, req, self.quant)? != plan.layout() {
+            return Err(mlx_gen::gen_core::Error::Unsupported(
+                "loaded Wan geometry differs from admission".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        Ok(self.i2v_memory.as_ref().and_then(|p| {
+            gen_core_memory_wan::validate_request(p, req)
+                .is_ok()
+                .then_some(p.tier)
+        }))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        ctx: &mut mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        if plan.geometry() != ctx.geometry {
+            return Ok(false);
+        }
+        match &self.i2v_memory {
+            Some(p) => gen_core_memory_wan::project_video_context(p, req, ctx),
+            None => Ok(true),
+        }
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
@@ -111,12 +159,20 @@ impl Wan14b {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
     /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     pub(super) fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        let id = self.descriptor.id;
+        Self::validate_metadata(&self.descriptor, &self.config, req)
+    }
+
+    pub(super) fn validate_metadata(
+        descriptor: &ModelDescriptor,
+        config: &WanModelConfig,
+        req: &GenerationRequest,
+    ) -> Result<()> {
+        let id = descriptor.id;
         // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 16 is
         // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
         // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (none for T2V, `Reference`
         // for I2V).
-        self.descriptor.capabilities.validate_request(id, req)?;
+        descriptor.capabilities.validate_request(id, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -135,13 +191,13 @@ impl Wan14b {
         // sc-12607: the 16-px grid stride (candle rejects via `is_multiple_of(SIZE_MULTIPLE_14B)`).
         // sc-12308: the area cap (T2V was uncapped entirely; I2V refit 1280×720 → 1264×704). Both A14B
         // variants share the 14B family's 921 600 budget.
-        let (dw, dh) = grid(&self.config, A14bProviderVae::VAE_TILING);
+        let (dw, dh) = grid(config, A14bProviderVae::VAE_TILING);
         reject_off_grid(id, req, dw, dh)?;
-        reject_over_area(id, req, dw, dh, self.config.max_area)?;
+        reject_over_area(id, req, dw, dh, config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
         // extended noise length would mismatch the conditioning's temporal dim).
-        if self.config.is_i2v_concat() {
+        if config.is_i2v_concat() {
             let Some((_, strength)) = i2v_reference(req) else {
                 return Err(Error::Msg(format!(
                     "{id}: image-to-video requires a Reference conditioning image"
@@ -216,18 +272,15 @@ impl Wan14b {
         let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
-        let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
-        // trim_first_frames: generate `trim` extra leading temporal chunks (each = vae_stride_t = 4
-        // latent frames → 4 output frames after the non-causal T→4T decode) and discard them after
-        // decode, so the first kept frame sees a full temporal receptive field (port of
-        // generate_wan.py). gen_frames stays 1+4k since frames is and we add a multiple of 4.
-        let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let vae_stride = provider_vae_stride(A14bProviderVae::VAE_TILING);
-        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim * vae_stride.0;
-        // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid, then
-        // enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280; no-op for T2V's max_area 0).
-        let (width, height) = resolve_capped_dims(req, cfg, A14bProviderVae::VAE_TILING);
+        let vae = A14bProviderVae::VAE_TILING;
+        let VideoDimensions {
+            frames,
+            trim_out,
+            width,
+            height,
+            lat,
+        } = video_dimensions(req, cfg, vae)?;
+        let vae_stride = provider_vae_stride(vae);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
@@ -243,7 +296,6 @@ impl Wan14b {
 
         // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
         // generation length.
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12736/sc-12795: every `Sequential` route keeps only ONE expert resident; `Resident`

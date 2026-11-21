@@ -206,6 +206,48 @@ pub fn dense_curated_phase(
     Ok(Some(phase))
 }
 
+// Only text-only curated 5B uses the shared sampler on Candle.
+fn dense_video_layout(
+    _: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    if curated_solver(req.sampler.as_deref()).is_none()
+        || DitSource::from_environment().gguf_path().is_some()
+    {
+        return Ok(None);
+    }
+    validate_dense_request(&descriptor(), req)?;
+    let phase = dense_curated_phase(req, req.seed.unwrap_or(0))?.expect("curated solver");
+    let output = phase.identity.geometry;
+    let (t, h, w) = pipeline::latent_dims(output.frames, output.width, output.height);
+    let bytes = [Z_DIM, t, h, w]
+        .into_iter()
+        .try_fold(4u64, |n, d| n.checked_mul(d as u64))
+        .ok_or_else(|| gen_core::Error::Unsupported("Wan latent size overflow".into()))?;
+    let chunk = output
+        .frames
+        .min(Ti2vProviderVae::VAE_TILING.temporal_scale as u32);
+    let mut layout = gen_core::VideoPlanLayout::single(
+        output,
+        &phase,
+        bytes,
+        output.frames,
+        chunk,
+        vec![],
+        candle_gen::default_memory_budget_domain(),
+    );
+    let frame_rgb = u64::from(output.width) * u64::from(output.height) * 3;
+    let clip_rgb = frame_rgb * u64::from(output.frames);
+    layout.phases[0].decoded_tensor_bytes = clip_rgb * 4;
+    // frames_to_images retains the f32 decoded clip and its f32 scaled copy while the
+    // separate CPU uint8 clip, final planar-to-interleaved frame and RGB result coexist.
+    layout.output_conversion = gen_core::VideoOutputConversion {
+        device_bytes: clip_rgb * 8,
+        host_bytes: clip_rgb + frame_rgb,
+    };
+    Ok(Some(layout))
+}
+
 /// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
 pub(crate) const MAX_WAN_FRAMES: usize = 1025;
 /// Matching temporal-conditioning budget after the z16 VAE's 4x causal compression.
@@ -1028,6 +1070,7 @@ struct SeqState<'a, 's> {
 }
 
 pub struct WanGenerator {
+    load_binding: gen_core::RenderLoadBinding,
     descriptor: ModelDescriptor,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
@@ -1210,7 +1253,126 @@ fn record_wan_adapters(count: usize) {
     candle_gen::execution::unobserved_adapters(count, "candle-gen-wan/src/lib.rs or wan14b.rs");
 }
 
+fn validate_dense_request(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg("wan: prompt must not be empty".into()));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg("wan: steps must be >= 1".into()));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "wan: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    // sc-12308: the 5B carries an area budget too (upstream `ti2v-5B` supports only `1280*704` /
+    // `704*1280`), but this lane checked only the per-edge range and the multiple — so a
+    // grid-aligned 1280×1280 validated and ran to an opaque OOM, exactly the sc-9028 hole the
+    // 14B lane already closed. mlx's 5B did cap (it silently refit instead); rejecting here is
+    // what makes the two backends agree on one geometry per request.
+    let area = req.width as usize * req.height as usize;
+    if area > MAX_AREA_5B {
+        return Err(gen_core::Error::Msg(format!(
+            "wan: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_5B} px \
+                 (1280×704); reduce the resolution",
+            req.width, req.height
+        )));
+    }
+    if let Some(f) = req.frames {
+        if f == 0 || f % 4 != 1 {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: frames must satisfy frames % 4 == 1 (got {f})"
+            )));
+        }
+        if f as usize > MAX_WAN_FRAMES {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: frames {f} exceeds the maximum {MAX_WAN_FRAMES}"
+            )));
+        }
+    }
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::Reference { .. }))
+        .count();
+    let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: {label} strength must be finite and in [0,1] (got {strength})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(strength) = req.strength {
+        check_strength("image", strength)?;
+    }
+    for conditioning in &req.conditioning {
+        match conditioning {
+            Conditioning::Reference {
+                strength: Some(strength),
+                ..
+            } => check_strength("Reference", *strength)?,
+            Conditioning::Keyframe { strength, .. } => check_strength("Keyframe", *strength)?,
+            _ => {}
+        }
+    }
+    let image_conditioned = reference_count > 0 || !req.keyframes().is_empty();
+    if reference_count > 1 {
+        return Err(gen_core::Error::Msg(
+            "wan: TI2V accepts at most one Reference image".into(),
+        ));
+    }
+    if reference_count > 0 && !req.keyframes().is_empty() {
+        return Err(gen_core::Error::Msg(
+            "wan: Reference and Keyframe conditioning cannot be combined; express the first \
+                 frame as Keyframe frame_idx=0"
+                .into(),
+        ));
+    }
+    if !req.keyframes().is_empty() {
+        let frames = req.frames.unwrap_or(DEFAULT_FRAMES) as usize;
+        let t_lat = (frames - 1) / config::VAE_STRIDE_TEMPORAL as usize + 1;
+        for keyframe in req.keyframes() {
+            let index = if keyframe.frame_idx < 0 {
+                t_lat as i32 + keyframe.frame_idx
+            } else {
+                keyframe.frame_idx
+            };
+            if index < 0 || index as usize >= t_lat {
+                return Err(gen_core::Error::Msg(format!(
+                    "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
+                    keyframe.frame_idx
+                )));
+            }
+        }
+    }
+    if image_conditioned && curated_solver(req.sampler.as_deref()).is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
+                .into(),
+        ));
+    }
+    if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
+        return Err(gen_core::Error::Msg(
+            "wan: trim_first_frames is not supported with Reference/Keyframe conditioning".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Generator for WanGenerator {
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        self.dit_source
+            .gguf_path()
+            .is_none()
+            .then_some(&self.load_binding)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -1225,115 +1387,7 @@ impl Generator for WanGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg("wan: prompt must not be empty".into()));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg("wan: steps must be >= 1".into()));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "wan: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        // sc-12308: the 5B carries an area budget too (upstream `ti2v-5B` supports only `1280*704` /
-        // `704*1280`), but this lane checked only the per-edge range and the multiple — so a
-        // grid-aligned 1280×1280 validated and ran to an opaque OOM, exactly the sc-9028 hole the
-        // 14B lane already closed. mlx's 5B did cap (it silently refit instead); rejecting here is
-        // what makes the two backends agree on one geometry per request.
-        let area = req.width as usize * req.height as usize;
-        if area > MAX_AREA_5B {
-            return Err(gen_core::Error::Msg(format!(
-                "wan: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_5B} px \
-                 (1280×704); reduce the resolution",
-                req.width, req.height
-            )));
-        }
-        if let Some(f) = req.frames {
-            if f == 0 || f % 4 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: frames must satisfy frames % 4 == 1 (got {f})"
-                )));
-            }
-            if f as usize > MAX_WAN_FRAMES {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: frames {f} exceeds the maximum {MAX_WAN_FRAMES}"
-                )));
-            }
-        }
-        let reference_count = req
-            .conditioning
-            .iter()
-            .filter(|c| matches!(c, Conditioning::Reference { .. }))
-            .count();
-        let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
-            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: {label} strength must be finite and in [0,1] (got {strength})"
-                )));
-            }
-            Ok(())
-        };
-        if let Some(strength) = req.strength {
-            check_strength("image", strength)?;
-        }
-        for conditioning in &req.conditioning {
-            match conditioning {
-                Conditioning::Reference {
-                    strength: Some(strength),
-                    ..
-                } => check_strength("Reference", *strength)?,
-                Conditioning::Keyframe { strength, .. } => check_strength("Keyframe", *strength)?,
-                _ => {}
-            }
-        }
-        let image_conditioned = reference_count > 0 || !req.keyframes().is_empty();
-        if reference_count > 1 {
-            return Err(gen_core::Error::Msg(
-                "wan: TI2V accepts at most one Reference image".into(),
-            ));
-        }
-        if reference_count > 0 && !req.keyframes().is_empty() {
-            return Err(gen_core::Error::Msg(
-                "wan: Reference and Keyframe conditioning cannot be combined; express the first \
-                 frame as Keyframe frame_idx=0"
-                    .into(),
-            ));
-        }
-        if !req.keyframes().is_empty() {
-            let frames = req.frames.unwrap_or(DEFAULT_FRAMES) as usize;
-            let t_lat = (frames - 1) / config::VAE_STRIDE_TEMPORAL as usize + 1;
-            for keyframe in req.keyframes() {
-                let index = if keyframe.frame_idx < 0 {
-                    t_lat as i32 + keyframe.frame_idx
-                } else {
-                    keyframe.frame_idx
-                };
-                if index < 0 || index as usize >= t_lat {
-                    return Err(gen_core::Error::Msg(format!(
-                        "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
-                        keyframe.frame_idx
-                    )));
-                }
-            }
-        }
-        if image_conditioned && curated_solver(req.sampler.as_deref()).is_some() {
-            return Err(gen_core::Error::Unsupported(
-                "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
-                    .into(),
-            ));
-        }
-        if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
-            return Err(gen_core::Error::Msg(
-                "wan: trim_first_frames is not supported with Reference/Keyframe conditioning"
-                    .into(),
-            ));
-        }
-        Ok(())
+        validate_dense_request(&self.descriptor, req)
     }
 
     fn generate_with_execution_report(
@@ -1526,6 +1580,7 @@ fn build_generator_with_source(
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
     Ok(WanGenerator {
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         descriptor: descriptor(),
         memory_strategy,
         memory_tier,
@@ -1551,6 +1606,10 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(TI2V_REGISTRATION)
+        .register_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: dense_video_layout,
+        })
         .register_generator(wan14b::T2V_14B_REGISTRATION)
         .register_generator(wan14b::I2V_14B_REGISTRATION)
         .register_generator(model_vace::VACE_REGISTRATION)
@@ -1868,6 +1927,45 @@ mod tests {
     use candle_gen::candle_core::safetensors as cst;
     use candle_gen::gen_core::ConditioningKind;
     use std::collections::HashMap;
+
+    #[test]
+    fn video_plan_candle_5b_streams_native_codec_and_preserves_native_aliases() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/no-weights".into()));
+        let registry = provider_registry().unwrap();
+        let mut req = GenerationRequest {
+            prompt: "video".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            steps: Some(2),
+            sampler: Some("heun".into()),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let phase = &plan.layout().phases[0];
+        assert_eq!(
+            (
+                phase.latent_frames,
+                phase.decoded_frames,
+                phase.decode_chunk_frames
+            ),
+            (3, 9, 4)
+        );
+        assert_eq!(phase.latent_bytes, 4 * 48 * 3 * 32 * 32);
+        assert_eq!(phase.decoded_tensor_bytes, 512 * 512 * 9 * 3 * 4);
+        assert!(registry
+            .compile_video_plan(config::MODEL_ID_I2V_14B, &spec, &req)
+            .unwrap()
+            .is_none());
+        req.sampler = Some("uni_pc".into());
+        assert!(registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .is_none());
+    }
 
     fn assert_video_solver_matches_legacy(
         req: &GenerationRequest,

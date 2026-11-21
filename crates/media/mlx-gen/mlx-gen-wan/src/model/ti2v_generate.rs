@@ -6,14 +6,20 @@ impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
     /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     pub(super) fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
+        Self::validate_metadata(&self.descriptor, &self.config, req)
+    }
+
+    pub(super) fn validate_metadata(
+        descriptor: &ModelDescriptor,
+        config: &WanModelConfig,
+        req: &GenerationRequest,
+    ) -> Result<()> {
         // Shared capability floor: size range (the advertised `min_size` = MIN_SIZE = 480 is the
         // 5B coherence floor below which the z48 vae22 renders garbage, sc-10306/sc-12636 — NOT the
         // 32-px grid stride, which `reject_off_grid` enforces below; `max_size` caps the long edge),
         // count, guidance/negative/true_cfg, sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and
         // conditioning (`Reference`/`Keyframe`).
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
+        descriptor.capabilities.validate_request(MODEL_ID, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -32,9 +38,9 @@ impl Wan {
         // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
         // via `is_multiple_of(SIZE_MULTIPLE)`). sc-12308: the 5B's OWN 901 120 area budget — its 32-px
         // grid makes 1280×704 the geometry it genuinely renders.
-        let (dw, dh) = grid(&self.config, Ti2vProviderVae::VAE_TILING);
+        let (dw, dh) = grid(config, Ti2vProviderVae::VAE_TILING);
         reject_off_grid(MODEL_ID, req, dw, dh)?;
-        reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
+        reject_over_area(MODEL_ID, req, dw, dh, config.max_area)?;
         // sc-19571: the conditioning strengths now reach the mask builder, so their range is load
         // bearing — reject out-of-range/non-finite here rather than letting `1 − strength` become a
         // negative mask deep in the denoise.
@@ -126,12 +132,14 @@ impl Wan {
         let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
-        let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
-        let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let vae_stride = provider_vae_stride(Ti2vProviderVae::VAE_TILING);
-        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim_out;
-        let (width, height) = resolve_capped_dims(req, cfg, Ti2vProviderVae::VAE_TILING);
+        let vae = Ti2vProviderVae::VAE_TILING;
+        let VideoDimensions {
+            frames: _,
+            trim_out,
+            width,
+            height,
+            lat,
+        } = video_dimensions(req, cfg, vae)?;
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
@@ -145,8 +153,6 @@ impl Wan {
             .negative_prompt
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
-
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12796: this is policy-INdependent for the dense 5B (unlike the A14B's `moe_denoise_resident_bytes`,
