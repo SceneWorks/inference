@@ -2466,8 +2466,164 @@ mod tests {
         }
     }
 
-    /// A native path that is NOT one of the aliased global projections still resolves to nothing — the
-    /// aliases are exact, not a blanket accept (guards against a future over-broad match arm).
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn phase_projector_and_sparse_adapters_match_independent_oracles() {
+        use mlx_gen::gen_core::phase::ConditioningBranches;
+        use mlx_gen::{AdapterKind, AdapterSpec, PinnedWeightsFile};
+
+        let (weights, cfg) = executable_test_weights();
+        let raw = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let projector_path = dir.path().join("projector.safetensors");
+        let block_path = dir.path().join("block.safetensors");
+        let projector_factor = Array::from_slice(&[1.0_f32], &[1, 1]);
+        Array::save_safetensors(
+            vec![
+                ("text_fusion.projector.lora_A.weight", &projector_factor),
+                ("text_fusion.projector.lora_B.weight", &projector_factor),
+            ],
+            None,
+            &projector_path,
+        )
+        .unwrap();
+        let down = Array::from_slice(&[0.6_f32, -0.4, 0.3, 0.1, 0.7, -0.5, 0.2, 0.8], &[1, 8]);
+        let up = Array::from_slice(&[0.3_f32, 0.6, -0.8, 0.7, 0.1, 0.4, -0.2, 0.5], &[8, 1]);
+        let alpha = Array::from_slice(&[0.5_f32], &[1]);
+        Array::save_safetensors(
+            vec![
+                ("transformer_blocks.0.attn.to_v.lora_A.weight", &down),
+                ("transformer_blocks.0.attn.to_v.lora_B.weight", &up),
+                ("transformer_blocks.0.attn.to_v.alpha", &alpha),
+            ],
+            None,
+            &block_path,
+        )
+        .unwrap();
+        let specs = [
+            AdapterSpec::new(projector_path, 0.5, AdapterKind::Lora),
+            AdapterSpec::new(block_path, 0.25, AdapterKind::Lora),
+        ];
+        let sources = specs
+            .iter()
+            .map(|spec| {
+                let pin = PinnedWeightsFile::pin(&spec.path).unwrap();
+                (spec.path.clone(), PhaseAdapterSource::load(pin).unwrap())
+            })
+            .collect();
+        let install_legacy = |specs: &[AdapterSpec]| {
+            let mut model = raw.clone();
+            model.apply_adapters_strict(specs, false).unwrap();
+            model
+        };
+        // The resident model starts with active defaults, including the routable projector.
+        let resident = install_legacy(&specs);
+        let context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let evaluate = |model: &Krea2Transformer, args: Option<&PhaseArguments>| {
+            let prep = model
+                .prepare_with_phase(
+                    &context,
+                    None,
+                    &latent,
+                    args.map(|args| Arc::from(args.adapters())),
+                )
+                .unwrap();
+            let output = model.forward_prepared(&latent, &timestep, &prep).unwrap();
+            mlx_rs::transforms::eval([&prep.ctx, &output]).unwrap();
+            (prep.ctx, output)
+        };
+        let phase = |keys| PhaseArguments::new(keys, 1.0, ConditioningBranches::Positive);
+        let bare = phase(vec![]);
+        let block_only = phase(vec![PhaseAdapterScale::new(1, 0.625)]);
+        let ordered = [
+            PhaseAdapterScale::new(1, 0.625),
+            PhaseAdapterScale::new(0, 0.75),
+            PhaseAdapterScale::new(1, -0.375),
+            PhaseAdapterScale::new(1, 0.625),
+        ];
+        let selected = phase(ordered.to_vec());
+        let evaluate_phase = |args: &PhaseArguments| {
+            let model = resident
+                .clone_for_phase_adapters(&specs, &sources, [args])
+                .unwrap();
+            evaluate(&model, Some(args))
+        };
+        let expected = |order: &[PhaseAdapterScale]| {
+            let phased: Vec<_> = order
+                .iter()
+                .map(|key| {
+                    let mut spec = specs[key.slot()].clone();
+                    spec.scale = key.scale();
+                    spec
+                })
+                .collect();
+            evaluate(&install_legacy(&phased), None)
+        };
+        let assert_pair = |actual: &(Array, Array), expected: &(Array, Array)| {
+            assert_exact(&actual.0, &expected.0);
+            assert_exact(&actual.1, &expected.1);
+        };
+
+        let raw_base = evaluate(&raw, None);
+        assert_ne!(
+            evaluate(&resident, None).0.as_slice::<f32>(),
+            raw_base.0.as_slice::<f32>()
+        );
+        assert_pair(&evaluate_phase(&bare), &raw_base);
+
+        let actual = evaluate_phase(&selected);
+        assert_pair(&actual, &expected(&ordered));
+        assert_ne!(actual.0.as_slice::<f32>(), raw_base.0.as_slice::<f32>());
+        assert_ne!(actual.1.as_slice::<f32>(), raw_base.1.as_slice::<f32>());
+        let without_repeat = expected(&ordered[..3]);
+        assert_exact(&actual.0, &without_repeat.0);
+        assert_ne!(
+            actual.1.as_slice::<f32>(),
+            without_repeat.1.as_slice::<f32>()
+        );
+        let mut with_default = ordered;
+        with_default[2] = PhaseAdapterScale::new(1, specs[1].scale);
+        assert_ne!(
+            actual.1.as_slice::<f32>(),
+            expected(&with_default).1.as_slice::<f32>()
+        );
+
+        // A cancelling pair makes the original left-to-right rounding observable on the projector.
+        let mut cancelling = [
+            PhaseAdapterScale::new(0, 1.0e8),
+            PhaseAdapterScale::new(0, -1.0e8),
+            PhaseAdapterScale::new(0, 0.75),
+        ];
+        let in_order = evaluate_phase(&phase(cancelling.to_vec()));
+        assert_pair(&in_order, &expected(&cancelling));
+        cancelling.rotate_right(1);
+        let reordered = evaluate_phase(&phase(cancelling.to_vec()));
+        assert_pair(&reordered, &expected(&cancelling));
+        assert_ne!(in_order.0.as_slice::<f32>(), reordered.0.as_slice::<f32>());
+
+        let sparse = evaluate_phase(&block_only);
+        assert_pair(&sparse, &expected(block_only.adapters()));
+        assert_exact(&sparse.0, &raw_base.0);
+        assert_ne!(sparse.1.as_slice::<f32>(), raw_base.1.as_slice::<f32>());
+        assert_pair(&evaluate_phase(&bare), &raw_base);
+        assert_pair(&evaluate_phase(&selected), &actual);
+
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles");
+    }
+
     #[test]
     fn phase_bank_clears_the_routable_projector_even_outside_training_targets() {
         let (weights, cfg) = executable_test_weights();
@@ -2491,6 +2647,7 @@ mod tests {
         assert!(!dit.adaptable_mut(&path).unwrap().has_adapters());
     }
 
+    /// Native aliases are exact. Unrelated paths must not resolve to an adaptable projection.
     #[test]
     fn adaptable_mut_rejects_unknown_native_global_path() {
         let mut t = tiny_transformer();
