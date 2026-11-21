@@ -199,6 +199,7 @@ pub(crate) fn with_historical_acceptance_current<T>(f: impl FnOnce() -> T) -> T 
 }
 
 fn scoped<T>(policy: Option<JobTrainingPolicy>, f: impl FnOnce() -> T) -> T {
+    crate::ensure_reference_math_hook();
     struct Restore(Option<JobTrainingPolicy>);
     impl Drop for Restore {
         fn drop(&mut self) {

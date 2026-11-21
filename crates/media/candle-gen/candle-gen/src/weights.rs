@@ -56,6 +56,28 @@ fn f32_le_planes(bytes: &[u8]) -> Vec<f32> {
             .collect()
     })
 }
+impl candle_layers::CandleWeightSource for Weights {
+    fn contains(&self, key: &str) -> bool {
+        Weights::contains(self, key)
+    }
+
+    fn require(&self, key: &str) -> Result<Tensor> {
+        Weights::require(self, key)
+    }
+
+    fn host_packed_target(&self) -> Option<&Device> {
+        Weights::host_packed_target(self)
+    }
+
+    fn int8_context(&self, device: &Device) -> Result<candle_quant_kernels::Int8Context> {
+        Weights::int8_context(self, device)
+    }
+
+    fn convrot_rotation(&self, group: usize, device: &Device) -> Result<Tensor> {
+        Weights::convrot_rotation(self, group, device)
+    }
+}
+
 impl Weights {
     /// The device this weight set is resident on — every constructor loads all tensors onto one
     /// `device`, so any tensor's device answers for the set. `None` only for an empty map.

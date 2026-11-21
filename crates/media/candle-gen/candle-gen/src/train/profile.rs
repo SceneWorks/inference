@@ -83,6 +83,7 @@ pub fn active() -> bool {
 /// are rejected, and all thread-local state is restored on errors/panics.
 #[cfg(feature = "model-inference-proof")]
 pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
+    crate::ensure_reference_math_hook();
     assert!(!ACTIVE.replace(true), "nested bounded training profile");
     struct Reset;
     impl Drop for Reset {
