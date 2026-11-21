@@ -46,8 +46,14 @@ impl TextEncoderBlockStream {
 
     fn open(&self) -> Result<Weights> {
         match &self.source {
-            WeightsSource::Dir(dir) => Weights::from_dir(dir),
-            WeightsSource::File(file) => Weights::from_file(file),
+            WeightsSource::Dir(dir) => Weights::from_dir_with_projection_layout(
+                dir,
+                crate::text_encoder::gpt_oss::stacked_expert_key,
+            ),
+            WeightsSource::File(file) => Weights::from_file_with_projection_layout(
+                file,
+                crate::text_encoder::gpt_oss::stacked_expert_key,
+            ),
         }
     }
 

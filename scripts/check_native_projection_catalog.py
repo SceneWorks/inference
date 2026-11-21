@@ -25,7 +25,7 @@ MLX_MEDIA = {
     "kolors": ("block_stream.rs", ("chatglm3.rs",)),
     "krea": ("loader.rs", ("quant.rs",)),
     "krea_realtime": ("t2v.rs", ("load.rs",)),
-    "lens": ("pipeline.rs", ("quant.rs", "reasoner.rs")),
+    "lens": ("pipeline.rs", ("quant.rs", "reasoner.rs", "dit/mod.rs")),
     "ltx": ("block_stream.rs", ("gemma.rs", "transformer/linear.rs", "diff_vae.rs")),
     "mage": ("block_stream.rs", ("quant.rs", "text_encoder/load.rs")),
     "minimax_h3": ("block_stream.rs", ("quant.rs",)),
@@ -100,7 +100,7 @@ REGISTER = re.compile(
     r"\(\s*([\w:]+)"
 )
 OPEN = re.compile(
-    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|dir|paths|source_map)\("
+    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|(?:dir|file)_with_projection_layout|dir|paths|source_map)\("
     r"|read_logical_weights\(|mlx_llm::text_registry\(|DitBlockStream::"
 )
 BIND = re.compile(
@@ -157,6 +157,7 @@ def check_mlx(root: Path) -> list[str]:
         (llm / "primitives/moe.rs", "obs.expert("),
         (llm / "models/qwen35.rs", "SwitchLinear::from_checkpoint("),
         (media / "mlx-gen-sdxl/src/ldm.rs", "insert_source_projection("),
+        (media / "mlx-gen-lens/src/text_encoder/gpt_oss.rs", "SwitchLinear::from_scalar_source("),
         (media / "mlx-gen-minimax-h3/src/dit/heads.rs", "source_projection("),
         (media / "src/quant.rs", "NativeProjection::from_weights("),
         (llm / "primitives/projection.rs", "NativeProjection::from_key("),

@@ -60,7 +60,9 @@ pub(crate) fn component_header_source(path: &Path) -> Result<pricing::FusedHeade
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
-    split_ldm_source(Weights::from_file(path)?)
+    split_ldm_source(Weights::from_file_with_projection_layout(path, |key| {
+        key == "conditioner.embedders.1.model.text_projection"
+    })?)
 }
 
 fn split_ldm_source(mut source: Weights) -> Result<LdmComponents> {

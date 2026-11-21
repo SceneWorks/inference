@@ -905,6 +905,43 @@ mod tests {
         CompanionRole, CompanionTensorPlan, PlannedResidency, ResidencyMode,
     };
 
+    #[test]
+    fn architecture_crops_raw_mxfp8_at_normal_constructor_and_refuses_descriptor_conflicts() {
+        let dir = fixture_dir();
+        for (name, desc, conflicting) in [
+            ("implicit", br#"{"format":"mxfp8"}"#.as_slice(), false),
+            (
+                "explicit",
+                br#"{"format":"mxfp8","orig_shape":[6,41]}"#.as_slice(),
+                true,
+            ),
+        ] {
+            let path = dir.path().join(format!("{name}.safetensors"));
+            write_safetensors(
+                &path,
+                &[
+                    ("model.q.weight", "F8_E4M3", &[32, 64], vec![0x38; 32 * 64]),
+                    ("model.q.weight_scale", "U8", &[128, 4], vec![127; 128 * 4]),
+                    ("model.q.comfy_quant", "U8", &[desc.len()], desc.to_vec()),
+                ],
+            );
+            let mut w = Weights::from_file(&path).unwrap();
+            if conflicting {
+                assert!(w.declare_projection_shape("model.q", [5, 40]).is_err());
+            } else {
+                w.declare_projection_shape("model.q", [5, 40]).unwrap();
+                if crate::metal_available() {
+                    let p = w.source_projection("model.q.weight").unwrap().unwrap();
+                    assert_eq!(p.shape(), [5, 40]);
+                    assert_eq!(p.operands()[0].1.shape(), [32, 64]);
+                } else {
+                    assert_eq!(w.require("model.q.weight").unwrap().shape(), [5, 40]);
+                }
+                assert!(w.declare_projection_shape("model.q", [5, 65]).is_err());
+            }
+        }
+    }
+
     /// File I/O only: preserve all FP8 storage bits and ordinary tensors without decoding.
     #[test]
     fn shared_lazy_reader_preserves_fp8_storage_bytes_and_mixed_dtypes() {
