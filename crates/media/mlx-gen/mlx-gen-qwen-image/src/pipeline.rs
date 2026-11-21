@@ -692,17 +692,19 @@ pub(crate) fn denoise_with_progress_windowed_pag_and_run(
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let (step_w, step_h, step_lh, step_lw) = match run {
+        let (step_w, step_h, step_lh, step_lw, is_phase0_latent) = match run {
             Some(run) => {
                 let (p0_w, p0_h) = run.plan().phase_output_size(0);
                 let (p0_lh, p0_lw) = ((p0_h / 16) as usize, (p0_w / 16) as usize);
-                if latents.shape().get(1).copied() == Some((p0_lh * p0_lw) as i32) {
-                    (p0_w, p0_h, p0_lh, p0_lw)
+                let is_p0 = (p0_w, p0_h) != (width, height)
+                    && latents.shape().get(1).copied() == Some((p0_lh * p0_lw) as i32);
+                if is_p0 {
+                    (p0_w, p0_h, p0_lh, p0_lw, true)
                 } else {
-                    (width, height, lh, lw)
+                    (width, height, lh, lw, false)
                 }
             }
-            None => (width, height, lh, lw),
+            None => (width, height, lh, lw, false),
         };
         crate::preview::emit_preview(preview, &previews, sliced, sigma, latents, step_w, step_h);
         let pos = transformer.forward_windowed(
@@ -733,13 +735,20 @@ pub(crate) fn denoise_with_progress_windowed_pag_and_run(
             }
             None => pos.clone(),
         };
-        let current_eval = eval_idx;
-        eval_idx += 1;
-        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+        let candidate_step = mlx_gen::gen_core::sampling::step_index_for_eval(
             canonical_solver,
-            current_eval,
+            eval_idx,
             total_steps,
         );
+        let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+        let is_boundary_endpoint_eval =
+            low_res_plan.is_some_and(|lr| is_phase0_latent && candidate_step >= lr.k);
+        let step_idx = if is_boundary_endpoint_eval {
+            low_res_plan.map_or(candidate_step, |lr| lr.k)
+        } else {
+            eval_idx += 1;
+            candidate_step
+        };
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
             if let Some(perturb_mask) =

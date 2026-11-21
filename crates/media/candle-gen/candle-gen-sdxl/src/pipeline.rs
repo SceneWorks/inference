@@ -1624,9 +1624,7 @@ impl Pipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        use candle_gen::gen_core::sampling::{
-            base_supports_cfgpp, cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler, Solver,
-        };
+        use candle_gen::gen_core::sampling::{base_supports_cfgpp, cfgpp_denoise, Solver};
 
         let base = Solver::from_name(sampler)
             .filter(|solver| base_supports_cfgpp(*solver))
@@ -1697,78 +1695,102 @@ impl Pipeline {
             Ok((guided, eps_u))
         };
 
-        for (span_idx, span) in spans.iter().enumerate() {
-            if let Some(run) = run {
-                run.begin_denoise_phase(span_idx)
-                    .map_err(CandleError::from)?;
+        let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<(Tensor, Tensor)> {
+            if req.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
             }
-            let span_sigmas = &sigmas[span.start..=span.end];
-            let cfgpp_sampler: Box<dyn CfgPpSampler<candle_gen::CandleLatentOps>> =
-                cfgpp_sampler_for::<candle_gen::CandleLatentOps>(base)
-                    .expect("base_supports_cfgpp holds");
-            let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<(Tensor, Tensor)> {
-                if req.cancel.is_cancelled() {
-                    return Err(gen_core::Error::Canceled);
+            candle_gen::preview::PreviewHook::emit(preview, &preview_counter, sigmas, sigma, x);
+            let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+            on_progress(Progress::Step { current, total });
+            cfgpp_denoise(&ops, ms, x, sigma, predict_pair)
+        };
+        latents = run_cfgpp_spans(
+            &ops,
+            base,
+            sigmas,
+            &spans,
+            latents,
+            |span_idx| {
+                if let Some(run) = run {
+                    run.begin_denoise_phase(span_idx)
+                        .map_err(CandleError::from)?;
                 }
-                candle_gen::preview::PreviewHook::emit(preview, &preview_counter, sigmas, sigma, x);
-                let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-                on_progress(Progress::Step { current, total });
-                cfgpp_denoise(&ops, ms, x, sigma, predict_pair)
-            };
-            latents = cfgpp_sampler
-                .sample(&ops, &mut denoise_fn, latents, span_sigmas)
-                .map_err(CandleError::from)?;
-            if let Some(run) = run {
-                run.end_denoise_phase(span_idx).map_err(CandleError::from)?;
-            }
-            if span_idx + 1 < spans.len() {
+                Ok(())
+            },
+            |span_idx, _latents| {
+                if let Some(run) = run {
+                    run.end_denoise_phase(span_idx).map_err(CandleError::from)?;
+                }
+                Ok(())
+            },
+            &mut denoise_fn,
+            |span_idx, boundary_step, latents, state| {
+                let _ = span_idx;
                 if let Some(run) = run {
                     if let Some(low_res_plan) = run.plan().low_res_start().cloned() {
-                        let sigma_k = sigmas[span.end];
-                        let base_seed = run.plan().base_seed();
-                        let output_index = seed.wrapping_sub(base_seed) as u32;
-                        let pass_index = run.plan().pass_index();
-                        let x0_low =
-                            gen_core::sampling::denoise(&ops, ms, &latents, sigma_k, |xin, t| {
-                                Ok(predict_pair(xin, t)?.0)
-                            })
+                        if boundary_step == low_res_plan.k {
+                            let sigma_k = sigmas[boundary_step];
+                            let base_seed = run.plan().base_seed();
+                            let output_index = seed.wrapping_sub(base_seed) as u32;
+                            let pass_index = run.plan().pass_index();
+                            let x0_low = gen_core::sampling::denoise(
+                                &ops,
+                                ms,
+                                latents,
+                                sigma_k,
+                                |xin, t| Ok(predict_pair(xin, t)?.0),
+                            )
                             .map_err(CandleError::from)?;
-                        let low_f32 = x0_low
-                            .to_dtype(DType::F32)?
-                            .flatten_all()?
-                            .to_vec1::<f32>()?;
-                        let dims = x0_low.dims();
-                        let (b_sz, channels, low_h) = (dims[0], dims[1], dims[2]);
-                        let vae_spatial_scale =
-                            ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
-                        let noised = gen_core::transition_clean_estimate_f32(
-                            gen_core::BoundaryState::CleanEstimate {
-                                latent: &low_f32,
-                                source: gen_core::EstimateSource::EndpointEvaluation,
-                            },
-                            b_sz,
-                            channels,
-                            vae_spatial_scale as u32,
-                            &low_res_plan,
-                            sigma_k,
-                            ms,
-                            base_seed,
-                            output_index,
-                            pass_index,
-                            0,
-                        )
-                        .map_err(CandleError::from)?;
-                        let full_h = (low_res_plan.full_height as usize) / vae_spatial_scale;
-                        let full_w = (low_res_plan.full_width as usize) / vae_spatial_scale;
-                        latents = Tensor::from_vec(
-                            noised,
-                            (b_sz, channels, full_h, full_w),
-                            x0_low.device(),
-                        )?;
+                            let low_f32 = x0_low
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()?;
+                            let dims = x0_low.dims();
+                            let (b_sz, channels, low_h) = (dims[0], dims[1], dims[2]);
+                            let vae_spatial_scale =
+                                ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
+                            let noised = gen_core::transition_clean_estimate_f32(
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: &low_f32,
+                                    source: gen_core::EstimateSource::EndpointEvaluation,
+                                },
+                                b_sz,
+                                channels,
+                                vae_spatial_scale as u32,
+                                &low_res_plan,
+                                sigma_k,
+                                ms,
+                                base_seed,
+                                output_index,
+                                pass_index,
+                                0,
+                            )
+                            .map_err(CandleError::from)?;
+                            let full_h = (low_res_plan.full_height as usize) / vae_spatial_scale;
+                            let full_w = (low_res_plan.full_width as usize) / vae_spatial_scale;
+                            let transitioned = Tensor::from_vec(
+                                noised,
+                                (b_sz, channels, full_h, full_w),
+                                x0_low.device(),
+                            )?;
+                            state.note_geometry_change(
+                                (low_res_plan.low_width, low_res_plan.low_height),
+                                (low_res_plan.full_width, low_res_plan.full_height),
+                            );
+                            state.note_renoise_transition();
+                            state
+                                .apply_phase_boundary(
+                                    gen_core::sampling::PhaseBoundary::Reset,
+                                    true,
+                                )
+                                .map_err(CandleError::from)?;
+                            return Ok(transitioned);
+                        }
                     }
                 }
-            }
-        }
+                Ok(latents.clone())
+            },
+        )?;
         Ok(latents.to_dtype(self.dtype)?)
     }
 
@@ -1845,6 +1867,54 @@ impl Pipeline {
             pixels,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_cfgpp_spans<L: gen_core::sampling::LatentOps + 'static>(
+    ops: &L,
+    base: gen_core::sampling::Solver,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    mut latents: L::Latent,
+    mut begin_phase: impl FnMut(usize) -> Result<()>,
+    mut end_phase: impl FnMut(usize, &L::Latent) -> Result<()>,
+    mut denoise_fn: impl FnMut(&L::Latent, f32) -> gen_core::Result<(L::Latent, L::Latent)>,
+    mut transition_fn: impl FnMut(
+        usize,
+        usize,
+        &L::Latent,
+        &mut gen_core::sampling::SolverRunState<L>,
+    ) -> Result<L::Latent>,
+) -> Result<L::Latent> {
+    use candle_gen::gen_core::sampling::{cfgpp_sampler_for, CfgPpSampler, SolverRunState};
+
+    let cfgpp_sampler: Box<dyn CfgPpSampler<L>> =
+        cfgpp_sampler_for::<L>(base).expect("base_supports_cfgpp holds");
+    let mut state = SolverRunState::new_cfg_pp(cfgpp_sampler.base_solver(), sigmas);
+
+    for (span_idx, span) in spans.iter().enumerate() {
+        begin_phase(span_idx)?;
+        latents = cfgpp_sampler
+            .sample_span(
+                ops,
+                &mut denoise_fn,
+                latents,
+                sigmas,
+                span.clone(),
+                &mut state,
+            )
+            .map_err(CandleError::from)?;
+        end_phase(span_idx, &latents)?;
+        if span_idx + 1 < spans.len() {
+            latents = transition_fn(span_idx, span.end, &latents, &mut state)?;
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(CandleError::from(gen_core::Error::Unsupported(
+            "cfg_pp sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    Ok(latents)
 }
 
 pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
@@ -2641,5 +2711,113 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch");
+    }
+
+    #[test]
+    fn cfgpp_dpmpp_2m_preserves_multistep_history_across_inert_split() {
+        use candle_gen::gen_core::sampling::{
+            cfgpp_denoise, cfgpp_sampler_for, CpuLatentOps, DiscreteModelSampling, Solver,
+        };
+
+        let registry = crate::provider_registry().expect("candle sdxl provider registry");
+        let spec = crate::tests::sdxl_spec(WeightsSource::Dir("/nonexistent/sdxl".into()));
+        let req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(7),
+            guidance: Some(7.0),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            guidance_method: Some("cfg_pp".into()),
+            ..Default::default()
+        };
+        let unsplit_plan = registry
+            .compile_render_plan(crate::MODEL_ID, &spec, &req)
+            .unwrap()
+            .expect("compiled sdxl cfg_pp plan");
+        assert_eq!(unsplit_plan.denoise_spans(), vec![0..8]);
+        let split_plan = unsplit_plan.clone().with_inert_split_at(4).unwrap();
+        assert_eq!(split_plan.denoise_spans(), vec![0..4, 4..8]);
+        assert!(split_plan.low_res_start().is_none());
+
+        let sched = sdxl_alpha_schedule().unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let ops = CpuLatentOps;
+        let init = vec![0.4f32, -0.25, 0.15, 0.8];
+        let predict_pair = |x_in: &Vec<f32>, t: f32| -> gen_core::Result<(Vec<f32>, Vec<f32>)> {
+            let tf = (t * 1e-3).sin();
+            let guided = x_in
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| 0.65 * v + 0.12 * tf + (i as f32) * 0.03)
+                .collect();
+            let uncond = x_in
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| 0.35 * v - 0.07 * tf - (i as f32) * 0.02)
+                .collect();
+            Ok((guided, uncond))
+        };
+
+        let run_for_plan = |plan: &gen_core::RenderPlan| -> Vec<f32> {
+            let cancel = gen_core::CancelFlag::default();
+            let run = gen_core::RenderRun::new(plan, &cancel, None);
+            run.encode(|| Ok::<_, CandleError>(())).unwrap();
+            run.begin_rendering().unwrap();
+            let mut denoise_fn =
+                |x: &Vec<f32>, sigma: f32| cfgpp_denoise(&ops, &ms, x, sigma, predict_pair);
+            let out = run_cfgpp_spans(
+                &ops,
+                Solver::Dpmpp2m,
+                plan.denoise_sigmas(),
+                &plan.denoise_spans(),
+                init.clone(),
+                |phase| run.begin_denoise_phase(phase).map_err(CandleError::from),
+                |phase, _| run.end_denoise_phase(phase).map_err(CandleError::from),
+                &mut denoise_fn,
+                |_phase, boundary_step, latents, state| {
+                    if run
+                        .plan()
+                        .low_res_start()
+                        .is_some_and(|lr| boundary_step == lr.k)
+                    {
+                        state.note_renoise_transition();
+                        state
+                            .apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)
+                            .map_err(CandleError::from)?;
+                    }
+                    Ok(latents.clone())
+                },
+            )
+            .unwrap();
+            let out = run.decode_phase(|| Ok::<_, CandleError>(out)).unwrap();
+            run.finish_rendering();
+            out
+        };
+
+        let unsplit_out = run_for_plan(&unsplit_plan);
+        let split_out = run_for_plan(&split_plan);
+        assert_eq!(
+            split_out, unsplit_out,
+            "inert phase split must preserve CFG++ DPM++ 2M multistep history"
+        );
+
+        // Sanity check: resetting CFG++ solver state at step 4 (as per-span `sample` did) diverges.
+        let sigmas = split_plan.denoise_sigmas();
+        let sampler = cfgpp_sampler_for::<CpuLatentOps>(Solver::Dpmpp2m).unwrap();
+        let mut denoise_fn =
+            |x: &Vec<f32>, sigma: f32| cfgpp_denoise(&ops, &ms, x, sigma, predict_pair);
+        let mid = sampler
+            .sample(&ops, &mut denoise_fn, init.clone(), &sigmas[0..=4])
+            .unwrap();
+        let reset_out = sampler
+            .sample(&ops, &mut denoise_fn, mid, &sigmas[4..=8])
+            .unwrap();
+        assert_ne!(
+            reset_out, unsplit_out,
+            "per-span reset must differ from preserved multistep history"
+        );
     }
 }

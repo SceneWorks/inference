@@ -494,7 +494,8 @@ pub fn denoise_cfg_planned(
     let window = transformer.block_window(block_window, cancel)?;
     let total_steps = sigmas.len().saturating_sub(1);
     let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
-    let has_low_res_start = phase_scope.is_some_and(|run| run.plan().low_res_start().is_some());
+    let low_res_plan = phase_scope.and_then(|run| run.plan().low_res_start().copied());
+    let phase0_dims = cached_dims;
     let mut eval_idx = 0usize;
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
@@ -508,22 +509,18 @@ pub fn denoise_cfg_planned(
             };
             cached_dims = dims;
         }
-        let current_eval = eval_idx;
-        eval_idx += 1;
-        let step_idx = if has_low_res_start && total_steps > 0 {
-            let sigma = 1.0 - timestep;
-            sigmas[..total_steps]
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs())))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
+        let candidate_step = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            eval_idx,
+            total_steps,
+        );
+        let is_boundary_endpoint_eval =
+            low_res_plan.is_some_and(|lr| dims == phase0_dims && candidate_step >= lr.k);
+        let step_idx = if is_boundary_endpoint_eval {
+            low_res_plan.map_or(candidate_step, |lr| lr.k)
         } else {
-            mlx_gen::gen_core::sampling::step_index_for_eval(
-                canonical_solver,
-                current_eval,
-                total_steps,
-            )
+            eval_idx += 1;
+            candidate_step
         };
         let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
         let eps_base = match &neg_prep {

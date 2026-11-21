@@ -1640,7 +1640,7 @@ mod tests {
     /// A lazy-loadable SDXL spec: the given `weights` plus the three staged components (epic 13657,
     /// sc-13663) the load gate now requires. The component paths are never read until `generate`, so
     /// nonexistent placeholders are fine for the lazy-resolution + validate tests here.
-    fn sdxl_spec(weights: WeightsSource) -> LoadSpec {
+    pub(crate) fn sdxl_spec(weights: WeightsSource) -> LoadSpec {
         LoadSpec::new(weights)
             .with_component(
                 "tokenizer_clip_l",
@@ -2378,8 +2378,7 @@ mod tests {
             req_err.contains("compiled render plan does not match"),
             "unexpected error: {req_err}"
         );
-        let other_spec = LoadSpec::new(WeightsSource::Dir("/other_nonexistent".into()))
-            .with_components(sdxl_component_specs());
+        let other_spec = sdxl_spec(WeightsSource::Dir("/other_nonexistent".into()));
         let other_plan = registry
             .compile_render_plan(MODEL_ID, &other_spec, &unseeded_req)
             .unwrap()

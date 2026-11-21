@@ -933,12 +933,40 @@ pub fn run_cfgpp_sampler_with_latent_hook(
     run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
     latents: Array,
+    on_latent: impl FnMut(&Array, f32),
+    predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+) -> Result<Array> {
+    let steps = run.sigmas.len().saturating_sub(1);
+    let span = 0..steps;
+    run_cfgpp_sampler_with_phase_transition_spans(
+        run,
+        ms,
+        latents,
+        std::slice::from_ref(&span),
+        None,
+        on_latent,
+        predict_pair,
+        None,
+    )
+}
+
+/// Multi-phase CFG++ driver that preserves a single [`gen_core::sampling::SolverRunState`] across
+/// inert spans (`with_inert_split_at`) and resets history only when `on_phase_boundary` performs
+/// an actual geometry/renoise transition (`SW-6947`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_cfgpp_sampler_with_phase_transition_spans(
+    run: SamplerRun<'_>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
     mut on_latent: impl FnMut(&Array, f32),
     mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+    mut on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>>,
 ) -> Result<Array> {
     use gen_core::sampling::{
         base_supports_cfgpp, cfgpp_denoise as gc_cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler,
-        Solver,
+        Solver, SolverRunState,
     };
 
     // `seed` is unused: every shipped CFG++ solver is deterministic.
@@ -959,61 +987,91 @@ pub fn run_cfgpp_sampler_with_latent_hook(
         .unwrap_or(Solver::Euler);
     let sampler: Box<dyn CfgPpSampler<MlxLatentOps>> = cfgpp_sampler_for::<MlxLatentOps>(base)
         .expect("base_supports_cfgpp(Euler) holds, so a sampler always resolves");
+    let mut state = SolverRunState::new_cfg_pp(sampler.base_solver(), sigmas);
     let mut evaluations = 0u64;
+    let mut out = latents;
 
-    let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
-        step_gate(cancel, on_progress, sigmas, total, sigma)?;
-        step_eval(&[x]).map_err(gen_core::Error::from)?;
-        crate::ios_quantum::diagnostic_metadata(
-            "curated",
-            "callback_evaluated",
-            &[
-                ("schema", 1),
-                ("cfg_pp", 1),
-                ("completed_predict_evaluations", evaluations),
-                ("sigma_bits", sigma.to_bits() as u64),
-                ("state_dtype", sampling_dtype_code(x.dtype())),
-                ("state_logical_bytes", crate::ios_quantum::bytes(x)),
-                ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
-            ],
-        );
-        on_latent(x, sigma);
-        let denoised = gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
-            evaluations += 1;
-            let prediction = predict_pair(xin, t).map_err(gen_core::Error::from)?;
-            crate::ios_quantum::diagnostic_metadata(
-                "curated",
-                "predict_pair_return",
-                &[
-                    ("schema", 1),
-                    ("cfg_pp", 1),
-                    ("evaluation", evaluations),
-                    ("guided_dtype", sampling_dtype_code(prediction.0.dtype())),
-                    ("uncond_dtype", sampling_dtype_code(prediction.1.dtype())),
-                    ("guided_elements", prediction.0.size() as u64),
-                    ("uncond_elements", prediction.1.size() as u64),
-                ],
-            );
-            Ok(prediction)
-        })?;
-        crate::ios_quantum::diagnostic_metadata(
-            "curated",
-            "denoised_pair_return",
-            &[
-                ("schema", 1),
-                ("cfg_pp", 1),
-                ("evaluation", evaluations),
-                ("guided_dtype", sampling_dtype_code(denoised.0.dtype())),
-                ("uncond_dtype", sampling_dtype_code(denoised.1.dtype())),
-            ],
-        );
-        Ok(denoised)
-    };
-
-    let out = sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas)
-        .map_err(crate::Error::from)?;
-    step_eval(&[&out])?;
+    for (phase, span) in spans.iter().enumerate() {
+        if span.start > span.end || span.end > sigmas.len().saturating_sub(1) {
+            return Err(crate::Error::from(gen_core::Error::Unsupported(format!(
+                "invalid cfg_pp sampler span {:?} for {} sigmas",
+                span,
+                sigmas.len()
+            ))));
+        }
+        if let Some(run) = phase_scope {
+            run.begin_denoise_phase(phase).map_err(crate::Error::from)?;
+        }
+        {
+            let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
+                step_gate(cancel, on_progress, sigmas, total, sigma)?;
+                step_eval(&[x]).map_err(gen_core::Error::from)?;
+                crate::ios_quantum::diagnostic_metadata(
+                    "curated",
+                    "callback_evaluated",
+                    &[
+                        ("schema", 1),
+                        ("cfg_pp", 1),
+                        ("completed_predict_evaluations", evaluations),
+                        ("sigma_bits", sigma.to_bits() as u64),
+                        ("state_dtype", sampling_dtype_code(x.dtype())),
+                        ("state_logical_bytes", crate::ios_quantum::bytes(x)),
+                        ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
+                    ],
+                );
+                on_latent(x, sigma);
+                let denoised = gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
+                    evaluations += 1;
+                    let prediction = predict_pair(xin, t).map_err(gen_core::Error::from)?;
+                    crate::ios_quantum::diagnostic_metadata(
+                        "curated",
+                        "predict_pair_return",
+                        &[
+                            ("schema", 1),
+                            ("cfg_pp", 1),
+                            ("evaluation", evaluations),
+                            ("guided_dtype", sampling_dtype_code(prediction.0.dtype())),
+                            ("uncond_dtype", sampling_dtype_code(prediction.1.dtype())),
+                            ("guided_elements", prediction.0.size() as u64),
+                            ("uncond_elements", prediction.1.size() as u64),
+                        ],
+                    );
+                    Ok(prediction)
+                })?;
+                crate::ios_quantum::diagnostic_metadata(
+                    "curated",
+                    "denoised_pair_return",
+                    &[
+                        ("schema", 1),
+                        ("cfg_pp", 1),
+                        ("evaluation", evaluations),
+                        ("guided_dtype", sampling_dtype_code(denoised.0.dtype())),
+                        ("uncond_dtype", sampling_dtype_code(denoised.1.dtype())),
+                    ],
+                );
+                Ok(denoised)
+            };
+            out = sampler
+                .sample_span(&ops, &mut denoise_fn, out, sigmas, span.clone(), &mut state)
+                .map_err(crate::Error::from)?;
+        }
+        if let Some(run) = phase_scope {
+            evaluate_and_end_denoise_phase(run, phase, &out, |out| step_eval(&[out]))?;
+        }
+        if phase + 1 < spans.len() {
+            if let Some(transition) = on_phase_boundary.as_deref_mut() {
+                out = transition(phase, span.end, &ops, ms, &out, &mut state)?;
+            }
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(crate::Error::from(gen_core::Error::Unsupported(
+            "cfg_pp sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    if phase_scope.is_none() {
+        step_eval(&[&out])?;
+    }
     crate::ios_quantum::diagnostic_metadata(
         "curated",
         "solve_complete",

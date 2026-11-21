@@ -1864,15 +1864,19 @@ impl Flux2Render<'_> {
         // transformer timestep (Sigma convention).
         let canonical_solver =
             mlx_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let low_res_plan = run.plan().low_res_start().copied();
+        let phase0_tokens = run.plan().phase_packed_tokens(0);
         let mut eval_idx = 0usize;
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = sigma * 1000.0;
-            let current_eval = eval_idx;
-            eval_idx += 1;
-            let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            let latent_tokens = latents.shape().get(1).copied().unwrap_or(0) as usize;
+            let step_idx = flux2_pag_step_index_for_eval(
                 canonical_solver,
-                current_eval,
+                &mut eval_idx,
                 total_steps,
+                low_res_plan,
+                phase0_tokens,
+                latent_tokens,
             );
             let step_pag = self
                 .pag
@@ -4955,6 +4959,26 @@ mod tests {
     }
 }
 
+fn flux2_pag_step_index_for_eval(
+    canonical_solver: mlx_gen::gen_core::sampling::Solver,
+    eval_idx: &mut usize,
+    total_steps: usize,
+    low_res_plan: Option<mlx_gen::gen_core::ResolvedLowResStartPlan>,
+    phase0_tokens: usize,
+    latent_tokens: usize,
+) -> usize {
+    let candidate_step =
+        mlx_gen::gen_core::sampling::step_index_for_eval(canonical_solver, *eval_idx, total_steps);
+    let is_boundary_endpoint_eval =
+        low_res_plan.is_some_and(|lr| latent_tokens == phase0_tokens && candidate_step >= lr.k);
+    if is_boundary_endpoint_eval {
+        low_res_plan.map_or(candidate_step, |lr| lr.k)
+    } else {
+        *eval_idx += 1;
+        candidate_step
+    }
+}
+
 fn observe_enhancement_outcome(outcome: &str, caption: &str) {
     use sha2::{Digest, Sha256};
     mlx_gen::image_execution::policy(
@@ -5056,5 +5080,86 @@ mod execution_policy_tests {
                 && events.contains("\"operation\":\"release-remnant\""),
             "expected SC-20686 events in output, got: {events}"
         );
+    }
+
+    #[test]
+    fn low_res_start_boundary_evaluation_does_not_shift_pag_step_counter() {
+        let desc = descriptor_klein_9b();
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 1.5,
+                start: Some(0.0),
+                stop: Some(0.625),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req).unwrap();
+        let low_res_plan = plan.low_res_start().copied();
+        assert_eq!(
+            low_res_plan.map(|lr| lr.estimate_source),
+            Some(mlx_gen::gen_core::EstimateSource::EndpointEvaluation)
+        );
+        let pag = desc
+            .capabilities
+            .resolve_pag(Flux2Variant::Klein9b.id(), &req)
+            .unwrap()
+            .expect("pag resolved");
+        let total_steps = plan.executed_steps();
+        assert_eq!(total_steps, 8);
+        let phase0_tokens = plan.phase_packed_tokens(0);
+        let phase1_tokens = plan.phase_packed_tokens(1);
+        assert_ne!(phase0_tokens, phase1_tokens);
+
+        for sampler_name in ["euler", "euler_ancestral"] {
+            let solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+            let mut eval_idx = 0usize;
+            let phase0_steps: Vec<usize> = (0..4)
+                .map(|_| {
+                    flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase0_tokens,
+                    )
+                })
+                .collect();
+            assert_eq!(phase0_steps, vec![0, 1, 2, 3]);
+            let boundary_step = flux2_pag_step_index_for_eval(
+                solver,
+                &mut eval_idx,
+                total_steps,
+                low_res_plan,
+                phase0_tokens,
+                phase0_tokens,
+            );
+            assert_eq!(boundary_step, 4);
+            assert_eq!(eval_idx, 4);
+            let phase1_steps: Vec<(usize, bool)> = (4..8)
+                .map(|_| {
+                    let step_idx = flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase1_tokens,
+                    );
+                    (step_idx, pag.step_scale(step_idx, total_steps) > 0.0)
+                })
+                .collect();
+            assert_eq!(
+                phase1_steps,
+                vec![(4, true), (5, false), (6, false), (7, false)]
+            );
+        }
     }
 }

@@ -1222,6 +1222,7 @@ impl Pipeline {
         let canonical_solver =
             candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(run.plan().sampler()));
         let total_steps = sigmas.len().saturating_sub(1);
+        let low_res_plan = run.plan().low_res_start().copied();
 
         run.images_with_denoise_phases(
             on_progress,
@@ -1250,12 +1251,14 @@ impl Pipeline {
                     Some(&preview),
                     |latents, sigma| -> CResult<Tensor> {
                         let ts = sigma * 1000.0;
-                        let current_eval = eval_idx;
-                        eval_idx += 1;
-                        let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                        let latent_tokens = latents.dim(1)?;
+                        let step_idx = flux2_pag_step_index_for_eval(
                             canonical_solver,
-                            current_eval,
+                            &mut eval_idx,
                             total_steps,
+                            low_res_plan,
+                            phase0_tokens,
+                            latent_tokens,
                         );
                         let step_pag = pag
                             .as_ref()
@@ -1264,7 +1267,7 @@ impl Pipeline {
                             .as_ref()
                             .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
                         let step_img_ids = match &phase0_img_ids {
-                            Some(ids) if latents.dim(1)? == phase0_tokens => ids.as_slice(),
+                            Some(ids) if latent_tokens == phase0_tokens => ids.as_slice(),
                             _ => img_ids.as_slice(),
                         };
                         let step_target_seq = step_img_ids.len();
@@ -1380,6 +1383,29 @@ impl Pipeline {
                 to_image(&decoded)
             },
         )
+    }
+}
+
+pub(crate) fn flux2_pag_step_index_for_eval(
+    canonical_solver: candle_gen::gen_core::sampling::Solver,
+    eval_idx: &mut usize,
+    total_steps: usize,
+    low_res_plan: Option<candle_gen::gen_core::ResolvedLowResStartPlan>,
+    phase0_tokens: usize,
+    latent_tokens: usize,
+) -> usize {
+    let candidate_step = candle_gen::gen_core::sampling::step_index_for_eval(
+        canonical_solver,
+        *eval_idx,
+        total_steps,
+    );
+    let is_boundary_endpoint_eval =
+        low_res_plan.is_some_and(|lr| latent_tokens == phase0_tokens && candidate_step >= lr.k);
+    if is_boundary_endpoint_eval {
+        low_res_plan.map_or(candidate_step, |lr| lr.k)
+    } else {
+        *eval_idx += 1;
+        candidate_step
     }
 }
 
@@ -3737,6 +3763,87 @@ mod tests {
             for spec in [&resident, &legacy_staged] {
                 assert!(load_variant_concrete(variant, spec).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn low_res_start_boundary_evaluation_does_not_shift_pag_step_counter() {
+        let desc = descriptor(Flux2Variant::Klein9b);
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+            pag: Some(gen_core::PagConfig {
+                scale: 1.5,
+                start: Some(0.0),
+                stop: Some(0.625),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = compile_base_plan(Flux2Variant::Klein9b, &req).unwrap();
+        let low_res_plan = plan.low_res_start().copied();
+        assert_eq!(
+            low_res_plan.map(|lr| lr.estimate_source),
+            Some(gen_core::EstimateSource::EndpointEvaluation)
+        );
+        let pag = desc
+            .capabilities
+            .resolve_pag(Flux2Variant::Klein9b.id(), &req)
+            .unwrap()
+            .expect("pag resolved");
+        let total_steps = plan.executed_steps();
+        assert_eq!(total_steps, 8);
+        let phase0_tokens = plan.phase_packed_tokens(0);
+        let phase1_tokens = plan.phase_packed_tokens(1);
+        assert_ne!(phase0_tokens, phase1_tokens);
+
+        for sampler_name in ["euler", "euler_ancestral"] {
+            let solver = gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+            let mut eval_idx = 0usize;
+            let phase0_steps: Vec<usize> = (0..4)
+                .map(|_| {
+                    flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase0_tokens,
+                    )
+                })
+                .collect();
+            assert_eq!(phase0_steps, vec![0, 1, 2, 3]);
+            let boundary_step = flux2_pag_step_index_for_eval(
+                solver,
+                &mut eval_idx,
+                total_steps,
+                low_res_plan,
+                phase0_tokens,
+                phase0_tokens,
+            );
+            assert_eq!(boundary_step, 4);
+            assert_eq!(eval_idx, 4);
+            let phase1_steps: Vec<(usize, bool)> = (4..8)
+                .map(|_| {
+                    let step_idx = flux2_pag_step_index_for_eval(
+                        solver,
+                        &mut eval_idx,
+                        total_steps,
+                        low_res_plan,
+                        phase0_tokens,
+                        phase1_tokens,
+                    );
+                    (step_idx, pag.step_scale(step_idx, total_steps) > 0.0)
+                })
+                .collect();
+            assert_eq!(
+                phase1_steps,
+                vec![(4, true), (5, false), (6, false), (7, false)]
+            );
         }
     }
 

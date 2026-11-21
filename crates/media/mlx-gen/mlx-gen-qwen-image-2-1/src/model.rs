@@ -1326,13 +1326,24 @@ pub(crate) fn validate_plan_load_spec(variant: Variant, spec: &LoadSpec) -> Resu
     Ok(())
 }
 
+fn resolve_plan_schedule(variant: Variant, spec: &LoadSpec) -> Result<Schedule> {
+    let root = loader::snapshot_root(&spec.weights)?;
+    if root.exists() {
+        Schedule::load(variant, root)
+    } else {
+        Ok(Schedule::production(variant))
+    }
+}
+
 pub fn compile_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Base, spec)
         .map_err(|error| labelled(Variant::Base.id(), error))?;
-    compile_trajectory_for(Variant::Base, &Schedule::production(Variant::Base), req)
+    let schedule = resolve_plan_schedule(Variant::Base, spec)
+        .map_err(|error| labelled(Variant::Base.id(), error))?;
+    compile_trajectory_for(Variant::Base, &schedule, req)
         .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
@@ -1342,7 +1353,9 @@ pub fn compile_render_plan_turbo(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Turbo, spec)
         .map_err(|error| labelled(Variant::Turbo.id(), error))?;
-    compile_trajectory_for(Variant::Turbo, &Schedule::production(Variant::Turbo), req)
+    let schedule = resolve_plan_schedule(Variant::Turbo, spec)
+        .map_err(|error| labelled(Variant::Turbo.id(), error))?;
+    compile_trajectory_for(Variant::Turbo, &schedule, req)
         .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
@@ -1937,6 +1950,79 @@ mod tests {
         ));
         assert!(matches!(
             compile_render_plan_turbo(&spec, &edit_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // When `spec.weights` points at an existing snapshot directory, `compile_render_plan`
+        // honors its saved `model_index.json` / `scheduler/scheduler_config.json` metadata.
+        let registry = crate::provider_registry().expect("qwen21 provider registry");
+        let turbo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            turbo_dir.path().join("model_index.json"),
+            r#"{"sample_sigmas": [1.0, 0.75, 0.5, 0.25]}"#,
+        )
+        .unwrap();
+        let turbo_snapshot_spec = LoadSpec::new(WeightsSource::Dir(turbo_dir.path().to_path_buf()));
+        let default_turbo_req = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: None,
+            ..Default::default()
+        };
+        let turbo_snapshot_plan = registry
+            .compile_render_plan(TURBO_MODEL_ID, &turbo_snapshot_spec, &default_turbo_req)
+            .expect("compile turbo plan from snapshot metadata")
+            .expect("some turbo plan");
+        assert_eq!(turbo_snapshot_plan.executed_steps(), 4);
+        assert_eq!(
+            turbo_snapshot_plan.denoise_sigmas(),
+            &[1.0, 0.75, 0.5, 0.25, 0.0]
+        );
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &turbo_snapshot_spec, &default_turbo_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        let base_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base_dir.path().join("scheduler")).unwrap();
+        std::fs::write(
+            base_dir
+                .path()
+                .join("scheduler")
+                .join("scheduler_config.json"),
+            r#"{
+                "base_image_seq_len": 256,
+                "base_shift": 0.9,
+                "invert_sigmas": false,
+                "max_image_seq_len": 8192,
+                "max_shift": 1.4,
+                "num_train_timesteps": 1000,
+                "shift": 1.0,
+                "shift_terminal": 0.05,
+                "time_shift_type": "exponential",
+                "use_beta_sigmas": false,
+                "use_dynamic_shifting": true,
+                "use_exponential_sigmas": false,
+                "use_karras_sigmas": false
+            }"#,
+        )
+        .unwrap();
+        let base_snapshot_spec = LoadSpec::new(WeightsSource::Dir(base_dir.path().to_path_buf()));
+        let base_snapshot_plan = registry
+            .compile_render_plan(MODEL_ID, &base_snapshot_spec, &default_turbo_req)
+            .expect("compile base plan from snapshot scheduler_config.json")
+            .expect("some base plan");
+        let default_base_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &default_turbo_req)
+            .expect("compile default base plan")
+            .expect("some default base plan");
+        assert_ne!(
+            base_snapshot_plan.denoise_sigmas(),
+            default_base_plan.denoise_sigmas()
+        );
+        assert!(matches!(
+            registry.compile_render_plan(TURBO_MODEL_ID, &base_snapshot_spec, &default_turbo_req),
             Err(gen_core::Error::Unsupported(_))
         ));
     }

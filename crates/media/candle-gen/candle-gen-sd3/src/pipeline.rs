@@ -1247,6 +1247,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution() {
         use candle_gen::gen_core::{Conditioning, RenderRun};
 
@@ -1358,6 +1359,11 @@ mod tests {
             staged_run.finish_rendering();
             assert_eq!(staged_img.pixels, direct.pixels, "steps={steps}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution"
+        );
     }
 
     // ---- structural end-to-end tests (random weights) ---------------------------------------------

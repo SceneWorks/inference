@@ -1658,7 +1658,8 @@ impl Pipeline {
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
-            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
+            let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+            let phase0_dims = prepared.latents.dims().to_vec();
             let mut eval_idx = 0usize;
             let out = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
@@ -1682,24 +1683,19 @@ impl Pipeline {
                         )?;
                         cached_dims = latents.dims().to_vec();
                     }
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = if has_low_res_start && total_steps > 0 {
-                        let sigma = 1.0 - t;
-                        run_sigmas[..total_steps]
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
-                            })
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
+                    let candidate_step = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        eval_idx,
+                        total_steps,
+                    );
+                    let is_boundary_endpoint_eval = low_res_plan.is_some_and(|lr| {
+                        latents.dims() == phase0_dims.as_slice() && candidate_step >= lr.k
+                    });
+                    let step_idx = if is_boundary_endpoint_eval {
+                        low_res_plan.map_or(candidate_step, |lr| lr.k)
                     } else {
-                        gen_core::sampling::step_index_for_eval(
-                            canonical_solver,
-                            current_eval,
-                            total_steps,
-                        )
+                        eval_idx += 1;
+                        candidate_step
                     };
                     predict_cfg_and_pag(
                         &self.device,
@@ -1845,7 +1841,8 @@ impl Pipeline {
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
-            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
+            let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+            let phase0_dims = prepared.latents.dims().to_vec();
             let mut eval_idx = 0usize;
             let out = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
@@ -1877,24 +1874,19 @@ impl Pipeline {
                         }
                         cached_dims = latents.dims().to_vec();
                     }
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = if has_low_res_start && total_steps > 0 {
-                        let sigma = 1.0 - t;
-                        run_sigmas[..total_steps]
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
-                            })
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
+                    let candidate_step = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        eval_idx,
+                        total_steps,
+                    );
+                    let is_boundary_endpoint_eval = low_res_plan.is_some_and(|lr| {
+                        latents.dims() == phase0_dims.as_slice() && candidate_step >= lr.k
+                    });
+                    let step_idx = if is_boundary_endpoint_eval {
+                        low_res_plan.map_or(candidate_step, |lr| lr.k)
                     } else {
-                        gen_core::sampling::step_index_for_eval(
-                            canonical_solver,
-                            current_eval,
-                            total_steps,
-                        )
+                        eval_idx += 1;
+                        candidate_step
                     };
                     predict_cfg_and_pag(
                         &self.device,
@@ -2045,7 +2037,8 @@ impl Pipeline {
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
-            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
+            let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+            let phase0_dims = prepared.latents.dims().to_vec();
             let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
@@ -2069,24 +2062,19 @@ impl Pipeline {
                         )?;
                         cached_dims = latents.dims().to_vec();
                     }
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = if has_low_res_start && total_steps > 0 {
-                        let sigma = 1.0 - t;
-                        run_sigmas[..total_steps]
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
-                            })
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
+                    let candidate_step = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        eval_idx,
+                        total_steps,
+                    );
+                    let is_boundary_endpoint_eval = low_res_plan.is_some_and(|lr| {
+                        latents.dims() == phase0_dims.as_slice() && candidate_step >= lr.k
+                    });
+                    let step_idx = if is_boundary_endpoint_eval {
+                        low_res_plan.map_or(candidate_step, |lr| lr.k)
                     } else {
-                        gen_core::sampling::step_index_for_eval(
-                            canonical_solver,
-                            current_eval,
-                            total_steps,
-                        )
+                        eval_idx += 1;
+                        candidate_step
                     };
                     predict_cfg_and_pag(
                         &self.device,
@@ -2281,7 +2269,8 @@ impl Pipeline {
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
-            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
+            let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+            let phase0_dims = prepared.latents.dims().to_vec();
             let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
@@ -2313,24 +2302,19 @@ impl Pipeline {
                         }
                         cached_dims = latents.dims().to_vec();
                     }
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = if has_low_res_start && total_steps > 0 {
-                        let sigma = 1.0 - t;
-                        run_sigmas[..total_steps]
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
-                            })
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
+                    let candidate_step = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        eval_idx,
+                        total_steps,
+                    );
+                    let is_boundary_endpoint_eval = low_res_plan.is_some_and(|lr| {
+                        latents.dims() == phase0_dims.as_slice() && candidate_step >= lr.k
+                    });
+                    let step_idx = if is_boundary_endpoint_eval {
+                        low_res_plan.map_or(candidate_step, |lr| lr.k)
                     } else {
-                        gen_core::sampling::step_index_for_eval(
-                            canonical_solver,
-                            current_eval,
-                            total_steps,
-                        )
+                        eval_idx += 1;
+                        candidate_step
                     };
                     predict_cfg_and_pag(
                         &self.device,

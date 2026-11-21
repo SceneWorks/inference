@@ -1191,4 +1191,50 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn strength_one_img2img_compiles_zero_step_endpoint_plan_without_weights() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let ref_img = Image {
+            width: 256,
+            height: 256,
+            pixels: vec![128; 256 * 256 * 3],
+        };
+        for (variant, provider_id) in [
+            (Variant::Large, MODEL_ID),
+            (Variant::LargeTurbo, MODEL_ID_TURBO),
+            (Variant::Medium, MODEL_ID_MEDIUM),
+        ] {
+            for steps in [1u32, 4u32] {
+                let req = GenerationRequest {
+                    prompt: "sd3 strength 1.0 zero-step endpoint".into(),
+                    width: 256,
+                    height: 256,
+                    steps: Some(steps),
+                    seed: Some(42),
+                    conditioning: vec![Conditioning::Reference {
+                        image: ref_img.clone(),
+                        strength: Some(1.0),
+                    }],
+                    ..Default::default()
+                };
+                let (sigmas, start_step) = resolved_schedule_for_request(variant, &req).unwrap();
+                assert_eq!(start_step, steps as usize, "{provider_id} steps={steps}");
+                assert_eq!(&sigmas[start_step..], &[0.0], "{provider_id} steps={steps}");
+
+                let plan = registry
+                    .compile_render_plan(provider_id, &spec, &req)
+                    .unwrap()
+                    .expect("compiled plan for strength 1.0 img2img");
+                assert_eq!(plan.executed_steps(), 0, "{provider_id} steps={steps}");
+                assert_eq!(plan.denoise_sigmas(), &[0.0], "{provider_id} steps={steps}");
+                assert_eq!(
+                    plan.denoise_spans(),
+                    vec![0..0],
+                    "{provider_id} steps={steps}"
+                );
+            }
+        }
+    }
 }

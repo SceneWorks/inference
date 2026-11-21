@@ -687,17 +687,19 @@ impl Pipeline {
             };
 
             let mut predict = |latents: &Tensor, sigma: f32| -> CResult<Tensor> {
-                let (step_lat_h, step_lat_w) = match run {
+                let (step_lat_h, step_lat_w, is_phase0_latent) = match run {
                     Some(run) => {
                         let (p0_w, p0_h) = run.plan().phase_output_size(0);
                         let (p0_lh, p0_lw) = pipeline::latent_dims(p0_w, p0_h);
-                        if latents.dims().get(1).copied() == Some(p0_lh * p0_lw) {
-                            (p0_lh, p0_lw)
+                        let is_p0 = (p0_w, p0_h) != (req.width, req.height)
+                            && latents.dims().get(1).copied() == Some(p0_lh * p0_lw);
+                        if is_p0 {
+                            (p0_lh, p0_lw, true)
                         } else {
-                            (lat_h, lat_w)
+                            (lat_h, lat_w, false)
                         }
                     }
-                    None => (lat_h, lat_w),
+                    None => (lat_h, lat_w, false),
                 };
                 let pos = transformer.forward_with_memory(
                     latents,
@@ -725,13 +727,20 @@ impl Pipeline {
                     }
                     None => pos.clone(),
                 };
-                let current_eval = eval_idx;
-                eval_idx += 1;
-                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                let candidate_step = candle_gen::gen_core::sampling::step_index_for_eval(
                     canonical_solver,
-                    current_eval,
+                    eval_idx,
                     total_steps,
                 );
+                let low_res_plan = run.and_then(|r| r.plan().low_res_start().copied());
+                let is_boundary_endpoint_eval =
+                    low_res_plan.is_some_and(|lr| is_phase0_latent && candidate_step >= lr.k);
+                let step_idx = if is_boundary_endpoint_eval {
+                    low_res_plan.map_or(candidate_step, |lr| lr.k)
+                } else {
+                    eval_idx += 1;
+                    candidate_step
+                };
                 let pag_scale = resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                 if pag_scale > 0.0 {
                     if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(

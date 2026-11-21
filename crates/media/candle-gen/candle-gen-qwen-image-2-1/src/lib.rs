@@ -475,6 +475,14 @@ impl Schedule {
         }
     }
 
+    pub fn load(variant: Variant, root: &Path) -> Result<Self> {
+        loader::check_snapshot_variant(variant, root)?;
+        match variant {
+            Variant::Base => loader::load_scheduler_config(root).map(Self::Shifted),
+            Variant::Turbo => loader::load_saved_sigma_schedule(root).map(Self::Saved),
+        }
+    }
+
     pub fn default_steps(&self) -> u32 {
         match self {
             Self::Shifted(_) => DEFAULT_STEPS,
@@ -495,14 +503,10 @@ fn load_variant_unlabelled(
     let root = loader::snapshot_root(&spec.weights)?;
     // Before anything is read: a base snapshot under the Turbo id (or the reverse) is a typed
     // refusal naming the mismatch, not a render over the wrong schedule.
-    loader::check_snapshot_variant(variant, root)?;
+    let schedule = Schedule::load(variant, root)?;
     let device = candle_gen::default_device()?;
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
-    let schedule = match variant {
-        Variant::Base => Schedule::Shifted(loader::load_scheduler_config(root)?),
-        Variant::Turbo => Schedule::Saved(loader::load_saved_sigma_schedule(root)?),
-    };
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
@@ -1244,13 +1248,24 @@ pub(crate) fn validate_plan_load_spec(variant: Variant, spec: &LoadSpec) -> gen_
     Ok(())
 }
 
+fn resolve_plan_schedule(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Schedule> {
+    let root = loader::snapshot_root(&spec.weights)
+        .map_err(|error| labelled(variant.id(), error.into()))?;
+    if root.exists() {
+        Schedule::load(variant, root).map_err(|error| labelled(variant.id(), error.into()))
+    } else {
+        Ok(Schedule::production(variant))
+    }
+}
+
 pub fn compile_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Base, spec)
         .map_err(|error| labelled(Variant::Base.id(), error))?;
-    compile_trajectory_for(Variant::Base, &Schedule::production(Variant::Base), req)
+    let schedule = resolve_plan_schedule(Variant::Base, spec)?;
+    compile_trajectory_for(Variant::Base, &schedule, req)
         .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
@@ -1260,7 +1275,8 @@ pub fn compile_render_plan_turbo(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Turbo, spec)
         .map_err(|error| labelled(Variant::Turbo.id(), error))?;
-    compile_trajectory_for(Variant::Turbo, &Schedule::production(Variant::Turbo), req)
+    let schedule = resolve_plan_schedule(Variant::Turbo, spec)?;
+    compile_trajectory_for(Variant::Turbo, &schedule, req)
         .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
@@ -2056,6 +2072,79 @@ mod execution_policy_tests {
         ));
         assert!(matches!(
             compile_render_plan_turbo(&spec, &edit_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // When `spec.weights` points at an existing snapshot directory, `compile_render_plan`
+        // honors its saved `model_index.json` / `scheduler/scheduler_config.json` metadata.
+        let registry = crate::provider_registry().expect("qwen21 provider registry");
+        let turbo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            turbo_dir.path().join("model_index.json"),
+            r#"{"sample_sigmas": [1.0, 0.75, 0.5, 0.25]}"#,
+        )
+        .unwrap();
+        let turbo_snapshot_spec = LoadSpec::new(WeightsSource::Dir(turbo_dir.path().to_path_buf()));
+        let default_turbo_req = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: None,
+            ..Default::default()
+        };
+        let turbo_snapshot_plan = registry
+            .compile_render_plan(TURBO_MODEL_ID, &turbo_snapshot_spec, &default_turbo_req)
+            .expect("compile turbo plan from snapshot metadata")
+            .expect("some turbo plan");
+        assert_eq!(turbo_snapshot_plan.executed_steps(), 4);
+        assert_eq!(
+            turbo_snapshot_plan.denoise_sigmas(),
+            &[1.0, 0.75, 0.5, 0.25, 0.0]
+        );
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &turbo_snapshot_spec, &default_turbo_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        let base_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base_dir.path().join("scheduler")).unwrap();
+        std::fs::write(
+            base_dir
+                .path()
+                .join("scheduler")
+                .join("scheduler_config.json"),
+            r#"{
+                "base_image_seq_len": 256,
+                "base_shift": 0.9,
+                "invert_sigmas": false,
+                "max_image_seq_len": 8192,
+                "max_shift": 1.4,
+                "num_train_timesteps": 1000,
+                "shift": 1.0,
+                "shift_terminal": 0.05,
+                "time_shift_type": "exponential",
+                "use_beta_sigmas": false,
+                "use_dynamic_shifting": true,
+                "use_exponential_sigmas": false,
+                "use_karras_sigmas": false
+            }"#,
+        )
+        .unwrap();
+        let base_snapshot_spec = LoadSpec::new(WeightsSource::Dir(base_dir.path().to_path_buf()));
+        let base_snapshot_plan = registry
+            .compile_render_plan(MODEL_ID, &base_snapshot_spec, &default_turbo_req)
+            .expect("compile base plan from snapshot scheduler_config.json")
+            .expect("some base plan");
+        let default_base_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &default_turbo_req)
+            .expect("compile default base plan")
+            .expect("some default base plan");
+        assert_ne!(
+            base_snapshot_plan.denoise_sigmas(),
+            default_base_plan.denoise_sigmas()
+        );
+        assert!(matches!(
+            registry.compile_render_plan(TURBO_MODEL_ID, &base_snapshot_spec, &default_turbo_req),
             Err(gen_core::Error::Unsupported(_))
         ));
     }
