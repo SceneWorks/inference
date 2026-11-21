@@ -60,7 +60,7 @@ impl TokenRefinerBlock {
             norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
-            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+            ff: DitFeedForward::load(w, &format!("{prefix}.ff"), dtype, Some(cfg))?,
         })
     }
 

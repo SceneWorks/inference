@@ -383,23 +383,65 @@ impl Weights {
     }
     /// Construct a checkpoint projection with the same codec as VarBuilder consumers.
     pub fn native_linear(&self, base: &str, bias: bool) -> Result<Option<candle_nn::Linear>> {
+        let Some((_, _, dtype)) = &self.source else {
+            return Ok(None);
+        };
+        self.native_linear_shaped(base, bias, None, *dtype)
+    }
+
+    /// Construct the encoded matrix at the consumer's logical size and compute dtype.
+    /// MXFP8's tile padding alone cannot identify either logical dimension.
+    pub fn native_linear_shaped(
+        &self,
+        base: &str,
+        bias: bool,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+    ) -> Result<Option<candle_nn::Linear>> {
+        use candle_nn::var_builder::SimpleBackend;
         let key = format!("{base}.weight");
         if !self.encoded_keys.contains(&key) {
             return Ok(None);
         }
-        let Some((source, device, dtype)) = &self.source else {
-            return Ok(None);
-        };
+        let (source, device, _) = self.source.as_ref().expect("owned projection source");
         let b = bias
-            .then(|| self.require(&format!("{base}.bias")))
+            .then(|| self.read_dense_with_shape(&format!("{base}.bias"), None, dtype))
             .transpose()?;
-        if let Some(layer) = source.native_linear(&key, *dtype, device, b.clone())? {
-            return Ok(Some(layer));
+        let layer = match source.native_linear_weight(&key, shape, dtype, device)? {
+            Some(op) => candle_nn::Linear::from_native(op, b),
+            None => candle_nn::Linear::new(self.read_dense_with_shape(&key, shape, dtype)?, b),
+        };
+        let dims = layer.weight_dims()?;
+        if shape.is_some_and(|expected| dims != expected) {
+            return Err(CandleError::Msg(format!(
+                "{key}: expected matrix {shape:?}, got {dims:?}"
+            )));
         }
-        Ok(Some(candle_nn::Linear::new(
-            source.reader().read_dense(&key, *dtype, device)?,
-            b,
-        )))
+        Ok(Some(layer))
+    }
+
+    /// Load an operator's coefficient view at its consuming precision, cropping MX padding.
+    pub fn read_dense_with_shape(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let tensor = if self.encoded_keys.contains(key) {
+            let (source, device, _) = self.source.as_ref().expect("owned projection source");
+            source
+                .reader()
+                .read_dense_with_shape(key, shape, dtype, device)?
+        } else {
+            self.require(key)?.to_dtype(dtype)?
+        };
+        if shape.is_some_and(|(n, k)| tensor.dims() != [n, k]) {
+            return Err(CandleError::Msg(format!(
+                "{key}: expected matrix {shape:?}, got {:?}",
+                tensor.dims()
+            )));
+        }
+        Ok(tensor)
     }
 
     /// The destination device of a [`from_files_filtered_host_packed`](Self::from_files_filtered_host_packed)
@@ -516,17 +558,20 @@ impl Weights {
         // H3's immutable mixed-precision loader keeps F32 heads, F16 biases and the
         // W4A8/INT8 value validators below. Route checkpoint FP8 matrices to the same
         // logical source as stock VarBuilder instead of casting FP8 or consuming its scales twice.
-        let fp8_bases: std::collections::HashSet<_> = headers
+        let fp8_parameters: std::collections::HashSet<_> = headers
             .iter()
-            .filter_map(|(key, (_, dtype, _))| {
+            .filter(|(key, (_, dtype, _))| {
                 matches!(
                     dtype,
                     safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
-                )
-                .then(|| key.strip_suffix(".weight"))
-                .flatten()
-                .map(str::to_owned)
+                ) && key.as_str() != "scaled_fp8"
+                    && gen_core::checkpoint_codec::projection_companion_base(key).is_none()
             })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let fp8_bases: std::collections::HashSet<_> = fp8_parameters
+            .iter()
+            .filter_map(|key| key.strip_suffix(".weight").map(str::to_owned))
             .collect();
         let mut source_bases = fp8_bases.clone();
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
@@ -629,11 +674,13 @@ impl Weights {
                 .map_err(CandleError::Msg)?;
         }
         let in_source = |key: &str| {
-            key.rsplit_once('.')
-                .is_some_and(|(base, _)| source_bases.contains(base))
+            fp8_parameters.contains(key)
+                || key
+                    .rsplit_once('.')
+                    .is_some_and(|(base, _)| source_bases.contains(base))
         };
         let mut weights = Self::from_map(HashMap::new());
-        if !source_bases.is_empty() {
+        if !source_bases.is_empty() || !fp8_parameters.is_empty() {
             let paths: Vec<_> = files.iter().map(|p| p.as_ref().to_owned()).collect();
             let st = crate::loader::mmap_safetensors_multi(&paths)?;
             let source = candle_checkpoint::ProjectionSource::from_mapped_selected(
@@ -660,9 +707,10 @@ impl Weights {
             weights.source = Some((source, device.clone(), DType::BF16));
         }
         for (key, (_, stored_dtype, _)) in &headers {
-            if key
-                .rsplit_once('.')
-                .is_some_and(|(base, _)| fp8_bases.contains(base))
+            if weights.companion_keys.contains(key)
+                || key
+                    .rsplit_once('.')
+                    .is_some_and(|(base, _)| fp8_bases.contains(base))
             {
                 continue;
             }

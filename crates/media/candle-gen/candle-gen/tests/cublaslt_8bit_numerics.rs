@@ -579,6 +579,54 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
+    // The BFL activation is BF16 before row quantization. Preserve the consumer's
+    // F16/F32 scale product before adding its bias, including near rounding ties.
+    let mut identity = vec![0; k * k];
+    let row_scales: Vec<f32> = (0..k).map(|j| 1. + (5 + 2 * j) as f32 / 4096.).collect();
+    for i in 0..k {
+        identity[i * k + i] = F8E4M3::from_f32(1.).to_bits();
+    }
+    let scale_bytes: Vec<u8> = row_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let bias = (-1.0f32).to_le_bytes().repeat(k);
+    let path = tmp.path().join("rowwise-typed.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &identity)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+            ("proj.bias", TensorView::new(Dtype::F32, vec![k], &bias)?),
+        ],
+        None,
+        &path,
+    )?;
+    for output in [DType::F16, DType::F32] {
+        let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+        let op = candle_gen::candle_nn::linear(k, k, vb.pp("proj"))?;
+        assert_eq!(op.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+        let x = Tensor::from_slice(&vec![1.0f32 + 1. / 512.; k], (1, k), &dev)?.to_dtype(output)?;
+        let y = __model_proof_output!(op.forward(&x))?;
+        assert_eq!(y.dtype(), output);
+        assert_eq!(y.dims(), [1, k]);
+        let expected: Vec<f32> = row_scales
+            .iter()
+            .map(|&scale| {
+                let product = (448.0f32 * (1.0f32 / 448.0)) * scale;
+                match output {
+                    DType::F16 => half::f16::from_f32(product).to_f32() - 1.,
+                    _ => product - 1.,
+                }
+            })
+            .collect();
+        assert_eq!(
+            y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+            expected
+        );
+    }
     // The H3 Veda predictor has a separate per-head calibration and a frozen serial scorer.
     // The first coefficient rounds to one in BF16 only after applying its stored FP32 scale.
     use candle_gen::quant::veda_score::{self, Projection};
