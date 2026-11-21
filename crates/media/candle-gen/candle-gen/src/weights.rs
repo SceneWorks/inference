@@ -481,53 +481,14 @@ impl Weights {
     }
 
     pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {
-        self.projection_resources.int8_context(device)
+        Ok(self.projection_resources.int8_context(device)?)
     }
     pub fn convrot_rotation(&self, group: usize, device: &Device) -> Result<Tensor> {
-        self.projection_resources.convrot_rotation(group, device)
+        Ok(self.projection_resources.convrot_rotation(group, device)?)
     }
 }
 
-/// Model-scoped resources for native projections on a single device. Shared by eager maps
-/// and lazy logical readers across layers and successive block windows.
-#[derive(Default)]
-pub struct ProjectionResources {
-    int8: std::sync::Mutex<Option<crate::quant::Int8Context>>,
-    convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
-}
-
-impl ProjectionResources {
-    pub(crate) fn set_int8_context(&mut self, context: crate::quant::Int8Context) {
-        self.int8 = std::sync::Mutex::new(Some(context));
-    }
-    /// One lazy cuBLASLt handle/workspace for every native INT8 projection in this map.
-    pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {
-        let mut cached = self.int8.lock().unwrap_or_else(|p| p.into_inner());
-        if cached.is_none() {
-            *cached = Some(crate::quant::Int8Context::new(device)?);
-        }
-        Ok(cached.as_ref().expect("initialized above").clone())
-    }
-
-    /// Share one immutable rotation per group on this map's device (no per-layer matrix copies).
-    pub fn convrot_rotation(&self, group: usize, device: &Device) -> Result<Tensor> {
-        let mut cache = self
-            .convrot_rotations
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = cache.get(&group) {
-            if !r.device().same_device(device) {
-                return Err(CandleError::Msg(
-                    "ConvRot map contains multiple devices".into(),
-                ));
-            }
-            return Ok(r.clone());
-        }
-        let r = crate::quant::regular_hadamard(group, device)?;
-        cache.insert(group, r.clone());
-        Ok(r)
-    }
-}
+pub use candle_quant_kernels::convrot_int8::ProjectionResources;
 
 #[cfg(test)]
 mod tests {

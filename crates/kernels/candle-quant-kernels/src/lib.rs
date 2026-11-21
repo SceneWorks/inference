@@ -54,8 +54,12 @@ const _: fn() = || {
         __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
 };
 
+pub mod convrot;
+pub mod convrot_int8;
 pub mod cublaslt;
 pub mod decode_attention;
+#[cfg(feature = "cuda")]
+pub mod eight_bit_linear;
 pub mod flux3_quant;
 pub mod fused_decode;
 pub mod gated_delta;
