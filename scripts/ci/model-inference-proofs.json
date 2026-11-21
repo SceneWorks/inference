@@ -96010,6 +96010,60 @@
     "package": "candle-gen-sdxl",
     "target": "candle_gen_sdxl",
     "target_kind": "lib",
+    "fqn": "pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output",
+    "source": "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_sdxl",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "CPU SDXL img2img with fixture UNet, VAE encoder and decoder; crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output",
+    "configuration_source": "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-sdxl",
+    "target": "candle_gen_sdxl",
+    "target_kind": "lib",
     "fqn": "pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch",
     "source": "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs",
     "cargo_target_metadata": {

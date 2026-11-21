@@ -1465,26 +1465,34 @@ impl Pipeline {
     ) -> Result<Tensor> {
         let sched = sdxl_alpha_schedule()?;
         let ms = DiscreteModelSampling::sdxl(&sched);
-        // Native curated schedule = ComfyUI's SDXL default (`normal`); the scheduler axis overrides it.
-        let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
-        let full_sigmas =
-            candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-        let (sigmas, latents): (&[f32], Tensor) = if let Some(clean) = init_clean {
-            let raw_strength = req.strength.unwrap_or(crate::DEFAULT_EDIT_STRENGTH);
-            let start_step = gen_core::resolve_img2img_init_time_step(
-                full_sigmas.len().saturating_sub(1),
-                Some(raw_strength),
-            )
-            .map_err(CandleError::from)?;
-            let sliced = &full_sigmas[start_step..];
-            if sliced.len() <= 1 {
+        let unplanned_sigmas;
+        let sigmas = if let Some(run) = run {
+            // The compiled trajectory already applies img2img strength and owns every phase.
+            run.plan().denoise_sigmas()
+        } else {
+            // Native curated schedule = ComfyUI's SDXL default (`normal`).
+            let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
+            unplanned_sigmas =
+                candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+            let start = if init_clean.is_some() {
+                let strength = req.strength.unwrap_or(crate::DEFAULT_EDIT_STRENGTH);
+                gen_core::resolve_img2img_init_time_step(
+                    unplanned_sigmas.len().saturating_sub(1),
+                    Some(strength),
+                )?
+            } else {
+                0
+            };
+            &unplanned_sigmas[start..]
+        };
+        let latents = if let Some(clean) = init_clean {
+            if sigmas.len() <= 1 {
                 return Ok(clean.to_dtype(self.dtype)?);
             }
-            let blended = (clean + (init * sliced[0] as f64)?)?;
-            (sliced, blended)
+            (clean + (init * sigmas[0] as f64)?)?
         } else {
-            // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler (cast to f16 per eval).
-            (&full_sigmas, (init * full_sigmas[0] as f64)?)
+            // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler.
+            (init * sigmas[0] as f64)?
         };
         // Per-step latent preview (epic 16948, sc-16954). Opting in is the sc-16949 projector hook, so
         // the loop is not restructured and the driver owns frame numbering + the multi-eval dedup.
@@ -1557,41 +1565,20 @@ impl Pipeline {
             Ok(eps.to_dtype(DType::F32)?)
         };
         let out = match run {
-            Some(run) => {
-                let (run_sigmas, spans) = if init_clean.is_some() {
-                    let spans = match run.plan().low_res_start() {
-                        Some(low_res) if low_res.k > 0 => {
-                            let p0 = low_res.k.min(sigmas.len().saturating_sub(1));
-                            if p0 < sigmas.len().saturating_sub(1) {
-                                vec![0..p0, p0..sigmas.len().saturating_sub(1)]
-                            } else {
-                                std::iter::once(0..sigmas.len().saturating_sub(1)).collect()
-                            }
-                        }
-                        _ => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
-                    };
-                    (sigmas, spans)
-                } else {
-                    (
-                        run.plan().denoise_sigmas(),
-                        run.plan().denoise_spans().to_vec(),
-                    )
-                };
-                candle_gen::sampler::run_curated_sampler_spans(
-                    Some(sampler),
-                    &ms,
-                    run_sigmas,
-                    &spans,
-                    Some(run),
-                    false,
-                    latents,
-                    seed,
-                    &req.cancel,
-                    on_progress,
-                    Some(&preview),
-                    &mut predict,
-                )?
-            }
+            Some(run) => candle_gen::sampler::run_curated_sampler_spans(
+                Some(sampler),
+                &ms,
+                sigmas,
+                &run.plan().denoise_spans(),
+                Some(run),
+                false,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                &mut predict,
+            )?,
             None => candle_gen::run_curated_sampler(
                 Some(sampler),
                 &ms,
@@ -1635,23 +1622,10 @@ impl Pipeline {
         candle_gen::execution::runtime(latents.device(), latents.dtype());
         candle_gen::execution::schedule(sampler, sigmas, "Discrete/Eps/cfg_pp");
 
-        let spans = match run {
-            Some(run) if run.plan().denoise_sigmas().len() == sigmas.len() => {
-                run.plan().denoise_spans().to_vec()
-            }
-            Some(run) => match run.plan().low_res_start() {
-                Some(low_res) if low_res.k > 0 => {
-                    let p0 = low_res.k.min(sigmas.len().saturating_sub(1));
-                    if p0 < sigmas.len().saturating_sub(1) {
-                        vec![0..p0, p0..sigmas.len().saturating_sub(1)]
-                    } else {
-                        std::iter::once(0..sigmas.len().saturating_sub(1)).collect()
-                    }
-                }
-                _ => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
-            },
-            None => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
-        };
+        let spans = run.map_or_else(
+            || std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
+            |run| run.plan().denoise_spans(),
+        );
 
         let predict_pair = |x_in: &Tensor, t: f32| -> gen_core::Result<(Tensor, Tensor)> {
             let (eps_u, eps_c) = if crate::sequential_cfg_enabled() {
@@ -2711,6 +2685,107 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch");
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn planned_img2img_inert_split_preserves_resident_and_staged_output() {
+        use candle_gen::candle_nn::VarMap;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let vars = VarMap::new();
+        let unet = SdxlUnet::Vendored(Arc::new(
+            VendoredUNet::new(
+                VarBuilder::from_varmap(&vars, dtype, &device),
+                4,
+                4,
+                false,
+                tiny_unet_cfg(),
+            )
+            .unwrap(),
+        ));
+        let vae = tiny_sdxl_vae(&device);
+        let encoder_vars = VarMap::new();
+        crate::unet::VaeMomentsEncoder::new(
+            VarBuilder::from_varmap(&encoder_vars, dtype, &device),
+            VAE_SCALE,
+        )
+        .unwrap();
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let vae_path = fixture_dir.path().join("vae.safetensors");
+        encoder_vars.save(&vae_path).unwrap();
+        drop(encoder_vars);
+        let mut pipe = decode_test_pipeline(&device);
+        pipe.vae_fix = Some(WeightsSource::File(vae_path));
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 32,
+            height: 32,
+            steps: Some(8),
+            seed: Some(7),
+            guidance: Some(7.0),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            source_image: Some(Image {
+                width: 32,
+                height: 32,
+                pixels: (0..32 * 32 * 3).map(|i| (i % 251) as u8).collect(),
+            }),
+            strength: Some(0.5),
+            ..Default::default()
+        };
+        let spec = crate::tests::sdxl_spec(WeightsSource::Dir("/nonexistent/sdxl".into()));
+        let plan = crate::compile_sdxl(&spec, &req).unwrap().unwrap();
+        let split = plan.clone().with_inert_split_at(2).unwrap();
+        assert_eq!(plan.denoise_sigmas(), split.denoise_sigmas());
+        assert_eq!(plan.denoise_spans(), vec![0..4]);
+        assert_eq!(split.denoise_spans(), vec![0..2, 2..4]);
+        let embeddings = Tensor::full(0.4f32, (2, 5, 16), &device).unwrap();
+
+        let generate = |plan, staged| {
+            let run = gen_core::RenderRun::new(plan, &req.cancel, None);
+            run.encode(|| Ok::<_, CandleError>(())).unwrap();
+            run.begin_rendering().unwrap();
+            let mut steps = Vec::new();
+            let mut progress = |event| {
+                if let Progress::Step { current, total } = event {
+                    steps.push((current, total));
+                }
+            };
+            let images = if staged {
+                let latents = pipe
+                    .denoise_images(&req, &embeddings, &unet, Some(&run), &mut progress)
+                    .unwrap();
+                pipe.decode_images(&req, &latents, &vae, None, Some(&run), &mut progress)
+                    .unwrap()
+            } else {
+                pipe.render(
+                    &req,
+                    &embeddings,
+                    &unet,
+                    &vae,
+                    None,
+                    Some(&run),
+                    &mut progress,
+                )
+                .unwrap()
+            };
+            run.finish_rendering();
+            assert_eq!(steps, [(1, 4), (2, 4), (3, 4), (4, 4)]);
+            assert_eq!(images.len(), 1);
+            images.into_iter().next().unwrap().pixels
+        };
+
+        let resident = generate(&plan, false);
+        assert_eq!(generate(&split, false), resident);
+        let staged = generate(&plan, true);
+        assert_eq!(generate(&split, true), staged);
+        assert_eq!(staged, resident);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::planned_img2img_inert_split_preserves_resident_and_staged_output");
     }
 
     #[test]
