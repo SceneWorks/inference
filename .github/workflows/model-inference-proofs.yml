@@ -51,7 +51,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
-          fetch-depth: ${{ env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' && '0' || '1' }}
+          # The adapter pair verifies the exact ENG-4a ancestor with bounded candidate history.
+          fetch-depth: ${{ env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' && '128' || '1' }}
           persist-credentials: false
       - name: Install pinned uv on Linux
         if: runner.os == 'Linux'
@@ -106,7 +107,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
-          fetch-depth: ${{ env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' && '0' || '1' }}
+          fetch-depth: ${{ env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' && '128' || '1' }}
           persist-credentials: false
       - name: Check out the exact pre-migration engine for the paired proof
         if: matrix.asset_setup == 'flux1-comparison'
