@@ -47,10 +47,7 @@ struct FluxImageProjModel {
 
 impl FluxImageProjModel {
     fn from_weights(w: &Weights, prefix: &str) -> GenResult<Self> {
-        let proj = Linear::new(
-            w.require(&format!("{prefix}.proj.weight"))?,
-            Some(w.require(&format!("{prefix}.proj.bias"))?),
-        );
+        let proj = w.linear(&format!("{prefix}.proj"), true)?;
         let norm = LayerNorm::new(
             w.require(&format!("{prefix}.norm.weight"))?,
             w.require(&format!("{prefix}.norm.bias"))?,
@@ -92,14 +89,8 @@ impl FluxIpAdapter {
         let mut blocks = Vec::with_capacity(NUM_DOUBLE_BLOCKS);
         for i in 0..NUM_DOUBLE_BLOCKS {
             let p = format!("double_blocks.{i}.processor.ip_adapter_double_stream");
-            let k = Linear::new(
-                w.require(&format!("{p}_k_proj.weight"))?,
-                Some(w.require(&format!("{p}_k_proj.bias"))?),
-            );
-            let v = Linear::new(
-                w.require(&format!("{p}_v_proj.weight"))?,
-                Some(w.require(&format!("{p}_v_proj.bias"))?),
-            );
+            let k = w.linear(&format!("{p}_k_proj"), true)?;
+            let v = w.linear(&format!("{p}_v_proj"), true)?;
             blocks.push((k, v));
         }
         let extra = format!(

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 struct State {
     rows: BTreeMap<usize, (ExecutionRepresentation, u64)>,
     dense_layouts: BTreeMap<usize, (Vec<usize>, usize)>,
+    coefficient_caches: BTreeMap<(usize, Option<usize>), (Vec<usize>, WeightEncoding, u64)>,
     slices: BTreeMap<usize, MatrixSlices>,
 }
 #[derive(Clone)]
@@ -82,6 +83,38 @@ impl CheckpointReadAccounting {
             .get(key)
             .copied()
             .ok_or_else(|| Error::Msg(format!("unknown measured checkpoint row {key:?}")))
+    }
+
+    /// A matrix operator may additionally retain a decoded weight for a coefficient consumer.
+    /// Account for both allocations while assigning the original bytes only to the native operand.
+    pub fn record_coefficient_cache(
+        &self,
+        key: &str,
+        first_row: Option<usize>,
+        shape: &[usize],
+        dtype: WeightEncoding,
+        bytes: u64,
+    ) -> Result<()> {
+        let i = self.index(key)?;
+        if !matches!(
+            dtype,
+            WeightEncoding::DenseF16
+                | WeightEncoding::DenseBf16
+                | WeightEncoding::DenseF32
+                | WeightEncoding::DenseF64
+        ) || shape
+            .iter()
+            .try_fold(dtype.element_bytes(), |n, &d| n.checked_mul(d as u64))
+            != Some(bytes)
+        {
+            return Err(format!("{key}: inconsistent cached coefficient layout").into());
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coefficient_caches
+            .insert((i, first_row), (shape.to_vec(), dtype, bytes));
+        Ok(())
     }
 
     /// Specify the requested dense compute width and unpadded logical geometry before materialization.
@@ -384,6 +417,26 @@ impl CheckpointReadAccounting {
                 }
             }
         }
+        for (&(i, first), (shape, dtype, bytes)) in &state.coefficient_caches {
+            let mut child = self.plan.tensors[i].clone();
+            child.logical_key = match first {
+                Some(row) => format!("{}[{row}]::coefficients", child.logical_key),
+                None => format!("{}::coefficients", child.logical_key),
+            };
+            child.physical_key = child.logical_key.clone();
+            child.shape = shape.clone();
+            child.source_bytes = 0;
+            child.resident_encoding = *dtype;
+            child.transform = None;
+            child.residency.mode = ResidencyMode::Dense;
+            child.residency.resident_bytes = *bytes;
+            let n = plan.tensors.len();
+            plan.to_mut().tensors.push(child);
+            measured
+                .to_mut()
+                .rows
+                .insert(n, (ExecutionRepresentation::DenseFallback, *bytes));
+        }
         (plan, measured)
     }
 
@@ -396,7 +449,9 @@ impl CheckpointReadAccounting {
     pub fn facts(&self) -> Result<CheckpointWeightFacts> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (mut plan, measured) = self.resolved(&state);
-        Self::apply_dense_layouts(plan.to_mut(), &state);
+        if !state.dense_layouts.is_empty() {
+            Self::apply_dense_layouts(plan.to_mut(), &state);
+        }
         let receipt = Self::receipt_for(&plan, &measured);
         CheckpointWeightFacts::new(plan.as_ref(), self.capability.clone(), receipt)
             .map_err(|e| Error::Msg(e.to_string()))

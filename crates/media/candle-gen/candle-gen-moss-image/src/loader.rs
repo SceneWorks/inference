@@ -1,6 +1,5 @@
 //! Exact prepared asset identities, authenticated before any backend tensor allocation.
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, weightsmeta, CancelFlag, LoadSpec, PinnedWeightsFile, WeightsSource,
 };
@@ -634,14 +633,11 @@ impl Sources {
             ],
             cancel,
         )?;
-        let map = weights
-            .keys()
-            .map(|k| Ok((k.clone(), weights.require(k)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
+        let vb = weights.into_var_builder(DType::F32, device);
         #[cfg(feature = "test-support")]
         if self.is_fixture() {
             return Ok(Flux2Vae::from_fixture_widths(
-                VarBuilder::from_tensors(map, DType::F32, device),
+                vb,
                 [32; 4],
                 &Flux2VaeDecoderConfig {
                     block_out_channels: [32; 4],
@@ -649,7 +645,7 @@ impl Sources {
             )?);
         }
         Ok(Flux2Vae::new_with_encoder_and_decoder_config(
-            VarBuilder::from_tensors(map, DType::F32, device),
+            vb,
             &Flux2VaeDecoderConfig {
                 block_out_channels: if self.is_fixture() {
                     [32; 4]
@@ -689,12 +685,9 @@ impl Sources {
             &["language_model."],
             cancel,
         )?;
-        let map = w
-            .keys()
-            .map(|k| Ok((k.clone(), w.require(k)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
+        let (plain, source) = w.into_checkpoint_parts();
         Qwen35Model::from_weights_headless(
-            &candle_llm::primitives::Weights::from_map(map, device.clone()),
+            &candle_llm::primitives::Weights::from_checkpoint_parts(plain, source, device.clone()),
             MOSS_TEXT_ENCODER_PREFIX,
             self.text_config.clone(),
         )
@@ -713,12 +706,9 @@ impl Sources {
                 "bn.running_var",
             ],
         )?;
-        let map = weights
-            .keys()
-            .map(|k| Ok((k.clone(), weights.require(k)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
+        let vb = weights.into_var_builder(DType::F32, device);
         Ok(Flux2Vae::new_with_decoder_config(
-            VarBuilder::from_tensors(map, DType::F32, device),
+            vb,
             &Flux2VaeDecoderConfig {
                 block_out_channels: if self.is_fixture() {
                     [32; 4]
@@ -1101,16 +1091,56 @@ pub(crate) fn load_weights_cancellable(
     prefixes: &[&str],
     cancel: &CancelFlag,
 ) -> Result<Weights> {
-    let mut map = HashMap::new();
-    for a in assets
+    let selected_assets: Vec<_> = assets
         .iter()
         .filter(|a| a.role == role && a.relative.ends_with(".safetensors"))
-    {
+        .collect();
+    // Dense published components keep their one-shard-at-a-time allocation. For encoded
+    // components, hold the exact authenticated source bytes needed by the shared projection.
+    let paths: Vec<_> = selected_assets
+        .iter()
+        .map(|a| a.pin.canonical_target_path().to_owned())
+        .collect();
+    let mut map = HashMap::new();
+    for (index, a) in selected_assets.iter().enumerate() {
         crate::transformer::check_cancel(cancel)?;
         let bytes = a.authenticated_bytes()?;
         crate::transformer::check_cancel(cancel)?;
         let safetensors = candle_gen::candle_core::safetensors::SliceSafetensors::new(&bytes)?;
-        for (k, _) in safetensors.tensors() {
+        let views = safetensors.tensors();
+        if views.iter().any(|(name, view)| {
+            prefixes.iter().any(|p| name.starts_with(p))
+                && (matches!(
+                    view.dtype(),
+                    safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
+                ) || name.ends_with(".comfy_quant")
+                    || name.ends_with(".weight_scale"))
+        }) {
+            drop(map);
+            let mut current = Some(bytes);
+            return Weights::from_authenticated_buffers(
+                &paths,
+                selected_assets.iter().enumerate().map(|(n, asset)| {
+                    crate::transformer::check_cancel(cancel)
+                        .map_err(candle_gen::candle_core::Error::wrap)?;
+                    if n == index {
+                        return current.take().ok_or_else(|| {
+                            candle_gen::candle_core::Error::Msg(
+                                "duplicate authenticated shard".into(),
+                            )
+                        });
+                    }
+                    asset
+                        .authenticated_bytes()
+                        .map_err(candle_gen::candle_core::Error::wrap)
+                }),
+                device,
+                dtype,
+                prefixes,
+                || crate::transformer::check_cancel(cancel),
+            );
+        }
+        for (k, _) in views {
             crate::transformer::check_cancel(cancel)?;
             if !prefixes.iter().any(|p| k.starts_with(p)) {
                 continue;

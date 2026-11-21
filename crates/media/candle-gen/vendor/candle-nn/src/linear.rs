@@ -26,6 +26,10 @@ use std::sync::{Arc, OnceLock};
 pub trait NativeLinearWeight: Send + Sync {
     fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>;
     fn dense_weight(&self) -> Result<Tensor>;
+    /// Called when the owning Linear caches a coefficient copy in addition to this operand.
+    fn retained_coefficients(&self, _tensor: &Tensor) -> Result<()> {
+        Ok(())
+    }
     fn compute_dtype(&self) -> candle::DType {
         candle::DType::BF16
     }
@@ -74,6 +78,18 @@ impl Linear {
         }
     }
 
+    /// Read the checkpoint's own matrix geometry. Dimensioned constructors continue validating
+    /// the caller's expectation; this form is for architectures whose matrix width is inferred.
+    pub fn from_var_builder(vb: &crate::VarBuilder<'_>, with_bias: bool) -> Result<Self> {
+        let bias = with_bias.then(|| vb.get_unchecked("bias")).transpose()?;
+        if let Some(op) = vb.native_linear_weight("weight")? {
+            return Ok(Self::from_native(op, bias));
+        }
+        let weight = vb.get_unchecked("weight")?;
+        weight.dims2()?;
+        Ok(Self::new(weight, bias))
+    }
+
     pub fn from_native(projection: Arc<dyn NativeLinearWeight>, bias: Option<Tensor>) -> Self {
         Self {
             weight: Weight::Native {
@@ -102,7 +118,15 @@ impl Linear {
     }
     pub fn native_resident_bytes(&self) -> Option<u64> {
         match &self.weight {
-            Weight::Native { projection, .. } => Some(projection.resident_bytes()),
+            Weight::Native {
+                projection,
+                decoded,
+            } => Some(
+                projection.resident_bytes()
+                    + decoded
+                        .get()
+                        .map_or(0, |t| (t.elem_count() * t.dtype().size_in_bytes()) as u64),
+            ),
             Weight::Dense(_) => None,
         }
     }
@@ -132,7 +156,9 @@ impl Linear {
                 if decoded.get().is_none() {
                     let _ = decoded.set(projection.dense_weight()?);
                 }
-                Ok(decoded.get().expect("decoded weight initialized above"))
+                let tensor = decoded.get().expect("decoded weight initialized above");
+                projection.retained_coefficients(tensor)?;
+                Ok(tensor)
             }
         }
     }

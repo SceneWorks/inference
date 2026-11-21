@@ -2344,6 +2344,7 @@ mod tests {
                 fp8_e4m3_native: true,
                 ..CandleCodecResidency::DENSE
             },
+            false,
         )
     }
 

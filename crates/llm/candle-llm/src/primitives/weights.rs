@@ -64,6 +64,21 @@ impl Weights {
         }
     }
 
+    /// Adopt a pre-authenticated provider component without forcing its stored projections
+    /// through a dense coefficient map.
+    pub fn from_checkpoint_parts(
+        tensors: HashMap<String, Tensor>,
+        source: Option<ProjectionSource>,
+        device: Device,
+    ) -> Self {
+        let mut out = Self::from_map(tensors, device);
+        if let Some(source) = source {
+            out.encoded = Self::encoded_rows(&source, &out.device, None);
+            out.source = Some(source);
+        }
+        out
+    }
+
     /// Load every tensor from a single `.safetensors` file onto `device`.
     pub fn from_file(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let path = path.as_ref();
@@ -216,21 +231,7 @@ impl Weights {
                     .collect::<std::collections::HashSet<_>>();
                 let tensors =
                     Self::plain_tensors(source.mmap(), device, place, host_packed, Some(&claimed))?;
-                let encoded = plan
-                    .tensors
-                    .iter()
-                    .map(|row| {
-                        let key = &row.logical_key;
-                        (
-                            key.clone(),
-                            EncodedRow {
-                                key: key.clone(),
-                                device: place.map_or_else(|| device.clone(), |p| p(key)),
-                                dense: OnceLock::new(),
-                            },
-                        )
-                    })
-                    .collect();
+                let encoded = Self::encoded_rows(&source, device, place);
                 Ok(Self {
                     tensors,
                     device: device.clone(),
@@ -240,6 +241,30 @@ impl Weights {
                 })
             }
         }
+    }
+
+    fn encoded_rows(
+        source: &ProjectionSource,
+        device: &Device,
+        place: Option<&dyn Fn(&str) -> Device>,
+    ) -> HashMap<String, EncodedRow> {
+        source
+            .reader()
+            .plan()
+            .tensors
+            .iter()
+            .map(|row| {
+                let key = &row.logical_key;
+                (
+                    key.clone(),
+                    EncodedRow {
+                        key: key.clone(),
+                        device: place.map_or_else(|| device.clone(), |p| p(key)),
+                        dense: OnceLock::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn plain_tensors(

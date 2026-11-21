@@ -179,7 +179,9 @@ impl ProjectionSourceHeaders {
         })
     }
 
-    fn select(
+    /// Compile a view of a provider-owned, validated physical source inventory. Descriptor bytes
+    /// must come from the same immutable source as these header rows.
+    pub fn select(
         source: BTreeMap<String, SafetensorsTensorHeader>,
         selected: impl Fn(&str) -> bool,
         tables: &[String],
