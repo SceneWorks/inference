@@ -22,7 +22,7 @@
 //!   * `fp8-e4m3-scalar-v1`: a CUDA device at the sm_89 floor (`CublasLt::meets_fp8_floor`, via
 //!     [`candle_quant_kernels::FP8_COMPUTE_CAP_FLOOR`]; locked decision 7), a rank-2 E4M3 weight, and no
 //!     `full_precision_matrix_mult` flag. The reader keeps the stored `F8E4M3` codes + f32 scale
-//!     resident ([`LogicalTensor::PackedFp8E4M3`]), the exact operands `CublasLt::matmul_fp8`
+//!     resident ([`LogicalTensor::PackedScalarFp8`]), the exact operands `CublasLt::matmul_fp8`
 //!     consumes. On a build without the `cuda` feature a `Packed` fp8 plan entry is a typed
 //!     refusal — never a silent dense substitution of what admission priced as packed.
 //!   * `nvfp4-v1` (sc-20641): a CUDA device at the sm_120 floor (via
@@ -64,9 +64,6 @@ use candle_core::safetensors::{self as cst, MmapedSafetensors};
 use candle_core::{DType, Device, Tensor};
 use candle_core::{Error as CandleError, Result};
 
-/// Descriptor payloads are tiny JSON blobs; anything above this is not a `.comfy_quant` tensor.
-const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
-
 /// The codec rows this engine implements and registers — identical to the MLX table (codecs are
 /// backend-portable declarations; each engine owns its implementation).
 pub const BASELINE_CODECS: &[CheckpointCodecRegistration] =
@@ -81,6 +78,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     FP8_E4M3_SCALAR_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
+    gen_core::convrot_int8::CODEC_ID,
     INT8_PER_ROW_CODEC.codec_id,
     NVFP4_CODEC.codec_id,
 ];
@@ -134,7 +132,11 @@ impl CandleCodecResidency {
     pub fn native_execution_capability(&self) -> NativeExecutionCapability {
         let mut ids: Vec<&'static str> = Vec::new();
         if self.fp8_e4m3_native {
-            ids.push(FP8_E4M3_SCALAR_CODEC.codec_id);
+            ids.extend([
+                FP8_E4M3_SCALAR_CODEC.codec_id,
+                FP8_E5M2_SCALAR_CODEC.codec_id,
+            ]);
+            ids.push(gen_core::convrot_int8::CODEC_ID);
         }
         if self.nvfp4_native {
             ids.push(NVFP4_CODEC.codec_id);
@@ -186,6 +188,13 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         if spec.full_precision_matrix_mult() {
             return ResidencyMode::Dense;
         }
+        if let TensorCodecSpec::ConvRotInt8 { geometry, .. } = spec {
+            return if self.fp8_e4m3_native && geometry.out_features.is_multiple_of(16) {
+                ResidencyMode::Packed
+            } else {
+                ResidencyMode::Dense
+            };
+        }
         // The scalar E4M3 row. The plain undescribed cast (unit scale) qualifies too:
         // `matmul_fp8` takes any f32 weight scale.
         //
@@ -198,7 +207,11 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         // backend disagreement about the same file, so the floor is enforced here, at plan time,
         // where the fallback is the dense decode both backends share.
         if self.fp8_e4m3_native
-            && codec.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id
+            && [
+                FP8_E4M3_SCALAR_CODEC.codec_id,
+                FP8_E5M2_SCALAR_CODEC.codec_id,
+            ]
+            .contains(&codec.codec_id)
             && candle_quant_kernels::cublaslt::eight_bit_layout_supported(stored_shape)
         {
             return ResidencyMode::Packed;
@@ -288,43 +301,28 @@ pub fn plan_logical_weights(
     mapping: &dyn LogicalKeyMapping,
     residency: &dyn CodecResidencyPolicy,
 ) -> Result<LogicalWeightPlan> {
-    let headers = gen_core::safetensors_path_tensor_headers(path)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    let descriptors = gen_core::read_safetensors_tensor_payloads(
+    gen_core::checkpoint_codec::plan_safetensors(
         path,
-        |header| header.name.ends_with(".comfy_quant"),
-        MAX_DESCRIPTOR_BYTES,
-    )
-    .map_err(|error| CandleError::Msg(error.to_string()))?;
-    // A checkpoint declares its quantization per layer (`.comfy_quant` tensors), file-wide
-    // (`__metadata__._quantization_metadata`, sc-20641), or not at all; both routes are read and
-    // the compiler refuses a layer the two disagree about.
-    let quantization_metadata = gen_core::safetensors_path_quantization_metadata(path)
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-    gen_core::compile_logical_weight_plan_with_metadata(
-        &headers,
-        &descriptors,
-        quantization_metadata.as_deref(),
         mapping,
         baseline_codec_registry(),
         residency,
     )
-    .map_err(|error| {
-        CandleError::Msg(format!(
-            "logical weight plan for {} ({}): {error}",
-            path.display(),
-            mapping.mapping_id()
-        ))
-    })
+    .map_err(|e| CandleError::Msg(e.to_string()))
 }
 
 /// One decoded logical tensor.
 pub enum LogicalTensor {
+    /// Exact two's-complement storage bytes, F32 row scales, and required online rotation.
+    PackedConvRot {
+        codes: Tensor,
+        scales: Tensor,
+        geometry: gen_core::convrot_int8::ConvRotInt8,
+    },
     /// The dense resident form (pass-through dtype for dense rows, bf16 for dequantized rows).
     Dense(Tensor),
     /// The packed-native fp8 E4M3 form: the stored codes (dtype `F8E4M3`, on device) plus the
     /// per-tensor scales — exactly the `CublasLt::matmul_fp8` weight-side operands.
-    PackedFp8E4M3 {
+    PackedScalarFp8 {
         codes: Tensor,
         /// The `weight_scale` value (1.0 for the plain undescribed cast).
         weight_scale: f32,
@@ -346,7 +344,7 @@ pub enum LogicalTensor {
     /// The packed-native NVFP4 form (sc-20641): the checkpoint's E2M1 nibbles and both scale levels
     /// repacked into the canonical container [`candle_quant_kernels::Nvfp4Linear::from_packed_in`] consumes.
     ///
-    /// Unlike [`Self::PackedFp8E4M3`] this variant is **not** `cuda`-gated. `Nvfp4Tensor` is a host
+    /// Unlike [`Self::PackedScalarFp8`] this variant is **not** `cuda`-gated. `Nvfp4Tensor` is a host
     /// container (`Vec<u8>` nibbles + scales), so the repack is pure host code that is correct — and
     /// testable — on every lane; only the *decision* to plan `Packed` is hardware-gated, by
     /// [`CandleCodecResidency::nvfp4_native`]. Uploading it to the FP4 GEMM is `Nvfp4Linear`'s job
@@ -370,8 +368,11 @@ impl LogicalTensor {
         /// One retained `f32` scale.
         const SCALE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
         match self {
+            Self::PackedConvRot { codes, scales, .. } => {
+                (codes.elem_count() + scales.elem_count() * scales.dtype().size_in_bytes()) as u64
+            }
             Self::Dense(tensor) => (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64,
-            Self::PackedFp8E4M3 {
+            Self::PackedScalarFp8 {
                 codes,
                 weight_scale_from_companion,
                 input_scale,
@@ -483,7 +484,7 @@ pub fn read_logical_weights(
 ///   receipt remain the independent pair the contract requires. A companion's source bytes are
 ///   attributed to its owner's codec row only once that owner has materialized.
 pub struct LogicalWeightReader {
-    st: MmapedSafetensors,
+    pub(crate) st: MmapedSafetensors,
     #[cfg(feature = "cuda")]
     fp8_context: std::sync::Mutex<Option<candle_quant_kernels::cublaslt::Int8Context>>,
     plan: LogicalWeightPlan,
@@ -566,13 +567,22 @@ impl LogicalWeightReader {
                 path.display(),
             )));
         }
+        Ok(Self::from_mapped(st, plan, device, capability))
+    }
+
+    pub(crate) fn from_mapped(
+        st: MmapedSafetensors,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+    ) -> Self {
         let by_logical_key = plan
             .tensors
             .iter()
             .enumerate()
             .map(|(index, tensor)| (tensor.logical_key.clone(), index))
             .collect();
-        Ok(Self {
+        Self {
             st,
             plan,
             device: device.clone(),
@@ -582,13 +592,17 @@ impl LogicalWeightReader {
             measured: std::sync::Mutex::new(BTreeMap::new()),
             demoted: std::sync::Mutex::new(BTreeMap::new()),
             capability,
-        })
+        }
     }
 
     /// Whether the native projection constructor owns this row of the compiled plan.
     pub fn has_native_projection(&self, key: &str) -> bool {
         self.planned(key).is_some_and(|row| {
-            row.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id
+            [
+                FP8_E4M3_SCALAR_CODEC.codec_id,
+                FP8_E5M2_SCALAR_CODEC.codec_id,
+            ]
+            .contains(&row.codec_id)
                 && row.residency.mode == ResidencyMode::Packed
         })
     }
@@ -606,7 +620,7 @@ impl LogicalWeightReader {
         }
         #[cfg(feature = "cuda")]
         {
-            let LogicalTensor::PackedFp8E4M3 {
+            let LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale,
                 input_scale,
@@ -623,7 +637,9 @@ impl LogicalWeightReader {
                     .lock()
                     .map_err(|_| CandleError::Msg("FP8 context lock poisoned".into()))?;
                 if context.is_none() {
-                    *context = Some(candle_quant_kernels::cublaslt::Int8Context::new(&self.device)?);
+                    *context = Some(candle_quant_kernels::cublaslt::Int8Context::new(
+                        &self.device,
+                    )?);
                 }
                 context
                     .as_ref()
@@ -631,9 +647,13 @@ impl LogicalWeightReader {
                     .handle_for(&self.device)?
                     .clone()
             };
-            Ok(Some(candle_quant_kernels::fp8_linear::Fp8Linear::from_parts(
-                codes, weight_scale, input_scale, bias, lt,
-            )?))
+            use candle_quant_kernels::fp8_linear::Fp8Linear;
+            let build = if codes.dtype() == DType::U8 {
+                Fp8Linear::from_e5m2_parts
+            } else {
+                Fp8Linear::from_parts
+            };
+            Ok(Some(build(codes, weight_scale, input_scale, bias, lt)?))
         }
     }
 
@@ -719,6 +739,28 @@ impl LogicalWeightReader {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(logical_key.to_owned(), decoded.resident_bytes());
         Ok(decoded)
+    }
+
+    /// Read a true dense operand for a caller that needs coefficients (embedding, convolution,
+    /// weight fusion), accounting for the actual storage when its plan priced a GEMM.
+    pub fn read_dense(&self, key: &str, dtype: DType, device: &Device) -> Result<Tensor> {
+        let row = self
+            .planned(key)
+            .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
+        let mut dense = row.clone();
+        dense.residency.mode = ResidencyMode::Dense;
+        let LogicalTensor::Dense(t) = decode(&self.st, &dense, device)? else {
+            candle_core::bail!("{key}: checkpoint operand has no dense coefficient representation")
+        };
+        let bytes = (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        self.measured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_owned(), bytes);
+        if row.residency.mode == ResidencyMode::Packed {
+            self.demote_to_dense_fallback(key, bytes)?;
+        }
+        t.to_dtype(dtype)
     }
 
     /// The receipt **measured** over everything materialized through [`Self::read`] so far.
@@ -987,8 +1029,12 @@ fn decode(
                             .as_deref()
                             .map(|key| scalar_f32(companion_bytes(st, tensor, key)?, key))
                             .transpose()?;
-                        let codes = st.load(&tensor.physical_key, device)?;
-                        LogicalTensor::PackedFp8E4M3 {
+                        let codes = if tensor.encoding == WeightEncoding::Fp8E5M2 {
+                            Tensor::from_raw_buffer(view.data(), DType::U8, source_shape, device)?
+                        } else {
+                            st.load(&tensor.physical_key, device)?
+                        };
+                        LogicalTensor::PackedScalarFp8 {
                             codes,
                             weight_scale,
                             weight_scale_from_companion,
@@ -1139,6 +1185,85 @@ fn decode(
                 }
             }
         }
+        TensorCodecSpec::ConvRotInt8 { scale, geometry } => {
+            guard_stored(
+                tensor,
+                view.dtype(),
+                view.shape(),
+                StDtype::I8,
+                source_shape,
+            )?;
+            let companion = st.get(scale)?;
+            let shape = [geometry.out_features, geometry.in_features];
+            if tensor.residency.mode != ResidencyMode::Packed
+                || shape != source_shape
+                || companion.dtype() != StDtype::F32
+                || companion.shape() != [geometry.out_features, 1]
+            {
+                return Err(CandleError::Msg(format!(
+                    "{}: expected native ConvRot I8 matrix and F32 row scales",
+                    tensor.physical_key
+                )));
+            }
+            let (start, n) = match &tensor.transform {
+                None => (0, geometry.out_features),
+                Some(t) => (t.rows.start, t.rows.len),
+            };
+            let k = geometry.in_features;
+            if start > geometry.out_features
+                || n > geometry.out_features - start
+                || tensor.shape.as_slice() != [n, k]
+            {
+                return Err(CandleError::Msg(format!(
+                    "{}: ConvRot row slice is outside stored weights",
+                    tensor.logical_key
+                )));
+            }
+            let slice = gen_core::convrot_int8::ConvRotInt8::from_geometry(
+                geometry.rotation_group,
+                &[n, k],
+                &[n, 1],
+            )
+            .map_err(CandleError::Msg)?;
+            let scale_bytes = &companion.data()[start * 4..(start + n) * 4];
+            cst::read_source_bytes(scale_bytes, |bytes| {
+                slice.validate_scale_values(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                )
+            })
+            .map_err(CandleError::Msg)?;
+            let codes = Tensor::from_raw_buffer(
+                &view.data()[start * k..(start + n) * k],
+                DType::U8,
+                &[n, k],
+                device,
+            )?;
+            let scales = Tensor::from_raw_buffer(scale_bytes, DType::F32, &[n, 1], device)?;
+            let (codes, scales) = if tensor.transform.as_ref().is_some_and(|t| t.half_swap) {
+                if !n.is_multiple_of(2) {
+                    return Err(CandleError::Msg(format!(
+                        "{}: odd ConvRot half swap",
+                        tensor.logical_key
+                    )));
+                }
+                let half_swap = |x: Tensor| {
+                    candle_core::Tensor::cat(
+                        &[x.narrow(0, n / 2, n / 2)?, x.narrow(0, 0, n / 2)?],
+                        0,
+                    )
+                };
+                (half_swap(codes)?, half_swap(scales)?)
+            } else {
+                (codes, scales)
+            };
+            return Ok(LogicalTensor::PackedConvRot {
+                codes,
+                scales,
+                geometry: slice,
+            });
+        }
         TensorCodecSpec::Int8PerRow { scale, .. } => {
             guard_stored(
                 tensor,
@@ -1200,12 +1325,18 @@ fn decode(
 /// its bytes and [`LogicalTensor::resident_bytes`] measures the slice rather than the whole source
 /// buffer it was cut from — the measurement the receipt is built on.
 #[doc(hidden)]
-pub fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result<LogicalTensor> {
+pub fn apply_transform(
+    tensor: &LogicalTensorPlan,
+    decoded: LogicalTensor,
+) -> Result<LogicalTensor> {
     let Some(transform) = tensor.transform.as_ref() else {
         return Ok(decoded);
     };
     let (start, len) = (transform.rows.start, transform.rows.len);
     match decoded {
+        LogicalTensor::PackedConvRot { .. } => Err(CandleError::Msg(
+            "ConvRot slices read directly from source".into(),
+        )),
         LogicalTensor::Dense(dense) => {
             let sliced = dense.narrow(0, start, len)?;
             let out = if transform.half_swap {
@@ -1219,7 +1350,7 @@ pub fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Re
             };
             Ok(LogicalTensor::Dense(out))
         }
-        LogicalTensor::PackedFp8E4M3 {
+        LogicalTensor::PackedScalarFp8 {
             codes,
             weight_scale,
             weight_scale_from_companion,
@@ -1232,7 +1363,7 @@ pub fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Re
             if transform.half_swap {
                 return Err(half_swap_on_packed(tensor));
             }
-            Ok(LogicalTensor::PackedFp8E4M3 {
+            Ok(LogicalTensor::PackedScalarFp8 {
                 codes: codes.narrow(0, start, len)?.contiguous()?,
                 weight_scale,
                 weight_scale_from_companion,
@@ -1281,4 +1412,3 @@ fn half_swap_on_packed(tensor: &LogicalTensorPlan) -> CandleError {
         tensor.codec_id, tensor.physical_key, tensor.logical_key
     ))
 }
-

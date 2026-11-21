@@ -9,8 +9,10 @@
 //! Callers keep the `Nvfp4Tensor::from_kitchen_parts(...)` spelling by bringing
 //! [`Nvfp4KitchenExt`] into scope.
 
-use candle_quant_kernels::nvfp4::{non_finite_msg, Nvfp4Tensor, NVFP4_BLOCK, SF_ATOM_COLS, SF_ATOM_ROWS};
 use candle_core::Result;
+use candle_quant_kernels::nvfp4::{
+    non_finite_msg, Nvfp4Tensor, NVFP4_BLOCK, SF_ATOM_COLS, SF_ATOM_ROWS,
+};
 
 /// The Kitchen constructor for [`Nvfp4Tensor`]. A trait only because the container lives in the
 /// shared codec; there is exactly one implementation.
@@ -122,4 +124,3 @@ impl Nvfp4KitchenExt for Nvfp4Tensor {
         })
     }
 }
-

@@ -126,7 +126,7 @@ impl Base {
     /// verifies shape and dtype only, exactly as it did before this seam existed.
     fn device(&self) -> Option<Device> {
         match self {
-            Base::Dense(l) => Some(l.weight().device().clone()),
+            Base::Dense(l) => Some(l.device().clone()),
             Base::Packed(q) => q.fp8_device().cloned(),
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
@@ -814,6 +814,13 @@ impl AdaptLinear {
     /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims — the seam a
     /// caller uses when it holds a `Linear` directly (e.g. a folded-delta reference, or a test grid).
     pub fn from_dense(l: Linear, in_dim: usize, out_dim: usize) -> Self {
+        if l.is_native() {
+            return Self::from_packed(
+                QLinear::from_dense(super::DenseLinear::Linear(l)),
+                in_dim,
+                out_dim,
+            );
+        }
         Self {
             base: Base::Dense(l),
             out_features: out_dim,
@@ -830,7 +837,10 @@ impl AdaptLinear {
     /// keeps its footprint.
     pub fn from_packed(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
         Self {
-            base: Base::Packed(base),
+            base: match base {
+                QLinear::ConvRot(q) => Base::ConvRot(q),
+                other => Base::Packed(other),
+            },
             out_features: out_dim,
             in_features: in_dim,
             adapters: Vec::new(),
@@ -982,41 +992,30 @@ impl AdaptLinear {
                 adapters: Vec::new(),
             })
         } else {
-            let w = vb.get_unchecked(&format!("{name}.weight"))?;
-            let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-            Ok(Self {
-                base: Base::Dense(Linear::new(w, None)),
-                out_features,
-                in_features,
-                adapters: Vec::new(),
-            })
+            Self::dense(vb, name)
         }
     }
 
     /// Bias-less **dense** `[out, in]` projection from `{name}.weight` (a component that never packs,
     /// e.g. Anima's conditioner q/k/v/o — dense bf16 in every tier).
     pub fn dense(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        Ok(Self {
-            base: Base::Dense(Linear::new(w, None)),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, false)
     }
 
-    /// **Dense** `[out, in]` projection with bias from `{name}.weight` + `{name}.bias`.
     pub fn dense_bias(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        let b = vb.get_unchecked(&format!("{name}.bias"))?;
-        Ok(Self {
-            base: Base::Dense(Linear::new(w, Some(b))),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, true)
+    }
+
+    fn from_builder(vb: &VarBuilder, name: &str, bias: bool) -> candle_core::Result<Self> {
+        let sub = vb.pp(name);
+        let b = bias.then(|| sub.get_unchecked("bias")).transpose()?;
+        let layer = if let Some(op) = sub.native_linear_weight("weight")? {
+            Linear::from_native(op, b)
+        } else {
+            Linear::new(sub.get_unchecked("weight")?, b)
+        };
+        let (out_features, in_features) = layer.weight_dims()?;
+        Ok(Self::from_dense(layer, in_features, out_features))
     }
 
     /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. A disabled residual is

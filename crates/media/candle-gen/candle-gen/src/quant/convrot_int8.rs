@@ -77,15 +77,44 @@ impl ConvRotLinear {
         } else {
             None
         };
+        Self::from_native_parts(
+            &w.projection_resources,
+            descriptor,
+            codes.clone(),
+            scales.clone(),
+            bias,
+        )
+        .map(Some)
+    }
+
+    /// Construct from original signed byte patterns and validated native F32 row scales.
+    pub(crate) fn from_native_parts(
+        resources: &crate::weights::ProjectionResources,
+        descriptor: ConvRotInt8,
+        codes: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        if codes.dtype() != DType::U8
+            || codes.dims() != [descriptor.out_features, descriptor.in_features]
+            || scales.dtype() != DType::F32
+            || scales.dims() != [descriptor.out_features, 1]
+            || !codes.device().same_device(scales.device())
+        {
+            return Err(CandleError::Msg(
+                "ConvRot code or scale layout/device mismatch".into(),
+            ));
+        }
         if bias.as_ref().is_some_and(|b| {
-            b.dims() != [descriptor.out_features]
+            !b.device().same_device(codes.device())
+                || b.dims() != [descriptor.out_features]
                 || !matches!(b.dtype(), DType::F32 | DType::F16 | DType::BF16)
         }) {
-            return Err(CandleError::Msg(format!("{base}: invalid ConvRot bias")));
+            return Err(CandleError::Msg("invalid ConvRot bias".into()));
         }
         #[cfg(feature = "cuda")]
         {
-            let ctx = w.int8_context(codes.device())?;
+            let ctx = resources.int8_context(codes.device())?;
             let lt = ctx.handle_for(codes.device())?;
             if !lt.meets_fp8_floor()? {
                 return Err(CandleError::Unsupported(
@@ -94,21 +123,21 @@ impl ConvRotLinear {
             }
             if !descriptor.out_features.is_multiple_of(16) {
                 return Err(CandleError::Msg(
-                    "ConvRot CUDA output width must be a multiple of16".into(),
+                    "ConvRot CUDA output width must be a multiple of 16".into(),
                 ));
             }
             let linear = super::Int8Linear::from_native_bytes(&codes, scales, bias, lt.clone())?;
-            let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
-            Ok(Some(Self {
+            let rotation = resources.convrot_rotation(descriptor.rotation_group, codes.device())?;
+            Ok(Self {
                 descriptor,
                 device: codes.device().clone(),
                 rotation,
                 linear,
-            }))
+            })
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (descriptor, bias);
+            let _ = (descriptor, bias, resources);
             Err(CandleError::Unsupported(
                 "ConvRot INT8 requires native CUDA; no floating fallback".into(),
             ))

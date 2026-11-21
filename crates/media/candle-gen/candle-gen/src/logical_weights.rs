@@ -1,48 +1,121 @@
 //! Media projection constructors over the Candle checkpoint reader shared with audio and LLMs.
-pub use candle_checkpoint::logical_weights::{
-    baseline_codec_registry, nvfp4_layout_is_native, read_logical_weights, register_checkpoint_codecs,
-    CandleCodecResidency, LogicalTensor, LogicalWeights, BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS,
-};
 use candle_checkpoint::logical_weights as shared;
+pub use candle_checkpoint::logical_weights::{
+    baseline_codec_registry, nvfp4_layout_is_native, read_logical_weights,
+    register_checkpoint_codecs, CandleCodecResidency, LogicalTensor, LogicalWeights,
+    BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS,
+};
 use candle_core::{Device, Tensor};
 use gen_core::checkpoint_codec::{CodecResidencyPolicy, LogicalKeyMapping, LogicalWeightPlan};
 use gen_core::checkpoint_facts::{CheckpointWeightFacts, NativeExecutionCapability};
 use std::path::Path;
 
-pub fn plan_logical_weights(path: &Path, mapping: &dyn LogicalKeyMapping, policy: &dyn CodecResidencyPolicy) -> crate::Result<LogicalWeightPlan> {
+pub fn plan_logical_weights(
+    path: &Path,
+    mapping: &dyn LogicalKeyMapping,
+    policy: &dyn CodecResidencyPolicy,
+) -> crate::Result<LogicalWeightPlan> {
     Ok(shared::plan_logical_weights(path, mapping, policy)?)
 }
 
-pub struct LogicalWeightReader(shared::LogicalWeightReader);
+pub struct LogicalWeightReader(
+    shared::LogicalWeightReader,
+    crate::weights::ProjectionResources,
+);
 
 impl std::ops::Deref for LogicalWeightReader {
     type Target = shared::LogicalWeightReader;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl LogicalWeightReader {
     pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> crate::Result<Self> {
-        Ok(Self(shared::LogicalWeightReader::open(path, plan, device)?))
+        Ok(Self(
+            shared::LogicalWeightReader::open(path, plan, device)?,
+            Default::default(),
+        ))
     }
 
-    pub fn open_with_capability(path: &Path, plan: LogicalWeightPlan, device: &Device, capability: NativeExecutionCapability) -> crate::Result<Self> {
-        Ok(Self(shared::LogicalWeightReader::open_with_capability(path, plan, device, capability)?))
+    pub fn open_with_capability(
+        path: &Path,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+    ) -> crate::Result<Self> {
+        Ok(Self(
+            shared::LogicalWeightReader::open_with_capability(path, plan, device, capability)?,
+            Default::default(),
+        ))
     }
 
     pub fn checkpoint_weight_facts(&self) -> crate::Result<CheckpointWeightFacts> {
         Ok(self.0.checkpoint_weight_facts()?)
     }
 
-    pub fn native_projection(&self, key: &str, bias: Option<Tensor>) -> crate::Result<Option<crate::quant::AdaptLinear>> {
+    /// Seed a model's shared cuBLASLt context after the provider checked the device.
+    pub fn set_int8_context(&mut self, context: crate::quant::Int8Context) {
+        self.1.set_int8_context(context);
+    }
+
+    /// Materialize and bind a planned ConvRot projection to this reader's shared device resources.
+    pub fn convrot_projection(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+    ) -> crate::Result<Option<crate::quant::AdaptLinear>> {
+        if !self
+            .planned(key)
+            .is_some_and(|p| matches!(p.codec, gen_core::TensorCodecSpec::ConvRotInt8 { .. }))
+        {
+            return Ok(None);
+        }
+        let LogicalTensor::PackedConvRot {
+            codes,
+            scales,
+            geometry,
+        } = self.read(key)?
+        else {
+            return Err(crate::CandleError::Msg(format!(
+                "{key}: expected native ConvRot operands"
+            )));
+        };
+        let linear = crate::quant::convrot_int8::ConvRotLinear::from_native_parts(
+            &self.1, geometry, codes, scales, bias,
+        )?;
+        Ok(Some(crate::quant::AdaptLinear::from_convrot(linear)))
+    }
+
+    pub fn has_native_projection(&self, key: &str) -> bool {
+        self.0.has_native_projection(key)
+            || self
+                .planned(key)
+                .is_some_and(|p| matches!(p.codec, gen_core::TensorCodecSpec::ConvRotInt8 { .. }))
+    }
+    pub fn native_projection(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+    ) -> crate::Result<Option<crate::quant::AdaptLinear>> {
+        if let Some(layer) = self.convrot_projection(key, bias.clone())? {
+            return Ok(Some(layer));
+        }
         #[cfg(feature = "cuda")]
-        if let Some(layer) = self.0.fp8_projection(key,bias)? {
-            let (out_dim,in_dim) = layer.dims();
-            return Ok(Some(crate::quant::AdaptLinear::from_packed(crate::quant::QLinear::Fp8(std::sync::Arc::new(layer)),in_dim,out_dim)));
+        if let Some(layer) = self.0.fp8_projection(key, bias)? {
+            let (out_dim, in_dim) = layer.dims();
+            return Ok(Some(crate::quant::AdaptLinear::from_packed(
+                crate::quant::QLinear::Fp8(std::sync::Arc::new(layer)),
+                in_dim,
+                out_dim,
+            )));
         }
         #[cfg(not(feature = "cuda"))]
         if self.has_native_projection(key) {
             let _ = bias;
-            return Err(crate::CandleError::Unsupported(format!("{key}: packed FP8 requires CUDA")));
+            return Err(crate::CandleError::Unsupported(format!(
+                "{key}: packed FP8 requires CUDA"
+            )));
         }
         Ok(None)
     }
@@ -51,14 +124,14 @@ impl LogicalWeightReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use candle_core::DType;
     use candle_quant_kernels::Nvfp4Tensor;
-    use shared::apply_transform;
     use gen_core::checkpoint_codec::*;
+    use gen_core::checkpoint_codec::{LogicalTensorTransform, PlannedResidency, RowRange};
     use gen_core::checkpoint_facts::ExecutionRepresentation;
     use gen_core::ProviderRegistryBuilder;
-    use gen_core::checkpoint_codec::{LogicalTensorTransform, PlannedResidency, RowRange};
+    use shared::apply_transform;
+    use std::collections::BTreeMap;
 
     struct StripModel;
 
@@ -380,7 +453,9 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap(),
-            LogicalTensor::PackedFp8E4M3 { .. } | LogicalTensor::PackedNvfp4 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedScalarFp8 { .. }
+            | LogicalTensor::PackedNvfp4 { .. } => {
                 panic!("{key} unexpectedly packed")
             }
         }
@@ -929,7 +1004,7 @@ mod tests {
         let codes = Tensor::zeros((256, 64), DType::U8, &Device::Cpu).expect("codes");
         let error = apply_transform(
             &fp8_plan,
-            LogicalTensor::PackedFp8E4M3 {
+            LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale: 1.0,
                 weight_scale_from_companion: false,
@@ -1095,7 +1170,7 @@ mod tests {
         // decoded value, so this number is derived independently of `plan.companions`.
         let codes = Tensor::zeros((2, 4), DType::F8E4M3, &Device::Cpu).expect("codes");
         assert_eq!(
-            LogicalTensor::PackedFp8E4M3 {
+            LogicalTensor::PackedScalarFp8 {
                 codes: codes.clone(),
                 weight_scale: 1.0,
                 weight_scale_from_companion: true,
@@ -1106,7 +1181,7 @@ mod tests {
             "packed codes + the retained weight_scale"
         );
         assert_eq!(
-            LogicalTensor::PackedFp8E4M3 {
+            LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale: 1.0,
                 weight_scale_from_companion: true,
@@ -1955,19 +2030,19 @@ mod tests {
     #[test]
     fn packed_fp8_resident_bytes_counts_only_companions_that_exist() {
         let codes = Tensor::zeros((8, 8), DType::F8E4M3, &Device::Cpu).expect("codes");
-        let unit = LogicalTensor::PackedFp8E4M3 {
+        let unit = LogicalTensor::PackedScalarFp8 {
             codes: codes.clone(),
             weight_scale: 1.0,
             weight_scale_from_companion: false,
             input_scale: None,
         };
-        let companion = LogicalTensor::PackedFp8E4M3 {
+        let companion = LogicalTensor::PackedScalarFp8 {
             codes: codes.clone(),
             weight_scale: 0.5,
             weight_scale_from_companion: true,
             input_scale: None,
         };
-        let both = LogicalTensor::PackedFp8E4M3 {
+        let both = LogicalTensor::PackedScalarFp8 {
             codes,
             weight_scale: 0.5,
             weight_scale_from_companion: true,

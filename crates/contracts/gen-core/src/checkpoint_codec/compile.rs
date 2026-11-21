@@ -14,6 +14,38 @@ pub(super) fn scalar_scale_shape_ok(shape: &[usize]) -> bool {
     shape.is_empty() || shape == [1]
 }
 
+/// Open only the header and bounded descriptor payloads and compile a logical plan. The same
+/// entry point serves source classification and backend planning; the caller supplies residency.
+pub fn plan_safetensors(
+    path: &std::path::Path,
+    mapping: &dyn LogicalKeyMapping,
+    codecs: &CheckpointCodecRegistry,
+    residency: &dyn CodecResidencyPolicy,
+) -> crate::Result<LogicalWeightPlan> {
+    let headers = crate::safetensors_path_tensor_headers(path)?;
+    let descriptors = crate::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(DESCRIPTOR_SUFFIX),
+        65_536,
+    )?;
+    let metadata = crate::safetensors_path_quantization_metadata(path)?;
+    compile_logical_weight_plan_with_metadata(
+        &headers,
+        &descriptors,
+        metadata.as_deref(),
+        mapping,
+        codecs,
+        residency,
+    )
+    .map_err(|e| {
+        crate::Error::Msg(format!(
+            "logical weight plan for {} ({}): {e}",
+            path.display(),
+            mapping.mapping_id()
+        ))
+    })
+}
+
 /// Compile a header into a [`LogicalWeightPlan`]. Pure and deterministic: the same header,
 /// descriptor payloads, mapping, codec registry, and residency policy always produce the same plan,
 /// in logical-key order. Fails on the first tensor (in header order, sorted by physical key) that
@@ -172,6 +204,9 @@ pub fn compile_logical_weight_plan_with_metadata(
             let Some(base) = header.name.strip_suffix(".weight") else {
                 continue;
             };
+            if !by_name.contains_key(format!("{base}{WEIGHT_SCALE_SUFFIX}").as_str()) {
+                continue;
+            }
             let format = match header.dtype {
                 Dtype::F8_E4M3 => ComfyQuantFormat::Float8E4M3Fn,
                 Dtype::F8_E5M2 => ComfyQuantFormat::Float8E5M2,
@@ -183,6 +218,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     format,
                     full_precision_matrix_mult: false,
                     orig_shape: None,
+                    rotation_group: None,
                 });
         }
     }
@@ -322,7 +358,7 @@ pub fn compile_logical_weight_plan_with_metadata(
         // defect, not a missing codec row.
         if let Some(descriptor) = descriptor {
             let expected_dtype = match descriptor.format {
-                ComfyQuantFormat::Int8TensorwisePerRow => Dtype::I8,
+                ComfyQuantFormat::Int8TensorwisePerRow | ComfyQuantFormat::ConvRotInt8 => Dtype::I8,
                 ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
                 ComfyQuantFormat::Float8E5M2 => Dtype::F8_E5M2,
                 // NVFP4 packs two E2M1 codes per byte; the file has no 4-bit dtype to declare.
@@ -519,6 +555,58 @@ pub fn compile_logical_weight_plan_with_metadata(
                             logical.to_vec(),
                         )
                     }
+                    ComfyQuantFormat::ConvRotInt8 => {
+                        if scale.dtype != Dtype::F32 {
+                            return Err(LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: scale.name.clone(),
+                                defect: "ConvRot weight_scale must be F32".into(),
+                            });
+                        }
+                        if let Some(declared) = &declared_source_shape {
+                            if declared != &header.shape {
+                                return Err(LogicalWeightPlanError::DescriptorOrigShape {
+                                    physical_key: header.name.clone(),
+                                    declared: declared.clone(),
+                                    logical: header.shape.clone(),
+                                });
+                            }
+                        }
+                        for suffix in [
+                            ".scales",
+                            ".biases",
+                            ".weight_s_rel",
+                            ".weight_s_channel",
+                            ".weight_codebook",
+                        ] {
+                            let key = format!("{base}{suffix}");
+                            if by_name.contains_key(key.as_str()) {
+                                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                                    physical_key: key,
+                                    reason: "contradictory ConvRot and affine/grouped operands",
+                                });
+                            }
+                        }
+                        let geometry = crate::convrot_int8::ConvRotInt8::from_geometry(
+                            descriptor
+                                .rotation_group
+                                .expect("complete ConvRot descriptor"),
+                            &header.shape,
+                            &scale.shape,
+                        )
+                        .map_err(|defect| {
+                            LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: header.name.clone(),
+                                defect,
+                            }
+                        })?;
+                        (
+                            TensorCodecSpec::ConvRotInt8 {
+                                scale: scale.name.clone(),
+                                geometry,
+                            },
+                            header.shape.clone(),
+                        )
+                    }
                     ComfyQuantFormat::Int8TensorwisePerRow => {
                         let rows = header.shape[0];
                         let scalar_single_row = rows == 1 && scale.shape.is_empty();
@@ -572,6 +660,11 @@ pub fn compile_logical_weight_plan_with_metadata(
         } else {
             residency.residency(codec, &codec_spec, &header.shape)
         };
+        if matches!(codec_spec, TensorCodecSpec::ConvRotInt8 { .. })
+            && mode != ResidencyMode::Packed
+        {
+            return Err(LogicalWeightPlanError::UnsupportedFormat { physical_key: header.name.clone(), format: "ConvRot INT8 requires native integer execution with online Hadamard rotation for this device and matrix geometry".into() });
+        }
         // The adapter's declarative transform, resolved against this tensor's real geometry, its
         // codec and the residency just chosen (sc-21547) — the last plan-time gate before the
         // entries are emitted, and still before any tensor payload is read.
@@ -677,6 +770,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     }
                 }
                 TensorCodecSpec::Mxfp8 { scale, .. }
+                | TensorCodecSpec::ConvRotInt8 { scale, .. }
                 | TensorCodecSpec::Int8PerRow { scale, .. } => {
                     let scale_header = by_name[scale.as_str()];
                     let retained = match mode {

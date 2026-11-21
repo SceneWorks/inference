@@ -57,11 +57,20 @@ impl std::fmt::Debug for Linear {
 
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight: Weight::Dense(weight), bias }
+        Self {
+            weight: Weight::Dense(weight),
+            bias,
+        }
     }
 
     pub fn from_native(projection: Arc<dyn NativeLinearWeight>, bias: Option<Tensor>) -> Self {
-        Self { weight: Weight::Native { projection, decoded: Arc::new(OnceLock::new()) }, bias }
+        Self {
+            weight: Weight::Native {
+                projection,
+                decoded: Arc::new(OnceLock::new()),
+            },
+            bias,
+        }
     }
 
     pub fn is_native(&self) -> bool {
@@ -86,7 +95,10 @@ impl Linear {
     pub fn try_weight(&self) -> Result<&Tensor> {
         match &self.weight {
             Weight::Dense(t) => Ok(t),
-            Weight::Native { projection, decoded } => {
+            Weight::Native {
+                projection,
+                decoded,
+            } => {
                 if decoded.get().is_none() {
                     let _ = decoded.set(projection.dense_weight()?);
                 }
@@ -97,7 +109,8 @@ impl Linear {
 
     /// Upstream compatibility accessor. Use try_weight for fallible native materialization.
     pub fn weight(&self) -> &Tensor {
-        self.try_weight().expect("failed to materialize the linear weight")
+        self.try_weight()
+            .expect("failed to materialize the linear weight")
     }
 
     pub fn bias(&self) -> Option<&Tensor> {
@@ -114,7 +127,7 @@ impl super::Module for Linear {
                 return match &self.bias {
                     Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
                     None => Ok(y),
-                }
+                };
             }
         };
         // When possible, we avoid using a broadcasted matmul as it is much slower
@@ -160,7 +173,14 @@ impl super::Module for Linear {
 pub fn linear(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Linear> {
     let mut layer = linear_no_bias(in_dim, out_dim, vb.clone())?;
     let bound = 1. / (in_dim as f64).sqrt();
-    let bs = vb.get_with_hints(out_dim, "bias", crate::Init::Uniform { lo: -bound, up: bound })?;
+    let bs = vb.get_with_hints(
+        out_dim,
+        "bias",
+        crate::Init::Uniform {
+            lo: -bound,
+            up: bound,
+        },
+    )?;
     layer.bias = Some(bs);
     Ok(layer)
 }
@@ -169,7 +189,11 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Li
 pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Linear> {
     if let Some(native) = vb.native_linear_weight("weight")? {
         if native.dims() != (out_dim, in_dim) {
-            candle::bail!("native weight {} expected [{out_dim},{in_dim}], got {:?}", vb.prefix(), native.dims());
+            candle::bail!(
+                "native weight {} expected [{out_dim},{in_dim}], got {:?}",
+                vb.prefix(),
+                native.dims()
+            );
         }
         return Ok(Linear::from_native(native, None));
     }

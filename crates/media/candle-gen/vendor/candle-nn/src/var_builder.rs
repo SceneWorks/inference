@@ -63,7 +63,14 @@ pub trait Backend: Send + Sync {
     /// Retrieve a tensor based on the name.
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
-    fn native_linear_weight(&self, _name: &str, _dtype: DType, _dev: &Device) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> { Ok(None) }
+    fn native_linear_weight(
+        &self,
+        _name: &str,
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
 
     fn contains_tensor(&self, name: &str) -> bool;
 }
@@ -82,7 +89,14 @@ pub trait SimpleBackend: Send + Sync {
     /// Retrieve a tensor based on the name.
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
-    fn native_linear_weight(&self, _name: &str, _dtype: DType, _dev: &Device) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> { Ok(None) }
+    fn native_linear_weight(
+        &self,
+        _name: &str,
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
 
     fn contains_tensor(&self, name: &str) -> bool;
 }
@@ -104,7 +118,12 @@ impl Backend for Box<dyn SimpleBackend + '_> {
         self.as_ref().get_unchecked(name, dtype, dev)
     }
 
-    fn native_linear_weight(&self, name: &str, dtype: DType, dev: &Device) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         self.as_ref().native_linear_weight(name, dtype, dev)
     }
 
@@ -199,8 +218,13 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         }
     }
 
-    pub fn native_linear_weight(&self, name: &str) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
-        self.data.backend.native_linear_weight(&self.path(name), self.dtype, self.device())
+    pub fn native_linear_weight(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        self.data
+            .backend
+            .native_linear_weight(&self.path(name), self.dtype, self.device())
     }
 
     /// This returns true only if a tensor with the passed in name is available. E.g. when passed
@@ -899,9 +923,17 @@ impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
         self.inner.get_unchecked_dtype(&name, dtype)?.to_device(dev)
     }
 
-    fn native_linear_weight(&self, name: &str, dtype: DType, dev: &Device) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         let name = self.renamer.rename(name);
-        self.inner.data.backend.native_linear_weight(&self.inner.path(&name), dtype, dev)
+        self.inner
+            .data
+            .backend
+            .native_linear_weight(&self.inner.path(&name), dtype, dev)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {

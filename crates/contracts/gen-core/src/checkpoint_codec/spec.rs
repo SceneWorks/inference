@@ -39,6 +39,11 @@ pub enum TensorCodecSpec {
         scale: String,
         full_precision_matrix_mult: bool,
     },
+    /// Original rotated I8 codes and a separate F32 row-scale plane.
+    ConvRotInt8 {
+        scale: String,
+        geometry: crate::convrot_int8::ConvRotInt8,
+    },
     /// NVFP4: `U8` `[rows, cols/2]` E2M1 nibbles + `to_blocked` E4M3 block scales + one `F32`
     /// per-tensor scale.
     Nvfp4 {
@@ -66,7 +71,7 @@ pub enum TensorCodecSpec {
 impl TensorCodecSpec {
     pub fn full_precision_matrix_mult(&self) -> bool {
         match self {
-            Self::Dense => false,
+            Self::Dense | Self::ConvRotInt8 { .. } => false,
             Self::ScalarFp8 {
                 full_precision_matrix_mult,
                 ..
@@ -129,5 +134,24 @@ impl CodecResidencyPolicy for DenseResidencyPolicy {
         _stored_shape: &[usize],
     ) -> ResidencyMode {
         ResidencyMode::Dense
+    }
+}
+
+/// Header-only source inspection. ConvRot has no dense decode. Pricing its packed bytes here
+/// identifies the stored representation without asserting any device can execute it.
+pub struct SourceCodecResidency;
+
+impl CodecResidencyPolicy for SourceCodecResidency {
+    fn residency(
+        &self,
+        _: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        _: &[usize],
+    ) -> ResidencyMode {
+        if matches!(spec, TensorCodecSpec::ConvRotInt8 { .. }) {
+            ResidencyMode::Packed
+        } else {
+            ResidencyMode::Dense
+        }
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 pub struct Fp8Linear {
     w_fp8: crate::cublaslt::DevFp8,
     device: Device,
-    dims: (usize,usize),
+    dims: (usize, usize),
     input_scale: Option<f32>,
     scale_w: f32,
     bias: Option<Tensor>,
@@ -19,11 +19,37 @@ impl Fp8Linear {
     /// Quantize a dense `(N, K)` weight to fp8 E4M3 once and bind it to a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
         let qw = quantize_weight_fp8(weight)?;
-        Self::from_parts(qw.q, qw.scale, None, bias, lt)
+        Self::from_codes(qw.q, qw.scale, None, bias, lt)
     }
 
     /// Bind checkpoint E4M3FN codes and dequantization scales without re-quantizing.
     pub fn from_parts(
+        codes: Tensor,
+        scale_w: f32,
+        input_scale: Option<f32>,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        if codes.dtype() != candle_core::DType::F8E4M3 {
+            candle_core::bail!("expected E4M3FN weight codes");
+        }
+        Self::from_codes(codes, scale_w, Some(input_scale.unwrap_or(1.0)), bias, lt)
+    }
+
+    pub fn from_e5m2_parts(
+        codes: Tensor,
+        scale_w: f32,
+        input_scale: Option<f32>,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        if codes.dtype() != candle_core::DType::U8 {
+            candle_core::bail!("expected raw E5M2 weight codes");
+        }
+        Self::from_codes(codes, scale_w, Some(input_scale.unwrap_or(1.0)), bias, lt)
+    }
+
+    fn from_codes(
         codes: Tensor,
         scale_w: f32,
         input_scale: Option<f32>,
@@ -53,7 +79,9 @@ impl Fp8Linear {
         })
     }
 
-    pub fn dims(&self) -> (usize,usize) { self.dims }
+    pub fn dims(&self) -> (usize, usize) {
+        self.dims
+    }
 
     pub fn device(&self) -> &Device {
         &self.device
@@ -67,7 +95,9 @@ impl Fp8Linear {
     /// `x`: `(..., K)`; flattened to `(M, K)` for the GEMM, then reshaped back. Output bf16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
-        let (qx, scale_x) = self.lt.scaled_fp8_activation(&flat, self.input_scale)?;
+        let (qx, scale_x) =
+            self.lt
+                .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?;
         let y = self
             .lt
             .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, scale_x)?;

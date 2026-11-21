@@ -37,11 +37,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use gen_core::checkpoint_codec::{
-    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyReport,
-    DenseResidencyPolicy, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
-    LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource, TensorCodecSpec,
-    WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
-    FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyReport, LogicalKeyMapping,
+    LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
+    ResidencyMode, ScalarScaleSource, TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
+    INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::ExecutionRepresentation;
 use gen_core::ProviderRegistryBuilder;
@@ -50,9 +50,6 @@ use mlx_rs::{Array, Dtype};
 
 use crate::weights::Weights;
 use crate::{Error, Result};
-
-/// Descriptor payloads are tiny JSON blobs; anything above this is not a `.comfy_quant` tensor.
-const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
 
 /// The codec rows this engine implements and registers. Register through
 /// [`register_checkpoint_codecs`]; never per family crate.
@@ -68,6 +65,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     FP8_E4M3_SCALAR_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
+    gen_core::convrot_int8::CODEC_ID,
     INT8_PER_ROW_CODEC.codec_id,
     NVFP4_CODEC.codec_id,
 ];
@@ -97,31 +95,12 @@ pub fn plan_logical_weights(
     path: &Path,
     mapping: &dyn LogicalKeyMapping,
 ) -> Result<LogicalWeightPlan> {
-    let headers = gen_core::safetensors_path_tensor_headers(path)?;
-    let descriptors = gen_core::read_safetensors_tensor_payloads(
+    Ok(gen_core::checkpoint_codec::plan_safetensors(
         path,
-        |header| header.name.ends_with(".comfy_quant"),
-        MAX_DESCRIPTOR_BYTES,
-    )?;
-    // A checkpoint declares its quantization per layer (`.comfy_quant` tensors), file-wide
-    // (`__metadata__._quantization_metadata`, sc-20641), or not at all; both routes are read and
-    // the compiler refuses a layer the two disagree about.
-    let quantization_metadata = gen_core::safetensors_path_quantization_metadata(path)?;
-    gen_core::compile_logical_weight_plan_with_metadata(
-        &headers,
-        &descriptors,
-        quantization_metadata.as_deref(),
         mapping,
         baseline_codec_registry(),
-        &DenseResidencyPolicy,
-    )
-    .map_err(|error| {
-        Error::Msg(format!(
-            "logical weight plan for {} ({}): {error}",
-            path.display(),
-            mapping.mapping_id()
-        ))
-    })
+        &gen_core::checkpoint_codec::SourceCodecResidency,
+    )?)
 }
 
 /// How a read leaves its payloads.
@@ -161,11 +140,9 @@ pub fn read_logical_weights(
     // find its source already taken. Refuse by name rather than fail as a missing tensor — a
     // transformed plan is not a plan this engine can honour, and silently reading only the first
     // output would hand the model a fused matrix under a split key's name.
-    if let Some(transformed) = plan
-        .tensors
-        .iter()
-        .find(|tensor| tensor.transform.is_some())
-    {
+    if let Some(transformed) = plan.tensors.iter().find(|tensor| {
+        tensor.transform.is_some() && !matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. })
+    }) {
         return Err(Error::Msg(format!(
             "logical weight read of {}: logical key {:?} is a declared transform of physical \
              tensor {:?}, which this engine's reader does not implement; plan this checkpoint with \
@@ -200,9 +177,80 @@ pub fn read_logical_weights(
     let eager = matches!(mode, LogicalReadMode::Eager(_));
     let mut logical = Weights::empty();
     for tensor in &plan.tensors {
-        let array = physical
-            .remove(&tensor.physical_key)
-            .ok_or_else(|| Error::MissingTensor(tensor.physical_key.clone()))?;
+        let array = if tensor.transform.is_some() {
+            physical.get(&tensor.physical_key).cloned()
+        } else {
+            physical.remove(&tensor.physical_key)
+        }
+        .ok_or_else(|| Error::MissingTensor(tensor.physical_key.clone()))?;
+        if let TensorCodecSpec::ConvRotInt8 { scale, geometry } = &tensor.codec {
+            let scales = companion(tensor, &physical, scale)?;
+            guard_dtype(tensor, &array, Dtype::Int8)?;
+            guard_shape(
+                tensor,
+                &array,
+                &[geometry.out_features, geometry.in_features],
+            )?;
+            guard_dtype(tensor, scales, Dtype::Float32)?;
+            guard_shape(tensor, scales, &[geometry.out_features, 1])?;
+            if tensor.residency.mode != ResidencyMode::Packed {
+                return Err(Error::Msg(format!(
+                    "{}: ConvRot requires packed residency",
+                    tensor.logical_key
+                )));
+            }
+            let base = tensor.logical_key.strip_suffix(".weight").ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: native projection must map to a weight",
+                    tensor.logical_key
+                ))
+            })?;
+            let (codes, scales, layout) = if let Some(t) = &tensor.transform {
+                let start = t.rows.start;
+                let n = t.rows.len;
+                if n == 0
+                    || start > geometry.out_features
+                    || n > geometry.out_features - start
+                    || tensor.shape != [n, geometry.in_features]
+                    || (t.half_swap && !n.is_multiple_of(2))
+                {
+                    return Err(Error::Msg(format!(
+                        "{}: invalid ConvRot row transform",
+                        tensor.logical_key
+                    )));
+                }
+                let slice = |x: &Array| -> Result<Array> {
+                    let rows = x.index((start as i32..(start + n) as i32, ..));
+                    if t.half_swap {
+                        let half = n as i32 / 2;
+                        Ok(mlx_rs::ops::concatenate_axis(
+                            &[rows.index((half.., ..)), rows.index((..half, ..))],
+                            0,
+                        )?)
+                    } else {
+                        Ok(rows)
+                    }
+                };
+                (
+                    slice(&array)?,
+                    slice(scales)?,
+                    gen_core::convrot_int8::ConvRotInt8::from_geometry(
+                        geometry.rotation_group,
+                        &[n, geometry.in_features],
+                        &[n, 1],
+                    )
+                    .map_err(Error::Msg)?,
+                )
+            } else {
+                (array, scales.clone(), *geometry)
+            };
+            if eager {
+                codes.eval()?;
+                scales.eval()?;
+            }
+            logical.insert_convrot(base, layout, codes, scales);
+            continue;
+        }
         let decoded = decode(tensor, array, &physical)?;
         if eager && !matches!(tensor.codec, TensorCodecSpec::Dense) {
             // MLX is lazy: materialize dequantizing projections one by one so the eager resident
@@ -406,6 +454,9 @@ fn decode(
         )));
     }
     match &tensor.codec {
+        TensorCodecSpec::ConvRotInt8 { .. } => Err(Error::Msg(
+            "ConvRot operands cannot be decoded into a dense tensor".into(),
+        )),
         TensorCodecSpec::Dense => {
             let expected = match tensor.codec_id {
                 id if id == DENSE_BF16_CODEC.codec_id => Dtype::Bfloat16,
@@ -593,7 +644,16 @@ fn measure_residency(
     for tensor in &plan.tensors {
         codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
         let array = logical.require(&tensor.logical_key)?;
-        let resident_bytes = u64::try_from(array.nbytes()).map_err(|_| {
+        let scale_bytes = if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .ok_or_else(|| Error::Msg("ConvRot projection key must end in .weight".into()))?;
+            logical.require(&format!("{base}.weight_scale"))?.nbytes()
+        } else {
+            0
+        };
+        let resident_bytes = u64::try_from(array.nbytes() + scale_bytes).map_err(|_| {
             Error::Msg(format!(
                 "tensor {:?} resident size overflows u64",
                 tensor.logical_key
@@ -607,7 +667,11 @@ fn measure_residency(
                 // dense resident encoding here, so every row this backend reports is a
                 // dense fallback and none of them may ever be labelled native (sc-21484). The
                 // retained-companion assertion below is the same invariant, stated on bytes.
-                representation: ExecutionRepresentation::DenseFallback,
+                representation: if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
+                    ExecutionRepresentation::NativePacked
+                } else {
+                    ExecutionRepresentation::DenseFallback
+                },
                 tensor_count: 0,
                 source_bytes: 0,
                 resident_bytes: 0,
@@ -629,7 +693,7 @@ fn measure_residency(
         //
         // Checked outside the `by_codec` lookup below, so a companion whose owner's row is absent
         // still cannot smuggle a retained residency past this refusal.
-        if companion.resident_bytes != 0 {
+        if companion.resident_bytes != 0 && *codec_id != gen_core::convrot_int8::CODEC_ID {
             return Err(Error::Msg(format!(
                 "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
                  this backend decodes every codec through its dense fallback and measures no \

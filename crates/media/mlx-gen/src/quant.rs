@@ -389,6 +389,9 @@ pub fn packed_bits_from_metadata(
 /// pre-quantized snapshot with no `quantization` manifest to read. Shared by the provider crates'
 /// packed loaders — each passes its own `group_size`.
 pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<AdaptableLinear> {
+    if let Some(native) = crate::convrot_int8::ConvRotLinear::from_weights(w, base, bias)? {
+        return Ok(AdaptableLinear::from_convrot(native));
+    }
     let bias = if bias {
         Some(w.require(&format!("{base}.bias"))?.clone())
     } else {

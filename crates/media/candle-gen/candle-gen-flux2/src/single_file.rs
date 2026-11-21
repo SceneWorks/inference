@@ -305,7 +305,9 @@ impl PlannedDitWeights {
             .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
         {
             LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype)?.to_device(&self.device),
-            LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedNvfp4 { .. }
+            | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "flux2 single-file: `{logical_key}` was planned packed but is read as a dense \
                      leaf; the mapping and the model disagree about this tensor's role"
@@ -398,7 +400,7 @@ impl PlannedDitWeights {
                 }
                 Ok(QLinear::from_nvfp4(lin))
             }
-            LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "flux2 single-file: `{weight_key}` packed FP8 row bypassed the native projection constructor"
                 )))

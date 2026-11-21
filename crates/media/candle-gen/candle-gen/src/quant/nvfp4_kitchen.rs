@@ -2,9 +2,9 @@ pub use candle_checkpoint::nvfp4_kitchen::Nvfp4KitchenExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::nvfp4::e4m3_to_f32;
     use candle_core::Result;
     use candle_quant_kernels::nvfp4::{Nvfp4Tensor, NVFP4_BLOCK, SF_ATOM_COLS, SF_ATOM_ROWS};
-    use crate::quant::nvfp4::e4m3_to_f32;
 
     #[test]
     fn kitchen_parts_swap_only_the_nibble_order() -> Result<()> {

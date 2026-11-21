@@ -36,11 +36,32 @@ fn coerce_float(v: Tensor, dtype: DType) -> Result<Tensor> {
     }
 }
 
+/// I8 weights have no signed-byte Candle dtype; keep their bits for the integer projection.
+fn load_map_tensor(
+    st: &cst::MmapedSafetensors,
+    key: &str,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let view = st.get(key)?;
+    if view.dtype() == safetensors::Dtype::I8 && key.ends_with(".weight") {
+        return Ok(Tensor::from_raw_buffer(
+            view.data(),
+            DType::U8,
+            view.shape(),
+            device,
+        )?);
+    }
+    if key.ends_with(".weight_scale") {
+        return Ok(st.load(key, device)?);
+    }
+    coerce_float(st.load(key, device)?, dtype)
+}
+
 /// A loaded checkpoint weight map (every tensor coerced to the requested compute dtype on load).
 pub struct Weights {
     map: HashMap<String, Tensor>,
-    int8: std::sync::Mutex<Option<crate::quant::Int8Context>>,
-    convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
+    pub(crate) projection_resources: ProjectionResources,
     /// The device the set is *destined for* when some tensors were deliberately left on the host
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
     target: Option<Device>,
@@ -71,10 +92,11 @@ impl Weights {
     /// production, f32 for CPU parity), matching how `mlx-gen-sdxl` casts the IP-Adapter bundle to the
     /// UNet dtype before building.
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        let raw = cst::load(path, device)?;
-        let mut map = HashMap::with_capacity(raw.len());
-        for (k, v) in raw {
-            map.insert(k, coerce_float(v, dtype)?);
+        let st = crate::loader::mmap_safetensors(path)?;
+        let mut map = HashMap::new();
+        for (key, _) in st.tensors() {
+            let tensor = load_map_tensor(&st, &key, device, dtype)?;
+            map.insert(key, tensor);
         }
         #[cfg(feature = "model-inference-proof")]
         gen_core::model_input_proof::record_reader_paths(
@@ -106,9 +128,9 @@ impl Weights {
             let path = path.as_ref();
             #[cfg(feature = "model-inference-proof")]
             __input_paths.push(path);
-            let raw = cst::load(path, device)?;
-            for (k, v) in raw {
-                let v = coerce_float(v, dtype)?;
+            let st = crate::loader::mmap_safetensors(path)?;
+            for (k, _) in st.tensors() {
+                let v = load_map_tensor(&st, &k, device, dtype)?;
                 if map.insert(k.clone(), v).is_some() {
                     return Err(CandleError::Msg(format!(
                         "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
@@ -152,7 +174,7 @@ impl Weights {
             // Load just this one tensor's bytes (header-only mmap), then re-cast floats to the compute
             // dtype via the shared `coerce_float` helper — identical per-tensor handling to
             // `from_file`, so retained values are byte-equal.
-            let v = coerce_float(st.load(&k, device)?, dtype)?;
+            let v = load_map_tensor(&st, &k, device, dtype)?;
             map.insert(k, v);
         }
         #[cfg(feature = "model-inference-proof")]
@@ -189,7 +211,7 @@ impl Weights {
                 if !prefixes.iter().any(|p| k.starts_with(p)) {
                     continue;
                 }
-                let v = coerce_float(st.load(&k, device)?, dtype)?;
+                let v = load_map_tensor(&st, &k, device, dtype)?;
                 if map.insert(k.clone(), v).is_some() {
                     return Err(CandleError::Msg(format!(
                         "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
@@ -252,7 +274,7 @@ impl Weights {
                     k.strip_suffix(s)
                         .is_some_and(|base| packed_bases.contains(base))
                 });
-                let v = coerce_float(st.load(&k, if in_triple { &host } else { device })?, dtype)?;
+                let v = load_map_tensor(st, &k, if in_triple { &host } else { device }, dtype)?;
                 if map.insert(k.clone(), v).is_some() {
                     return Err(CandleError::Msg(format!(
                         "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
@@ -301,8 +323,7 @@ impl Weights {
     pub fn from_map(map: HashMap<String, Tensor>) -> Self {
         Self {
             map,
-            int8: std::sync::Mutex::new(None),
-            convrot_rotations: std::sync::Mutex::new(HashMap::new()),
+            projection_resources: ProjectionResources::default(),
             target: None,
         }
     }
@@ -459,6 +480,26 @@ impl Weights {
         Ok(Self::from_map(map))
     }
 
+    pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {
+        self.projection_resources.int8_context(device)
+    }
+    pub fn convrot_rotation(&self, group: usize, device: &Device) -> Result<Tensor> {
+        self.projection_resources.convrot_rotation(group, device)
+    }
+}
+
+/// Model-scoped resources for native projections on a single device. Shared by eager maps
+/// and lazy logical readers across layers and successive block windows.
+#[derive(Default)]
+pub struct ProjectionResources {
+    int8: std::sync::Mutex<Option<crate::quant::Int8Context>>,
+    convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
+}
+
+impl ProjectionResources {
+    pub(crate) fn set_int8_context(&mut self, context: crate::quant::Int8Context) {
+        self.int8 = std::sync::Mutex::new(Some(context));
+    }
     /// One lazy cuBLASLt handle/workspace for every native INT8 projection in this map.
     pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {
         let mut cached = self.int8.lock().unwrap_or_else(|p| p.into_inner());

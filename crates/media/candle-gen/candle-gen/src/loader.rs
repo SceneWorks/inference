@@ -254,7 +254,7 @@ pub fn mmap_var_builder(
     // SAFETY: see the function-level doc — no process may truncate or modify the mapped files while
     // the mapping is live (accepted residual risk). Standard candle loading path.
     __model_proof_inspect!(
-        Ok(unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? }),
+        Ok(candle_checkpoint::mmap_var_builder(files, dtype, device)?),
         |_| {
             gen_core::model_input_proof::record_reader_paths(
                 "candle-gen::loader::mmap_var_builder",
