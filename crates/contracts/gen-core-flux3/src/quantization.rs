@@ -49,6 +49,7 @@ impl DitFormat {
     pub fn check_device(self, device: QuantDevice) -> Result<()> {
         let supported = match (self, device) {
             (Self::Dense, _) => true,
+            (Self::Fp8Rowwise, QuantDevice::Mlx) => true,
             (Self::Fp8Rowwise, QuantDevice::Cuda { major, minor }) => (major, minor) >= (8, 9),
             (Self::Nvfp4, QuantDevice::Cuda { major, .. }) => major >= 12,
             _ => false,

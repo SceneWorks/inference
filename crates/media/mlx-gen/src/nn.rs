@@ -76,6 +76,9 @@ pub enum TokenEmbedding {
 impl TokenEmbedding {
     /// Gather rows for `ids` (`[b, s]`) → `[b, s, hidden]`, cast to f32.
     pub fn forward(&self, ids: &Array) -> Result<Array> {
+        Ok(self.rows(ids)?.as_dtype(Dtype::Float32)?)
+    }
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
         let out = match self {
             Self::Dense(w) => w.take_axis(ids, 0)?,
             Self::Native(p) => p.rows(ids)?,
@@ -92,7 +95,7 @@ impl TokenEmbedding {
                 dequantize(&pw, &sc, &bi, *group_size, *bits)?
             }
         };
-        Ok(out.as_dtype(Dtype::Float32)?)
+        Ok(out)
     }
 
     /// Build a quantized table directly from **already-packed** parts read off disk — the

@@ -266,6 +266,7 @@ pub fn linear_header_facts(
     Ok(super::LinearFacts {
         base_shape: vec![ws[0], input],
         is_quantized: packed,
+        source_packed: false,
         has_live_adapters: false,
         adapter_count: 0,
         bias_shape: None,

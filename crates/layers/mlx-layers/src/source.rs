@@ -12,6 +12,15 @@ use std::{
     },
 };
 
+pub fn metal_available() -> bool {
+    static METAL: OnceLock<bool> = OnceLock::new();
+    *METAL.get_or_init(|| {
+        let mut available = false;
+        // SAFETY: MLX writes a Boolean availability probe; no stream or array is allocated.
+        unsafe { mlx_sys::mlx_metal_is_available(&mut available) == 0 && available }
+    })
+}
+
 pub struct MlxCodecResidency;
 impl CodecResidencyPolicy for MlxCodecResidency {
     fn residency(
@@ -20,10 +29,12 @@ impl CodecResidencyPolicy for MlxCodecResidency {
         spec: &TensorCodecSpec,
         shape: &[usize],
     ) -> ResidencyMode {
-        if shape.len() == 2
+        if metal_available()
+            && shape.len() == 2
             && matches!(
                 spec,
                 TensorCodecSpec::ConvRotInt8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. }
                     | TensorCodecSpec::ScalarFp8 {
                         full_precision_matrix_mult: false,
                         ..
@@ -41,11 +52,15 @@ impl CodecResidencyPolicy for MlxCodecResidency {
     }
 }
 pub fn capability() -> NativeExecutionCapability {
+    if !metal_available() {
+        return NativeExecutionCapability::new([]);
+    }
     NativeExecutionCapability::new([
         gen_core::convrot_int8::CODEC_ID,
         FP8_E4M3_SCALAR_CODEC.codec_id,
         FP8_E5M2_SCALAR_CODEC.codec_id,
         MXFP8_CODEC.codec_id,
+        FP8_E4M3_ROWWISE_CODEC.codec_id,
     ])
 }
 
@@ -158,9 +173,9 @@ impl SourceReads {
                         matches!(scale, ScalarScaleSource::Companion { .. }),
                         input_scale.is_some(),
                     ),
-                    TensorCodecSpec::ConvRotInt8 { .. } | TensorCodecSpec::Mxfp8 { .. } => {
-                        (true, false)
-                    }
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                    | TensorCodecSpec::Mxfp8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. } => (true, false),
                     _ => (false, false),
                 };
                 (
@@ -240,6 +255,9 @@ pub fn prepare_sources(
                         crate::convrot_int8::descriptor_array(geometry.rotation_group)
                     });
                 continue;
+            }
+            TensorCodecSpec::RowwiseFp8 { scale } => {
+                (ComfyQuantFormat::Fp8Rowwise, Some(scale), None)
             }
             TensorCodecSpec::Mxfp8 { scale, .. } => (ComfyQuantFormat::Mxfp8, Some(scale), None),
             TensorCodecSpec::ScalarFp8 {

@@ -50,6 +50,7 @@ fn facts(
                 super::super::LinearFacts {
                     base_shape: vec![4, 4],
                     is_quantized: packed,
+                    source_packed: false,
                     has_live_adapters: false,
                     adapter_count: 0,
                     bias_shape: None,

@@ -1262,6 +1262,7 @@ impl FusedQkvProjection {
                 LinearFacts {
                     base_shape: vec![out, inp],
                     is_quantized: linear.is_quantized(),
+                    source_packed: linear.fp8_base().is_some() || linear.convrot_base().is_some(),
                     // A packed backing *is* the no-adapter proof — `try_pack` refuses a triple
                     // carrying any live adapter, and `parts_mut`/`part_mut` (the only route to an
                     // installer) leave the backing split. So neither count can be non-zero here.

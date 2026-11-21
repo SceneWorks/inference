@@ -77,7 +77,7 @@ impl NativeProjection {
         if let Some(blob) = w.get(&format!("{base}.comfy_quant")) {
             let desc = convrot_int8::descriptor(blob, base)?;
             use gen_core::comfy_quant::ComfyQuantFormat::*;
-            if matches!(desc.format, Float8E4M3Fn | Float8E5M2 | Mxfp8) {
+            if matches!(desc.format, Float8E4M3Fn | Float8E5M2 | Fp8Rowwise | Mxfp8) {
                 if desc.full_precision_matrix_mult {
                     return Err(format!("{base}: full precision FP8 requires the dense decode selected by the checkpoint").into());
                 }

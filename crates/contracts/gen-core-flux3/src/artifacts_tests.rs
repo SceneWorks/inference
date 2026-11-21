@@ -113,8 +113,11 @@ fn honest_backend_matrix_does_not_intersect_away_cuda_only_formats() {
         major: 12,
         minor: 0,
     };
+    let fp8r = NativeDitStorage::Publisher(DitFormat::Fp8Rowwise);
+    fp8r.check_backend(ArtifactBackend::Mlx).unwrap();
+    fp8r.check_backend(cuda).unwrap();
+    assert!(fp8r.check_backend(ArtifactBackend::CandleCpu).is_err());
     for storage in [
-        NativeDitStorage::Publisher(DitFormat::Fp8Rowwise),
         NativeDitStorage::Publisher(DitFormat::Nvfp4),
         NativeDitStorage::GgmlQ4_1,
         NativeDitStorage::GgmlQ8_0,

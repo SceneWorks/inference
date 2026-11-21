@@ -76,8 +76,14 @@ const PROJECT: &str = r#"
     float vq = 0.0f;
     float vk = 0.0f;
     for (int n = 0; n < 3 * D; ++n) {
-        vq = vq + veda_mul(qr[n], float(proj_q[base + uint(n) * uint(D)]));
-        vk = vk + veda_mul(kr[n], float(proj_k[base + uint(n) * uint(D)]));
+        const uint index=base+uint(n)*uint(D);
+        // Frozen predictor contract: coefficients are rounded to BF16 before the precise FP32
+        // sequential accumulation. E4M3 uses one independent source scale per projection head.
+        const uint head_index=uint(layer)*uint(H)+head;
+        float qw=Q_FP8 ? float(bfloat(veda_mul(sc_decode_fp8(uchar(proj_q[index]),false),q_scale[head_index]))) : float(proj_q[index]);
+        float kw=K_FP8 ? float(bfloat(veda_mul(sc_decode_fp8(uchar(proj_k[index]),false),k_scale[head_index]))) : float(proj_k[index]);
+        vq=vq+veda_mul(qr[n],qw);
+        vk=vk+veda_mul(kr[n],kw);
     }
     const uint out = (g * uint(video) + uint(t)) * uint(D) + uint(d);
     oq[out] = vq + qr[d];
@@ -495,11 +501,14 @@ fn with_kernels<T>(f: impl FnOnce(&Kernels) -> Result<T>) -> Result<T> {
                         &["f"],
                         POOL,
                     )?,
-                    project: make(
+                    project: with(
                         "project",
-                        &["fq", "fk", "proj_q", "proj_k", "heads", "params"],
+                        &[
+                            "fq", "fk", "proj_q", "proj_k", "q_scale", "k_scale", "heads", "params",
+                        ],
                         &["oq", "ok"],
                         PROJECT,
+                        &format!("{HEADER}{}", mlx_gen::METAL_FP8_HEADER),
                     )?,
                     logits: make("logits", &["q", "k", "divisor", "params"], &["s"], LOGITS)?,
                     attend: make("attend", &ATTEND_INPUTS, &["out"], ATTEND)?,
@@ -581,6 +590,41 @@ pub fn scores(
     layer: usize,
     dim: usize,
 ) -> Result<Vec<f32>> {
+    scores_with_weights(
+        layout,
+        x_q,
+        x_k,
+        &HeadwiseWeights {
+            values: proj_q.clone(),
+            scales: None,
+        },
+        &HeadwiseWeights {
+            values: proj_k.clone(),
+            scales: None,
+        },
+        heads,
+        layer,
+        dim,
+    )
+}
+
+#[derive(Clone)]
+pub struct HeadwiseWeights {
+    pub values: Array,
+    pub scales: Option<Array>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scores_with_weights(
+    layout: &DeviceLayout,
+    x_q: &Array,
+    x_k: &Array,
+    proj_q: &HeadwiseWeights,
+    proj_k: &HeadwiseWeights,
+    heads: &[i32],
+    layer: usize,
+    dim: usize,
+) -> Result<Vec<f32>> {
     let total = x_q.shape()[1];
     let (g, video, d) = (heads.len() as i32, layout.video as i32, dim as i32);
     let ids = ints(heads);
@@ -602,17 +646,22 @@ pub fn scores(
                 .remove(0))
         };
         let (fq, fk) = (pool(x_q)?, pool(x_k)?);
+        let unit = Array::from_f32(1.0);
         let mut projected = k
             .project
             .apply()
             .inputs([
                 &fq,
                 &fk,
-                proj_q,
-                proj_k,
+                &proj_q.values,
+                &proj_k.values,
+                proj_q.scales.as_ref().unwrap_or(&unit),
+                proj_k.scales.as_ref().unwrap_or(&unit),
                 &ids,
                 &ints(&[total, video, d, layer as i32]),
             ])
+            .template_arg("Q_FP8", i32::from(proj_q.scales.is_some()))
+            .template_arg("K_FP8", i32::from(proj_k.scales.is_some()))
             .output_shape(vec![g, video, d], Dtype::Float32)
             .output_shape(vec![g, video, d], Dtype::Float32)
             .grid(video * d, g, 1)

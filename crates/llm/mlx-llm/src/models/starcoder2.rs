@@ -12,7 +12,7 @@ use crate::decode::Decode;
 use crate::error::Result;
 use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, gelu_tanh, layer_norm, linear};
+use crate::primitives::nn::{gelu_tanh, layer_norm};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::Weights;
 
@@ -54,7 +54,7 @@ impl StarCoder2Config {
 
 /// Native StarCoder2 decoder with tied input/output embeddings.
 pub struct StarCoder2 {
-    embed_tokens: Array,
+    embed_tokens: Projection,
     layers: Vec<StarCoder2Layer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
@@ -71,12 +71,18 @@ impl StarCoder2 {
     /// accepting an unrelated optional head.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: StarCoder2Config) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        let embed_tokens = w.require(&key("model.embed_tokens.weight"))?.clone();
+        let embed_tokens =
+            Projection::from_named(w, &key("model.embed_tokens.weight"), None, None)?;
+        let actual = match &embed_tokens {
+            Projection::Dense { weight, .. } => weight.shape().to_vec(),
+            Projection::Native(p) => p.shape().to_vec(),
+            _ => unreachable!("from_named binds stock or native"),
+        };
         let expected_embedding_shape = [cfg.vocab_size, cfg.hidden_size];
-        if embed_tokens.shape() != expected_embedding_shape {
+        if actual != expected_embedding_shape {
             return Err(crate::error::Error::Config(format!(
                 "StarCoder2 tied embedding/head must be {expected_embedding_shape:?}, got {:?}",
-                embed_tokens.shape()
+                actual
             )));
         }
         let mut layers = Vec::with_capacity(cfg.layers);
@@ -101,7 +107,7 @@ impl StarCoder2 {
 
     /// Embed token ids without any positional addition; StarCoder2 positions are RoPE-only.
     pub fn embed(&self, ids: &Array) -> Result<Array> {
-        embed(&self.embed_tokens, ids)
+        self.embed_tokens.rows(ids)
     }
 
     /// Prefill or decode precomputed embeddings, returning last-position logits.
@@ -124,7 +130,7 @@ impl StarCoder2 {
             self.cfg.layer_norm_eps,
         )?;
         let last = hidden.take_axis(Array::from_slice(&[hidden.shape()[1] - 1], &[1]), 1)?;
-        let logits = linear(&last, &self.embed_tokens, None)?;
+        let logits = self.embed_tokens.forward(&last)?;
         Ok(logits.reshape(&[hidden.shape()[0], self.cfg.vocab_size])?)
     }
 

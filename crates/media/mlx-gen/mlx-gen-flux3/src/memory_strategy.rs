@@ -93,7 +93,7 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
     match spec.quantize {
-        None | Some(Quant::Q4 | Quant::Q8) => Ok(()),
+        None | Some(Quant::Q4 | Quant::Q8 | Quant::Fp8Rowwise) => Ok(()),
         Some(other) => Err(CoreError::Unsupported(format!(
             "{MODEL_ID}: {} has no MLX FLUX3 kernel; the native MLX tiers are affine q4/q8 \
              converted from the original dense package",
@@ -107,6 +107,7 @@ fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
 pub fn tier_fingerprint(base: &str, quant: Option<Quant>, group: Option<u32>) -> String {
     match (quant, group) {
         (None, _) => base.to_owned(),
+        (Some(Quant::Fp8Rowwise), _) => format!("{base}-mlx-fp8r"),
         (Some(q), None) => format!("{base}-mlx-affine-{}", q.key()),
         (Some(q), Some(g)) => format!("{base}-mlx-affine-{}-g{g}", q.key()),
     }
@@ -294,13 +295,16 @@ pub(crate) fn generation_contract(
     }
 
     let storage = NativeDitStorage::from_package(&resources.package_dir)?;
-    storage.validate_selection(spec.quantize, precision)?;
+    let selection = spec.quantize.or_else(|| {
+        (storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise)).then_some(Quant::Fp8Rowwise)
+    });
+    storage.validate_selection(selection, precision)?;
     if let Some(calibration) = &mut contract.calibration {
         let group = match storage {
             NativeDitStorage::MlxAffine { group_size, .. } => Some(group_size),
             _ => None,
         };
-        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, group);
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, selection, group);
     }
     let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
@@ -1308,7 +1312,6 @@ mod tests {
     fn a_spec_no_loader_opens_has_no_contract() {
         for spec in [
             sentinel().with_quant(Quant::Nvfp4),
-            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             match weights_free_memory_strategy_contract(MODEL_ID, &spec) {

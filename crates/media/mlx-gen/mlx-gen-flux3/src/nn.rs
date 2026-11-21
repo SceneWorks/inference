@@ -170,15 +170,7 @@ impl Linear {
 
     /// Every base parameter (dense weight, or packed codes + scales + biases), for eval.
     pub fn arrays(&self) -> Vec<&Array> {
-        if let Some((weight, bias)) = self.inner.dense_weight() {
-            return std::iter::once(weight).chain(bias).collect();
-        }
-        match self.inner.quantized_params() {
-            Some((wq, scales, biases, bias, _, _)) => {
-                [wq, scales, biases].into_iter().chain(bias).collect()
-            }
-            None => Vec::new(),
-        }
+        self.inner.base_arrays()
     }
 }
 

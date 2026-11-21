@@ -127,7 +127,7 @@ pub struct VedaRuntime {
     device: BTreeMap<TileShape, metal::DeviceLayout>,
     /// Device-resident BF16 `[heads, 3*dim, dim]` (Q, K) projections per layer, uploaded on the
     /// layer's first sparse call and kept for every later step.
-    projections: RefCell<BTreeMap<usize, (Array, Array)>>,
+    projections: RefCell<BTreeMap<usize, (metal::HeadwiseWeights, metal::HeadwiseWeights)>>,
     limits: Limits,
     request: VedaRequest,
     report: ReportSink,
@@ -375,24 +375,33 @@ impl VedaRuntime {
         r.dense_token_pairs += pairs;
     }
 
-    /// Device-resident BF16 `[heads, 3*dim, dim]` Q and K projections of `layer`.
-    fn projection(&self, layer: usize) -> Result<(Array, Array)> {
-        if let Some(p) = self.projections.borrow().get(&layer) {
-            return Ok(p.clone());
+    /// The frozen Veda projection keeps the checkpoint's per-head representation for the layer.
+    fn projection(&self, layer: usize) -> Result<(metal::HeadwiseWeights, metal::HeadwiseWeights)> {
+        if let Some(pair) = self.projections.borrow().get(&layer) {
+            return Ok(pair.clone());
         }
         let (h, d) = (self.bundle.heads as i32, self.bundle.dim as i32);
-        let all: Vec<i32> = (0..h).collect();
-        // Projections are stored BF16 (E2): the f32 values below are exactly representable.
-        let upload = |query: bool| -> Result<Array> {
-            Ok(
-                Array::from_slice(&self.bundle.projection(layer, &all, query), &[h, 3 * d, d])
-                    .as_dtype(Dtype::Bfloat16)?,
-            )
+        let all: Vec<_> = (0..h).collect();
+        let upload = |query| -> Result<metal::HeadwiseWeights> {
+            let selected = self.bundle.selected_projection(layer, &all, query);
+            let (values, scales) = if let Some((codes, scales)) = selected.packed() {
+                (
+                    Array::from_slice(codes.as_ref(), &[h, 3 * d, d]),
+                    Some(Array::from_slice(scales.as_ref(), &[h])),
+                )
+            } else {
+                (
+                    Array::from_slice(&selected.dense(), &[h, 3 * d, d])
+                        .as_dtype(Dtype::Bfloat16)?,
+                    None,
+                )
+            };
+            mlx_rs::transforms::eval(std::iter::once(&values).chain(scales.iter()))?;
+            Ok(metal::HeadwiseWeights { values, scales })
         };
-        let p = (upload(true)?, upload(false)?);
-        mlx_rs::transforms::eval([&p.0, &p.1])?;
-        self.projections.borrow_mut().insert(layer, p.clone());
-        Ok(p)
+        let pair = (upload(true)?, upload(false)?);
+        self.projections.borrow_mut().insert(layer, pair.clone());
+        Ok(pair)
     }
 
     fn execute(
@@ -511,8 +520,16 @@ impl VedaRuntime {
                     let width = bound.chunks[shape].heads.max(group.len());
                     let mut padded = group.to_vec();
                     padded.resize(width, *group.last().unwrap());
-                    let mut s =
-                        metal::scores(&self.device[shape], nq, nk, pq, pk, &padded, 0, dim)?;
+                    let mut s = metal::scores_with_weights(
+                        &self.device[shape],
+                        nq,
+                        nk,
+                        pq,
+                        pk,
+                        &padded,
+                        0,
+                        dim,
+                    )?;
                     s.truncate(group.len() * layout.video * layout.video);
                     s
                 }

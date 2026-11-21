@@ -181,6 +181,7 @@ impl AdaptableHost for DitBlockStream {
         let slot = mlx_gen::adapters::LinearFacts::of(self.adapter_slot_mut(index, rest)?);
         (staged.base_shape == slot.base_shape).then_some(mlx_gen::adapters::LinearFacts {
             is_quantized: staged.is_quantized,
+            source_packed: staged.source_packed,
             ..slot
         })
     }

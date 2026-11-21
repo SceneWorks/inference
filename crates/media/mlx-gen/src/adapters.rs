@@ -803,10 +803,24 @@ impl AdaptableLinear {
                 l.weight = Param::new(merged);
                 Ok(())
             }
-            LinearBase::Quantized(_)
-            | LinearBase::Fp8(_)
-            | LinearBase::ConvRot(_)
-            | LinearBase::W4A8(_) => Err(
+            LinearBase::Fp8(_) | LinearBase::ConvRot(_) => {
+                if delta.shape() != self.base_shape()
+                    || !matches!(
+                        delta.dtype(),
+                        Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+                    )
+                {
+                    return Err(
+                        "native projection adapter delta must match the floating base shape".into(),
+                    );
+                }
+                self.push(Adapter::Lokr {
+                    delta: delta.clone(),
+                    scale: 1.0,
+                });
+                Ok(())
+            }
+            LinearBase::Quantized(_) | LinearBase::W4A8(_) => Err(
                 "merge_dense_delta: base is quantized; a LoRA must be merged before quantization"
                     .into(),
             ),
@@ -958,6 +972,28 @@ impl AdaptableLinear {
             | LinearBase::Fp8(_)
             | LinearBase::ConvRot(_)
             | LinearBase::W4A8(_) => None,
+        }
+    }
+
+    /// Physical operands held by the base for staging or resident-byte enumeration.
+    pub fn base_arrays(&self) -> Vec<&Array> {
+        match &self.base {
+            LinearBase::Dense(l) => std::iter::once(&l.weight.value)
+                .chain(l.bias.value.iter())
+                .collect(),
+            LinearBase::Quantized(q) => [&q.inner.weight.value, &q.scales.value, &q.biases.value]
+                .into_iter()
+                .chain(q.inner.bias.value.iter())
+                .collect(),
+            LinearBase::Fp8(p) => [p.codes(), p.scales(), p.input_scale()]
+                .into_iter()
+                .chain(p.bias())
+                .collect(),
+            LinearBase::ConvRot(p) => [p.codes(), p.scales(), p.rotation()]
+                .into_iter()
+                .chain(p.bias())
+                .collect(),
+            LinearBase::W4A8(p) => p.base_arrays(),
         }
     }
 
@@ -1300,6 +1336,8 @@ pub struct LinearFacts {
     pub base_shape: Vec<i32>,
     /// Whether the base is group-quantized (packed) rather than dense.
     pub is_quantized: bool,
+    /// A source-encoded base can retain a checked full delta as an additive projection.
+    pub source_packed: bool,
     /// Whether **any** installed adapter is live (`scale != 0`). A disabled adapter reads `false`,
     /// matching `apply_adapters` rule 1 and [`FusedQkvProjection`](crate::qkv::FusedQkvProjection)'s
     /// pack predicate, which both treat "installed at scale 0" as "never installed".
@@ -1319,6 +1357,7 @@ impl LinearFacts {
         Self {
             base_shape: lin.base_shape(),
             is_quantized: lin.is_quantized(),
+            source_packed: lin.fp8_base().is_some() || lin.convrot_base().is_some(),
             has_live_adapters: lin.adapters().iter().any(|a| !a.is_disabled()),
             adapter_count: lin.adapters().len(),
             bias_shape: lin.bias().map(|b| b.shape().to_vec()),

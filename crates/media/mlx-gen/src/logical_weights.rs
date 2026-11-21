@@ -37,8 +37,8 @@ use gen_core::checkpoint_codec::{
     CheckpointCodecRegistration, CodecResidencyReport, LogicalKeyMapping,
     LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
     ResidencyMode, ScalarScaleSource, TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC,
-    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
-    INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
+    FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::ExecutionRepresentation;
 use gen_core::ProviderRegistryBuilder;
@@ -60,6 +60,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     DENSE_F16_CODEC.codec_id,
     DENSE_F32_CODEC.codec_id,
     FP8_E4M3_SCALAR_CODEC.codec_id,
+    FP8_E4M3_ROWWISE_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
     gen_core::convrot_int8::CODEC_ID,
@@ -135,6 +136,7 @@ pub fn read_logical_weights(
                 && matches!(
                     tensor.codec,
                     TensorCodecSpec::ConvRotInt8 { .. }
+                        | TensorCodecSpec::RowwiseFp8 { .. }
                         | TensorCodecSpec::ScalarFp8 { .. }
                         | TensorCodecSpec::Mxfp8 { .. }
                 ))
@@ -185,7 +187,9 @@ pub fn read_logical_weights(
         if tensor.residency.mode == ResidencyMode::Packed
             && matches!(
                 tensor.codec,
-                TensorCodecSpec::ScalarFp8 { .. } | TensorCodecSpec::Mxfp8 { .. }
+                TensorCodecSpec::ScalarFp8 { .. }
+                    | TensorCodecSpec::Mxfp8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. }
             )
         {
             let base = tensor.logical_key.strip_suffix(".weight").ok_or_else(|| {
@@ -347,6 +351,12 @@ fn bind_fp8(
             };
             (encoding, sw, sx)
         }
+        TensorCodecSpec::RowwiseFp8 { scale } => {
+            let scales = companion(t, physical, scale)?.clone();
+            guard_shape(t, &scales, &[codes.shape()[0] as usize])?;
+            guard_dtype(t, &scales, Dtype::Float32)?;
+            (ComfyQuantFormat::Fp8Rowwise, Some(scales), None)
+        }
         TensorCodecSpec::Mxfp8 {
             scale,
             stored_shape,
@@ -371,17 +381,21 @@ fn bind_fp8(
             return Err("invalid packed FP8 output row transform".into());
         }
         let rows = |a: &Array, lo: usize, hi: usize, swap: bool| -> Result<Array> {
-            let view = a.index((lo as i32..hi as i32, ..));
+            let view = a.index(lo as i32..hi as i32);
             if !swap {
                 return Ok(view);
             }
             let h = ((hi - lo) / 2) as i32;
             Ok(mlx_rs::ops::concatenate_axis(
-                &[&view.index((h.., ..)), &view.index((..h, ..))],
+                &[&view.index(h..), &view.index(..h)],
                 0,
             )?)
         };
         codes = rows(&codes, start, start + len, tx.half_swap)?;
+        if format == ComfyQuantFormat::Fp8Rowwise {
+            let scale = sw.as_ref().expect("validated FP8 row scales");
+            sw = Some(rows(scale, start, start + len, tx.half_swap)?);
+        }
         if format == ComfyQuantFormat::Mxfp8 {
             if tx.half_swap || !start.is_multiple_of(128) || !len.is_multiple_of(128) {
                 return Err(
@@ -446,28 +460,19 @@ fn companion<'a>(
 /// so those two codes are substituted explicitly. Pinned by the 256-code cross-check test against
 /// `gen_core::fp8_e4m3fn_to_f32`.
 fn e4m3_bytes_to_f32(codes: &Array) -> Result<Array> {
-    let decoded = codes.from_fp8(Dtype::Float32)?;
-    let nan_code = mlx_rs::ops::logical_or(
-        &mlx_rs::ops::eq(codes, Array::from_slice(&[0x7F_u8], &[]))?,
-        &mlx_rs::ops::eq(codes, Array::from_slice(&[0xFF_u8], &[]))?,
-    )?;
-    Ok(mlx_rs::ops::r#where(
-        &nan_code,
-        Array::from_f32(f32::NAN),
-        &decoded,
+    Ok(mlx_layers::fp8::decoded_codes(
+        codes,
+        gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn,
     )?)
 }
 
 /// Decode E5M2 bytes (`U8` view) to f32: E5M2 is IEEE binary16 truncated to its top byte, so
 /// `u16(byte) << 8` reinterpreted as f16 is the exact value (inf/NaN codes included).
 fn e5m2_bytes_to_f32(codes: &Array) -> Result<Array> {
-    let shifted = mlx_rs::ops::multiply(
-        &codes.as_dtype(Dtype::Uint16)?,
-        Array::from_slice(&[256_u16], &[]),
-    )?;
-    Ok(shifted
-        .view_dtype(Dtype::Float16)?
-        .as_dtype(Dtype::Float32)?)
+    Ok(mlx_layers::fp8::decoded_codes(
+        codes,
+        gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2,
+    )?)
 }
 
 /// Decode E8M0 shared-exponent bytes (`U8` view) to f32: `2^(byte − 127)` = `u32(byte) << 23`
@@ -574,6 +579,17 @@ fn decode(
             guard_shape(tensor, &array, &tensor.shape)?;
             guard_dtype(tensor, &array, expected)?;
             Ok(array)
+        }
+        TensorCodecSpec::RowwiseFp8 { scale } => {
+            guard_shape(tensor, &array, &tensor.shape)?;
+            let scales = companion(tensor, physical, scale)?;
+            guard_shape(tensor, scales, &[tensor.shape[0]])?;
+            guard_dtype(tensor, scales, Dtype::Float32)?;
+            guard_dtype(tensor, &array, Dtype::Uint8)?;
+            Ok(
+                mlx_rs::ops::multiply(e4m3_bytes_to_f32(&array)?, scales.reshape(&[-1, 1])?)?
+                    .as_dtype(Dtype::Bfloat16)?,
+            )
         }
         TensorCodecSpec::ScalarFp8 { scale, .. } => {
             // fp8 arrives as the U8 byte view (MLX has no fp8 dtype; the loader re-presents it).
