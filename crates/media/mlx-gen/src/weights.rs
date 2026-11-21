@@ -153,14 +153,11 @@ impl Weights {
         // A full-precision declaration already decoded the payload. Its cast/crop belongs to the
         // logical dense materialization; retain its representation rather than rebinding it.
         let dk = format!("{base}.comfy_quant");
-        if self.tensors.contains_key(&dk) {
-            self.tensors.insert(
-                dk,
-                mlx_layers::fp8::descriptor_array(
-                    gen_core::ComfyQuantFormat::Mxfp8,
-                    false,
-                    Some(&shape),
-                ),
+        if let Some(descriptor) = self.tensors.get_mut(&dk) {
+            *descriptor = mlx_layers::fp8::descriptor_array(
+                gen_core::ComfyQuantFormat::Mxfp8,
+                false,
+                Some(&shape),
             );
         } else if let Some(a) = self.tensors.get_mut(&key) {
             use mlx_rs::ops::indexing::IndexOp;
@@ -1007,6 +1004,24 @@ pub fn join(prefix: &str, name: &str) -> String {
     }
 }
 
+impl mlx_layers::MlxWeightSource for Weights {
+    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
+        self.source_reads.get(key)
+    }
+    fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
+        self.planned_fp8(base)
+    }
+    fn get(&self, key: &str) -> Option<&Array> {
+        self.get(key)
+    }
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.source_reads.rotation(group, build)
+    }
+    fn planned_geometry(&self, base: &str) -> Option<gen_core::convrot_int8::ConvRotInt8> {
+        self.planned_convrot(base)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,23 +1435,5 @@ mod tests {
         assert!(is_available(derived));
         let expected = Array::from_slice(&[1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0], &[3, 2]);
         assert_eq!(derived.as_dtype(Dtype::Float32).unwrap(), expected);
-    }
-}
-
-impl mlx_layers::MlxWeightSource for Weights {
-    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
-        self.source_reads.get(key)
-    }
-    fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
-        self.planned_fp8(base)
-    }
-    fn get(&self, key: &str) -> Option<&Array> {
-        self.get(key)
-    }
-    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.source_reads.rotation(group, build)
-    }
-    fn planned_geometry(&self, base: &str) -> Option<gen_core::convrot_int8::ConvRotInt8> {
-        self.planned_convrot(base)
     }
 }
