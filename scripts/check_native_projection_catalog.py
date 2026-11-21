@@ -100,7 +100,7 @@ REGISTER = re.compile(
     r"\(\s*([\w:]+)"
 )
 OPEN = re.compile(
-    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|(?:dir|file)_with_projection_layout|dir|paths|source_map)\("
+    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|(?:dir|file)_with_(?:projection_layout|layout)|dir|paths|source_map)\("
     r"|read_logical_weights\(|mlx_llm::text_registry\(|DitBlockStream::"
 )
 BIND = re.compile(
@@ -159,6 +159,8 @@ def check_mlx(root: Path) -> list[str]:
         (media / "mlx-gen-sdxl/src/ldm.rs", "insert_source_projection("),
         (media / "mlx-gen-z-image/src/comfyui.rs", "insert_split_projection("),
         (media / "mlx-gen-qwen-image-2-1/src/loader.rs", "visual.into_language_weights("),
+        (media / "mlx-gen-flux3/src/model.rs", "weights.native_tensor_keys()"),
+        (media / "mlx-gen-flux3/src/model.rs", "storage.validate_source_headers("),
         (media / "mlx-gen-wan/src/memory_strategy.rs", "plan_projection_sources("),
         (media / "mlx-gen-svd/src/memory_strategy.rs", "projected_float_component_bytes("),
         (media / "mlx-gen-minimax-h3/src/text_encoder/mod.rs", "Weights::from_selected_files("),
