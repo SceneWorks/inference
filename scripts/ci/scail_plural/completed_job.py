@@ -32,6 +32,7 @@ def terminal_scope(guard, end, pool, card, claim, basis):
         raise ValueError("a CUDA source sample breaches its approved guard")
     validate_rejected_growth(guard, end, pool, card, completed_job=True)
     raw = guard["fit_observation"]
+    tick_ns = admission["pollMillis"] * 1_000_000
     counts = {}
     gaps = {}
     for key, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]), ("shared", raw["wddm_shared"])):
@@ -46,7 +47,11 @@ def terminal_scope(guard, end, pool, card, claim, basis):
             # KeepSystemGrowth records read_ns before PairCudaProbe polls PDH;
             # Observer records at_ns after BOTH gauges. Windows may return the
             # same tick for both reads. A previous attempt cannot overlap.
-            if not (final[-2]["at_ns"] < final[-1]["read_ns"] <= gap["start_ns"] <= gap["end_ns"] <= final[-1]["at_ns"]
+            start, finish = gap["start_ns"], gap["end_ns"]
+            lower, upper = gap["local_filetime_before"], gap["local_filetime_after"]
+            if not (all(type(v) is int and v > 0 for v in (start, finish, lower, upper))
+                    and 0 <= finish - start <= tick_ns and 0 <= (upper - lower) * 100 <= tick_ns
+                    and final[-2]["at_ns"] < final[-1]["read_ns"] <= gap["start_ns"] <= gap["end_ns"] <= final[-1]["at_ns"]
                     and gap["retried"] is True and gap["retry_sample"] is None
                     and series["samples"] and gap["previous"] == series["samples"][-1]
                     and gap["local_filetime_before"] >= series["samples"][-1][0]):

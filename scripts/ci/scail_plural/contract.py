@@ -308,7 +308,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             admission = guard["admission"]
             if (admission["cudaDeviceUuid"] != approved.cuda_device_uuid
                     or admission["gpuFreeReserveBytes"] != approved.gpu_free_reserve_bytes
-                    or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes):
+                    or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes
+                    or (completed_job is not None and admission["pollMillis"] != approved.poll_millis)):
                 raise ValueError("rejected CUDA attempt budget differs from the approved guard")
         growth, growth_count = tenant_growth(guard, uuid)
         stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job)

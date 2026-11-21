@@ -18,6 +18,7 @@ from scripts.tests.test_scail2_cuda_stage import fixture_with_rejected_growth
 def completed_fixture():
     guard, pool = fixture_with_rejected_growth()
     guard["returncode"] = 0
+    guard["admission"]["pollMillis"] = 250
     raw = guard["fit_observation"]
     card = raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"]
     card.pop()
@@ -60,7 +61,8 @@ class CompletedJob(unittest.TestCase):
 
     def test_unlocated_gaps_missing_polls_and_failed_guards_are_ineligible(self):
         for problem in ("before-read", "overlap", "filetime", "unrecorded", "missing-attempt",
-                        "crossed-job", "cap", "reserve", "reused-card", "release", "return"):
+                        "crossed-job", "cap", "reserve", "reused-card", "release", "return",
+                        "shared-backwards", "both-backwards", "noninteger", "late-clock"):
             with self.subTest(problem=problem):
                 guard, pool, claim = completed_fixture()
                 raw = guard["fit_observation"]
@@ -73,6 +75,14 @@ class CompletedJob(unittest.TestCase):
                     shared["start_ns"] -= 1
                 elif problem == "filetime":
                     shared["local_filetime_before"] -= 1
+                elif problem == "shared-backwards":
+                    shared["local_filetime_after"] = shared["local_filetime_before"] - 1
+                elif problem == "both-backwards":
+                    gap["local_filetime_after"] = shared["local_filetime_after"] = 0
+                elif problem == "noninteger":
+                    shared["end_ns"] = float(shared["end_ns"])
+                elif problem == "late-clock":
+                    shared["local_filetime_after"] += 2_500_001
                 elif problem == "unrecorded":
                     raw["wddm_shared"]["samples"].pop(0)
                 elif problem == "missing-attempt":
@@ -129,7 +139,7 @@ class CompletedJob(unittest.TestCase):
             guard_path = root / "count-6.supervisor.json"
             captured = json.loads(guard_path.read_bytes())
             policy = runner.tier1.read_policy(root, "policy.json", contract.policy("candle-cuda", cuda_uuid=contract.GPU0))
-            for problem in ("missing-attempt", "earlier-gap", "foreign-job", "native-pool"):
+            for problem in ("missing-attempt", "earlier-gap", "foreign-job", "native-pool", "both-backwards"):
                 with self.subTest(problem=problem):
                     guard = copy.deepcopy(captured)
                     raw = guard["fit_observation"]
@@ -140,6 +150,9 @@ class CompletedJob(unittest.TestCase):
                         raw["wddm_retry"]["dedicated"]["events"][0]["start_ns"] = tail[-2]["read_ns"]
                     elif problem == "foreign-job":
                         tail[-1]["pid"] = 1
+                    elif problem == "both-backwards":
+                        for gauge in raw["wddm_retry"].values():
+                            gauge["events"][-1]["local_filetime_after"] = 0
                     else:
                         tail[-1]["pool"]["poolReservedHighBytes"] -= 1
                     guard_path.write_text(json.dumps(guard))
