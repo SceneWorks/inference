@@ -5,12 +5,15 @@
 
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) use candle_layers::prism::cuda;
+#[cfg(test)]
+pub(crate) use candle_layers::prism::{
+    fwht_tensor, gdn_gather_index, gdn_reorder_tensor, multiply_signs, rotation_affine_factor,
+    upload_signs, PackedStorage, Rotation, ROTATION_UPLOADS,
+};
 pub use candle_layers::prism::{
     launch_elems, launch_grid_x, launch_u32, GdnRowMap, PrismPackedWeight, PrismRegistry,
     FUSED_ROTATION_MAX_BLOCK, PRISM_SRC,
 };
-#[cfg(test)]
-pub(crate) use candle_layers::prism::{rotation_affine_factor, ROTATION_UPLOADS};
 
 #[cfg(test)]
 pub(crate) mod tests {

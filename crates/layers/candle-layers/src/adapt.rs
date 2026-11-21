@@ -635,7 +635,15 @@ impl Adapter {
                 .residual(x)
             }
             // The `scale` is already baked into `factors.w2`; rescale only when overridden.
+            // A zero-baked `factors.scale == 0.0` destroyed the pre-bake `w2` amplitude, so a
+            // nonzero request-scoped override cannot recover the unscaled factors and is refused.
             Adapter::LokrStructured { factors } => {
+                if factors.scale == 0.0 && override_scale != 0.0 {
+                    return Err(candle_core::Error::Msg(
+                        "LokrStructured: cannot apply nonzero ScaleContext override when baked factors.scale is 0.0"
+                            .into(),
+                    ));
+                }
                 let y = factors.residual(x)?;
                 if (override_scale - factors.scale).abs() <= f64::EPSILON || factors.scale == 0.0 {
                     Ok(y)
@@ -2275,5 +2283,26 @@ mod tests {
         assert!(!lin.is_adapted());
         assert!(!lin.has_trainable_adapter());
         assert!(!lin.is_trainable_frozen());
+    }
+
+    #[test]
+    fn lokr_structured_zero_baked_scale_rejects_nonzero_override() {
+        let dev = Device::Cpu;
+        let adapter = Adapter::LokrStructured {
+            factors: LokrFactors {
+                w1: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
+                w2: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
+                a: 2,
+                b: 2,
+                c: 2,
+                d: 2,
+                scale: 0.0,
+            },
+        };
+        let x = Tensor::zeros((1, 4), DType::F32, &dev).unwrap();
+        let err = adapter
+            .residual_with_scale(&x, 0.5)
+            .expect_err("zero-baked LokrStructured must reject nonzero override");
+        assert!(err.to_string().contains("baked factors.scale is 0.0"));
     }
 }

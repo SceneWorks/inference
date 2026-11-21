@@ -255,8 +255,12 @@ impl LoraLinear {
     }
 
     /// Construct a [`LoraLinear`] directly from a shared-spine [`AdaptLinear`] at `path` (`SW-6956`),
-    /// preserving any attached forward-time additive or trainable LoRA/LoKr residuals.
-    pub fn from_adapt_linear(adapt: AdaptLinear, path: String) -> Self {
+    /// preserving any attached forward-time additive or single trainable LoRA/LoKr residual.
+    ///
+    /// Returns an error if `adapt` contains more than one trainable adapter (`TrainableLora` or
+    /// `TrainableLokr`), because `LoraLinear` owns a single trainable slot alongside arbitrary
+    /// forward-time additive residuals.
+    pub fn from_adapt_linear(adapt: AdaptLinear, path: String) -> Result<Self> {
         let out_features = adapt.out_features;
         let in_features = adapt.in_features;
         let mut adapter = None;
@@ -283,6 +287,11 @@ impl LoraLinear {
                     scale,
                     frozen: is_frozen,
                 } => {
+                    if adapter.is_some() {
+                        return Err(CandleError::Msg(format!(
+                            "LoraLinear::from_adapt_linear at '{path}' cannot represent multiple trainable adapters"
+                        )));
+                    }
                     if is_frozen {
                         let detached = Adapter::Lora {
                             down: down.detach(),
@@ -303,6 +312,11 @@ impl LoraLinear {
                     scale,
                     frozen: is_frozen,
                 } => {
+                    if adapter.is_some() {
+                        return Err(CandleError::Msg(format!(
+                            "LoraLinear::from_adapt_linear at '{path}' cannot represent multiple trainable adapters"
+                        )));
+                    }
                     let live = Adapter::Lokr {
                         w1: w1.clone(),
                         w2: match &w2 {
@@ -347,7 +361,7 @@ impl LoraLinear {
                 }
             }
         }
-        Self {
+        Ok(Self {
             base: adapt.base,
             in_features,
             out_features,
@@ -356,7 +370,7 @@ impl LoraLinear {
             frozen,
             additive,
             additive_pass: Arc::new(AtomicUsize::new(0)),
-        }
+        })
     }
 
     /// Inspect the underlying shared [`candle_layers::adapt::Base`].
@@ -3346,5 +3360,38 @@ mod adapter_noise_tests {
         let mut g = zero_grads(&s);
         assert!(apply_gradient_noise(&mut g, &s, -0.1, 0.55, 0, 0).is_err());
         assert!(apply_gradient_noise(&mut g, &s, 0.01, -1.0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn from_adapt_linear_rejects_multiple_trainable_adapters() {
+        let dev = Device::Cpu;
+        let w = Tensor::zeros((4, 3), DType::F32, &dev).unwrap();
+        let base = Linear::new(w, None);
+        let mut adapt = AdaptLinear::from_dense(base);
+        let down1 = candle_core::Var::zeros((3, 2), DType::F32, &dev).unwrap();
+        let up1 = candle_core::Var::zeros((2, 4), DType::F32, &dev).unwrap();
+        adapt
+            .attach_trainable_lora(
+                down1.as_tensor().clone(),
+                up1.as_tensor().clone(),
+                1.0,
+                false,
+            )
+            .unwrap();
+        assert!(LoraLinear::from_adapt_linear(adapt.clone(), "blk.0.attn.to_q".into()).is_ok());
+
+        let down2 = candle_core::Var::zeros((3, 2), DType::F32, &dev).unwrap();
+        let up2 = candle_core::Var::zeros((2, 4), DType::F32, &dev).unwrap();
+        adapt
+            .attach_trainable_lora(
+                down2.as_tensor().clone(),
+                up2.as_tensor().clone(),
+                1.0,
+                false,
+            )
+            .unwrap();
+        let err = LoraLinear::from_adapt_linear(adapt, "blk.0.attn.to_q".into())
+            .expect_err("multiple trainable adapters must be rejected");
+        assert!(err.to_string().contains("multiple trainable adapters"));
     }
 }

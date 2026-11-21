@@ -16,6 +16,7 @@ pub struct Linear {
 
 impl Linear {
     /// Wrap a raw dense `[out, in]` weight and optional `[out]` bias on the shared spine.
+    #[cfg(test)]
     pub(crate) fn from_dense(weight: Array, bias: Option<Array>) -> Self {
         Self {
             inner: AdaptableLinear::dense(weight, bias),

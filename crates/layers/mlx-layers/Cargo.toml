@@ -2,7 +2,8 @@
 name = "mlx-layers"
 version = "0.1.0"
 edition = "2021"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
 description = "Lower-level MLX linear, quantization, and residual adapter primitives shared below media and LLM engines"
 
 [features]

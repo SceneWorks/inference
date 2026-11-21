@@ -125,23 +125,8 @@ impl candle_core::CustomOp1 for FrozenPackedInput {
 
 /// Apply a two-dimensional factor without materializing one copy per leading batch.
 pub(crate) fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
-    if super::comparison::active_stage().is_some() {
-        super::profile::cohort_reuse(if super::comparison::legacy_e1() {
-            "comparison:e1-factor:legacy"
-        } else {
-            "comparison:e1-factor:current"
-        });
-    }
-    if super::profile::reference_math() || w.rank() != 2 || x.rank() <= 2 {
-        return x.broadcast_matmul(w);
-    }
-    let dims = x.dims();
-    let mut output = dims[..dims.len() - 1].to_vec();
-    let rows: usize = output.iter().product();
-    output.push(w.dim(1)?);
-    x.reshape((rows, dims[dims.len() - 1]))?
-        .matmul(w)?
-        .reshape(output)
+    crate::ensure_reference_math_hook();
+    candle_layers::adapt::apply_factor(x, w)
 }
 
 /// Scale the rank-sized intermediate only in f32. Half precision keeps the reference
@@ -152,18 +137,8 @@ pub(crate) fn scaled_lora(
     up: &Tensor,
     scale: f64,
 ) -> candle_core::Result<Tensor> {
-    let rank = apply_factor(x, down)?;
-    if super::profile::reference_math() {
-        return apply_factor(&rank, up)? * scale;
-    }
-    if scale == 1.0 {
-        // The common alpha == rank convention needs no scaling kernel at any dtype.
-        apply_factor(&rank, up)
-    } else if x.dtype() == DType::F32 && down.dim(1)? < up.dim(1)? && scale.is_finite() {
-        apply_factor(&(rank * scale)?, up)
-    } else {
-        apply_factor(&rank, up)? * scale
-    }
+    crate::ensure_reference_math_hook();
+    candle_layers::adapt::scaled_lora(x, down, up, scale)
 }
 
 /// Run-owned frozen dense weights concatenated once along their actual output widths.

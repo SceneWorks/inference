@@ -688,7 +688,15 @@ impl Adapter {
             // Structured LoKr (sc-10050): the vec-trick, `factors.scale` is already baked into
             // `factors.w2`. When `override_scale` matches `factors.scale`, return directly without
             // any extra op; when overridden and `factors.scale != 0.0`, rescale by the ratio.
+            // A zero-baked `factors.scale == 0.0` destroyed the pre-bake `w2` amplitude, so a
+            // nonzero request-scoped override cannot recover the unscaled factors and is refused.
             Adapter::LokrStructured { factors } => {
+                if factors.scale == 0.0 && override_scale != 0.0 {
+                    return Err(Error::Msg(
+                        "LokrStructured: cannot apply nonzero ScaleContext override when baked factors.scale is 0.0"
+                            .to_string(),
+                    ));
+                }
                 let y = factors.residual(x)?;
                 if (override_scale - factors.scale).abs() <= f32::EPSILON || factors.scale == 0.0 {
                     return Ok(y);
@@ -1945,5 +1953,25 @@ mod tests {
         assert_eq!(q.compute_dtype(), Some(Dtype::Float32));
         q.cast_compute_dtype(Dtype::Bfloat16).unwrap();
         assert_eq!(q.compute_dtype(), Some(Dtype::Bfloat16));
+    }
+
+    #[test]
+    fn lokr_structured_zero_baked_scale_rejects_nonzero_override() {
+        let adapter = Adapter::LokrStructured {
+            factors: LokrFactors {
+                w1: Array::zeros::<f32>(&[2, 2]).unwrap(),
+                w2: Array::zeros::<f32>(&[2, 2]).unwrap(),
+                a: 2,
+                b: 2,
+                c: 2,
+                d: 2,
+                scale: 0.0,
+            },
+        };
+        let x = Array::zeros::<f32>(&[1, 4]).unwrap();
+        let err = adapter
+            .residual_with_scale(&x, 0.5)
+            .expect_err("zero-baked LokrStructured must reject nonzero override");
+        assert!(err.to_string().contains("baked factors.scale is 0.0"));
     }
 }
