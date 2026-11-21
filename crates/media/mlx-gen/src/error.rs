@@ -161,6 +161,15 @@ impl From<gen_core::Error> for Error {
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<mlx_layers::Error> for Error {
+    fn from(e: mlx_layers::Error) -> Self {
+        match e {
+            mlx_layers::Error::Mlx(e) => Self::Mlx(e),
+            mlx_layers::Error::Msg(message) => Self::Msg(message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,14 +260,5 @@ mod tests {
                 ..
             }
         ));
-    }
-}
-
-impl From<mlx_layers::Error> for Error {
-    fn from(e: mlx_layers::Error) -> Self {
-        match e {
-            mlx_layers::Error::Mlx(e) => Self::Mlx(e),
-            mlx_layers::Error::Msg(message) => Self::Msg(message),
-        }
     }
 }
