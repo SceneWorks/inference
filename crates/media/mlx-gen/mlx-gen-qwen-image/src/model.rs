@@ -396,7 +396,7 @@ impl Generator for QwenImage {
         let mut report = mlx_gen::image_execution::without_capture(|| {
             self.generate_with_report_observed_with_run(req, Some(&run), on_progress)
         })?;
-        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        report.low_res_start = low_res_start_report(plan)?;
         Ok(report)
     }
 
@@ -429,12 +429,18 @@ impl Generator for QwenImage {
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 let mut report =
                     self.generate_with_report_observed_with_run(req, Some(&run), &mut progress)?;
-                report.low_res_start =
-                    plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                report.low_res_start = low_res_start_report(plan)?;
                 Ok(report)
             },
         )
     }
+}
+
+fn low_res_start_report(
+    plan: &mlx_gen::gen_core::RenderPlan,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::LowResStartExecutionReport>> {
+    // The retained boundary estimate lives in the f32 sampler trajectory.
+    plan.low_res_start_execution_report("f32", 4, "base_dit")
 }
 
 impl QwenImage {
@@ -1276,6 +1282,74 @@ mod tests {
             .execution_report(20)
             .validate_with_capability(caps.pag.as_ref().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn previous_evaluation_reports_f32_retained_estimate_bytes() {
+        use mlx_gen::gen_core::sampling::{
+            FlowModelSampling, Solver, SolverRunState, TimestepConvention,
+        };
+        use mlx_gen::gen_core::{EstimateSource, EvaluationKind, LowResStartSpec};
+        use mlx_gen::sampler::MlxLatentOps;
+
+        let req = GenerationRequest {
+            prompt: "a fox in the forest".into(),
+            width: 512,
+            height: 512,
+            seed: Some(42),
+            steps: Some(4),
+            sampler: Some("euler".into()),
+            low_res_start: Some(
+                LowResStartSpec::new(2, Some(0.5))
+                    .with_estimate_source(EstimateSource::PreviousEvaluation),
+            ),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let registry = crate::register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new())
+            .build()
+            .unwrap();
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let (width, height) = plan.phase_output_size(0);
+        let noise = create_noise(42, width, height).unwrap();
+        let sigmas = plan.denoise_sigmas();
+        let mut state = SolverRunState::new(Solver::Euler, sigmas);
+        state
+            .configure_low_res_start(plan.low_res_start().unwrap())
+            .unwrap();
+        let _ = Solver::Euler
+            .boxed::<MlxLatentOps>()
+            .sample_span(
+                &MlxLatentOps,
+                &FlowModelSampling::new(TimestepConvention::Sigma),
+                &mut |x, _| Ok(x.clone()),
+                noise,
+                sigmas,
+                42,
+                plan.denoise_spans()[0].clone(),
+                &mut state,
+            )
+            .unwrap();
+        let retained = state.take_captured_primary_estimate(1).unwrap().latent;
+        assert_eq!(
+            retained.shape(),
+            vec![1, (width / 16 * (height / 16)) as i32, 64]
+        );
+        assert_eq!(retained.dtype(), mlx_rs::Dtype::Float32);
+
+        let estimate = low_res_start_report(&plan)
+            .unwrap()
+            .unwrap()
+            .estimate_provenance;
+        assert_eq!(estimate.evaluation_kind, EvaluationKind::GuidedPrimaryX0);
+        assert_eq!(estimate.dtype, "f32");
+        assert_eq!(
+            estimate.retained_primary_estimate_bytes,
+            retained.nbytes() as u64
+        );
     }
 
     #[test]

@@ -96049,7 +96049,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+          "Resident and staged img2img trajectories, each with split and unsplit spans and byte-identical output"
         ]
       }
     },

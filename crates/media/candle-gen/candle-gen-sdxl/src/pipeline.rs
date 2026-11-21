@@ -2737,7 +2737,28 @@ mod tests {
             ..Default::default()
         };
         let spec = crate::tests::sdxl_spec(WeightsSource::Dir("/nonexistent/sdxl".into()));
-        let plan = crate::compile_sdxl(&spec, &req).unwrap().unwrap();
+        // Compile the img2img schedule at the provider's supported size, then run that
+        // exact schedule on a smaller fixture canvas to bound CPU proof cost.
+        let full_size_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..req.clone()
+        };
+        let compiled = crate::compile_sdxl(&spec, &full_size_req).unwrap().unwrap();
+        let plan = gen_core::RenderPlan::packed_image_trajectory(
+            &crate::plain_descriptor(),
+            &req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: compiled.pixel_stride(),
+                token_width: compiled.token_width(),
+                sampler: compiled.sampler(),
+                guidance: compiled.guidance(),
+                sigmas: compiled.denoise_sigmas().to_vec(),
+                executed_steps: compiled.denoise_sigmas().len() - 1,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
         let split = plan.clone().with_inert_split_at(2).unwrap();
         assert_eq!(plan.denoise_sigmas(), split.denoise_sigmas());
         assert_eq!(plan.denoise_spans(), vec![0..4]);
