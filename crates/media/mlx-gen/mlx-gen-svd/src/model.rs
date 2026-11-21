@@ -402,27 +402,27 @@ impl Svd {
     }
 }
 
-impl Svd {
-    fn generate_execution_attempt(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
 impl Generator for Svd {
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_impl(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
+            .map_err(Into::into)
         })
     }
 
@@ -440,7 +440,8 @@ impl Generator for Svd {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_impl(req, None, on_progress)
+                .map_err(Into::into)
         })
     }
 
@@ -499,6 +500,7 @@ impl Svd {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
@@ -572,45 +574,21 @@ impl Svd {
             current: 0,
             total: total_steps,
         });
-        // Thread per-step progress through the 25-step denoise loop so progress UIs advance through the
-        // dominant denoise phase instead of sitting at 0% until decode (F-088).
-        let final_latents = if let Some(name) = req.sampler.as_deref() {
-            // Curated unified solver (epic 7114, sc-7122): swap the integrator, keep the native Karras
-            // EDM σ schedule (SVD is sampler-only). The native EDM Euler default (no `req.sampler`) stays
-            // on `denoise` below — byte-exact (N1).
-            self.pipeline.denoise_curated(
-                name,
-                &latents,
-                &image_embeds,
-                &image_latents,
-                &added_time_ids,
-                params.num_frames,
-                params.num_inference_steps,
-                params.min_guidance_scale,
-                params.max_guidance_scale,
-                seed,
-                &req.cancel,
-                on_progress,
-            )?
-        } else {
-            self.pipeline.denoise(
-                &latents,
-                &image_embeds,
-                &image_latents,
-                &added_time_ids,
-                params.num_frames,
-                params.num_inference_steps,
-                params.min_guidance_scale,
-                params.max_guidance_scale,
-                &req.cancel,
-                &mut |step| {
-                    on_progress(Progress::Step {
-                        current: step as u32,
-                        total: total_steps,
-                    })
-                },
-            )?
-        };
+        let final_latents = self.pipeline.denoise_scoped(
+            sched,
+            req.sampler.as_deref(),
+            seed,
+            &latents,
+            &image_embeds,
+            &image_latents,
+            &added_time_ids,
+            params.num_frames,
+            params.min_guidance_scale,
+            params.max_guidance_scale,
+            &req.cancel,
+            scope,
+            on_progress,
+        )?;
 
         on_progress(Progress::Decoding);
         mlx_gen::video_execution::policy(

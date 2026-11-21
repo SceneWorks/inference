@@ -945,6 +945,7 @@ dependencies = [
  "candle-gen-flux",
  "image",
  "rand",
+ "sceneworks-gen-core-family",
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
@@ -2970,6 +2971,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-flux",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-family",
  "serde_json",
  "tempfile",
 ]

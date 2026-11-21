@@ -14,6 +14,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
 
+use mlx_gen::gen_core::MemoryRequestScope;
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
@@ -235,6 +236,7 @@ impl Mochi {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
@@ -242,6 +244,23 @@ impl Mochi {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+
+        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
+        let seed = req.seed.unwrap_or_else(default_seed);
+        let phase = gen_core_family::mochi::phase(
+            req.width,
+            req.height,
+            frames,
+            self.vae_config.temporal_compression_ratio() as u32,
+            req.steps.unwrap_or(DEFAULT_STEPS) as usize,
+            MOCHI_SHIFT,
+            seed,
+        )?;
+        let active = phase.enter(&req.cancel, scope)?;
+        let s_ratio = self.vae_config.spatial_compression_ratio() as u32;
+        let lh = req.height / s_ratio;
+        let lw = req.width / s_ratio;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch (the
         // reference encodes the negative prompt, or "" when unset, with `do_classifier_free_guidance`).
@@ -259,21 +278,9 @@ impl Mochi {
                 Ok((pos, neg, enc, enc_mask))
             },
         )?;
-        // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
-        // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
-        let t_ratio = self.vae_config.temporal_compression_ratio() as u32;
-        let s_ratio = self.vae_config.spatial_compression_ratio() as u32;
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let lf = 1 + (frames - 1) / t_ratio;
-        let lh = req.height / s_ratio;
-        let lw = req.width / s_ratio;
-
         // Seeded init noise. FlowMatchEuler `init_noise_sigma = 1`, so the seeded standard-normal latent
         // is used unscaled (RNG is not portable to the reference; the e2e parity gate teacher-forces the
         // init latents instead of matching MLX's RNG).
-        let seed = req.seed.unwrap_or_else(default_seed);
         let key = random::key(seed)?;
         mlx_gen::video_execution::policy(
             "mochi_precision",
@@ -281,24 +288,31 @@ impl Mochi {
         );
         mlx_gen::video_execution::draw(0, "mochi_initial_normal", seed);
         let init = random::normal::<f32>(
-            &[1, LATENT_CHANNELS, lf as i32, lh as i32, lw as i32],
+            &[
+                1,
+                LATENT_CHANNELS,
+                phase.latent_frames as i32,
+                lh as i32,
+                lw as i32,
+            ],
             None,
             None,
             Some(&key),
         )?;
 
-        let latents = crate::pipeline::denoise(
+        let latents = crate::pipeline::denoise_schedule(
             &self.transformer,
             &init,
             &enc,
             &enc_mask,
-            steps,
+            &phase.sigmas,
             guidance,
             MOCHI_SHIFT,
             &req.cancel,
             on_progress,
         )?;
 
+        active.finish()?;
         on_progress(Progress::Decoding);
         let frames_arr = crate::pipeline::decode_to_frames(&self.vae, &latents, &req.cancel)?;
         let images: Vec<Image> = crate::pipeline::frames_to_images(&frames_arr)?;
@@ -310,27 +324,27 @@ impl Mochi {
     }
 }
 
-impl Mochi {
-    fn generate_execution_attempt(
-        &self,
-        req: &mlx_gen::GenerationRequest,
-        on_progress: &mut dyn FnMut(mlx_gen::Progress),
-    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
 impl mlx_gen::Generator for Mochi {
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_impl(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
+            .map_err(Into::into)
         })
     }
 
@@ -347,7 +361,8 @@ impl mlx_gen::Generator for Mochi {
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_impl(req, None, on_progress)
+                .map_err(Into::into)
         })
     }
 }

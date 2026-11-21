@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 candle-gen = { path = "../candle-gen" }
 # Mochi conditions on the same google/t5-v1.1-xxl encoder FLUX reuses; the masked T5 encode is run
 # through the shared `candle_gen_flux::PackedT5Encoder` stack (packed-detect QLinear/QEmbedding → dense
