@@ -417,26 +417,29 @@ class SharedHeadroom(unittest.TestCase):
             with self.assertRaises(ValueError):
                 proof.validate_configurations(row)
 
-    def test_projection_proofs_bind_only_the_registered_gpu0_uuid_and_index(self):
+    def test_projection_proofs_bind_only_the_registered_device_uuid_and_index(self):
         rows = [row for row in proof.load_registry()
-                if (row['package'], row['target'], row['fqn']) in proof.GPU0_PROJECTION_PROOFS]
+                if (row['package'], row['target'], row['fqn']) in proof.PROJECTION_PROOF_DEVICES]
         self.assertEqual(len(rows), 2)
         for row in rows:
             with self.subTest(case=proof.identity(row)):
                 configured = proof.configured_case(row, 'fixed_cuda')
-                self.assertEqual(configured['required_cuda_device_uuid'], proof.training_comparison.DEVICES['gpu0'][0])
-                self.assertEqual(configured['required_cuda_physical_index'], 0)
+                device = proof.PROJECTION_PROOF_DEVICES[(row['package'], row['target'], row['fqn'])]
+                expected_uuid, expected_index = proof.training_comparison.DEVICES[device]
+                self.assertEqual(configured['required_cuda_device_uuid'], expected_uuid)
+                self.assertEqual(configured['required_cuda_physical_index'], expected_index)
                 self.assertEqual(resources.bound_cuda_activity_profile(configured), PROFILE)
-                for key, value in [('uuid', UUID), ('index', 1), ('fqn', 'unbound_fixture')]:
+                for key, value in [('uuid', OTHER), ('index', 1 - expected_index)]:
                     modified = copy.deepcopy(row)
                     if key == 'uuid':
                         modified['required_cuda_device_uuid'] = value
                     elif key == 'index':
                         modified['configurations']['fixed_cuda']['required_cuda_physical_index'] = value
-                    else:
-                        modified['fqn'] = value
                     with self.assertRaises(ValueError):
                         proof.validate_configurations(modified)
+                unregistered = {**configured, 'fqn': 'unbound_fixture'}
+                with self.assertRaises(ValueError):
+                    resources.bound_cuda_activity_profile(unregistered)
 
     def test_all_bounded_cases_bind_source_owned_gpu1_headroom_without_implicit_selection(self):
         rows = [row for row in proof.load_registry() if 'bounded_acceleration' in row['fqn']]

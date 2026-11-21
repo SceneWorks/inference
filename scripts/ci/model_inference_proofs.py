@@ -68,9 +68,9 @@ IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
 )
 IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
 SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
-GPU0_PROJECTION_PROOFS = {
-    ('candle-gen', 'integration', 'cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16'),
-    ('candle-gen-minimax-h3', 'integration', 'convrot_int8::native_projections_match_pinned_kitchen'),
+PROJECTION_PROOF_DEVICES = {
+    ('candle-gen', 'integration', 'cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16'): 'gpu0',
+    ('candle-gen-minimax-h3', 'integration', 'convrot_int8::native_projections_match_pinned_kitchen'): 'gpu1',
 }
 # A product-pinned Hub snapshot: `org/name@<40-hex revision>` plus an optional subfolder path.
 HUB_PIN = re.compile(r'^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@([0-9a-f]{40})((?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)$')
@@ -416,10 +416,11 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
         shared_headroom = recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_PROFILE
         comparison_binding = comparison_metadata_binding(row, name, recipe) if comparison_recipe else None
         expected_index = comparison_binding[1] if comparison_binding else 1
-        if name == 'fixed_cuda' and (row.get('package'), row.get('target'), row.get('fqn')) in GPU0_PROJECTION_PROOFS:
-            uuid, expected_index = training_comparison.DEVICES['gpu0']
+        projection_device = PROJECTION_PROOF_DEVICES.get((row.get('package'), row.get('target'), row.get('fqn')))
+        if name == 'fixed_cuda' and projection_device is not None:
+            uuid, expected_index = training_comparison.DEVICES[projection_device]
             if not shared_headroom or row.get('required_cuda_device_uuid') != uuid:
-                raise ValueError('projection correctness proof requires its fixed GPU 0 UUID and headroom profile')
+                raise ValueError('projection correctness proof requires its fixed device UUID and headroom profile')
         if shared_headroom and (expected_activity_profile is not None or route != 'candle-cuda'
                                 or recipe.get('required_cuda_physical_index') != expected_index
                                 or type(recipe.get('required_cuda_physical_index')) is not int
