@@ -174,7 +174,7 @@ impl Weights {
         let mut tensors = HashMap::new();
         let mut declarations = Vec::new();
         for shard in &shards {
-            let (part, meta) = crate::load_progress::load_with_metadata(&shard)
+            let (part, meta) = crate::load_progress::load_with_metadata(shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
             declarations.extend(meta.get("_quantization_metadata").cloned());
             for (name, tensor) in part {

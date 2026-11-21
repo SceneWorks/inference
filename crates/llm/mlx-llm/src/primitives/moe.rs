@@ -446,7 +446,7 @@ pub struct SparseMoe {
     gate_up: GateUp,
     down: SwitchLinear,
     num_experts: usize,
-    shared: SwiGlu,
+    shared: Box<SwiGlu>,
     /// Shared-expert sigmoid gate `[1, hidden]`; `None` ⇒ the shared expert is added ungated.
     shared_gate: Option<Projection>,
     routing: MoeRouting,
@@ -538,7 +538,7 @@ impl SparseMoe {
             gate_up,
             down,
             num_experts,
-            shared,
+            shared: Box::new(shared),
             shared_gate,
             routing,
         })
