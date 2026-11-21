@@ -84,6 +84,37 @@ pub fn baseline_codec_registry() -> &'static CheckpointCodecRegistry {
     })
 }
 
+/// Native MLX projections consume the stored bytes. Scalar non-matrix tensors and
+/// producer-requested full-precision GEMMs keep their existing dense decoding contract.
+pub struct MlxCodecResidency;
+impl gen_core::checkpoint_codec::CodecResidencyPolicy for MlxCodecResidency {
+    fn residency(
+        &self,
+        _: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        shape: &[usize],
+    ) -> ResidencyMode {
+        if shape.len() == 2
+            && matches!(
+                spec,
+                TensorCodecSpec::ConvRotInt8 { .. }
+                    | TensorCodecSpec::ScalarFp8 {
+                        full_precision_matrix_mult: false,
+                        ..
+                    }
+                    | TensorCodecSpec::Mxfp8 {
+                        full_precision_matrix_mult: false,
+                        ..
+                    }
+            )
+        {
+            ResidencyMode::Packed
+        } else {
+            ResidencyMode::Dense
+        }
+    }
+}
+
 /// Header-plus-descriptors plan for one safetensors file under the given mapping. Refuses before
 /// any array is created. Native row-scaled ConvRot projections are priced at stored width.
 pub fn plan_logical_weights(
@@ -94,7 +125,7 @@ pub fn plan_logical_weights(
         path,
         mapping,
         baseline_codec_registry(),
-        &gen_core::checkpoint_codec::SourceCodecResidency,
+        &MlxCodecResidency,
     )?)
 }
 
@@ -179,6 +210,25 @@ pub fn read_logical_weights(
             physical.remove(&tensor.physical_key)
         }
         .ok_or_else(|| Error::MissingTensor(tensor.physical_key.clone()))?;
+        if tensor.residency.mode == ResidencyMode::Packed
+            && matches!(
+                tensor.codec,
+                TensorCodecSpec::ScalarFp8 { .. } | TensorCodecSpec::Mxfp8 { .. }
+            )
+        {
+            let base = tensor.logical_key.strip_suffix(".weight").ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: packed projection requires a weight key",
+                    tensor.logical_key
+                ))
+            })?;
+            let (fp8, scale, input) = bind_fp8(tensor, array, &physical)?;
+            if eager {
+                fp8.materialize()?;
+            }
+            logical.insert_fp8(base, fp8, scale, input);
+            continue;
+        }
         if let TensorCodecSpec::ConvRotInt8 { scale, geometry } = &tensor.codec {
             let scales = companion(tensor, &physical, scale)?;
             guard_dtype(tensor, &array, Dtype::Int8)?;
@@ -287,6 +337,88 @@ pub fn read_logical_weights(
 // =================================================================================================
 // Per-layer codec decode (MLX ops; lazy until the caller evaluates).
 // =================================================================================================
+
+fn bind_fp8(
+    t: &LogicalTensorPlan,
+    mut codes: Array,
+    physical: &HashMap<String, Array>,
+) -> Result<(mlx_layers::fp8::Fp8Linear, bool, bool)> {
+    use gen_core::comfy_quant::ComfyQuantFormat;
+    if let Some(refusal) = t.undeclared_padded_storage_refusal() {
+        return Err(Error::Msg(refusal));
+    }
+    guard_dtype(t, &codes, Dtype::Uint8)?;
+    let (format, mut sw, sx) = match &t.codec {
+        TensorCodecSpec::ScalarFp8 {
+            scale, input_scale, ..
+        } => {
+            let sw = match scale {
+                ScalarScaleSource::Unit => None,
+                ScalarScaleSource::Companion { physical_key } => {
+                    Some(companion(t, physical, physical_key)?.clone())
+                }
+            };
+            let sx = input_scale
+                .as_ref()
+                .map(|key| companion(t, physical, key).cloned())
+                .transpose()?;
+            let encoding = match t.encoding {
+                WeightEncoding::Fp8E4M3 => ComfyQuantFormat::Float8E4M3Fn,
+                WeightEncoding::Fp8E5M2 => ComfyQuantFormat::Float8E5M2,
+                _ => return Err("invalid scalar FP8 storage".into()),
+            };
+            (encoding, sw, sx)
+        }
+        TensorCodecSpec::Mxfp8 {
+            scale,
+            stored_shape,
+            ..
+        } => {
+            guard_shape(t, &codes, stored_shape)?;
+            let scales = companion(t, physical, scale)?.clone();
+            let grid = gen_core::mxfp8_scale_shape(*stored_shape);
+            guard_shape(t, &scales, &grid)?;
+            (ComfyQuantFormat::Mxfp8, Some(scales), None)
+        }
+        _ => unreachable!(),
+    };
+    if let Some(tx) = &t.transform {
+        let start = tx.rows.start;
+        let len = tx.rows.len;
+        if len == 0
+            || start > codes.shape()[0] as usize
+            || len > codes.shape()[0] as usize - start
+            || (tx.half_swap && !len.is_multiple_of(2))
+        {
+            return Err("invalid packed FP8 output row transform".into());
+        }
+        let rows = |a: &Array, lo: usize, hi: usize, swap: bool| -> Result<Array> {
+            let view = a.index((lo as i32..hi as i32, ..));
+            if !swap {
+                return Ok(view);
+            }
+            let h = ((hi - lo) / 2) as i32;
+            Ok(mlx_rs::ops::concatenate_axis(
+                &[&view.index((h.., ..)), &view.index((..h, ..))],
+                0,
+            )?)
+        };
+        codes = rows(&codes, start, start + len, tx.half_swap)?;
+        if format == ComfyQuantFormat::Mxfp8 {
+            if tx.half_swap || !start.is_multiple_of(128) || !len.is_multiple_of(128) {
+                return Err(
+                    "MXFP8 row transform must preserve complete 128-row scale atoms".into(),
+                );
+            }
+            let scale = sw.as_ref().expect("validated MXFP8 scale");
+            sw = Some(rows(scale, start, start + len, false)?);
+        }
+    }
+    let has_scale = sw.is_some();
+    let has_input = sx.is_some();
+    let fp8 = mlx_layers::fp8::Fp8Linear::new(format, codes, sw, sx, &t.shape, None)?;
+    Ok((fp8, has_scale, has_input))
+}
 
 fn guard_shape(tensor: &LogicalTensorPlan, array: &Array, expected: &[usize]) -> Result<()> {
     let expected: Vec<i32> = expected.iter().map(|dim| *dim as i32).collect();
@@ -620,8 +752,10 @@ fn measure_residency(
     plan: &LogicalWeightPlan,
     logical: &Weights,
 ) -> Result<Vec<CodecResidencyReport>> {
-    let mut by_codec: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
-    let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+    let mut by_codec: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
+        BTreeMap::new();
+    let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
+        BTreeMap::new();
     // A transformed tensor contributes one plan entry per logical output, all naming the same
     // physical key (sc-21547), and exactly one of them carries `source_bytes` while its siblings
     // carry zero — the plan compiler's convention. So a plain sum totals the file once, and
@@ -630,7 +764,13 @@ fn measure_residency(
     // counts and resident bytes stay per-logical: each output is separately decoded and separately
     // occupies memory.
     for tensor in &plan.tensors {
-        codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+        let representation = if tensor.residency.mode == ResidencyMode::Packed {
+            ExecutionRepresentation::NativePacked
+        } else {
+            ExecutionRepresentation::DenseFallback
+        };
+        let row_key = (tensor.codec_id, representation);
+        codec_by_owner.insert(tensor.physical_key.as_str(), row_key);
         let array = logical.require(&tensor.logical_key)?;
         let scale_bytes = if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
             let base = tensor
@@ -641,36 +781,45 @@ fn measure_residency(
         } else {
             0
         };
+        let scale_bytes = if let Some(base) = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .filter(|base| logical.planned_fp8(base).is_some())
+        {
+            [".weight_scale", ".input_scale"]
+                .into_iter()
+                .filter_map(|suffix| logical.peek(&format!("{base}{suffix}")))
+                .map(|a| a.nbytes())
+                .sum()
+        } else {
+            scale_bytes
+        };
         let resident_bytes = u64::try_from(array.nbytes() + scale_bytes).map_err(|_| {
             Error::Msg(format!(
                 "tensor {:?} resident size overflows u64",
                 tensor.logical_key
             ))
         })?;
-        let report = by_codec
-            .entry(tensor.codec_id)
-            .or_insert(CodecResidencyReport {
-                codec_id: tensor.codec_id,
-                representation: if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
-                    ExecutionRepresentation::NativePacked
-                } else {
-                    ExecutionRepresentation::DenseFallback
-                },
-                tensor_count: 0,
-                source_bytes: 0,
-                resident_bytes: 0,
-            });
+        let report = by_codec.entry(row_key).or_insert(CodecResidencyReport {
+            codec_id: tensor.codec_id,
+            representation,
+            tensor_count: 0,
+            source_bytes: 0,
+            resident_bytes: 0,
+        });
         report.tensor_count += 1;
         report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
         report.resident_bytes = report.resident_bytes.saturating_add(resident_bytes);
     }
     for companion in &plan.companions {
-        let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
+        let Some(row_key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
             continue;
         };
         // Native scales were measured alongside their codes. Other decoders consume their
         // companions and cannot claim resident bytes for them.
-        if companion.resident_bytes != 0 && *codec_id != gen_core::convrot_int8::CODEC_ID {
+        let (codec_id, representation) = row_key;
+        if companion.resident_bytes != 0 && *representation != ExecutionRepresentation::NativePacked
+        {
             return Err(Error::Msg(format!(
                 "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
                  this backend decodes every codec through its dense fallback and measures no \
@@ -679,7 +828,7 @@ fn measure_residency(
                 companion.physical_key, companion.resident_bytes
             )));
         }
-        if let Some(report) = by_codec.get_mut(codec_id) {
+        if let Some(report) = by_codec.get_mut(row_key) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
         }
     }
@@ -696,7 +845,7 @@ fn load_planned_file(path: &Path) -> Result<HashMap<String, Array>> {
     // Keep the shared contiguous/full-coverage validation: native MLX alone accepts overlapping
     // or gapped ranges. This is a header read, never crediting the untouched tensor payload.
     gen_core::safetensors_file_tensor_locations(path)?;
-    let arrays = Weights::from_file(path)?.into_tensors();
+    let (arrays, _) = crate::weights::load_safetensors_on_cpu(path)?;
     #[cfg(feature = "model-inference-proof")]
     gen_core::model_input_proof::record_reader_paths(
         "mlx-gen::logical_weights::load_planned_file",

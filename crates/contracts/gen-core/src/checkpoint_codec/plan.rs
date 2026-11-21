@@ -520,7 +520,7 @@ pub enum LogicalWeightPlanError {
         /// The authoritative per-tensor `.comfy_quant` declaration.
         tensor: ComfyQuantDescriptor,
         /// The corroborating file-level entry, as declared (absent fields stay absent).
-        metadata: PartialComfyQuantDescriptor,
+        metadata: Box<PartialComfyQuantDescriptor>,
         /// The descriptor field names that disagree, in declaration order.
         disagreement: Vec<&'static str>,
     },

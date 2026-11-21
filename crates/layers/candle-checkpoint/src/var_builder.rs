@@ -98,6 +98,44 @@ impl ProjectionSource {
             .map(|op| candle_nn::Linear::from_native(op, bias)))
     }
 
+    /// Select a contiguous physical row range from a stack of equally shaped scalar-FP8 matrices.
+    pub fn native_linear_slice(
+        &self,
+        key: &str,
+        dev: &Device,
+        dtype: DType,
+        first_row: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<candle_nn::Linear>> {
+        #[cfg(feature = "cuda")]
+        {
+            let source = self.on_device(dev)?;
+            let Some((op, resident_bytes)) =
+                source.0.fp8_matrix_slice(key, first_row, rows, cols)?
+            else {
+                return Ok(None);
+            };
+            let format_id = op.format_id();
+            let layer = SourceLinear {
+                source,
+                key: key.to_owned(),
+                dtype,
+                op: NativeOp::Fp8(op),
+                format_id,
+                resident_bytes,
+                transpose: false,
+                first_row: Some(first_row),
+            };
+            Ok(Some(candle_nn::Linear::from_native(Arc::new(layer), None)))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (key, dev, dtype, first_row, rows, cols);
+            Ok(None)
+        }
+    }
+
     pub fn native_linear_transposed(
         &self,
         key: &str,
@@ -259,6 +297,24 @@ struct SourceLinear {
     format_id: &'static str,
     resident_bytes: u64,
     transpose: bool,
+    first_row: Option<usize>,
+}
+#[cfg(feature = "cuda")]
+impl SourceLinear {
+    fn slice_coefficients(
+        &self,
+        source: &ProjectionSource,
+        dev: &Device,
+        first: usize,
+    ) -> Result<Tensor> {
+        let (rows, cols) = self.dims();
+        source
+            .reader()
+            .dense_coefficients(&self.key, None, self.dtype, dev)?
+            .reshape(((), cols))?
+            .narrow(0, first, rows)?
+            .force_contiguous()
+    }
 }
 #[cfg(feature = "cuda")]
 impl NativeLinearWeight for SourceLinear {
@@ -268,13 +324,7 @@ impl NativeLinearWeight for SourceLinear {
                 Some(b) => op.forward_with_bias(x, b),
                 None => op.forward(x),
             },
-            NativeOp::Fp8(op) => {
-                let y = op.forward(x)?.to_dtype(x.dtype())?;
-                match bias {
-                    Some(b) => y.broadcast_add(&b.to_dtype(x.dtype())?),
-                    None => Ok(y),
-                }
-            }
+            NativeOp::Fp8(op) => op.forward_with_bias(x, bias),
         }
     }
     fn compute_dtype(&self) -> DType {
@@ -282,6 +332,18 @@ impl NativeLinearWeight for SourceLinear {
     }
     fn relocated(&self, dev: &Device) -> Result<candle_nn::Linear> {
         let source = self.source.on_device(dev)?;
+        if let Some(first) = self.first_row {
+            let (rows, cols) = self.dims();
+            if let Some(layer) =
+                source.native_linear_slice(&self.key, dev, self.dtype, first, rows, cols)?
+            {
+                return Ok(layer);
+            }
+            return Ok(candle_nn::Linear::new(
+                self.slice_coefficients(&source, dev, first)?,
+                None,
+            ));
+        }
         let shape = Some(self.dims());
         let op = source.native_oriented(&self.key, shape, self.dtype, dev, self.transpose)?;
         if let Some(op) = op {
@@ -309,6 +371,9 @@ impl NativeLinearWeight for SourceLinear {
         self.resident_bytes
     }
     fn dense_weight(&self) -> Result<Tensor> {
+        if let Some(first) = self.first_row {
+            return self.slice_coefficients(&self.source, self.device(), first);
+        }
         let t = self.source.0.dense_coefficients(
             &self.key,
             if self.transpose {
@@ -376,6 +441,7 @@ impl ProjectionSource {
                 dtype,
                 op,
                 transpose,
+                first_row: None,
                 format_id: self
                     .0
                     .planned(name)

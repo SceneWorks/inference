@@ -480,6 +480,27 @@ mod cuda_impl {
         }
     }
 
+    /// Storage and CUDA descriptor must describe the same allocation.
+    trait Fp8Output: cudarc::driver::DeviceRepr + Sized {
+        const CUDA_TYPE: sys::cudaDataType_t;
+        const F32: u32;
+        fn storage(buf: cudarc::driver::CudaSlice<Self>) -> CudaStorageSlice;
+    }
+    impl Fp8Output for f32 {
+        const CUDA_TYPE: sys::cudaDataType_t = sys::cudaDataType_t::CUDA_R_32F;
+        const F32: u32 = 1;
+        fn storage(buf: cudarc::driver::CudaSlice<Self>) -> CudaStorageSlice {
+            CudaStorageSlice::F32(buf)
+        }
+    }
+    impl Fp8Output for half::bf16 {
+        const CUDA_TYPE: sys::cudaDataType_t = sys::cudaDataType_t::CUDA_R_16BF;
+        const F32: u32 = 0;
+        fn storage(buf: cudarc::driver::CudaSlice<Self>) -> CudaStorageSlice {
+            CudaStorageSlice::BF16(buf)
+        }
+    }
+
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
         const WORKSPACE: usize = super::CUBLASLT_WORKSPACE_BYTES;
@@ -1128,6 +1149,26 @@ mod cuda_impl {
             x: &DevFp8,
             scale_x: f32,
         ) -> Result<Tensor> {
+            self.scalar_gemm::<half::bf16>(w, scale_w, x, scale_x)
+        }
+
+        pub fn matmul_fp8_staged_f32(
+            &self,
+            w: &DevFp8,
+            scale_w: f32,
+            x: &DevFp8,
+            scale_x: f32,
+        ) -> Result<Tensor> {
+            self.scalar_gemm::<f32>(w, scale_w, x, scale_x)
+        }
+
+        fn scalar_gemm<T: Fp8Output>(
+            &self,
+            w: &DevFp8,
+            scale_w: f32,
+            x: &DevFp8,
+            scale_x: f32,
+        ) -> Result<Tensor> {
             let (m, k, n) = (x.rows, x.cols, w.rows);
             if x.cols != w.cols {
                 candle_core::bail!(
@@ -1138,7 +1179,7 @@ mod cuda_impl {
                 );
             }
             check_alignment(k, n)?;
-            let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            let mut out = unsafe { self.stream.alloc::<T>(m * n) }.map_err(drv_err)?;
             if w.is_e5m2() {
                 if !x.is_e5m2() {
                     candle_core::bail!("E5M2 weights require E5M2 activation codes");
@@ -1166,6 +1207,7 @@ mod cuda_impl {
                         .arg(&k32)
                         .arg(&scale_x)
                         .arg(&scale_w)
+                        .arg(&T::F32)
                         .launch(LaunchConfig {
                             grid_dim: (n32.div_ceil(32), m32.div_ceil(16), 1),
                             block_dim: (128, 1, 1),
@@ -1175,7 +1217,7 @@ mod cuda_impl {
                 }
                 return Ok(Tensor::from_storage(
                     Storage::Cuda(CudaStorage {
-                        slice: CudaStorageSlice::BF16(out),
+                        slice: T::storage(out),
                         device: self.device.clone(),
                     }),
                     (m, n),
@@ -1197,7 +1239,7 @@ mod cuda_impl {
                         sys::cudaDataType_t::CUDA_R_8F_E4M3,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         sys::cudaDataType_t::CUDA_R_32F,
-                        sys::cudaDataType_t::CUDA_R_16BF,
+                        T::CUDA_TYPE,
                         m,
                         k,
                         n,
@@ -1210,7 +1252,7 @@ mod cuda_impl {
                 }
             }
             let storage = CudaStorage {
-                slice: CudaStorageSlice::BF16(out),
+                slice: T::storage(out),
                 device: self.device.clone(),
             };
             Ok(Tensor::from_storage(
@@ -1436,6 +1478,26 @@ mod cuda_impl {
             x: &Tensor,
             logical_n: usize,
         ) -> Result<Tensor> {
+            self.block_scaled_gemm::<half::bf16>(w, weight_scales, x, logical_n)
+        }
+
+        pub fn mxfp8_linear_f32(
+            &self,
+            w: &DevFp8,
+            weight_scales: &Tensor,
+            x: &Tensor,
+            logical_n: usize,
+        ) -> Result<Tensor> {
+            self.block_scaled_gemm::<f32>(w, weight_scales, x, logical_n)
+        }
+
+        fn block_scaled_gemm<T: Fp8Output>(
+            &self,
+            w: &DevFp8,
+            weight_scales: &Tensor,
+            x: &Tensor,
+            logical_n: usize,
+        ) -> Result<Tensor> {
             use cudarc::driver::{LaunchConfig, PushKernelArg};
             let (m, k) = x.dims2()?;
             let mp = m.next_multiple_of(32);
@@ -1499,7 +1561,7 @@ mod cuda_impl {
                     })
                     .map_err(drv_err)?;
             }
-            let mut out = unsafe { self.stream.alloc::<half::bf16>(mp * n) }.map_err(drv_err)?;
+            let mut out = unsafe { self.stream.alloc::<T>(mp * n) }.map_err(drv_err)?;
             {
                 let (a, _a) = w.buf.device_ptr(&self.stream);
                 let (b, _b) = codes.device_ptr(&self.stream);
@@ -1512,7 +1574,7 @@ mod cuda_impl {
                         w.dtype,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         sys::cudaDataType_t::CUDA_R_32F,
-                        sys::cudaDataType_t::CUDA_R_16BF,
+                        T::CUDA_TYPE,
                         mp,
                         kp,
                         n,
@@ -1526,7 +1588,7 @@ mod cuda_impl {
             }
             Tensor::from_storage(
                 Storage::Cuda(CudaStorage {
-                    slice: CudaStorageSlice::BF16(out),
+                    slice: T::storage(out),
                     device: self.device.clone(),
                 }),
                 (mp, n),

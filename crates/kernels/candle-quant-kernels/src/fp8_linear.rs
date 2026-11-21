@@ -156,13 +156,31 @@ impl Fp8Linear {
 
     /// `x`: `(..., K)`; flattened to `(M, K)` for the GEMM, then reshaped back. Output bf16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_bias(x, self.bias.as_ref())
+    }
+
+    /// Checkpoint execution rounds the scaled accumulator and optional bias once to the consuming dtype.
+    /// The legacy dynamically quantized recipe returns BF16 as before.
+    pub fn forward_with_bias(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        use candle_core::DType;
+        let source = self.input_scale.is_some() || self.block_scales.is_some();
+        let output_dtype = if source { x.dtype() } else { DType::BF16 };
+        if !matches!(output_dtype, DType::BF16 | DType::F16 | DType::F32) {
+            candle_core::bail!("unsupported FP8 projection output {output_dtype:?}");
+        }
+        let f32_accumulator = source && (output_dtype != DType::BF16 || bias.is_some());
         let (flat, restore) = flatten_tokens(x)?;
         if flat.dim(1)? != self.dims.1 || !flat.device().same_device(self.device()) {
             candle_core::bail!("FP8 input width or device differs from weight");
         }
         let y = if let Some(scales) = &self.block_scales {
-            self.lt
-                .mxfp8_linear(&self.w_fp8, scales, &flat, self.dims.0)?
+            if f32_accumulator {
+                self.lt
+                    .mxfp8_linear_f32(&self.w_fp8, scales, &flat, self.dims.0)?
+            } else {
+                self.lt
+                    .mxfp8_linear(&self.w_fp8, scales, &flat, self.dims.0)?
+            }
         } else {
             let (qx, sx) = if let Some(quantize) = self.dynamic_quantizer {
                 let (codes, scale) = quantize(&flat)?;
@@ -171,14 +189,20 @@ impl Fp8Linear {
                 self.lt
                     .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?
             };
-            self.lt
-                .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)?
+            if f32_accumulator {
+                self.lt
+                    .matmul_fp8_staged_f32(&self.w_fp8, self.scale_w, &qx, sx)?
+            } else {
+                self.lt
+                    .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)?
+            }
         };
         let y = restore(y)?;
-        match &self.bias {
-            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
-            None => Ok(y),
-        }
+        let y = match bias {
+            Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?)?,
+            None => y,
+        };
+        __model_proof_output!(y.to_dtype(output_dtype))
     }
 }
 

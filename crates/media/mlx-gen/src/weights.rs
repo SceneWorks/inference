@@ -27,6 +27,7 @@ pub struct Weights {
     metadata: HashMap<String, String>,
     accessed: RefCell<std::collections::HashSet<String>>,
     planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
+    planned_fp8: HashMap<String, mlx_layers::fp8::Fp8Linear>,
     convrot_rotations: RefCell<HashMap<usize, Array>>,
 }
 
@@ -38,6 +39,7 @@ impl Weights {
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
+            planned_fp8: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
@@ -50,6 +52,7 @@ impl Weights {
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
+            planned_fp8: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
@@ -70,14 +73,18 @@ path.as_ref(),
             "mlx-gen::Weights::from_file",
             &[__input_path],
         );
-        if let Some(table) = metadata.get("_quantization_metadata") {
-            mlx_layers::convrot_int8::attach_metadata(&mut tensors, std::slice::from_ref(table))?;
-        }
+        let declarations: Vec<_> = metadata
+            .get("_quantization_metadata")
+            .cloned()
+            .into_iter()
+            .collect();
+        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.as_ref().to_owned()], &declarations)?;
         Ok(Self {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
+            planned_fp8: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -250,7 +257,10 @@ path.as_ref(),
                     })
                 })
                 .collect::<Result<_>>()?;
-            let value = if view.dtype() == safetensors_fp8::Dtype::F8_E4M3 {
+            let value = if matches!(
+                view.dtype(),
+                safetensors_fp8::Dtype::F8_E4M3 | safetensors_fp8::Dtype::F8_E5M2
+            ) {
                 let elements = shape.iter().try_fold(1i32, |count, &dim| {
                     count.checked_mul(dim).ok_or_else(|| {
                         Error::Msg(format!(
@@ -268,7 +278,7 @@ path.as_ref(),
                         view.data().len()
                     )));
                 }
-                Array::from_slice(view.data(), &shape).from_fp8(Dtype::Bfloat16)?
+                Array::from_slice(view.data(), &shape)
             } else {
                 let dtype = match view.dtype() {
                     safetensors_fp8::Dtype::BOOL => Dtype::Bool,
@@ -309,11 +319,16 @@ path.as_ref(),
             gen_core::model_input_proof::InputRole::ModelWeights,
             &[__input_path],
         );
+        let declarations = gen_core::safetensors_path_quantization_metadata(path.as_ref())?
+            .into_iter()
+            .collect::<Vec<_>>();
+        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.as_ref().to_owned()], &declarations)?;
         Ok(Self {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
+            planned_fp8: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -381,12 +396,13 @@ f,
             "mlx-gen::Weights::from_paths",
             files,
         );
-        mlx_layers::convrot_int8::attach_metadata(&mut tensors, &declarations)?;
+        mlx_layers::fp8::prepare_sources(&mut tensors, files, &declarations)?;
         Ok(Self {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
+            planned_fp8: HashMap::new(),
             convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
@@ -429,10 +445,34 @@ f,
         self.planned_convrot.insert(base.to_owned(), geometry);
     }
 
+    pub(crate) fn insert_fp8(
+        &mut self,
+        base: &str,
+        p: mlx_layers::fp8::Fp8Linear,
+        has_scale: bool,
+        has_input: bool,
+    ) {
+        self.insert(format!("{base}.weight"), p.codes().clone());
+        if has_scale {
+            self.insert(format!("{base}.weight_scale"), p.scales().clone());
+        }
+        if has_input {
+            self.insert(format!("{base}.input_scale"), p.input_scale().clone());
+        }
+        self.planned_fp8.insert(base.to_owned(), p);
+    }
+
+    pub(crate) fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
+        self.planned_fp8.get(base)
+    }
+
     /// Whether a physical companion belongs to a validated native projection in this map.
     pub fn is_native_companion(&self, key: &str) -> bool {
-        key.strip_suffix(".weight_scale")
-            .is_some_and(|base| self.planned_convrot.contains_key(base))
+        key.strip_suffix(".weight_scale").is_some_and(|base| {
+            self.planned_convrot.contains_key(base) || self.planned_fp8.contains_key(base)
+        }) || key
+            .strip_suffix(".input_scale")
+            .is_some_and(|base| self.planned_fp8.contains_key(base))
     }
 
     pub(crate) fn planned_convrot(
@@ -449,8 +489,10 @@ f,
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
+            .or_else(|| key.strip_suffix(".input_scale"))
         {
             self.planned_convrot.remove(base);
+            self.planned_fp8.remove(base);
         }
         self.tensors.insert(key, tensor);
     }
@@ -462,6 +504,12 @@ f,
             if let (Some(source), Some(dest)) =
                 (from.strip_suffix(".weight"), to.strip_suffix(".weight"))
             {
+                if let Some(fp8) = self.planned_fp8(source).cloned() {
+                    let scaled = self.tensors.contains_key(&format!("{source}.weight_scale"));
+                    let input = self.tensors.contains_key(&format!("{source}.input_scale"));
+                    self.insert_fp8(dest, fp8, scaled, input);
+                    return;
+                }
                 if let Some(geometry) = self.planned_convrot(source) {
                     if let Some(scale) =
                         self.tensors.get(&format!("{source}.weight_scale")).cloned()
@@ -484,8 +532,10 @@ f,
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
+            .or_else(|| key.strip_suffix(".input_scale"))
         {
             self.planned_convrot.remove(base);
+            self.planned_fp8.remove(base);
         }
         self.tensors.remove(key)
     }
@@ -494,6 +544,8 @@ f,
     /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
     pub fn remove_prefix(&mut self, prefix: &str) {
         self.tensors.retain(|k, _| !k.starts_with(prefix));
+        self.planned_fp8
+            .retain(|base, _| self.tensors.contains_key(&format!("{base}.weight")));
         self.planned_convrot.retain(|base, _| {
             self.tensors.contains_key(&format!("{base}.weight"))
                 && self.tensors.contains_key(&format!("{base}.weight_scale"))
@@ -532,6 +584,24 @@ f,
     /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
     /// loader, which never has metadata to begin with.
     pub fn into_tensors(mut self) -> HashMap<String, Array> {
+        for (base, fp8) in self.planned_fp8 {
+            let shape = fp8.shape();
+            let desc = if fp8.format == gen_core::comfy_quant::ComfyQuantFormat::Mxfp8 {
+                format!(
+                    r#"{{"format":"mxfp8","orig_shape":[{},{}]}}"#,
+                    shape[0], shape[1]
+                )
+            } else {
+                format!(r#"{{"format":"{}"}}"#, fp8.format.as_str())
+            };
+            self.tensors
+                .entry(format!("{base}.weight_scale"))
+                .or_insert_with(|| fp8.scales().clone());
+            self.tensors.insert(
+                format!("{base}.comfy_quant"),
+                Array::from_slice(desc.as_bytes(), &[desc.len() as i32]),
+            );
+        }
         for (base, geometry) in self.planned_convrot {
             self.tensors
                 .entry(format!("{base}.comfy_quant"))
@@ -570,10 +640,11 @@ f,
             .keys()
             .filter_map(|key| key.strip_suffix(".comfy_quant"))
             .chain(self.planned_convrot.keys().map(String::as_str))
+            .chain(self.planned_fp8.keys().map(String::as_str))
             .map(str::to_owned)
             .collect();
         for (key, value) in &mut self.tensors {
-            let encoded = [".weight", ".weight_scale", ".comfy_quant"]
+            let encoded = [".weight", ".weight_scale", ".input_scale", ".comfy_quant"]
                 .iter()
                 .any(|suffix| {
                     key.strip_suffix(*suffix)
@@ -606,7 +677,8 @@ f,
             );
             let pack_companion = key.ends_with(".scales")
                 || key.ends_with(".biases")
-                || key.ends_with(".weight_scale");
+                || key.ends_with(".weight_scale")
+                || key.ends_with(".input_scale");
             if floating && !pack_companion && value.dtype() != dtype {
                 *value = value.as_dtype(dtype)?;
             }
@@ -1056,7 +1128,10 @@ mod tests {
     }
 }
 
-impl mlx_layers::convrot_int8::ProjectionWeights for Weights {
+impl mlx_layers::MlxWeightSource for Weights {
+    fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
+        self.planned_fp8(base)
+    }
     fn get(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }

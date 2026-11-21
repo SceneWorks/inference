@@ -611,7 +611,7 @@ pub struct DiffVaeQuant {
 /// tier ships (sc-18775). The DiffVAE decoder is 99.96 % rank-2 Linear by parameter count, so this is
 /// where a q4/q8 tier's 834 MB → ~230 MB actually comes from.
 enum ProjWeight {
-    Native(mlx_gen::convrot_int8::ConvRotLinear),
+    Native(mlx_gen::NativeProjection),
     Dense(Array),
     Quant {
         /// `[out, in·bits/32]` `U32` — never cast; the payload is bit-packed, not numeric.
@@ -634,8 +634,7 @@ impl ProjWeight {
     /// caller believes the file is dense while the file says otherwise, and loading the packed `U32`
     /// payload as a float weight would produce a decoder that runs and returns garbage.
     fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
-        if let Some(native) = mlx_gen::convrot_int8::ConvRotLinear::from_weights(w, prefix, false)?
-        {
+        if let Some(native) = mlx_gen::NativeProjection::from_weights(w, prefix, false)? {
             return Ok(Self::Native(native));
         }
         let key = format!("{prefix}.weight");
@@ -679,7 +678,7 @@ impl ProjWeight {
     /// axis 0 of the packed `U32` weight exactly as it is of the dense one.
     fn out_features(&self) -> i32 {
         match self {
-            Self::Native(native) => native.descriptor().out_features as i32,
+            Self::Native(native) => native.shape()[0],
             ProjWeight::Dense(w) => w.shape()[0],
             ProjWeight::Quant { q, .. } => q.shape()[0],
         }
@@ -694,7 +693,7 @@ impl ProjWeight {
     /// [`check_widths`]: NaDiffusionDecoder::check_widths
     fn in_features(&self) -> i32 {
         match self {
-            Self::Native(native) => native.descriptor().in_features as i32,
+            Self::Native(native) => native.shape()[1],
             ProjWeight::Dense(w) => w.shape()[1],
             ProjWeight::Quant { scales, group, .. } => scales.shape()[1] * group,
         }

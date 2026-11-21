@@ -46,6 +46,8 @@ pub mod caption;
 pub mod checkpoint_codec;
 pub mod checkpoint_facts;
 mod receipt_scope;
+mod read_accounting;
+pub use read_accounting::CheckpointReadAccounting;
 pub use receipt_scope::CheckpointReceiptScope;
 pub mod comfy_quant;
 pub mod control;

@@ -384,7 +384,8 @@ pub fn packed_bits_from_metadata(
 
 /// Resolve native codec operands before family-specific casts or affine handling.
 pub fn native_lin(w: &Weights, base: &str, bias: bool) -> Result<Option<AdaptableLinear>> {
-    if w.planned_convrot(base).is_none()
+    if w.planned_fp8(base).is_none()
+        && w.planned_convrot(base).is_none()
         && w.peek(&format!("{base}.comfy_quant")).is_none()
         && !w
             .peek(&format!("{base}.weight"))
@@ -393,8 +394,8 @@ pub fn native_lin(w: &Weights, base: &str, bias: bool) -> Result<Option<Adaptabl
         return Ok(None);
     }
     Ok(
-        crate::convrot_int8::ConvRotLinear::from_weights(w, base, bias)?
-            .map(AdaptableLinear::from_convrot),
+        mlx_layers::NativeProjection::from_weights(w, base, bias)?
+            .map(AdaptableLinear::from_native),
     )
 }
 
@@ -418,17 +419,17 @@ pub fn lin_with_bias(
     bias: Option<Array>,
     group_size: i32,
 ) -> Result<AdaptableLinear> {
-    if w.planned_convrot(base).is_some()
+    if w.planned_fp8(base).is_some()
+        || w.planned_convrot(base).is_some()
         || w.peek(&format!("{base}.comfy_quant")).is_some()
         || w.peek(&format!("{base}.weight"))
             .is_some_and(|v| v.dtype() == Dtype::Int8)
     {
-        if let Some(mut native) = crate::convrot_int8::ConvRotLinear::from_weights(w, base, false)?
-        {
+        if let Some(mut native) = mlx_layers::NativeProjection::from_weights(w, base, false)? {
             if let Some(b) = bias {
                 native.set_bias(b)?;
             }
-            return Ok(AdaptableLinear::from_convrot(native));
+            return Ok(AdaptableLinear::from_native(native));
         }
     }
     if let Some(scales) = w.get(&format!("{base}.scales")) {
