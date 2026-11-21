@@ -1,0 +1,1323 @@
+{
+  "cases": {
+    "cuda-mochi-masked-euler": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "pair": 1,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "pair": 2,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 1880772608,
+            "head_bytes": 1679446016,
+            "pair": 3,
+            "ratio": 0.8929553784739085,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1880772608,
+            "head_bytes": 1679446016,
+            "pair": 4,
+            "ratio": 0.8929553784739085,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 1880772608,
+            "pair": 5,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "inconclusive",
+        "pass",
+        "pass",
+        "inconclusive"
+      ],
+      "fixture": {
+        "depth": 2,
+        "files": {
+          "inputs.safetensors": "5cb617a23d48c118ff950d9af72505f33bdac7e43c2db5748de65c3d70132160",
+          "transformer/model.safetensors": "cfbbc4f378f0b4c9425668fdc775fbaf9900949bf5f5cf904dfdc470449a1284"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "5af7c091506900783e19a24ec2d26b35b348ba88921ee83c4ca5532fe84f691c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/transformer/model.safetensors": "500acae4b3f6c7784459e2b4597f76bc0a52c364fb062d1ece846d3c62fbc41a"
+          },
+          "repo": "SceneWorks/mochi-1-mlx",
+          "snapshot": "90a87786d9b5b592c3b3c083e5fcdf130007b1de"
+        },
+        "variant": "mochi"
+      },
+      "fixture_contract_sha256": "57a2a9c7a74fa24313d18a971a38d131147a257844869df1bd0048319abe7824",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "ae0a9d2f89ba2484c7dc14e084a6eea0e91eaa460d7195c1a67d742e98c8928d",
+      "missing_dedicated_pair_indices": [
+        1,
+        2,
+        5
+      ],
+      "original_receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "original_run_id": "44861650824",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "12aa1e48b15f09289395392a24e4072d54673d133c2017d1cc8308172aca6068",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811411",
+      "tensor_shape": [
+        1,
+        12,
+        2,
+        4,
+        6
+      ],
+      "terminal_sha256": "27969c9ed65309ab4cddbdb8a71e6501d60cc5ccaf6446fed247b5684a2b7169",
+      "timing": {
+        "base": [
+          0.014934925,
+          0.013909625,
+          0.01337635,
+          0.013863775,
+          0.01370765
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.014781625,
+          0.01399955,
+          0.0128268,
+          0.01326605,
+          0.0131893
+        ],
+        "interval": [
+          0.9568858409776558,
+          1.0064649478328855
+        ],
+        "median": 0.9621853490569134,
+        "paired_ratios": [
+          0.9897354690431991,
+          1.0064649478328855,
+          0.9589162962990652,
+          0.9568858409776558,
+          0.9621853490569134
+        ],
+        "verdict": "pass"
+      },
+      "timing_source": "retained",
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-scail2-animation-unipc": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 3222958080,
+            "head_bytes": 3155849216,
+            "pair": 1,
+            "ratio": 0.9791778663159032,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "pair": 2,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3222958080,
+            "head_bytes": 3155849216,
+            "pair": 3,
+            "ratio": 0.9791778663159032,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "pair": 4,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "pair": 5,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "pass"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "fixture_contract_sha256": "f7c37f120f5f72d0e89c258a0e5076c76ff31c3b9d6dbb6e4348450fe18dbccd",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "5d41f07bb77576018f578b210a04536be030db8230be2f7b591c7683d4c2e5cc",
+      "missing_dedicated_pair_indices": [],
+      "original_receipt_sha256": "b30a3090e81871e6a0425b756f6b5e3300e1358d4d3bfb2a57d08918c608b816",
+      "original_run_id": "44861650857",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "f2be8945a6608994fd1bbcec1e8b1feaba554e28416f33d8130810b9718a1d63",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811440",
+      "tensor_shape": [
+        1,
+        16,
+        2,
+        4,
+        8
+      ],
+      "terminal_sha256": "f6dce19caad1931363a7eb7ae645e3862fffe8c893dd551b56a71865e1b59787",
+      "timing": {
+        "base": [
+          0.016958475,
+          0.017207125,
+          0.01705965,
+          0.016137075,
+          0.01617935
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0172654,
+          0.01624555,
+          0.01709315,
+          0.016041225,
+          0.0162438
+        ],
+        "interval": [
+          0.9441176256928453,
+          1.018098620306366
+        ],
+        "median": 1.0019636979656674,
+        "paired_ratios": [
+          1.018098620306366,
+          0.9441176256928453,
+          1.0019636979656674,
+          0.9940602618504283,
+          1.0039834727600305
+        ],
+        "verdict": "pass"
+      },
+      "timing_source": "retained",
+      "trace_sha256": "2108d24cae2c4d5b92bdcf269b6e2e79cfdd96a451dd5d2c66609462b2562991"
+    },
+    "cuda-scail2-replacement-dpmpp": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 3256516608,
+            "head_bytes": 3256516608,
+            "pair": 1,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3256516608,
+            "head_bytes": 3256516608,
+            "pair": 2,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3256516608,
+            "head_bytes": 3256516608,
+            "pair": 3,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 3256516608,
+            "pair": 4,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "pair": 5,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "pass",
+        "pass",
+        "inconclusive",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "fixture_contract_sha256": "16b8027a4af67145697388c41b70027b62e1ec58fe0b5b354decb08bc1635717",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "fae929d7325b30d7014dafae1f34d41ac8f2c9132520457cc7d49ccce68aba67",
+      "missing_dedicated_pair_indices": [
+        4
+      ],
+      "original_receipt_sha256": "b30a3090e81871e6a0425b756f6b5e3300e1358d4d3bfb2a57d08918c608b816",
+      "original_run_id": "44861650857",
+      "outer_steps": 8,
+      "parity": "pass",
+      "receipt_sha256": "f2be8945a6608994fd1bbcec1e8b1feaba554e28416f33d8130810b9718a1d63",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811440",
+      "tensor_shape": [
+        2,
+        16,
+        2,
+        4,
+        8
+      ],
+      "terminal_sha256": "047e32145946a53f41e587848609884a51c7450e0137edb7c9c171a93d5d61c8",
+      "timing": {
+        "base_mean_ns": [
+          149579143.75,
+          150991375,
+          154167712.5,
+          150555062.5,
+          150330556.25,
+          152651331.25,
+          151024081.25,
+          152342362.5,
+          151791000,
+          151230843.75,
+          150615843.75,
+          151530462.5
+        ],
+        "base_mean_seconds_per_outer_step": [
+          0.01869739296875,
+          0.018873921875,
+          0.0192709640625,
+          0.0188193828125,
+          0.01879131953125,
+          0.01908141640625,
+          0.01887801015625,
+          0.0190427953125,
+          0.018973875,
+          0.01890385546875,
+          0.01882698046875,
+          0.0189413078125
+        ],
+        "ceiling": 1.02,
+        "head_mean_ns": [
+          144492100,
+          147614887.5,
+          150375337.5,
+          154170218.75,
+          151173337.5,
+          151149637.5,
+          151425956.25,
+          150707643.75,
+          150824856.25,
+          150442881.25,
+          150974037.5,
+          152241981.25
+        ],
+        "head_mean_seconds_per_outer_step": [
+          0.0180615125,
+          0.0184518609375,
+          0.0187969171875,
+          0.01927127734375,
+          0.0188966671875,
+          0.0188937046875,
+          0.01892824453125,
+          0.01883845546875,
+          0.01885310703125,
+          0.01880536015625,
+          0.0188717546875,
+          0.01903024765625
+        ],
+        "interval": [
+          0.97763787832252,
+          1.0046955492530092
+        ],
+        "median": 0.9942123549863435,
+        "outer_steps": 8,
+        "paired_ratios": [
+          0.9659909555405514,
+          0.97763787832252,
+          0.9754009776852595,
+          1.0240121865712752,
+          1.0056061872650723,
+          0.9901625898857007,
+          1.0026609994689175,
+          0.9892694407309064,
+          0.993635039297455,
+          0.9947896706752322,
+          1.0023781943591177,
+          1.0046955492530092
+        ],
+        "verdict": "pass"
+      },
+      "timing_source": "follow-up",
+      "trace_sha256": "a559f418b9f0836b44ce401ad3f129a226424f73e7649090724bd1882516b4ac"
+    },
+    "cuda-svd-euler-cfg": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 4665810944,
+            "head_bytes": 4665810944,
+            "pair": 1,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 4632256512,
+            "pair": 2,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4665810944,
+            "pair": 3,
+            "ratio": 1.007243647218818,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 4632256512,
+            "pair": 4,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632260608,
+            "pair": 5,
+            "ratio": 1.0000008842342796,
+            "source": "retained",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "inconclusive",
+        "pass",
+        "inconclusive",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "fixture_contract_sha256": "3e0a896b61be1ad55c52da301e7788bbb582c2ab0ca133f2243c689b6f8a131b",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [
+        2,
+        4
+      ],
+      "original_receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "original_run_id": "44861650824",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "12aa1e48b15f09289395392a24e4072d54673d133c2017d1cc8308172aca6068",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811411",
+      "tensor_shape": [
+        1,
+        3,
+        4,
+        8,
+        16
+      ],
+      "terminal_sha256": "6b161492735bb0795882e1eef8d113704c5c9aa80f9aaf77801f97d0bc3ef267",
+      "timing": {
+        "base_mean_ns": [
+          384229018.75,
+          419420900,
+          394646218.75,
+          397598137.5,
+          408296456.25,
+          375286837.5,
+          424371956.25,
+          422637956.25,
+          451291468.75,
+          390607550,
+          379125881.25,
+          369321225
+        ],
+        "base_mean_seconds_per_outer_step": [
+          0.0960572546875,
+          0.104855225,
+          0.0986615546875,
+          0.099399534375,
+          0.1020741140625,
+          0.093821709375,
+          0.1060929890625,
+          0.1056594890625,
+          0.1128228671875,
+          0.0976518875,
+          0.0947814703125,
+          0.09233030625
+        ],
+        "ceiling": 1.02,
+        "head_mean_ns": [
+          365632006.25,
+          433919506.25,
+          439870268.75,
+          421761800,
+          461569325,
+          383894500,
+          419365725,
+          370827943.75,
+          408430993.75,
+          398645650,
+          370108243.75,
+          353433825
+        ],
+        "head_mean_seconds_per_outer_step": [
+          0.0914080015625,
+          0.1084798765625,
+          0.1099675671875,
+          0.10544045,
+          0.11539233125,
+          0.095973625,
+          0.10484143125,
+          0.0927069859375,
+          0.1021077484375,
+          0.0996614125,
+          0.0925270609375,
+          0.08835845625
+        ],
+        "interval": [
+          0.9515991463619768,
+          1.0607740837317177
+        ],
+        "median": 1.0043908274559752,
+        "outer_steps": 4,
+        "paired_ratios": [
+          0.9515991463619768,
+          1.0345681539713447,
+          1.114593901705792,
+          1.0607740837317177,
+          1.1304759518103213,
+          1.0229362227498853,
+          0.9882031996311962,
+          0.8774127791083838,
+          0.9050270657260236,
+          1.0205784552807542,
+          0.9762146612880441,
+          0.9569821636977404
+        ],
+        "verdict": "inconclusive"
+      },
+      "timing_source": "follow-up",
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-svd-euler-single": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 1,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 2,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 3,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 4,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 5,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "pass"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "fixture_contract_sha256": "c6595dd251245e96c10d08bca428c0b0c050d1692a37496f4398305fac2b2753",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [],
+      "original_receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "original_run_id": "44861650824",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "12aa1e48b15f09289395392a24e4072d54673d133c2017d1cc8308172aca6068",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811411",
+      "tensor_shape": [
+        1,
+        3,
+        4,
+        8,
+        16
+      ],
+      "terminal_sha256": "f201d79139e865647d95a7d7a1a6273704e75cb6f5df4c2df2d4ba6115cdd171",
+      "timing": {
+        "base": [
+          0.049164025,
+          0.047297725,
+          0.041310475,
+          0.051242375,
+          0.0453028
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0448298,
+          0.044467725,
+          0.04125385,
+          0.046590375,
+          0.044279025
+        ],
+        "interval": [
+          0.9092157613693744,
+          0.9986292822825203
+        ],
+        "median": 0.9401662553537194,
+        "paired_ratios": [
+          0.9118415345366861,
+          0.9401662553537194,
+          0.9986292822825203,
+          0.9092157613693744,
+          0.9774015071916085
+        ],
+        "verdict": "pass"
+      },
+      "timing_source": "retained",
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-svd-heun-cfg": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 1,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 4665810944,
+            "pair": 2,
+            "ratio": null,
+            "source": "follow-up",
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 3,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4665810944,
+            "head_bytes": 4665810944,
+            "pair": 4,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "pair": 5,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "inconclusive",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "fixture_contract_sha256": "d965ea3d88711548ecedeea0949ce8f8bc558976a96a0fbe3040ad0c72b935a0",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [
+        2
+      ],
+      "original_receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "original_run_id": "44861650824",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "12aa1e48b15f09289395392a24e4072d54673d133c2017d1cc8308172aca6068",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811411",
+      "tensor_shape": [
+        1,
+        3,
+        4,
+        8,
+        16
+      ],
+      "terminal_sha256": "074e2afa8b18b3309b551fddea8e5faed0d46d3212c437ee185190d28802ecbd",
+      "timing": {
+        "base": [
+          0.160594925,
+          0.1626773,
+          0.223264425,
+          0.165674275,
+          0.177140575
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.159776475,
+          0.157231975,
+          0.17519825,
+          0.1487616,
+          0.154262225
+        ],
+        "interval": [
+          0.7847118948753256,
+          0.9949036372102045
+        ],
+        "median": 0.897916106770348,
+        "paired_ratios": [
+          0.9949036372102045,
+          0.9665268294961866,
+          0.7847118948753256,
+          0.897916106770348,
+          0.8708463602988756
+        ],
+        "verdict": "pass"
+      },
+      "timing_source": "retained",
+      "trace_sha256": "e164fe0083cf5ee05cc825f0fe2233e76c64f1c9ee203f6a505269d56ddbca40"
+    },
+    "cuda-ti2v5b-t2v-heun": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 1444560896,
+            "head_bytes": 1444560896,
+            "pair": 1,
+            "ratio": 1.0,
+            "source": "follow-up",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444560896,
+            "head_bytes": 1444564992,
+            "pair": 2,
+            "ratio": 1.0000028354637118,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444564992,
+            "head_bytes": 1444560896,
+            "pair": 3,
+            "ratio": 0.9999971645443281,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444564992,
+            "head_bytes": 1444560896,
+            "pair": 4,
+            "ratio": 0.9999971645443281,
+            "source": "retained",
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444560896,
+            "head_bytes": 1444560896,
+            "pair": 5,
+            "ratio": 1.0,
+            "source": "retained",
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "pass"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "fb3f74c93401b64e87e60201d08a1ab88ff158fd50dec318e8a300211f50d994",
+          "transformer/model.safetensors": "e61077b49656eb8535f5a1dad73330ac011bdac9b32e08b6a6ebb8fd24ff509d"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "addccfddb976d2a2fd6598dc780055643dd0e798f1891557666cb4c3ec0b162d",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "transformer/diffusion_pytorch_model-00001-of-00005.safetensors": "2166da7c8abdd9652d81fb73ac47046a4aba12279fd95e75e3f2aad6a6f9f7a3",
+            "transformer/diffusion_pytorch_model-00002-of-00005.safetensors": "f2b0d42432b2f12a800dbf0cd752cf54f0a756cc47ff7bacef23054d6ba03c4d",
+            "transformer/diffusion_pytorch_model-00003-of-00005.safetensors": "148c4239ac3e5f38a946e139498b75ba7cde0de84b637e83010e49f34ba33a93",
+            "transformer/diffusion_pytorch_model-00004-of-00005.safetensors": "b7a70c48ea5cd2b8026f8480ddd0d5f8a323bfdc691acedfefcbc7927a544666",
+            "transformer/diffusion_pytorch_model-00005-of-00005.safetensors": "caab8f9edee861245db3aea068cedf66c66a5a3d9725b9b9914406d20df162cc"
+          },
+          "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+          "snapshot": "b8fff7315c768468a5333511427288870b2e9635"
+        },
+        "variant": "cuda-ti2v5b"
+      },
+      "fixture_contract_sha256": "fcafe904c36795c56d14e15f4f34fc9381bb235a947a8e52425904110958f7a9",
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_noise": "pass",
+      "initial_sha256": "d1b57b9929d7ada5da3140602b5ea38628be406be20614e3e869c7be4ded3903",
+      "missing_dedicated_pair_indices": [],
+      "original_receipt_sha256": "516c91bf595243a51760e02af4762116aee9016d984cbcf1cedfbe2e795381d3",
+      "original_run_id": "44861650920",
+      "outer_steps": 4,
+      "parity": "pass",
+      "receipt_sha256": "7d6f0d007caac9b6f7d271b70f7e17b8e94c6a80d684bc98556514af1e4a4600",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44893811394",
+      "tensor_shape": [
+        1,
+        48,
+        2,
+        4,
+        6
+      ],
+      "terminal_sha256": "f10e94e467edf6ac581def9de1fc5b5d145009e115f1f32a2d5fa20d82487e30",
+      "timing": {
+        "base_mean_ns": [
+          25467068.75,
+          31064862.5,
+          30733237.5,
+          33113931.25,
+          32724756.25,
+          32715387.5,
+          33703287.5,
+          27590843.75,
+          26204743.75,
+          27379793.75,
+          26709218.75,
+          27463387.5
+        ],
+        "base_mean_seconds_per_outer_step": [
+          0.0063667671875,
+          0.007766215625,
+          0.007683309375,
+          0.0082784828125,
+          0.0081811890625,
+          0.008178846875,
+          0.008425821875,
+          0.0068977109375,
+          0.0065511859375,
+          0.0068449484375,
+          0.0066773046875,
+          0.006865846875
+        ],
+        "ceiling": 1.02,
+        "head_mean_ns": [
+          27082550,
+          26889237.5,
+          33638500,
+          29420281.25,
+          33614243.75,
+          29097293.75,
+          31149693.75,
+          29084281.25,
+          24838062.5,
+          28225875,
+          24990506.25,
+          25399750
+        ],
+        "head_mean_seconds_per_outer_step": [
+          0.0067706375,
+          0.006722309375,
+          0.008409625,
+          0.0073550703125,
+          0.0084035609375,
+          0.0072743234375,
+          0.0077874234375,
+          0.0072710703125,
+          0.006209515625,
+          0.00705646875,
+          0.0062476265625,
+          0.0063499375
+        ],
+        "interval": [
+          0.8894069724835141,
+          1.0541280112174896
+        ],
+        "median": 0.9417484998366964,
+        "outer_steps": 4,
+        "paired_ratios": [
+          1.063434126080961,
+          0.8655836638581613,
+          1.0945316125579025,
+          0.8884563124772448,
+          1.0271808747238569,
+          0.8894069724835141,
+          0.9242330959554019,
+          1.0541280112174896,
+          0.9478460364642948,
+          1.0309016663063797,
+          0.935650963209098,
+          0.9248585958305399
+        ],
+        "verdict": "inconclusive"
+      },
+      "timing_source": "follow-up",
+      "trace_sha256": "e164fe0083cf5ee05cc825f0fe2233e76c64f1c9ee203f6a505269d56ddbca40"
+    }
+  },
+  "diagnostic_guard_revision": "ba88622e0fb67e464fee5fe8c5ef98186cd6469b",
+  "original_manifest_sha256": "cea63aa105b0894f448a9291e4ad5f1a0716359e6d541cf8a11f4837f6490ccf",
+  "previous_controller": "1ca8da6bc1900281864e8a482e6bc5c10bb570a7",
+  "repository": "SceneWorks/inference",
+  "runs": {
+    "44893811394": {
+      "accepted": false,
+      "artifact_id": "14703895433",
+      "artifact_name": "model-proof-1ca8da6bc1900281864e8a482e6bc5c10bb570a7-candle-cuda-44893811394-1",
+      "artifact_zip_sha256": "d61a0016228b3a487067e3760acf11608cfb324c0181f0175987798becddfd38",
+      "backend": "candle-cuda",
+      "base": "38dab65f5d9640396cf2946cd4ee866ce46630c6",
+      "base_tree": "583299608475223416f4e1bcad3b4276eeefb055",
+      "binary_sha256": {
+        "base": "aed7b154623c16f1defa1de540839c39d83ec5b41906d7eb8e824b9f67465c08",
+        "head": "ebbb2f42de091ce66b6f6bdc940ecacbfd18f8ca6e51d4fd44f6ed19f3594ea8"
+      },
+      "body_count": 26,
+      "controller_revision": "1ca8da6bc1900281864e8a482e6bc5c10bb570a7",
+      "controller_tree": "5981e320aeb4c22c84c183d71c485586a05b20db",
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_inputs_sha256": {
+        "fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25",
+        "headers.json": "cc19b391d7efaaf98242582b38e151c05ea6498f046c334f9b0146bf13eb6cbc"
+      },
+      "fixture_source_sha256": {
+        "base": "ef223e634ccf655090acc1f00d9661d1b4b6d4d77c823206b5b1386681d81bc4",
+        "head": "e9394c56d9cc5a909cd02683239a688fe12a7ce60ad6cf339b1e3c98be4098ee"
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "wan-curated-tier1-sw-6954-timing-memory-v1",
+      "receipt_sha256": "7d6f0d007caac9b6f7d271b70f7e17b8e94c6a80d684bc98556514af1e4a4600",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows-2"
+    },
+    "44893811411": {
+      "accepted": false,
+      "artifact_id": "14703599105",
+      "artifact_name": "model-proof-1ca8da6bc1900281864e8a482e6bc5c10bb570a7-candle-cuda-44893811411-1",
+      "artifact_zip_sha256": "e9b4b7de859ee4b111fe7191baf281a028066ee46219222667b1272ec32adb47",
+      "backend": "candle-cuda",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "mochi": "814957628fb82689adbbe5243648c43216e76ad2d0d8ae4dd4d5cfa5d87c3e56",
+          "svd": "8e434923bd9c88b534bf7af64baeab70a27210fa370f1459dcd6b03d1667457f"
+        },
+        "head": {
+          "mochi": "03db0bdb4bdbb1b1387be6427d97016bc5f5d4abfc72afc65006b6c9b49e95ea",
+          "svd": "15a56201817fca0367484544d7692e5399d0520f288679c843f98bfd065aa850"
+        }
+      },
+      "body_count": 46,
+      "controller_revision": "1ca8da6bc1900281864e8a482e6bc5c10bb570a7",
+      "controller_tree": "5981e320aeb4c22c84c183d71c485586a05b20db",
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_inputs_sha256": {
+        "fixture.py": "658cea8da1ed0faa81ae1f853fa7a83bd8e61ce71a94288cb1c681fa56418f19",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "ac769208e52cdb3b5ef109d9819861db5fa79bc7720c4608b70532e7c99c7d1a",
+        "ms_pair/aux_shapes.json": "f4caf29d2a38824533a462e29b93db1f6983a726e53b31fbec1266f392627d4e",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/candle-gen/candle-gen-mochi/src/lib.rs": "99673d9f9416b310d4517c4505adde414012013c32aafb012b8de10b98a5548b",
+          "crates/media/candle-gen/candle-gen-mochi/src/video_pair_fixture.rs": "8412fdca193c049d06dcbe4a3cd6bed48d90bc1248ef2ef8d135d6edb0763b3c",
+          "crates/media/candle-gen/candle-gen-svd/src/lib.rs": "b3573e2c8fb4d4dc7c7de9a0af87e1ee6a002d2be34ed25711c9d5e4347fb0e6",
+          "crates/media/candle-gen/candle-gen-svd/src/video_pair_fixture.rs": "7bc5ac23cf0895cffcaeb1f8e2f8246ca769fa30d0bc0d7a02ca047ed1d12e62"
+        },
+        "head": {
+          "crates/media/candle-gen/candle-gen-mochi/src/lib.rs": "14e5d0e0f9a12e148ddc7e133577f6d8cd2ee5c669b10ea19417129ca28e13f2",
+          "crates/media/candle-gen/candle-gen-mochi/src/video_pair_fixture.rs": "8412fdca193c049d06dcbe4a3cd6bed48d90bc1248ef2ef8d135d6edb0763b3c",
+          "crates/media/candle-gen/candle-gen-svd/src/lib.rs": "b16549251a8d67d0cfa9f20475b018da47019b1b999d7901e7c5aa6eb407f514",
+          "crates/media/candle-gen/candle-gen-svd/src/video_pair_fixture.rs": "7bc5ac23cf0895cffcaeb1f8e2f8246ca769fa30d0bc0d7a02ca047ed1d12e62"
+        }
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "mochi-svd-tier1-sw-6954-timing-memory-v1",
+      "receipt_sha256": "12aa1e48b15f09289395392a24e4072d54673d133c2017d1cc8308172aca6068",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows"
+    },
+    "44893811440": {
+      "accepted": false,
+      "artifact_id": "14703549952",
+      "artifact_name": "model-proof-1ca8da6bc1900281864e8a482e6bc5c10bb570a7-candle-cuda-44893811440-1",
+      "artifact_zip_sha256": "0d092a3a06cefd89c493ac059a822567eafc112f532963f6c29ef0d21359c770",
+      "backend": "candle-cuda",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "scail2": "5e505b5cc198d74a409f974dea31749d821a0942164826a7cb8eeeeb540adedc"
+        },
+        "head": {
+          "scail2": "d31d0b6174baaa56609eda6336d1f8cdd9d5b417bd907d2c657219a2654c2bf4"
+        }
+      },
+      "body_count": 34,
+      "controller_revision": "1ca8da6bc1900281864e8a482e6bc5c10bb570a7",
+      "controller_tree": "5981e320aeb4c22c84c183d71c485586a05b20db",
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_inputs_sha256": {
+        "fixture.py": "18a44b34a31e8b2c47bc385277976ed3eef9e57e36af86492f40e2abf8cfae9d",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "5f02f6145cbf6229196df2aee0b8a98e3b82068ce7766c4bf7e2f0da6726ad73",
+        "scail_pair/overlay.py": "8815cdf67675023e6327ec837b922555a2d0ccb01f02f691818a77cc6d597ac1",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/candle-gen/candle-gen-scail2/src/generate.rs": "8d4317a7642dfeae85f3ff3a93800a9fa8231b2fa9d6097dce4b1f573d3f86c3",
+          "crates/media/candle-gen/candle-gen-scail2/src/model.rs": "8cdf27bc692ce0aafecbc5ca6596749b509ace53938cafc187ffb550c55aa8b4",
+          "crates/media/candle-gen/candle-gen-scail2/src/pipeline.rs": "ae2559ef06f89e733a69b320d0411a73bf3e2576eaba8a34b9bf4be2dbd07959",
+          "crates/media/candle-gen/candle-gen-scail2/src/scail_pair_fixture.rs": "056ee4afb31fa8c4f48ff32583079f000a1696677f2054a1e9242cf58e70fb2e",
+          "crates/media/candle-gen/candle-gen-wan/src/scheduler.rs": "ebdfa0e06dbfaa4883c5104f948b9324df4b854638d9dded899f8c88f3fc54b6"
+        },
+        "head": {
+          "crates/media/candle-gen/candle-gen-scail2/src/generate.rs": "000c8cdd1fbc1c7fe69e358e4d7721eb358e1d3617131d40dbfa61545fef3ebf",
+          "crates/media/candle-gen/candle-gen-scail2/src/model.rs": "8cdf27bc692ce0aafecbc5ca6596749b509ace53938cafc187ffb550c55aa8b4",
+          "crates/media/candle-gen/candle-gen-scail2/src/pipeline.rs": "d8078e9952482dc3af6b0d52f85daed9bca4a42350fc61ffd9b30f4b8df4ef6d",
+          "crates/media/candle-gen/candle-gen-scail2/src/scail_pair_fixture.rs": "cb803e75ea571f27408a90f245eec233bd53c638cbde874c0285f7a81bcc9403",
+          "crates/media/candle-gen/candle-gen-wan/src/scheduler.rs": "135cd3a7172deae5718c3c05d35004b87194d01614eecdbdb49c4201b74282bd"
+        }
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "scail2-tier1-sw-6954-timing-memory-v1",
+      "receipt_sha256": "f2be8945a6608994fd1bbcec1e8b1feaba554e28416f33d8130810b9718a1d63",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows-2"
+    }
+  },
+  "schema_version": 1,
+  "timing_previous_samples_pooled": false
+}
