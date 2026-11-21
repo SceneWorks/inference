@@ -1,0 +1,118 @@
+// Installed only into disposable exact source checkouts by sga_terminal_comparison.py.
+use candle_gen::candle_core::{DType, Device, DeviceLocation};
+use candle_gen::gen_core::{
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+};
+use candle_gen::sampler::take_z_image_terminal_sample;
+use serde_json::json;
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+type ProofResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// __SGA_CUDA_RECEIPT__
+
+fn main() -> ProofResult<()> {
+    let variant = env::var("PAIR_TIER2_VARIANT")?;
+    let snapshot = PathBuf::from(env::var_os("PAIR_TIER2_SNAPSHOT").ok_or("missing snapshot")?);
+    let (provider, size, steps, prompt, negative, guidance) = match variant.as_str() {
+        "turbo" => ("z_image_turbo", 256, 4, "a fox", None, None),
+        "base" => (
+            "z_image",
+            512,
+            12,
+            "a photo of a rusty robot holding a lit candle, dramatic cinematic lighting",
+            Some("blurry, low quality, watermark"),
+            Some(4.0_f32),
+        ),
+        _ => return Err("unknown Z-Image terminal variant".into()),
+    };
+    let request = GenerationRequest {
+        prompt: prompt.into(),
+        negative_prompt: negative.map(str::to_owned),
+        guidance,
+        width: size,
+        height: size,
+        steps: Some(steps),
+        seed: Some(42),
+        count: 1,
+        ..Default::default()
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot));
+    let registry = candle_gen_z_image::provider_registry()?;
+    let plan = registry
+        .compile_render_plan(provider, &spec, &request)?
+        .ok_or("missing registered Z-Image plan")?;
+    assert_eq!(plan.base_seed(), 42);
+    assert_eq!(plan.guidance(), guidance.unwrap_or(1.0));
+    assert_eq!(plan.sampler(), "euler");
+    assert!(plan.low_res_start().is_none());
+    assert_eq!(plan.phase_output_size(0), (size, size));
+    assert_eq!(
+        plan.denoise_spans(),
+        std::iter::once(0..steps as usize).collect::<Vec<_>>()
+    );
+    let sigmas: Vec<u32> = plan.denoise_sigmas().iter().map(|s| s.to_bits()).collect();
+    let identity = json!({
+        "provider": provider, "width": size, "height": size, "steps": steps, "seed": plan.base_seed(),
+        "count": request.count, "prompt": prompt, "negative_prompt": negative, "guidance": guidance,
+        "sigmas_bits": sigmas,
+    });
+    match env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => (),
+        [flag] if flag == "--preflight" => {
+            println!("SGA_TERMINAL_PREFLIGHT {identity}");
+            return Ok(());
+        }
+        _ => return Err("unknown Z-Image terminal option".into()),
+    }
+
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing proof output")?);
+    let mut progress = Vec::with_capacity(steps as usize);
+    let start = Instant::now();
+    let generator = registry.load(provider, &spec)?;
+    assert_eq!(generator.descriptor().id, provider);
+    let report = generator.generate_planned(&request, &plan, None, &mut |event| {
+        if let Progress::Step { current, total } = event {
+            assert_eq!(total, steps);
+            progress.push(current);
+        }
+    })?;
+    let e2e_ns = start.elapsed().as_nanos();
+    let sample = take_z_image_terminal_sample().ok_or("resident sampler did not run")?;
+    assert_eq!(sample.device.location(), DeviceLocation::Cuda { gpu_id: 0 });
+    assert_eq!(sample.dtype, DType::BF16);
+    assert_eq!(sample.sigmas, sigmas);
+    assert_eq!(
+        sample.shape,
+        [1, 16, 1, size as usize / 8, size as usize / 8]
+    );
+    assert_eq!(progress, (1..=steps).collect::<Vec<_>>());
+    let Some(GenerationOutput::Images(images)) = report.output else {
+        return Err("expected native Z-Image RGB output".into());
+    };
+    let [image] = images.as_slice() else {
+        return Err("expected one native Z-Image output".into());
+    };
+    assert_eq!((image.width, image.height), (size, size));
+    assert_eq!(image.pixels.len(), size as usize * size as usize * 3);
+    fs::File::create_new(output.join("image.rgb"))?.write_all(&image.pixels)?;
+    let row = json!({
+        "plan": identity,
+        "sample": {
+            "dtype": format!("{:?}", sample.dtype),
+            "device": "candle-cuda:0",
+            "sigmas_bits": sample.sigmas,
+            "latent_shape": sample.shape,
+        },
+        "progress": progress, "e2e_ns": e2e_ns, "denoise_ns": sample.time,
+    });
+    serde_json::to_writer(fs::File::create_new(output.join("result.json"))?, &row)?;
+    retain_cuda_pool(&output, &sample.device)?;
+    println!("SGA_Z_IMAGE_TIER2_BODY {variant}");
+    Ok(())
+}
