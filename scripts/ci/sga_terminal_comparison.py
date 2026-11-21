@@ -27,6 +27,7 @@ from scripts.media_campaign_supervisor import load_policy
 
 SELECTION = "sga-terminal-tier2"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
+            ("mlx", "ltx25"): "ltx25_tier2_mlx",
             ("candle-cuda", "z-image"): "z_image_tier2_fixture",
             ("mlx", "wan"): "wan_adapter_tier2_fixture",
             ("candle-cuda", "wan"): "wan_adapter_tier2_fixture"}
