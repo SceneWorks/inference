@@ -12,7 +12,7 @@
 //! so the pipeline only supplies the latent + conditioning.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{self, CancelFlag, GenerationRequest, Image, Progress};
@@ -26,13 +26,9 @@ use crate::scheduler::{advance, cfg_combine};
 use crate::text_encoder::{encode_prompt, MochiT5};
 use crate::transformer::{load_transformer_var_builder, MochiDitConfig, MochiTransformer3DModel};
 use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
-use crate::{DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE, DEFAULT_STEPS, DIT_DTYPE};
+use crate::{DEFAULT_FPS, DEFAULT_GUIDANCE, DIT_DTYPE};
 use gen_core_family::mochi::{inverted_sigmas, MochiEuler};
-
-/// AsymmVAE latent channels fed to the DiT / seeded as init noise.
-const LATENT_CHANNELS: usize = 12;
-/// Resolution `shift` for the flow-match schedule — Mochi config `shift = 1.0` (no shift).
-const MOCHI_SHIFT: f32 = 1.0;
+use gen_core_family::mochi::{MochiVideo, LATENT_CHANNELS};
 
 /// The loaded Mochi 1 model, held resident for the whole generation. `Arc`-wrapped so the lazy
 /// component cache clones cheaply.
@@ -56,6 +52,7 @@ pub(crate) struct ComponentLayout {
 /// The lazy pipeline handle (root + device); [`load_components`](Pipeline::load_components) assembles
 /// the heavy components on first use.
 pub struct Pipeline {
+    layout: Mutex<Option<Arc<ComponentLayout>>>,
     root: PathBuf,
     device: Device,
 }
@@ -63,6 +60,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(root: &Path, device: &Device) -> Self {
         Self {
+            layout: Mutex::new(None),
             root: root.to_path_buf(),
             device: device.clone(),
         }
@@ -71,22 +69,26 @@ impl Pipeline {
     /// Assemble the full Mochi model from a snapshot directory: the reused T5-XXL encoder + tokenizer
     /// (bf16), the AsymmDiT transformer (bf16-stored, f32-activation), and the AsymmVAE decoder (f32).
     pub fn load_components(&self) -> CResult<Components> {
-        self.load_components_from(&self.component_layout()?)
+        self.load_components_from(self.component_layout()?.as_ref())
     }
 
-    pub(crate) fn component_layout(&self) -> CResult<ComponentLayout> {
+    pub(crate) fn component_layout(&self) -> CResult<Arc<ComponentLayout>> {
+        candle_gen::cached(&self.layout, || Self::read_layout(&self.root).map(Arc::new))
+    }
+
+    pub(crate) fn read_layout(root: &Path) -> CResult<ComponentLayout> {
         // A pre-quantized tier dir (`.../q4|q8|bf16`) holds only the packed/dense transformer +
         // `split_model.json`; its shared T5-XXL / AsymmVAE live in the parent (the `convert.rs` staged
         // layout). A raw diffusers snapshot has them all under one root (`detect` ⇒ `None`). Resolve the
         // DiT root and the shared (T5/VAE) root up front so both layouts load from the right place.
-        let tier = crate::tier::MochiTierPaths::detect(&self.root);
+        let tier = crate::tier::MochiTierPaths::detect(root);
         let (dit_root, shared_root) = match &tier {
             Some(t) => {
                 // Fail loudly if a quantized tier ever ships a non-64 group (the repack would mis-align).
                 t.validate_group_size()?;
                 (t.tier_dir.clone(), t.shared_root.clone())
             }
-            None => (self.root.clone(), self.root.clone()),
+            None => (root.to_path_buf(), root.to_path_buf()),
         };
 
         // MochiConfig is currently config-as-code (the T5 geometry is fixed by the reused encoder); the
@@ -114,7 +116,7 @@ impl Pipeline {
         // attn/ff Linears self-detect on their `.scales` siblings (`transformer::QLinear::linear_detect`).
         let dit_vb = load_transformer_var_builder(dit_root, DIT_DTYPE, &self.device)?;
         let transformer = MochiTransformer3DModel::new(dit_vb, &dit_cfg, &self.device)?;
-        let vae = MochiVaeDecoder::load(shared_root, &self.device)?;
+        let vae = MochiVaeDecoder::load_with_config(shared_root, vae_cfg, &self.device)?;
 
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
@@ -144,17 +146,13 @@ impl Pipeline {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
-        let t_ratio = vae_cfg.temporal_compression_ratio() as u32;
-        let s_ratio = vae_cfg.spatial_compression_ratio() as u32;
-        let phase = gen_core_family::mochi::phase(
-            req.width,
-            req.height,
-            req.frames.unwrap_or(DEFAULT_FRAMES),
-            t_ratio,
-            req.steps.unwrap_or(DEFAULT_STEPS) as usize,
-            MOCHI_SHIFT,
+        let video = MochiVideo::new(
+            req,
+            &vae_cfg.temporal_expansions,
+            &vae_cfg.spatial_expansions,
             req.seed.unwrap_or_else(gen_core::default_seed),
         )?;
+        let phase = &video.phase;
         let active = phase.enter(&req.cancel, scope)?;
         let comps = acquire_components(&req.cancel, components)?;
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
@@ -174,8 +172,6 @@ impl Pipeline {
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let lh = req.height / s_ratio;
-        let lw = req.width / s_ratio;
 
         // Seeded init noise `[1, 12, F_lat, H_lat, W_lat]` (FlowMatchEuler `init_noise_sigma = 1`, used
         // unscaled). The draw is CPU-`StdRng` (launch-portable); the reference's `torch.Generator` RNG is
@@ -183,8 +179,8 @@ impl Pipeline {
         let init = seeded_latents(
             phase.seed,
             phase.latent_frames as usize,
-            lh as usize,
-            lw as usize,
+            video.latent_height as usize,
+            video.latent_width as usize,
             &self.device,
         )?;
 
@@ -208,7 +204,7 @@ impl Pipeline {
             "mochi_vae_decode",
             serde_json::json!({
                 "chunk_frames": DEFAULT_DECODE_CHUNK_FRAMES, "spatial_tiling": false,
-                "temporal_compression": t_ratio, "spatial_compression": s_ratio
+                "temporal_compression": video.temporal_ratio, "spatial_compression": video.spatial_ratio
             }),
         );
         let video = comps
@@ -230,14 +226,14 @@ fn acquire_components<T>(cancel: &CancelFlag, load: impl FnOnce() -> CResult<T>)
 
 /// Deterministic N(0,1) init latent `[1, 12, F_lat, H_lat, W_lat]` (f32) — CPU `StdRng`, launch-portable.
 fn seeded_latents(seed: u64, lf: usize, lh: usize, lw: usize, device: &Device) -> CResult<Tensor> {
-    let n = LATENT_CHANNELS * lf * lh * lw;
+    let n = LATENT_CHANNELS as usize * lf * lh * lw;
     candle_gen::execution::draw("mochi_video_latents", seed, 0);
     candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(
         data,
-        (1, LATENT_CHANNELS, lf, lh, lw),
+        (1, LATENT_CHANNELS as usize, lf, lh, lw),
         device,
     )?)
 }

@@ -274,8 +274,16 @@ impl MochiVaeDecoder {
     /// f32 compute precision.
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
         let cfg = MochiVaeConfig::from_model_dir(root)?;
+        Self::load_with_config(root, &cfg, device)
+    }
+
+    pub(crate) fn load_with_config(
+        root: &Path,
+        cfg: &MochiVaeConfig,
+        device: &Device,
+    ) -> Result<Self> {
         let vb = candle_gen::component_vb(root, "vae", DType::F32, device, "mochi vae")?;
-        Self::new(vb.pp("decoder"), &cfg, DType::F32, device)
+        Self::new(vb.pp("decoder"), cfg, DType::F32, device)
     }
 
     /// De-normalize a raw latent (diffusers `MochiPipeline`): `z · std / scaling + mean`, per channel.

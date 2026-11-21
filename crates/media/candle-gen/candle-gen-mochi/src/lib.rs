@@ -42,12 +42,12 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, Progress, Quant, RenderLoadBinding, VideoPlanLayout, WeightsSource,
 };
 
 pub use config::{MochiConfig, MochiVaeConfig};
@@ -73,17 +73,10 @@ pub const VAE_DTYPE: DType = DType::F32;
 /// Width/height must be divisible by 16 (VAE 8× spatial × DiT patch 2). Exposed as the pinned-engine
 /// stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors mlx's
 /// `mlx_gen_mochi::SIZE_MULTIPLE` and `wan::config::SIZE_MULTIPLE_14B`.
-pub const SIZE_MULTIPLE: u32 = 16;
-/// The AsymmVAE temporal ratio: a valid clip length is `1 + 6·k`.
-const TEMPORAL_RATIO: u32 = 6;
+pub use gen_core_family::mochi::SIZE_MULTIPLE;
 
-// Production defaults when the request leaves a knob unset.
-/// Diffusers `MochiPipeline` default `num_inference_steps` for the preview.
-pub(crate) const DEFAULT_STEPS: u32 = 64;
 /// Diffusers `MochiPipeline` default `guidance_scale`.
 pub(crate) const DEFAULT_GUIDANCE: f32 = 4.5;
-/// A safe default frame count on the `6·k + 1` lattice (`6·3 + 1`).
-pub(crate) const DEFAULT_FRAMES: u32 = 19;
 /// Mochi renders ~30 fps.
 pub(crate) const DEFAULT_FPS: u32 = 30;
 
@@ -127,6 +120,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// The lazy candle Mochi 1 generator. `spec.weights` is a `genmo/mochi-1-preview` diffusers snapshot
 /// dir (`tokenizer/` vendored, `text_encoder/`, `transformer/`, `vae/`).
 pub struct MochiGenerator {
+    load_binding: RenderLoadBinding,
     descriptor: ModelDescriptor,
     pipe: Pipeline,
     components: Mutex<Option<Components>>,
@@ -143,27 +137,14 @@ impl MochiGenerator {
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        // Use the loaded codec's geometry on a warm request. On a cold request,
-        // resolve metadata first and reserve the phase before loading tensors.
-        let resident = candle_gen::lock_recover(&self.components).clone();
-        let (frames, fps) = if let Some(comps) = resident {
-            self.pipe.render_scoped(
-                req,
-                &comps.vae_cfg,
-                || Ok(comps.clone()),
-                scope,
-                on_progress,
-            )?
-        } else {
-            let layout = self.pipe.component_layout()?;
-            self.pipe.render_scoped(
-                req,
-                &layout.vae_cfg,
-                || candle_gen::cached(&self.components, || self.pipe.load_components_from(&layout)),
-                scope,
-                on_progress,
-            )?
-        };
+        let layout = self.pipe.component_layout()?;
+        let (frames, fps) = self.pipe.render_scoped(
+            req,
+            &layout.vae_cfg,
+            || candle_gen::cached(&self.components, || self.pipe.load_components_from(&layout)),
+            scope,
+            on_progress,
+        )?;
         Ok(GenerationOutput::Video {
             frames,
             fps,
@@ -173,6 +154,21 @@ impl MochiGenerator {
 }
 
 impl Generator for MochiGenerator {
+    fn video_load_binding(&self) -> Option<&RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        self.validate(req)?;
+        let layout = self.pipe.component_layout()?;
+        gen_core_family::mochi::check_layout(plan, &video_layout(req, &layout.vae_cfg)?)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -180,29 +176,7 @@ impl Generator for MochiGenerator {
     /// Reject a request Mochi cannot serve: the shared capability floor plus the model-specific
     /// constraints — non-empty prompt, 16-divisible width/height, and `num_frames = 1 + 6·k`.
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "mochi_1: prompt must not be empty".into(),
-            ));
-        }
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "mochi_1: width/height must be divisible by {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if let Some(frames) = req.frames {
-            // The AsymmVAE has a 6× temporal ratio, so a valid clip length is `1 + 6·k` latent-aligned.
-            if frames % TEMPORAL_RATIO != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "mochi_1: num_frames must be 1 + 6·k (got {frames})"
-                )));
-            }
-        }
-        Ok(())
+        gen_core_family::mochi::validate_request(&self.descriptor.capabilities, req)
     }
 
     fn generate_with_execution_report(
@@ -238,6 +212,17 @@ impl Generator for MochiGenerator {
 /// (a split-weight diffusers layout). Adapters / on-the-fly quantization / conditioning are rejected
 /// (not wired — Mochi ships pre-quantized per-tier checkpoints).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let root = load_root(spec)?;
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(MochiGenerator {
+        load_binding: RenderLoadBinding::from_video_spec(spec),
+        descriptor: descriptor(),
+        pipe: Pipeline::new(&root, &device),
+        components: Mutex::new(None),
+    }))
+}
+
+fn load_root(spec: &LoadSpec) -> gen_core::Result<PathBuf> {
     let root =
         match &spec.weights {
             WeightsSource::Dir(p) => p.clone(),
@@ -293,12 +278,33 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle mochi does not support image / I2V conditioning yet (txt2video only)".into(),
         ));
     }
-    let device = candle_gen::default_device()?;
-    Ok(Box::new(MochiGenerator {
-        descriptor: descriptor(),
-        pipe: Pipeline::new(&root, &device),
-        components: Mutex::new(None),
-    }))
+    Ok(root)
+}
+
+fn compile_video_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<VideoPlanLayout>> {
+    gen_core_family::mochi::validate_request(&descriptor().capabilities, req)?;
+    let root = load_root(spec)?;
+    let cfg = Pipeline::read_layout(&root)?.vae_cfg;
+    video_layout(req, &cfg).map(Some)
+}
+
+fn video_layout(
+    req: &GenerationRequest,
+    cfg: &MochiVaeConfig,
+) -> gen_core::Result<VideoPlanLayout> {
+    let video = gen_core_family::mochi::MochiVideo::new(
+        req,
+        &cfg.temporal_expansions,
+        &cfg.spatial_expansions,
+        req.seed.unwrap_or_default(),
+    )?;
+    video.layout(
+        DEFAULT_DECODE_CHUNK_FRAMES,
+        candle_gen::default_memory_budget_domain(),
+    )
 }
 
 candle_gen::register_generators! {
@@ -309,7 +315,12 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry
+        .register_generator(REGISTRATION)
+        .register_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        })
 }
 
 /// Build the complete explicit Candle Mochi 1 provider catalog.
@@ -320,6 +331,97 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     use super::*;
+
+    #[test]
+    fn registered_video_plan_reads_shared_codec_metadata_before_weights() {
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, WeightsSource};
+        let root = tempfile::tempdir().unwrap();
+        let tier = root.path().join("bf16");
+        std::fs::create_dir_all(tier.join("transformer")).unwrap();
+        std::fs::write(tier.join("split_model.json"), r#"{"quantized":false}"#).unwrap();
+        std::fs::create_dir(root.path().join("text_encoder")).unwrap();
+        std::fs::create_dir(root.path().join("vae")).unwrap();
+        // Non-default metadata detects accidental hard-coding of the real 6x8 checkpoint.
+        std::fs::write(
+            root.path().join("vae/config.json"),
+            r#"{"temporal_expansions":[1,1,3],"spatial_expansions":[1,2,2]}"#,
+        )
+        .unwrap();
+        let req = GenerationRequest {
+            prompt: "kitten".into(),
+            width: 64,
+            height: 48,
+            frames: Some(7),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(tier));
+        let registry = super::provider_registry().unwrap();
+        let plan = registry
+            .compile_video_plan(super::MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let phase = &plan.layout().phases[0];
+        assert_eq!(
+            (phase.latent_frames, phase.latent_bytes),
+            (3, 3 * 12 * 16 * 12 * 4)
+        );
+        assert_eq!((phase.decoded_frames, phase.decode_chunk_frames), (9, 3));
+        assert_eq!(plan.layout().output.frames, 7);
+        let invalid = GenerationRequest {
+            frames: Some(8),
+            ..req
+        };
+        assert!(registry
+            .compile_video_plan(super::MODEL_ID, &spec, &invalid)
+            .is_err());
+    }
+
+    #[test]
+    fn warmed_metadata_refuses_spatial_drift_before_weight_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let vae = root.path().join("vae");
+        std::fs::create_dir(&vae).unwrap();
+        let config = vae.join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let req = GenerationRequest {
+            prompt: "kitten".into(),
+            width: 64,
+            height: 48,
+            frames: Some(7),
+            ..Default::default()
+        };
+        let registry = provider_registry().unwrap();
+        let original = registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let generator = MochiGenerator {
+            load_binding: RenderLoadBinding::from_video_spec(&spec),
+            descriptor: descriptor(),
+            pipe: Pipeline::new(root.path(), &candle_gen::candle_core::Device::Cpu),
+            components: Mutex::new(None),
+        };
+        generator.validate_video_plan(&original, &req).unwrap();
+        std::fs::write(&config, r#"{"spatial_expansions":[1,2,2]}"#).unwrap();
+        let changed = registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.geometry(), changed.geometry());
+        assert_eq!(
+            original.layout().phases[0].latent_frames,
+            changed.layout().phases[0].latent_frames
+        );
+        assert_ne!(
+            original.layout().phases[0].latent_bytes,
+            changed.layout().phases[0].latent_bytes
+        );
+        assert!(
+            matches!(generator.validate_video_plan(&changed, &req), Err(gen_core::Error::Unsupported(msg)) if msg.contains("Mochi codec geometry"))
+        );
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
+    }
 
     #[test]
     fn explicit_catalog_has_stable_surface() {
