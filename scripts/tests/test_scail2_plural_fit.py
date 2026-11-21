@@ -1,9 +1,9 @@
 import copy
 import hashlib
+import itertools
 import json
 import os
 from contextlib import contextmanager
-from itertools import count
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from pathlib import Path
@@ -214,7 +214,7 @@ class PluralQualification(unittest.TestCase):
     def test_retries_preserve_earlier_missing_polls_and_stop_at_the_audit_limit(self):
         from scripts.ci.scail_plural import wddm_retry
 
-        clock = patch.object(wddm_retry.time, "monotonic_ns", side_effect=count(1, 100).__next__)
+        clock = patch.object(wddm_retry.time, "monotonic_ns", side_effect=itertools.count(1, 100).__next__)
         clock.start()
         self.addCleanup(clock.stop)
         gauge = MagicMock()
@@ -269,6 +269,26 @@ class PluralQualification(unittest.TestCase):
                 with patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_RUN_ID": "1",
                         "GITHUB_RUN_ATTEMPT": "1", "SCAIL_PLURAL_RECEIPT_SHA256": runner.tier1.sha(path)}):
                     runner.verify(SimpleNamespace(output=dest), contract)
+            records = receipt["counts"]
+            # Count 3 cannot follow 6 if 2 was omitted, even in a failed campaign.
+            records["3"] = records.pop("2")
+            with self.assertRaisesRegex(ValueError, "not a prefix"):
+                verify()
+            records["2"] = records.pop("3")
+            # Every attempted predecessor must replay; only the last attempted
+            # count may have aborted before completing physical verification.
+            preceding = records["6"]
+            records["6"] = {"accepted": False}
+            with self.assertRaisesRegex(ValueError, "after a hard failure"):
+                verify()
+            records["6"] = preceding
+            last = records["2"]
+            records["2"] = {"accepted": False}
+            with patch.object(runner.proof, "verify_execution", return_value={"ok": True}), \
+                    patch.object(c, "measured_row", side_effect=c.IncompleteWddmSamples) as earlier:
+                verify()
+                self.assertEqual(earlier.call_count, 1)
+            records["2"] = last
             with patch.object(runner.proof, "verify_execution", return_value={"ok": True}), \
                     patch.object(c, "measured_row", side_effect=[
                         c.IncompleteWddmSamples(), {"price": 200},

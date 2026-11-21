@@ -340,12 +340,17 @@ def verify(args, contract):
     for name, published in receipt["logs"].items():
         if tier1.sha(evidence.owned_file(dest, name, allowed[name])) != published["sha256"]:
             raise ValueError("changed published evidence")
-    known = set(map(str, contract["counts"]))
     records = receipt["counts"]
-    if not set(records).issubset(known):
-        raise ValueError("unexpected count in physical campaign")
+    # The producer serializes JSON keys in sorted order; replay the declared
+    # schedule rather than treating the order of a JSON object as evidence.
+    attempted = contract["counts"][:len(records)]
+    if set(records) != {str(count) for count in attempted}:
+        raise ValueError("attempted counts are not a prefix of the physical campaign")
+    prefixes = {f"count-{count}" for count in attempted}
+    if any(name.partition(".")[0] not in prefixes for name in receipt["logs"]):
+        raise ValueError("evidence belongs to an unattempted count")
     if receipt["accepted"]:
-        if set(records) != known or not all(record["accepted"] is True for record in records.values()):
+        if attempted != contract["counts"] or not all(record["accepted"] is True for record in records.values()):
             raise ValueError("incomplete campaign")
     elif not (receipt.get("failure") or receipt.get("log_errors")):
         raise ValueError("unexplained partial campaign")
@@ -353,11 +358,13 @@ def verify(args, contract):
 
     with TemporaryDirectory() as d:
         approved = tier1.read_policy(Path(d), "policy.json", contract["request"]["policy"])
-    for count in contract["counts"]:
-        record = records.get(str(count))
-        if record is None:
-            continue
+    for count in attempted:
+        record = records[str(count)]
+        if type(record["accepted"]) is not bool:
+            raise ValueError("invalid count outcome")
         if record["accepted"] is False and "telemetry_failure" not in record:
+            if count != attempted[-1]:
+                raise ValueError("attempted another count after a hard failure")
             if "candidate_row_pending_physical_review" in record:
                 raise ValueError("unverified count exposes a physical price")
             continue  # hard failure before a verified measurement
