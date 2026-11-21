@@ -263,6 +263,17 @@ pub const INT8_PER_ROW_CODEC: CheckpointCodecRegistration = CheckpointCodecRegis
     resident_encoding: WeightEncoding::DenseBf16,
 };
 
+/// Rotated signed I8 matrices. This source has no dense fallback: the projection must
+/// rotate the activation and run the native integer operation.
+pub const CONVROT_INT8_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+    codec_id: crate::convrot_int8::CODEC_ID,
+    stored: &[StoredTensorFormat::described(
+        WeightEncoding::Int8,
+        ComfyQuantFormat::ConvRotInt8,
+    )],
+    resident_encoding: WeightEncoding::Int8,
+};
+
 /// ComfyUI **NVFP4** (sc-20641): E2M1 nibbles packed two per `U8` byte (even element in the high
 /// nibble), one FP8 **E4M3** micro-scale per 16-element block in the cuBLAS 128×4 `to_blocked`
 /// swizzle (`{layer}.weight_scale`), and one `F32` per-tensor scale (`{layer}.weight_scale_2`) —
@@ -287,6 +298,7 @@ pub const COMFY_QUANT_CODECS: &[CheckpointCodecRegistration] = &[
     FP8_E5M2_SCALAR_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
+    CONVROT_INT8_CODEC,
     NVFP4_CODEC,
 ];
 
@@ -308,6 +320,7 @@ pub const BASELINE_CHECKPOINT_CODECS: &[CheckpointCodecRegistration] = &[
     FP8_E5M2_SCALAR_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
+    CONVROT_INT8_CODEC,
     NVFP4_CODEC,
 ];
 

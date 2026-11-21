@@ -80,6 +80,8 @@ pub const NVFP4_PAD: usize = 16;
 pub enum ComfyQuantFormat {
     /// `int8_tensorwise` with `per_row: true` — int8 codes + per-output-row f32 scale.
     Int8TensorwisePerRow,
+    /// Rotated I8 codes with online input rotation and dynamic activation quantization.
+    ConvRotInt8,
     /// `float8_e4m3fn` — fp8 E4M3FN values + one per-tensor f32 scale.
     Float8E4M3Fn,
     /// `float8_e5m2` — fp8 E5M2 values + one per-tensor f32 scale.
@@ -95,7 +97,7 @@ impl ComfyQuantFormat {
     /// The exact `format` string ComfyUI writes.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Int8TensorwisePerRow => "int8_tensorwise",
+            Self::Int8TensorwisePerRow | Self::ConvRotInt8 => "int8_tensorwise",
             Self::Float8E4M3Fn => "float8_e4m3fn",
             Self::Float8E5M2 => "float8_e5m2",
             Self::Mxfp8 => "mxfp8",
@@ -124,6 +126,8 @@ impl fmt::Display for ComfyQuantFormat {
 /// A validated `.comfy_quant` descriptor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComfyQuantDescriptor {
+    /// Hadamard group width for a rotated INT8 projection.
+    pub rotation_group: Option<usize>,
     pub format: ComfyQuantFormat,
     /// ComfyUI's per-layer "dequantize and multiply in full precision" flag: the layer keeps its
     /// packed storage but never takes a quantized matmul. A codec plan treats it as "dense fallback
@@ -153,8 +157,7 @@ pub enum ComfyQuantDescriptorError {
     UnsupportedFormat {
         format: String,
     },
-    /// `convrot` present: the rotated INT8 convention belongs to the Candle ConvRot loader, not the
-    /// plain per-row arm, and must not be dequantized as if unrotated.
+    /// Malformed or contradictory rotation metadata.
     ConvRot,
     /// `int8_tensorwise` without `per_row: true` (the only int8 layout either backend decodes).
     Int8NotPerRow,
@@ -199,11 +202,7 @@ impl fmt::Display for ComfyQuantDescriptorError {
                 "descriptor format {format:?} has no registered codec on this workspace (known: \
                  int8_tensorwise, float8_e4m3fn, float8_e5m2, mxfp8, nvfp4)"
             ),
-            Self::ConvRot => write!(
-                f,
-                "descriptor carries `convrot`; rotated int8 checkpoints are not the plain per-row \
-                 format"
-            ),
+            Self::ConvRot => write!(f, "INT8 ConvRot requires convrot: true, convrot_groupsize 64 or 256, per_row omitted or true, and native matrix multiplication"),
             Self::Int8NotPerRow => write!(
                 f,
                 "descriptor format `int8_tensorwise` must declare `per_row: true`"
@@ -280,6 +279,8 @@ pub fn parse_comfy_quant_descriptor(
 ///   (the ComfyUI Kitchen NVFP4 converters' form, sc-20641).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialComfyQuantDescriptor {
+    pub convrot: Option<bool>,
+    pub rotation_group: Option<usize>,
     pub format: ComfyQuantFormat,
     pub full_precision_matrix_mult: Option<bool>,
     /// Only meaningful for `int8_tensorwise`; `None` everywhere else (the key is refused as an
@@ -296,11 +297,26 @@ impl PartialComfyQuantDescriptor {
     /// descriptor: today that is int8's `per_row: true`, the only int8 layout either backend
     /// decodes. Absent optional fields take their ComfyUI defaults.
     pub fn into_complete(self) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
-        if self.format == ComfyQuantFormat::Int8TensorwisePerRow && self.per_row != Some(true) {
-            return Err(ComfyQuantDescriptorError::Int8NotPerRow);
-        }
+        let format = if self.convrot == Some(true) {
+            if self.rotation_group.is_none()
+                || self.per_row == Some(false)
+                || self.full_precision_matrix_mult == Some(true)
+            {
+                return Err(ComfyQuantDescriptorError::ConvRot);
+            }
+            ComfyQuantFormat::ConvRotInt8
+        } else {
+            if self.rotation_group.is_some() {
+                return Err(ComfyQuantDescriptorError::ConvRot);
+            }
+            if self.format == ComfyQuantFormat::Int8TensorwisePerRow && self.per_row != Some(true) {
+                return Err(ComfyQuantDescriptorError::Int8NotPerRow);
+            }
+            self.format
+        };
         Ok(ComfyQuantDescriptor {
-            format: self.format,
+            format,
+            rotation_group: self.rotation_group,
             full_precision_matrix_mult: self.full_precision_matrix_mult.unwrap_or(false),
             orig_shape: self.orig_shape,
         })
@@ -312,8 +328,17 @@ impl PartialComfyQuantDescriptor {
     /// are consistent and the authoritative one stands.
     pub fn disagreement_with(&self, tensor: &ComfyQuantDescriptor) -> Vec<&'static str> {
         let mut disagreement = Vec::new();
-        if self.format != tensor.format {
+        if self.format.as_str() != tensor.format.as_str() {
             disagreement.push("format");
+        }
+        if self
+            .convrot
+            .is_some_and(|flag| flag != (tensor.format == ComfyQuantFormat::ConvRotInt8))
+        {
+            disagreement.push("convrot");
+        }
+        if self.rotation_group.is_some() && self.rotation_group != tensor.rotation_group {
+            disagreement.push("convrot_groupsize");
         }
         if self
             .full_precision_matrix_mult
@@ -324,7 +349,12 @@ impl PartialComfyQuantDescriptor {
         // `per_row` does not survive into `ComfyQuantDescriptor` — the int8 format variant *is* the
         // per-row layout — so a declared `per_row: false` on an int8 layer contradicts the
         // authoritative blob just as surely as a format mismatch would.
-        if self.per_row == Some(false) && tensor.format == ComfyQuantFormat::Int8TensorwisePerRow {
+        if self.per_row == Some(false)
+            && matches!(
+                tensor.format,
+                ComfyQuantFormat::Int8TensorwisePerRow | ComfyQuantFormat::ConvRotInt8
+            )
+        {
             disagreement.push("per_row");
         }
         // Two block-scaled declarations of the same layer that name different pre-quantization
@@ -349,6 +379,12 @@ impl fmt::Display for PartialComfyQuantDescriptor {
         let mut declared = Vec::new();
         if let Some(flag) = self.full_precision_matrix_mult {
             declared.push(format!("full_precision_matrix_mult={flag}"));
+        }
+        if let Some(flag) = self.convrot {
+            declared.push(format!("convrot={flag}"));
+        }
+        if let Some(group) = self.rotation_group {
+            declared.push(format!("convrot_groupsize={group}"));
         }
         if let Some(flag) = self.per_row {
             declared.push(format!("per_row={flag}"));
@@ -389,14 +425,29 @@ pub fn partial_descriptor_from_json(
         .get("format")
         .and_then(serde_json::Value::as_str)
         .ok_or(ComfyQuantDescriptorError::MissingFormat)?;
-    if object.contains_key("convrot") || object.contains_key("convrot_groupsize") {
-        return Err(ComfyQuantDescriptorError::ConvRot);
-    }
     let format = ComfyQuantFormat::parse(format).ok_or_else(|| {
         ComfyQuantDescriptorError::UnsupportedFormat {
             format: format.to_owned(),
         }
     })?;
+    let int8 = format == ComfyQuantFormat::Int8TensorwisePerRow;
+    let convrot = object
+        .get("convrot")
+        .map(|v| {
+            v.as_bool()
+                .ok_or(ComfyQuantDescriptorError::NonBooleanField { field: "convrot" })
+        })
+        .transpose()?;
+    let rotation_group = object
+        .get("convrot_groupsize")
+        .map(|v| match v.as_u64() {
+            Some(group @ (64 | 256)) => Ok(group as usize),
+            _ => Err(ComfyQuantDescriptorError::ConvRot),
+        })
+        .transpose()?;
+    if !int8 && (convrot.is_some() || rotation_group.is_some()) {
+        return Err(ComfyQuantDescriptorError::ConvRot);
+    }
     let full_precision_matrix_mult = match object.get("full_precision_matrix_mult") {
         None => None,
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
@@ -467,7 +518,7 @@ pub fn partial_descriptor_from_json(
     };
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
-            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow)
+            || (matches!(key.as_str(), "per_row" | "convrot" | "convrot_groupsize") && int8)
             || key == "group_size"
             || (matches!(key.as_str(), "orig_dtype" | "orig_shape") && block_scaled);
         if !known {
@@ -475,6 +526,8 @@ pub fn partial_descriptor_from_json(
         }
     }
     Ok(PartialComfyQuantDescriptor {
+        convrot,
+        rotation_group,
         format,
         full_precision_matrix_mult,
         per_row,
@@ -1395,6 +1448,7 @@ mod tests {
         assert_eq!(
             parse_comfy_quant_descriptor(br#"{"format": "float8_e4m3fn"}"#),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E4M3Fn,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
@@ -1405,6 +1459,7 @@ mod tests {
                 br#"{"format": "float8_e5m2", "full_precision_matrix_mult": true}"#
             ),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E5M2,
                 full_precision_matrix_mult: true,
                 orig_shape: None,
@@ -1825,6 +1880,8 @@ mod tests {
             // Declared fields only (sc-20651): an entry that says nothing about
             // `full_precision_matrix_mult` must stay distinguishable from one that declares `false`.
             PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: None,
                 per_row: None,
@@ -1839,6 +1896,7 @@ mod tests {
         assert_eq!(
             table["blocks.0.attn.wq"].clone().into_complete(),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
@@ -1853,6 +1911,8 @@ mod tests {
         assert_eq!(
             int8["q"],
             PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: None,

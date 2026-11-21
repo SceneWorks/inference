@@ -249,11 +249,14 @@ fn a_layer_declared_twice_must_agree() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
             metadata: PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E4M3Fn,
                 full_precision_matrix_mult: None,
                 per_row: None,
@@ -276,11 +279,14 @@ fn a_layer_declared_twice_must_agree() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
             metadata: PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: Some(true),
                 per_row: None,
@@ -364,11 +370,14 @@ fn a_file_level_entry_that_is_a_subset_of_its_tensor_blob_corroborates_it() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
             metadata: PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: Some(false),

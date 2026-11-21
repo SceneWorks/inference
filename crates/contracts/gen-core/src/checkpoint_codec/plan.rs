@@ -130,6 +130,7 @@ impl LogicalTensorPlan {
         match &self.codec {
             TensorCodecSpec::Mxfp8 { .. }
             | TensorCodecSpec::Nvfp4 { .. }
+            | TensorCodecSpec::ConvRotInt8 { .. }
             | TensorCodecSpec::Int8PerRow { .. } => {}
             TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => return None,
         }
