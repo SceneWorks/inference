@@ -461,11 +461,44 @@ impl SvdGenerator {
     }
 }
 
-struct SequentialState<'a> {
+struct SequentialState<'a, 's> {
+    active: Option<gen_core::render::video::ActiveVideoDenoiseScope<'s>>,
     image_embeds: Option<Tensor>,
     image_latents: Option<Tensor>,
     latents: Option<Tensor>,
     on_progress: &'a mut dyn FnMut(Progress),
+}
+
+impl<'s> SequentialState<'_, 's> {
+    fn load_denoiser<T>(
+        &mut self,
+        phase: &gen_core::render::video::VideoDenoisePhase<(), Option<&str>>,
+        scope: Option<&'s mut dyn gen_core::MemoryRequestScope>,
+        cancel: &gen_core::CancelFlag,
+        load: impl FnOnce() -> CResult<T>,
+    ) -> CResult<T> {
+        self.active = Some(phase.enter(cancel, scope)?);
+        load_after_progress(cancel, self.on_progress, LoadPhase::Renderer, load)
+    }
+
+    fn finish_denoiser(&mut self) -> CResult<()> {
+        if let Some(active) = self.active.take() {
+            active.finish()?;
+        }
+        Ok(())
+    }
+}
+
+fn load_after_progress<T>(
+    cancel: &gen_core::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    component: LoadPhase,
+    load: impl FnOnce() -> CResult<T>,
+) -> CResult<T> {
+    check_cancel(cancel)?;
+    on_progress(Progress::Loading(component));
+    check_cancel(cancel)?;
+    load()
 }
 
 /// Production residency-policy dispatch seam. Passing the mutable request state into only the
@@ -661,6 +694,26 @@ impl SvdGenerator {
         dbg("init_latents", &latents);
 
         let phase = pipeline::video_phase(&latents, req.sampler.as_deref(), sched.sigmas, seed)?;
+        let denoise = |unet: &unet::SvdUnet,
+                       latents: &Tensor,
+                       embeds: &Tensor,
+                       image_latents: &Tensor,
+                       progress: &mut dyn FnMut(Progress)| {
+            pipeline::denoise_phase(
+                &phase,
+                latents,
+                embeds,
+                image_latents,
+                params.num_frames,
+                params.min_guidance_scale,
+                params.max_guidance_scale,
+                &req.cancel,
+                progress,
+                |input, time, embeds| {
+                    Ok(unet.forward(input, time, embeds, &atid, params.num_frames)?)
+                },
+            )
+        };
         let mut dispatch_state = (on_progress, Some(latents), scope);
         let frames = dispatch_svd_offload(
             self.offload,
@@ -680,22 +733,17 @@ impl SvdGenerator {
                     seed,
                 )?;
                 dbg("image_latents", &image_latents);
-                let final_latents = pipeline::denoise_phase(
-                    &phase,
-                    &comps.unet,
-                    latents
-                        .as_ref()
-                        .expect("init latents seeded before residency dispatch"),
-                    &image_embeds,
-                    &image_latents,
-                    &atid,
-                    params.num_frames,
-                    params.min_guidance_scale,
-                    params.max_guidance_scale,
-                    &req.cancel,
-                    scope.take(),
-                    &mut **on_progress,
-                )?;
+                let final_latents = phase.run(&req.cancel, scope.take(), || {
+                    denoise(
+                        &comps.unet,
+                        latents
+                            .as_ref()
+                            .expect("init latents seeded before residency dispatch"),
+                        &image_embeds,
+                        &image_latents,
+                        &mut **on_progress,
+                    )
+                })?;
                 dbg("final_latents", &final_latents);
                 pipeline::decode_to_images_incremental(
                     &comps.vae,
@@ -709,6 +757,7 @@ impl SvdGenerator {
             |dispatch| {
                 let (on_progress, latents, scope) = dispatch;
                 let mut state = SequentialState {
+                    active: None,
                     image_embeds: None,
                     image_latents: None,
                     latents: latents.take(),
@@ -717,9 +766,12 @@ impl SvdGenerator {
                 run_three_stage_sequential(
                     &mut state,
                     |st| {
-                        check_cancel(&req.cancel)?;
-                        (st.on_progress)(Progress::Loading(LoadPhase::TextEncoder));
-                        ConditioningComponents::load(&self.root, &self.device)
+                        load_after_progress(
+                            &req.cancel,
+                            st.on_progress,
+                            LoadPhase::TextEncoder,
+                            || ConditioningComponents::load(&self.root, &self.device),
+                        )
                     },
                     |conditioners, st| {
                         let image_embeds = self.clip_embeds(&conditioners.image_encoder, img)?;
@@ -739,13 +791,12 @@ impl SvdGenerator {
                         Ok(())
                     },
                     |st| {
-                        check_cancel(&req.cancel)?;
-                        (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
-                        load_unet(&self.root, &self.device)
+                        st.load_denoiser(&phase, scope.take(), &req.cancel, || {
+                            load_unet(&self.root, &self.device)
+                        })
                     },
                     |unet, st| {
-                        let final_latents = pipeline::denoise_phase(
-                            &phase,
+                        let final_latents = denoise(
                             unet,
                             st.latents
                                 .as_ref()
@@ -756,12 +807,6 @@ impl SvdGenerator {
                             st.image_latents
                                 .as_ref()
                                 .expect("image latents produced in conditioning phase"),
-                            &atid,
-                            params.num_frames,
-                            params.min_guidance_scale,
-                            params.max_guidance_scale,
-                            &req.cancel,
-                            scope.take(),
                             st.on_progress,
                         )?;
                         dbg("final_latents", &final_latents);
@@ -771,11 +816,15 @@ impl SvdGenerator {
                     |st| {
                         // The denoise boundary sync has completed before this closure runs, so the
                         // conditioning tensors can release before the decoder weights materialize.
+                        st.finish_denoiser()?;
                         st.image_embeds.take();
                         st.image_latents.take();
-                        check_cancel(&req.cancel)?;
-                        (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
-                        load_vae(&self.root, &self.device)
+                        load_after_progress(
+                            &req.cancel,
+                            st.on_progress,
+                            LoadPhase::Renderer,
+                            || load_vae(&self.root, &self.device),
+                        )
                     },
                     |vae, st| {
                         pipeline::decode_to_images_incremental(
@@ -1030,6 +1079,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scoped_unet_refusal_and_loading_cancellation_precede_weight_load() {
+        use candle_gen::request_scope::{CandleRequestScopeConfig, CandleRequestScopeCore};
+        use std::cell::RefCell;
+
+        for reject_geometry in [true, false] {
+            let geometry = gen_core::MemoryGeometry {
+                width: 256,
+                height: 256,
+                frames: 2,
+                batch: 1,
+                reference_count: 1,
+            };
+            let phase = gen_core::render::video::VideoDenoisePhase::fixed(
+                geometry,
+                2,
+                None,
+                vec![2., 0.],
+                9,
+            );
+            let mut admitted = geometry;
+            if reject_geometry {
+                admitted.frames = 1;
+            }
+            let config = CandleRequestScopeConfig::new(
+                MODEL_ID,
+                Device::Cpu,
+                admitted,
+                None,
+                false,
+                0,
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+            let mut scope = CandleRequestScopeCore::new(config);
+            let cancel = gen_core::CancelFlag::new();
+            let events = RefCell::new(Vec::new());
+            let mut progress = |event| {
+                assert!(matches!(event, Progress::Loading(LoadPhase::Renderer)));
+                events.borrow_mut().push("loading");
+                cancel.cancel();
+            };
+            let mut state = SequentialState {
+                active: None,
+                image_embeds: None,
+                image_latents: None,
+                latents: None,
+                on_progress: &mut progress,
+            };
+            let result = state.load_denoiser(&phase, Some(&mut scope), &cancel, || {
+                events.borrow_mut().push("weight-load");
+                Ok(())
+            });
+            if reject_geometry {
+                assert!(matches!(result, Err(CandleError::Unsupported(_))));
+                assert!(events.borrow().is_empty());
+                assert!(state.active.is_none());
+            } else {
+                assert!(matches!(result, Err(CandleError::Canceled)));
+                assert_eq!(*events.borrow(), ["loading"]);
+                assert!(state.active.is_some());
+            }
+        }
+    }
+
     /// Engine-level drop-order witness for the exact SVD phases. The conditioning aggregate contains
     /// the image encoder + source-image VAE encode; it must release before the UNet loads, and the
     /// UNet must release before the decode VAE reloads. An all-resident mutation raises `max_live`.
@@ -1073,7 +1187,28 @@ mod tests {
                 log: &log,
             }
         };
-        let mut state = ();
+        let phase = gen_core::render::video::VideoDenoisePhase::fixed(
+            gen_core::MemoryGeometry {
+                width: 8,
+                height: 8,
+                frames: 2,
+                batch: 1,
+                reference_count: 1,
+            },
+            2,
+            None,
+            vec![1., 0.],
+            1,
+        );
+        let cancel = gen_core::CancelFlag::new();
+        let mut progress = |_| log.borrow_mut().push("unet-progress");
+        let mut state = SequentialState {
+            active: None,
+            image_embeds: None,
+            image_latents: None,
+            latents: None,
+            on_progress: &mut progress,
+        };
         dispatch_svd_offload(
             OffloadPolicy::Sequential,
             &mut state,
@@ -1091,17 +1226,27 @@ mod tests {
                         log.borrow_mut().push("use-conditioner");
                         Ok(())
                     },
-                    |_| Ok(load("unet")),
-                    |_, _| {
+                    |st| st.load_denoiser(&phase, None, &cancel, || Ok(load("unet"))),
+                    |_, st| {
+                        assert!(st.active.is_some());
                         log.borrow_mut().push("use-unet");
                         Ok(())
                     },
-                    |_| Ok(load("decoder")),
+                    |st| {
+                        assert!(st.active.is_some());
+                        assert_eq!(log.borrow().last(), Some(&"drop-unet"));
+                        st.finish_denoiser()?;
+                        log.borrow_mut().push("leave-denoise");
+                        Ok(load("decoder"))
+                    },
                     |_, _| {
                         log.borrow_mut().push("use-decoder");
                         Ok(())
                     },
-                    || Ok(()),
+                    || {
+                        log.borrow_mut().push("sync");
+                        Ok(())
+                    },
                 )
             },
         )
@@ -1113,12 +1258,17 @@ mod tests {
             vec![
                 "load-conditioner",
                 "use-conditioner",
+                "sync",
                 "drop-conditioner",
+                "unet-progress",
                 "load-unet",
                 "use-unet",
+                "sync",
                 "drop-unet",
+                "leave-denoise",
                 "load-decoder",
                 "use-decoder",
+                "sync",
                 "drop-decoder"
             ]
         );
