@@ -4,6 +4,7 @@ use candle_core::{DType, Tensor, TensorId, D};
 use candle_nn::{Linear, Module};
 
 use super::lora::LoraLinear;
+use crate::gen_core::phase::ScaleContext;
 use crate::quant::AdaptLinear;
 
 /// Keep an immutable quantized base packed on the autograd tape. Ordinary
@@ -354,6 +355,27 @@ impl FrozenProjectionPack {
         x: &Tensor,
         layers: &[&LoraLinear],
     ) -> candle_core::Result<Vec<Tensor>> {
+        self.forward_lora_residuals(x, layers, LoraLinear::apply_residuals)
+    }
+
+    /// Same packed base evaluation with explicit request scales for the residuals.
+    pub fn forward_lora_with_scales(
+        &self,
+        x: &Tensor,
+        layers: &[&LoraLinear],
+        scales: &ScaleContext<'_>,
+    ) -> candle_core::Result<Vec<Tensor>> {
+        self.forward_lora_residuals(x, layers, |layer, x, y| {
+            layer.apply_residuals_with_scales(x, y, scales)
+        })
+    }
+
+    fn forward_lora_residuals(
+        &self,
+        x: &Tensor,
+        layers: &[&LoraLinear],
+        apply: impl Fn(&LoraLinear, &Tensor, Tensor) -> candle_core::Result<Tensor>,
+    ) -> candle_core::Result<Vec<Tensor>> {
         let ys = self.forward_bases(
             x,
             &layers.iter().map(|l| l.dense_base()).collect::<Vec<_>>(),
@@ -361,7 +383,7 @@ impl FrozenProjectionPack {
         layers
             .iter()
             .zip(ys)
-            .map(|(layer, y)| layer.apply_residuals(x, y))
+            .map(|(layer, y)| apply(layer, x, y))
             .collect()
     }
 

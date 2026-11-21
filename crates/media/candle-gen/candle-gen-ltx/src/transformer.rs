@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use candle_gen::block_window::BlockPlan;
 use candle_gen::candle_core::{DType, Device, DeviceLocation, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, VarBuilder};
-use candle_gen::gen_core::CancelFlag;
+use candle_gen::gen_core::{phase::ScaleContext, CancelFlag};
 
 use crate::config::AvConfig;
 use crate::quant::{qlinear, QLinear, TrainingProjectionPacks};
@@ -199,12 +199,6 @@ impl Attention {
         Ok(())
     }
 
-    fn set_adapter_pass(&self, pass: usize) {
-        for linear in [&self.to_q, &self.to_k, &self.to_v, &self.to_out, &self.gate] {
-            linear.set_additive_pass(pass);
-        }
-    }
-
     fn to_heads(&self, x: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         x.reshape((b, s, self.heads, self.dim_head))?
@@ -220,6 +214,7 @@ impl Attention {
         context: Option<&Tensor>,
         rope: Option<(&Tensor, &Tensor)>,
         k_rope: Option<(&Tensor, &Tensor)>,
+        scales: &ScaleContext<'_>,
     ) -> Result<Tensor> {
         let ctx = context.unwrap_or(x);
         let (q, k, v, gate_logits) = if self.training_packs.active() {
@@ -231,15 +226,16 @@ impl Attention {
                 self.to_k.lora().unwrap(),
                 self.to_v.lora().unwrap(),
                 self.gate.lora(),
+                Some(scales),
             )?
         } else {
             candle_gen::train::profile::cohort_reuse(
                 "ltx25:native-incompatible-projection-fallback",
             );
             (
-                self.to_q.forward(x)?,
-                self.to_k.forward(ctx)?,
-                self.to_v.forward(ctx)?,
+                self.to_q.forward_with_scales(x, scales)?,
+                self.to_k.forward_with_scales(ctx, scales)?,
+                self.to_v.forward_with_scales(ctx, scales)?,
                 None,
             )
         };
@@ -297,14 +293,14 @@ impl Attention {
         // Per-head gate: 2·sigmoid(logits) (zero-init → identity).
         let logits = match gate_logits {
             Some(logits) => logits,
-            None => self.gate.forward(x)?,
+            None => self.gate.forward_with_scales(x, scales)?,
         };
         let gates = (sigmoid(&logits)? * 2.0)?.reshape((b, s, self.heads, 1))?;
         out = out
             .reshape((b, s, self.heads, self.dim_head))?
             .broadcast_mul(&gates)?
             .reshape((b, s, inner))?;
-        self.to_out.forward(&out)
+        self.to_out.forward_with_scales(&out, scales)
     }
 }
 
@@ -326,9 +322,10 @@ impl FeedForward {
             proj_out: qlinear(&vb.pp("net"), "2", bias)?,
         })
     }
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, scales: &ScaleContext<'_>) -> Result<Tensor> {
         // tanh-approx gelu.
-        self.proj_out.forward(&self.proj_in.forward(x)?.gelu()?)
+        let hidden = self.proj_in.forward_with_scales(x, scales)?.gelu()?;
+        self.proj_out.forward_with_scales(&hidden, scales)
     }
 
     fn visit_adaptable_mut(
@@ -349,11 +346,6 @@ impl FeedForward {
             }
         }
         Ok(())
-    }
-
-    fn set_adapter_pass(&self, pass: usize) {
-        self.proj_in.set_additive_pass(pass);
-        self.proj_out.set_additive_pass(pass);
     }
 }
 
@@ -376,11 +368,16 @@ impl AdaLayerNormSingle {
 
     /// `ts_flat` is `[N]` f32 (already scaled). Returns `(scale_shift [N, coeff·inner], embedded
     /// [N, inner])`, bf16.
-    fn forward(&self, ts_flat: &Tensor, device: &Device) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        ts_flat: &Tensor,
+        device: &Device,
+        scales: &ScaleContext<'_>,
+    ) -> Result<(Tensor, Tensor)> {
         let proj = timestep_embedding(ts_flat, device)?.to_dtype(self.dtype)?;
-        let h = self.ts_lin1.forward(&proj)?.silu()?;
-        let embedded = self.ts_lin2.forward(&h)?;
-        let scale_shift = self.linear.forward(&embedded.silu()?)?;
+        let h = self.ts_lin1.forward_with_scales(&proj, scales)?.silu()?;
+        let embedded = self.ts_lin2.forward_with_scales(&h, scales)?;
+        let scale_shift = self.linear.forward_with_scales(&embedded.silu()?, scales)?;
         Ok((scale_shift, embedded))
     }
 
@@ -393,12 +390,6 @@ impl AdaLayerNormSingle {
             f(&path, linear)?;
         }
         Ok(())
-    }
-
-    fn set_adapter_pass(&self, pass: usize) {
-        self.ts_lin1.set_additive_pass(pass);
-        self.ts_lin2.set_additive_pass(pass);
-        self.linear.set_additive_pass(pass);
     }
 }
 
@@ -497,20 +488,18 @@ impl AvStream {
         self.cross_gate_adaln.visit_adaptable_mut(f)
     }
 
-    fn set_adapter_pass(&self, pass: usize) {
-        self.patchify.set_additive_pass(pass);
-        self.proj_out.set_additive_pass(pass);
-        self.adaln.set_adapter_pass(pass);
-        self.prompt_adaln.set_adapter_pass(pass);
-        self.cross_ss_adaln.set_adapter_pass(pass);
-        self.cross_gate_adaln.set_adapter_pass(pass);
-    }
-
     /// adaLN-single + prompt/cross controllers for a uniform T2V timestep `sigma`.
-    fn ts_embeds(&self, sigma: f64, ts_mult: f64, b: usize, device: &Device) -> Result<AvTs> {
+    fn ts_embeds(
+        &self,
+        sigma: f64,
+        ts_mult: f64,
+        b: usize,
+        device: &Device,
+        scales: &ScaleContext<'_>,
+    ) -> Result<AvTs> {
         let ts_scaled = (sigma * ts_mult) as f32;
         let ts_flat = Tensor::from_vec(vec![ts_scaled; b], (b,), device)?;
-        self.ts_embeds_flat(&ts_flat, &ts_flat, b, 1, device)
+        self.ts_embeds_flat(&ts_flat, &ts_flat, b, 1, device, scales)
     }
 
     /// adaLN-single controllers for a per-token video timestep table `[B, S]`.
@@ -518,7 +507,13 @@ impl AvStream {
     /// LTX image/keyframe and IC-LoRA conditioning feeds `sigma * denoise_mask` per token. Keeping
     /// that table here (instead of collapsing it to a scalar) is load-bearing: fully pinned tokens
     /// receive timestep zero while generation tokens receive the current schedule sigma.
-    fn ts_embeds_tokens(&self, timesteps: &Tensor, ts_mult: f64, device: &Device) -> Result<AvTs> {
+    fn ts_embeds_tokens(
+        &self,
+        timesteps: &Tensor,
+        ts_mult: f64,
+        device: &Device,
+        scales: &ScaleContext<'_>,
+    ) -> Result<AvTs> {
         let (b, s) = timesteps.dims2()?;
         let ts_flat = (timesteps.to_dtype(DType::F32)? * ts_mult)?
             .flatten_all()?
@@ -528,7 +523,7 @@ impl AvStream {
         let prompt_flat = (timesteps.narrow(1, 0, 1)?.to_dtype(DType::F32)? * ts_mult)?
             .flatten_all()?
             .contiguous()?;
-        self.ts_embeds_flat(&ts_flat, &prompt_flat, b, s, device)
+        self.ts_embeds_flat(&ts_flat, &prompt_flat, b, s, device, scales)
     }
 
     fn ts_embeds_flat(
@@ -538,12 +533,13 @@ impl AvStream {
         b: usize,
         s: usize,
         device: &Device,
+        scales: &ScaleContext<'_>,
     ) -> Result<AvTs> {
         let inner = self.inner;
-        let (ss, emb) = self.adaln.forward(ts_flat, device)?;
-        let (pss, _) = self.prompt_adaln.forward(prompt_flat, device)?;
-        let (css, _) = self.cross_ss_adaln.forward(ts_flat, device)?;
-        let (cgs, _) = self.cross_gate_adaln.forward(ts_flat, device)?;
+        let (ss, emb) = self.adaln.forward(ts_flat, device, scales)?;
+        let (pss, _) = self.prompt_adaln.forward(prompt_flat, device, scales)?;
+        let (css, _) = self.cross_ss_adaln.forward(ts_flat, device, scales)?;
+        let (cgs, _) = self.cross_gate_adaln.forward(ts_flat, device, scales)?;
         Ok(AvTs {
             ts_emb: ss.reshape((b, s, self.coeff * inner))?,
             emb_ts: emb.reshape((b, s, inner))?,
@@ -553,10 +549,16 @@ impl AvStream {
         })
     }
 
-    fn output_head(&self, h: &Tensor, emb_ts: &Tensor) -> Result<Tensor> {
+    fn output_head(
+        &self,
+        h: &Tensor,
+        emb_ts: &Tensor,
+        scales: &ScaleContext<'_>,
+    ) -> Result<Tensor> {
         let (scale, shift) = output_scale_shift(&self.scale_shift_table, emb_ts, self.inner)?;
         let normed = layer_norm_noaffine(h, self.eps)?;
-        self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
+        self.proj_out
+            .forward_with_scales(&modulate(&normed, &scale, &shift)?, scales)
     }
 }
 
@@ -578,6 +580,7 @@ fn output_scale_shift(table: &Tensor, emb_ts: &Tensor, inner: usize) -> Result<(
 
 /// Borrowed per-stream args threaded into an [`AvBlock`].
 struct AvStreamArgs<'a> {
+    scales: &'a ScaleContext<'a>,
     ts_emb: &'a Tensor,
     prompt_ts: &'a Tensor,
     context: &'a Tensor,
@@ -886,17 +889,6 @@ impl AvBlock {
         self.v2a.visit_lora_mut(f)
     }
 
-    fn set_adapter_pass(&self, pass: usize) {
-        self.attn1.set_adapter_pass(pass);
-        self.attn2.set_adapter_pass(pass);
-        self.ff.set_adapter_pass(pass);
-        self.a_attn1.set_adapter_pass(pass);
-        self.a_attn2.set_adapter_pass(pass);
-        self.a_ff.set_adapter_pass(pass);
-        self.a2v.set_adapter_pass(pass);
-        self.v2a.set_adapter_pass(pass);
-    }
-
     /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
     /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
     /// would leave the audio branch's scores unbounded while the contract claimed the rung.
@@ -934,7 +926,7 @@ impl AvBlock {
         let x = if run_self {
             let msa = ada_values(sst, a.ts_emb, 0, 3)?;
             let norm = modulate(&rms_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-            let attn = attn1.forward(&norm, None, Some((a.cos, a.sin)), None)?;
+            let attn = attn1.forward(&norm, None, Some((a.cos, a.sin)), None, a.scales)?;
             gated(x, &attn, &msa[2])?
         } else {
             x.clone()
@@ -945,7 +937,7 @@ impl AvBlock {
 
         let ca = ada_values(sst, a.ts_emb, 6, 9)?;
         let norm_ca = modulate(&rms_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = attn2.forward(&norm_ca, Some(&context), None, None)?;
+        let cross = attn2.forward(&norm_ca, Some(&context), None, None, a.scales)?;
         gated(&x, &cross, &ca[2])
     }
 
@@ -954,11 +946,11 @@ impl AvBlock {
         x: &Tensor,
         ff: &FeedForward,
         sst: &Tensor,
-        ts_emb: &Tensor,
+        args: &AvStreamArgs<'_>,
     ) -> Result<Tensor> {
-        let mlp = ada_values(sst, ts_emb, 3, 6)?;
+        let mlp = ada_values(sst, args.ts_emb, 3, 6)?;
         let norm = modulate(&rms_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
-        let ff_out = ff.forward(&norm)?;
+        let ff_out = ff.forward(&norm, args.scales)?;
         gated(x, &ff_out, &mlp[2])
     }
 
@@ -1014,6 +1006,7 @@ impl AvBlock {
                 Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
                 Some((v.cross_cos, v.cross_sin)),
                 Some((a.cross_cos, a.cross_sin)),
+                v.scales,
             )?;
             vx = gated(&vx, &a2v, &gate_a2v)?;
 
@@ -1023,12 +1016,13 @@ impl AvBlock {
                 Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
                 Some((a.cross_cos, a.cross_sin)),
                 Some((v.cross_cos, v.cross_sin)),
+                a.scales,
             )?;
             ax = gated(&ax, &v2a, &gate_v2a)?;
         }
 
-        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
-        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
+        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v)?;
+        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a)?;
         Ok((vx, ax))
     }
 }
@@ -1626,19 +1620,6 @@ impl AvDiT {
         &self.device
     }
 
-    /// Select the active distilled denoise pass for every installed adapter residual. This takes
-    /// `&self`: projections carry an atomic pass selector so a shared render-time `Arc<AvDiT>` can
-    /// switch stages without rebuilding or mutating the frozen model.
-    pub(crate) fn set_adapter_pass(&self, pass: usize) {
-        self.video.set_adapter_pass(pass);
-        self.audio.set_adapter_pass(pass);
-        if let AvBlocks::Resident(blocks) = &self.blocks {
-            for block in blocks {
-                block.set_adapter_pass(pass);
-            }
-        }
-    }
-
     /// Build the four split-RoPE tables once for a request. This deliberately has no model-owned cache:
     /// callers retain the prepared object for the render, avoiding host key extraction on each forward.
     pub(crate) fn prepare_rope(
@@ -1730,6 +1711,7 @@ impl AvDiT {
             video_grid,
             audio_grid,
             &prepared,
+            &ScaleContext::new(),
         )
     }
 
@@ -1776,6 +1758,7 @@ impl AvDiT {
         audio_grid: &Tensor,
         prepared: &PreparedAvRope,
     ) -> Result<(Tensor, Tensor)> {
+        let scales = &ScaleContext::new();
         prepared.request.validate(
             self.load_id,
             video_latent,
@@ -1799,10 +1782,10 @@ impl AvDiT {
         let ts_mult = self.cfg.video.timestep_scale_multiplier;
         let v_ts = self
             .video
-            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device)?;
+            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device, scales)?;
         let a_ts = self
             .audio
-            .ts_embeds_tokens(audio_timesteps, ts_mult, &self.device)?;
+            .ts_embeds_tokens(audio_timesteps, ts_mult, &self.device, scales)?;
         self.forward_with_ts(
             video_latent,
             audio_latent,
@@ -1813,6 +1796,7 @@ impl AvDiT {
             &v_ts,
             &a_ts,
             &AvPerturbation::none(),
+            scales,
         )
     }
 
@@ -1827,6 +1811,7 @@ impl AvDiT {
         video_grid: &Tensor,
         audio_grid: &Tensor,
         prepared: &PreparedAvRope,
+        scales: &ScaleContext<'_>,
     ) -> Result<(Tensor, Tensor)> {
         prepared.request.validate(
             self.load_id,
@@ -1839,8 +1824,8 @@ impl AvDiT {
         let b = video_latent.dim(0)?;
         let ts_mult = self.cfg.video.timestep_scale_multiplier;
 
-        let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device)?;
-        let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device)?;
+        let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device, scales)?;
+        let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device, scales)?;
 
         self.forward_with_ts(
             video_latent,
@@ -1852,6 +1837,7 @@ impl AvDiT {
             &v_ts,
             &a_ts,
             &AvPerturbation::none(),
+            scales,
         )
     }
 
@@ -1870,6 +1856,34 @@ impl AvDiT {
         audio_grid: &Tensor,
         video_keyframes_mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_conditioned_with_scales(
+            video_latent,
+            audio_latent,
+            video_timesteps,
+            audio_sigma,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            video_keyframes_mask,
+            &ScaleContext::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_conditioned_with_scales(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_timesteps: &Tensor,
+        audio_sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
+        scales: &ScaleContext<'_>,
+    ) -> Result<(Tensor, Tensor)> {
         let prepared = self.prepare_rope(video_latent, audio_latent, video_grid, audio_grid)?;
         self.forward_conditioned_prepared(
             video_latent,
@@ -1882,6 +1896,7 @@ impl AvDiT {
             audio_grid,
             video_keyframes_mask,
             &prepared,
+            scales,
         )
     }
 
@@ -1898,40 +1913,21 @@ impl AvDiT {
         audio_grid: &Tensor,
         video_keyframes_mask: Option<&Tensor>,
         prepared: &PreparedAvRope,
+        scales: &ScaleContext<'_>,
     ) -> Result<(Tensor, Tensor)> {
-        prepared.request.validate(
-            self.load_id,
+        self.forward_conditioned_prepared_controlled(
             video_latent,
             audio_latent,
-            video_grid,
-            audio_grid,
-        )?;
-        let b = video_latent.dim(0)?;
-        if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "ltx: video timestep shape {:?} must be [batch={}, tokens={}]",
-                video_timesteps.dims(),
-                b,
-                video_latent.dim(1)?
-            )));
-        }
-        let ts_mult = self.cfg.video.timestep_scale_multiplier;
-        let v_ts = self
-            .video
-            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device)?;
-        let a_ts = self
-            .audio
-            .ts_embeds(audio_sigma, ts_mult, b, &self.device)?;
-        self.forward_with_ts(
-            video_latent,
-            audio_latent,
+            video_timesteps,
+            audio_sigma,
             video_context,
             audio_context,
+            video_grid,
+            audio_grid,
             video_keyframes_mask,
             prepared,
-            &v_ts,
-            &a_ts,
             &AvPerturbation::none(),
+            scales,
         )
     }
 
@@ -1951,6 +1947,7 @@ impl AvDiT {
         video_keyframes_mask: Option<&Tensor>,
         prepared: &PreparedAvRope,
         perturbation: &AvPerturbation,
+        scales: &ScaleContext<'_>,
     ) -> Result<(Tensor, Tensor)> {
         prepared.request.validate(
             self.load_id,
@@ -1971,10 +1968,10 @@ impl AvDiT {
         let ts_mult = self.cfg.video.timestep_scale_multiplier;
         let v_ts = self
             .video
-            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device)?;
+            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device, scales)?;
         let a_ts = self
             .audio
-            .ts_embeds(audio_sigma, ts_mult, b, &self.device)?;
+            .ts_embeds(audio_sigma, ts_mult, b, &self.device, scales)?;
         self.forward_with_ts(
             video_latent,
             audio_latent,
@@ -1985,6 +1982,7 @@ impl AvDiT {
             &v_ts,
             &a_ts,
             perturbation,
+            scales,
         )
     }
 
@@ -2000,13 +1998,14 @@ impl AvDiT {
         v_ts: &AvTs,
         a_ts: &AvTs,
         perturbation: &AvPerturbation,
+        scales: &ScaleContext<'_>,
     ) -> Result<(Tensor, Tensor)> {
         candle_gen::execution::runtime(&self.device, self.video.dtype);
         candle_gen::execution::runtime(&self.device, self.audio.dtype);
         let mut vx = self
             .video
             .patchify
-            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+            .forward_with_scales(&video_latent.to_dtype(self.video.dtype)?, scales)?;
         // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only). The DFR token loops
         // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
         // passes `None`, keeping this an exact no-op.
@@ -2018,11 +2017,12 @@ impl AvDiT {
         let ax = self
             .audio
             .patchify
-            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+            .forward_with_scales(&audio_latent.to_dtype(self.audio.dtype)?, scales)?;
         let v_ctx = video_context.to_dtype(self.video.dtype)?;
         let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
 
         let va = AvStreamArgs {
+            scales,
             ts_emb: &v_ts.ts_emb,
             prompt_ts: &v_ts.prompt_ts,
             context: &v_ctx,
@@ -2034,6 +2034,7 @@ impl AvDiT {
             cross_gate_ts: &v_ts.cross_gate_ts,
         };
         let aa = AvStreamArgs {
+            scales,
             ts_emb: &a_ts.ts_emb,
             prompt_ts: &a_ts.prompt_ts,
             context: &a_ctx,
@@ -2094,8 +2095,8 @@ impl AvDiT {
                 .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
             }
         };
-        let v_vel = self.video.output_head(&vx, &v_ts.emb_ts)?;
-        let a_vel = self.audio.output_head(&ax, &a_ts.emb_ts)?;
+        let v_vel = self.video.output_head(&vx, &v_ts.emb_ts, scales)?;
+        let a_vel = self.audio.output_head(&ax, &a_ts.emb_ts, scales)?;
         Ok((v_vel, a_vel))
     }
 
@@ -2110,12 +2111,14 @@ impl AvDiT {
         video_context: &Tensor,
         video_grid: &Tensor,
     ) -> Result<Tensor> {
+        let scales = &ScaleContext::new();
         let b = video_latent.dim(0)?;
         let v_ts = self.video.ts_embeds(
             sigma,
             self.cfg.video.timestep_scale_multiplier,
             b,
             &self.device,
+            scales,
         )?;
         let (v_cos, v_sin) = self.training_freqs(
             video_grid,
@@ -2128,12 +2131,13 @@ impl AvDiT {
         let mut vx = self
             .video
             .patchify
-            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+            .forward_with_scales(&video_latent.to_dtype(self.video.dtype)?, scales)?;
         vx = apply_keyframes_embedding(&vx, self.video.keyframes_embedding.as_ref(), None)?;
         let v_ctx = video_context.to_dtype(self.video.dtype)?;
         // The video-only path never consumes the cross-modal fields. Reuse the self-RoPE/timestep
         // tensors to keep this borrowed argument bundle allocation-free.
         let va = AvStreamArgs {
+            scales,
             ts_emb: &v_ts.ts_emb,
             prompt_ts: &v_ts.prompt_ts,
             context: &v_ctx,
@@ -2162,9 +2166,9 @@ impl AvDiT {
                 &va,
                 true,
             )?;
-            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &va)?;
         }
-        self.video.output_head(&vx, &v_ts.emb_ts)
+        self.video.output_head(&vx, &v_ts.emb_ts, scales)
     }
 
     /// Video-only training forward with a per-token timestep table.  This is the single-active
@@ -2196,12 +2200,14 @@ impl AvDiT {
         audio_context: &Tensor,
         audio_grid: &Tensor,
     ) -> Result<Tensor> {
+        let scales = &ScaleContext::new();
         let b = audio_latent.dim(0)?;
         let a_ts = self.audio.ts_embeds(
             sigma,
             self.cfg.video.timestep_scale_multiplier,
             b,
             &self.device,
+            scales,
         )?;
         let (a_cos, a_sin) = self.training_freqs(
             audio_grid,
@@ -2214,9 +2220,10 @@ impl AvDiT {
         let mut ax = self
             .audio
             .patchify
-            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+            .forward_with_scales(&audio_latent.to_dtype(self.audio.dtype)?, scales)?;
         let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
         let aa = AvStreamArgs {
+            scales,
             ts_emb: &a_ts.ts_emb,
             prompt_ts: &a_ts.prompt_ts,
             context: &a_ctx,
@@ -2242,9 +2249,9 @@ impl AvDiT {
                 &aa,
                 true,
             )?;
-            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &a_ts.ts_emb)?;
+            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &aa)?;
         }
-        self.audio.output_head(&ax, &a_ts.emb_ts)
+        self.audio.output_head(&ax, &a_ts.emb_ts, scales)
     }
 
     /// Audio-only training forward with a per-token timestep table.  Audio-only and
@@ -2257,6 +2264,7 @@ impl AvDiT {
         audio_context: &Tensor,
         audio_grid: &Tensor,
     ) -> Result<Tensor> {
+        let scales = &ScaleContext::new();
         let b = audio_latent.dim(0)?;
         if audio_timesteps.dims2()? != (b, audio_latent.dim(1)?) {
             return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -2269,6 +2277,7 @@ impl AvDiT {
             audio_timesteps,
             self.cfg.video.timestep_scale_multiplier,
             &self.device,
+            scales,
         )?;
         let (a_cos, a_sin) = self.training_freqs(
             audio_grid,
@@ -2281,9 +2290,10 @@ impl AvDiT {
         let mut ax = self
             .audio
             .patchify
-            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+            .forward_with_scales(&audio_latent.to_dtype(self.audio.dtype)?, scales)?;
         let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
         let aa = AvStreamArgs {
+            scales,
             ts_emb: &a_ts.ts_emb,
             prompt_ts: &a_ts.prompt_ts,
             context: &a_ctx,
@@ -2309,9 +2319,9 @@ impl AvDiT {
                 &aa,
                 true,
             )?;
-            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &a_ts.ts_emb)?;
+            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &aa)?;
         }
-        self.audio.output_head(&ax, &a_ts.emb_ts)
+        self.audio.output_head(&ax, &a_ts.emb_ts, scales)
     }
 
     /// **Video-only** forward with per-token video timesteps and the DFR keyframes mask — the
@@ -2334,12 +2344,14 @@ impl AvDiT {
             video_grid,
             video_keyframes_mask,
             &AvPerturbation::none(),
+            &ScaleContext::new(),
         )
     }
 
     /// Controlled single-video-stream forward for the Dev validation route.  This retains the
     /// ordinary video-only topology while letting STG suppress self-attention at the selected
     /// block indices; text cross-attention and FF remain active at every block.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_video_only_conditioned_controlled(
         &self,
         video_latent: &Tensor,
@@ -2348,6 +2360,7 @@ impl AvDiT {
         video_grid: &Tensor,
         video_keyframes_mask: Option<&Tensor>,
         perturbation: &AvPerturbation,
+        scales: &ScaleContext<'_>,
     ) -> Result<Tensor> {
         let b = video_latent.dim(0)?;
         if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
@@ -2362,6 +2375,7 @@ impl AvDiT {
             video_timesteps,
             self.cfg.video.timestep_scale_multiplier,
             &self.device,
+            scales,
         )?;
         let (v_cos, v_sin) = self.training_freqs(
             video_grid,
@@ -2374,7 +2388,7 @@ impl AvDiT {
         let mut vx = self
             .video
             .patchify
-            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+            .forward_with_scales(&video_latent.to_dtype(self.video.dtype)?, scales)?;
         vx = apply_keyframes_embedding(
             &vx,
             self.video.keyframes_embedding.as_ref(),
@@ -2383,6 +2397,7 @@ impl AvDiT {
         let v_ctx = video_context.to_dtype(self.video.dtype)?;
         // The video-only path never consumes the cross-modal fields; reuse the self-RoPE tensors.
         let va = AvStreamArgs {
+            scales,
             ts_emb: &v_ts.ts_emb,
             prompt_ts: &v_ts.prompt_ts,
             context: &v_ctx,
@@ -2405,7 +2420,7 @@ impl AvDiT {
                         &va,
                         perturbation.attention_plan(index).run_self,
                     )?;
-                    vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+                    vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &va)?;
                 }
                 vx
             }
@@ -2429,7 +2444,7 @@ impl AvDiT {
                                 &va,
                                 perturbation.attention_plan(index).run_self,
                             )?;
-                            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+                            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &va)?;
                         }
                         Ok(vx)
                     },
@@ -2437,7 +2452,7 @@ impl AvDiT {
                 .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
             }
         };
-        self.video.output_head(&vx, &v_ts.emb_ts)
+        self.video.output_head(&vx, &v_ts.emb_ts, scales)
     }
 }
 
