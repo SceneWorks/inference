@@ -101,8 +101,12 @@ impl ConvRotLinear {
                     "ConvRot CUDA output width must be a multiple of16".into(),
                 ));
             }
-            let linear =
-                crate::eight_bit_linear::Int8Linear::from_native_bytes(&codes, scales, bias, lt.clone())?;
+            let linear = crate::eight_bit_linear::Int8Linear::from_native_bytes(
+                &codes,
+                scales,
+                bias,
+                lt.clone(),
+            )?;
             let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
             Ok(Some(Self {
                 descriptor,
