@@ -1,0 +1,57 @@
+@COMMON@
+
+use mlx_rs::{DeviceType, Stream};
+const LANE: &str = "mlx";
+type State = Array;
+type Inputs = Weights;
+type Resource = Stream;
+type NativeResult<T> = mlx_gen::Result<T>;
+type ForwardResult<T> = mlx_gen::Result<T>;
+
+fn parse(s: &str) -> SolverKind {
+    SolverKind::from_name(s)
+}
+fn shape(x: &Array) -> &[i32] {
+    x.shape()
+}
+fn sync(stream: &Stream) -> ProofResult<()> {
+    Ok(stream.synchronize_and_retire()?)
+}
+fn peak(_: &Pair) -> ProofResult<u64> {
+    Ok(mlx_rs::memory::get_peak_memory() as u64)
+}
+fn input(inputs: &Weights, k: &str) -> Result<Array> {
+    Ok(inputs.require(k)?.clone())
+}
+fn values(x: &Array) -> ForwardResult<Vec<f32>> {
+    assert_eq!(x.dtype(), Dtype::Float32);
+    Ok(mlx_gen::array::contiguous(x)?.as_slice::<f32>().to_vec())
+}
+fn carry(x: &Array) -> NativeResult<Array> {
+    Ok(x.take_axis(Array::from_slice(&[1i32], &[1]), 1)?)
+}
+fn load(pair: &Pair) -> ProofResult<(Scail2Dit, Inputs, Resource, Value)> {
+    let stream = Stream::task_local_or_default();
+    assert!(matches!(stream.get_device()?.get_type()?, DeviceType::Gpu));
+    crate::model_inference_device::record_model_inference_device();
+    let mut cfg = Scail2Config::scail2_14b();
+    cfg.wan.num_layers = 1;
+    let weights = Weights::from_file(pair.root.join("dit.safetensors"))?;
+    assert_eq!(
+        weights.require("patch_embedding.weight")?.dtype(),
+        Dtype::Bfloat16
+    );
+    let mut model = Scail2Dit::from_weights(&weights, &cfg)?;
+    model.set_compute_dtype(Dtype::Float32);
+    model.set_memory_config(SCAIL2_MEM_DEFAULT);
+    let settings = json!({"depth":model.num_blocks(),"heads":cfg.wan.num_heads,
+        "width_channels":cfg.wan.dim,"patch":cfg.wan.patch_size,"compute_dtype":"F32","weight_dtype":"BF16"});
+    Ok((
+        model,
+        Weights::from_file(pair.root.join("inputs.safetensors"))?,
+        stream,
+        settings,
+    ))
+}
+
+@RUN@

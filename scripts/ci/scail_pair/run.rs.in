@@ -1,0 +1,186 @@
+fn sweep<const OBSERVE: bool>(
+    model: &Scail2Dit,
+    inputs: &Inputs,
+    job: &Scail2Job,
+    resource: &Resource,
+    condition: &Conditioning,
+) -> ProofResult<Sweep> {
+    let segments = @SEGMENTS@;
+    let trace = RefCell::new(Vec::new());
+    let cancel = &CancelFlag::default();
+    let mut sweep = Sweep::default();
+    let mut prior = None;
+    @WINDOWS@
+        let history_latent = prior.as_ref().map(carry).transpose()?;
+        let history_mask = history_latent
+            .as_ref()
+            .map(|_| input(inputs, "history_mask"))
+            .transpose()?;
+        let ref_masks = input(inputs, "ref_masks")?;
+        let driving_masks = input(inputs, &format!("driving{seg_idx}"))?;
+        let pose_latent = input(inputs, &format!("pose{seg_idx}"))?;
+        let dit = Forward::<OBSERVE> {
+            inner: model,
+            condition,
+            history: history_latent.as_ref(),
+            trace: &trace,
+        };
+        let on_progress = &mut |event| {
+            if let Progress::Step { current, total } = event {
+                trace
+                    .borrow_mut()
+                    .push(json!({"event":"step","current":current,"total":total}));
+            }
+        };
+        trace
+            .borrow_mut()
+            .push(json!({"event":"window","start":seg_start,"end":seg_end,
+                                      "seed":job.seed.wrapping_add(seg_idx as u64)}));
+        let (lat_t, lat_h, lat_w) = (
+            shape(&pose_latent)[1],
+            shape(&condition.ref_latent)[2],
+            shape(&condition.ref_latent)[3],
+        );
+        @BINDINGS@
+        @CFG@
+        sync(resource)?;
+        let start = Instant::now();
+        let mut initial_sample = None;
+        let (initial, latent) = (|| -> NativeResult<(State, State)> {
+            @NATIVE@
+            Ok((
+                initial_sample.expect("at least one native scheduler update"),
+                latent,
+            ))
+        })()?;
+        sync(resource)?;
+        sweep.elapsed_ns += u64::try_from(start.elapsed().as_nanos())?;
+        // Compare the state actually handed to the scheduler: its seed draw with
+        // the previous window's clean prefix installed by the production helper.
+        let initial = values(&initial)?;
+        let terminal = values(&latent)?;
+        if let Some(history) = &history_latent {
+            let pinned = values(history)?;
+            assert_prefix(&initial, &pinned);
+            assert_prefix(&terminal, &pinned);
+        }
+        assert_ne!(bits(&initial), bits(&terminal));
+        sweep.initial.extend(bits(&initial));
+        sweep.terminal.extend(bits(&terminal));
+        prior = Some(latent);
+    }
+    sweep.trace = trace.into_inner();
+    Ok(sweep)
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    assert_eq!(env::var("MODEL_INFERENCE_CASE_FQN")?, FQN);
+    let pair = Pair {
+        case: env::var("VIDEO_PAIR_CASE")?,
+        root: env::var("VIDEO_PAIR_FIXTURE")?.into(),
+        out: env::var("PAIR_OUT")?.into(),
+    };
+    let replacement = match pair.case.strip_prefix(LANE) {
+        Some("-scail2-animation-unipc") => false,
+        Some("-scail2-replacement-dpmpp") => true,
+        _ => return Err("unexpected SCAIL-2 case for this device".into()),
+    };
+    let image = Image {
+        width: 64,
+        height: 32,
+        pixels: vec![0; 64 * 32 * 3],
+    };
+    let frames = vec![image.clone(); if replacement { 9 } else { 5 }];
+    let requested = if replacement { "dpm++" } else { "unipc" };
+    let character = || CharacterRef {
+        image: &image,
+        mask: &image,
+    };
+    let job = Scail2Job {
+        prompt: "positive",
+        negative_prompt: "negative",
+        width: 64,
+        height: 32,
+        reference: character(),
+        additional: if replacement {
+            vec![character(), character()]
+        } else {
+            vec![]
+        },
+        driving_frames: &frames,
+        driving_masks: &frames,
+        replace_flag: replacement,
+        seed: SEED,
+        steps: 4,
+        shift: 5.0,
+        guidance: 5.0,
+        sampler: parse(requested),
+        fps: 16,
+        segment_len: 5,
+        segment_overlap: 1,
+        @JOB_FIELDS@
+    };
+    let (model, inputs, resource, model_settings) = load(&pair)?;
+    let condition = Conditioning {
+        ref_latent: input(&inputs, "reference")?,
+        additional_ref_latent: replacement.then(|| input(&inputs, "extra")).transpose()?,
+        additional_ref_masks: replacement
+            .then(|| input(&inputs, "extra_masks"))
+            .transpose()?,
+        context: input(&inputs, "positive")?,
+        context_null: input(&inputs, "negative")?,
+        clip_fea: input(&inputs, "clip")?,
+    };
+    let diagnostic = sweep::<true>(&model, &inputs, &job, &resource, &condition)?;
+    let measured = sweep::<false>(&model, &inputs, &job, &resource, &condition)?;
+    assert_eq!(diagnostic.initial, measured.initial);
+    assert_eq!(diagnostic.terminal, measured.terminal);
+    let events = diagnostic
+        .trace
+        .iter()
+        .filter(|e| matches!(e["event"].as_str(), Some("window" | "step")));
+    assert!(events.eq(measured.trace.iter()));
+    let complete = measured.trace.last().unwrap()["current"].as_u64().unwrap();
+    let count = if replacement { 2 } else { 1 };
+    assert_eq!(complete, 4 * count);
+    if replacement {
+        // Independently verify the serialized layout and the selected previous
+        // tail. A self-consistent reuse of the wrong history cell must fail.
+        let window_bytes = 16 * 2 * 4 * 8 * 4;
+        let frame_bytes = 4 * 8 * 4;
+        for channel in 0..16 {
+            let first = channel * 2 * frame_bytes;
+            let previous_tail = &measured.terminal[first+frame_bytes..first+2*frame_bytes];
+            let second = window_bytes + first;
+            assert_eq!(&measured.initial[second..second+frame_bytes], previous_tail);
+            assert_eq!(&measured.terminal[second..second+frame_bytes], previous_tail);
+        }
+    }
+    let mut settings = json!({"seed":job.seed,"steps":job.steps,"shift":job.shift,"guidance":job.guidance,
+        "requested_sampler":requested,"effective_sampler":format!("{:?}",job.sampler),"replace":job.replace_flag,
+        "extra_references":job.additional.len(),"width":job.width,"height":job.height,"frames":frames.len(),
+        "segment_len":job.segment_len,"segment_overlap":job.segment_overlap,
+        "text_shape":shape(&condition.context),"clip_shape":shape(&condition.clip_fea)});
+    settings
+        .as_object_mut()
+        .unwrap()
+        .extend(model_settings.as_object().unwrap().clone());
+    let peak = peak(&pair)?;
+    assert!(peak > 0 && measured.elapsed_ns > 0);
+    fs::write(pair.out.join("state-0.f32"), &measured.initial)?;
+    fs::write(
+        pair.out.join(format!("state-{complete}.f32")),
+        &measured.terminal,
+    )?;
+    fs::write(
+        pair.out.join("result.json"),
+        serde_json::to_vec(&json!({
+            "case":pair.case,"trace":diagnostic.trace,"settings":settings,"tensor_shape":[count,16,2,4,8],
+            "warmups":1,"samples":[{"elapsed_ns":measured.elapsed_ns,"outer_steps":complete}],"allocator_peak_bytes":peak
+        }))?,
+    )?;
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED {FQN}");
+    Ok(())
+}
