@@ -195,7 +195,15 @@ fn resize_bytes(image: &crate::Image, width: u32, height: u32) -> Result<u64> {
     )
 }
 
-fn source_pins(spec: &LoadSpec) -> Result<Vec<PinnedWeightsFile>> {
+fn source_pins(spec: &LoadSpec, cancel: &crate::CancelFlag) -> Result<Vec<PinnedWeightsFile>> {
+    let check = || {
+        if cancel.is_cancelled() {
+            Err(Error::Canceled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(unsupported("requires a complete snapshot"));
     };
@@ -204,6 +212,7 @@ fn source_pins(spec: &LoadSpec) -> Result<Vec<PinnedWeightsFile>> {
         .map(|name| root.join(name))
         .chain(spec.adapters.iter().map(|a| a.path.clone()))
         .map(|p| {
+            check()?;
             let abs = std::path::absolute(&p)?;
             let retained = spec
                 .source_inventory()
@@ -216,7 +225,7 @@ fn source_pins(spec: &LoadSpec) -> Result<Vec<PinnedWeightsFile>> {
                     pin.ensure_unchanged()?;
                     Ok(pin.clone())
                 }
-                None => PinnedWeightsFile::pin(&abs),
+                None => PinnedWeightsFile::pin_with_check(&abs, check),
             }
         })
         .collect()
@@ -231,7 +240,7 @@ impl Scail2FitProfile {
             return Ok(());
         }
         super::Scail2CharacterReferences::catalog_carrier(&req.conditioning, false)?;
-        let pins = source_pins(spec)?;
+        let pins = source_pins(spec, &req.cancel)?;
         spec.include_directory_member_pins(&pins)
     }
 
@@ -249,6 +258,9 @@ impl Scail2FitProfile {
         let pairs = super::Scail2CharacterReferences::from_request(MODEL, req)?;
         if pairs.additional.is_empty() {
             return Ok(None);
+        }
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
         }
         plan.check_fit_load(spec)?;
         plan.check_inputs(req)?;
@@ -273,7 +285,7 @@ impl Scail2FitProfile {
                 ))
             }
         };
-        let pins = source_pins(spec)?;
+        let pins = source_pins(spec, &req.cancel)?;
         let mut hash = Sha256::new();
         hash.update(b"scail2-plural-weights-v1");
         for pin in &pins {
@@ -523,7 +535,13 @@ impl Scail2FitAxes {
                 } else {
                     self.source_resize_bytes
                 },
-                self.schedule_bytes.saturating_sub(a.schedule_bytes),
+                if self.schedule_bytes > a.schedule_bytes {
+                    // Native Vec capacity may jump when the terminal sigma is appended.
+                    // The measured row does not expose its actual allocated capacities.
+                    self.schedule_bytes
+                } else {
+                    0
+                },
             )?,
         )?;
         if row.gross_host_bytes < a.floor_host_bytes
@@ -797,6 +815,24 @@ mod tests {
         assert!(p.validate_load(&sp).is_err());
     }
     #[test]
+    fn scail2_fit_cancelled_acquisition_precedes_disk_reads_and_cache_changes() {
+        let (dir, mut spec) = spec(Scail2FitBackend::Cuda);
+        let req = request(2);
+        let p = plan(Scail2FitBackend::Cuda, &spec, &req);
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        req.cancel.cancel();
+        assert!(matches!(
+            Scail2FitProfile::prepare_load(&mut spec, &req),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            Scail2FitProfile::from_plan(&spec, &p, &req),
+            Err(Error::Canceled)
+        ));
+        assert_eq!(spec.prepared_file_pins().iter().count(), 0);
+    }
+
+    #[test]
     fn scail2_fit_preserves_native_schedule_source_pixels_and_decoder_cap() {
         let (_dir, spec) = spec(Scail2FitBackend::Mlx);
         let req = request(6);
@@ -817,7 +853,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             active.unified_bytes,
-            row.gross_unified_bytes + 36 * 64 + 12 * 6240 * 16 * 4 * 10 + 5 * 4
+            row.gross_unified_bytes + 41 * 64 + 12 * 6240 * 16 * 4 * 10 + 5 * 4
         );
         assert_eq!(mlx_decode_budget_bytes(), None);
         active.with_execution(|| {
