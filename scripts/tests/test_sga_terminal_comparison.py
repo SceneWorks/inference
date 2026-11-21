@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from scripts.ci import ltx25_tier2_fixture as ltx
 from scripts.ci import sga_terminal_comparison as comparison
@@ -23,6 +24,13 @@ class TerminalTests(unittest.TestCase):
                 comparison.profile_for("candle-cuda", request)
         with self.assertRaises(ValueError):
             comparison.profile_for("mlx", REQUEST)
+        request = {key: value for key, value in REQUEST.items() if key != "cuda_device_uuid"}
+        with patch.dict(comparison.PROFILES, {("mlx", "ltx25"): "ltx25_tier2_fixture"}):
+            self.assertIs(comparison.profile_for("mlx", dict(request, runner="nax")), ltx)
+            with self.assertRaises(ValueError):
+                comparison.profile_for("mlx", dict(request, runner="nax-primary"))
+        mac_limits = comparison.sample_limits(ltx, dict(ltx.policy("dev", UUID), backend="darwin-mlx"))
+        self.assertNotIn("cuda-pool.json", mac_limits)
 
     def test_pair_order_and_exact_decisions(self):
         base = {"identity": {"v": "same", "a": "same"}, "timing": {"e2e_ns": 1000}, "peaks": {"device": 1000}}

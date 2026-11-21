@@ -283,6 +283,8 @@ jobs:
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
           "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" \

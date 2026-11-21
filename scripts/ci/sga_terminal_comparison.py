@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit source-bound real-weight comparisons on one physically claimed CUDA device."""
+"""Explicit source-bound real-weight comparisons on one physically claimed device."""
 
 import argparse
 from dataclasses import asdict
@@ -26,7 +26,8 @@ from scripts.ci.wan_adapter_tier1_fixture import unique_object
 from scripts.media_campaign_supervisor import load_policy
 
 SELECTION = "sga-terminal-tier2"
-PROFILES = {"ltx25": "ltx25_tier2_fixture"}
+PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture"}
+DEVICE_KEY = {"candle-cuda": "cuda_device_uuid", "mlx": "runner"}
 ARMS = source_pair.ARMS
 ORDER = (ARMS, tuple(reversed(ARMS)))
 SAMPLES = [(f"warmup-{arm}", arm) for arm in ARMS] + [
@@ -36,14 +37,17 @@ PREFLIGHT_SECONDS = 180
 
 
 def profile_for(backend, request):
-    if (backend != "candle-cuda" or not isinstance(request, dict)
-            or set(request) != {"selection", "profile", "variant", "cuda_device_uuid", "download_missing"}
+    binding = DEVICE_KEY.get(backend)
+    if (binding is None or not isinstance(request, dict)
+            or set(request) != {"selection", "profile", "variant", binding, "download_missing"}
             or request["selection"] != SELECTION or request["download_missing"] is not True
-            or not isinstance(request["profile"], str) or request["profile"] not in PROFILES
-            or not isinstance(request["cuda_device_uuid"], str)
-            or not re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request["cuda_device_uuid"])):
-        raise ValueError("select one registered native Tier 2 CUDA route and exact physical device")
-    module = importlib.import_module("scripts.ci." + PROFILES[request["profile"]])
+            or not isinstance(request["profile"], str) or (backend, request["profile"]) not in PROFILES
+            or not isinstance(request[binding], str)):
+        raise ValueError("select one registered native Tier 2 route with its device binding")
+    if (backend == "mlx" and request[binding] != "nax") or (backend == "candle-cuda" and not
+            re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request[binding])):
+        raise ValueError("terminal route requires the secondary Mac or an exact physical CUDA UUID")
+    module = importlib.import_module("scripts.ci." + PROFILES[backend, request["profile"]])
     if not isinstance(request["variant"], str) or request["variant"] not in module.CASE:
         raise ValueError("incorrect declared native Tier 2 variant")
     return module
@@ -56,7 +60,8 @@ def plan(backend, request, head):
     if head == base or subprocess.run(["git", "merge-base", "--is-ancestor", base, head],
                                       cwd=ROOT, timeout=30).returncode != 0:
         raise ValueError("terminal head must descend from the exact ENG-4a baseline")
-    policy = profile.policy(request["variant"], request["cuda_device_uuid"])
+    binding = request[DEVICE_KEY[backend]]
+    policy = profile.policy(request["variant"], binding)
     with TemporaryDirectory(prefix="sga-terminal-policy-") as directory:
         checked_policy = Path(directory) / "policy.json"
         proof.write_json(checked_policy, policy)
@@ -66,7 +71,8 @@ def plan(backend, request, head):
         overlay = profile.overlay(lambda path: subprocess.check_output(["git", "show", f"{revision}:{path}"],
                                   cwd=ROOT, timeout=30), arm, backend, source_pair.PROOF_BIN)
         overlays[arm] = source_pair.overlay_identity(overlay)
-    return {"protocol": SELECTION, "schema": 1, "runner": proof.RUNNERS[backend], "backend": backend,
+    runner = proof.NAX_ROUTES[binding]["labels"] if backend == "mlx" else proof.RUNNERS[backend]
+    return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-adapter-comparison", "request": request, "policy": policy,
             "base": {"revision": base, "tree": paired.git(ROOT, "rev-parse", base + "^{tree}")},
             "head": candidate, "overlay_sha256": overlays, "expected_samples": [name for name, _ in SAMPLES],
@@ -74,8 +80,11 @@ def plan(backend, request, head):
 
 
 def sample_limits(profile, policy):
-    return {**paired.retained_log_limits(policy), "result.json": source_pair.RESULT_LIMIT,
-            "cuda-pool.json": 4096, **getattr(profile, "ARTIFACT_LIMITS", {})}
+    limits = {**paired.retained_log_limits(policy), "result.json": source_pair.RESULT_LIMIT,
+              **getattr(profile, "ARTIFACT_LIMITS", {})}
+    if policy["backend"] == "windows-cuda":
+        limits["cuda-pool.json"] = 4096
+    return limits
 
 
 def collect_sample(name, root, limits, out, work):
@@ -96,23 +105,27 @@ def read_sample(name, directory, profile, contract, *, upload=False):
         return directory / (f"{name}.{leaf}" if upload else leaf)
 
     guard = load_json(file("supervisor.json"))
-    pool = load_json(file("cuda-pool.json"))
     source_pair.validate_guard(guard, contract["policy"])
-    source_pair.validate_cuda_pool(file("cuda-pool.json"), guard, contract["policy"])
+    peaks = {"host_process_bytes": guard["peak_host_bytes"]}
+    if contract["backend"] == "candle-cuda":
+        pool = load_json(file("cuda-pool.json"))
+        source_pair.validate_cuda_pool(file("cuda-pool.json"), guard, contract["policy"])
+        peaks.update(cuda_process_bytes=guard["peak_gpu_bytes"], cuda_pool_used_bytes=pool["poolUsedHighBytes"],
+                     cuda_pool_reserved_bytes=pool["poolReservedHighBytes"])
     req = contract["request"]
     readback = profile.observe(file("stdout.log").read_text(encoding="utf-8"), file("result.json"),
-                               req["cuda_device_uuid"], req["variant"])
-    return {**readback, "peaks": {"host_process_bytes": guard["peak_host_bytes"],
-                                    "cuda_process_bytes": guard["peak_gpu_bytes"],
-                                    "cuda_pool_used_bytes": pool["poolUsedHighBytes"],
-                                    "cuda_pool_reserved_bytes": pool["poolReservedHighBytes"]}}
+                               req[DEVICE_KEY[contract["backend"]]], req["variant"])
+    return {**readback, "peaks": peaks}
 
 
-def summarize(samples):
+def summarize(samples, preflight=None):
     if list(samples) != [name for name, _ in SAMPLES]:
         raise ValueError("terminal decision requires every frozen sample in exact execution order")
     reference = samples["warmup-base"]
-    if any(row["identity"] != reference["identity"] or row["timing"].keys() != reference["timing"].keys()
+    if "plan" in reference["identity"] and reference["identity"]["plan"] != preflight:
+        raise ValueError("terminal runtime changed the compiled preflight plan")
+    if "e2e_ns" not in reference["timing"] or any(
+           row["identity"] != reference["identity"] or row["timing"].keys() != reference["timing"].keys()
            for row in samples.values()):
         raise ValueError("terminal output or metric surface differed across paired and warmup samples")
     metrics = {}
@@ -138,7 +151,8 @@ def require_sm120(uuid):
 
 def execute(args, contract, profile):
     env = os.environ.copy()
-    proof.require_host(args.backend, env, "hosted")
+    cuda = args.backend == "candle-cuda"
+    proof.require_host(args.backend, env, "hosted" if cuda else "nax")
     if env.get("MODEL_PROOF_RUNNER_ENVIRONMENT") != "self-hosted":
         raise ValueError("terminal comparisons require the self-hosted real-weights lane")
     identity = source_pair.attempt_identity(env)
@@ -155,48 +169,56 @@ def execute(args, contract, profile):
         policy_path = work / "policy.json"
         proof.write_json(policy_path, contract["policy"])
         policy = load_policy(policy_path)
-        uuid, variant = request["cuda_device_uuid"], request["variant"]
-        receipt["hardware"] = {**paired.hardware(args.backend, policy), "capability": require_sm120(uuid)}
+        binding, variant = request[DEVICE_KEY[args.backend]], request["variant"]
+        receipt["hardware"] = paired.hardware(args.backend, policy)
+        if cuda:
+            receipt["hardware"]["capability"] = require_sm120(binding)
         model_root = env.get(getattr(profile, "HUB_ENV", "MODEL_PROOF_HUB_ROOT")) or env.get("MODEL_PROOF_HUB_ROOT", "")
         model_hub = hub_root(dict(env, MODEL_PROOF_HUB_ROOT=model_root))
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
         child_env = {key: value for key, value in env.items() if not proof.SENSITIVE_ENVIRONMENT.search(key)}
-        child_env.update(CARGO_INCREMENTAL="0", CUDA_VISIBLE_DEVICES=uuid, CUDA_DEVICE_ORDER="PCI_BUS_ID",
-                         CUBLAS_WORKSPACE_CONFIG=":4096:8", PAIR_TIER2_VARIANT=variant, PAIR_TIER2_SNAPSHOT=str(snapshot),
-                         SCENEWORKS_CUDA_PROOF_POOL_BYTES=str(contract["settings"]["pool_cap_bytes"]))
-        executables = {}
+        child_env.update(CARGO_INCREMENTAL="0", PAIR_TIER2_VARIANT=variant, PAIR_TIER2_SNAPSHOT=str(snapshot))
+        if cuda:
+            child_env.update(CUDA_VISIBLE_DEVICES=binding, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUBLAS_WORKSPACE_CONFIG=":4096:8",
+                             SCENEWORKS_CUDA_PROOF_POOL_BYTES=str(contract["settings"]["pool_cap_bytes"]))
+        executables, preflight_rows = {}, []
         for arm, origin in zip(ARMS, (baseline, ROOT), strict=True):
             arm_env = child_env.copy()
             binary, receipt["arms"][arm] = source_pair.build(work, origin, arm, contract, profile, arm_env,
-                                                              release=True, cuda_features=profile.BUILD_FEATURES)
+                                                              release=True, cuda_features=getattr(profile, "BUILD_FEATURES", "cuda"))
             executables[arm] = (binary, arm_env)
             preflight = subprocess.run([str(binary), "--preflight"], cwd=work / arm, text=True, check=True,
                                        env=dict(arm_env, CUDA_VISIBLE_DEVICES=""), capture_output=True,
                                        timeout=PREFLIGHT_SECONDS)
             if len(preflight.stdout.encode("utf-8")) > source_pair.RESULT_LIMIT:
                 raise ValueError("terminal constructor preflight exceeded its retained metadata limit")
-            profile.preflight(preflight.stdout, variant)
+            preflight_rows.append(profile.preflight(preflight.stdout, variant))
             receipt["arms"][arm]["preflight_stdout"] = preflight.stdout
+        if preflight_rows[0] != preflight_rows[1]:
+            raise ValueError("terminal source arms resolved different preflight metadata")
         if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
             raise ValueError("terminal source arms have different compiler identities")
         claim_dir = work / "claim"
         claim_dir.mkdir()
-        reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
-        budget = (len(SAMPLES) + 1) * policy.deadline_seconds + reserve
-        claim_file = claim_dir / "policy.json"
-        proof.write_json(claim_file, dict(contract["policy"], deadlineSeconds=budget))
-        claim_deadline = time.monotonic() + budget
+        claim_policy, claim_deadline, last_child_start = policy, None, None
+        if cuda:
+            reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
+            budget = (len(SAMPLES) + 1) * policy.deadline_seconds + reserve
+            claim_file = claim_dir / "policy.json"
+            proof.write_json(claim_file, dict(contract["policy"], deadlineSeconds=budget))
+            claim_policy = load_policy(claim_file)
+            claim_deadline = time.monotonic() + budget
+            last_child_start = claim_deadline - reserve - policy.deadline_seconds
         observations = {}
         limits = sample_limits(profile, contract["policy"])
-        with execution_claim(args.backend, load_policy(claim_file), claim_dir, env,
+        with execution_claim(args.backend, claim_policy, claim_dir, env,
                              original_deadline_monotonic=claim_deadline) as claim:
             receipt["physical_claim"] = claim
             for name, arm in SAMPLES:
                 binary, arm_env = executables[arm]
                 run = work / name
                 try:
-                    paired.invoke(binary, work / arm, run, arm_env, policy, env,
-                                  last_child_start=claim_deadline - reserve - policy.deadline_seconds)
+                    paired.invoke(binary, work / arm, run, arm_env, policy, env, last_child_start=last_child_start)
                     for leaf, cap in limits.items():
                         if leaf != "guard.jsonl":
                             source_pair.bounded_owned_file(run / leaf, work, cap)
@@ -206,7 +228,7 @@ def execute(args, contract, profile):
         if (claim.get("post_execution_verified") is not True
                 or profile.staged_assets(variant, model_hub, stage=False) != (snapshot, receipt["assets"])):
             raise ValueError("terminal physical release or staged model asset identity changed")
-        receipt["comparison_result"] = summarize(observations)
+        receipt["comparison_result"] = summarize(observations, preflight_rows[0])
         if receipt["comparison_result"]["status"] != "pass":
             raise ValueError("terminal performance decision is " + receipt["comparison_result"]["status"])
         receipt["accepted"] = True
@@ -246,17 +268,20 @@ def verify(args, contract, profile):
     required = set(allowed) - {f"{name}.guard.jsonl" for name, _ in SAMPLES}
     if not required <= receipt["files"].keys() or receipt["physical_claim"].get("post_execution_verified") is not True:
         raise ValueError("accepted terminal receipt lacks exact supervised sample evidence")
+    preflight_rows = []
     for arm in ARMS:
         build = receipt["arms"][arm]
         if (any(build.get(key) != value for key, value in contract[arm].items())
                 or build["overlay_sha256"] != contract["overlay_sha256"][arm]
                 or not re.fullmatch(r"[0-9a-f]{64}", build["binary_sha256"])):
             raise ValueError("terminal binary evidence differs from the exact compiled source")
-        profile.preflight(build["preflight_stdout"], contract["request"]["variant"])
+        preflight_rows.append(profile.preflight(build["preflight_stdout"], contract["request"]["variant"]))
+    if preflight_rows[0] != preflight_rows[1]:
+        raise ValueError("retained terminal source arms resolved different preflight metadata")
     if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
         raise ValueError("terminal artifact compiler identity changed")
     observations = {name: read_sample(name, args.output, profile, contract, upload=True) for name, _ in SAMPLES}
-    verified = summarize(observations)
+    verified = summarize(observations, preflight_rows[0])
     if verified != receipt["comparison_result"] or verified["status"] != "pass":
         raise ValueError("terminal upload does not reproduce its acceptance decision")
 
