@@ -819,6 +819,28 @@ impl Generator for KreaGenerator {
         &self.descriptor
     }
 
+    fn retained_component_state(
+        &self,
+    ) -> gen_core::Result<Option<gen_core::generator::GeneratorComponentResidency>> {
+        use gen_core::generator::GeneratorComponentResidency;
+        if !self.is_imported_turbo() {
+            return Ok(None);
+        }
+        let state = self
+            .residency
+            .with_resident_parts(|text, heavy| match (text, heavy) {
+                (KreaTextPhase::Resident, KreaHeavyPhase::Resident(resident)) => {
+                    GeneratorComponentResidency {
+                        base_components: true,
+                        reference_encoder: candle_gen::lock_recover(&resident.img2img_encoder)
+                            .is_some(),
+                    }
+                }
+                _ => GeneratorComponentResidency::default(),
+            })?;
+        Ok(Some(state.unwrap_or_default()))
+    }
+
     /// The three correlated facts about the checkpoint this generator loaded (sc-21484 follow-up).
     ///
     /// Krea's single-file native import route publishes here from the shared logical-weight reader;
@@ -970,11 +992,7 @@ impl Generator for KreaGenerator {
             }
         }
         #[cfg(any(feature = "cuda", test))]
-        if self.descriptor.id == KREA_2_TURBO_ID
-            && self.native_dit.is_some()
-            && plan.produced_reference().is_some()
-            && scope.is_none()
-        {
+        if self.is_imported_turbo() && plan.produced_reference().is_some() && scope.is_none() {
             return Err(gen_core::Error::Unsupported(
                 "imported Krea Turbo refinement requires an admitted planned request scope".into(),
             ));
@@ -1026,6 +1044,11 @@ fn validate_krea_request(
 }
 
 impl KreaGenerator {
+    fn is_imported_turbo(&self) -> bool {
+        self.descriptor.id == KREA_2_TURBO_ID
+            && (self.native_dit.is_some() || is_convrot_import(&self.file_pin_spec))
+    }
+
     #[cfg(any(feature = "cuda", test))]
     fn begin_imported_turbo_refine_scope(
         &self,
@@ -1053,7 +1076,7 @@ impl KreaGenerator {
             )
         })?;
         let route_gate = || {
-            if self.native_dit.is_none()
+            if !self.is_imported_turbo()
                 || plan.pass_index() != 1
                 || reference.from_pass != 0
                 || plan.image_count() != 1
@@ -1770,6 +1793,14 @@ fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBu
     }
 }
 
+fn is_convrot_import(spec: &LoadSpec) -> bool {
+    matches!(&spec.weights, WeightsSource::Dir(_))
+        && matches!(
+            spec.components.get(KREA_CONVROT_DIT_COMPONENT),
+            Some(WeightsSource::File(_))
+        )
+}
+
 fn resolved_base_and_native(
     spec: &LoadSpec,
     id: &str,
@@ -2386,31 +2417,38 @@ pub struct KreaHiresEncoderWeights {
 /// Read only the companion VAE headers. The encoder uses the same materialization dtype as the
 /// decoder and does not load `post_quant_conv` or the decoder subtree.
 pub fn hires_encoder_weights(spec: &LoadSpec) -> gen_core::Result<KreaHiresEncoderWeights> {
-    let (WeightsSource::File(_), Some(WeightsSource::Dir(root))) =
-        (&spec.weights, spec.components.get(BASE_SNAPSHOT_COMPONENT))
-    else {
-        return Err(gen_core::Error::Unsupported(
-            "Krea Turbo Hires encoder pricing requires a native file and companion snapshot".into(),
-        ));
+    let root = match &spec.weights {
+        WeightsSource::File(_) if spec.components.get(KREA_CONVROT_DIT_COMPONENT).is_none() => {
+            gen_core::require_base_snapshot(spec, KREA_2_TURBO_ID)?
+        }
+        WeightsSource::Dir(root) if is_convrot_import(spec) => root.as_path(),
+        _ => {
+            return Err(gen_core::Error::Unsupported(
+                "Krea Turbo Hires encoder pricing requires an imported DiT and companion snapshot"
+                    .into(),
+            ));
+        }
     };
-    let directory = root.join("vae");
-    let encoder = gen_core::safetensors_path_tensor_headers(&directory)?
-        .into_iter()
-        .filter(|header| vae_tensor_is_encoder_only(&header.name))
-        .collect::<Vec<_>>();
-    let source_bytes = encoder
-        .iter()
-        .try_fold(0_u64, |bytes, header| bytes.checked_add(header.data_bytes))
-        .filter(|bytes| *bytes > 0)
-        .ok_or_else(|| {
-            gen_core::Error::Unsupported(
-                "Krea Turbo Hires could not price the companion VAE encoder".into(),
-            )
-        })?;
-    let device_bytes = gen_core::materialized_header_bytes(&encoder, VAE_WIDTH, &directory)?;
-    Ok(KreaHiresEncoderWeights {
-        source_bytes,
-        device_bytes,
+    spec.read_prepared_files_unchanged(|| {
+        let directory = root.join("vae");
+        let encoder = gen_core::safetensors_path_tensor_headers(&directory)?
+            .into_iter()
+            .filter(|header| vae_tensor_is_encoder_only(&header.name))
+            .collect::<Vec<_>>();
+        let source_bytes = encoder
+            .iter()
+            .try_fold(0_u64, |bytes, header| bytes.checked_add(header.data_bytes))
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "Krea Turbo Hires could not price the companion VAE encoder".into(),
+                )
+            })?;
+        let device_bytes = gen_core::materialized_header_bytes(&encoder, VAE_WIDTH, &directory)?;
+        Ok(KreaHiresEncoderWeights {
+            source_bytes,
+            device_bytes,
+        })
     })
 }
 
@@ -8400,24 +8438,94 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         assert!(generator
             .begin_planned_memory_strategy_request(&refine, refiner, &rejected)
             .is_err());
+        use gen_core::generator::GeneratorComponentResidency;
+        assert_eq!(
+            generator.retained_component_state().unwrap(),
+            Some(GeneratorComponentResidency::default()),
+            "a pinned lazy generator may be cached before any components are resident"
+        );
         generator.native_dit = None;
         assert!(generator
             .begin_planned_memory_strategy_request(&refine, refiner, &context)
             .is_err());
+        assert!(generator.retained_component_state().unwrap().is_none());
+
+        // The ConvRot import uses the snapshot as primary, with the actual pinned DiT in the
+        // named component. A standalone snapshot still cannot claim an imported refiner scope.
+        let mut convrot = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_component(KREA_CONVROT_DIT_COMPONENT, spec.weights.clone());
+        convrot.prepare_file_sources().unwrap();
+        generator.loaded_quant = actual_quant_tier(&convrot, KREA_2_TURBO_ID).unwrap();
+        assert_eq!(generator.loaded_quant, Some(Quant::Q8));
+        context.selection.tier.quant = generator.loaded_quant;
+        generator.file_pin_spec = convrot.clone();
+        let draft_refine = GenerationRequest {
+            conditioning: Vec::new(),
+            ..refine.clone()
+        };
+        let convrot_plan = registry
+            .compile_multi_pass_render_plan(
+                KREA_2_TURBO_ID,
+                &convrot,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &base,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: &draft_refine,
+                        produced_reference: refiner.produced_reference(),
+                    },
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let convrot_refiner = &convrot_plan.passes()[1];
+        assert!(generator
+            .begin_planned_memory_strategy_request(&refine, refiner, &context)
+            .is_err());
+        assert!(matches!(
+            generator.generate_planned(&refine, convrot_refiner, None, &mut |_| {}),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("admitted planned request scope")
+        ));
+        let mut scope = generator
+            .begin_planned_memory_strategy_request(&refine, convrot_refiner, &context)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut refine).unwrap();
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        assert_eq!(
+            generator.retained_component_state().unwrap(),
+            Some(GeneratorComponentResidency::default()),
+            "admission leaves the sealed ConvRot DiT unloaded"
+        );
     }
 
     #[test]
     fn imported_hires_price_reads_only_encoder_weights_at_loader_width() {
         let fixture = tempfile::tempdir().unwrap();
-        let spec = valid_imported_spec(fixture.path(), "fixture.safetensors");
+        let mut spec = valid_imported_spec(fixture.path(), "fixture.safetensors");
+        spec.prepare_file_sources().unwrap();
         write_full_vae(fixture.path());
-        assert_eq!(
-            hires_encoder_weights(&spec).unwrap(),
-            KreaHiresEncoderWeights {
-                source_bytes: 160,
-                device_bytes: 320
-            }
-        );
+        let expected = KreaHiresEncoderWeights {
+            source_bytes: 160,
+            device_bytes: 320,
+        };
+        assert_eq!(hires_encoder_weights(&spec).unwrap(), expected);
+        let root = WeightsSource::Dir(fixture.path().to_path_buf());
+        let mut convrot = LoadSpec::new(root.clone())
+            .with_component(KREA_CONVROT_DIT_COMPONENT, spec.weights.clone());
+        convrot.prepare_file_sources().unwrap();
+        assert_eq!(hires_encoder_weights(&convrot).unwrap(), expected);
+        assert!(hires_encoder_weights(&LoadSpec::new(root)).is_err());
+        let WeightsSource::File(path) = &spec.weights else {
+            unreachable!()
+        };
+        std::fs::write(path, b"changed imported source").unwrap();
+        assert!(matches!(
+            hires_encoder_weights(&convrot),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("artifact seal mismatch")
+        ));
     }
 
     #[test]

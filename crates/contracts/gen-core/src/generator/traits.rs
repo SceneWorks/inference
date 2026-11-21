@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Device components the generator's cache actually owns between requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GeneratorComponentResidency {
+    pub base_components: bool,
+    pub reference_encoder: bool,
+}
+
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
 /// `on_progress` streams step/decode progress.
@@ -82,6 +89,12 @@ pub trait Generator {
     /// grants no credit.
     fn retained_weight_bytes(&self) -> Option<u64> {
         None
+    }
+
+    /// Snapshot retained base and optional reference components without opening weights. Call
+    /// within the serialized cache transaction. Missing information grants no retained credit.
+    fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
+        Ok(None)
     }
 
     /// Actual per-adapter install outcomes from the most recent successful generation.
