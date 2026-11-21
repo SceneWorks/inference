@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 134
+EXPECTED_MEMBER_COUNT = 136
 INTERNAL_PACKAGES = {
     "sceneworks-gen-cv",
     "candle-audio",
@@ -23,6 +23,8 @@ INTERNAL_PACKAGES = {
     "candle-audio-moss-sfx",
     "candle-gen-catalog",
     "candle-quant-kernels",
+    "candle-checkpoint",
+    "mlx-layers",
     "core-llm",
     "core-llm-testkit",
     "mlx-gen-catalog",
@@ -75,6 +77,10 @@ PATH_VENDORED_PACKAGES = {
 # CUDA-graph parameter cache cherry-picked onto it) in its VENDORED.md. The root manifest still
 # declares the git pin above, so a candle bump still has to move every revision in lockstep.
 VENDORED_PACKAGES = {
+    "candle-nn": {
+        "path": "crates/media/candle-gen/vendor/candle-nn",
+        "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+    },
     "candle-core": {
         "path": "crates/media/candle-gen/vendor/candle-core",
         "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
@@ -3953,6 +3959,10 @@ def main() -> int:
         check_audio_hub_layout_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
         check_candle_gen_raw_mmap_seam(ROOT)
+        from check_native_projection_catalog import check_all
+        projection_violations = check_all(ROOT)
+        if projection_violations:
+            fail("registered provider checkpoint/projection adoption drift:\n  " + "\n  ".join(projection_violations))
         check_memory_profile_ratchet(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
@@ -3968,6 +3978,7 @@ def main() -> int:
         "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
         "no unguarded test temp roots, "
         "no raw candle-gen mmap sites outside the loader seam, "
+        "registered providers use shared checkpoint/projection paths, "
         "no new bespoke provider memory-strategy skeletons, "
         "no cross-backend geometry drift)"
     )
