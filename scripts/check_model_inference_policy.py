@@ -854,7 +854,10 @@ class RunGraph:
             # SW-6936 adds FLUX.1 conditional pre-load plan/refusal checks (gen-core multi-pass,
             # MLX ControlNet/XLabs IP/PuLID, Candle ControlNet/IP/PuLID) and the preview
             # source scans; none constructs a generator or runs learned compute.
-            controls_sha = '31b81ee7290677f9ccd81fe38e7a0df89e221b20920c48685dc389e64465245c'
+            # SW-7232/7234 add five file/header planning controls and the file-backed
+            # OpenCLIP packed-source remap control. Constructors/readbacks retain source
+            # bytes only; no learned projection or activation computation executes.
+            controls_sha = '8f3907d0c01d18a03179c54301c5dd758e167d30aed5d8ed0a2dbc5a2c7bc351'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

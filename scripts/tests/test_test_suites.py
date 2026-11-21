@@ -163,7 +163,8 @@ class TestSuites(unittest.TestCase):
         controls = suites.safe_controls()
         # SW-F331 adds six runner controls and two preload controls per backend; SW-6936 adds
         # 24 conditional pre-load plan/refusal and preview source-scan controls.
-        self.assertEqual(len(controls), 106)
+        # SW-7232/7234 add six source-file/owner planning and packed-view controls.
+        self.assertEqual(len(controls), 112)
         flux_plan_sources = {
             "crates/contracts/gen-core/src/render/tests.rs": 9,
             "crates/media/mlx-gen/mlx-gen-flux/src/model.rs": 4,
