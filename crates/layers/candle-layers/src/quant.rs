@@ -997,7 +997,7 @@ impl QEmbedding {
     }
 
     /// Build from an already-device-format GGML table, as produced by
-    /// [`PackedWeightSidecars`]. This is the no-conversion twin of
+    /// `PackedWeightSidecars`. This is the no-conversion twin of
     /// [`Self::from_packed_dtype_gs`]: the caller has already validated and converted the source
     /// affine triple ahead of the render. Installation also captures its compact quantized bytes once
     /// so later forwards can assemble only selected rows without a whole-table device readback.
@@ -1321,7 +1321,7 @@ pub fn lin_gs(
     }
 }
 
-/// Load a raw-map projection from a [`Weights`] checkpoint. This is the `Weights` counterpart to
+/// Load a raw-map projection from a `Weights` checkpoint. This is the `Weights` counterpart to
 /// [`lin_gs`]: the MLX affine `{base}.weight/.scales/.biases` triple is consumed directly when
 /// present, otherwise the original dense `Linear` is retained. Raw-map consumers must not interpret
 /// packed U32 codes as a dense float matrix merely because they do not use a `VarBuilder`.

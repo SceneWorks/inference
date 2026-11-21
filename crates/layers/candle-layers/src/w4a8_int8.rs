@@ -10,7 +10,7 @@
 //! lands in shared memory as F32, four radix-4 stages (strides `1,4,16,64`, `0.5f` each) build the
 //! rotated values in F32, and the row absmax — hence `x_scale` — is taken from those F32 values
 //! before `quant_div_float_to_float<T>` rounds the numerator, the divisor and the quotient to the
-//! activation dtype. [`super::convrot_fht_f32`] replays exactly that `+`-order in F32; feeding the
+//! activation dtype. [`crate::convrot::convrot_fht_f32`] replays exactly that `+`-order in F32; feeding the
 //! quantizer a dtype-rounded dense rotation instead moves the peak (and the divisor) by whole
 //! dtypes' worth of ulps and changes the int8 codes.
 use crate::{CandleError, CandleWeightSource, Result};
@@ -35,7 +35,7 @@ pub struct W4A8Linear {
     #[cfg(feature = "cuda")]
     bias: Option<Tensor>,
     #[cfg(feature = "cuda")]
-    lt: std::sync::Arc<super::CublasLt>,
+    lt: std::sync::Arc<crate::cublaslt::CublasLt>,
 }
 
 impl std::fmt::Debug for W4A8Linear {
@@ -232,7 +232,7 @@ impl W4A8Linear {
             // `convrot_rotate` (a dense matmul): see the module doc — it re-associates the
             // additions and, in the source dtype, rounds the rotated values before the row
             // absmax, which is what moves `x_scale` and the int8 codes.
-            let rotated = super::convrot_fht_f32(x, d.rotation_group)?
+            let rotated = crate::convrot::convrot_fht_f32(x, d.rotation_group)?
                 .reshape((x.elem_count() / d.in_features, d.in_features))?;
             // Full-row scale and codes are computed ONCE, outside the weight tile loop. Never
             // quantize per K-chunk: that would change the published activation arithmetic.
@@ -247,7 +247,7 @@ impl W4A8Linear {
                     &self.packed,
                     &self.s_rel,
                     &self.codebook,
-                    super::W4A8DecodeTile {
+                    crate::cublaslt::W4A8DecodeTile {
                         rows,
                         in_features: d.in_features,
                         group: d.group_size,

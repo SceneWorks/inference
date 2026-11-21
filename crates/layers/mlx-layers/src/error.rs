@@ -55,7 +55,7 @@ pub enum Error {
 
     /// A freshly loaded weight buffer whose GPU view never converged on the bytes the CPU holds
     /// (sc-22414). Typed so a consumer can tell "the host's Metal mapping is lagging" from a
-    /// generic failure; see [`crate::coherence`]. Bridges to [`gen_core::Error::Msg`] with its full
+    /// generic failure; see `crate::coherence`. Bridges to [`gen_core::Error::Msg`] with its full
     /// text — gen-core has no load-coherence variant and the worker only reports it.
     #[error(
         "GPU view of `{name}` ({bytes} bytes) never matched the CPU view after {attempts} reads \

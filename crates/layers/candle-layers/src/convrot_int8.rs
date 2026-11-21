@@ -10,7 +10,7 @@ pub struct ConvRotLinear {
     #[cfg(feature = "cuda")]
     rotation: Tensor,
     #[cfg(feature = "cuda")]
-    linear: super::Int8Linear,
+    linear: crate::eight_bit_linear::Int8Linear,
 }
 impl std::fmt::Debug for ConvRotLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,7 +101,8 @@ impl ConvRotLinear {
                     "ConvRot CUDA output width must be a multiple of16".into(),
                 ));
             }
-            let linear = super::Int8Linear::from_native_bytes(&codes, scales, bias, lt.clone())?;
+            let linear =
+                crate::eight_bit_linear::Int8Linear::from_native_bytes(&codes, scales, bias, lt.clone())?;
             let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
             Ok(Some(Self {
                 descriptor,
@@ -132,7 +133,7 @@ impl ConvRotLinear {
             {
                 candle_core::bail!("ConvRot INT8 activation shape/dtype/device mismatch");
             }
-            let rotated = super::convrot_rotate(x, &self.rotation)?
+            let rotated = crate::convrot::convrot_rotate(x, &self.rotation)?
                 .to_dtype(x.dtype())?
                 .reshape((x.elem_count() / d.in_features, d.in_features))?;
             let out = self.linear.forward_kitchen(&rotated, x.dtype())?;

@@ -35,7 +35,7 @@
 //! # `.weight_s_rel` is loaded as raw E4M3 bytes, not as a float
 //!
 //! MLX has no fp8 storage dtype: its safetensors reader maps `F8_E4M3` to `uint8`
-//! (`mlx/io/safetensors.cpp`), which is what [`Weights`] hands out. The group scales therefore stay
+//! (`mlx/io/safetensors.cpp`), which is what `Weights` hands out. The group scales therefore stay
 //! their on-disk bytes, [`W4A8Int8::validate_s_rel`] checks exactly those bytes, and the dequant
 //! kernel decodes them — a scale tensor never enters the float domain on the way in.
 

@@ -1496,7 +1496,7 @@ impl AdaptableConv2d {
 /// the only way to ask "is there a projection here, how big is it, is it packed, does it already
 /// carry an adapter?" was to take a `&mut AdaptableLinear` through
 /// [`adaptable_mut`](AdaptableHost::adaptable_mut) — and once a family's `to_q`/`to_k`/`to_v` live
-/// behind a [`FusedQkvProjection`](crate::qkv::FusedQkvProjection), *handing out that `&mut` is
+/// behind a `FusedQkvProjection`, *handing out that `&mut` is
 /// exactly what unfuses the block*. A mere scan (the LoRA/LyCORIS/BFL installers' pass 1, a
 /// `.diff`-patch existence check, a trainer's target-shape read) would then dismantle the fusion it
 /// just built, over every block, for nothing.
@@ -1511,7 +1511,7 @@ pub struct LinearFacts {
     /// Whether the base is group-quantized (packed) rather than dense.
     pub is_quantized: bool,
     /// Whether **any** installed adapter is live (`scale != 0`). A disabled adapter reads `false`,
-    /// matching `apply_adapters` rule 1 and [`FusedQkvProjection`](crate::qkv::FusedQkvProjection)'s
+    /// matching `apply_adapters` rule 1 and `FusedQkvProjection`'s
     /// pack predicate, which both treat "installed at scale 0" as "never installed".
     pub has_live_adapters: bool,
     /// How many adapters are on the stack **including disabled ones** — the "is there anything here
@@ -1550,10 +1550,10 @@ impl LinearFacts {
 /// * [`adaptable_mut`](Self::adaptable_mut) — **the mutation.** "Give me the projection so I can
 ///   change it." Returns `&mut AdaptableLinear`.
 ///
-/// Only the mutation half may unfuse a [`FusedQkvProjection`](crate::qkv::FusedQkvProjection).
+/// Only the mutation half may unfuse a `FusedQkvProjection`.
 /// **A host holding one MUST override `adaptable_facts`** for the paths that resolve into it, and
 /// answer from the packed representation
-/// ([`FusedQkvProjection::part_facts`](crate::qkv::FusedQkvProjection::part_facts)); the default
+/// (`FusedQkvProjection::part_facts`); the default
 /// below routes through `adaptable_mut`, which unfuses. Because the routing is a hand-written tree,
 /// every intermediate node on the way down to a fused leaf must forward `adaptable_facts` too — the
 /// default's `adaptable_mut` delegation would otherwise take over at the first node that forgot.
@@ -1571,7 +1571,7 @@ pub trait AdaptableHost {
     ///
     /// The default answers through [`adaptable_mut`](Self::adaptable_mut), which is correct for
     /// every host whose projections are plain [`AdaptableLinear`]s and wrong for one holding a
-    /// [`FusedQkvProjection`](crate::qkv::FusedQkvProjection) — see the trait doc.
+    /// `FusedQkvProjection` — see the trait doc.
     fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
         self.adaptable_mut(path).map(|lin| LinearFacts::of(lin))
     }

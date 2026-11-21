@@ -180,6 +180,7 @@ fn historical_current_active() -> bool {
 
 #[cfg(feature = "model-inference-proof")]
 fn historical_current_scope<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    crate::ensure_reference_math_hook();
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {

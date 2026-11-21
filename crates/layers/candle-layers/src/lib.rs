@@ -29,6 +29,11 @@ pub mod w4a8_int8;
 
 pub use adapt::{AdaptLinear, Adapter, Base, Linear, LokrFactors, ScaleContext};
 pub use candle_quant_kernels::{cublaslt, nvfp4, nvfp4_linear, nvfp4_outlier};
+pub use convrot::{convrot_fht_f32, convrot_rotate};
+#[cfg(feature = "cuda")]
+pub use cublaslt::{CublasLt, W4A8DecodeTile};
+#[cfg(feature = "cuda")]
+pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 pub use quant::{
     DenseLinear, MatmulStrategy, PackedConfig, QEmbedding, QLinear, QuantForward, QuantWeight,
 };
@@ -138,7 +143,7 @@ impl From<CandleError> for gen_core::Error {
 }
 
 /// Reverse bridge: lift a backend-neutral [`gen_core::Error`] back into [`CandleError`]. The unified
-/// curated-sampler driver ([`sampler::run_curated_sampler`]) runs over the gen-core `Sampler` trait
+/// curated-sampler driver (`sampler::run_curated_sampler`) runs over the gen-core `Sampler` trait
 /// (which returns `gen_core::Result`), so a provider's rich-`Result` denoise body needs this to `?` the
 /// driver's output. The load-bearing arm is `Canceled -> Canceled`: a cooperative cancel tripped inside
 /// the driver's `denoise` callback surfaces as `gen_core::Error::Canceled` and MUST stay the typed

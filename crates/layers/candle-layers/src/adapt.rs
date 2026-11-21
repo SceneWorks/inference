@@ -17,9 +17,9 @@
 //! **The base weight is NEVER mutated.** On a packed q4/q8 DiT that is the whole point: the packed
 //! codes survive load (`is_packed()` stays true, no dense `[out,in]` weight is materialized), and each
 //! adapter rides *unmerged* as small matmuls per forward. On a **dense** base the fold path
-//! ([`crate::train::merge`]) is still preferred for real runs, because a merge into a real `.weight`
+//! (`crate::train::merge`) is still preferred for real runs, because a merge into a real `.weight`
 //! is byte-for-byte what the chaos-sensitive samplers' goldens expect (`(W+δ)·x ≠ W·x + δ·x` to ~1
-//! ULP — see [`crate::train::lora::reconstruct_lora_delta`]); the additive branch equals the fold to
+//! ULP — see `crate::train::lora::reconstruct_lora_delta`); the additive branch equals the fold to
 //! f32 tolerance and is the *only* viable path where a merge is impossible (a quant-resident weight).
 //! With **no** adapter attached the forward is byte-identical to the bare base, so swapping this in for
 //! a projection leaves the plain-model / dense-fold paths unchanged.
@@ -537,12 +537,12 @@ impl Adapter {
 ///   `Y = w1 · X · w2ᵀ`  (then flatten row-major `[.., a, b] → [.., out]`),
 /// where `X = reshape(x, [.., c, d])`. Two small matmuls (`[a,c]·[..,c,d]` then `·[d,b]`) touch only
 /// the factor shapes — never `[out, in]` — so a LoKr applies on a packed q4/q8 base at the same memory
-/// profile as a plain LoRA. The row-major kron ordering here matches [`crate::train::lora`]'s `kron2d`
+/// profile as a plain LoRA. The row-major kron ordering here matches `crate::train::lora`'s `kron2d`
 /// (`out[i·b+k, j·d+l] = w1[i,j]·w2[k,l]`), so the structured residual equals the folded delta. The
 /// full `(alpha/rank)·strength` scale is baked into `w2` at build time.
 ///
 /// `Clone`/`Debug` so a caller that stacks these residuals on its own adaptable seam (the SDXL
-/// [`crate::train::lora::LoraLinear`] additive channel, sc-11103) can hold them in a `#[derive(Clone,
+/// `crate::train::lora::LoraLinear` additive channel, sc-11103) can hold them in a `#[derive(Clone,
 /// Debug)]` module without re-implementing the vec-trick — the factors are `Tensor`s (cheap `Arc`
 /// clone) plus `usize` shape metadata.
 #[derive(Clone, Debug)]
@@ -591,7 +591,7 @@ impl LokrFactors {
     /// Build the small `[a,c]`/`[b,d]` Kronecker factors from a LoKr module's factors (full `w1`/`w2`
     /// or a low-rank `w_a·w_b` product — that product is bounded by the factor dims, NEVER `out×in`),
     /// baking the FULL `scale` into `w2`. The allocation-free counterpart to
-    /// [`crate::train::lora::reconstruct_lokr_delta`] (which materializes the full `[out,in]` delta).
+    /// `crate::train::lora::reconstruct_lokr_delta` (which materializes the full `[out,in]` delta).
     ///
     /// **Scale differs from the fold path by design** (the two-conventions trap, sc-10578): the
     /// materialized `reconstruct_lokr_delta` bakes only `alpha/rank` and rides the user `strength` in
@@ -1079,7 +1079,7 @@ impl AdaptLinear {
 
     /// **Packed-detecting** `[out, in]` loader at an explicit MLX `group_size`: if `{base}.scales` is
     /// present under `vb` (a pre-quantized MLX tier), build a `Base::Packed` straight from the packed
-    /// parts on `vb`'s device via the shared [`super::lin_gs`] — **no dense weight is materialized**.
+    /// parts on `vb`'s device via the shared [`crate::quant::lin_gs`] — **no dense weight is materialized**.
     /// Otherwise the **dense** path is taken unchanged (`{base}.weight` [+ `{base}.bias`], shape-
     /// checked).
     ///
@@ -1809,7 +1809,7 @@ pub fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 /// Reconstruct the LoRA weight delta `ΔW = (alpha/rank)·scale·(B·A)` as an `[out, in]` **f32** tensor
-/// — the inference-side **merge** counterpart to [`LoraLinear`]'s training **forward**, which adds the
+/// — the inference-side **merge** counterpart to `LoraLinear`'s training **forward**, which adds the
 /// mathematically-identical residual `scale·(x·Aᵀ)·Bᵀ` with the install `scale = alpha/rank`. `down`
 /// is `A` `[rank, in]`, `up` is `B` `[out, rank]`; `scale` is the caller's per-adapter strength
 /// (`gen_core::AdapterSpec::scale`, `1.0` reconstructs the trained delta verbatim). Computed in f32 so
@@ -1862,7 +1862,7 @@ pub fn parse_lokr_metadata(rank: Option<&str>, alpha: Option<&str>) -> Result<(f
 }
 
 /// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
-/// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
+/// (`[out, in]`), as **f32** — the inference-side merge counterpart to `LoraLinear`'s LoKr forward,
 /// using the *same* `kron2d` reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
 /// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
 /// Errors if a leg is missing or if metadata/user scaling is invalid. Linear-only: pass 2-D factors

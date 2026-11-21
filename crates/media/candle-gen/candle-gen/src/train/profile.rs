@@ -545,6 +545,7 @@ fn with_observation<T>(
     comparison: Option<serde_json::Value>,
     f: impl FnOnce() -> T,
 ) -> T {
+    crate::ensure_reference_math_hook();
     assert!(!active() && !cohort_active(), "nested bounded proof scope");
     COHORT.with(|state| {
         *state.borrow_mut() = Some(CohortObservation {
