@@ -96,6 +96,7 @@ struct Mock {
     forward_calls: Cell<u32>,
     latent_frames: u32,
     output_case: usize,
+    contract: Option<crate::MemoryProviderContract>,
 }
 impl Mock {
     fn new(spec: &LoadSpec) -> Self {
@@ -105,10 +106,14 @@ impl Mock {
             forward_calls: Cell::new(0),
             latent_frames: 2,
             output_case: 0,
+            contract: None,
         }
     }
 }
 impl Generator for Mock {
+    fn memory_strategy_contract(&self) -> Option<&crate::MemoryProviderContract> {
+        self.contract.as_ref()
+    }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.desc
     }
@@ -282,4 +287,142 @@ fn denoise_retained_tensor_and_terminal_rgb_use_distinct_budgets() {
             .unwrap()
             > budget
     );
+}
+
+#[test]
+fn resident_defaults_preserve_optional_scope_and_optimized_requires_one() {
+    use crate::{
+        LoadShape, MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection,
+        MemoryStrategy, Precision,
+    };
+    let req = request();
+    let spec = LoadSpec::new(WeightsSource::Dir("fixtures".into()));
+    let plan = registry()
+        .compile_video_plan(descriptor().id, &spec, &req)
+        .unwrap()
+        .unwrap();
+    let mut context = MemoryRunContext {
+        selection: MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+        },
+        optimization_authority: Default::default(),
+        calibration_abi: crate::MEMORY_CALIBRATION_ABI,
+        calibration_fingerprint: String::new(),
+        load_shape: LoadShape::EagerMaterialization,
+        mode: MemoryMode::Other("image_to_video".into()),
+        has_reference: true,
+        use_pid: false,
+        has_phases: false,
+        geometry: plan.geometry(),
+        reference_resources: None,
+        overlay: None,
+        budget: MemoryBudget {
+            total_bytes: 10000,
+            committed_bytes: 100,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        },
+        predicted_peak_bytes: 2000,
+        cache_state: MemoryCacheState::Cold,
+        evidence_revision: "test".into(),
+        low_res_start: None,
+    };
+    let mock = Mock::new(&spec);
+    let bound = plan.bind_admission(&spec, Some(&context), &req).unwrap();
+    assert!(mock
+        .begin_memory_strategy_request(&context)
+        .unwrap()
+        .is_none());
+    assert!(mock
+        .generate_video_planned_with_execution_report(&req, &bound, None, &mut |_| {})
+        .is_ok());
+    context.selection.strategy = MemoryStrategy::StagedResidency;
+    let forged = plan.bind_admission(&spec, Some(&context), &req).unwrap();
+    assert!(mock
+        .generate_video_planned_with_execution_report(&req, &forged, None, &mut |_| {})
+        .is_err());
+    assert_eq!(mock.forward_calls.get(), 1);
+    let mut mock = mock;
+    let mut contract = crate::MemoryProviderContract::compatibility_default(
+        mock.desc.id,
+        crate::MemoryBackendRealization::MlxMetal {
+            bounded_wired_residency: true,
+            lazy_or_mmap_materialization: true,
+            explicit_evaluation_and_synchronization: true,
+            cache_eviction: true,
+        },
+    );
+    contract
+        .strategies
+        .iter_mut()
+        .find(|r| r.strategy == MemoryStrategy::StagedResidency)
+        .unwrap()
+        .support = crate::MemoryStrategySupport::Implemented;
+    let mut req = req;
+    let selected = contract.generation_memory(&context.selection);
+    req.memory = selected;
+    mock.contract = Some(contract);
+    let bound = plan.bind_admission(&spec, Some(&context), &req).unwrap();
+    assert!(mock
+        .generate_video_planned_with_execution_report(&req, &bound, None, &mut |_| {})
+        .is_err());
+    let mut borrowed = BorrowedScope::default();
+    assert!(mock
+        .generate_video_planned_with_execution_report(
+            &req,
+            &bound,
+            Some(&mut borrowed),
+            &mut |_| {}
+        )
+        .is_ok());
+    assert_eq!(borrowed.events, vec![true, false]);
+    req.memory = None;
+    let incorrectly_configured = plan.bind_admission(&spec, Some(&context), &req).unwrap();
+    assert!(mock
+        .generate_video_planned_with_execution_report(
+            &req,
+            &incorrectly_configured,
+            Some(&mut borrowed),
+            &mut |_| {}
+        )
+        .is_err());
+    assert_eq!(borrowed.events, vec![true, false]);
+}
+
+#[derive(Default)]
+struct BorrowedScope {
+    events: Vec<bool>,
+}
+impl MemoryRequestScope for BorrowedScope {
+    fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+        panic!("caller owns configure")
+    }
+    fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+        panic!("caller owns finish")
+    }
+    fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+        assert_eq!(phase, MemoryPhase::Denoise);
+        self.events.push(true);
+        Ok(())
+    }
+    fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+        assert_eq!(phase, MemoryPhase::Denoise);
+        self.events.push(false);
+        Ok(())
+    }
+    fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+        unreachable!()
+    }
+    fn configure_attention(&mut self, _: u32) -> Result<()> {
+        unreachable!()
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+        unreachable!()
+    }
 }

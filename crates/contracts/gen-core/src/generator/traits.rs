@@ -462,7 +462,7 @@ pub trait Generator {
     }
 }
 
-pub(super) fn requires_memory_request_scope(contract: &MemoryProviderContract) -> bool {
+pub(crate) fn requires_memory_request_scope(contract: &MemoryProviderContract) -> bool {
     contract.strategies.iter().any(|capability| {
         capability.strategy.is_optimized()
             && matches!(

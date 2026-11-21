@@ -250,11 +250,13 @@ fn same_ladder(actual: Option<GenerationMemory>, selected: Option<GenerationMemo
     let Some(mut actual) = actual else {
         return false;
     };
-    let domains = actual.graph_eval_cadence.take().is_some()
-        | actual.ffn_chunk.take().is_some()
-        | actual.cfg_batching.take().is_some()
-        | actual.prefix_kv_cache.take().is_some();
-    domains && actual == selected.unwrap_or_default()
+    let domains = (
+        actual.graph_eval_cadence.take(),
+        actual.ffn_chunk.take(),
+        actual.cfg_batching.take(),
+        actual.prefix_kv_cache.take(),
+    );
+    domains != (None, None, None, None) && actual == selected.unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -516,14 +518,24 @@ impl VideoRenderPlan {
             || req.memory != self.memory
             || self.inputs != VideoInputs::from_request(req)?
             || self.context.as_ref().is_some_and(|c| {
-                (scope.is_none() && c.selection.strategy.is_optimized())
-                    || !contract
-                        .is_some_and(|k| same_ladder(req.memory, k.generation_memory(&c.selection)))
+                let optimized = c.selection.strategy.is_optimized();
+                let needs_scope = optimized
+                    || contract.is_some_and(crate::generator::requires_memory_request_scope);
+                (needs_scope && scope.is_none())
+                    || match contract {
+                        Some(contract) => {
+                            !same_ladder(req.memory, contract.generation_memory(&c.selection))
+                        }
+                        None => optimized || !same_ladder(req.memory, None),
+                    }
             })
         {
             return Err(Error::Unsupported(
                 "video execution differs from its admitted request".into(),
             ));
+        }
+        if let (Some(context), Some(contract)) = (&self.context, contract) {
+            contract.validate_selection(&context.selection)?;
         }
         let mut trace = VideoScope {
             plan: &self.layout,
