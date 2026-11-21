@@ -201,12 +201,37 @@ pub enum Base {
     Nvfp4(std::sync::Arc<Nvfp4Linear>),
     ConvRot(Arc<convrot_int8::ConvRotLinear>),
     W4A8(Arc<w4a8_int8::W4A8Linear>),
+    #[cfg(feature = "cuda")]
+    Fp8(Arc<crate::eight_bit_linear::Fp8Linear>),
+    #[cfg(feature = "cuda")]
+    Int8(Arc<crate::eight_bit_linear::Int8Linear>),
     /// Metadata ONLY for a caller-owned strict packed GEMM. This wrapper owns no
     /// base tensor and can apply residuals only to an externally computed output.
     External {
         compute: DType,
         device: Device,
     },
+}
+
+impl std::fmt::Debug for Base {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(l) => f.debug_tuple("Dense").field(l).finish(),
+            Self::Packed(_) => f.write_str("Packed(QLinear)"),
+            Self::Nvfp4(_) => f.write_str("Nvfp4(Nvfp4Linear)"),
+            Self::ConvRot(_) => f.write_str("ConvRot(ConvRotLinear)"),
+            Self::W4A8(_) => f.write_str("W4A8(W4A8Linear)"),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => f.write_str("Fp8(Fp8Linear)"),
+            #[cfg(feature = "cuda")]
+            Self::Int8(_) => f.write_str("Int8(Int8Linear)"),
+            Self::External { compute, device } => f
+                .debug_struct("External")
+                .field("compute", compute)
+                .field("device", &device.location())
+                .finish(),
+        }
+    }
 }
 
 /// The one refusal every fold entry point returns on an **NVFP4** base (sc-21483, epic 11037 E2).
@@ -228,13 +253,17 @@ fn external_base_refusal(action: &str) -> candle_core::Error {
 }
 
 impl Base {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Base::Dense(l) => l.forward(x),
             Base::Packed(q) => q.forward(x),
             Base::Nvfp4(q) => q.forward(x),
             Base::ConvRot(q) => q.forward(x),
             Base::W4A8(q) => q.forward(x),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(q) => q.forward(x),
+            #[cfg(feature = "cuda")]
+            Base::Int8(q) => q.forward(x),
             Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
@@ -245,7 +274,7 @@ impl Base {
     /// stays at the storage dtype's. Inert when the base already matches `x`'s dtype (`Tensor::to_dtype`
     /// short-circuits to an `Arc` clone), so byte-identical to [`Self::forward`]. The **packed** base
     /// already dequantizes to the activation dtype, so it delegates unchanged.
-    fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Base::Dense(l) => {
                 let dt = x.dtype();
@@ -259,29 +288,59 @@ impl Base {
             Base::Nvfp4(q) => q.forward(x),
             Base::ConvRot(q) => q.forward(x),
             Base::W4A8(q) => q.forward(x),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(q) => q.forward(x),
+            #[cfg(feature = "cuda")]
+            Base::Int8(q) => q.forward(x),
             Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
 
-    fn is_packed(&self) -> bool {
+    pub fn is_packed(&self) -> bool {
         matches!(self, Base::Packed(_) | Base::ConvRot(_) | Base::W4A8(_))
     }
 
-    fn is_nvfp4(&self) -> bool {
+    pub fn is_nvfp4(&self) -> bool {
         matches!(self, Base::Nvfp4(_))
+    }
+
+    pub fn is_fp8(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            matches!(self, Base::Fp8(_))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    pub fn is_int8(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            matches!(self, Base::Int8(_))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
     }
 
     /// The device the frozen base weight lives on — the device a residual factor must already be on
     /// before it can be admitted. `None` on the MLX-packed arm, whose resident weight is a `QTensor`
     /// behind a [`MatmulStrategy`] and exposes no device accessor; an admission check then
     /// verifies shape and dtype only, exactly as it did before this seam existed.
-    fn device(&self) -> Option<Device> {
+    pub fn device(&self) -> Option<Device> {
         match self {
             Base::Dense(l) => Some(l.weight().device().clone()),
             Base::Packed(_) => None,
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
             Base::W4A8(q) => Some(q.device().clone()),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(q) => Some(q.device().clone()),
+            #[cfg(feature = "cuda")]
+            Base::Int8(q) => Some(q.device().clone()),
             Base::External { device, .. } => Some(device.clone()),
         }
     }
@@ -1002,6 +1061,17 @@ impl AdaptLinear {
         }
     }
 
+    /// Convert a [`QLinear`] into an [`AdaptLinear`] on the shared spine (`SW-6956`, `BACK-1`).
+    /// Standard dense `QLinear::Dense(DenseLinear::Linear(l))` unwraps to `Base::Dense(l)` so
+    /// dense inspection and dense delta folding remain available; quantized, W4A8, and pre-transposed
+    /// projections wrap as `Base::Packed(base)`.
+    pub fn from_qlinear(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
+        match base {
+            QLinear::Dense(DenseLinear::Linear(l)) => Self::from_dense(l, in_dim, out_dim),
+            other => Self::from_packed(other, in_dim, out_dim),
+        }
+    }
+
     /// Wrap an already-built **NVFP4** [`Nvfp4Linear`] as an adapter-capable base (sc-21483,
     /// epic 11037) — the NVFP4 twin of [`Self::from_packed`]. The logical `[out, in]` dims come from
     /// the packed tensor itself, so no dense weight is read back.
@@ -1051,6 +1121,40 @@ impl AdaptLinear {
     /// Distinguish native codebook W4A8 from affine Q4 and symmetric ConvRot INT8.
     pub fn is_w4a8(&self) -> bool {
         matches!(self.base, Base::W4A8(_))
+    }
+
+    /// Wrap a CUDA [`crate::eight_bit_linear::Fp8Linear`] on the shared spine (`SW-6956`).
+    #[cfg(feature = "cuda")]
+    pub fn from_fp8(base: crate::eight_bit_linear::Fp8Linear) -> Self {
+        let (out_dim, in_dim) = base.shape();
+        Self {
+            base: Base::Fp8(Arc::new(base)),
+            out_features: out_dim,
+            in_features: in_dim,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Whether the base is a CUDA [`crate::eight_bit_linear::Fp8Linear`].
+    pub fn is_fp8(&self) -> bool {
+        self.base.is_fp8()
+    }
+
+    /// Wrap a CUDA [`crate::eight_bit_linear::Int8Linear`] on the shared spine (`SW-6956`).
+    #[cfg(feature = "cuda")]
+    pub fn from_int8(base: crate::eight_bit_linear::Int8Linear) -> Self {
+        let (out_dim, in_dim) = base.shape();
+        Self {
+            base: Base::Int8(Arc::new(base)),
+            out_features: out_dim,
+            in_features: in_dim,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Whether the base is a CUDA [`crate::eight_bit_linear::Int8Linear`].
+    pub fn is_int8(&self) -> bool {
+        self.base.is_int8()
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
@@ -1278,30 +1382,26 @@ impl AdaptLinear {
         self.base.is_nvfp4()
     }
 
-    /// Whether the base weight is held in *any* quantized regime — MLX-packed or NVFP4.
+    /// Whether the base weight is held in *any* quantized regime — MLX-packed, NVFP4, FP8, INT8, or External.
     pub fn is_quantized(&self) -> bool {
-        self.is_packed() || self.is_nvfp4() || matches!(self.base, Base::External { .. })
+        self.is_packed()
+            || self.is_nvfp4()
+            || self.is_fp8()
+            || self.is_int8()
+            || matches!(self.base, Base::External { .. })
     }
 
     pub fn matmul_strategy(&self) -> Option<MatmulStrategy> {
         match &self.base {
-            Base::Dense(_)
-            | Base::Nvfp4(_)
-            | Base::ConvRot(_)
-            | Base::W4A8(_)
-            | Base::External { .. } => None,
             Base::Packed(linear) => linear.matmul_strategy(),
+            _ => None,
         }
     }
 
     pub fn quant_dtype(&self) -> Option<candle_core::quantized::GgmlDType> {
         match &self.base {
-            Base::Dense(_)
-            | Base::Nvfp4(_)
-            | Base::ConvRot(_)
-            | Base::W4A8(_)
-            | Base::External { .. } => None,
             Base::Packed(linear) => linear.quant_dtype(),
+            _ => None,
         }
     }
 
@@ -1316,11 +1416,7 @@ impl AdaptLinear {
     pub fn base_qlinear(&self) -> Option<&QLinear> {
         match &self.base {
             Base::Packed(q) => Some(q),
-            Base::Dense(_)
-            | Base::Nvfp4(_)
-            | Base::ConvRot(_)
-            | Base::W4A8(_)
-            | Base::External { .. } => None,
+            _ => None,
         }
     }
 
@@ -1329,11 +1425,7 @@ impl AdaptLinear {
     pub fn base_nvfp4(&self) -> Option<&Nvfp4Linear> {
         match &self.base {
             Base::Nvfp4(q) => Some(q),
-            Base::Dense(_)
-            | Base::Packed(_)
-            | Base::ConvRot(_)
-            | Base::W4A8(_)
-            | Base::External { .. } => None,
+            _ => None,
         }
     }
 
@@ -1397,6 +1489,14 @@ impl AdaptLinear {
             Base::ConvRot(_) => Err(CandleError::Unsupported("ConvRot INT8 base is immutable; install an additive residual instead".into())),
             Base::W4A8(_) => Err(CandleError::Unsupported(
                 "W4A8 base is immutable; install an additive residual instead".into(),
+            )),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => Err(CandleError::Unsupported(
+                "FP8 base is immutable; install an additive residual instead".into(),
+            )),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => Err(CandleError::Unsupported(
+                "INT8 base is immutable; install an additive residual instead".into(),
             )),
         }
     }
@@ -1519,6 +1619,10 @@ impl AdaptLinear {
             Base::Nvfp4(_) => "NVFP4 base",
             Base::ConvRot(_) => "ConvRot INT8 base",
             Base::W4A8(_) => "W4A8 base",
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => "FP8 base",
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => "INT8 base",
             Base::External { .. } => "external packed base",
         }
     }
@@ -1625,6 +1729,33 @@ impl AdaptLinear {
         }
     }
 
+    /// Whether any trainable LoRA/LoKr adapter is currently attached.
+    pub fn has_trainable_adapter(&self) -> bool {
+        self.adapters.iter().any(|a| {
+            matches!(
+                a,
+                Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. }
+            )
+        })
+    }
+
+    /// Whether all attached trainable adapters are currently frozen (detached for graph-free preview).
+    pub fn is_trainable_frozen(&self) -> bool {
+        let mut found = false;
+        for adapter in &self.adapters {
+            match adapter {
+                Adapter::TrainableLora { frozen, .. } | Adapter::TrainableLokr { frozen, .. } => {
+                    if !*frozen {
+                        return false;
+                    }
+                    found = true;
+                }
+                Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {}
+            }
+        }
+        found
+    }
+
     /// Attach a forward-time **structured LoKr** residual via the Kronecker vec-trick: the full
     /// `(alpha/rank)·strength` scale is already baked into `factors.w2`, so `[out,in]` is never
     /// materialized. Valid on **any** base — the base weight is untouched, so a packed q4/q8 tier keeps
@@ -1675,6 +1806,10 @@ impl AdaptLinear {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
             Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1703,6 +1838,10 @@ impl AdaptLinear {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
             Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1724,6 +1863,10 @@ impl AdaptLinear {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
             Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1784,11 +1927,31 @@ impl AdaptLinear {
                     candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
                 }
             }
+            #[cfg(feature = "cuda")]
+            Base::Fp8(q) => {
+                if !q.device().same_device(device) {
+                    candle_core::bail!("FP8 refuses cross-device migration of its staged base");
+                }
+            }
+            #[cfg(feature = "cuda")]
+            Base::Int8(q) => {
+                if !q.device().same_device(device) {
+                    candle_core::bail!("INT8 refuses cross-device migration of its staged base");
+                }
+            }
         }
         for ad in &mut self.adapters {
             ad.migrate_to(device)?;
         }
         Ok(())
+    }
+}
+
+impl From<CandleNnLinear> for AdaptLinear {
+    fn from(linear: CandleNnLinear) -> Self {
+        let dims = linear.weight().dims();
+        let (out_dim, in_dim) = (dims[0], dims[1]);
+        Self::from_dense(linear, in_dim, out_dim)
     }
 }
 
@@ -2042,5 +2205,45 @@ mod tests {
         assert!(parse_lokr_metadata(Some("0"), Some("4.0")).is_err());
         assert!(parse_lokr_metadata(Some("-2"), None).is_err());
         assert!(parse_lokr_metadata(Some("NaN"), None).is_err());
+    }
+
+    #[test]
+    fn adapt_linear_spine_introspection_and_trainable_freeze_transitions() {
+        let dev = Device::Cpu;
+        let ext = AdaptLinear::for_external_base(8, 4, DType::BF16, &dev).unwrap();
+        assert_eq!(ext.base_shape(), (4, 8));
+        assert_eq!(ext.in_features(), 8);
+        assert_eq!(ext.out_features(), 4);
+        assert!(ext.is_quantized());
+        assert!(!ext.is_packed());
+        assert!(!ext.is_nvfp4());
+        assert!(!ext.is_fp8());
+        assert!(!ext.is_int8());
+        assert_eq!(ext.external_base_compute_dtype(), Some(DType::BF16));
+
+        let w = Tensor::zeros((4, 8), DType::F32, &dev).unwrap();
+        let qlin = QLinear::from_dense(DenseLinear::Linear(CandleNnLinear::new(w, None)));
+        let mut lin = AdaptLinear::from_qlinear(qlin, 8, 4);
+        assert!(!lin.is_packed());
+        assert!(lin.dense_base().is_some());
+        assert!(!lin.has_trainable_adapter());
+        assert!(!lin.is_trainable_frozen());
+
+        let down = Tensor::zeros((2, 8), DType::F32, &dev).unwrap();
+        let up = Tensor::zeros((4, 2), DType::F32, &dev).unwrap();
+        lin.push_trainable_lora(down, up, 1.0);
+        assert!(lin.is_adapted());
+        assert!(lin.has_trainable_adapter());
+        assert!(!lin.is_trainable_frozen());
+
+        lin.set_trainable_frozen(true);
+        assert!(lin.is_trainable_frozen());
+        lin.set_trainable_frozen(false);
+        assert!(!lin.is_trainable_frozen());
+
+        lin.clear_adapters();
+        assert!(!lin.is_adapted());
+        assert!(!lin.has_trainable_adapter());
+        assert!(!lin.is_trainable_frozen());
     }
 }
