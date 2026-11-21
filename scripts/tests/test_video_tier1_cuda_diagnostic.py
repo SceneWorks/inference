@@ -17,14 +17,14 @@ from scripts.ci import video_tier1_followup as followup
 
 
 class TargetedCudaTests(unittest.TestCase):
-    def binding(self, selection, tracked=None):
+    def binding(self, selection, tracked=None, *, name=followup.NAME, uuid=followup.CUDA_UUID):
         def read(_head, path):
             return (proof.ROOT / path).read_bytes()
         policy = dict(schemaVersion=1, backend="windows-cuda", deadlineSeconds=180, pollMillis=125,
                       termGraceMillis=2000, hostFreeReserveBytes=8 * proof.GIB, childFootprintCapBytes=20 * proof.GIB,
-                      cudaDeviceUuid=followup.CUDA_UUID, gpuFreeReserveBytes=6 * proof.GIB, childGpuCapBytes=12 * proof.GIB,
+                      cudaDeviceUuid=uuid, gpuFreeReserveBytes=6 * proof.GIB, childGpuCapBytes=12 * proof.GIB,
                       **dict.fromkeys(("stdoutCapBytes", "stderrCapBytes", "eventCapBytes"), 4 * proof.MIB))
-        _, _, prior = followup.bind("controller", "candle-cuda", selection, read, policy)
+        _, _, prior = followup.bind("controller", "candle-cuda", selection, read, policy, name)
         return diagnostic.bind("controller", "candle-cuda", selection, tracked or read, prior)
 
     def test_continuation_has_three_independent_fixed_schedules_and_frozen_rank_interval(self):
@@ -64,6 +64,57 @@ class TargetedCudaTests(unittest.TestCase):
         _, prior = self.binding(proof.cohorts.WAN)
         with self.assertRaises(ValueError):
             diagnostic.continuation(diagnostic.MEMORY_CONTINUATION, proof.cohorts.WAN, prior)
+
+    def test_gpu0_continuations_bind_fresh_card_and_preserve_original_gpu1_scope(self):
+        gpu0 = diagnostic.GPU0_HARDWARE
+        for cohort, fresh, old, count in (
+            (proof.cohorts.WAN, diagnostic.GPU0_TIMING, diagnostic.TIMING_CONTINUATION, 80),
+            (proof.cohorts.MOCHI_SVD, diagnostic.GPU0_TIMING, diagnostic.TIMING_CONTINUATION, 80),
+            (proof.cohorts.MOCHI_SVD, diagnostic.GPU0_MEMORY, diagnostic.MEMORY_CONTINUATION, 6),
+        ):
+            _, previous = self.binding(cohort, name=fresh, uuid=gpu0["uuid"])
+            cases, extension = diagnostic.continuation(fresh, cohort, previous)
+            old_cases, history = diagnostic.continuation(old, cohort, previous)
+            self.assertEqual(cases, old_cases)
+            self.assertEqual(proof.phases(cases, extension), proof.phases(cases, history))
+            self.assertEqual(len(proof.phases(cases, extension)), count)
+            self.assertEqual(extension["protocol"]["retained_hardware"]["uuid"], followup.CUDA_UUID)
+            self.assertEqual(extension["protocol"]["fresh_hardware"], gpu0)
+            self.assertEqual(extension["protocol"]["measurement_source"], diagnostic.GPU0_PROTOCOL_SOURCE)
+            self.assertNotIn("fresh_hardware", history["protocol"])
+            for case in cases:
+                saved = extension["retained"][case]
+                gpu1_adapter = saved["dedicated_adapter"]
+                adapter = dict(gpu1_adapter, cuda_uuid=gpu0["uuid"], luid="luid_0x00000000_0x00001234")
+                proof.check_followup_device(extension, gpu0, adapter)
+                for changed in (dict(gpu0, index="1"), dict(gpu0, driver_version="other"),
+                                dict(gpu0, name="other"), dict(gpu0, **{"memory.total": "1000"})):
+                    with self.assertRaises(ValueError):
+                        proof.check_followup_device(extension, changed, adapter)
+                with self.assertRaises(ValueError):
+                    proof.check_followup_device(history, gpu0, adapter)
+                with self.assertRaises(ValueError):
+                    proof.check_followup_device(extension, gpu0, gpu1_adapter)
+                observations = {}
+                for _, _, role, calls in proof.schedule(case, extension):
+                    observations[role] = {"initial": {"sha256": saved["initial_sha256"]},
+                        "terminal": {"sha256": saved["terminal_sha256"]}, "trace": [], "trace_sha256": saved["trace_sha256"],
+                        "samples": [{"elapsed_ns": 100, "outer_steps": 4}] * calls, "peaks": {"pool": 101},
+                        "cuda_process": {"lower": 50, "upper": 200, "basis": "wddm-bounded",
+                                         "dedicated": {"adapter": adapter, "sampled_peak_bytes": 100}}}
+                result = proof.compare_case(case, extension, observations, adapter=adapter)
+                self.assertTrue(result["accepted"])
+                self.assertEqual(result["fresh_cuda_uuid"], gpu0["uuid"])
+                self.assertEqual(result["retained_cuda_uuid"], followup.CUDA_UUID)
+                observations[role]["cuda_process"]["dedicated"]["adapter"] = dict(adapter, luid=gpu1_adapter["luid"])
+                with self.assertRaises(ValueError):
+                    proof.compare_case(case, extension, observations, adapter=adapter)
+            with self.assertRaises(ValueError):
+                self.binding(cohort, name=fresh, uuid=followup.CUDA_UUID)
+            with self.assertRaises(ValueError):
+                self.binding(cohort, name=old, uuid=gpu0["uuid"])
+        with self.assertRaises(ValueError):
+            diagnostic.continuation(diagnostic.GPU0_MEMORY, proof.cohorts.WAN, previous)
 
     def test_native_conditioning_is_complete_disjoint_and_within_the_owned_child(self):
         for case, count in diagnostic.TIMING_CALLS.items():

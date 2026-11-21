@@ -99,7 +99,19 @@ def verify_clocks(measurement, uuid):
 
 TIMING_CONTINUATION = "sw-6954-cuda-conditioning-timing-v1"
 MEMORY_CONTINUATION = "sw-6954-cuda-process-memory-v1"
-CONTINUATIONS = (TIMING_CONTINUATION, MEMORY_CONTINUATION)
+GPU0_TIMING = "sw-6954-gpu0-conditioning-timing-v1"
+GPU0_MEMORY = "sw-6954-gpu0-process-memory-v1"
+GPU0_CONTINUATIONS = (GPU0_TIMING, GPU0_MEMORY)
+TIMING_CONTINUATIONS = (TIMING_CONTINUATION, GPU0_TIMING)
+MEMORY_CONTINUATIONS = (MEMORY_CONTINUATION, GPU0_MEMORY)
+CONTINUATIONS = (*TIMING_CONTINUATIONS, *MEMORY_CONTINUATIONS)
+# Recorded GPU0 inventory from the two-card Windows real-weights host.
+GPU0_HARDWARE = {
+    "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0", "index": "0",
+    "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "memory.total": "97887", "driver_version": "596.36",
+}
+GPU0_PROTOCOL_SOURCE = "f971a8c5eabd55c02cc20efa1413fd37ddc0a498"
 DIAGNOSTICS = (NAME, *CONTINUATIONS)
 CONTINUATION_PAIRS = 40
 CONTINUATION_MEMORY = {"cuda-mochi-masked-euler": (1, 2), "cuda-svd-euler-cfg": (2,)}
@@ -185,11 +197,11 @@ TARGETED_HISTORY = {
 
 def continuation(name, selection, extension):
     history = TARGETED_HISTORY.get(selection)
-    if name not in CONTINUATIONS or not history or (name == MEMORY_CONTINUATION and selection != cohorts.MOCHI_SVD):
+    if name not in CONTINUATIONS or not history or (name in MEMORY_CONTINUATIONS and selection != cohorts.MOCHI_SVD):
         raise ValueError("no authorized CUDA continuation on this selection")
     if history["base_tree"] != extension["historical_base_tree"] or history["head_tree"] != extension["historical_head_tree"]:
         raise ValueError("targeted continuation uses different historical engine trees")
-    timing = name == TIMING_CONTINUATION
+    timing = name in TIMING_CONTINUATIONS
     cases = history["unresolved_timing"] if timing else list(history["unresolved_memory"])
     if (timing and (len(cases) != 1 or cases[0] not in TIMING_CALLS)
             or not timing and history["unresolved_memory"] != {k: list(v) for k, v in CONTINUATION_MEMORY.items()}):
@@ -199,6 +211,11 @@ def continuation(name, selection, extension):
         "timing_previous_samples_pooled": False, "early_stopping": False, "ceiling": 1.02,
         "device_policy": "non-isolated shared headroom on the same physical UUID",
     }
+    if name in GPU0_CONTINUATIONS:
+        protocol.update(device_policy="non-isolated shared headroom on physical GPU0 for both fresh arms",
+                        fresh_hardware=GPU0_HARDWARE, retained_hardware=extension["prior_hardware"],
+                        retained_scope="historical measurements on GPU1 only",
+                        measurement_source=GPU0_PROTOCOL_SOURCE)
     if timing:
         count = TIMING_CALLS[cases[0]]
         protocol.update(pairs=CONTINUATION_PAIRS, order="20 AB and 20 BA in adjacent alternating pairs",

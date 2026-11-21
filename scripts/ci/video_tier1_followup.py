@@ -33,7 +33,7 @@ PROTOCOL = {
 }
 
 
-def bind(head, backend, selection, tracked, policy):
+def bind(head, backend, selection, tracked, policy, name=NAME):
     cases = [case for case in cohorts.cases(selection, backend) if case in TIMING or case in MEMORY]
     if not cases:
         raise ValueError("no authorized follow-up cases on this lane")
@@ -41,9 +41,10 @@ def bind(head, backend, selection, tracked, policy):
               "deadlineSeconds": 180, "pollMillis": 125, "termGraceMillis": 2000, "hostFreeReserveBytes": 8 * 1024**3,
               "childFootprintCapBytes": 20 * 1024**3, **dict.fromkeys(("stdoutCapBytes", "stderrCapBytes", "eventCapBytes"), 4 * 1024**2)}
     if backend == "candle-cuda":
-        frozen.update(cudaDeviceUuid=CUDA_UUID, gpuFreeReserveBytes=6 * 1024**3, childGpuCapBytes=12 * 1024**3)
+        uuid = targeted.GPU0_HARDWARE["uuid"] if name in targeted.GPU0_CONTINUATIONS else CUDA_UUID
+        frozen.update(cudaDeviceUuid=uuid, gpuFreeReserveBytes=6 * 1024**3, childGpuCapBytes=12 * 1024**3)
     if frozen != policy:
-        raise ValueError("follow-up requires the original exact physical and supervision policy")
+        raise ValueError("follow-up requires its exact physical and supervision policy")
     raw = tracked(head, MANIFEST)
     manifest = json.loads(raw)
     run_id = RUNS[(selection, backend)]
@@ -67,11 +68,11 @@ def bind(head, backend, selection, tracked, policy):
 
 
 def groups(case, name=NAME):
-    if name == targeted.TIMING_CONTINUATION:
+    if name in targeted.TIMING_CONTINUATIONS:
         if case in targeted.TIMING_CALLS:
             yield "timing", range(1, targeted.CONTINUATION_PAIRS + 1), targeted.TIMING_CALLS[case]
         return
-    if name == targeted.MEMORY_CONTINUATION:
+    if name in targeted.MEMORY_CONTINUATIONS:
         if case in targeted.CONTINUATION_MEMORY:
             yield "memory", targeted.CONTINUATION_MEMORY[case], 1
         return
@@ -107,7 +108,7 @@ def timing(base, head, ceiling, *, pairs=TIMING_PAIRS, calls=CALLS, ranks=(3, 10
             "verdict": "pass" if upper <= ceiling else "fail" if lower > ceiling else "inconclusive"}
 
 
-def compare(case, retained, observations, settings, name=NAME):
+def compare(case, retained, observations, settings, name=NAME, *, adapter=None):
     diagnostic = name in targeted.DIAGNOSTICS
     source = "targeted-diagnostic" if diagnostic else "follow-up"
     if name in targeted.CONTINUATIONS:
@@ -120,6 +121,13 @@ def compare(case, retained, observations, settings, name=NAME):
     result = {"retained_run_id": retained["run_id"], "retained_receipt_sha256": retained["receipt_sha256"],
               "retained_peaks": retained["retained_peaks"], "initial_noise": "pass" if initial_ok else "fail",
               "parity": ("pass" if parity_ok else "fail") if initial_ok else "inconclusive"}
+    expected_adapter = retained["dedicated_adapter"] if case in MEMORY else None
+    if name in targeted.GPU0_CONTINUATIONS:
+        from scripts.ci import wddm_process_memory
+        expected_adapter = wddm_process_memory.validate_adapter(adapter, targeted.GPU0_HARDWARE["uuid"])
+        if any(row["cuda_process"]["dedicated"]["adapter"] != expected_adapter for row in observations.values()):
+            raise ValueError("fresh CUDA role used a different physical adapter")
+        result.update(fresh_cuda_uuid=expected_adapter["cuda_uuid"], retained_cuda_uuid=CUDA_UUID)
     if diagnostic:
         result.update(followup_run_id=retained["followup_run_id"],
                       followup_receipt_sha256=retained["followup_receipt_sha256"])
@@ -128,7 +136,7 @@ def compare(case, retained, observations, settings, name=NAME):
         base, head = ([observations[f"{case}-timing-p{i}-{arm}"] for i in slots]
                       for arm in ("base", "head"))
         ranks = (6, 15) if diagnostic else (3, 10)
-        if name == targeted.TIMING_CONTINUATION:
+        if name in targeted.TIMING_CONTINUATIONS:
             ranks = (14, 27)
         measured = timing(base, head, settings["seconds_ratio_ceiling"], pairs=len(slots), calls=calls, ranks=ranks)
         measured["outer_steps"] = base[0]["samples"][0]["outer_steps"]
@@ -136,15 +144,15 @@ def compare(case, retained, observations, settings, name=NAME):
             measured[arm + "_mean_seconds_per_outer_step"] = [
                 v / (1e9 * measured["outer_steps"]) for v in measured[arm + "_mean_ns"]]
         result["timing"] = {"source": source, **measured}
-    elif name != targeted.MEMORY_CONTINUATION:
+    elif name not in targeted.MEMORY_CONTINUATIONS:
         result["timing"] = {"source": retained.get("timing_source", "retained"), **retained["timing"]}
     if "timing" in result:
         verdicts.append(result["timing"]["verdict"])
-    if case in MEMORY and name != targeted.TIMING_CONTINUATION:
+    if case in MEMORY and name not in targeted.TIMING_CONTINUATIONS:
         slots = []
         for i, previous in enumerate(retained["dedicated_metrics"]["pairs"], 1):
             if i not in schedule.get("memory", ((), 1))[0]:
-                if name == targeted.MEMORY_CONTINUATION:
+                if name in targeted.MEMORY_CONTINUATIONS:
                     continue
                 if previous["verdict"] != "pass":
                     raise ValueError("retained slot lacks a completed process-memory comparison")
@@ -152,7 +160,7 @@ def compare(case, retained, observations, settings, name=NAME):
                 continue
             b, h = (observations[f"{case}-memory-p{i}-{arm}"] for arm in ("base", "head"))
             for sample in (b, h):
-                if sample["cuda_process"]["dedicated"]["adapter"] != retained["dedicated_adapter"]:
+                if sample["cuda_process"]["dedicated"]["adapter"] != expected_adapter:
                     raise ValueError("follow-up dedicated process counter differs from its retained adapter")
             metric = evidence.compare([b], [h], dict(settings, pairs=1))["metrics"]
             dedicated = metric["wddm_dedicated_process_bytes"]["pairs"][0]
@@ -161,7 +169,7 @@ def compare(case, retained, observations, settings, name=NAME):
             slots.append({"source": source, "pair": i, "base_bytes": dedicated["base"]["sampled_peak_bytes"],
                           "head_bytes": dedicated["head"]["sampled_peak_bytes"], "ratio": dedicated["ratio"],
                           "verdict": verdict, "native": native})
-        if len(slots) != (len(targeted.CONTINUATION_MEMORY[case]) if name == targeted.MEMORY_CONTINUATION else 5):
+        if len(slots) != (len(targeted.CONTINUATION_MEMORY[case]) if name in targeted.MEMORY_CONTINUATIONS else 5):
             raise ValueError("incomplete original process-memory slot set")
         result["dedicated_process_memory"] = {"pairs": slots, "verdict": evidence.peak_verdict(slots), "ceiling": 1.02}
         verdicts.append(result["dedicated_process_memory"]["verdict"])

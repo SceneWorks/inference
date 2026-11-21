@@ -79,9 +79,9 @@ def phases(cases, extension=None):
     return tuple(name for case in cases for _, _, name, _ in schedule(case, extension))
 
 
-def compare_case(case, extension, observations):
+def compare_case(case, extension, observations, *, adapter=None):
     if extension:
-        return followup.compare(case, extension["retained"][case], observations, SETTINGS, extension["name"])
+        return followup.compare(case, extension["retained"][case], observations, SETTINGS, extension["name"], adapter=adapter)
     base, head = ([observations[name] for _, a, name, _ in schedule(case) if a == arm] for arm in ARMS)
     return evidence.compare(base, head, SETTINGS)
 
@@ -101,16 +101,19 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     engine_head, extension = head, None
     extra_contract = {}
     if "followup" in value:
-        cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"])
+        cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"], value["followup"])
         if value["followup"] in targeted.DIAGNOSTICS:
             cases, extension = targeted.bind(head, backend, selection, tracked, extension)
             if value["followup"] in targeted.CONTINUATIONS:
                 cases, extension = targeted.continuation(value["followup"], selection, extension)
-                if value["followup"] == targeted.TIMING_CONTINUATION:
-                    extension["conditioning_module_sha256"] = hashlib.sha256(tracked(head, targeted.CONDITIONING_TEMPLATE)).hexdigest()
+                if value["followup"] in targeted.TIMING_CONTINUATIONS:
+                    field, path = "conditioning_module_sha256", targeted.CONDITIONING_TEMPLATE
                 else:
-                    retry = tracked(head, "scripts/ci/scail_plural/wddm_retry.py")
-                    extension["same_tick_retry_sha256"] = hashlib.sha256(retry).hexdigest()
+                    field, path = "same_tick_retry_sha256", "scripts/ci/scail_plural/wddm_retry.py"
+                shim = tracked(head, path)
+                if value["followup"] in targeted.GPU0_CONTINUATIONS and shim != tracked(targeted.GPU0_PROTOCOL_SOURCE, path):
+                    raise ValueError("GPU0 continuation changed the fixed GPU1 measurement protocol source")
+                extension[field] = hashlib.sha256(shim).hexdigest()
         subprocess.run(["git", "merge-base", "--is-ancestor", base, engine_head], cwd=ROOT, check=True)
         subprocess.run(["git", "merge-base", "--is-ancestor", engine_head, head], cwd=ROOT, check=True)
         if (paired.git(ROOT, "rev-parse", engine_head + "^{tree}") != extension["historical_head_tree"]
@@ -248,7 +251,7 @@ def compiled_overlay(head, backend, arm, model, engine_head, extension):
         previous = extension["prior_targeted"]["measured_targets"][arm][model]
         if hashlib.sha256(blob).hexdigest() != previous["module_sha256"]:
             raise ValueError("fixture differs from the module used by the historical executable")
-        if extension["name"] == targeted.TIMING_CONTINUATION:
+        if extension["name"] in targeted.TIMING_CONTINUATIONS:
             if blob.count(b"pair.measure(") != 1:
                 raise ValueError("expected one call to the unmodified historical measurement helper")
             wrapper = tracked(head, targeted.CONDITIONING_TEMPLATE)
@@ -414,9 +417,9 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
             or guard["peak_host_bytes"] > policy.child_footprint_cap_bytes
             or guard["admission"]["policySha256"] != policy.sha256):
         raise ValueError("supervisor did not record an admitted bounded execution")
-    if settings.get("campaign") == targeted.TIMING_CONTINUATION:
+    if settings.get("campaign") in targeted.TIMING_CONTINUATIONS:
         targeted.verify_conditioning(observed["conditioning"], facts["samples"], case, guard["elapsed_seconds"])
-    if settings.get("campaign") == targeted.MEMORY_CONTINUATION:
+    if settings.get("campaign") in targeted.MEMORY_CONTINUATIONS:
         targeted.verify_retry(guard, policy, adapter)
     validate_admission(guard["admission"], policy_sha256=policy.sha256)
     peaks = {"process_footprint_bytes": guard["peak_host_bytes"]}
@@ -480,11 +483,7 @@ def execute(args, contract):
         if backend == "candle-cuda":
             adapter = receipt["dedicated_adapter"] = cuda_adapter(policy)
         if contract.get("followup"):
-            extension = contract["followup"]
-            if receipt["hardware"] != extension["prior_hardware"]:
-                raise ValueError("follow-up physical device or driver differs from the original job")
-            if adapter is not None and any(adapter != r["dedicated_adapter"] for r in extension["retained"].values()):
-                raise ValueError("follow-up counter differs from the retained physical adapter")
+            check_followup_device(contract["followup"], receipt["hardware"], adapter)
         paths = {}
         for case in contract["cases"]:
             descriptor = cohorts.BY_NAME[case]
@@ -509,7 +508,10 @@ def execute(args, contract):
         deadline = time.monotonic() + budget
         last_start = deadline - policy.deadline_seconds - contract["release_reserve_seconds"]
         lease_env = builds["base"][2]
-        with execution_claim(backend, claim_policy, claim_dir, lease_env,
+        constraints = None
+        if contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS:
+            constraints = {"required_cuda_device_uuid": targeted.GPU0_HARDWARE["uuid"], "required_cuda_physical_index": 0}
+        with execution_claim(backend, claim_policy, claim_dir, lease_env, constraints=constraints,
                              original_deadline_monotonic=deadline) as claim:
             receipt["physical_claim"] = claim
             for case in contract["cases"]:
@@ -531,7 +533,7 @@ def execute(args, contract):
                     out = work / name
                     started = time.monotonic_ns()
                     latest = last_start - (targeted.CLOCK_TIMEOUT if diagnostics is not None else 0)
-                    memory_retry = contract["request"].get("followup") == targeted.MEMORY_CONTINUATION
+                    memory_retry = contract["request"].get("followup") in targeted.MEMORY_CONTINUATIONS
                     paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=latest,
                                   observer=targeted.DedicatedRetryObserver if memory_retry else None,
                                   arguments=(cohorts.FQN[model], "--exact", "--ignored", "--nocapture", "--test-threads=1"),
@@ -543,7 +545,7 @@ def execute(args, contract):
                         order["clock_diagnostics"] = diagnostics
                     receipt["execution_order"].append(order)
                     observed = read_observed(out, case)
-                    if contract["request"].get("followup") == targeted.TIMING_CONTINUATION:
+                    if contract["request"].get("followup") in targeted.TIMING_CONTINUATIONS:
                         observed["conditioning"] = json.loads(evidence.owned_file(out, "conditioning.json", 16 * 1024).read_bytes())
                     info = {"observed": observed}
                     guard = json.loads(evidence.owned_file(out, "supervisor.json", 16 * MIB).read_bytes())
@@ -554,7 +556,7 @@ def execute(args, contract):
                                               stdout, guard, pool, adapter)
                     receipt["observations"][name] = info
                     results[name] = info["result"]
-                receipt["comparisons"][case] = compare_case(case, contract.get("followup"), results)
+                receipt["comparisons"][case] = compare_case(case, contract.get("followup"), results, adapter=adapter)
                 if receipt["fixtures"][case] != inspect_fixture(paths[case], case, contract["fixture_contracts"][case]):
                     raise ValueError("fixture content changed across the adjacent measurements")
             if diagnostic:
@@ -666,6 +668,19 @@ def verify_cuda_claim(claim, hardware, policy):
         raise ValueError("CUDA utilization readings differ from the admission samples")
 
 
+def check_followup_device(extension, hardware, adapter):
+    if extension["name"] in targeted.GPU0_CONTINUATIONS:
+        if hardware != targeted.GPU0_HARDWARE:
+            raise ValueError("fresh physical GPU0 identity or driver differs from the frozen hardware")
+        from scripts.ci import wddm_process_memory
+        wddm_process_memory.validate_adapter(adapter, hardware["uuid"])
+    else:
+        if hardware != extension["prior_hardware"]:
+            raise ValueError("follow-up hardware differs from the retained job")
+        if adapter is not None and any(adapter != r["dedicated_adapter"] for r in extension["retained"].values()):
+            raise ValueError("follow-up counter differs from the retained physical adapter")
+
+
 def check_complete_provenance(receipt, contract):
 
     backend = contract["backend"]
@@ -687,8 +702,8 @@ def check_complete_provenance(receipt, contract):
     with TemporaryDirectory() as directory:
         policy = read_policy(Path(directory), "policy.json", contract["request"]["policy"])
     hardware = receipt["hardware"]
-    if contract.get("followup") and hardware != contract["followup"]["prior_hardware"]:
-        raise ValueError("follow-up hardware differs from the retained job")
+    if contract.get("followup"):
+        check_followup_device(contract["followup"], hardware, receipt.get("dedicated_adapter"))
     if hardware != paired.hardware(backend, policy):
         raise ValueError("physical hardware differs from live runner")
     if backend == "mlx":
@@ -832,7 +847,7 @@ def verify(args, contract):
             if diagnostic and case in receipt["comparisons"] and len(results) != len(expected_schedule):
                 raise ValueError("targeted conclusion lacks its complete fixed schedule")
             if len(results) == len(expected_schedule):
-                result = compare_case(case, contract.get("followup"), results)
+                result = compare_case(case, contract.get("followup"), results, adapter=receipt.get("dedicated_adapter"))
                 if receipt["comparisons"].get(case) != result or (receipt["accepted"] and not result["accepted"]):
                     raise ValueError("unverified paired conclusion")
 
