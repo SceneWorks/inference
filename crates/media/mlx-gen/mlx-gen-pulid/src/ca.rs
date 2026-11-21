@@ -152,7 +152,7 @@ impl PerceiverAttentionCA {
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, h * hd])?;
-        Ok(self.to_out.forward(&out)?)
+        self.to_out.forward(&out)
     }
 }
 

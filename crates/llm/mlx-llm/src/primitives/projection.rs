@@ -289,7 +289,7 @@ impl Projection {
     }
 
     /// The arrays this projection holds, for load-time materialization (sc-24446).
-    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+    pub fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Projection::Dense { weight, bias } => {
                 out.push(weight.clone());

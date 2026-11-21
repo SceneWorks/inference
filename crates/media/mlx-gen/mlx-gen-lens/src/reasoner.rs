@@ -70,7 +70,7 @@ impl LensReasonerModel {
         dtype: Dtype,
         quant: Option<Quant>,
     ) -> Result<Self> {
-        let embed_tokens = mlx_gen::quant::embedding_compute(&w, "model.embed_tokens", dtype)?;
+        let embed_tokens = mlx_gen::quant::embedding_compute(w, "model.embed_tokens", dtype)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(GptOssDecoderLayer::from_weights(
@@ -86,7 +86,7 @@ impl LensReasonerModel {
             embed_tokens,
             layers,
             final_norm: w.require("model.norm.weight")?.as_dtype(dtype)?,
-            lm_head: match mlx_gen::quant::native_lin(&w, "lm_head", false)? {
+            lm_head: match mlx_gen::quant::native_lin(w, "lm_head", false)? {
                 Some(p) => p,
                 None => mlx_gen::adapters::AdaptableLinear::dense(
                     w.require("lm_head.weight")?.as_dtype(dtype)?,
@@ -298,7 +298,7 @@ impl ReasonerTarget<'_> {
             hidden
         };
         let normed = mlx_rs::fast::rms_norm(&last, &m.final_norm, m.cfg.rms_eps)?;
-        Ok(m.lm_head.forward(&normed)?) // [1, 1, vocab]
+        m.lm_head.forward(&normed) // [1, 1, vocab]
     }
 }
 

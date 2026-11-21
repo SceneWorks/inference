@@ -160,7 +160,7 @@ impl PerceiverAttention {
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, n_lat, h * hd])?;
-        Ok(self.to_out.forward(&out)?)
+        self.to_out.forward(&out)
     }
 }
 
@@ -186,7 +186,7 @@ impl FeedForward {
         let h = layer_norm(x, Some(&self.ln_w), Some(&self.ln_b), EPS)?;
         let h = self.l1.forward(&h)?;
         let h = gelu_exact(&h)?;
-        Ok(self.l3.forward(&h)?)
+        self.l3.forward(&h)
     }
 }
 
