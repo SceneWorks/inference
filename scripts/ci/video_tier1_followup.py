@@ -5,6 +5,7 @@ import statistics
 
 from scripts.ci import video_tier1_cohorts as cohorts
 from scripts.ci import video_tier1_evidence as evidence
+from scripts.ci import video_tier1_cuda_diagnostic as targeted
 
 NAME = "sw-6954-timing-memory-v1"
 MANIFEST = "scripts/ci/video_tier1_retained.json"
@@ -65,34 +66,43 @@ def bind(head, backend, selection, tracked, policy):
     }
 
 
-def groups(case):
+def groups(case, name=NAME):
+    if name == targeted.NAME:
+        if case in targeted.TIMING_CALLS:
+            yield "timing", range(1, targeted.TIMING_PAIRS + 1), targeted.TIMING_CALLS[case]
+        if case in targeted.MEMORY:
+            yield "memory", targeted.MEMORY[case], 1
+        return
     if case in TIMING:
         yield "timing", range(1, TIMING_PAIRS + 1), CALLS
     if case in MEMORY:
         yield "memory", MEMORY[case], 1
 
 
-def timing(base, head, ceiling):
-    if len(base) != TIMING_PAIRS or len(head) != TIMING_PAIRS:
+def timing(base, head, ceiling, *, pairs=TIMING_PAIRS, calls=CALLS, ranks=(3, 10)):
+    if len(base) != pairs or len(head) != pairs:
         raise ValueError("missing follow-up timing pairs")
     durations = []
     for arm in (base, head):
         means = []
         for result in arm:
             samples = result["samples"]
-            if len(samples) != CALLS:
+            if len(samples) != calls:
                 raise ValueError("incomplete grouped timing")
             means.append(statistics.mean(v["elapsed_ns"] for v in samples))
         durations.append(means)
     ratios = [h / b for b, h in zip(*durations, strict=True)]
     ranked = sorted(ratios)
-    lower, upper = ranked[2], ranked[9]
+    lower, upper = ranked[ranks[0] - 1], ranked[ranks[1] - 1]
     return {"paired_ratios": ratios, "median": statistics.median(ratios), "interval": [lower, upper], "ceiling": ceiling,
             "base_mean_ns": durations[0], "head_mean_ns": durations[1],
             "verdict": "pass" if upper <= ceiling else "fail" if lower > ceiling else "inconclusive"}
 
 
-def compare(case, retained, observations, settings):
+def compare(case, retained, observations, settings, name=NAME):
+    diagnostic = name == targeted.NAME
+    source = "targeted-diagnostic" if diagnostic else "follow-up"
+    schedule = {phase: (slots, calls) for phase, slots, calls in groups(case, name)}
     initial_ok = all(r["initial"]["sha256"] == retained["initial_sha256"] for r in observations.values())
     parity_ok = all(r["terminal"]["sha256"] == retained["terminal_sha256"] and r["trace_sha256"] == retained["trace_sha256"]
                     for r in observations.values())
@@ -100,22 +110,27 @@ def compare(case, retained, observations, settings):
     result = {"retained_run_id": retained["run_id"], "retained_receipt_sha256": retained["receipt_sha256"],
               "retained_peaks": retained["retained_peaks"], "initial_noise": "pass" if initial_ok else "fail",
               "parity": ("pass" if parity_ok else "fail") if initial_ok else "inconclusive"}
-    if case in TIMING:
-        base, head = ([observations[f"{case}-timing-p{i}-{arm}"] for i in range(1, TIMING_PAIRS + 1)]
+    if diagnostic:
+        result.update(followup_run_id=retained["followup_run_id"],
+                      followup_receipt_sha256=retained["followup_receipt_sha256"])
+    if "timing" in schedule:
+        slots, calls = schedule["timing"]
+        base, head = ([observations[f"{case}-timing-p{i}-{arm}"] for i in slots]
                       for arm in ("base", "head"))
-        measured = timing(base, head, settings["seconds_ratio_ceiling"])
+        measured = timing(base, head, settings["seconds_ratio_ceiling"], pairs=len(slots), calls=calls,
+                          ranks=(6, 15) if diagnostic else (3, 10))
         measured["outer_steps"] = base[0]["samples"][0]["outer_steps"]
         for arm in ("base", "head"):
             measured[arm + "_mean_seconds_per_outer_step"] = [
                 v / (1e9 * measured["outer_steps"]) for v in measured[arm + "_mean_ns"]]
-        result["timing"] = {"source": "follow-up", **measured}
+        result["timing"] = {"source": source, **measured}
     else:
-        result["timing"] = {"source": "retained", **retained["timing"]}
+        result["timing"] = {"source": retained.get("timing_source", "retained"), **retained["timing"]}
     verdicts.append(result["timing"]["verdict"])
     if case in MEMORY:
         slots = []
         for i, previous in enumerate(retained["dedicated_metrics"]["pairs"], 1):
-            if i not in MEMORY[case]:
+            if i not in schedule.get("memory", ((), 1))[0]:
                 if previous["verdict"] != "pass":
                     raise ValueError("retained slot lacks a completed process-memory comparison")
                 slots.append({"source": "retained", "pair": i, **previous})
@@ -128,7 +143,7 @@ def compare(case, retained, observations, settings):
             dedicated = metric["wddm_dedicated_process_bytes"]["pairs"][0]
             native = metric["cuda_process_bytes"]
             verdict = dedicated["verdict"] if evidence.accepted_metric(native) else "fail"
-            slots.append({"source": "follow-up", "pair": i, "base_bytes": dedicated["base"]["sampled_peak_bytes"],
+            slots.append({"source": source, "pair": i, "base_bytes": dedicated["base"]["sampled_peak_bytes"],
                           "head_bytes": dedicated["head"]["sampled_peak_bytes"], "ratio": dedicated["ratio"],
                           "verdict": verdict, "native": native})
         if len(slots) != 5:

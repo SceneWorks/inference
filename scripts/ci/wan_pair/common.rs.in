@@ -67,15 +67,20 @@ impl Pair {
         assert!(elapsed_ns > 0);
         let completed = steps.last().unwrap().0;
         let mut samples = vec![json!({"elapsed_ns":elapsed_ns,"outer_steps":completed})];
-        if env::var_os("VIDEO_TIER1_GROUPED_TIMING").is_some() {
-            for _ in 1..16 {
-                let (ns, next_trace, next_shape, next_values) = run()?;
-                assert!(ns > 0);
-                assert_eq!(next_trace, trace);
-                assert_eq!(next_shape, shape);
-                assert!(values.iter().map(|v| v.to_bits()).eq(next_values.iter().map(|v| v.to_bits())));
-                samples.push(json!({"elapsed_ns":ns,"outer_steps":completed}));
-            }
+        let calls = match env::var("VIDEO_TIER1_GROUPED_TIMING").as_deref() {
+            Err(env::VarError::NotPresent) => 1,
+            Ok("1") => 16,
+            Ok("targeted-cuda") if self.case == "cuda-ti2v5b-t2v-heun" => 256,
+            Ok("targeted-cuda") if self.case == "cuda-svd-euler-cfg" => 32,
+            _ => return Err("unregistered grouped timing case".into()),
+        };
+        for _ in 1..calls {
+            let (ns, next_trace, next_shape, next_values) = run()?;
+            assert!(ns > 0);
+            assert_eq!(next_trace, trace);
+            assert_eq!(next_shape, shape);
+            assert!(values.iter().map(|v| v.to_bits()).eq(next_values.iter().map(|v| v.to_bits())));
+            samples.push(json!({"elapsed_ns":ns,"outer_steps":completed}));
         }
         let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
         assert_eq!(bytes.len(), initial_bytes.len());

@@ -79,7 +79,7 @@ class FollowupTests(unittest.TestCase):
                 "samples": [{"elapsed_ns": 500, "outer_steps": 4}],
                 "cuda_process": {"lower": 50, "upper": 200, "basis": "wddm-bounded",
                     "dedicated": {"adapter": historical["dedicated_adapter"], "sampled_peak_bytes": 100}}}
-        data = {name: deepcopy(base) for _, _, name, _ in proof.schedule(case, True)}
+        data = {name: deepcopy(base) for _, _, name, _ in proof.schedule(case, {"name": followup.NAME})}
         def compare():
             return followup.compare(case, historical, data, proof.SETTINGS)
         result = compare()

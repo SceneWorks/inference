@@ -21,6 +21,7 @@ from scripts.ci import model_inference_proofs as proof
 from scripts.ci import video_tier1_cohorts as cohorts
 from scripts.ci import video_tier1_evidence as evidence
 from scripts.ci import video_tier1_followup as followup
+from scripts.ci import video_tier1_cuda_diagnostic as targeted
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.media_campaign_supervisor import load_policy, validate_admission
@@ -50,7 +51,7 @@ def tracked(revision, path):
 
 def protocol(selection, extension=None):
     if extension:
-        return selection + "-" + followup.NAME
+        return selection + "-" + extension["name"]
     return "wan-curated-tier1-v2" if selection == SELECTION else selection + "-v1"
 
 
@@ -59,7 +60,7 @@ def seal_name(selection):
 
 
 def schedule(case, extension=None):
-    groups = followup.groups(case) if extension else (("", range(1, SETTINGS["pairs"] + 1), 1),)
+    groups = followup.groups(case, extension["name"]) if extension else (("", range(1, SETTINGS["pairs"] + 1), 1),)
     for group, slots, repeats in groups:
         for slot in slots:
             order = ARMS if slot % 2 else ARMS[::-1]
@@ -79,7 +80,7 @@ def phases(cases, extension=None):
 
 def compare_case(case, extension, observations):
     if extension:
-        return followup.compare(case, extension["retained"][case], observations, SETTINGS)
+        return followup.compare(case, extension["retained"][case], observations, SETTINGS, extension["name"])
     base, head = ([observations[name] for _, a, name, _ in schedule(case) if a == arm] for arm in ARMS)
     return evidence.compare(base, head, SETTINGS)
 
@@ -87,7 +88,7 @@ def compare_case(case, extension, observations):
 def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     if (backend not in LANES or not isinstance(value, dict)
             or set(value) not in ({"selection", "base", "policy"}, {"selection", "base", "policy", "followup"})
-            or value["selection"] not in allowed or ("followup" in value and value["followup"] != followup.NAME)):
+            or value["selection"] not in allowed or ("followup" in value and value["followup"] not in (followup.NAME, targeted.NAME))):
         raise ValueError("expected a fixed video Tier 1 proof selection")
     selection = value["selection"]
     base = BASE if selection == SELECTION else cohorts.VIDEO_BASE
@@ -100,6 +101,8 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     extra_contract = {}
     if "followup" in value:
         cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"])
+        if value["followup"] == targeted.NAME:
+            cases, extension = targeted.bind(head, backend, selection, tracked, extension)
         subprocess.run(["git", "merge-base", "--is-ancestor", base, engine_head], cwd=ROOT, check=True)
         subprocess.run(["git", "merge-base", "--is-ancestor", engine_head, head], cwd=ROOT, check=True)
         if (paired.git(ROOT, "rev-parse", engine_head + "^{tree}") != extension["historical_head_tree"]
@@ -120,6 +123,10 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
         raise ValueError("video Tier 1 CUDA requires a GPU reserve and caps its child at 12 GiB")
     reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
     budget = (1 + len(phases(cases, extension))) * policy.deadline_seconds + reserve
+    if extension and extension["name"] == targeted.NAME:
+        # Two bounded clock queries outside each timing child, inside the claim.
+        timing_roles = sum(1 for case in cases for _, _, _, repeats in schedule(case, extension) if repeats > 1)
+        budget += timing_roles * 2 * targeted.CLOCK_TIMEOUT
     # Bind both the random generator and its production source-header capture before
     # resource scheduling. Reads only tracked Git objects during the hosted plan.
     directory = cohorts.DIRECTORY[selection]
@@ -478,13 +485,22 @@ def execute(args, contract):
                                 "MODEL_INFERENCE_CASE_FQN": cohorts.FQN[model]})
                     if repeats == followup.CALLS:
                         env["VIDEO_TIER1_GROUPED_TIMING"] = "1"
+                    diagnostics = None
+                    if contract["request"].get("followup") == targeted.NAME and repeats > 1:
+                        env["VIDEO_TIER1_GROUPED_TIMING"] = "targeted-cuda"
+                        diagnostics = {"before": targeted.clock_snapshot(policy.cuda_device_uuid)}
                     out = work / name
                     started = time.monotonic_ns()
-                    paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=last_start,
+                    latest = last_start - (targeted.CLOCK_TIMEOUT if diagnostics is not None else 0)
+                    paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=latest,
                                   arguments=(cohorts.FQN[model], "--exact", "--ignored", "--nocapture", "--test-threads=1"),
                                   capture_cuda_basis=True, dedicated_adapter=adapter)
                     ended = time.monotonic_ns()
-                    receipt["execution_order"].append({"phase": name, "start_ns": started, "end_ns": ended})
+                    order = {"phase": name, "start_ns": started, "end_ns": ended}
+                    if diagnostics is not None:
+                        diagnostics["after"] = targeted.clock_snapshot(policy.cuda_device_uuid)
+                        order["clock_diagnostics"] = diagnostics
+                    receipt["execution_order"].append(order)
                     observed = read_observed(out, case)
                     info = {"observed": observed}
                     guard = json.loads(evidence.owned_file(out, "supervisor.json", 16 * MIB).read_bytes())
@@ -654,6 +670,10 @@ def verify(args, contract):
     if backend == "candle-cuda" and receipt.get("observations"):
         from scripts.ci import wddm_process_memory
         wddm_process_memory.validate_adapter(receipt.get("dedicated_adapter"), contract["request"]["policy"]["cudaDeviceUuid"])
+    if contract["request"].get("followup") == targeted.NAME:
+        for measurement in receipt["execution_order"]:
+            if "-timing-" in measurement["phase"]:
+                targeted.verify_clocks(measurement, contract["request"]["policy"]["cudaDeviceUuid"])
     if receipt["accepted"]:
         check_complete_provenance(receipt, contract)
     required = {name for name in entries if not name.endswith(".guard.jsonl")}
