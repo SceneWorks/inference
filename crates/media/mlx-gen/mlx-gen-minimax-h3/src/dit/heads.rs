@@ -73,6 +73,37 @@ pub const TIME_PROJ_FLIP_SIN_TO_COS: bool = true;
 /// and not by `half_dim − 1`.
 pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 
+/// Decode only the dense side of a stored-code projection at its receiving dtype. MLX has
+/// already exposed FP8/I8 storage as byte arrays, so an originally floating sibling supplies the
+/// precision. When both are encoded the H3 model's published head role supplies it.
+pub(crate) fn open_dit_weights(dir: &std::path::Path) -> Result<Weights> {
+    Weights::from_dir_with_layout(
+        dir,
+        |_| false,
+        |key, source| {
+            let sibling = key
+                .strip_suffix(".bias")
+                .map(|p| (p, "weight"))
+                .or_else(|| key.strip_suffix(".weight").map(|p| (p, "bias")));
+            let Some((prefix, suffix)) = sibling else {
+                return Dtype::Bfloat16;
+            };
+            if let Some(dtype) = source
+                .get(&format!("{prefix}.{suffix}"))
+                .map(Array::dtype)
+                .filter(|dtype| matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16))
+            {
+                return dtype;
+            }
+            if gen_core_h3::h3_projection_keeps_fp32(prefix) {
+                Dtype::Float32
+            } else {
+                Dtype::Bfloat16
+            }
+        },
+    )
+}
+
 /// An `nn.Linear(in, out, bias=True)` over a stored `[out, in]` weight.
 ///
 /// Distinct from [`crate::dit::layers::LinearNoBias`] because **every** projection in this module
@@ -1008,6 +1039,59 @@ mod tests {
             })
             .collect();
         Array::from_slice(&v, shape)
+    }
+
+    #[test]
+    fn encoded_head_bias_uses_the_role_or_the_original_dense_sibling_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut header = serde_json::Map::new();
+        let mut data: Vec<u8> = vec![];
+        for (name, dtype, shape, bytes) in [
+            ("proj_in.weight", "F8_E4M3", vec![1, 2], vec![0x38; 2]),
+            ("proj_in.bias", "F8_E4M3", vec![1], vec![0x38]),
+            (
+                "proj_in.bias.scale_weight",
+                "F32",
+                vec![1],
+                (1.0f32 + 1. / 512.).to_le_bytes().to_vec(),
+            ),
+            (
+                "context_embedder.weight",
+                "F8_E5M2",
+                vec![1, 2],
+                vec![0x3c; 2],
+            ),
+            ("context_embedder.bias", "F8_E4M3", vec![1], vec![0x38]),
+            ("h.weight", "F16", vec![1, 2], vec![0, 60, 0, 60]),
+            ("h.bias", "F8_E4M3", vec![1], vec![0x38]),
+        ] {
+            let offset = data.len();
+            data.extend_from_slice(&bytes);
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,data.len()]}),
+            );
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend(data);
+        std::fs::write(dir.path().join("model.safetensors"), file).unwrap();
+        let mut weights = open_dit_weights(dir.path()).unwrap();
+        for (prefix, dtype, value) in [
+            ("proj_in", Dtype::Float32, 1. + 1. / 512.),
+            ("context_embedder", Dtype::Bfloat16, 1.),
+            ("h", Dtype::Float16, 1.),
+        ] {
+            let head = LinearBias::from_weights(&mut weights, prefix, 2, 1).unwrap();
+            assert_eq!(head.dtype(), dtype);
+            assert_eq!(head.bias().dtype(), dtype);
+            assert_eq!(
+                head.bias().as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+                value
+            );
+        }
     }
 
     /// SW-7092: exactly the float32 projections take the N=1 full-precision dispatch.

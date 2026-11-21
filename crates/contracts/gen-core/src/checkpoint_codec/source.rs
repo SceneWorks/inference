@@ -57,6 +57,105 @@ pub fn plan_projection_sources(
         .map(Some)
 }
 
+/// Retained bytes of the encoded portion of a component, keyed by physical name. A consumed
+/// descriptor or scale is present with zero bytes. Ordinary floats and unrelated integer/control
+/// buffers remain the caller's responsibility. Read only bounded declarations from the same
+/// files whose complete physical header inventory was supplied by the caller.
+pub fn projected_checkpoint_bytes(
+    paths: &[PathBuf],
+    headers: &[SafetensorsTensorHeader],
+    dense_width: impl Fn(&SafetensorsTensorHeader) -> u64,
+    policy: &dyn CodecResidencyPolicy,
+    native_matrix: impl Fn(&str, &[usize]) -> bool,
+) -> crate::Result<BTreeMap<String, u64>> {
+    if !headers.iter().any(|h| {
+        matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::I8)
+            || h.name.ends_with(".comfy_quant")
+    }) {
+        return Ok(BTreeMap::new());
+    }
+    struct Consumer<'a, F>(&'a dyn CodecResidencyPolicy, F);
+    impl<F: Fn(&str, &[usize]) -> bool> CodecResidencyPolicy for Consumer<'_, F> {
+        fn residency(
+            &self,
+            codec: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            shape: &[usize],
+        ) -> ResidencyMode {
+            self.0.residency(codec, spec, shape)
+        }
+        fn residency_for_key(
+            &self,
+            key: &str,
+            codec: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            shape: &[usize],
+        ) -> ResidencyMode {
+            if (self.1)(key, shape) {
+                self.0.residency_for_key(key, codec, spec, shape)
+            } else {
+                ResidencyMode::Dense
+            }
+        }
+    }
+    let mut tables = Vec::new();
+    let mut descriptors = BTreeMap::new();
+    let has_descriptors = headers.iter().any(|h| h.name.ends_with(".comfy_quant"));
+    for path in paths {
+        if let Some(table) = crate::safetensors_path_quantization_metadata(path)? {
+            tables.push(table);
+        }
+        if has_descriptors {
+            descriptors.extend(crate::read_safetensors_tensor_payloads(
+                path,
+                |h| h.name.ends_with(".comfy_quant"),
+                65_536,
+            )?);
+        }
+    }
+    let registry = CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied())
+        .expect("valid baseline checkpoint codecs");
+    let Some(plan) = plan_projection_source_headers(
+        headers,
+        &descriptors,
+        |_| true,
+        &tables,
+        &registry,
+        &Consumer(policy, native_matrix),
+    )?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let physical: BTreeMap<_, _> = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+    let mut bytes = BTreeMap::new();
+    for row in &plan.tensors {
+        let resident = match row.residency.mode {
+            ResidencyMode::Packed => row.residency.resident_bytes,
+            ResidencyMode::Dense => {
+                let h = physical[row.physical_key.as_str()];
+                row.shape
+                    .iter()
+                    .try_fold(dense_width(h), |count, &extent| {
+                        count.checked_mul(extent as u64)
+                    })
+                    .ok_or_else(|| {
+                        crate::Error::Msg(format!(
+                            "{}: dense checkpoint resident byte count overflow",
+                            row.physical_key
+                        ))
+                    })?
+            }
+        };
+        bytes.insert(row.physical_key.clone(), resident);
+    }
+    bytes.extend(
+        plan.companions
+            .into_iter()
+            .map(|c| (c.physical_key, c.resident_bytes)),
+    );
+    Ok(bytes)
+}
+
 /// Inspect the encoded operands of a complete source before a model importer chooses a dialect.
 /// Dense parameters and integer control buffers are left to the family. Every field of an encoded
 /// leaf must have known semantics; a foreign scale spelling can never become an implicit unit
@@ -371,6 +470,31 @@ mod tests {
                 ("model.b.weight_scale", "F32", &[], &0.5f32.to_le_bytes()),
             ],
         );
+        let headers: Vec<_> = shards
+            .iter()
+            .flat_map(|p| crate::safetensors_path_tensor_headers(p).unwrap())
+            .collect();
+        let bytes = projected_checkpoint_bytes(
+            &shards,
+            &headers,
+            |_| 4,
+            &SourceCodecResidency,
+            |_, shape| shape.len() == 2,
+        )
+        .unwrap();
+        assert_eq!(bytes["model.a.weight"], 64);
+        assert_eq!(bytes["model.a.weight_scale"], 4);
+        assert_eq!(bytes["model.a.comfy_quant"], 0);
+        assert_eq!(bytes["model.b.weight"], 8);
+        assert_eq!(bytes["model.b.weight_scale"], 0);
+        assert!(projected_checkpoint_bytes(
+            &shards,
+            &headers,
+            |_| 4,
+            &SourceCodecResidency,
+            |_, _| false
+        )
+        .is_err());
         let metadata = vec![
             r#"{"layers":{"a":{"format":"int8_tensorwise"},"b":{"format":"float8_e4m3fn"}}}"#
                 .to_owned(),
