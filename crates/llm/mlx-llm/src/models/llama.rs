@@ -96,6 +96,7 @@ enum Stack {
 #[derive(Debug)]
 enum TokenEmbedding {
     Dense(Array),
+    Native(mlx_layers::NativeProjection),
     Quantized(QuantizedEmbedding),
 }
 
@@ -103,6 +104,7 @@ impl TokenEmbedding {
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
+            Self::Native(p) => Ok(p.rows(input_ids)?),
             Self::Quantized(weight) => weight.forward(input_ids),
         }
     }
@@ -111,6 +113,7 @@ impl TokenEmbedding {
     fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Self::Dense(weight) => out.push(weight.clone()),
+            Self::Native(p) => p.push_arrays(out),
             Self::Quantized(q) => {
                 out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
             }
@@ -119,6 +122,7 @@ impl TokenEmbedding {
 
     fn tied_projection(&self) -> Projection {
         match self {
+            Self::Native(p) => Projection::Native(p.clone()),
             Self::Dense(weight) => Projection::Dense {
                 weight: weight.clone(),
                 bias: None,
@@ -473,7 +477,11 @@ impl CausalLm {
             .strip_suffix(".weight")
             .expect("embedding weight key has the required suffix");
         let embed_scales_key = format!("{embed_base}.scales");
-        let embed_tokens = if w.contains(&embed_scales_key) {
+        let embed_tokens = if let Some(Projection::Native(p)) =
+            Projection::native(w, &embed_key, false)?
+        {
+            TokenEmbedding::Native(p)
+        } else if w.contains(&embed_scales_key) {
             let spec = cfg.quantization.ok_or_else(|| {
                 Error::Config(format!(
                     "snapshot stores quantized tensor `{embed_scales_key}` but config.json has no `quantization` block"

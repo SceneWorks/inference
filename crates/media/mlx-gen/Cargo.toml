@@ -171,7 +171,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 # Match mlx-rs' safetensors ABI so the opt-in loader can inspect raw E4M3
 # byte views before converting them into MLX's supported bf16 storage dtype.
-safetensors-fp8 = { package = "safetensors", version = "0.4" }
+safetensors-fp8 = { package = "safetensors", version = "0.7" }
 memmap2 = "0.9"
 # `train::dataset::decode_image` (the trainers' shared dataset reader, sc-27332) and
 # `testing::save_png`. Already in every graph through sceneworks-gen-core, so no new crate.
