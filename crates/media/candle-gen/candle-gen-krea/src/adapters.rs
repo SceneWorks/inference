@@ -2634,17 +2634,39 @@ mod tests {
     /// request and later report a zero-match. The quant module separately proves residual arithmetic;
     /// this test pins file resolution, per-source accounting, and the route-facing host contract.
     #[test]
-    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_applies_selected_lora_to_convrot_host() {
         use crate::quant::QLinear;
+        use candle_gen::candle_core::Result as TensorResult;
+        use candle_gen::candle_nn::{linear::NativeLinearWeight, Linear};
+        use std::sync::Arc;
 
-        let dev = Device::new_cuda(0).unwrap();
-        let (out_dim, in_dim, group) = (16usize, 64usize, 64usize);
-        let canonical = Tensor::ones((out_dim, in_dim), DType::F32, &dev).unwrap();
-        let rotation = candle_gen::quant::regular_hadamard(group, &dev).unwrap();
-        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
-        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
-        let host = QLinear::convrot_int8(parts.q, parts.scale, group, None, &dev).unwrap();
+        struct ConvRotMetadata;
+        impl NativeLinearWeight for ConvRotMetadata {
+            fn forward(&self, _: &Tensor, _: Option<&Tensor>) -> TensorResult<Tensor> {
+                panic!("installing an adapter must not execute its base")
+            }
+            fn dense_weight(&self) -> TensorResult<Tensor> {
+                panic!("installing an adapter must not materialize dense coefficients")
+            }
+            fn format_id(&self) -> &'static str {
+                candle_gen::gen_core::convrot_int8::CODEC_ID
+            }
+            fn dims(&self) -> (usize, usize) {
+                (16, 64)
+            }
+            fn resident_bytes(&self) -> u64 {
+                0
+            }
+            fn device(&self) -> &Device {
+                &Device::Cpu
+            }
+        }
+
+        let operand = ConvRotMetadata;
+        let (out_dim, in_dim) = operand.dims();
+        let dev = operand.device().clone();
+        let layer = Linear::from_native(Arc::new(operand), None);
+        let host = QLinear::Adapt(AdaptLinear::from_dense(layer, in_dim, out_dim));
 
         struct ConvRotDit {
             device: Device,
