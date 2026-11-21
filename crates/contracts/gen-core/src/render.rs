@@ -2,6 +2,7 @@
 
 pub mod conditional;
 mod passes;
+pub mod video;
 
 pub use passes::{MultiPassRenderPlan, PlannedPassRequest, ProducedReference};
 

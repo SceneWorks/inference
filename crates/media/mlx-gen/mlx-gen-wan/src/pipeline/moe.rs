@@ -1,6 +1,23 @@
 //! The A14B two-expert denoise: boundary crossing, ranges and the staged expert swap.
 
+use super::denoise::curated_phase;
 use super::*;
+use mlx_gen::gen_core::render::video::{VideoModelCoordinate, VideoModelRule};
+use mlx_gen::MoeExpert;
+
+pub fn wan_expert_rule(
+    num_train_timesteps: usize,
+    boundary_timestep: f32,
+) -> VideoModelRule<MoeExpert> {
+    VideoModelRule::AtOrAbove {
+        coordinate: VideoModelCoordinate::TruncatedTimestep {
+            num_train_timesteps,
+        },
+        threshold: boundary_timestep,
+        high: MoeExpert::High,
+        low: MoeExpert::Low,
+    }
+}
 
 /// One MoE expert: a full transformer + its own (per-model) embedded contexts + guidance scale.
 /// Wan2.2-A14B's "MoE" is two complete checkpoints, not token routing — each carries its own
@@ -164,6 +181,39 @@ pub fn denoise_moe_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_moe_curated_scoped(
+        low,
+        high,
+        boundary_timestep,
+        sampler_name,
+        num_train_timesteps,
+        steps,
+        shift,
+        init_noise,
+        y,
+        seed,
+        cancel,
+        None,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_moe_curated_scoped(
+    low: &Expert,
+    high: &Expert,
+    boundary_timestep: f32,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    y: Option<&Array>,
+    seed: u64,
+    cancel: &CancelFlag,
+    scope: Option<&mut dyn MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let grid = low.transformer.patch_grid(init_noise);
     let low_cache = build_cache(
@@ -186,27 +236,60 @@ pub fn denoise_moe_curated(
         serde_json::json!({"low_guidance_bits":low.guidance.to_bits(),"high_guidance_bits":high.guidance.to_bits()}),
     );
     mlx_gen::video_execution::schedule("wan_curated", &sigmas);
-    let nt = num_train_timesteps as f32;
-    mlx_gen::run_flow_sampler(
-        mlx_gen::SamplerRun {
-            sampler_name: Some(sampler_name),
-            sigmas: &sigmas,
-            seed,
-            cancel,
-            on_progress,
-        },
-        mlx_gen::TimestepConvention::Sigma,
+    let time = VideoModelCoordinate::TruncatedTimestep {
+        num_train_timesteps,
+    };
+    let phase = curated_phase(
+        sampler_name,
+        sigmas,
+        seed,
+        init_noise.shape(),
+        WanVae::VAE_TILING,
+        u32::from(y.is_some()),
+        wan_expert_rule(num_train_timesteps, boundary_timestep),
+    )?;
+    mlx_gen::sampler::run_video_flow_sampler(
+        &phase,
         init_noise.clone(),
-        |x, sigma| {
-            let t = (sigma * nt).trunc();
-            let (e, cache) = if t >= boundary_timestep {
-                (high, &high_cache)
-            } else {
-                (low, &low_cache)
+        cancel,
+        scope,
+        on_progress,
+        |x, sigma, slot| {
+            let t = time.at_sigma(sigma);
+            let (e, cache) = match slot {
+                MoeExpert::High => (high, &high_cache),
+                MoeExpert::Low => (low, &low_cache),
             };
             predict(e.transformer, x, t, cache, e.guidance, y)
         },
     )
+}
+
+/// Keep the prepared expert across adjacent evaluations. Release the outgoing weights
+/// and cache before loading the incoming slot, including when cancellation races eviction.
+pub(super) fn select_curated_expert<'a, E>(
+    active: &'a mut Option<(MoeExpert, E)>,
+    slot: MoeExpert,
+    cancel: &CancelFlag,
+    release: impl FnOnce(E),
+    load: impl FnOnce(MoeExpert) -> Result<E>,
+) -> Result<&'a E> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    if active.as_ref().is_none_or(|(current, _)| *current != slot) {
+        if let Some((_, outgoing)) = active.take() {
+            release(outgoing);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        *active = Some((slot, load(slot)?));
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+    }
+    Ok(&active.as_ref().expect("selected expert").1)
 }
 
 /// Sequential-residency twin of [`denoise_moe_curated`]. The curated solver remains in control of
@@ -225,61 +308,65 @@ pub(crate) fn denoise_moe_curated_swapped(
     y: Option<&Array>,
     seed: u64,
     cancel: &CancelFlag,
+    scope: Option<&mut dyn MemoryRequestScope>,
     on_progress: &mut dyn FnMut(Progress),
     mut load: impl FnMut(bool) -> Result<(WanTransformer, Array, Option<Array>, f32)>,
 ) -> Result<Array> {
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let (transformer, cond, uncond, guidance) = load(true)?;
-    let grid = transformer.patch_grid(init_noise);
-    let cache = build_cache(&transformer, &cond, uncond.as_ref(), grid)?;
-    // The first shifted Wan sigma is always above the configured A14B boundary. Keeping the
-    // initially loaded high expert here avoids a second load before the first evaluation.
-    let mut active = Some((transformer, cache, guidance, true));
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let time = VideoModelCoordinate::TruncatedTimestep {
+        num_train_timesteps,
+    };
+    let phase = curated_phase(
+        sampler_name,
+        sigmas,
+        seed,
+        init_noise.shape(),
+        WanVae::VAE_TILING,
+        u32::from(y.is_some()),
+        wan_expert_rule(num_train_timesteps, boundary_timestep),
+    )?;
+    let first = phase.models.slot(phase.sigmas[0]);
+    let mut prepare = |slot| {
+        let (transformer, cond, uncond, guidance) = load(slot == MoeExpert::High)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let grid = transformer.patch_grid(init_noise);
+        let cache = build_cache(&transformer, &cond, uncond.as_ref(), grid)?;
+        Ok((transformer, cache, guidance))
+    };
+    let release = |outgoing| {
+        mlx_gen::sc20686::mark_phase("load");
+        drop(outgoing);
+        mlx_rs::memory::clear_cache();
+    };
+    let mut active = None;
+    let guidance = select_curated_expert(&mut active, first, cancel, release, &mut prepare)?.2;
     mlx_gen::video_execution::curated_sampling(
         "wan_curated",
         sampler_name,
         "flow_velocity",
         serde_json::json!({"guidance_bits":guidance.to_bits()}),
     );
-    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
-    let nt = num_train_timesteps as f32;
-    let result = mlx_gen::run_flow_sampler(
-        mlx_gen::SamplerRun {
-            sampler_name: Some(sampler_name),
-            sigmas: &sigmas,
-            seed,
-            cancel,
-            on_progress,
-        },
-        mlx_gen::TimestepConvention::Sigma,
+    mlx_gen::video_execution::schedule("wan_curated", &phase.sigmas);
+    let result = mlx_gen::sampler::run_video_flow_sampler(
+        &phase,
         init_noise.clone(),
-        |x, sigma| {
-            let t = (sigma * nt).trunc();
-            let wants_high = t >= boundary_timestep;
-            let has_high = active.as_ref().is_some_and(|(_, _, _, high)| *high);
-            if wants_high != has_high {
-                // A descending sigma schedule may cross high→low once, never low→high.
-                if wants_high {
-                    return Err(Error::Msg(
-                        "wan: curated sampler timestep increased across the MoE boundary".into(),
-                    ));
-                }
-                // SC-20686 Metal lane: the swap (drop, evict, load) is its own phase window.
-                mlx_gen::sc20686::mark_phase("load");
-                drop(active.take());
-                mlx_rs::memory::clear_cache();
-                let (transformer, cond, uncond, guidance) = load(false)?;
-                let cache = build_cache(&transformer, &cond, uncond.as_ref(), grid)?;
-                active = Some((transformer, cache, guidance, false));
-            }
-            let (transformer, cache, guidance, _) =
-                active.as_ref().expect("curated expert is loaded");
+        cancel,
+        scope,
+        on_progress,
+        |x, sigma, slot| {
+            let t = time.at_sigma(sigma);
+            let (transformer, cache, guidance) =
+                select_curated_expert(&mut active, slot, cancel, release, &mut prepare)?;
             predict(transformer, x, t, cache, *guidance, y)
         },
     );
     drop(active);
-    mlx_rs::memory::clear_cache();
+    if !matches!(&result, Err(Error::ProcessPoisoned(_))) {
+        mlx_rs::memory::clear_cache();
+    }
     result
 }
 

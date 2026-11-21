@@ -199,6 +199,7 @@ impl Wan {
     fn generate_execution_attempt(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
@@ -208,7 +209,7 @@ impl Wan {
             self.descriptor.id,
             || mlx_gen::sc20686::RequestFacts::from_request(req),
             on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
+            |on_progress| self.generate_impl(req, scope, on_progress),
         )
         .map_err(Into::into)
     }
@@ -220,8 +221,17 @@ impl Generator for Wan {
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -249,7 +259,7 @@ impl Generator for Wan {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_execution_attempt(req, None, on_progress)
         })
     }
 

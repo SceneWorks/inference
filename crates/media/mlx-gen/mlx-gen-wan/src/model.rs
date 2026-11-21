@@ -37,11 +37,11 @@ use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::feature_cache::TrunkCache;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
-    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_curated,
-    denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range, denoise_ti2v,
-    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
-    refuse_unwired_approximation, reject_off_grid, reject_over_area, resolve_sampler_knobs,
-    seq_len, staged_expert_swap, ti2v_blend_init, Expert,
+    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_moe,
+    denoise_moe_curated_swapped, denoise_range, denoise_ti2v, frames_to_images, latent_shape,
+    preflight_denoise_memory_guard, preprocess_ti2v_image, refuse_unwired_approximation,
+    reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
+    ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier_with_progress;
@@ -92,7 +92,7 @@ pub fn a14b_vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> 
 
 /// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
 /// native solvers — the gen-core-only solvers, routed through `run_flow_sampler` over Wan's own flow-σ
-/// schedule ([`crate::pipeline::denoise_curated`] / [`denoise_moe_curated`]).
+/// schedule ([`crate::pipeline::denoise_curated`] / [`crate::pipeline::denoise_moe_curated`]).
 ///
 /// A14B residency note (sc-12795): under `Sequential`, these route the expert **per eval** inside the
 /// solver callback. This preserves boundary-straddling sub-evaluations while making one high→low

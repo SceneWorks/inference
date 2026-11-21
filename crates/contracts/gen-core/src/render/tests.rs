@@ -958,3 +958,83 @@ fn single_pass_plans_keep_pass_zero_and_digest_binding() {
     }
     assert!(compiled.check_request(&descriptor(), &changed).is_err());
 }
+
+#[test]
+fn video_denoise_borrows_the_admitted_scope_once_and_preserves_failure_ownership() {
+    use super::video::{VideoDenoisePhase, VideoModelRule};
+    let phase = VideoDenoisePhase {
+        identity: RenderPhaseIdentity {
+            pass: 0,
+            phase: 0,
+            geometry: MemoryGeometry {
+                width: 1024,
+                height: 1024,
+                frames: 17,
+                batch: 1,
+                reference_count: 1,
+            },
+        },
+        latent_frames: 5,
+        solver: crate::sampling::Solver::Heun,
+        sigmas: vec![0.99, 0.6, 0.0],
+        seed: 11,
+        models: VideoModelRule::Fixed(()),
+    };
+    let cancel = CancelFlag::new();
+    let mut scope = PhaseScope::default();
+    phase
+        .run(&cancel, Some(&mut scope), || Ok::<_, Error>(()))
+        .unwrap();
+    assert_eq!(
+        scope.events,
+        [
+            (true, MemoryPhase::Denoise, 0),
+            (false, MemoryPhase::Denoise, 0)
+        ]
+    );
+    assert!(phase
+        .run(&cancel, Some(&mut scope), || Err::<(), _>(
+            Error::ProcessPoisoned("device".into())
+        ))
+        .is_err());
+    assert_eq!(scope.active, Some(0));
+    cancel.cancel();
+    let events = scope.events.clone();
+    let result: Result<()> = phase.run(&cancel, Some(&mut scope), || {
+        panic!("cancelled before phase entry")
+    });
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert_eq!(scope.events, events);
+    assert!(scope.terminal.is_empty());
+}
+
+#[test]
+fn video_phase_accepts_the_native_schedule_direction_and_selects_exact_sigma_thresholds() {
+    use super::video::{VideoDenoisePhase, VideoModelCoordinate, VideoModelRule};
+    let phase = VideoDenoisePhase {
+        identity: RenderPhaseIdentity {
+            pass: 0,
+            phase: 0,
+            geometry: MemoryGeometry {
+                width: 128,
+                height: 96,
+                frames: 17,
+                batch: 1,
+                reference_count: 0,
+            },
+        },
+        latent_frames: 5,
+        solver: (),
+        sigmas: vec![0.0, 0.4, 1.0],
+        seed: 11,
+        models: VideoModelRule::AtOrAbove {
+            coordinate: VideoModelCoordinate::Sigma,
+            threshold: 0.4,
+            high: true,
+            low: false,
+        },
+    };
+    phase.validate().unwrap();
+    assert!(!phase.models.slot(0.4f32.next_down()));
+    assert!(phase.models.slot(0.4));
+}

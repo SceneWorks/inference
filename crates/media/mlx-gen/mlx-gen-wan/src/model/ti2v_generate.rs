@@ -60,7 +60,7 @@ impl Wan {
         // hook. (The 14B sibling has no mask-blend path: its I2V is channel-concat, which the
         // curated solvers DO serve via `denoise_moe_curated`.)
         if is_wan_curated(req.sampler.as_deref()) && image_conditioned {
-            return Err(Error::Msg(
+            return Err(Error::Unsupported(
                 "wan2_2_ti2v_5b: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                  supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
                     .into(),
@@ -93,6 +93,7 @@ impl Wan {
     pub(super) fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Reject anything outside the advertised surface before doing expensive work — in particular
@@ -313,7 +314,7 @@ impl Wan {
                 (Some(_), true) => {
                     // Unreachable via requests — `validate_impl` rejects curated × mask-blend up
                     // front (F-074a); kept as a defensive backstop for direct callers.
-                    return Err(Error::Msg(
+                    return Err(Error::Unsupported(
                         "wan: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                          supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
                             .into(),
@@ -358,7 +359,7 @@ impl Wan {
                         "curated unified solver",
                         &approximation,
                     )?;
-                    denoise_curated(
+                    crate::pipeline::denoise_curated_scoped(
                         &dit,
                         req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
                         cfg.num_train_timesteps,
@@ -370,6 +371,7 @@ impl Wan {
                         &latents_init,
                         seed,
                         &req.cancel,
+                        scope,
                         on_progress,
                     )?
                 }

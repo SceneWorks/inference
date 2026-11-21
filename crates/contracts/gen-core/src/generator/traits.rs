@@ -365,6 +365,17 @@ pub trait Generator {
         )
     }
 
+    /// Execute with the worker's already configured memory scope. Video providers that own
+    /// typed denoise phases borrow it for phase entry and exit. The caller owns final teardown.
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        _scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.generate_with_execution_report(req, on_progress)
+    }
+
     /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
     /// (path **B**) of the stateless [`Conditioning::ConversationHistory`] carrier (path **A**). A
     /// context-aware conversational TTS model (e.g. MOSS-TTS-Realtime, a voice-agent foundation model)

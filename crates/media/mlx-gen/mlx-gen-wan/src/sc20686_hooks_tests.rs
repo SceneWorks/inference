@@ -384,6 +384,7 @@ fn a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique() {
         None,
         7,
         &CancelFlag::new(),
+        None,
         &mut |progress| obs::observe_progress(&progress),
         load,
     )

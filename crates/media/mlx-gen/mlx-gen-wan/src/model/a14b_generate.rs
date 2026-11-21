@@ -6,6 +6,7 @@ impl Wan14b {
     fn generate_execution_attempt(
         &self,
         request: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
@@ -15,7 +16,7 @@ impl Wan14b {
             self.descriptor.id,
             || mlx_gen::sc20686::RequestFacts::from_request(request),
             on_progress,
-            |on_progress| self.generate_impl(request, on_progress),
+            |on_progress| self.generate_impl(request, scope, on_progress),
         )
         .map_err(Into::into)
     }
@@ -27,8 +28,17 @@ impl Generator for Wan14b {
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -56,7 +66,7 @@ impl Generator for Wan14b {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(request, on_progress)
+            self.generate_execution_attempt(request, None, on_progress)
         })
     }
 
@@ -173,6 +183,7 @@ impl Wan14b {
     pub(super) fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Reject anything outside the advertised surface before doing expensive work — in particular
@@ -345,6 +356,7 @@ impl Wan14b {
                 y.as_ref(),
                 seed,
                 &req.cancel,
+                scope,
                 on_progress,
                 |high| {
                     if req.cancel.is_cancelled() {
@@ -356,6 +368,9 @@ impl Wan14b {
                         MoeExpert::Low
                     };
                     let (dit, report) = self.build_expert_staged(which)?;
+                    if req.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     let cond = dit.embed_text(&context)?;
                     let uncond = Some(dit.embed_text(&context_null)?);
                     if high {
@@ -444,7 +459,7 @@ impl Wan14b {
             // native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). Works for both T2V (`y = None`)
             // and I2V (`y = Some` channel-concat conditioning).
             if is_wan_curated(req.sampler.as_deref()) {
-                denoise_moe_curated(
+                crate::pipeline::denoise_moe_curated_scoped(
                     &low,
                     &high,
                     boundary_timestep,
@@ -456,6 +471,7 @@ impl Wan14b {
                     y.as_ref(),
                     seed,
                     &req.cancel,
+                    scope,
                     on_progress,
                 )?
             } else {
