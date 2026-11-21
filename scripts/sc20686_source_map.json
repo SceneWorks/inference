@@ -141,7 +141,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1197
+              "line": 1196
             }
           ],
           "creation": [
@@ -184,7 +184,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1197
+              "line": 1196
             }
           ],
           "creation": [
@@ -441,7 +441,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 739
+              "line": 736
             }
           ],
           "release": [
@@ -490,7 +490,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 739
+              "line": 736
             }
           ],
           "release": [
@@ -548,7 +548,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 739
+              "line": 736
             }
           ],
           "release": [
@@ -599,14 +599,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 203
+              "line": 206
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 209
+              "line": 212
             }
           ],
           "release": [
@@ -648,14 +648,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 203
+              "line": 206
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 209
+              "line": 212
             }
           ],
           "release": [
@@ -684,7 +684,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1000
+              "line": 1011
             }
           ],
           "product_residency": "sequential",
