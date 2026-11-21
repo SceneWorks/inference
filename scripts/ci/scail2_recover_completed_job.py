@@ -55,16 +55,24 @@ def replay_files(dest, policy):
 
 
 def recover(zip_path):
-    pin = c.RECOVERED_SIX
+    request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda", cuda_uuid=c.GPU0)}
+    return replay_archive(zip_path, c.RECOVERED_SIX, 98830, [6], request, replay_files)
+
+
+def replay_archive(zip_path, pin, archive_size, counts, request, derive):
+    """Authenticate a pinned local archive and replay its producer revision before deriving evidence."""
     with zip_path.open("rb") as archive:
-        raw = archive.read(98831)
-    if len(raw) != 98830 or hashlib.sha256(raw).hexdigest() != pin["archive_sha256"]:
-        raise ValueError("not the authenticated GitHub Actions archive 14719969057")
+        raw = archive.read(archive_size + 1)
+    if len(raw) != archive_size or hashlib.sha256(raw).hexdigest() != pin["archive_sha256"]:
+        raise ValueError(f"not the authenticated GitHub Actions archive {pin['artifact_id']}")
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp).resolve()
         dest, checkout = root / "evidence", root / "original"
         dest.mkdir()
-        files = {"receipt.json", "count-6.cuda-pool.json", "count-6.stdout.log", "count-6.stderr.log", "count-6.supervisor.json"}
+        files = {"receipt.json"} | {
+            f"count-{count}.{suffix}" for count in counts
+            for suffix in ("cuda-pool.json", "stdout.log", "stderr.log", "supervisor.json")
+        }
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             if sorted(archive.namelist()) != sorted(files):
                 raise ValueError("unexpected source evidence files")
@@ -72,7 +80,6 @@ def recover(zip_path):
                 (dest / name).write_bytes(archive.read(name))
         if runner.tier1.sha(dest / "receipt.json") != pin["receipt_sha256"]:
             raise ValueError("original producer receipt seal mismatch")
-        request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda", cuda_uuid=c.GPU0)}
         # Run the actual archived verifier (including its exact-head check) in
         # a private, local metadata checkout. No network, weights or GPU calls.
         subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(checkout)], check=True)
@@ -85,7 +92,7 @@ def recover(zip_path):
                         "candle-cuda", "--expected-sha", pin["inference_revision"], "--request-env", "ARCHIVED_REQUEST",
                         "--output", str(dest)], cwd=checkout, env=env, check=True)
         policy = runner.tier1.read_policy(root, "policy.json", request["policy"])
-        return replay_files(dest, policy)
+        return derive(dest, policy)
 
 
 if __name__ == "__main__":

@@ -322,7 +322,7 @@ def validate_rejected_growth(guard, end, native_pool, card, *, completed_job=Fal
         raise ValueError("CUDA usage resumed after the original Job exited")
 
 
-def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None):
+def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None, archived_owned_zero=False):
     raw = guard["fit_observation"]
     end = raw.get("cuda_render_end")
     if end is None:
@@ -427,6 +427,20 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
             if event["child_growth_bytes"] > 0
         ]
     )
+    scope = {
+        "pid": mark["pid"],
+        "created_filetime": mark["created_filetime"],
+        "cuda_uuid": cuda_uuid,
+        "pool_card_index": mark["card_index"],
+        "zero_card_index": zero["card_index"],
+        "dedicated_missing_after_output": ded["missing_active_polls"],
+        "shared_missing_after_output": shared["missing_active_polls"],
+    }
+    if archived_owned_zero:
+        from scripts.ci.scail_plural.completed_job import ordered_owned_zero
+        claim, _ = completed_job
+        scope.update(ordered_owned_zero(guard, end, card, claim, last_used))
+        return scope
     for key, series in (("dedicated", ded), ("shared", shared)):
         misses = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]
         if len(misses) != series["missing_active_polls"]:
@@ -444,12 +458,4 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
                 and e["local_filetime_before"] >= series["samples"][-1][0]
             ):
                 return None
-    return {
-        "pid": mark["pid"],
-        "created_filetime": mark["created_filetime"],
-        "cuda_uuid": cuda_uuid,
-        "pool_card_index": mark["card_index"],
-        "zero_card_index": zero["card_index"],
-        "dedicated_missing_after_output": ded["missing_active_polls"],
-        "shared_missing_after_output": shared["missing_active_polls"],
-    }
+    return scope

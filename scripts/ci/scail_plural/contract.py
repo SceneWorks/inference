@@ -203,7 +203,14 @@ class IncompleteWddmSamples(ValueError):
     """A released render with a genuine missing poll in an otherwise valid sample series."""
 
 
-def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision, *, completed_job=None):
+def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision, *,
+                 completed_job=None, archived_owned_zero=False):
+    if archived_owned_zero:
+        from scripts.ci.scail_plural.completed_job import OWNED_ZERO_CAPTURE
+        if (backend != "candle-cuda" or approved.cuda_device_uuid != GPU0 or count not in (3, 5)
+                or revision != OWNED_ZERO_CAPTURE["inference_revision"] or completed_job is None
+                or completed_job[1] != "owned-job-completion"):
+            raise ValueError("unexpected source for archived owned-zero evidence")
     validate_native(data, backend, count)
     validate_admission(guard["admission"], policy_sha256=approved.sha256)
     if (
@@ -312,7 +319,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
                     or (completed_job is not None and admission["pollMillis"] != approved.poll_millis)):
                 raise ValueError("rejected CUDA attempt budget differs from the approved guard")
         growth, growth_count = tenant_growth(guard, uuid)
-        stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job)
+        stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job,
+                             archived_owned_zero=archived_owned_zero)
         if stage is not None and (incomplete or "basis" in stage):
             scope = stage
             incomplete = False
