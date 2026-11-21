@@ -146,7 +146,7 @@ def retain_logs(work, artifact, receipt, phases=PHASES):
 
 
 def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None,
-           arguments=()):
+           arguments=(), capture_cuda_basis=False):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -156,13 +156,14 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         env["SCENEWORKS_METAL_EXECUTION_LOCK_FD"] = fd
         fds = (int(fd),)
     stderr_path = out / "stderr.log"
+    probe = (PairCudaProbe(policy, out / "cuda-pool.json")
+             if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
     try:
         guard = run_guarded([str(binary), *(["--preflight"] if preflight else []), *arguments],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
-                            probe=PairCudaProbe(policy, out / "cuda-pool.json")
-                            if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
+                            probe=probe)
     except SupervisionError as error:
         proof.write_json(out / "supervisor.json", {
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
@@ -183,7 +184,10 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         if tail:
             print(proof.redact(tail, env), file=sys.stderr)
         raise
-    proof.write_json(out / "supervisor.json", asdict(guard), owned=out.parent)
+    summary = asdict(guard)
+    if capture_cuda_basis and probe is not None:
+        summary["cuda_attribution"] = probe.measurement()
+    proof.write_json(out / "supervisor.json", summary, owned=out.parent)
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 

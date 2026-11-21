@@ -22,6 +22,7 @@ class FakeSystem:
         self.global_used = global_used
 
     def gpu_free_and_tree_bytes(self, owner):
+        self.last_global_used_upper_bound_bytes = self.global_used
         return 1000 * MIB, self.global_used
 
 
@@ -31,11 +32,8 @@ class PairCudaProbeTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "cuda-pool.json"
         policy = SimpleNamespace(cuda_device_uuid=UUID, child_gpu_cap_bytes=256 * MIB)
-        self.probe = PairCudaProbe.__new__(PairCudaProbe)
-        self.probe.policy = policy
-        self.probe.proof_path = self.path
-        self.probe.system = FakeSystem()
-        self.probe.gpu_usage_basis = "owned-process-attributed"
+        with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=FakeSystem()):
+            self.probe = PairCudaProbe(policy, self.path)
         self.owner = SimpleNamespace(members=lambda: {123})
 
     def write(self, **changes):

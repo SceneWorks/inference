@@ -57,6 +57,10 @@ class PairCudaProbe:
         self.policy = policy
         self.proof_path = proof_path
         self.system = SystemProbe(policy)
+        self.pid_peak_bytes = 0
+        self.unknown_pid_polls = 0
+        self.global_upper_bytes = 0
+        self.pool_fallback_peak_bytes = 0
         self.gpu_usage_basis = "owned-process-attributed"
 
     def __getattr__(self, name):
@@ -66,7 +70,10 @@ class PairCudaProbe:
         free, used = self.system.gpu_free_and_tree_bytes(owner)
         self.gpu_usage_basis = self.system.gpu_usage_basis
         if self.gpu_usage_basis != "global-used-upper-bound":
+            self.pid_peak_bytes = max(self.pid_peak_bytes, used)
             return free, used
+        self.unknown_pid_polls += 1
+        self.global_upper_bytes = max(self.global_upper_bytes, self.system.last_global_used_upper_bound_bytes)
         # The upper bound remains the cap input even when the child proof is
         # available. An unrelated process can only make that bound stricter.
         row = _read_pool_proof(self.proof_path)
@@ -90,4 +97,9 @@ class PairCudaProbe:
         if used > self.policy.child_gpu_cap_bytes:
             raise SupervisionError("device-memory", "WDDM global use exceeded child cap")
         self.gpu_usage_basis = "owned-process-attributed"
+        self.pool_fallback_peak_bytes = max(self.pool_fallback_peak_bytes, values[3])
         return free, values[3]
+
+    def measurement(self):
+        return {"pid_peak_bytes": self.pid_peak_bytes, "unknown_pid_polls": self.unknown_pid_polls,
+                "global_upper_bytes": self.global_upper_bytes, "pool_fallback_peak_bytes": self.pool_fallback_peak_bytes}
