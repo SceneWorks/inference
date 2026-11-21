@@ -17,7 +17,7 @@ from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as 
 from scripts.ci import wddm_process_memory as wddm
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.ci.scail_plural import contract as c
-from scripts.ci.scail_plural.cuda_stage import RenderEnd
+from scripts.ci.scail_plural.cuda_stage import KeepSystemGrowth, RenderEnd
 from scripts.ci.scail_plural.wddm_retry import SameTickSamples
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
@@ -75,6 +75,7 @@ class Observer:
         self.render_end = RenderEnd() if cuda else None
         self.shared = None
         if cuda is not None:
+            cuda.system = KeepSystemGrowth(cuda.system)
             cuda.dedicated = SameTickSamples(cuda.dedicated, approved.poll_millis)
             self.shared = SameTickSamples(
                 wddm.DedicatedSamples(cuda.dedicated_adapter, approved.cuda_device_uuid, shared=True),

@@ -1,13 +1,53 @@
 """Evidence for the end of a completed SCAIL CUDA render on its original Job."""
 
+import time
+
 
 def nonnegative(value):
     return type(value) is int and value >= 0
 
 
+class KeepSystemGrowth:
+    """Observe the existing supervisor read before PairCudaProbe may return pool bytes."""
+
+    def __init__(self, system):
+        self.system = system
+        self.current = None
+
+    def __getattr__(self, name):
+        return getattr(self.system, name)
+
+    def gpu_free_and_tree_bytes(self, owner):
+        self.current = None
+        free, used = self.system.gpu_free_and_tree_bytes(owner)
+        if self.system.gpu_usage_basis == "global-used-upper-bound":
+            self.current = {
+                "read_ns": time.monotonic_ns(),
+                "cuda_uuid": self.system.policy.cuda_device_uuid,
+                "free_bytes": free,
+                "global_used_upper_bytes": self.system.last_global_used_upper_bound_bytes,
+                "child_growth_bytes": used,
+            }
+        return free, used
+
+
 def tenant_growth(guard, cuda_uuid):
     """The supervisor already adjusts the deductible baseline as each tenant exits."""
+
+    def valid_charge(growth, absolute):
+        baseline = guard["admission"].get("gpuGlobalUsedBaselineBytes")
+        return (
+            nonnegative(baseline)
+            and nonnegative(growth)
+            and nonnegative(absolute)
+            and max(0, absolute - baseline)
+            <= growth
+            <= absolute
+            <= guard["cuda_attribution"]["global_upper_bytes"]
+        )
+
     peak = 0
+    absolute_peak = 0
     seen = 0
     last = 0
     for row in guard["samples"]:
@@ -19,9 +59,7 @@ def tenant_growth(guard, cuda_uuid):
         )
         if not (
             row["cudaDeviceUuid"] == cuda_uuid
-            and nonnegative(growth)
-            and nonnegative(absolute)
-            and growth <= absolute <= guard["cuda_attribution"]["global_upper_bytes"]
+            and valid_charge(growth, absolute)
             and nonnegative(row["gpuFreeBytes"])
             and type(row["at_ns"]) is int
             and row["at_ns"] > last
@@ -30,6 +68,50 @@ def tenant_growth(guard, cuda_uuid):
         last = row["at_ns"]
         seen += 1
         peak = max(peak, growth)
+        absolute_peak = max(absolute_peak, absolute)
+    raw = guard["fit_observation"]
+    end = raw.get("cuda_render_end")
+    if end is not None:
+        card = raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"]
+        entries = end["pool_growth"]
+        if len(entries) != end["pool_ticks"]:
+            raise ValueError("missing original growth for a substituted CUDA pool tick")
+        last_index = -1
+        for entry in entries:
+            i = entry["card_index"]
+            growth = entry["child_growth_bytes"]
+            if not (
+                nonnegative(i)
+                and last_index < i < len(card)
+                and entry["cuda_uuid"] == cuda_uuid
+                and nonnegative(entry["read_ns"])
+                and (card[i - 1][0] if i else 0)
+                < entry["read_ns"]
+                <= entry["at_ns"]
+                == card[i][0]
+                and nonnegative(entry["free_bytes"])
+                and entry["free_bytes"] == card[i][1]
+                and valid_charge(growth, entry["global_used_upper_bytes"])
+            ):
+                raise ValueError("invalid tenant growth at CUDA pool substitution")
+            peak = max(peak, growth)
+            last_index = i
+            absolute_peak = max(absolute_peak, entry["global_used_upper_bytes"])
+        if absolute_peak != guard["cuda_attribution"]["global_upper_bytes"]:
+            raise ValueError(
+                "CUDA growth evidence does not reproduce the card high-water mark"
+            )
+        if entries and (
+            end["pool"] is None
+            or entries[0]["card_index"] != end["pool"]["card_index"]
+            or any(
+                card[e["card_index"]][2] != end["pool"]["pool_reserved_high_bytes"]
+                for e in entries
+            )
+        ):
+            raise ValueError(
+                "CUDA pool growth differs from the verified render-end marker"
+            )
     return peak, seen
 
 
@@ -51,7 +133,7 @@ def original_root(owner, pid, created):
 
 class RenderEnd:
     def __init__(self):
-        self.record = {"pool": None, "zero": None, "pool_ticks": 0}
+        self.record = {"pool": None, "zero": None, "pool_ticks": 0, "pool_growth": []}
 
     def before(self, owner):
         mark = self.record["pool"]
@@ -69,7 +151,15 @@ class RenderEnd:
         if native_pool:
             # PairCudaProbe has just read and validated the atomic, post-output
             # cuda-pool.json against this Job PID, CUDA UUID, cap and raw pool.
+            original = probe.system.current
+            if original is None:
+                raise ValueError(
+                    "missing original supervised growth before CUDA pool substitution"
+                )
             raw["pool_ticks"] += 1
+            raw["pool_growth"].append(
+                dict(original, card_index=card_index, at_ns=at_ns)
+            )
             if mark is None:
                 series = probe.dedicated.record
                 if used <= 0 or probe.pool_fallback_peak_bytes != used:
