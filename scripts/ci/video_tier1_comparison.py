@@ -363,8 +363,8 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
         peaks["mlx_allocator_peak_bytes"] = allocator_peak
     if backend == "candle-cuda":
         if (cuda_pool["pid"] != guard["pid"] or cuda_pool["cudaDeviceUuid"] != policy.cuda_device_uuid
-                or not evidence.positive_int(guard["peak_gpu_bytes"])
-                or guard["peak_gpu_bytes"] > policy.child_gpu_cap_bytes):
+                or (guard["peak_gpu_bytes"] is not None and (not evidence.positive_int(guard["peak_gpu_bytes"])
+                    or guard["peak_gpu_bytes"] > policy.child_gpu_cap_bytes))):
             raise ValueError("supervised GPU observations do not match the child/physical UUID")
         used, used_high, reserved, reserved_high = [cuda_pool[key] for key in
             ("poolUsedBytes", "poolUsedHighBytes", "poolReservedBytes", "poolReservedHighBytes")]

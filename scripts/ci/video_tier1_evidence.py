@@ -96,7 +96,7 @@ def cuda_process(guard, pool_high, adapter=None):
     if not isinstance(row, dict) or set(row) != expected or any(type(row[k]) is not int or row[k] < 0 for k in fields):
         raise ValueError("invalid GPU measurement provenance")
     pid, upper, pool = row["pid_peak_bytes"], row["global_upper_bytes"], row["pool_fallback_peak_bytes"]
-    if guard["peak_gpu_bytes"] != max(pid, pool) or pool > pool_high:
+    if guard["peak_gpu_bytes"] != (max(pid, pool) or None) or pool > pool_high:
         raise ValueError("GPU high-water attribution differs from the supervisor or native pool")
     if row["unknown_pid_polls"] == 0:
         if not pid or upper or pool:
@@ -106,10 +106,13 @@ def cuda_process(guard, pool_high, adapter=None):
         if upper <= 0:
             raise ValueError("missing whole-card upper bound for an unknown owned PID")
         observed = {"basis": "wddm-bounded", "lower": max(pid, pool_high), "upper": max(pid, pool_high, upper)}
+    peak = None
     if adapter is not None:
         from scripts.ci import wddm_process_memory
         peak = wddm_process_memory.sampled_peak(row["wddm_dedicated"], pid=guard["pid"], adapter=adapter)
         observed["dedicated"] = {"adapter": adapter, "sampled_peak_bytes": peak}
+    if guard["peak_gpu_bytes"] is None and peak is None:
+        raise ValueError("missing attributable GPU sample from the guard or dedicated process counter")
     return {**observed, **{k: row[k] for k in fields}}
 
 

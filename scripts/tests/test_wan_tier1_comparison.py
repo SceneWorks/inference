@@ -168,6 +168,23 @@ class WanEvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     pair.evaluate(observation, self.case, "candle-cuda", policy, pair.SETTINGS, log, guard, bad_pool)
 
+            from scripts.ci import wddm_process_memory as wddm
+            adapter = {"cuda_uuid": policy.cuda_device_uuid, "luid": "luid_0x00000000_0x00000001",
+                       "physical_node": 0, "node_mask": 1, "counter": wddm.COUNTER}
+            guard.update(peak_gpu_bytes=None, cuda_attribution={
+                "pid_peak_bytes": 0, "unknown_pid_polls": 2, "global_upper_bytes": 180,
+                "pool_fallback_peak_bytes": 0, "wddm_dedicated": {"pid": 17, "created_filetime": 123,
+                    "adapter": adapter, "samples": [[130, 111], [140, 120]], "error": None, "missing_active_polls": 0}})
+            result = pair.evaluate(observation, self.case, "candle-cuda", policy, pair.SETTINGS, stdout, guard, pool, adapter)
+            self.assertEqual(result["cuda_process"]["dedicated"]["sampled_peak_bytes"], 120)
+            self.assertEqual(result["peaks"]["cuda_pool_reserved_high_bytes"], 64)
+            for invalid in (dict(pool, pid=18), dict(pool, poolReservedHighBytes=65)):
+                with self.assertRaises(ValueError):
+                    pair.evaluate(observation, self.case, "candle-cuda", policy, pair.SETTINGS, stdout, guard, invalid, adapter)
+            guard["cuda_attribution"]["wddm_dedicated"]["missing_active_polls"] = 1
+            with self.assertRaisesRegex(ValueError, "missing attributable GPU sample"):
+                pair.evaluate(observation, self.case, "candle-cuda", policy, pair.SETTINGS, stdout, guard, pool, adapter)
+
     def test_upload_verifier_replays_raw_parity_and_detects_missing_or_tampered_evidence(self):
         backend = "candle-cuda"
         plan = {"backend": backend, "cases": [self.case], "base": pair.BASE, "head": "1" * 40,

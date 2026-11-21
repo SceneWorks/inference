@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import stat
 
-from scripts.ci.wddm_process_memory import DedicatedSamples
+from scripts.ci.wddm_process_memory import DedicatedSamples, sampled_peak
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
 _MISSING = object()
@@ -58,6 +58,7 @@ class PairCudaProbe:
         self.policy = policy
         self.proof_path = proof_path
         self.system = SystemProbe(policy)
+        self.dedicated_adapter = dedicated_adapter
         self.dedicated = (DedicatedSamples(dedicated_adapter, policy.cuda_device_uuid)
                           if dedicated_adapter is not None else None)
         self.pid_peak_bytes = 0
@@ -70,10 +71,15 @@ class PairCudaProbe:
         return getattr(self.system, name)
 
     def gpu_free_and_tree_bytes(self, owner):
-        free, used = self.system.gpu_free_and_tree_bytes(owner)
+        try:
+            free, used = self.system.gpu_free_and_tree_bytes(owner)
+        except SupervisionError:
+            # A failed NVIDIA read can be retried or tolerated by the watchdog.
+            # Collect PDH on this attempt too, treating an absent live gauge as a gap.
+            self._poll_dedicated(owner, cuda_active=True)
+            raise
         self.gpu_usage_basis = self.system.gpu_usage_basis
-        if self.dedicated is not None:
-            self.dedicated.poll(owner, cuda_active=self.gpu_usage_basis == "global-used-upper-bound" or used > 0)
+        self._poll_dedicated(owner, cuda_active=self.gpu_usage_basis == "global-used-upper-bound" or used > 0)
         if self.gpu_usage_basis != "global-used-upper-bound":
             self.pid_peak_bytes = max(self.pid_peak_bytes, used)
             return free, used
@@ -104,6 +110,23 @@ class PairCudaProbe:
         self.gpu_usage_basis = "owned-process-attributed"
         self.pool_fallback_peak_bytes = max(self.pool_fallback_peak_bytes, values[3])
         return free, values[3]
+
+    def _poll_dedicated(self, owner, *, cuda_active):
+        if self.dedicated is not None:
+            self.dedicated.poll(owner, cuda_active=cuda_active)
+            samples = self.dedicated.record["samples"]
+            if samples and samples[-1][1] > self.policy.child_gpu_cap_bytes:
+                raise SupervisionError("device-memory", "WDDM dedicated process usage exceeded child cap")
+
+    def completed_process_gpu_sample(self, pid):
+        if self.dedicated is None:
+            return False
+        # Close also records a PDH error, which must invalidate the completion witness.
+        self.dedicated.close()
+        try:
+            return sampled_peak(self.dedicated.record, pid=pid, adapter=self.dedicated_adapter) is not None
+        except ValueError as error:
+            raise SupervisionError("probe-failure", str(error)) from error
 
     def close(self):
         if self.dedicated is not None:
