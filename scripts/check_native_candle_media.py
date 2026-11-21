@@ -10,7 +10,7 @@ from native_projection_llm_audio import _production
 # normal model path. Extra entries cover distinct formats or source adapters in the same family.
 ROUTES = {
     "anima": ("loader:mmap_var_builder(", "vae:remap_file_var_builder(", "nn:Linear::from_var_builder("),
-    "bernini": ("components:component_vb(", "nn:Linear::from_var_builder("),
+    "bernini": ("components:component_vb(", "nn:Linear::from_var_builder(", "vision:native_linear_weight_flattened("),
     "boogu": ("pipeline:Weights::from_dir(", "loader:st.linear("),
     "chroma": ("pipeline:load_sorted_mmap(", "quant:Self::linear_detect_gs("),
     "clip": ("lib:mmap_var_builder(", "lib:w.linear("),
