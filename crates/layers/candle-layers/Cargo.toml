@@ -1,0 +1,29 @@
+[package]
+name = "candle-layers"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+description = "Lower-level Candle linear, quantization, and residual adapter primitives shared below media and LLM engines"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal"]
+model-inference-proof = [
+    "candle-quant-kernels/model-inference-proof",
+    "sceneworks-gen-core/model-inference-proof",
+    "candle-core/model-inference-proof",
+    "core-llm/model-inference-proof",
+]
+
+[dependencies]
+sceneworks-gen-core = { workspace = true }
+core-llm = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-quant-kernels = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+safetensors = "0.7"
+half = "2"
+rayon = "1"

@@ -388,6 +388,7 @@ fn install_collector(
     decode_control: Option<BenchmarkDecodeControl>,
     phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    crate::ensure_exact_epilogue_hooks();
     COLLECTOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {

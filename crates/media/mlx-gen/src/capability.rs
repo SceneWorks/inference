@@ -153,6 +153,7 @@ pub struct CapabilityOptOut {
 impl CapabilityOptOut {
     /// Opt this thread out of `capability` until the returned guard drops.
     pub fn install(capability: PipelineCapability) -> Self {
+        crate::ensure_exact_epilogue_hooks();
         let prev = with_opt_out(capability, |cell| cell.replace(true));
         Self { capability, prev }
     }

@@ -53,7 +53,6 @@ pub use diff::*;
 
 use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::add;
-use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use super::{

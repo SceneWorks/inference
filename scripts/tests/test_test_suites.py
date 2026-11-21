@@ -217,7 +217,7 @@ class TestSuites(unittest.TestCase):
         normal = yaml.safe_load((suites.ROOT / '.github/workflows/ci.yml').read_text(encoding="utf-8"))['jobs']
         manual = yaml.safe_load((suites.ROOT / '.github/workflows/model-test-suites.yml').read_text(encoding="utf-8"))['jobs']
         base = next(row for row in manual['candle-cpu']['strategy']['matrix']['include'] if row['group'] == 'base')
-        self.assertEqual(base['packages'], '-p candle-llm -p candle-quant-kernels -p candle-audio* -p runtime-cpu -p sceneworks-gen-cv')
+        self.assertEqual(base['packages'], '-p candle-llm -p candle-quant-kernels -p candle-layers -p candle-audio* -p runtime-cpu -p sceneworks-gen-cv')
         self.assertEqual(base['targets'], '--lib')
         cpu = next(step for step in manual['candle-cpu']['steps'] if step.get('name') == 'Run former CPU conformance and bundle baselines')
         for command in (
@@ -403,7 +403,7 @@ class TestSuites(unittest.TestCase):
         self.assertEqual(len(steps), 2)
         self.assertEqual([step["if"] for step in steps], ["matrix.group == 'base'", "matrix.group == 'gen'"])
         selectors = [
-            "-p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv",
+            "-p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv",
             "-p 'candle-gen*'",
         ]
         targets = ["--lib", "--lib --tests"]

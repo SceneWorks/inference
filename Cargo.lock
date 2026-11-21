@@ -495,6 +495,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-layers",
  "candle-nn",
  "candle-quant-kernels",
  "float8",
@@ -1246,6 +1247,22 @@ name = "candle-kernels"
 version = "0.10.2"
 dependencies = [
  "cudaforge",
+]
+
+[[package]]
+name = "candle-layers"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-quant-kernels",
+ "core-llm",
+ "half",
+ "rayon",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2537,6 +2554,7 @@ dependencies = [
  "image",
  "libc",
  "memmap2",
+ "mlx-layers",
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
@@ -3245,6 +3263,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "mlx-layers"
+version = "0.1.0"
+dependencies = [
+ "core-llm",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "sceneworks-gen-core",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

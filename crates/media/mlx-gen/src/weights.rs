@@ -485,7 +485,23 @@ f,
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
     }
+}
 
+impl mlx_layers::MlxWeightSource for Weights {
+    fn get(&self, key: &str) -> Option<&Array> {
+        Weights::get(self, key)
+    }
+
+    fn require(&self, key: &str) -> Result<&Array> {
+        Weights::require(self, key)
+    }
+
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        Weights::convrot_rotation(self, group, build)
+    }
+}
+
+impl Weights {
     /// Cast every tensor to `dtype` in place — mirrors the way a reference loader downcasts the
     /// whole checkpoint at load (e.g. the vendored SDXL `_load_safetensor_weights(..., float16=True)`
     /// applies `v.astype(mx.float16)` to every tensor). A no-op when `dtype` already matches.
