@@ -122,8 +122,8 @@ impl Wan {
         // freed UMT5 TE / VAE-encoder don't linger in MLX's buffer cache (RSS / wired footprint) through
         // the denoise + decode that follow. `Resident` (default) leaves the cache warm — the
         // byte-identical pre-offload path (residency/lifetime change only, numerics untouched).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || crate::i2v_memory_strategy::staged(req);
+        let offload = crate::i2v_memory_strategy::effective_offload(self.offload_policy, req);
+        let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);

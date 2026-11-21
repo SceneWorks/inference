@@ -212,8 +212,8 @@ impl Wan14b {
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
         // byte-identical pre-swap path (both experts co-resident, no per-stage `clear_cache`).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || crate::i2v_memory_strategy::staged(req);
+        let offload = crate::i2v_memory_strategy::effective_offload(self.offload_policy, req);
+        let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -270,7 +270,7 @@ impl Wan14b {
         preflight_denoise_memory_guard(
             self.descriptor.id,
             wan14b_denoise_resident_bytes(
-                self.offload_policy,
+                offload,
                 req.sampler.as_deref(),
                 low_bytes.saturating_add(low_adapter_bytes),
                 high_bytes.saturating_add(high_adapter_bytes),

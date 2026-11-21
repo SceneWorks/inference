@@ -99,7 +99,7 @@ pub(crate) fn dense_denoise_facts(
             (
                 A14bProviderVae::VAE_TILING,
                 wan14b_denoise_resident_bytes(
-                    spec.offload_policy,
+                    crate::i2v_memory_strategy::effective_offload(spec.offload_policy, req),
                     req.sampler.as_deref(),
                     low.saturating_add(low_adapters),
                     high.saturating_add(high_adapters),
