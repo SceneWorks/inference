@@ -277,14 +277,19 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertEqual(job['runs-on'], ['self-hosted', 'windows', 'cuda'])
         self.assertEqual(job['timeout-minutes'], 5)
         self.assertEqual(job['env'], {'CUDA_VISIBLE_DEVICES': '-1'})
-        self.assertEqual(len(job['steps']), 3)
-        checkout, capture, upload = job['steps']
+        self.assertEqual(len(job['steps']), 5)
+        checkout, capture, interpreter, pdh, upload = job['steps']
         self.assertRegex(checkout['uses'], r'^actions/checkout@[0-9a-f]{40}$')
         self.assertEqual(capture['shell'], 'powershell')
         self.assertIn('.\\scripts\\ci\\windows-gpu1-diagnostic.ps1 -OutputDirectory $out', capture['run'])
         self.assertEqual(upload['if'], 'always()')
         self.assertRegex(upload['uses'], r'^actions/upload-artifact@[0-9a-f]{40}$')
-        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/gpu1-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/evidence.json')
+        self.assertIn('locate-existing-reviewed-python-without-installation.cmd', interpreter['run'])
+        self.assertIn('$env:CUDA_VISIBLE_DEVICES = $uuid', pdh['run'])
+        self.assertIn('wddm_process_memory.py --cuda-uuid $uuid --diagnose-luid $luid', pdh['run'])
+        self.assertEqual(upload['with']['path'].splitlines(),
+                         ['${{ runner.temp }}/gpu1-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/' + name
+                          for name in ('evidence.json', 'pdh.json')])
         self.assertEqual(upload['with']['retention-days'], 3)
 
     def test_collector_has_no_admission_or_process_control_or_product_api(self):

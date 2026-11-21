@@ -9,6 +9,7 @@ from contextlib import contextmanager
 COUNTER = r"\GPU Process Memory(*)\Dedicated Usage"
 NO_INSTANCE = 0x800007D1
 NO_DATA = 0x800007D5
+MORE_DATA = 0x800007D2
 LARGE_RAWCOUNT = 0x10100
 UUID = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 LUID = re.compile(r"luid_0x[0-9a-f]{8}_0x[0-9a-f]{8}")
@@ -73,6 +74,21 @@ class _Raw(C.Structure):
                 ("first", C.c_int64), ("second", C.c_int64), ("multi", DWORD)]
 
 
+class _RawItem(C.Structure):
+    _fields_ = [("name", C.c_wchar_p), ("raw", _Raw)]
+
+
+def _sample(raw):
+    if raw.status == NO_INSTANCE:
+        return None
+    if raw.status not in (0, 1) or raw.first < 0:
+        raise OSError(f"invalid PDH byte gauge status/value 0x{raw.status:x}/{raw.first}")
+    stamp = raw.stamp_high << 32 | raw.stamp_low
+    if not stamp:
+        raise OSError("PDH byte gauge has no provider timestamp")
+    return [stamp, raw.first]
+
+
 class _Pdh:
     def __init__(self):
         dll = C.WinDLL("pdh.dll", winmode=0x800)
@@ -80,25 +96,51 @@ class _Pdh:
         self.add = _function(dll, "PdhAddEnglishCounterW", [HANDLE, C.c_wchar_p, C.c_size_t, C.POINTER(HANDLE)])
         self.collect = _function(dll, "PdhCollectQueryData", [HANDLE])
         self.raw = _function(dll, "PdhGetRawCounterValue", [HANDLE, C.POINTER(DWORD), C.POINTER(_Raw)])
+        self.array = _function(dll, "PdhGetRawCounterArrayW", [HANDLE, C.POINTER(DWORD), C.POINTER(DWORD), HANDLE])
         self.close = _function(dll, "PdhCloseQuery", [HANDLE])
 
     def read(self, handle):
         kind, raw = DWORD(), _Raw()
         _check(self.raw(handle, C.byref(kind), C.byref(raw)), "PdhGetRawCounterValue")
-        if raw.status == NO_INSTANCE:
-            return None
-        if raw.status not in (0, 1) or kind.value != LARGE_RAWCOUNT or raw.first < 0:
-            raise OSError(f"invalid PDH byte gauge status/type 0x{raw.status:x}/0x{kind.value:x}")
-        stamp = raw.stamp_high << 32 | raw.stamp_low
-        if not stamp:
-            raise OSError("PDH byte gauge has no provider timestamp")
-        return [stamp, raw.first]
+        if raw.status != NO_INSTANCE and kind.value != LARGE_RAWCOUNT:
+            raise OSError(f"invalid PDH byte gauge type 0x{kind.value:x}")
+        return _sample(raw)
+
+    def selected_rows(self, counter, instance):
+        # PdhGetRawCounterArrayW returns the actual instance name with each raw
+        # sample. Do not depend on the value obtained by requesting an index
+        # the provider may alias. No foreign process identities/bytes are retained.
+        for _ in range(3):
+            size, count = DWORD(), DWORD()
+            status = self.array(counter, C.byref(size), C.byref(count), None)
+            if status == NO_DATA or (status == 0 and not size.value and not count.value):
+                return []
+            if status != MORE_DATA:
+                _check(status, "PdhGetRawCounterArrayW sizing")
+            if not 0 < size.value <= 16 * 1024**2:
+                raise OSError("invalid PDH counter array size")
+            buffer = C.create_string_buffer(size.value)
+            status = self.array(counter, C.byref(size), C.byref(count), buffer)
+            if status == MORE_DATA:
+                continue  # Windows requires sizing again, not trusting this call's length
+            if status == NO_DATA:
+                return []
+            _check(status, "PdhGetRawCounterArrayW")
+            if count.value * C.sizeof(_RawItem) > size.value or size.value > len(buffer):
+                raise OSError("invalid PDH counter array length")
+            items = (_RawItem * count.value).from_buffer(buffer)
+            selected = []
+            for item in items:
+                name = (item.name or "").casefold()
+                base = name.partition("#")[0]
+                if base == instance:
+                    selected.append((name, _sample(item.raw)))
+            return selected
+        raise OSError("PDH counter array size kept changing")
 
 
 @contextmanager
-def _query(adapter, pid=None):
-    # Check both the exact occurrence and its first duplicate; selecting #0 alone
-    # would silently pick a value if Windows exposed an ambiguous instance name.
+def _query(adapter, pid=None, *, diagnostic=None):
     instance = f"{adapter['luid']}_phys_{adapter['physical_node']}"
     category = "GPU Adapter Memory"
     if pid is not None:
@@ -107,39 +149,55 @@ def _query(adapter, pid=None):
     api, query = _Pdh(), HANDLE()
     _check(api.open(None, 0, C.byref(query)), "PdhOpenQueryW")
     try:
-        counters = []
-        for suffix in ("", "#1"):
-            path = rf"\{category}({instance}{suffix})\Dedicated Usage"
-            counter = HANDLE()
-            _check(api.add(query, path, 0, C.byref(counter)), "PdhAddEnglishCounterW")
-            counters.append(counter)
+        def counter(name):
+            handle = HANDLE()
+            path = rf"\{category}({name})\Dedicated Usage"
+            _check(api.add(query, path, 0, C.byref(handle)), "PdhAddEnglishCounterW")
+            return handle
+
+        wildcard = counter("*")
+        exact = counter(instance)
+        indexed = counter(instance + "#1") if diagnostic is not None else None
 
         def read():
             status = api.collect(query)
             if status != NO_DATA:
                 _check(status, "PdhCollectQueryData")
-            primary, duplicate = [api.read(counter) for counter in counters]
-            if duplicate is not None:
-                raise OSError("ambiguous PDH dedicated-memory instance")
-            if status == NO_DATA and primary is not None:
-                raise OSError("inconsistent empty PDH collection")
-            return primary
+            rows = api.selected_rows(wildcard, instance)
+            if diagnostic is not None:
+                diagnostic.update(instance=instance, enumerated_count=len(rows), enumerated=rows[:2],
+                                  scalar=api.read(exact), scalar_index_one=api.read(indexed))
+            if len(rows) > 1 or (rows and rows[0][0] not in (instance, instance + "#0")):
+                raise OSError("ambiguous enumerated PDH dedicated-memory instance")
+            if not rows or rows[0][1] is None:
+                return None
+            # The scalar call supplies lpdwType. Source the number and instance
+            # identity from the array. Both must be live in this collection.
+            if status == NO_DATA or api.read(exact) is None:
+                raise OSError("inconsistent PDH instance/type observation")
+            return rows[0][1]
 
         yield read
     finally:
         _check(api.close(query), "PdhCloseQuery")
 
 
-def preflight(cuda_uuid):
+def preflight(cuda_uuid, *, diagnostic=None, expected_luid=None):
     if os.name != "nt":
         raise ValueError("Windows WDDM preflight requires the Windows runner")
     adapter = validate_adapter(_adapter(cuda_uuid), cuda_uuid)
-    with _query(adapter) as read:
+    if expected_luid is not None and adapter["luid"] != expected_luid:
+        raise ValueError("CUDA adapter LUID differs from the PCI-mapped Windows adapter")
+    adapter_query = {}
+    process_query = {}
+    if diagnostic is not None:
+        diagnostic.update(adapter=adapter, adapter_query=adapter_query, process_query=process_query)
+    with _query(adapter, diagnostic=adapter_query if diagnostic is not None else None) as read:
         if read() is None:
             raise ValueError("PDH cannot read the selected adapter's dedicated-memory gauge")
     # Add the exact English process counter before scheduling costly builds. A
     # host process without a GPU instance may legitimately return NO_INSTANCE.
-    with _query(adapter, os.getpid()) as read:
+    with _query(adapter, os.getpid(), diagnostic=process_query if diagnostic is not None else None) as read:
         read()
     return adapter
 
@@ -236,4 +294,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Read selected CUDA adapter and PDH metadata without model execution.")
     parser.add_argument("--cuda-uuid", required=True)
-    print(json.dumps(preflight(parser.parse_args().cuda_uuid), sort_keys=True))
+    parser.add_argument("--diagnose-luid", help="Cross-check this PCI-mapped LUID and report actual and indexed PDH rows.")
+    args = parser.parse_args()
+    if args.diagnose_luid is None:
+        print(json.dumps(preflight(args.cuda_uuid), sort_keys=True))
+    else:
+        report = {}
+        try:
+            preflight(args.cuda_uuid, expected_luid=args.diagnose_luid, diagnostic=report)
+            report["completed"] = True
+        except (OSError, ValueError) as exc:
+            report.update(completed=False, error=str(exc))
+        print(json.dumps(report, sort_keys=True))
+        raise SystemExit(0 if report["completed"] else 1)

@@ -49,17 +49,57 @@ class WindowsDedicatedMemoryTests(TestCase):
             with self.assertRaises(ValueError):
                 run(devices, mask)
 
-    def test_targeted_exact_query_rejects_duplicate_and_closes_on_failure(self):
+    def test_actual_instance_array_controls_uniqueness_even_if_scalar_index_aliases(self):
         api = MagicMock()
         api.open.return_value = api.add.return_value = api.collect.return_value = api.close.return_value = 0
-        api.read.side_effect = [[10, 512], [10, 12]]
-        with patch.object(wddm, "_Pdh", return_value=api), self.assertRaisesRegex(OSError, "ambiguous"):
-            with wddm._query(ADAPTER, PID) as read:
-                read()
+        name = f"pid_{PID}_{LUID}_phys_0"
+        sample = [10, 512]
+        api.read.return_value = sample
+        with patch.object(wddm, "_Pdh", return_value=api):
+            diagnostic = {}
+            with wddm._query(ADAPTER, PID, diagnostic=diagnostic) as read:
+                api.selected_rows.return_value = [(name, sample)]
+                self.assertEqual(read(), sample)
+                self.assertEqual(diagnostic["enumerated_count"], 1)
+                self.assertEqual(diagnostic["scalar"], diagnostic["scalar_index_one"])
+                for duplicate in (name, name + "#1"):
+                    api.selected_rows.return_value = [(name, sample), (duplicate, sample)]
+                    with self.assertRaisesRegex(OSError, "ambiguous"):
+                        read()
+                api.selected_rows.return_value = [(name + "#1", sample)]
+                with self.assertRaisesRegex(OSError, "ambiguous"):
+                    read()
+                api.selected_rows.return_value = []
+                self.assertIsNone(read())
         paths = [call.args[1] for call in api.add.call_args_list]
-        prefix = rf"\GPU Process Memory(pid_{PID}_{LUID}_phys_0"
-        self.assertEqual(paths, [prefix + suffix + r")\Dedicated Usage" for suffix in ("", "#1")])
+        self.assertEqual(paths, [rf"\GPU Process Memory({i})\Dedicated Usage" for i in ("*", name, name + "#1")])
         api.close.assert_called_once()
+
+    def test_native_array_two_pass_retry_reads_only_exact_pid_adapter_node(self):
+        name = f"pid_{PID}_{LUID}_phys_0"
+        names = [name.replace("pid_17", "pid_171"), name.replace("phys_0", "phys_1"),
+                 name.replace("22222222", "33333333"), name, name + "#1"]
+        strings = [ctypes.create_unicode_buffer(n) for n in names]
+        calls = []
+        def fill(counter, size, count, buf):
+            calls.append(buf is None)
+            if buf is None:
+                size._obj.value = ctypes.sizeof(wddm._RawItem) * len(names)
+                return wddm.MORE_DATA
+            if len(calls) == 2:
+                return wddm.MORE_DATA
+            rows = (wddm._RawItem * len(names)).from_buffer(buf)
+            count._obj.value = len(rows)
+            for i, row in enumerate(rows):
+                row.name = ctypes.cast(strings[i], ctypes.c_wchar_p)
+                row.raw.status = 0 if i >= 3 else 999
+                row.raw.stamp_low = 10
+                row.raw.first = 100 + i
+            return 0
+        api = wddm._Pdh.__new__(wddm._Pdh)
+        api.array = fill
+        self.assertEqual(api.selected_rows(None, name), [(name, [10, 103]), (name + "#1", [10, 104])])
+        self.assertEqual(calls, [True, False, True, False])
 
     def test_preflight_requires_selected_adapter_but_allows_an_unregistered_process(self):
         with patch.object(wddm.os, "name", "nt"), patch.object(wddm, "_adapter", return_value=ADAPTER):
