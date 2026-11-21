@@ -2,7 +2,7 @@ import copy
 import hashlib
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts.ci import scail2_plural_fit as runner
 from scripts.ci.scail_plural import contract as c
@@ -146,6 +146,17 @@ class PluralQualification(unittest.TestCase):
         ]:
             with self.assertRaises(ValueError):
                 c.validate_stage(bad, root)
+
+    def test_shared_gauge_accounts_for_a_retryable_failed_nvidia_tick(self):
+        base = MagicMock()
+        observer = runner.Observer.__new__(runner.Observer)
+        observer.base = base
+        observer.shared = MagicMock()
+        owner = object()
+        base.gpu_free_and_tree_bytes.side_effect = runner.SupervisionError("probe-failure", "NVIDIA timeout")
+        with self.assertRaisesRegex(runner.SupervisionError, "NVIDIA timeout"):
+            observer.gpu_free_and_tree_bytes(owner)
+        observer.shared.poll.assert_called_once_with(owner, cuda_active=True)
 
     def test_physical_measurements_require_owned_gpu_pool_proc_and_shared_counters(self):
         from types import SimpleNamespace

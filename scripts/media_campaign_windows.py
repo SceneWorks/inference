@@ -123,6 +123,8 @@ def _apis():
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
     kernel.IsProcessInJob.restype = wintypes.BOOL
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
     kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
@@ -212,6 +214,26 @@ class WindowsJob:
                 self.kernel.CloseHandle(thread)
         finally:
             self.kernel.CloseHandle(snapshot)
+
+    def root_identity(self, pid: int) -> tuple[int, bool]:
+        """Read the creation FILETIME and exit signal on the handle assigned to this Job."""
+        child = self._root
+        if child is None or child.pid != pid:
+            raise WindowsJobError("observed PID is not the assigned Job root")
+        # The process object, and therefore its PID, is pinned by Popen for the
+        # whole observation. Reopening by PID or requiring an image path can
+        # fail during teardown even though the original handle remains valid.
+        handle = child._handle
+        native_pid = self.kernel.GetProcessId(handle)
+        if not native_pid:
+            raise _failed("GetProcessId/Job-root")
+        if native_pid != pid:
+            raise WindowsJobError("retained Job root handle belongs to a different PID")
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not self.kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                           ctypes.byref(kernel), ctypes.byref(user)):
+            raise _failed("GetProcessTimes/Job-root")
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime, child.poll() is not None
 
     def exited_root_and_empty(self, pid: int) -> bool:
         """Check the original Popen process handle and the same non-breakaway Job."""

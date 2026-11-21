@@ -56,8 +56,7 @@ class PairCudaProbeTests(unittest.TestCase):
     def test_pdh_collects_on_failed_nvidia_tick_between_two_valid_samples(self):
         adapter = {"cuda_uuid": UUID, "luid": "luid_0x00000000_0x00000001", "node_mask": 1,
                    "physical_node": 0, "counter": wddm.COUNTER}
-        self.owner.member_identities = lambda pids: {"processes": [
-            {"pid": 123, "status": "owned-identity-resolved", "createdFileTime": 11}]}
+        self.owner.root_identity = lambda pid: (11, False)
         for middle, complete in ((None, False), ([21, 150], True)):
             with self.subTest(middle=middle), patch.object(wddm, "_query") as query:
                 system = FakeSystem()

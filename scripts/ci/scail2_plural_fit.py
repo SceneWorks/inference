@@ -17,7 +17,7 @@ from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as 
 from scripts.ci import wddm_process_memory as wddm
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.ci.scail_plural import contract as c
-from scripts.media_campaign_supervisor import SystemProbe
+from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
 
 def row(backend):
@@ -94,7 +94,14 @@ class Observer:
         return value
 
     def gpu_free_and_tree_bytes(self, owner):
-        free, used = self.base.gpu_free_and_tree_bytes(owner)
+        try:
+            free, used = self.base.gpu_free_and_tree_bytes(owner)
+        except SupervisionError:
+            # The watchdog can tolerate a failed NVIDIA tick. Account for the
+            # shared gauge on that tick just as PairCudaProbe does for dedicated.
+            if self.shared is not None:
+                self.shared.poll(owner, cuda_active=True)
+            raise
         self.shared.poll(owner, cuda_active=bool(self.base.dedicated.record["samples"]))
         self.card_samples.append([time.monotonic_ns(), free, used])
         return free, used

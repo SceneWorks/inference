@@ -20,8 +20,7 @@ PID = 17
 def owner():
     job = MagicMock()
     job.members.return_value = {PID}
-    job.member_identities.return_value = {"processes": [{"pid": PID, "status": "owned-identity-resolved",
-                                                         "createdFileTime": 999}]}
+    job.root_identity.return_value = (999, False)
     return job
 
 
@@ -162,6 +161,53 @@ class WindowsDedicatedMemoryTests(TestCase):
                 self.assertFalse(probe.record["samples"])
                 probe.close()
 
+    def test_both_counters_bracket_each_read_with_assigned_handle_even_when_image_lookup_fails(self):
+        from scripts.media_campaign_windows import WindowsJob
+        job = WindowsJob.__new__(WindowsJob)
+        job.kernel = MagicMock()
+        job._root = MagicMock(pid=PID)
+        job._root._handle = 12345
+        job._root.poll.return_value = None
+        job.members = MagicMock(return_value={PID})
+        job.kernel.GetProcessId.return_value = PID
+        def times(handle, created, *_):
+            self.assertEqual(handle, job._root._handle)
+            created._obj.dwHighDateTime = 2
+            created._obj.dwLowDateTime = 1
+            return True
+        job.kernel.GetProcessTimes.side_effect = times
+        for shared in (False, True):
+            with self.subTest(shared=shared), patch.object(wddm, "_query") as query:
+                job.kernel.reset_mock()
+                # In the former identity path a missing image or OpenProcess
+                # result poisoned the record even with the original handle live.
+                job.kernel.OpenProcess.return_value = 0
+                job.kernel.QueryFullProcessImageNameW.return_value = 0
+                query.return_value.__enter__.return_value.side_effect = [[10, 64], [11, 72]]
+                probe = wddm.DedicatedSamples(ADAPTER, GPU, shared=shared)
+                probe.poll(job, cuda_active=True)
+                probe.poll(job, cuda_active=True)
+                self.assertEqual(probe.record["created_filetime"], 2 << 32 | 1)
+                self.assertEqual(wddm.sampled_peak(probe.record, pid=PID, adapter=ADAPTER), 72)
+                self.assertEqual(job.kernel.GetProcessTimes.call_count, 4)
+                self.assertEqual([c.args for c in job.kernel.GetProcessId.call_args_list],
+                                 [(job._root._handle,)] * 4)
+                job.kernel.OpenProcess.assert_not_called()
+                job.kernel.QueryFullProcessImageNameW.assert_not_called()
+                probe.close()
+
+        job.kernel.GetProcessId.return_value = PID + 1
+        with self.assertRaisesRegex(RuntimeError, "different PID"):
+            job.root_identity(PID)
+        job.kernel.GetProcessId.return_value = PID
+        job.kernel.GetProcessTimes.side_effect = None
+        job.kernel.GetProcessTimes.return_value = False
+        with patch("scripts.media_campaign_windows._failed", return_value=RuntimeError("times unavailable")):
+            probe = wddm.DedicatedSamples(ADAPTER, GPU)
+            probe.poll(job, cuda_active=True)
+            self.assertEqual(probe.record["error"], "times unavailable")
+            self.assertIsNone(wddm.sampled_peak(probe.record, pid=PID, adapter=ADAPTER))
+
     def test_root_exit_requires_the_assigned_process_handle_and_an_empty_job(self):
         from scripts.media_campaign_windows import WindowsJob
         job = WindowsJob.__new__(WindowsJob)
@@ -184,14 +230,14 @@ class WindowsDedicatedMemoryTests(TestCase):
                     probe = wddm.DedicatedSamples(ADAPTER, GPU)
                     probe.poll(job, cuda_active=True)
                     probe.poll(job, cuda_active=True)
-                    resolved = job.member_identities.return_value
-                    departed = {"processes": [{"pid": PID, "status": "left-job-before-open", "createdFileTime": None}]}
+                    resolved = job.root_identity.return_value
+                    departed = (999, True)
                     if stage == "before-open":
-                        job.member_identities.return_value = departed
+                        job.root_identity.return_value = departed
                     elif stage == "after-read":
                         job.members.side_effect = [{PID}, set()]
                     elif stage == "during-recheck":
-                        job.member_identities.side_effect = [resolved, departed]
+                        job.root_identity.side_effect = [resolved, departed]
                     else:
                         job.members.return_value = set()
                     probe.poll(job, cuda_active=True)
@@ -210,11 +256,10 @@ class WindowsDedicatedMemoryTests(TestCase):
                 probe = wddm.DedicatedSamples(ADAPTER, GPU)
                 probe.poll(job, cuda_active=True)
                 probe.poll(job, cuda_active=True)
-                row = job.member_identities.return_value["processes"][0]
                 if problem == "foreign-handle":
-                    row.update(status="opened-handle-not-in-job", createdFileTime=None)
+                    job.root_identity.side_effect = ValueError("retained handle PID differs")
                 elif problem == "reused-pid":
-                    row.update(status="owned-identity-partial", createdFileTime=1111)
+                    job.root_identity.return_value = (1111, True)
                 elif problem == "descendant":
                     job.members.return_value = {PID + 1}
                 probe.poll(job, cuda_active=True)
@@ -240,13 +285,20 @@ class WindowsDedicatedMemoryTests(TestCase):
                 self.addCleanup(probe.close)
                 probe.poll(job, cuda_active=True)
                 probe.poll(job, cuda_active=True)
-                identify = job.member_identities
-                def exit_before_open(pids):
+                created, exited = job.root_identity(child.pid)
+                self.assertGreater(created, 0)
+                self.assertFalse(exited)
+                with self.assertRaisesRegex(RuntimeError, "not the assigned Job root"):
+                    job.root_identity(child.pid + 1)
+                identify = job.root_identity
+                def exit_before_open(pid):
                     child.stdin.close()
                     self.assertEqual(child.wait(timeout=5), 0)
-                    return identify(pids)
-                with patch.object(job, "member_identities", side_effect=exit_before_open):
+                    return identify(pid)
+                with patch.object(job, "root_identity", side_effect=exit_before_open), \
+                     patch.object(job, "member_identities", side_effect=AssertionError("reopened root PID")):
                     probe.poll(job, cuda_active=True)
+                self.assertEqual(identify(child.pid), (created, True))
                 self.assertTrue(job.exited_root_and_empty(child.pid))
                 self.assertFalse(job.exited_root_and_empty(child.pid + 1))
                 self.assertEqual(wddm.sampled_peak(probe.record, pid=child.pid, adapter=ADAPTER), 72)

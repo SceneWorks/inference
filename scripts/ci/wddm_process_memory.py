@@ -203,19 +203,16 @@ def preflight(cuda_uuid, *, diagnostic=None, expected_luid=None):
 
 
 def _creation_time(owner, pid, expected):
-    rows = owner.member_identities([pid])["processes"]
-    if len(rows) != 1 or rows[0]["pid"] != pid:
-        raise ValueError("unexpected owned process identity")
-    row = rows[0]
-    created = row["createdFileTime"]
-    if created is not None and expected is not None and created != expected:
+    created, exited = owner.root_identity(pid)
+    if type(created) is not int or created <= 0:
+        raise ValueError("assigned root creation time is unavailable")
+    if expected is not None and created != expected:
         raise ValueError("owned process identity changed")
-    if row["status"] == "owned-identity-resolved" and type(created) is int and created > 0:
-        return created
-    if (row["status"] in ("left-job-before-open", "open-unavailable", "owned-identity-partial")
-            and owner.exited_root_and_empty(pid) is True):
-        return None
-    raise ValueError("owned process identity is unavailable")
+    if exited:
+        if owner.exited_root_and_empty(pid) is True:
+            return None
+        raise ValueError("exited root still has an occupied Job")
+    return created
 
 
 class DedicatedSamples:
