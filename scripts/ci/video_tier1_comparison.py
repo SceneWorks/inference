@@ -599,8 +599,41 @@ def verify_target(build, backend, model, arm):
         raise ValueError("accepted proof target or measured binary mismatch")
 
 
+def verify_cuda_claim(claim, hardware, policy):
+    from scripts.ci.model_proof_resources import bound_cuda_activity_profile, proof_cuda_idle
+    from scripts.release.veda_cuda_guard import BASELINE_SAMPLES, stable_window
+
+    # execution_claim uses the default source-bound profile for paired proofs.
+    # Replay the same five headroom and quiet-card checks under that UUID lock.
+    profile = bound_cuda_activity_profile({})
+    baseline = claim["admission_baseline"]
+    samples = claim["admission_background_activity"]
+    if (not hardware["name"] or not hardware["driver_version"] or int(hardware["memory.total"]) <= 0
+            or hardware["uuid"] != policy.cuda_device_uuid or int(hardware["index"]) != claim.get("physical_index")
+            or type(claim.get("physical_index")) is not int
+            or claim.get("device_uuid") != policy.cuda_device_uuid or baseline.get("uuid") != policy.cuda_device_uuid
+            or baseline.get("admitted_total_mib") != int(hardware["memory.total"])
+            or not isinstance(baseline.get("process_identities"), list) or type(baseline.get("reserved_baseline_mib")) is not int
+            or claim.get("mechanism") != "existing PUBLIC/SceneWorks/gpu-locks UUID lock"
+            or claim.get("activity_profile") != profile or not claim.get("activity_policy")
+            or claim.get("isolated_benchmark_claim") is not False or claim.get("lease_released") is not True
+            or claim.get("post_execution_verified") is not True or samples.get("activity_profile") != profile
+            or samples.get("status") != "retained-existing-samples" or samples.get("sample_count") != BASELINE_SAMPLES
+            or len(samples["samples"]) != BASELINE_SAMPLES):
+        raise ValueError("missing exact CUDA headroom claim, admission samples or device release")
+    check, state = stable_window(lambda card, rows: proof_cuda_idle(card, rows, policy, activity_profile=profile))
+    for number, observation in enumerate(samples["samples"], 1):
+        card = observation["selected_card"]
+        if (observation["sample_number"] != number or observation["predicates"].get("unique_uuid") is not True
+                or observation.get("selected_index_matches_admission") is not True
+                or card["index"] != claim["physical_index"] or card["total_mib"] != baseline["admitted_total_mib"]
+                or not check(card, [])):
+            raise ValueError("invalid selected CUDA admission sample: " + str(state["reason"] or "card identity"))
+    if claim.get("admission_utilization_percent") != [s["selected_card"]["utilization_percent"] for s in samples["samples"]]:
+        raise ValueError("CUDA utilization readings differ from the admission samples")
+
+
 def check_complete_provenance(receipt, contract):
-    from scripts.ci.model_proof_resources import STRICT_CUDA_ACTIVITY
 
     backend = contract["backend"]
     if (set(receipt["builds"]) != set(ARMS) or receipt.get("log_errors") or receipt.get("cleanup_failure")
@@ -635,14 +668,7 @@ def check_complete_provenance(receipt, contract):
     else:
         if receipt.get("dedicated_adapter") != cuda_adapter(policy):
             raise ValueError("WDDM process counter source differs from the selected physical adapter")
-        baseline = claim["admission_baseline"]
-        if (not hardware["name"] or not hardware["driver_version"] or int(hardware["memory.total"]) <= 0
-                or hardware["uuid"] != policy.cuda_device_uuid or int(hardware["index"]) != claim.get("physical_index")
-                or claim.get("device_uuid") != policy.cuda_device_uuid or baseline.get("uuid") != policy.cuda_device_uuid
-                or not isinstance(baseline.get("process_identities"), list) or type(baseline.get("reserved_baseline_mib")) is not int
-                or claim.get("mechanism") != "existing PUBLIC/SceneWorks/gpu-locks UUID lock"
-                or claim.get("activity_profile") != STRICT_CUDA_ACTIVITY or not claim.get("idle_policy")):
-            raise ValueError("missing exact CUDA claim, stable idle admission or device identity")
+        verify_cuda_claim(claim, hardware, policy)
     # The verifier runs in the same job after scratch cleanup, with the pinned compiler.
     tc = proof.verified_toolchain(build_env(policy), root=ROOT)
     models = cohorts.models(contract["cases"])

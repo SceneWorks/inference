@@ -28,6 +28,27 @@ def request(backend, base):
     return {"selection": pair.SELECTION, "base": base, "policy": policy}
 
 
+def retained_cuda_claim():
+    # The five actual admission rows and seals from Wan run 44893811394.
+    uuid = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+    profile = "non-isolated-correctness-headroom"
+    samples = [{"sample_number": i, "selected_index_matches_admission": True, "predicates": {"unique_uuid": True},
+                "selected_card": {"total_mib": 97887, "free_mib": free, "used_mib": used,
+                                  "index": 1, "utilization_percent": 0}}
+               for i, (free, used) in enumerate([(63284, 34155)] * 3 + [(63281, 34158)] * 2, 1)]
+    return {"activity_profile": profile, "device_uuid": uuid, "physical_index": 1, "runner": "cuda-windows-2",
+            "activity_policy": "non-isolated correctness; exact-card identity and policy cap plus reserve free "
+                               "on a quiet card (memory.used spread/growth, utilization level/spread bounded); "
+                               "foreign contexts are diagnostic only",
+            "isolated_benchmark_claim": False, "lease_released": True, "post_execution_verified": True,
+            "mechanism": "existing PUBLIC/SceneWorks/gpu-locks UUID lock",
+            "admission_baseline": {"uuid": uuid, "admitted_total_mib": 97887,
+                                   "process_identities": [], "reserved_baseline_mib": 41818},
+            "admission_utilization_percent": [0] * 5,
+            "admission_background_activity": {"activity_profile": profile, "status": "retained-existing-samples",
+                                              "sample_count": 5, "samples": samples}}
+
+
 class WanPlanningTests(unittest.TestCase):
     def test_ancestry_overlay_and_fixed_selection(self):
         with TemporaryDirectory() as temporary, ExitStack() as patches:
@@ -185,6 +206,31 @@ class WanEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing attributable GPU sample"):
                 pair.evaluate(observation, self.case, "candle-cuda", policy, pair.SETTINGS, stdout, guard, pool, adapter)
 
+    def test_observed_shared_headroom_rejects_wrong_policy_unlocked_or_unstable_card(self):
+        claim = retained_cuda_claim()
+        hardware = {"name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "uuid": claim["device_uuid"],
+                    "index": "1", "memory.total": "97887", "driver_version": "596.36"}
+        policy = SimpleNamespace(cuda_device_uuid=hardware["uuid"], child_gpu_cap_bytes=12 * pair.GIB,
+                                 gpu_free_reserve_bytes=6 * pair.GIB)
+        pair.verify_cuda_claim(claim, hardware, policy)
+        for alter in (
+            lambda c: c.update(activity_profile="strict-zero-utilization", idle_policy="strict"),
+            lambda c: c.update(lease_released=False),
+            lambda c: c.update(post_execution_verified=False),
+            lambda c: c.update(isolated_benchmark_claim=True),
+            lambda c: c.update(physical_index=0),
+            lambda c: c.update(device_uuid="GPU-other"),
+            lambda c: c["admission_background_activity"]["samples"].pop(),
+            lambda c: c["admission_background_activity"]["samples"][1]["predicates"].update(unique_uuid=False),
+            lambda c: c["admission_background_activity"]["samples"][1]["selected_card"].update(free_mib=200),
+            lambda c: c["admission_background_activity"]["samples"][1]["selected_card"].update(used_mib=1024),
+            lambda c: c["admission_background_activity"]["samples"][1]["selected_card"].update(utilization_percent=100),
+        ):
+            altered = deepcopy(claim)
+            alter(altered)
+            with self.assertRaises(ValueError):
+                pair.verify_cuda_claim(altered, hardware, policy)
+
     def test_upload_verifier_replays_raw_parity_and_detects_missing_or_tampered_evidence(self):
         backend = "candle-cuda"
         plan = {"backend": backend, "cases": [self.case], "base": pair.BASE, "head": "1" * 40,
@@ -194,27 +240,25 @@ class WanEvidenceTests(unittest.TestCase):
                                     "source":{"snapshot":"v"}, "files":["tensor.safetensors"]}},
                 "toolchain_contracts": {arm: {"channel":"1.96.0","declaration_sha256":"7"*64} for arm in pair.ARMS}}
         from scripts.ci import wddm_process_memory
-        uuid = plan["request"]["policy"]["cudaDeviceUuid"]
+        claim = retained_cuda_claim()
+        uuid = plan["request"]["policy"]["cudaDeviceUuid"] = claim["device_uuid"]
         adapter = {"cuda_uuid": uuid, "luid": "luid_0x00000000_0x00020c10", "node_mask": 1,
                    "physical_node": 0, "counter": wddm_process_memory.COUNTER}
         with TemporaryDirectory() as directory, ExitStack() as patches:
             tmp = Path(directory)
             output = tmp / "evidence"
             output.mkdir()
-            patches.enter_context(patch.dict(os.environ, RUNNER_TEMP=directory, RUNNER_NAME="runner", GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1"))
+            patches.enter_context(patch.dict(os.environ, RUNNER_TEMP=directory, RUNNER_NAME=claim["runner"], GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1"))
             patches.enter_context(patch.object(evidence, "case_spec", return_value=self.spec))
-            hw = {"uuid":uuid, "index":"1","name":"CUDA card","memory.total":"90000","driver_version":"1"}
+            hw = {"uuid":uuid, "index":"1","name":"CUDA card","memory.total":"97887","driver_version":"1"}
             tc = {"channel":"1.96.0","declaration_sha256":"7"*64,"rustc_version":"rustc selected",
                   "cargo_version":"cargo selected","binaries":{"rustc":"selected", "cargo":"selected"}}
             patches.enter_context(patch.object(pair.proof, "verified_toolchain", return_value=tc))
             patches.enter_context(patch.object(pair.paired, "hardware", return_value=hw))
             patches.enter_context(patch.object(pair, "cuda_adapter", return_value=adapter))
             receipt = {"dedicated_adapter": adapter, "protocol": "wan-curated-tier1-v2", **plan, "run_id": "1", "run_attempt": "1",
-                       "accepted": True, "host":pair.platform.platform(), "runner_name":"runner",
-                       "execution_order": [], "physical_claim": {"post_execution_verified": True, "device_uuid": uuid,
-                            "physical_index":1,"runner":"runner","admission_baseline":{"uuid":uuid,
-                            "process_identities":[],"reserved_baseline_mib":64},"activity_profile":"strict-zero-utilization",
-                            "idle_policy":"strict","mechanism":"existing PUBLIC/SceneWorks/gpu-locks UUID lock"},
+                       "accepted": True, "host":pair.platform.platform(), "runner_name":claim["runner"],
+                       "execution_order": [], "physical_claim": claim,
                        "hardware": deepcopy(hw), "builds": {}, "logs": {}, "observations": {},
                        "fixtures": {self.case: {"fixture_schema": 1, "depth": 1, "seed": 104729, "variant": "5b",
                                                "source": {"snapshot":"v"}, "geometry_sha256":"1"*64, "files": {"tensor.safetensors": "0" * 64}}}}
