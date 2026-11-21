@@ -24,14 +24,18 @@ on:
   # runners. `lanes: windows-cuda` scopes a dispatch to the Windows CUDA lanes (`windows-cuda-check`
   # and the manual `windows-cuda`), so CUDA tests can be run against a branch without scheduling
   # anything on a self-hosted Mac (sc-24164). The unconditional hosted checks still run.
-  # windows-gpu-diagnostic runs only bounded GPU1 metadata collection; all CI siblings skip.
+  # windows-gpu-diagnostic runs only bounded CUDA metadata collection; all CI siblings skip.
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only CUDA metadata only"
         type: choice
         options: [all, windows-cuda, windows-gpu-diagnostic]
         default: all
+      gpu0_adapter_only:
+        description: "In windows-gpu-diagnostic, verify GPU0's selected WDDM adapter from a GPU1-masked parent"
+        type: boolean
+        default: false
       raw_training_math_only:
         description: "Manual windows-cuda raw proofs only; reuse full-suite evidence only when its production closure is unchanged"
         type: boolean
@@ -1859,9 +1863,9 @@ jobs:
 
   # Diagnostic completion is evidence capture, never GPU ownership or allocation admission.
   windows-gpu-diagnostic:
-    name: Physical GPU1 read-only diagnostic (Windows, manual)
+    name: Physical ${{ inputs.gpu0_adapter_only && 'GPU0 adapter' || 'GPU1' }} read-only diagnostic (Windows, manual)
     if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'windows-gpu-diagnostic' && !inputs.raw_training_math_only
-    runs-on: [self-hosted, windows, cuda]
+    runs-on: ${{ fromJSON(inputs.gpu0_adapter_only && '["self-hosted","windows","cuda","real-weights"]' || '["self-hosted","windows","cuda"]') }}
     timeout-minutes: 5
     env:
       CUDA_VISIBLE_DEVICES: "-1"
@@ -1874,12 +1878,63 @@ jobs:
         shell: cmd
         timeout-minutes: 1
         run: '"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_wddm_process_memory.WindowsDedicatedMemoryTests -v'
+      - name: Verify selected GPU0 WDDM metadata from a GPU1-masked parent
+        if: inputs.gpu0_adapter_only
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          CUDA_VISIBLE_DEVICES: '1'
+          CUDA_DEVICE_ORDER: PCI_BUS_ID
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "gpu0-adapter-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          $probe = @'
+          import json, os, sys
+          from pathlib import Path
+          from types import SimpleNamespace
+          sys.path.insert(0, str(Path.cwd()))
+          from scripts.ci.flux1_comparison import hardware
+          from scripts.ci.scail_plural.contract import GPU, GPU0, cuda_identity
+          from scripts.ci.video_tier1_comparison import cuda_adapter
+          from scripts.ci.windows_cuda_metadata import visible_devices
+          policy = SimpleNamespace(backend="windows-cuda", cuda_device_uuid=GPU0)
+          card = hardware("candle-cuda", policy, pci_bus=True)
+          if card["index"] != "0" or os.environ["CUDA_VISIBLE_DEVICES"] != "1":
+              raise ValueError("GPU0 physical identity or parent mask changed")
+          parent_devices = visible_devices()["devices"]
+          if parent_devices != [{"ordinal": 0, "uuid": GPU}]:
+              raise ValueError("the parent is not masked to physical GPU1")
+          adapter = cuda_adapter(policy)
+          identity = cuda_identity(card, adapter)
+          if os.environ["CUDA_VISIBLE_DEVICES"] != "1":
+              raise ValueError("metadata probe mutated the parent mask")
+          print(json.dumps({"source": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"],
+                            "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "parent_mask": "1",
+                            "parent_devices": parent_devices, "hardware": card,
+                            "adapter": adapter, "identity": identity}, sort_keys=True))
+          '@
+          $probePath = Join-Path $out 'probe.py'
+          [IO.File]::WriteAllText($probePath, $probe, [Text.UTF8Encoding]::new($false))
+          $response = & $env:REVIEWED_PYTHON -I $probePath
+          if ($LASTEXITCODE -ne 0 -or -not ($response -is [string]) -or
+              [Text.Encoding]::UTF8.GetByteCount($response) -gt 8192) { throw 'GPU0 adapter metadata probe failed' }
+          [IO.File]::WriteAllText((Join-Path $out 'adapter.json'), $response, [Text.UTF8Encoding]::new($false))
+      - name: Upload selected GPU0 adapter metadata
+        if: inputs.gpu0_adapter_only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gpu0-adapter-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gpu0-adapter-${{ github.run_id }}-${{ github.run_attempt }}/adapter.json
+          if-no-files-found: error
+          retention-days: 3
       - name: Capture bounded GPU1 metadata without device admission
+        if: '!inputs.gpu0_adapter_only'
         shell: powershell
         run: |
           $out = Join-Path $env:RUNNER_TEMP "gpu1-diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           & .\scripts\ci\windows-gpu1-diagnostic.ps1 -OutputDirectory $out
       - name: Check actual Windows dedicated-memory instances on the mapped adapter
+        if: '!inputs.gpu0_adapter_only'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1899,7 +1954,7 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $out 'pdh.json'), $response, [Text.UTF8Encoding]::new($false))
           exit $status
       - name: Upload diagnostic evidence including incomplete results
-        if: always()
+        if: always() && !inputs.gpu0_adapter_only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gpu1-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
