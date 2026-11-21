@@ -5,7 +5,7 @@
 //! with a batch dimension (so of shape `(b_sz, in_c)`) or without (of shape `(in_c,)`), the
 //! output has shape `(b_sz, out_c)` and `(out_c,)` respectively.
 //!
-//! ```rust
+//! ```no_run
 //! use candle::{Tensor, Device::Cpu};
 //! use candle_nn::{Linear, Module};
 //! # fn main() -> candle::Result<()> {

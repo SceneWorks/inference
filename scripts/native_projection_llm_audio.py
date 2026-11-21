@@ -1,10 +1,9 @@
 """Verify registered Candle text/audio providers still reach their checkpoint constructors."""
 
 import re
-from functools import lru_cache
 from pathlib import Path
 
-from check_model_inference_policy import matching_brace, rust_mask
+from check_model_inference_policy import rust_function_bodies, rust_production_mask
 
 
 # Each witness names a production function and the next callable on the ordinary load or
@@ -78,8 +77,8 @@ VARIANT_REGISTRATIONS = {
 }
 
 
-def _audio_registrations(folder, source):
-    code = "\n".join(source(path) for path in sorted(folder.glob("*.rs")))
+def _audio_registrations(folder):
+    code = "\n".join(_production(path) for path in sorted(folder.glob("*.rs")))
     body = next(_bodies(code, "register_providers"), "")
     entries = set(re.findall(r"\.register_\w+\(\s*([\w:]+)\s*\)", body))
     if "REGISTRATIONS" in body:
@@ -108,20 +107,11 @@ RAW_OWNERS = {
 
 
 def _production(path: Path) -> str:
-    mask = rust_mask(path.read_text(encoding="utf-8"))
-    # Remove test modules before scanning. An unused test fixture cannot satisfy a route.
-    for match in reversed(list(re.finditer(r"#\s*\[\s*cfg\(test\)\s*\]\s*(?:pub(?:\(crate\))?\s+)?mod\s+\w+\s*\{", mask))):
-        start = mask.find("{", match.start())
-        end = matching_brace(mask, start) + 1
-        mask = mask[:match.start()] + " " * (end-match.start()) + mask[end:]
-    return mask
+    return rust_production_mask(path.read_text(encoding="utf-8"))
 
 
 def _bodies(text: str, name: str):
-    for match in re.finditer(r"\bfn\s+" + re.escape(name) + r"\s*(?:<[^>{}]*>)?\s*\(", text):
-        opening = text.find("{", match.end())
-        if opening >= 0:
-            yield text[opening:matching_brace(text, opening)+1]
+    return (body for decl, body in rust_function_bodies(text) if decl == name)
 
 
 def check_candle_llm_audio(root: Path) -> list[str]:
@@ -129,13 +119,12 @@ def check_candle_llm_audio(root: Path) -> list[str]:
     crates = root / "crates"
     audio = crates / "audio"
     text = crates / "llm/candle-llm/src"
-    source = lru_cache(maxsize=None)(_production)
-    catalog = source(audio / "candle-audio-catalog/src/lib.rs")
+    catalog = _production(audio / "candle-audio-catalog/src/lib.rs")
     registration = next(_bodies(catalog, "register_providers"), "")
     discovered = {name.replace("_", "-") for name in re.findall(r"\bcandle_audio_(\w+)::register_providers\(", registration)}
     direct = re.search(r"pub const CRATE_API_PROVIDERS[^;]*;", catalog)
     discovered.update(name.replace("_", "-") for name in re.findall(r"candle_audio_(\w+)::", direct[0] if direct else ""))
-    text_catalog = source(text / "lib.rs")
+    text_catalog = _production(text / "lib.rs")
     registered_text = {name for fn in ("register_text_providers", "register_cuda_text_providers")
                        for body in _bodies(text_catalog, fn)
                        for name in re.findall(r"\.register\(\s*(\w+)::REGISTRATION\s*\)", body)}
@@ -146,13 +135,13 @@ def check_candle_llm_audio(root: Path) -> list[str]:
             for module, fn, callee in witnesses[name]:
                 path = folder(name) / (module + ".rs")
                 target = r"\b" + re.escape(callee) + r"\s*(?:\(|[,)]|$)"
-                if not path.is_file() or not any(re.search(target, body) for body in _bodies(source(path), fn)):
+                if not path.is_file() or not any(re.search(target, body) for body in _bodies(_production(path), fn)):
                     errors.append(f"{label} {name}: {module}::{fn} has lost its {callee} checkpoint route")
 
     for name in sorted(discovered - {"sheetsage2"}):
         folder = audio / ("candle-audio-" + name) / "src"
         found = {entry.removeprefix("model::") if name not in VARIANT_REGISTRATIONS else entry
-                 for entry in _audio_registrations(folder, source)}
+                 for entry in _audio_registrations(folder)}
         expected = VARIANT_REGISTRATIONS.get(name, {"REGISTRATION"})
         for entry in sorted(found ^ expected):
             errors.append(f"Candle audio {name}: registration {entry} needs a checkpoint constructor witness")
@@ -164,8 +153,8 @@ def check_candle_llm_audio(root: Path) -> list[str]:
 
     audit(discovered, AUDIO_ROUTES, lambda name: audio / ("candle-audio-" + name) / "src", "Candle audio")
     audit(registered_text, TEXT_ROUTES, lambda name: text, "Candle text")
-    registry = source(crates / "contracts/gen-core/src/registry/providers.rs")
-    scopes = source(crates / "contracts/gen-core/src/registry/media_receipts.rs")
+    registry = _production(crates / "contracts/gen-core/src/registry/providers.rs")
+    scopes = _production(crates / "contracts/gen-core/src/registry/media_receipts.rs")
     for fn, trait in (("audio_embedder", "AudioEmbedder"), ("voice_embedder", "VoiceEmbedder"),
                       ("transcriber", "Transcriber"), ("audio_transform", "AudioTransform")):
         if not re.search(r"dyn\s+" + trait + r"\s*,\s*super::media_receipts::load_" + fn, registry):
@@ -178,7 +167,7 @@ def check_candle_llm_audio(root: Path) -> list[str]:
             local = path.relative_to(folder)
             if local.name == "tests.rs" or {"tests", "bin"} & set(local.parts):
                 continue
-            code = source(path)
+            code = _production(path)
             for match in RAW_READS.finditer(code):
                 if re.search(r"\bfn\s*$", code[max(0,match.start()-8):match.start()]):
                     continue

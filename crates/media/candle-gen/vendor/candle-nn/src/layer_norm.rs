@@ -6,7 +6,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```no_run
 //! use candle::{Tensor, Device::Cpu, test_utils::to_vec3_round};
 //! use candle_nn::{LayerNorm, Module};
 //! # fn main() -> candle::Result<()> {

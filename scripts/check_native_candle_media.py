@@ -1,5 +1,4 @@
 """Guard the production registration, file reader and operator paths of the Candle media catalog."""
-from functools import lru_cache
 from pathlib import Path
 import re
 
@@ -53,9 +52,8 @@ DIRECT = {"depth", "face", "instantid", "pid", "pulid", "sam3"}
 
 
 def check_candle_media(root: Path) -> list[str]:
-    source = lru_cache(maxsize=None)(_production)
     media = root / "crates/media/candle-gen"
-    catalog = source(media / "candle-gen-catalog/src/lib.rs")
+    catalog = _production(media / "candle-gen-catalog/src/lib.rs")
     exports = set(re.findall(r"pub\s+use\s+candle_gen_(\w+)\s+as\s+\w+\s*;", catalog))
     registrations = set(re.findall(r"candle_gen_(\w+)::register_providers\(registry\)", catalog))
     issues = []
@@ -69,6 +67,6 @@ def check_candle_media(root: Path) -> list[str]:
         for entry in entries:
             module, call = entry.split(":", 1)
             path = media / ("candle-gen-" + name.replace("_", "-")) / "src" / (module + ".rs")
-            if not path.is_file() or call not in source(path):
+            if not path.is_file() or call not in _production(path):
                 issues.append(f"Candle media {name} no longer uses {module} / {call}")
     return issues

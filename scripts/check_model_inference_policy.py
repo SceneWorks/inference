@@ -80,6 +80,25 @@ def matching_brace(mask: str, opening: int) -> int:
     return position
 
 
+def rust_production_mask(text: str) -> str:
+    """Mask literals/comments and inline test-only modules before inventorying production callers."""
+    mask = rust_mask(text)
+    # Remove test modules before scanning. An unused test fixture cannot satisfy a route.
+    for match in reversed(list(re.finditer(r"#\s*\[\s*cfg\(test\)\s*\]\s*(?:pub(?:\(crate\))?\s+)?mod\s+\w+\s*\{", mask))):
+        start = mask.find("{", match.start())
+        end = matching_brace(mask, start) + 1
+        mask = mask[:match.start()] + " " * (end-match.start()) + mask[end:]
+    return mask
+
+
+def rust_function_bodies(mask: str):
+    """Yield function names and brace-balanced implementation bodies from a Rust source mask."""
+    for declaration in re.finditer(r"\bfn\s+(?:r#)?(\w+)\s*(?:<[^>{}]*>)?\s*\(", mask):
+        opening = mask.find("{", declaration.end())
+        if opening >= 0:
+            yield declaration[1], mask[opening:matching_brace(mask, opening)]
+
+
 def attributes_before(text: str, mask: str, position: int) -> list[str]:
     attributes = []
     while position > 0:
