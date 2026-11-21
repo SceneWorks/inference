@@ -26,10 +26,13 @@
 //! upstream by SceneWorks (`sceneworks-core::base_weights`, sc-10662); this module
 //! is handed the files already identified as a Z-Image DiT and VAE.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+#[cfg(test)]
+use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::{CandleError, Result};
 
 /// The four external inputs for an in-place ComfyUI Z-Image load (sc-10668): the

@@ -69,6 +69,26 @@ impl SourcePlan {
     }
 }
 impl ProjectionSource {
+    pub fn selected_var_builder(
+        self,
+        keys: impl IntoIterator<Item = String>,
+        dtype: DType,
+        dev: &Device,
+    ) -> VarBuilder<'static> {
+        let names = keys
+            .into_iter()
+            .map(|key| (key.clone(), (key.clone(), SourceView::Whole(key))))
+            .collect();
+        VarBuilder::from_backend(
+            Box::new(Remapped {
+                source: MappedWeights::Checkpoint(self),
+                names,
+            }),
+            dtype,
+            dev.clone(),
+        )
+    }
+
     pub fn reader(&self) -> &LogicalWeightReader {
         &self.0
     }
@@ -194,16 +214,40 @@ impl ProjectionSource {
         }) {
             return Ok(Err(st));
         }
-        let mut tables = Vec::new();
-        for path in files {
-            if let Some(table) =
-                gen_core::safetensors_path_quantization_metadata(path).map_err(Error::wrap)?
-            {
-                tables.push(table);
+        let tables = st.quantization_tables()?;
+        let mut headers = BTreeMap::new();
+        for (name, view) in st.tensors() {
+            let header = gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.clone(),
+                dtype: gen_core::weightsmeta::Dtype::parse(&format!("{:?}", view.dtype()))
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "unsupported source dtype {:?} for {name}",
+                            view.dtype()
+                        ))
+                    })?,
+                shape: view.shape().to_vec(),
+                data_bytes: view.data().len() as u64,
+            };
+            if headers.insert(name.clone(), header).is_some() {
+                candle_core::bail!("duplicate tensor across checkpoint shards: {name}")
             }
         }
-        let Some(headers) =
-            ProjectionSourceHeaders::read(files, selected, &tables).map_err(Error::wrap)?
+        let Some(headers) = ProjectionSourceHeaders::select(headers, selected, &tables, |names| {
+            names
+                .iter()
+                .map(|&name| {
+                    let view = st
+                        .get(name)
+                        .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                    if view.data().len() > 65_536 {
+                        return Err(format!("{name}: descriptor exceeds 65536 bytes").into());
+                    }
+                    Ok((name.to_owned(), view.data().to_vec()))
+                })
+                .collect()
+        })
+        .map_err(Error::wrap)?
         else {
             return Ok(Err(st));
         };
@@ -246,10 +290,7 @@ impl SourceLinear {
         let (rows, cols) = self.dims();
         source
             .reader()
-            .dense_coefficients(&self.key, None, self.dtype, dev)?
-            .reshape(((), cols))?
-            .narrow(0, first, rows)?
-            .force_contiguous()
+            .dense_matrix_slice(&self.key, first, rows, cols, self.dtype, dev)
     }
 }
 #[cfg(feature = "cuda")]
@@ -305,6 +346,11 @@ impl NativeLinearWeight for SourceLinear {
     }
     fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+    fn retained_coefficients(&self, t: &Tensor) -> Result<()> {
+        self.source
+            .reader()
+            .record_coefficient_cache(&self.key, self.first_row, t)
     }
     fn dense_weight(&self) -> Result<Tensor> {
         if let Some(first) = self.first_row {

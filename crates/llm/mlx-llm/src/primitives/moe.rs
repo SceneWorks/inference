@@ -94,7 +94,28 @@ impl SwitchLinear {
         dense: impl FnOnce() -> Result<Array>,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        use mlx_layers::convrot_int8::MlxWeightSource;
+        if let Some(bank) = Self::from_scalar_source(w, key, shape, false, None)? {
+            return Ok(bank);
+        }
+        let weight = dense()?;
+        if weight.shape() != shape {
+            return Err(Error::Config(format!(
+                "{key}: expected {shape:?}, got {:?}",
+                weight.shape()
+            )));
+        }
+        Self::load(weight, quant)
+    }
+
+    /// Bind source scalar FP8 bank axes in declared architecture order. Some publishers
+    /// store each expert in input-major order and keep a separate per-expert bias.
+    pub fn from_scalar_source(
+        w: &impl mlx_layers::MlxWeightSource,
+        key: &str,
+        shape: [i32; 3],
+        input_major: bool,
+        bias: Option<&Array>,
+    ) -> Result<Option<Self>> {
         use mlx_layers::ComfyQuantFormat;
         if let Some(blob) = w.get(&format!("{key}.comfy_quant")) {
             let desc = mlx_layers::convrot_int8::descriptor(blob, key)?;
@@ -108,7 +129,12 @@ impl SwitchLinear {
                 )));
             }
             let codes = w.require(key)?;
-            if codes.shape() != shape || shape.iter().any(|n| *n <= 0) {
+            let [e, n, k] = shape;
+            let (rows, cols) = if input_major { (k, n) } else { (n, k) };
+            if codes.shape() != [e, rows, cols]
+                || shape.iter().any(|n| *n <= 0)
+                || bias.is_some_and(|b| b.shape() != [e, n])
+            {
                 return Err(Error::Config(format!(
                     "{key}: invalid expert bank geometry"
                 )));
@@ -116,39 +142,49 @@ impl SwitchLinear {
             let scales = w.get(&format!("{key}.weight_scale")).cloned();
             let input = w.get(&format!("{key}.input_scale")).cloned();
             let observation = w.observation(key);
-            let [e, n, k] = shape;
-            let all_rows = e.checked_mul(n).ok_or_else(|| {
+            let all_rows = e.checked_mul(rows).ok_or_else(|| {
                 Error::Config(format!("{key}: expert bank exceeds MLX row range"))
             })?;
             let matrix = mlx_layers::fp8::Fp8Linear::new(
                 desc.format,
-                codes.reshape(&[all_rows, k])?,
+                codes.reshape(&[all_rows, cols])?,
                 scales,
                 input,
-                &[all_rows as usize, k as usize],
+                &[all_rows as usize, cols as usize],
                 None,
             )?;
             let mut parts = Vec::with_capacity(e as usize);
             for i in 0..e {
-                let mut op = matrix.slice_rows(i * n, (i + 1) * n)?;
+                let mut op = matrix.slice_rows(i * rows, (i + 1) * rows)?;
+                if input_major {
+                    op = op.transposed_scalar()?;
+                }
+                if let Some(bias) = bias {
+                    op.set_bias(bias.index(i))?;
+                }
                 if let Some(obs) = &observation {
-                    op.observe(obs.expert(i as usize, n as usize, k as usize)?)?;
+                    op.observe(obs.expert(i as usize, rows as usize, cols as usize)?)?;
                 }
                 parts.push(Projection::Native(mlx_layers::NativeProjection::Fp8(op)));
             }
-            return Ok(Self::Source {
+            return Ok(Some(Self::Source {
                 parts,
                 shape: [n, k],
-            });
+            }));
         }
-        let weight = dense()?;
-        if weight.shape() != shape {
-            return Err(Error::Config(format!(
-                "{key}: expected {shape:?}, got {:?}",
-                weight.shape()
-            )));
+        Ok(None)
+    }
+
+    /// Project ordered active token groups with a shared router boundary vector.
+    pub fn project_sorted(&self, x: &Array, idx: &Array, offsets: &[i32]) -> Result<Array> {
+        if offsets.len() != self.num_experts() + 1
+            || offsets.first() != Some(&0)
+            || offsets.last().copied() != x.shape().first().copied()
+            || offsets.windows(2).any(|s| s[1] < s[0])
+        {
+            return Err(Error::Config("invalid source expert boundaries".into()));
         }
-        Self::load(weight, quant)
+        self.forward(x, idx, true, Some(offsets))
     }
 
     /// Stack per-expert projections (a checkpoint that stores each expert under its own key).
@@ -1026,7 +1062,7 @@ mod tests {
 
 // Read only E+1 boundaries for the three operators, regardless of prompt length. Token data,
 // sorted IDs, and expert operands stay on device. Each active expert receives a contiguous batch.
-fn routed_offsets(ids: &Array, experts: usize) -> Result<Vec<i32>> {
+pub fn routed_offsets(ids: &Array, experts: usize) -> Result<Vec<i32>> {
     use mlx_rs::fast::MetalKernel;
     thread_local! {static KERNEL:std::cell::RefCell<Option<MetalKernel>>=const{std::cell::RefCell::new(None)};}
     const SOURCE: &str = r#"

@@ -224,8 +224,8 @@ pub(crate) fn header_dtype(dtype: mlx_gen::gen_core::weightsmeta::Dtype) -> Resu
         Stored::BF16 => Dtype::Bfloat16,
         Stored::F32 => Dtype::Float32,
         // The actual pinned native safetensors decoder stores these as uint8, NOT decoded fp8.
-        Stored::F8_E4M3 | Stored::F8_E8M0 => Dtype::Uint8,
-        Stored::F64 | Stored::F8_E5M2 => {
+        Stored::F8_E4M3 | Stored::F8_E5M2 | Stored::F8_E8M0 => Dtype::Uint8,
+        Stored::F64 => {
             return Err(mlx_gen::Error::Unsupported(
                 "sdxl native safetensors loader does not accept this source dtype".into(),
             ))

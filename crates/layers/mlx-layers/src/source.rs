@@ -77,6 +77,7 @@ struct Row {
     accounting: Arc<gen_core::CheckpointReadAccounting>,
     key: String,
     logical_shape: Vec<usize>,
+    mx_layout: Option<([usize; 2], bool)>,
     // The constructor verifies the actual handles it keeps before enabling packed accounting.
     packed_bytes: AtomicU64,
     packed_observed: AtomicBool,
@@ -88,6 +89,11 @@ struct Row {
 #[derive(Clone, Debug)]
 pub struct Observation(Arc<Row>);
 impl Observation {
+    pub fn mxfp8_geometry(&self) -> Option<([usize; 2], Option<&[usize]>)> {
+        let (stored, declared) = self.0.mx_layout?;
+        Some((stored, declared.then_some(&self.0.logical_shape)))
+    }
+
     /// Each expert selected from a rank-three source has its own materialization boundary.
     pub fn expert(&self, index: usize, rows: usize, cols: usize) -> Result<Self> {
         if self.0.logical_shape.len() != 3
@@ -100,6 +106,7 @@ impl Observation {
             accounting: self.0.accounting.clone(),
             key: self.0.key.clone(),
             logical_shape: vec![rows, cols],
+            mx_layout: None,
             packed_bytes: AtomicU64::new(0),
             packed_observed: AtomicBool::new(false),
             has_weight_scale: self.0.has_weight_scale,
@@ -233,6 +240,14 @@ impl SourceReads {
                         accounting: accounting.clone(),
                         key: t.logical_key.clone(),
                         logical_shape: t.shape.clone(),
+                        mx_layout: match &t.codec {
+                            TensorCodecSpec::Mxfp8 {
+                                stored_shape,
+                                logical_shape_declared,
+                                ..
+                            } => Some((*stored_shape, *logical_shape_declared)),
+                            _ => None,
+                        },
                         packed_bytes: AtomicU64::new(0),
                         packed_observed: AtomicBool::new(false),
                         has_weight_scale,
@@ -353,7 +368,7 @@ pub fn bind_source_layout(
         let base = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix("_weight"))
-            .or_else(|| (t.shape.len() == 2 || expert_key(key)).then_some(key.as_str()));
+            .or_else(|| expert_key(key).then_some(key.as_str()));
         let (format, scale, sx) = match &t.codec {
             TensorCodecSpec::ConvRotInt8 { geometry, .. } => {
                 let base = base.ok_or("missing ConvRot projection base")?;
@@ -419,6 +434,8 @@ pub fn bind_source_layout(
             );
             if let Some(sx) = sx {
                 tensors.insert(format!("{base}.input_scale"), sx);
+            } else {
+                tensors.remove(&format!("{base}.input_scale"));
             }
         }
     }

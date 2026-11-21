@@ -9,10 +9,7 @@ use candle_gen::Result;
 
 /// `Linear` **with** bias loaded from `{name}.weight` + `{name}.bias`.
 pub fn lin_bias(vb: &VarBuilder, name: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get_unchecked(&format!("{name}.weight"))?,
-        Some(vb.get_unchecked(&format!("{name}.bias"))?),
-    ))
+    Ok(Linear::from_var_builder(&vb.pp(name), true)?)
 }
 
 /// Plain RMSNorm `w · x / sqrt(mean(x²) + eps)` over the last dim (matches `mlx_rs::fast::rms_norm`).

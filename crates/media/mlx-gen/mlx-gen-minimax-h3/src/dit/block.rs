@@ -160,6 +160,7 @@ impl AdaLnProjection {
         cfg: &MiniMaxH3DitConfig,
         dtype: Dtype,
     ) -> Result<Self> {
+        w.declare_projection_shape(prefix, [cfg.adaln_out_features(), cfg.time_embed_dim])?;
         let mut linear = crate::quant::lin(w, prefix, true)?;
         // No-op on a packed base, whose compute dtype is fixed by its scales.
         linear.cast_weights(dtype)?;
@@ -315,7 +316,7 @@ impl DitBlock {
             norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
-            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+            ff: DitFeedForward::from_model_weights(w, &format!("{prefix}.ff"), cfg, dtype)?,
             adaln_proj: None,
         })
     }
