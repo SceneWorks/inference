@@ -22,8 +22,7 @@ pub struct CheckpointReceiptScope {
 
     prepared: Option<Arc<LoadSpec>>,
     primary: Option<PathBuf>,
-    pin: Option<PinnedWeightsFile>,
-    observed_pin: Arc<std::sync::OnceLock<std::result::Result<PinnedWeightsFile, String>>>,
+    pin: Option<std::result::Result<PinnedWeightsFile, String>>,
 }
 
 impl CheckpointReceiptScope {
@@ -37,7 +36,12 @@ impl CheckpointReceiptScope {
             crate::WeightsSource::File(path) => Ok(Self {
                 prepared,
                 primary: Some(absolute(path)),
-                pin: spec.prepared_file_pin_for(path)?.cloned(),
+                // Capture an unprepared primary before a reader mmaps it. A domain-only load may
+                // name a missing file; deliver that error only if a real reader describes it.
+                pin: Some(match spec.prepared_file_pin_for(path)? {
+                    Some(pin) => Ok(pin.clone()),
+                    None => PinnedWeightsFile::pin(path).map_err(|e| e.to_string()),
+                }),
                 ..Self::default()
             }),
         }
@@ -77,7 +81,6 @@ impl CheckpointReceiptScope {
             return crate::CheckpointReadAccounting::create(plan, capability);
         };
         let paths = source_paths(paths);
-        scope.pin_primary(&paths);
         let mut readers = scope.readers.lock().unwrap_or_else(|e| e.into_inner());
         let group = readers.entry(paths.clone()).or_default();
         if let Some(existing) = group.iter().find(|r| r.same_plan(&plan, &capability)) {
@@ -88,37 +91,42 @@ impl CheckpointReceiptScope {
         reader
     }
 
-    fn pin_primary(&self, paths: &[PathBuf]) {
-        if let Some(path) = self.primary.as_ref().filter(|p| paths.contains(p)) {
-            self.observed_pin.get_or_init(|| {
-                self.pin
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(|| PinnedWeightsFile::pin(path))
-                    .map_err(|e| e.to_string())
-            });
-        }
-    }
     fn bind(
         &self,
         paths: &[PathBuf],
         facts: CheckpointWeightFacts,
     ) -> crate::Result<CheckpointWeightFacts> {
-        if self
-            .primary
-            .as_ref()
-            .is_some_and(|primary| paths.contains(primary))
-        {
-            let pin = self
-                .observed_pin
-                .get()
-                .ok_or_else(|| crate::Error::Msg("missing observed checkpoint pin".into()))?
-                .as_ref()
-                .map_err(|e| crate::Error::Msg(e.clone()))?;
-            facts.with_verified_source(pin)
-        } else {
-            Ok(facts)
+        let mut pins = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut pin = None;
+            if let Some(spec) = &self.prepared {
+                pin = spec.prepared_file_pins().get(path);
+                if pin.is_none() {
+                    if let Some(inventory) = spec.source_inventory() {
+                        pin = inventory.member_pin(path)?;
+                    }
+                }
+            }
+            if pin.is_none() && self.primary.as_ref() == Some(path) {
+                pin = Some(
+                    self.pin
+                        .as_ref()
+                        .ok_or_else(|| crate::Error::Msg("missing observed checkpoint pin".into()))?
+                        .as_ref()
+                        .map_err(|e| crate::Error::Msg(e.clone()))?,
+                );
+            }
+            if let Some(pin) = pin {
+                pins.push(pin);
+            }
         }
+        if pins.is_empty() {
+            return Ok(facts);
+        }
+        if pins.len() != paths.len() {
+            return Err(crate::Error::Unsupported("a measured checkpoint shard set is only partially bound to its prepared source inventory".into()));
+        }
+        facts.with_verified_sources(pins)
     }
     /// Register a lightweight snapshot callback, replacing the previous load of the same shards.
     pub fn register(
@@ -127,7 +135,6 @@ impl CheckpointReceiptScope {
     ) {
         if let Some(scope) = Self::current() {
             let paths = source_paths(paths);
-            scope.pin_primary(&paths);
             let snapshot: Snapshot = Arc::new(snapshot);
             scope
                 .sources
@@ -137,8 +144,7 @@ impl CheckpointReceiptScope {
         }
     }
 
-    /// Every component with a measured read. The primary single-file source is reverified.
-    pub fn try_snapshots(&self) -> crate::Result<Vec<CheckpointWeightFacts>> {
+    fn snapshot_groups(&self) -> crate::Result<Vec<(Vec<PathBuf>, CheckpointWeightFacts)>> {
         let readers = self
             .sources
             .lock()
@@ -150,7 +156,8 @@ impl CheckpointReceiptScope {
             if value.receipt().tensor_count == 0 {
                 continue;
             }
-            facts.push(self.bind(&paths, value)?);
+            let bound = self.bind(&paths, value)?;
+            facts.push((paths, bound));
         }
         let readers = self
             .readers
@@ -160,10 +167,20 @@ impl CheckpointReceiptScope {
         for (paths, group) in readers {
             let value = crate::CheckpointReadAccounting::combined(&group)?;
             if value.receipt().tensor_count != 0 {
-                facts.push(self.bind(&paths, value)?);
+                let bound = self.bind(&paths, value)?;
+                facts.push((paths, bound));
             }
         }
         Ok(facts)
+    }
+
+    /// Every component with a measured read, bound to its original prepared source shards.
+    pub fn try_snapshots(&self) -> crate::Result<Vec<CheckpointWeightFacts>> {
+        Ok(self
+            .snapshot_groups()?
+            .into_iter()
+            .map(|(_, facts)| facts)
+            .collect())
     }
 
     pub fn snapshots(&self) -> Vec<CheckpointWeightFacts> {
@@ -173,13 +190,14 @@ impl CheckpointReceiptScope {
     /// The exact File primary, or the unique measured checkpoint for a directory load.
     /// A multi-component directory has no implicit primary; all components remain available in snapshots.
     pub fn facts(&self) -> Option<CheckpointWeightFacts> {
-        let mut snapshots = self.try_snapshots().ok()?;
-        if self.primary.is_some() {
+        let mut snapshots = self.snapshot_groups().ok()?;
+        if let Some(primary) = &self.primary {
             snapshots
                 .into_iter()
-                .find(|value| value.source_binding().is_some())
+                .find(|(paths, _)| paths.contains(primary))
+                .map(|(_, facts)| facts)
         } else if snapshots.len() == 1 {
-            snapshots.pop()
+            snapshots.pop().map(|(_, facts)| facts)
         } else {
             None
         }
