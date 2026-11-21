@@ -326,7 +326,7 @@ mod tests {
         assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
 
         // The packed forward reproduces the affine grid (group-64 default + dequant-on-forward).
-        let grid_lin = dense_adapt(Linear::new(grid, None));
+        let grid_lin = dense_adapt(Linear::new(grid, None))?;
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
@@ -384,7 +384,7 @@ mod tests {
 
         let packed = linear_detect(&w, "input_proj", true)?;
         assert!(packed.is_packed());
-        let dense = dense_adapt(Linear::new(grid, Some(dbias)));
+        let dense = dense_adapt(Linear::new(grid, Some(dbias)))?;
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &dense.forward(&x)?);
         assert!(
