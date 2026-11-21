@@ -183,6 +183,14 @@ class LtxTests(unittest.TestCase):
                 path.write_text(json.dumps(dict(row, velocity_bits=velocities)), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     ltx.observe(out, path, "mlx")
+            candle = dict(row, device={"kind": "candle-cuda", "index": 0})
+            path.write_text(json.dumps(candle), encoding="utf-8")
+            marker = f"SGA_LTX_CONSTRUCTOR_OK {ltx.CANDLE_TENSOR_COUNT} {ltx.CANDLE_HEADER_SHA256}\n"
+            self.assertEqual(ltx.observe(marker + out, path, "candle-cuda"), candle)
+            wrong_pin = f"SGA_LTX_CONSTRUCTOR_OK {ltx.CANDLE_TENSOR_COUNT} {'0' * 64}\n"
+            for evidence in (out, marker + marker + out, wrong_pin + out):
+                with self.assertRaisesRegex(ValueError, "constructor metadata check"):
+                    ltx.observe(evidence, path, "candle-cuda")
 
 
 if __name__ == "__main__":

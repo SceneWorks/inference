@@ -14,6 +14,10 @@ REPOSITORY = "SceneWorks/ltx-2.5-mlx"
 REVISION = "081658ce6886cacba20817ce0359bbefef706ff2"
 CHECKPOINT = "dev/bf16/transformer.safetensors"
 HEADER_SHA256 = "4167e35028851c220d7f11786ac0e4adeaa14b2aa0000828fefd2437f83183d6"
+# Exact generated header after the pinned topology is trimmed to block 0, before its BF16 payload.
+CANDLE_HEADER_SHA256 = "c9e3440c0fa10327332acc398319600f98226be0a750050b93a4acfdd815873b"
+CANDLE_HEADER_PLACEHOLDER = "__SGA_LTX_CONSTRUCTOR_HEADER_SHA256__"
+CANDLE_TENSOR_COUNT = 143
 WEIGHT_BYTES = 1_628_279_680
 PACKAGES = {"mlx": "mlx-gen-ltx", "candle-cuda": "candle-gen-ltx"}
 PROBES = {"mlx": "mlx", "candle-cuda": "candle"}
@@ -43,12 +47,15 @@ def package(backend):
 
 
 def contract(backend):
+    geometry = {"depth": 1, "video_width": 4096, "audio_width": 2048, "shapes": SHAPES,
+                "retained_bf16_bytes": WEIGHT_BYTES}
+    if backend == "candle-cuda":
+        geometry.update(constructor_header_sha256=CANDLE_HEADER_SHA256, constructor_tensor_count=CANDLE_TENSOR_COUNT)
     return {
         "compared": "LTX 2.5 joint AV component, one DiT block, fixed sigma and geometry; timing and peaks are diagnostic",
         "source_snapshot": {"repository": REPOSITORY, "revision": REVISION, "file": CHECKPOINT,
                             "header_sha256": HEADER_SHA256},
-        "geometry": {"depth": 1, "video_width": 4096, "audio_width": 2048, "shapes": SHAPES,
-                     "retained_bf16_bytes": WEIGHT_BYTES},
+        "geometry": geometry,
         "settings": {"fixture_seed": fixture.SEED, "pass_scales": [0.0, 0.75], "timeline": [0, 1, 0],
                      "sigma": 0.5, "rank": 4, "alpha": 4, "targets": TARGETS,
                      "device": {"kind": DEVICES[backend], "index": 0}, "weights": "dense BF16",
@@ -75,6 +82,10 @@ def overlay(read, arm, backend, binary):
     # Import the perturbation only where the old public method cannot accept it.
     if backend == "mlx" and arm == "head":
         probe = "use mlx_gen_ltx::transformer::AvPerturbation;\n" + probe
+    if backend == "candle-cuda":
+        if probe.count(CANDLE_HEADER_PLACEHOLDER) != 1:
+            raise ValueError("missing unique LTX Candle constructor header pin")
+        probe = probe.replace(CANDLE_HEADER_PLACEHOLDER, CANDLE_HEADER_SHA256)
     files = {f"{root}/bin/{binary}.rs": probe.replace(PLACEHOLDER, BRIDGES[backend, arm]).encode()}
     if backend == "mlx" and arm == "head":
         path = f"{root}/transformer/av_dit.rs"
@@ -94,6 +105,12 @@ def overlay(read, arm, backend, binary):
         if arm == "base":
             source = expose(source, "fn", "set_adapter_pass(")
         files[path] = source
+        path = f"{root}/tier.rs"
+        source = expose(read(path), "fn", "ltx25_transformer_vb(")
+        private_builder = b"\nfn rename_vb("
+        if source.count(private_builder) != 1:
+            raise ValueError("expected one source-owned LTX converted-tier key bridge")
+        files[path] = source.replace(private_builder, b"\npub fn rename_vb(")
     return files
 
 
@@ -161,7 +178,12 @@ def identify(root):
 
 
 def observe(stdout, out, backend):
-    if stdout.splitlines().count("SGA_ADAPTER_TIER1_BODY " + PROFILE) != 1:
+    lines = stdout.splitlines()
+    if backend == "candle-cuda" and lines.count(
+        f"SGA_LTX_CONSTRUCTOR_OK {CANDLE_TENSOR_COUNT} {CANDLE_HEADER_SHA256}"
+    ) != 1:
+        raise ValueError("missing unique LTX Candle constructor metadata check")
+    if lines.count("SGA_ADAPTER_TIER1_BODY " + PROFILE) != 1:
         raise ValueError("missing unique completed LTX AV fixture body")
     result = json.loads(out.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     expected = {"device": {"kind": DEVICES[backend], "index": 0}, "applied": len(TARGETS),
