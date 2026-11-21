@@ -32,6 +32,62 @@ impl<'a> Scail2CharacterReferences<'a> {
         )
     }
 
+    /// Strict product grammar, shared by pixel receipts and the pre-load physical join.
+    /// Validates ordering and aligned frame origins without reading image bytes.
+    pub(super) fn catalog_carrier(
+        conditioning: &'a [Conditioning],
+        replacement: bool,
+    ) -> crate::Result<(Self, ControlClipRef<'a>)> {
+        let Some((
+            Conditioning::ControlClip {
+                frames,
+                mask,
+                masking_strength,
+                start_frame,
+                mode: replacement_mode,
+            },
+            characters,
+        )) = conditioning.split_last()
+        else {
+            return Err(Error::Unsupported(
+                "SCAIL-2 catalog conditioning must end with one ControlClip".into(),
+            ));
+        };
+        if characters.iter().any(|entry| {
+            !matches!(
+                entry,
+                Conditioning::Reference { strength: None, .. } | Conditioning::Mask { .. }
+            )
+        }) {
+            return Err(Error::Unsupported(
+                "SCAIL-2 catalog characters require ordered Reference(strength unset), Mask pairs"
+                    .into(),
+            ));
+        }
+        let characters = Scail2CharacterReferences::parse("scail2", replacement, characters)?;
+        if frames.len() != mask.len() || frames.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "SCAIL-2 admission requires equal non-empty driving frame/mask counts, got {} and {}",
+                frames.len(),
+                mask.len()
+            )));
+        }
+        if *start_frame != 0 {
+            return Err(Error::Unsupported(format!(
+                "SCAIL-2 admission requires a frame-0 driving clip, got {start_frame}"
+            )));
+        }
+        Ok((
+            characters,
+            ControlClipRef {
+                frames,
+                mask,
+                masking_strength: *masking_strength,
+                start_frame: *start_frame,
+                mode: *replacement_mode,
+            },
+        ))
+    }
     fn parse(id: &str, replacement: bool, conditioning: &'a [Conditioning]) -> crate::Result<Self> {
         let mut primary = None;
         let mut additional = Vec::new();
@@ -137,46 +193,15 @@ impl Scail2AnimationConditioningRef<'_> {
                 )))
             }
         };
-        let Some((
-            Conditioning::ControlClip {
-                frames,
-                mask,
-                masking_strength,
-                start_frame,
-                mode: replacement_mode,
-            },
-            characters,
-        )) = conditioning.split_last()
-        else {
-            return Err(Error::Unsupported(
-                "SCAIL-2 catalog conditioning must end with one ControlClip".into(),
-            ));
-        };
-        if characters.iter().any(|entry| {
-            !matches!(
-                entry,
-                Conditioning::Reference { strength: None, .. } | Conditioning::Mask { .. }
-            )
-        }) {
-            return Err(Error::Unsupported(
-                "SCAIL-2 catalog characters require ordered Reference(strength unset), Mask pairs"
-                    .into(),
-            ));
-        }
-        let characters =
-            Scail2CharacterReferences::parse("scail2", task == "replacement", characters)?;
-        if frames.len() != mask.len() || frames.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "SCAIL-2 admission requires equal non-empty driving frame/mask counts, got {} and {}",
-                frames.len(),
-                mask.len()
-            )));
-        }
-        if *start_frame != 0 {
-            return Err(Error::Unsupported(format!(
-                "SCAIL-2 admission requires a frame-0 driving clip, got {start_frame}"
-            )));
-        }
+        let (characters, driving) =
+            Scail2CharacterReferences::catalog_carrier(conditioning, task == "replacement")?;
+        let ControlClipRef {
+            frames,
+            mask,
+            masking_strength,
+            mode: replacement_mode,
+            ..
+        } = driving;
         let single = characters.additional.is_empty();
         let (receipt_domain, seal_domain) = if single {
             (RECEIPT_DOMAIN, SEAL_DOMAIN)

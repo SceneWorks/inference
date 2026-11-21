@@ -230,6 +230,7 @@ impl Scail2FitProfile {
         if pairs.additional.is_empty() {
             return Ok(());
         }
+        super::Scail2CharacterReferences::catalog_carrier(&req.conditioning, false)?;
         let pins = source_pins(spec)?;
         spec.include_directory_member_pins(&pins)
     }
@@ -254,6 +255,8 @@ impl Scail2FitProfile {
         if req.video_mode.as_deref() != Some("animation") || req.memory.is_some() {
             return Err(unsupported("requires the native unscoped animation path"));
         }
+        let (pairs, clip) =
+            super::Scail2CharacterReferences::catalog_carrier(&req.conditioning, false)?;
         let g = plan.geometry();
         if g.reference_count != pairs.reference_count()
             || !(2..=6).contains(&g.reference_count)
@@ -374,9 +377,6 @@ impl Scail2FitProfile {
         }
         let mut resize = 0;
         let mut source_shapes = Sha256::new();
-        let clip = req
-            .control_clip()
-            .ok_or_else(|| unsupported("driving clip missing"))?;
         for img in clip.frames.iter().chain(clip.mask).chain(
             std::iter::once(&pairs.primary)
                 .chain(&pairs.additional)
@@ -760,6 +760,11 @@ mod tests {
         let mut bad = request(2);
         bad.conditioning.swap(0, 1);
         assert!(Scail2FitProfile::prepare_load(&mut sp, &bad).is_err());
+        let mut duplicate = request(2);
+        duplicate
+            .conditioning
+            .insert(0, duplicate.conditioning.last().unwrap().clone());
+        assert!(Scail2FitProfile::prepare_load(&mut sp, &duplicate).is_err());
         let mut replace = request(2);
         replace.video_mode = Some("replacement".into());
         assert!(Scail2FitProfile::prepare_load(&mut sp, &replace).is_err());
