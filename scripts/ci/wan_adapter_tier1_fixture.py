@@ -31,8 +31,19 @@ MAX_HEADER_BYTES = 2**20
 ASSEMBLED_WEIGHT_BYTES = 1_168_227_456
 
 
-def contract():
+def package(_backend):
+    return PACKAGE
+
+
+def overlay(_read, _arm, backend, binary):
+    if backend != "mlx":
+        raise ValueError("Wan fixture requires MLX")
+    return {f"crates/media/mlx-gen/{PACKAGE}/src/bin/{binary}.rs": PROBE.read_bytes()}
+
+
+def contract(_backend="mlx"):
     return {
+        "compared": "bare and per-expert component velocities; timing and peaks are diagnostic only",
         "source_snapshot": {"repository": REPOSITORY, "revision": REVISION, "headers_sha256": HEADERS},
         "geometry": {"model_width": 5120, "heads": 40, "depth": 1, "latent_shape": SHAPE,
                      "text_shape": [64, 4096], "retained_bf16_bytes": ASSEMBLED_WEIGHT_BYTES},
@@ -113,17 +124,20 @@ def retained_geometry(raw):
     return dict(sorted(geometry.items()))
 
 
+def fetch_pinned_header(repository, revision, path, expected, fetch=fetch_range):
+    url = f"https://huggingface.co/{repository}/resolve/{revision}/{path}"
+    length, = struct.unpack("<Q", fetch(url, 0, 7))
+    if not 0 < length <= MAX_HEADER_BYTES:
+        raise ValueError("tensor header exceeds the bounded metadata read")
+    data = fetch(url, 8, 7 + length)
+    if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("tensor header differs from the product snapshot pin")
+    return data
+
+
 def fetch_geometry(fetch=fetch_range):
-    layouts = []
-    for path, expected in HEADERS.items():
-        url = f"https://huggingface.co/{REPOSITORY}/resolve/{REVISION}/{path}"
-        length, = struct.unpack("<Q", fetch(url, 0, 7))
-        if not 0 < length <= MAX_HEADER_BYTES:
-            raise ValueError("Wan header exceeds the bounded metadata read")
-        data = fetch(url, 8, 7 + length)
-        if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
-            raise ValueError("Wan header differs from the product snapshot pin")
-        layouts.append(retained_geometry(data))
+    layouts = [retained_geometry(fetch_pinned_header(REPOSITORY, REVISION, path, expected, fetch))
+               for path, expected in HEADERS.items()]
     if layouts[0] != layouts[1]:
         raise ValueError("Wan expert layouts disagree")
     return layouts[0]
@@ -146,18 +160,18 @@ def materialize(root):
     return identify(root)
 
 
-def identify(root):
-    if {file.name for file in root.iterdir()} != FIXTURE_FILES:
+def identify(root, files=FIXTURE_FILES):
+    if {file.name for file in root.iterdir()} != files:
         raise ValueError("fixture contains an unexpected file")
-    for name in FIXTURE_FILES:
+    for name in files:
         path = root / name
         unlinked_path(path, root)
         if not path.is_file() or path.lstat().st_nlink != 1:
             raise ValueError("fixture must contain only regular, unlinked files")
-    return {name: fixture.sha(root / name) for name in sorted(FIXTURE_FILES)}
+    return {name: fixture.sha(root / name) for name in sorted(files)}
 
 
-def observe(stdout, out):
+def observe(stdout, out, _backend="mlx"):
     if stdout.splitlines().count("SGA_ADAPTER_TIER1_BODY " + PROFILE) != 1:
         raise ValueError("missing unique completed Wan Metal fixture body")
     row = json.loads(out.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
