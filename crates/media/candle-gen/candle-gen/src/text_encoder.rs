@@ -1,26 +1,54 @@
-//! Vendored **diffusers-layout** FLUX.1 text encoders (CLIP-L + T5-XXL) with the shared packed-load
-//! seam (sc-9407) — the candle twin of the flux2-dev vendored text encoder (sc-9087) and the z-image
-//! `packed_te` (sc-9408).
+//! Shared CLIP-L and T5 text encoders for FLUX.1 and Mochi.
 //!
-//! **Why vendor.** The pre-quantized MLX tier (`SceneWorks/flux1-schnell-mlx`, epic 8506) packs the
-//! CLIP-L text encoder (`text_model.*`) and the T5-XXL encoder (`encoder.block.*`, `shared`) as MLX
-//! packed triples. The stock `candle-transformers` `ClipTextTransformer` / `T5EncoderModel` build their
-//! projections through the plain `candle_nn::{linear, embedding}`, with no seam to load from packed
-//! parts. So the packed path vendors minimal **encoder-only** copies here, building every `Linear` /
-//! embedding through the packed-detecting [`crate::quant::QLinear`] / `crate::quant::QEmbedding`:
-//! q4/q8 load straight from the packed parts (no dense staging), and a dense bf16 diffusers snapshot
-//! (no `.scales`) loads through the same code unchanged.
-//!
-//! These are faithful ports of the stock forwards — CLIP: token+position embed → 12 pre-norm attention
-//! layers (causal mask, QuickGELU MLP) → final LayerNorm → argmax-EOT pool; T5: `shared` embed → 24
-//! encoder blocks (T5 RMSNorm, relative-position-bias self-attention on block 0, gated-GELU FF) → final
-//! RMSNorm. The T5 relative-attention-bucket math is copied verbatim from the stock encoder. A CI test
-//! pins a dense build of each against the stock model at 1e-4 on shared weights.
+//! Based on the Candle CLIP/T5 encoders at 1e6aa85 and the FLUX.1 packed encoder port.
+//! Native FLUX keeps BFL's dense projection and config conventions. Diffusers FLUX and
+//! Mochi use the same encoder topology with dense or packed storage, and Mochi supplies
+//! its token padding mask and activation dtype.
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_gen::candle_nn::{LayerNorm, Module, VarBuilder};
+use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_nn::{Activation, LayerNorm, Module, VarBuilder};
 
-use crate::quant::{QEmbedding, QLinear};
+use crate::quant::{embedding, AdaptLinear, QEmbedding};
+
+/// Checkpoint-specific storage policy used within the shared encoder graphs.
+#[derive(Clone, Copy)]
+enum Storage {
+    Dense,
+    PackedDetect,
+}
+
+impl Storage {
+    fn linear(
+        self,
+        vb: &VarBuilder<'_>,
+        name: &str,
+        input: usize,
+        output: usize,
+        bias: bool,
+    ) -> Result<AdaptLinear> {
+        match self {
+            Self::Dense => Ok(AdaptLinear::from_dense(
+                candle_nn::linear_b(input, output, bias, vb.pp(name))?,
+                input,
+                output,
+            )),
+            Self::PackedDetect => AdaptLinear::linear_detect(input, output, vb, name, bias),
+        }
+    }
+
+    fn embedding(
+        self,
+        vb: &VarBuilder<'_>,
+        name: &str,
+        vocab: usize,
+        hidden: usize,
+    ) -> Result<QEmbedding> {
+        match self {
+            Self::Dense => QEmbedding::embedding(vocab, hidden, vb.pp(name)),
+            Self::PackedDetect => embedding(vb, name, vocab, hidden),
+        }
+    }
+}
 
 // ============================================================================================
 // CLIP-L text encoder (openai/clip-vit-large-patch14 layout, `text_model.` prefix).
@@ -66,16 +94,16 @@ struct ClipEmbeddings {
 }
 
 impl ClipEmbeddings {
-    fn new(cfg: &ClipConfig, vb: &VarBuilder) -> Result<Self> {
+    fn new(cfg: &ClipConfig, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         let emb = vb.pp("embeddings");
         Ok(Self {
-            token_embedding: QEmbedding::detect(
+            token_embedding: storage.embedding(
                 &emb,
                 "token_embedding",
                 cfg.vocab_size,
                 cfg.embed_dim,
             )?,
-            position_embedding: QEmbedding::detect(
+            position_embedding: storage.embedding(
                 &emb,
                 "position_embedding",
                 cfg.max_position_embeddings,
@@ -96,20 +124,20 @@ impl ClipEmbeddings {
 }
 
 struct ClipAttention {
-    q_proj: QLinear,
-    k_proj: QLinear,
-    v_proj: QLinear,
-    out_proj: QLinear,
+    q_proj: AdaptLinear,
+    k_proj: AdaptLinear,
+    v_proj: AdaptLinear,
+    out_proj: AdaptLinear,
     head_dim: usize,
     scale: f64,
     num_heads: usize,
 }
 
 impl ClipAttention {
-    fn new(cfg: &ClipConfig, vb: &VarBuilder) -> Result<Self> {
+    fn new(cfg: &ClipConfig, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         let d = cfg.embed_dim;
         let head_dim = d / cfg.num_attention_heads;
-        let lin = |n: &str| QLinear::linear_detect(d, d, vb, n, true);
+        let lin = |name| storage.linear(vb, name, d, d, true);
         Ok(Self {
             q_proj: lin("q_proj")?,
             k_proj: lin("k_proj")?,
@@ -150,7 +178,7 @@ impl ClipAttention {
             .reshape((bsz, self.num_heads, seq_len, src_len))?
             .broadcast_add(causal_mask)?
             .reshape((bsz * self.num_heads, seq_len, src_len))?;
-        let attn_weights = candle_gen::candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?.to_dtype(in_dtype)?;
         let attn_output = attn_output
             .reshape((bsz, self.num_heads, seq_len, self.head_dim))?
@@ -161,22 +189,22 @@ impl ClipAttention {
 }
 
 struct ClipMlp {
-    fc1: QLinear,
-    fc2: QLinear,
+    fc1: AdaptLinear,
+    fc2: AdaptLinear,
 }
 
 impl ClipMlp {
-    fn new(cfg: &ClipConfig, vb: &VarBuilder) -> Result<Self> {
+    fn new(cfg: &ClipConfig, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         Ok(Self {
-            fc1: QLinear::linear_detect(cfg.embed_dim, cfg.intermediate_size, vb, "fc1", true)?,
-            fc2: QLinear::linear_detect(cfg.intermediate_size, cfg.embed_dim, vb, "fc2", true)?,
+            fc1: storage.linear(vb, "fc1", cfg.embed_dim, cfg.intermediate_size, true)?,
+            fc2: storage.linear(vb, "fc2", cfg.intermediate_size, cfg.embed_dim, true)?,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.fc1.forward(xs)?;
         // QuickGELU: x * sigmoid(1.702 x).
-        let xs = (&xs * candle_gen::candle_nn::ops::sigmoid(&(&xs * 1.702f64)?)?)?;
+        let xs = (&xs * candle_nn::ops::sigmoid(&(&xs * 1.702f64)?)?)?;
         self.fc2.forward(&xs)
     }
 }
@@ -189,11 +217,11 @@ struct ClipLayer {
 }
 
 impl ClipLayer {
-    fn new(cfg: &ClipConfig, vb: &VarBuilder) -> Result<Self> {
+    fn new(cfg: &ClipConfig, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         Ok(Self {
-            self_attn: ClipAttention::new(cfg, &vb.pp("self_attn"))?,
+            self_attn: ClipAttention::new(cfg, &vb.pp("self_attn"), storage)?,
             layer_norm1: clip_layer_norm(cfg.embed_dim, vb, "layer_norm1")?,
-            mlp: ClipMlp::new(cfg, &vb.pp("mlp"))?,
+            mlp: ClipMlp::new(cfg, &vb.pp("mlp"), storage)?,
             layer_norm2: clip_layer_norm(cfg.embed_dim, vb, "layer_norm2")?,
         })
     }
@@ -210,22 +238,31 @@ impl ClipLayer {
     }
 }
 
-/// The packed CLIP-L text transformer — token+position embed → 12 pre-norm layers → final LayerNorm,
+/// The CLIP-L text transformer — token+position embed → 12 pre-norm layers → final LayerNorm,
 /// pooled at the argmax-EOT position (FLUX's `vec`/`y` conditioning).
-pub struct PackedClipText {
+pub struct ClipTextEncoder {
     embeddings: ClipEmbeddings,
     layers: Vec<ClipLayer>,
     final_layer_norm: LayerNorm,
 }
 
-impl PackedClipText {
+impl ClipTextEncoder {
     /// Load from `vb` rooted at the CLIP `text_model.` prefix (the pipeline passes `vb.pp("text_model")`).
     pub fn new(cfg: &ClipConfig, vb: VarBuilder) -> Result<Self> {
-        let embeddings = ClipEmbeddings::new(cfg, &vb)?;
+        Self::load(cfg, vb, Storage::PackedDetect)
+    }
+
+    /// Load the native BFL dense CLIP-L checkpoint.
+    pub fn new_bfl(cfg: &ClipConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(cfg, vb, Storage::Dense)
+    }
+
+    fn load(cfg: &ClipConfig, vb: VarBuilder, storage: Storage) -> Result<Self> {
+        let embeddings = ClipEmbeddings::new(cfg, &vb, storage)?;
         let enc = vb.pp("encoder").pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(ClipLayer::new(cfg, &enc.pp(i))?);
+            layers.push(ClipLayer::new(cfg, &enc.pp(i), storage)?);
         }
         let final_layer_norm = clip_layer_norm(cfg.embed_dim, &vb, "final_layer_norm")?;
         Ok(Self {
@@ -266,7 +303,7 @@ impl PackedClipText {
 // T5-XXL encoder (google/t5-v1_1-xxl layout: `shared`, `encoder.block.*`, `encoder.final_layer_norm`).
 // ============================================================================================
 
-/// The T5-XXL config subset the FLUX encoder path needs (encoder-only, gated-GELU).
+/// Geometry and normalization configuration for the encoder-only T5 graph.
 pub struct T5Config {
     pub vocab_size: usize,
     pub d_model: usize,
@@ -320,59 +357,92 @@ impl T5LayerNorm {
     }
 }
 
-/// T5 gated-GELU FF: `wo( gelu(wi_0(x)) * wi_1(x) )`, all bias-less.
-struct T5DenseGatedActDense {
-    wi_0: QLinear,
-    wi_1: QLinear,
-    wo: QLinear,
+/// Native BFL T5 used Candle's broadcasted no-bias matrix multiply. Diffusers and
+/// Mochi used the shared projection's regular/upcast path. Keep that kernel choice at
+/// the projection so both routes use the same attention and feed-forward graph.
+struct T5Projection {
+    linear: AdaptLinear,
+    storage: Storage,
 }
 
-impl T5DenseGatedActDense {
-    fn new(cfg: &T5Config, vb: &VarBuilder) -> Result<Self> {
+impl T5Projection {
+    fn new(
+        storage: Storage,
+        vb: &VarBuilder<'_>,
+        name: &str,
+        input: usize,
+        output: usize,
+    ) -> Result<Self> {
         Ok(Self {
-            wi_0: QLinear::linear_detect(cfg.d_model, cfg.d_ff, vb, "wi_0", false)?,
-            wi_1: QLinear::linear_detect(cfg.d_model, cfg.d_ff, vb, "wi_1", false)?,
-            wo: QLinear::linear_detect(cfg.d_ff, cfg.d_model, vb, "wo", false)?,
+            linear: storage.linear(vb, name, input, output, false)?,
+            storage,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // T5 v1.1 uses the "new"/tanh GELU (NewGelu) — candle `gelu` is the tanh approximation.
-        // `forward_upcast` so a bf16-weight encoder can run f32 activations (Mochi's regime); it is
-        // inert (byte-identical, no copy) when the weights already match `xs`'s dtype — the FLUX /
-        // Chroma path.
-        let hidden_gelu = self.wi_0.forward_upcast(xs)?.gelu()?;
-        let hidden_linear = self.wi_1.forward_upcast(xs)?;
-        self.wo
-            .forward_upcast(&hidden_gelu.broadcast_mul(&hidden_linear)?)
+        let Storage::Dense = self.storage else {
+            return self.linear.forward_upcast(xs);
+        };
+        let dense = self
+            .linear
+            .dense_base()
+            .ok_or_else(|| candle_core::Error::Msg("native T5 projection is not dense".into()))?;
+        let weight = dense.weight().to_dtype(xs.dtype())?;
+        let weight = match *xs.dims() {
+            [b1, b2, _, _] => weight.broadcast_left((b1, b2))?,
+            [batch, _, _] => weight.broadcast_left(batch)?,
+            _ => weight,
+        };
+        xs.matmul(&weight.t()?)
     }
 }
 
 struct T5LayerFF {
-    dense: T5DenseGatedActDense,
+    wi: T5Projection,
+    gate: Option<T5Projection>,
+    wo: T5Projection,
+    activation: Activation,
     layer_norm: T5LayerNorm,
 }
 
 impl T5LayerFF {
-    fn new(cfg: &T5Config, vb: &VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &T5Config,
+        vb: &VarBuilder,
+        storage: Storage,
+        gated_activation: Option<Activation>,
+    ) -> Result<Self> {
+        let dense = vb.pp("DenseReluDense");
+        let input = |name| T5Projection::new(storage, &dense, name, cfg.d_model, cfg.d_ff);
+        let (wi, gate, activation) = match gated_activation {
+            Some(activation) => (input("wi_0")?, Some(input("wi_1")?), activation),
+            // The reference's ungated feed-forward always uses ReLU.
+            None => (input("wi")?, None, Activation::Relu),
+        };
         Ok(Self {
-            dense: T5DenseGatedActDense::new(cfg, &vb.pp("DenseReluDense"))?,
+            wi,
+            gate,
+            wo: T5Projection::new(storage, &dense, "wo", cfg.d_ff, cfg.d_model)?,
+            activation,
             layer_norm: T5LayerNorm::new(cfg.d_model, cfg.layer_norm_epsilon, vb, "layer_norm")?,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let ys = self.layer_norm.forward(xs)?;
-        let ys = self.dense.forward(&ys)?;
-        xs + ys
+        let normed = self.layer_norm.forward(xs)?;
+        let mut hidden = self.activation.forward(&self.wi.forward(&normed)?)?;
+        if let Some(gate) = &self.gate {
+            hidden = hidden.broadcast_mul(&gate.forward(&normed)?)?;
+        }
+        xs + self.wo.forward(&hidden)?
     }
 }
 
 struct T5Attention {
-    q: QLinear,
-    k: QLinear,
-    v: QLinear,
-    o: QLinear,
+    q: T5Projection,
+    k: T5Projection,
+    v: T5Projection,
+    o: T5Projection,
     relative_attention_bias: Option<QEmbedding>,
     n_heads: usize,
     d_kv: usize,
@@ -382,15 +452,15 @@ struct T5Attention {
 }
 
 impl T5Attention {
-    fn new(has_rel_bias: bool, cfg: &T5Config, vb: &VarBuilder) -> Result<Self> {
+    fn new(has_rel_bias: bool, cfg: &T5Config, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
         Ok(Self {
-            q: QLinear::linear_detect(cfg.d_model, inner_dim, vb, "q", false)?,
-            k: QLinear::linear_detect(cfg.d_model, inner_dim, vb, "k", false)?,
-            v: QLinear::linear_detect(cfg.d_model, inner_dim, vb, "v", false)?,
-            o: QLinear::linear_detect(inner_dim, cfg.d_model, vb, "o", false)?,
+            q: T5Projection::new(storage, vb, "q", cfg.d_model, inner_dim)?,
+            k: T5Projection::new(storage, vb, "k", cfg.d_model, inner_dim)?,
+            v: T5Projection::new(storage, vb, "v", cfg.d_model, inner_dim)?,
+            o: T5Projection::new(storage, vb, "o", inner_dim, cfg.d_model)?,
             relative_attention_bias: if has_rel_bias {
-                Some(QEmbedding::detect(
+                Some(storage.embedding(
                     vb,
                     "relative_attention_bias",
                     cfg.relative_attention_num_buckets,
@@ -461,9 +531,9 @@ impl T5Attention {
         let kv_len = q_len;
         // `forward_upcast`: inert (byte-identical) when weights already match `xs`'s dtype — the FLUX /
         // Chroma path — and lets Mochi run f32 activations over bf16-resident weights.
-        let q = self.q.forward_upcast(xs)?;
-        let k = self.k.forward_upcast(xs)?;
-        let v = self.v.forward_upcast(xs)?;
+        let q = self.q.forward(xs)?;
+        let k = self.k.forward(xs)?;
+        let v = self.v.forward(xs)?;
         let to_heads = |t: Tensor| -> Result<Tensor> {
             t.reshape((b_sz, q_len, self.n_heads, self.d_kv))?
                 .transpose(1, 2)?
@@ -492,12 +562,12 @@ impl T5Attention {
             Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
             None => scores,
         };
-        let attn = candle_gen::candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = attn.matmul(&v)?;
         let out = out
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.inner_dim))?;
-        Ok((self.o.forward_upcast(&out)?, position_bias))
+        Ok((self.o.forward(&out)?, position_bias))
     }
 }
 
@@ -507,9 +577,9 @@ struct T5LayerSelfAttention {
 }
 
 impl T5LayerSelfAttention {
-    fn new(has_rel_bias: bool, cfg: &T5Config, vb: &VarBuilder) -> Result<Self> {
+    fn new(has_rel_bias: bool, cfg: &T5Config, vb: &VarBuilder, storage: Storage) -> Result<Self> {
         Ok(Self {
-            self_attention: T5Attention::new(has_rel_bias, cfg, &vb.pp("SelfAttention"))?,
+            self_attention: T5Attention::new(has_rel_bias, cfg, &vb.pp("SelfAttention"), storage)?,
             layer_norm: T5LayerNorm::new(cfg.d_model, cfg.layer_norm_epsilon, vb, "layer_norm")?,
         })
     }
@@ -532,11 +602,17 @@ struct T5Block {
 }
 
 impl T5Block {
-    fn new(has_rel_bias: bool, cfg: &T5Config, vb: &VarBuilder) -> Result<Self> {
+    fn new(
+        has_rel_bias: bool,
+        cfg: &T5Config,
+        vb: &VarBuilder,
+        storage: Storage,
+        gated_activation: Option<Activation>,
+    ) -> Result<Self> {
         let vb = vb.pp("layer");
         Ok(Self {
-            self_attn: T5LayerSelfAttention::new(has_rel_bias, cfg, &vb.pp("0"))?,
-            ff: T5LayerFF::new(cfg, &vb.pp("1"))?,
+            self_attn: T5LayerSelfAttention::new(has_rel_bias, cfg, &vb.pp("0"), storage)?,
+            ff: T5LayerFF::new(cfg, &vb.pp("1"), storage, gated_activation)?,
         })
     }
 
@@ -551,24 +627,57 @@ impl T5Block {
     }
 }
 
-/// The packed T5-XXL encoder — `shared` embed → 24 encoder blocks (relative bias on block 0) → final
+/// The T5 encoder — `shared` embed → 24 encoder blocks (relative bias on block 0) → final
 /// RMSNorm. Returns the `[B, L, 4096]` sequence FLUX consumes as `txt`.
-pub struct PackedT5Encoder {
+pub struct T5Encoder {
     shared: QEmbedding,
     blocks: Vec<T5Block>,
     final_layer_norm: T5LayerNorm,
 }
 
-impl PackedT5Encoder {
+impl T5Encoder {
     /// Load from `vb` rooted at the T5 checkpoint root (`shared`, `encoder.block.*`,
     /// `encoder.final_layer_norm`).
     pub fn new(cfg: &T5Config, vb: VarBuilder) -> Result<Self> {
-        let shared = QEmbedding::detect(&vb, "shared", cfg.vocab_size, cfg.d_model)?;
+        Self::load(
+            cfg,
+            vb,
+            "shared",
+            Storage::PackedDetect,
+            Some(Activation::NewGelu),
+        )
+    }
+
+    /// Load the native BFL T5 encoder and honor the config's feed-forward layout.
+    /// `None` selects the legacy ungated ReLU branch.
+    pub fn new_bfl(
+        cfg: &T5Config,
+        vb: VarBuilder,
+        gated_activation: Option<Activation>,
+    ) -> Result<Self> {
+        let prefix = bfl_t5_embedding_prefix(|name| vb.contains_tensor(name));
+        Self::load(cfg, vb, prefix, Storage::Dense, gated_activation)
+    }
+
+    fn load(
+        cfg: &T5Config,
+        vb: VarBuilder,
+        embedding_prefix: &str,
+        storage: Storage,
+        gated_activation: Option<Activation>,
+    ) -> Result<Self> {
+        let shared = storage.embedding(&vb, embedding_prefix, cfg.vocab_size, cfg.d_model)?;
         let enc = vb.pp("encoder");
         let block_vb = enc.pp("block");
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(T5Block::new(i == 0, cfg, &block_vb.pp(i))?);
+            blocks.push(T5Block::new(
+                i == 0,
+                cfg,
+                &block_vb.pp(i),
+                storage,
+                gated_activation,
+            )?);
         }
         let final_layer_norm = T5LayerNorm::new(
             cfg.d_model,
@@ -612,164 +721,45 @@ impl PackedT5Encoder {
     }
 }
 
+fn bfl_t5_embedding_prefix(contains: impl Fn(&str) -> bool) -> &'static str {
+    if contains("shared.weight") {
+        "shared"
+    } else if contains("decoder.embed_tokens")
+        || (!contains("encoder.embed_tokens.weight") && contains("decoder.embed_tokens.weight"))
+    {
+        "decoder.embed_tokens"
+    } else {
+        "encoder.embed_tokens"
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use candle_gen::candle_core::{DType, Device};
-    use candle_gen::candle_nn::VarMap;
-    use candle_gen::testkit::tensor_max_abs_diff_f32;
+    use super::bfl_t5_embedding_prefix;
 
-    /// **Vendored CLIP ≡ stock candle-transformers CLIP (dense, 1e-4).** Both models load from the SAME
-    /// random `VarMap` (identical `text_model.*` diffusers keys), so a byte-for-byte match of their
-    /// pooled `[B, 768]` outputs proves the vendored packed-detect CLIP is a faithful dense port — the
-    /// dense path is unchanged, and (since the packed forward = dequant-then-dense-matmul) a packed load
-    /// of the same weights would track it too. A tiny 2-layer config keeps it GPU-free and fast.
     #[test]
-    #[ignore = "model inference; explicit model workflow only"]
-    fn vendored_clip_matches_stock_dense() -> Result<()> {
-        use candle_transformers::models::clip::text_model::{
-            Activation, ClipTextConfig, ClipTextTransformer,
-        };
-        let dev = Device::Cpu;
-        let cfg = ClipConfig {
-            vocab_size: 64,
-            embed_dim: 32,
-            intermediate_size: 64,
-            max_position_embeddings: 16,
-            num_hidden_layers: 2,
-            num_attention_heads: 4,
-        };
-        let stock_cfg = ClipTextConfig {
-            vocab_size: cfg.vocab_size,
-            embed_dim: cfg.embed_dim,
-            projection_dim: cfg.embed_dim,
-            activation: Activation::QuickGelu,
-            intermediate_size: cfg.intermediate_size,
-            max_position_embeddings: cfg.max_position_embeddings,
-            pad_with: None,
-            num_hidden_layers: cfg.num_hidden_layers,
-            num_attention_heads: cfg.num_attention_heads,
-        };
-
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        // Build the vendored model (forces the `text_model.*` keys to be created in the VarMap).
-        let vendored = PackedClipText::new(&cfg, vb.pp("text_model"))?;
-        // Build the stock model from the SAME VarMap → identical weights.
-        let vb2 = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let stock = ClipTextTransformer::new(vb2.pp("text_model"), &stock_cfg)?;
-
-        let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 0, 0], (1, 6), &dev)?;
-        let v = vendored.forward(&ids)?;
-        let s = __model_proof_output!(stock.forward(&ids))?;
-        assert_eq!(v.dims(), s.dims());
-        let d = tensor_max_abs_diff_f32(&v, &s);
-        assert!(d < 1e-4, "vendored CLIP vs stock max|Δ| = {d}");
-        #[cfg(feature = "model-inference-proof")]
-        println!(
-            "\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::vendored_clip_matches_stock_dense"
+    fn bfl_t5_embedding_keeps_native_key_precedence_and_fallback() {
+        let prefix = |present: &[&str]| bfl_t5_embedding_prefix(|name| present.contains(&name));
+        assert_eq!(
+            prefix(&[
+                "shared.weight",
+                "decoder.embed_tokens",
+                "encoder.embed_tokens.weight"
+            ]),
+            "shared"
         );
-        Ok(())
-    }
-
-    /// **Vendored T5 encoder ≡ stock candle-transformers T5 encoder (dense, 1e-4).** Same-VarMap parity
-    /// on the encoder path (`shared`, `encoder.block.*`, `encoder.final_layer_norm`, gated-GELU FF,
-    /// block-0 relative bias). A tiny 2-block config keeps it GPU-free.
-    #[test]
-    #[ignore = "model inference; explicit model workflow only"]
-    fn vendored_t5_matches_stock_dense() -> Result<()> {
-        use candle_transformers::models::t5::{
-            ActivationWithOptionalGating, Config as StockT5Config, T5EncoderModel,
-        };
-        let dev = Device::Cpu;
-        let cfg = T5Config {
-            vocab_size: 64,
-            d_model: 32,
-            d_kv: 8,
-            d_ff: 64,
-            num_layers: 2,
-            num_heads: 4,
-            relative_attention_num_buckets: 8,
-            relative_attention_max_distance: 128,
-            layer_norm_epsilon: 1e-6,
-        };
-        let stock_cfg = StockT5Config {
-            vocab_size: cfg.vocab_size,
-            d_model: cfg.d_model,
-            d_kv: cfg.d_kv,
-            d_ff: cfg.d_ff,
-            num_layers: cfg.num_layers,
-            num_decoder_layers: None,
-            num_heads: cfg.num_heads,
-            relative_attention_num_buckets: cfg.relative_attention_num_buckets,
-            relative_attention_max_distance: cfg.relative_attention_max_distance,
-            dropout_rate: 0.0,
-            layer_norm_epsilon: cfg.layer_norm_epsilon,
-            initializer_factor: 1.0,
-            feed_forward_proj: ActivationWithOptionalGating {
-                gated: true,
-                activation: candle_gen::candle_nn::Activation::NewGelu,
-            },
-            tie_word_embeddings: false,
-            is_decoder: false,
-            is_encoder_decoder: true,
-            use_cache: false,
-            pad_token_id: 0,
-            eos_token_id: 1,
-            decoder_start_token_id: Some(0),
-        };
-
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let vendored = PackedT5Encoder::new(&cfg, vb)?;
-        let vb2 = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let mut stock = T5EncoderModel::load(vb2, &stock_cfg)?;
-
-        let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 7, 1], (1, 6), &dev)?;
-        let v = vendored.forward(&ids, DType::F32)?;
-        let s = __model_proof_output!(stock.forward(&ids))?;
-        assert_eq!(v.dims(), s.dims());
-        let d = tensor_max_abs_diff_f32(&v, &s);
-        assert!(d < 1e-4, "vendored T5 encoder vs stock max|Δ| = {d}");
-        #[cfg(feature = "model-inference-proof")]
-        println!(
-            "\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::vendored_t5_matches_stock_dense"
+        assert_eq!(
+            prefix(&["decoder.embed_tokens", "encoder.embed_tokens.weight"]),
+            "decoder.embed_tokens"
         );
-        Ok(())
-    }
-
-    /// The masked forward (added for Mochi's `_get_t5_prompt_embeds`) is **inert** with an all-zero
-    /// additive key-padding mask: `forward_masked(ids, dt, Some(zeros))` is byte-identical to the
-    /// unmasked `forward(ids, dt)`. This guards the FLUX dense path's byte-exactness — the added
-    /// `Some(mask)` branch must not perturb the computation when the mask is all-zero. (The mask's
-    /// *numeric* effect on padded keys needs non-trivial weights, so it is validated with real weights
-    /// in the Mochi `te_parity` gate, not here — this test's `VarMap` zero-inits every projection.)
-    #[test]
-    #[ignore = "model inference; explicit model workflow only"]
-    fn masked_forward_zero_mask_is_byte_identical_to_unmasked() -> Result<()> {
-        let dev = Device::Cpu;
-        let cfg = T5Config {
-            vocab_size: 64,
-            d_model: 32,
-            d_kv: 8,
-            d_ff: 64,
-            num_layers: 2,
-            num_heads: 4,
-            relative_attention_num_buckets: 8,
-            relative_attention_max_distance: 128,
-            layer_norm_epsilon: 1e-6,
-        };
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let enc = PackedT5Encoder::new(&cfg, vb)?;
-
-        let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 7, 1], (1, 6), &dev)?;
-        let unmasked = enc.forward(&ids, DType::F32)?;
-        let zeros = Tensor::zeros((1, 1, 1, 6), DType::F32, &dev)?;
-        let masked_zero = enc.forward_masked(&ids, DType::F32, Some(&zeros))?;
-        assert_eq!(tensor_max_abs_diff_f32(&unmasked, &masked_zero), 0.0);
-        #[cfg(feature = "model-inference-proof")]
-        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked");
-        Ok(())
+        assert_eq!(
+            prefix(&["decoder.embed_tokens.weight", "encoder.embed_tokens.weight"]),
+            "encoder.embed_tokens"
+        );
+        assert_eq!(
+            prefix(&["decoder.embed_tokens.weight"]),
+            "decoder.embed_tokens"
+        );
+        assert_eq!(prefix(&[]), "encoder.embed_tokens");
     }
 }
