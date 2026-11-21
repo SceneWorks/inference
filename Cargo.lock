@@ -495,6 +495,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-layers",
  "candle-nn",
  "candle-quant-kernels",
  "float8",
@@ -1249,11 +1250,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-layers"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-quant-kernels",
+ "core-llm",
+ "half",
+ "rayon",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "candle-llm"
 version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-layers",
  "candle-llm",
  "candle-nn",
  "candle-quant-kernels",
@@ -2537,6 +2555,7 @@ dependencies = [
  "image",
  "libc",
  "memmap2",
+ "mlx-layers",
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
@@ -3248,6 +3267,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-layers"
+version = "0.1.0"
+dependencies = [
+ "core-llm",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "sceneworks-gen-core",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mlx-llm"
 version = "0.0.0"
 dependencies = [
@@ -3256,6 +3287,7 @@ dependencies = [
  "half",
  "libc",
  "memmap2",
+ "mlx-layers",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-load-progress",

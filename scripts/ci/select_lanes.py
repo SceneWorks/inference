@@ -62,6 +62,7 @@ IOS_BOUND_PATHS = (
     "crates/contracts/gen-core-pag-policy",
     "crates/contracts/gen-core-tokenizer",
     "crates/contracts/gen-core-train",
+    "crates/layers/mlx-layers",
     "crates/llm/mlx-llm",
     "crates/media/mlx-gen/mlx-gen-anima",
     "crates/media/mlx-gen/mlx-gen-ios-catalog",
@@ -248,12 +249,14 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             lanes.update(windows_cuda=True, real_weights=True, release=True)
             continue
 
-        # The shared low-precision kernels (sc-24135) are consumed by both Candle engines, so a
-        # change there exercises every lane either engine builds on.
+        # The shared low-precision kernels (sc-24135) and Candle layer primitives (SW-6955) are
+        # consumed by both Candle engines, so a change there exercises every lane either engine
+        # builds on.
         if (
             _under(path, "crates/llm/candle-llm")
             or _under(path, "crates/media/candle-gen")
             or _under(path, "crates/kernels")
+            or _under(path, "crates/layers/candle-layers")
         ):
             lanes.update(
                 candle_cpu=True,
@@ -274,7 +277,11 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        if _under(path, "crates/llm/mlx-llm") or _under(path, "crates/media/mlx-gen"):
+        if (
+            _under(path, "crates/llm/mlx-llm")
+            or _under(path, "crates/media/mlx-gen")
+            or _under(path, "crates/layers/mlx-layers")
+        ):
             lanes.update(macos_metal=True, real_weights=True)
             continue
 

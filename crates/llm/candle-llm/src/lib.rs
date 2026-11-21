@@ -62,7 +62,9 @@ pub mod starvector;
 pub mod starvector_8b;
 mod starvector_common;
 
-// Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
+// Re-export the contract and shared Candle layer spine crates so consumers can reach them as
+// `candle_llm::core_llm::…` and `candle_llm::candle_layers::…`.
+pub use candle_layers;
 pub use core_llm;
 
 pub use backend::{backend_capabilities, nvfp4_support};

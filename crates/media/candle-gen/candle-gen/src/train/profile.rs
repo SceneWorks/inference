@@ -83,6 +83,7 @@ pub fn active() -> bool {
 /// are rejected, and all thread-local state is restored on errors/panics.
 #[cfg(feature = "model-inference-proof")]
 pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
+    crate::ensure_reference_math_hook();
     assert!(!ACTIVE.replace(true), "nested bounded training profile");
     struct Reset;
     impl Drop for Reset {
@@ -544,6 +545,7 @@ fn with_observation<T>(
     comparison: Option<serde_json::Value>,
     f: impl FnOnce() -> T,
 ) -> T {
+    crate::ensure_reference_math_hook();
     assert!(!active() && !cohort_active(), "nested bounded proof scope");
     COHORT.with(|state| {
         *state.borrow_mut() = Some(CohortObservation {

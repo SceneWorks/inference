@@ -19,10 +19,33 @@
 // below so every downstream `use mlx_gen::…` keeps compiling. Re-exported as a module too, so
 // `mlx_gen::gen_core::{Error, Result}` (the neutral contract error) is reachable by name.
 pub use ::gen_core;
+pub extern crate mlx_layers;
 pub use gen_core::{
     impl_generator, register_captioner, register_generators, register_image_embedder,
     register_text_embedder, register_trainer,
 };
+pub use mlx_layers::{Linear, MlxWeightSource, ScaleContext};
+
+#[inline]
+pub(crate) fn ensure_exact_epilogue_hooks() {
+    mlx_layers::register_exact_epilogue_hooks(
+        || crate::capability::enabled(crate::capability::PipelineCapability::ExactEpilogues),
+        |op| {
+            crate::diagnostics::record_exact_epilogue(
+                op,
+                crate::diagnostics::ToggleDisposition::Applied,
+                None,
+            );
+        },
+        |op| {
+            crate::diagnostics::record_exact_epilogue(
+                op,
+                crate::diagnostics::ToggleDisposition::Fallback,
+                Some("unsupported_dtype_shape_or_dispatch"),
+            );
+        },
+    );
+}
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
