@@ -752,7 +752,7 @@ pub fn compile_logical_weight_plan_with_metadata(
         let mode = if codec_spec.full_precision_matrix_mult() {
             ResidencyMode::Dense
         } else {
-            residency.residency(codec, &codec_spec, &header.shape)
+            residency.residency_for_key(&header.name, codec, &codec_spec, &header.shape)
         };
         if matches!(codec_spec, TensorCodecSpec::ConvRotInt8 { .. })
             && mode != ResidencyMode::Packed

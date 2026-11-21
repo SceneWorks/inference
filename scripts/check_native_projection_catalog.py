@@ -153,7 +153,11 @@ def check_mlx(root: Path) -> list[str]:
                 issues.append(f"{name}: {path} lost shared native projection construction")
     for path, needle in (
         (media / "src/weights.rs", "mlx_layers::source::prepare_sources("),
-        (llm / "primitives/weights.rs", "mlx_layers::source::prepare_sources("),
+        (llm / "primitives/weights.rs", "mlx_layers::source::prepare_sources_with_experts("),
+        (llm / "primitives/moe.rs", "obs.expert("),
+        (llm / "models/qwen35.rs", "SwitchLinear::from_checkpoint("),
+        (media / "mlx-gen-sdxl/src/ldm.rs", "insert_source_projection("),
+        (media / "mlx-gen-minimax-h3/src/dit/heads.rs", "source_projection("),
         (media / "src/quant.rs", "NativeProjection::from_weights("),
         (llm / "primitives/projection.rs", "NativeProjection::from_key("),
     ):

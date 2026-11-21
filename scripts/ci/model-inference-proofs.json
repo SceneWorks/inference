@@ -270720,6 +270720,41 @@
   },
   {
     "package": "mlx-gen",
+    "target": "mlx_gen",
+    "target_kind": "lib",
+    "fqn": "logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding",
+    "source": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Original E4M3FN, E5M2, publisher rowwise and swizzled MXFP8 source bytes; 1x1x32 and tail 3x17x35 codebook controls",
+    "configuration_source": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs::logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding",
+    "output_contract": "F64 independent codebook oracle, <=1 BF16 ULP single output and <=2 BF16 ULP multirow; exact MX scale discriminant and pre-bias dtype rounding",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "no_default_features": false,
+    "cargo_target_metadata": {
+      "name": "mlx_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "required_environment": [],
+    "reachable_helper_trace": [
+      "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs -> mlx_layers::fp8::Fp8Linear::forward -> model-selected Metal stream tiled matmul"
+    ],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs::logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding; source-defined codebooks, shapes, activation/weight scales and deterministic weights/inputs",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen",
     "target": "integration",
     "target_kind": "test",
     "fqn": "quant_parity::adaptable_linear_quantize_matches_reference",

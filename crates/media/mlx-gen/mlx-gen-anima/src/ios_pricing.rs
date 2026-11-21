@@ -65,6 +65,7 @@ pub(crate) struct AnimaPricingFacts {
     pub(crate) dit: Vec<SafetensorsTensorHeader>,
     pub(crate) text_encoder: Vec<SafetensorsTensorHeader>,
     pub(crate) vae: Vec<SafetensorsTensorHeader>,
+    source_plans: [Option<mlx_gen::gen_core::LogicalWeightPlan>; 3],
     pub(crate) configs: (DitConfig, ConditionerConfig, Qwen3Config),
     /// Whether the variant runs a CFG pair (an uncond prompt): never for Turbo.
     pub(crate) uses_cfg: bool,
@@ -346,14 +347,39 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
 /// as it resolves them) and the model configs it builds.
 pub(crate) fn snapshot_facts(spec: &LoadSpec, variant: Variant) -> Result<AnimaPricingFacts> {
     let root = crate::loader::resolve_split_files(&spec.weights)?;
-    let headers = |path: std::path::PathBuf| {
-        mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path)
-            .map_err(|e| Error::Msg(format!("{}: {e}", path.display())))
+    let component = |path: std::path::PathBuf| -> Result<_> {
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        let plan = if headers.iter().any(|h| {
+            matches!(
+                h.dtype,
+                StoredDtype::F8_E4M3 | StoredDtype::F8_E5M2 | StoredDtype::I8
+            ) || h.name.ends_with(".comfy_quant")
+        }) {
+            let table =
+                mlx_gen::gen_core::weightsmeta::safetensors_path_quantization_metadata(&path)
+                    .map_err(|e| Error::Msg(e.to_string()))?;
+            mlx_gen::gen_core::checkpoint_codec::plan_projection_sources(
+                &[path],
+                |_| true,
+                &table.into_iter().collect::<Vec<_>>(),
+                mlx_gen::logical_weights::baseline_codec_registry(),
+                &mlx_gen::logical_weights::MlxCodecResidency,
+            )
+            .map_err(|e| Error::Msg(e.to_string()))?
+        } else {
+            None
+        };
+        Ok((headers, plan))
     };
+    let (dit, d) = component(root.join("diffusion_models").join(variant.dit_filename()))?;
+    let (text_encoder, t) = component(root.join(crate::loader::TEXT_ENCODER_FILE))?;
+    let (vae, v) = component(root.join(crate::loader::VAE_FILE))?;
     Ok(AnimaPricingFacts {
-        dit: headers(root.join("diffusion_models").join(variant.dit_filename()))?,
-        text_encoder: headers(root.join(crate::loader::TEXT_ENCODER_FILE))?,
-        vae: headers(root.join(crate::loader::VAE_FILE))?,
+        dit,
+        text_encoder,
+        vae,
+        source_plans: [d, t, v],
         configs: crate::loader::model_configs(),
         uses_cfg: variant.uses_cfg(),
         adapter_bytes: adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive)
@@ -377,7 +403,9 @@ pub(crate) fn fold(quanta: &[PricedQuantum]) -> IosPricing {
 fn mlx_dtype(dtype: StoredDtype) -> Result<Dtype> {
     Ok(match dtype {
         StoredDtype::BOOL => Dtype::Bool,
-        StoredDtype::U8 => Dtype::Uint8,
+        StoredDtype::U8 | StoredDtype::F8_E4M3 | StoredDtype::F8_E5M2 | StoredDtype::F8_E8M0 => {
+            Dtype::Uint8
+        }
         StoredDtype::I8 => Dtype::Int8,
         StoredDtype::U16 => Dtype::Uint16,
         StoredDtype::I16 => Dtype::Int16,
@@ -399,7 +427,10 @@ fn mlx_dtype(dtype: StoredDtype) -> Result<Dtype> {
 
 /// Shape-only placeholders for every header: lazy `zeros`, never evaluated (nothing is allocated
 /// and no payload is read), so a module built over them answers its quanta's formulas.
-fn placeholders(headers: &[SafetensorsTensorHeader]) -> Result<Weights> {
+fn placeholders(
+    headers: &[SafetensorsTensorHeader],
+    plan: Option<&mlx_gen::gen_core::LogicalWeightPlan>,
+) -> Result<Weights> {
     let mut map = HashMap::with_capacity(headers.len());
     for h in headers {
         let shape = h
@@ -408,12 +439,21 @@ fn placeholders(headers: &[SafetensorsTensorHeader]) -> Result<Weights> {
             .map(|&d| i32::try_from(d))
             .collect::<std::result::Result<Vec<i32>, _>>()
             .map_err(|_| Error::Unsupported(format!("{}: dimension overflow", h.name)))?;
-        map.insert(
-            h.name.clone(),
-            mlx_rs::ops::zeros_dtype(&shape, mlx_dtype(h.dtype)?)?,
-        );
+        let dtype = mlx_dtype(h.dtype)?;
+        let companion = plan.is_some_and(|p| {
+            p.companions
+                .binary_search_by(|c| c.physical_key.cmp(&h.name))
+                .is_ok()
+        });
+        let value =
+            if companion && matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16) {
+                mlx_rs::ops::ones_dtype(&shape, dtype)?
+            } else {
+                mlx_rs::ops::zeros_dtype(&shape, dtype)?
+            };
+        map.insert(h.name.clone(), value);
     }
-    Ok(Weights::from_map(map))
+    Weights::from_pricing_map(map, plan)
 }
 
 fn elements(h: &SafetensorsTensorHeader) -> Vec<u64> {
@@ -457,12 +497,17 @@ pub(crate) fn price_quanta(
         .ok_or_else(|| Error::Msg("anima: DiT root prefix not found in headers".into()))?
         .to_string();
     let blocks_prefix = format!("{prefix}.blocks.");
-    let dit_w = placeholders(&facts.dit)?;
+    let dit_w = placeholders(&facts.dit, facts.source_plans[0].as_ref())?;
     let dit = CosmosDiT::from_weights(&dit_w, &prefix, dit_cfg)?;
     let cond =
         AnimaTextConditioner::from_weights(&dit_w, &format!("{prefix}.llm_adapter"), cond_cfg)?;
-    let te = AnimaQwen3::from_weights(&placeholders(&facts.text_encoder)?, "model", &qwen_cfg)?;
-    let (vae, _) = crate::vae::vae_from_source(&placeholders(&facts.vae)?)?;
+    let te = AnimaQwen3::from_weights(
+        &placeholders(&facts.text_encoder, facts.source_plans[1].as_ref())?,
+        "model",
+        &qwen_cfg,
+    )?;
+    let (vae, _) =
+        crate::vae::vae_from_source(&placeholders(&facts.vae, facts.source_plans[2].as_ref())?)?;
 
     // ---- Byte facts.
     let te_bytes = stored(&facts.text_encoder, |_| true);

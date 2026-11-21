@@ -1247,6 +1247,53 @@ mod tests {
     }
 
     #[test]
+    fn routed_fp8_views_charge_shared_scale_once_for_materialized_experts() {
+        use crate::checkpoint_codec::{ScalarScaleSource, FP8_E4M3_SCALAR_CODEC};
+        let codec = FP8_E4M3_SCALAR_CODEC.codec_id;
+        let mut tensor = dense_tensor("bank");
+        tensor.encoding = WeightEncoding::Fp8E4M3;
+        tensor.shape = vec![3, 4, 8];
+        tensor.source_bytes = 96;
+        tensor.codec_id = codec;
+        tensor.codec = TensorCodecSpec::ScalarFp8 {
+            scale: ScalarScaleSource::Companion {
+                physical_key: "bank.weight_scale".into(),
+            },
+            input_scale: None,
+            full_precision_matrix_mult: false,
+        };
+        tensor.residency = PlannedResidency {
+            mode: ResidencyMode::Packed,
+            resident_bytes: 96,
+        };
+        let mut scale = scale_companion("bank", 4);
+        scale.source_bytes = 4;
+        scale.physical_key = "bank.weight_scale".into();
+        let plan = LogicalWeightPlan {
+            mapping_id: MAPPING,
+            tensors: vec![tensor],
+            companions: vec![scale],
+            source_bytes: 100,
+        };
+        let tracker = crate::CheckpointReadAccounting::new(
+            std::sync::Arc::new(plan),
+            NativeExecutionCapability::new([codec]),
+            &[],
+        );
+        for start in [8, 0, 8] {
+            tracker
+                .record_shared_matrix_slice("bank", start, 4, 8, 36)
+                .unwrap();
+        }
+        let facts = tracker.facts().unwrap();
+        let row = facts
+            .materialized_as(codec, ExecutionRepresentation::NativePacked)
+            .unwrap();
+        assert_eq!(row.tensor_count, 2);
+        assert_eq!(row.resident_bytes, 68);
+    }
+
+    #[test]
     fn reader_counts_repeated_materialization_once_and_applies_declared_compute_width() {
         use ExecutionRepresentation::{DenseFallback, NativePacked};
         let tracker = crate::CheckpointReadAccounting::new(

@@ -56,6 +56,11 @@ pub fn nbytes(lin: &AdaptableLinear) -> usize {
         // This is residency (and eviction credit), not an execution peak. Per-operation
         // decoded tiles belong to memory_strategy's stage-local working profile.
         q.nbytes()
+    } else if let Some(q) = lin.fp8_base() {
+        q.codes().nbytes()
+            + q.scales().nbytes()
+            + q.input_scale().nbytes()
+            + q.bias().map_or(0, |b| b.nbytes())
     } else if let Some(q) = lin.convrot_base() {
         q.nbytes()
     } else if let Some((weight, bias)) = lin.dense_weight() {
@@ -71,7 +76,7 @@ pub fn nbytes(lin: &AdaptableLinear) -> usize {
 /// carry it — [`mlx_gen::quant::quantize_map`] casts to bf16 before packing, so the scales are bf16
 /// and an activation fed in at f32 would mismatch the quantized matmul.
 pub fn compute_dtype(lin: &AdaptableLinear) -> mlx_rs::Dtype {
-    if lin.convrot_base().is_some() || lin.w4a8_base().is_some() {
+    if lin.convrot_base().is_some() || lin.w4a8_base().is_some() || lin.fp8_base().is_some() {
         return mlx_rs::Dtype::Bfloat16;
     }
     lin.weight_dtype().unwrap_or_else(|| {

@@ -216,13 +216,24 @@ pub fn linear_header_facts(
             .collect::<crate::Result<Vec<_>>>()
     };
     let ws = shape(weight)?;
-    let dtype = native_header_dtype(weight.dtype)?;
+    use crate::gen_core::weightsmeta::Dtype as Stored;
+    let source_packed = matches!(weight.dtype, Stored::F8_E4M3 | Stored::F8_E5M2)
+        || (weight.dtype == Stored::I8
+            && headers.contains_key(&format!("{base}.weight_scale"))
+            && headers.contains_key(&format!("{base}.comfy_quant")));
+    let dtype = if weight.dtype == Stored::F8_E5M2 {
+        Dtype::Uint8
+    } else {
+        native_header_dtype(weight.dtype)?
+    };
     if ws.len() != 2 {
         return Err(crate::Error::Unsupported(format!(
             "adapter target {base} is not a Linear projection"
         )));
     }
-    let (input, packed) = if let Some(scales) = headers.get(&format!("{base}.scales")) {
+    let (input, packed) = if source_packed {
+        (ws[1], true)
+    } else if let Some(scales) = headers.get(&format!("{base}.scales")) {
         let ss = shape(scales)?;
         crate::quant::packed_bits_from_metadata(
             &ws,
@@ -266,7 +277,7 @@ pub fn linear_header_facts(
     Ok(super::LinearFacts {
         base_shape: vec![ws[0], input],
         is_quantized: packed,
-        source_packed: false,
+        source_packed,
         has_live_adapters: false,
         adapter_count: 0,
         bias_shape: None,
