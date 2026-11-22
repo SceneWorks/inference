@@ -29,6 +29,16 @@ pub type VoiceEmbedding = Vec<f32>;
 /// `Send + Sync` like [`FaceEmbedder`](crate::face::FaceEmbedder) — the identity embedder it
 /// mirrors — so a resolved embedder can be shared across the worker's threads.
 pub trait VoiceEmbedder: Send + Sync {
+    /// Checkpoint execution and measured resident bytes for the primary source, when available.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+
+    /// Measured checkpoints, including separately loaded encoder and decoder components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
+
     /// Stable identity + advertised shape, constructible without loading weights.
     fn descriptor(&self) -> &VoiceEmbedderDescriptor;
 

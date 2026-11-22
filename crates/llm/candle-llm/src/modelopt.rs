@@ -189,7 +189,7 @@ pub fn convert_snapshot_to_bf16(source: &Path, out_dir: &Path) -> Result<Convert
     let shard_count = shards.len();
     for (index, shard) in shards.iter().enumerate() {
         let weights = Weights::from_file_host_raw(shard)?;
-        all.extend(weights.into_map());
+        all.extend(weights.try_into_map()?);
         // Emit every tensor whose triple is now complete; keep incomplete triples for the next
         // shard. With the published layout every shard is self-contained.
         let ready: Vec<String> = all

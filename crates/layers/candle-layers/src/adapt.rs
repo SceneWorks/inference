@@ -26,6 +26,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::quant::ComponentFold;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear as CandleNnLinear, Module, VarBuilder};
 
@@ -305,6 +306,21 @@ impl Base {
     }
 
     pub fn is_fp8(&self) -> bool {
+        if let Base::Packed(q) = self {
+            use gen_core::checkpoint_codec::{
+                FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, MXFP8_CODEC,
+            };
+            return q.native_format_id().is_some_and(|id| {
+                [
+                    FP8_E4M3_SCALAR_CODEC,
+                    FP8_E5M2_SCALAR_CODEC,
+                    MXFP8_CODEC,
+                    FP8_E4M3_ROWWISE_CODEC,
+                ]
+                .iter()
+                .any(|codec| codec.codec_id == id)
+            });
+        }
         #[cfg(feature = "cuda")]
         {
             matches!(self, Base::Fp8(_))
@@ -332,8 +348,8 @@ impl Base {
     /// verifies shape and dtype only, exactly as it did before this seam existed.
     pub fn device(&self) -> Option<Device> {
         match self {
-            Base::Dense(l) => Some(l.weight().device().clone()),
-            Base::Packed(_) => None,
+            Base::Dense(l) => Some(l.device().clone()),
+            Base::Packed(q) => q.native_device().cloned(),
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
             Base::W4A8(q) => Some(q.device().clone()),
@@ -349,68 +365,49 @@ impl Base {
     /// base as an idempotent no-op and refusing re-quantization on `Nvfp4`, `ConvRot`, `W4A8`, `Fp8`,
     /// `Int8`, and `External` bases.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
-        reject_rowwise_as_legacy_quant(quant)?;
-        match self {
-            Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
-                candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
-            }
-            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            #[cfg(feature = "cuda")]
-            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize(quant)?;
-                *self = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.fold(quant, ComponentFold::DequantDense)
     }
 
-    /// As [`Self::quantize`] but folds a **dense** base to a dequant-dense packed base landing on
-    /// `device` via [`QLinear::quantize_dequant_onto`].
     pub fn quantize_dequant_onto(
         &mut self,
         quant: Quant,
         device: &Device,
     ) -> candle_core::Result<()> {
+        self.fold(quant, ComponentFold::DequantDenseOnto(device))
+    }
+
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+        self.fold(quant, ComponentFold::Int8FastOnto(device))
+    }
+
+    /// Apply a component tier while retaining an immutable checkpoint operand and its device binding.
+    pub fn quantize_component(
+        &mut self,
+        quant: Quant,
+        fold: ComponentFold<'_>,
+    ) -> candle_core::Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
         match self {
-            Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
-                candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
-            }
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            #[cfg(feature = "cuda")]
-            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_dequant_onto(quant, device)?;
-                *self = Base::Packed(q);
+            Base::Packed(q) if q.native_format_id().is_some() => q.quantize_component(quant, fold),
+            Base::ConvRot(q) => {
+                if fold
+                    .target()
+                    .is_some_and(|dev| !dev.same_device(q.device()))
+                {
+                    candle_core::bail!(
+                        "ConvRot INT8 refuses cross-device migration of its staged base"
+                    );
+                }
                 Ok(())
             }
+            _ => self.fold(quant, fold),
         }
     }
 
-    /// Quantize a **dense** base with [`QLinear::quantize_onto`], treating an already-packed base as
-    /// an idempotent no-op and refusing re-quantization on `Nvfp4`, `ConvRot`, `W4A8`, `Fp8`, `Int8`,
-    /// and `External` bases.
-    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+    fn fold(&mut self, quant: Quant, fold: ComponentFold<'_>) -> candle_core::Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
         match self {
+            Base::Packed(q) if q.native_format_id().is_some() => fold.apply(q, quant),
             Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
                 candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
             }
@@ -426,7 +423,7 @@ impl Base {
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_onto(quant, device)?;
+                fold.apply(&mut q, quant)?;
                 *self = Base::Packed(q);
                 Ok(())
             }
@@ -1134,6 +1131,13 @@ impl AdaptLinear {
     /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims — the seam a
     /// caller uses when it holds a `Linear` directly (e.g. a folded-delta reference, or a test grid).
     pub fn from_dense(l: CandleNnLinear, in_dim: usize, out_dim: usize) -> Self {
+        if l.is_native() {
+            return Self::from_packed(
+                QLinear::from_dense(super::DenseLinear::Linear(l)),
+                in_dim,
+                out_dim,
+            );
+        }
         Self {
             base: Base::Dense(l),
             out_features: out_dim,
@@ -1150,7 +1154,10 @@ impl AdaptLinear {
     /// keeps its footprint.
     pub fn from_packed(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
         Self {
-            base: Base::Packed(base),
+            base: match base {
+                QLinear::ConvRot(q) => Base::ConvRot(q),
+                other => Base::Packed(other),
+            },
             out_features: out_dim,
             in_features: in_dim,
             adapters: Vec::new(),
@@ -1188,8 +1195,8 @@ impl AdaptLinear {
         }
     }
     /// Native symmetric INT8 base with shared adapter residual semantics.
-    pub fn from_convrot(base: convrot_int8::ConvRotLinear) -> Self {
-        let d = base.descriptor;
+    pub fn from_convrot(base: super::convrot_int8::ConvRotLinear) -> Self {
+        let d = base.descriptor();
         Self {
             base: Base::ConvRot(Arc::new(base)),
             in_features: d.in_features,
@@ -1201,6 +1208,7 @@ impl AdaptLinear {
     /// Distinguish descriptor-driven integer execution from affine packed Q8.
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self.base, Base::ConvRot(_))
+            || matches!(&self.base,Base::Packed(q) if q.native_format_id()==Some(gen_core::convrot_int8::CODEC_ID))
     }
 
     /// Packed W4A8 base; residuals remain additive in the original, unrotated input basis.
@@ -1347,41 +1355,25 @@ impl AdaptLinear {
                 adapters: Vec::new(),
             })
         } else {
-            let w = vb.get_unchecked(&format!("{name}.weight"))?;
-            let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-            Ok(Self {
-                base: Base::Dense(CandleNnLinear::new(w, None)),
-                out_features,
-                in_features,
-                adapters: Vec::new(),
-            })
+            Self::dense(vb, name)
         }
     }
 
     /// Bias-less **dense** `[out, in]` projection from `{name}.weight` (a component that never packs,
     /// e.g. Anima's conditioner q/k/v/o — dense bf16 in every tier).
     pub fn dense(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        Ok(Self {
-            base: Base::Dense(CandleNnLinear::new(w, None)),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, false)
     }
 
-    /// **Dense** `[out, in]` projection with bias from `{name}.weight` + `{name}.bias`.
     pub fn dense_bias(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        let b = vb.get_unchecked(&format!("{name}.bias"))?;
-        Ok(Self {
-            base: Base::Dense(CandleNnLinear::new(w, Some(b))),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, true)
+    }
+
+    fn from_builder(vb: &VarBuilder, name: &str, bias: bool) -> candle_core::Result<Self> {
+        let sub = vb.pp(name);
+        let layer = CandleNnLinear::from_var_builder(&sub, bias)?;
+        let (out_features, in_features) = layer.weight_dims()?;
+        Ok(Self::from_dense(layer, in_features, out_features))
     }
 
     /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. A disabled residual is
@@ -1633,7 +1625,10 @@ impl AdaptLinear {
     /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
     /// their own shape screening) and always return `Ok`.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lora_checked(a, b, scale);
         }
         self.adapters.push(Adapter::Lora {
@@ -1711,6 +1706,7 @@ impl AdaptLinear {
     fn admission_subject(&self) -> &'static str {
         match &self.base {
             Base::Dense(_) => "dense base",
+            Base::Packed(q) if q.native_device().is_some() => "FP8 base",
             Base::Packed(_) => "MLX-packed base",
             Base::Nvfp4(_) => "NVFP4 base",
             Base::ConvRot(_) => "ConvRot INT8 base",
@@ -1860,7 +1856,10 @@ impl AdaptLinear {
     /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** — same
     /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lokr_structured_checked(factors);
         }
         self.adapters.push(Adapter::LokrStructured { factors });
@@ -1887,6 +1886,7 @@ impl AdaptLinear {
     /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
     /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
     ///
+    /// Native checkpoint operands preserve the source precision and refuse a fold.
     /// An **NVFP4** base is a hard error, never a no-op and never a re-fold (sc-21483): re-quantizing
     /// it to `Q4`/`Q8` — or dequantizing it to BF16 to make some other path fit — would swap the
     /// projection's numeric regime out from under a caller that asked for NVFP4. `Quant::Nvfp4` is
@@ -1913,6 +1913,19 @@ impl AdaptLinear {
     /// forward-time residuals.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
         self.base.quantize_onto(quant, device)
+    }
+
+    /// Apply a component tier, retaining the source-native precision and migrating attached factors.
+    pub fn quantize_component(
+        &mut self,
+        quant: Quant,
+        fold: ComponentFold<'_>,
+    ) -> candle_core::Result<()> {
+        self.base.quantize_component(quant, fold)?;
+        if let Some(device) = fold.target() {
+            self.to_device(device)?;
+        }
+        Ok(())
     }
 
     /// Move the projection — base + every attached residual factor — onto `device`, in place. The seam

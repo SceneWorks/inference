@@ -690,7 +690,7 @@ impl From<CheckpointWeightFactsError> for crate::Error {
 /// consumer can never be handed an unvalidated set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointWeightFacts {
-    source_binding: Option<SourceBinding>,
+    source_bindings: Vec<SourceBinding>,
     capability: NativeExecutionCapability,
     source: SourceCodecSummary,
     receipt: LogicalWeightReceipt,
@@ -707,7 +707,7 @@ impl CheckpointWeightFacts {
         let source = SourceCodecSummary::of(plan)?;
         validate(plan, &source, &capability, &receipt)?;
         Ok(Self {
-            source_binding: None,
+            source_bindings: Vec::new(),
             capability,
             source,
             receipt,
@@ -717,14 +717,34 @@ impl CheckpointWeightFacts {
     /// Tie these facts to the verified source binding they describe. Re-verifies the pin, so a file
     /// that changed under the load refuses here rather than shipping facts about bytes that are
     /// gone.
-    pub fn with_verified_source(mut self, pin: &PinnedWeightsFile) -> crate::Result<Self> {
-        self.source_binding = Some(SourceBinding::verify(pin)?);
+    pub fn with_verified_source(self, pin: &PinnedWeightsFile) -> crate::Result<Self> {
+        self.with_verified_sources([pin])
+    }
+
+    /// Bind each shard of the observed source to the token used to prepare that file.
+    /// Verification uses the mutation-sensitive stat identity and never re-hashes model data.
+    pub fn with_verified_sources<'a>(
+        mut self,
+        pins: impl IntoIterator<Item = &'a PinnedWeightsFile>,
+    ) -> crate::Result<Self> {
+        self.source_bindings = pins
+            .into_iter()
+            .map(SourceBinding::verify)
+            .collect::<crate::Result<_>>()?;
         Ok(self)
     }
 
-    /// The verified source binding, when the loader supplied one.
+    /// The single-file binding, when this receipt describes exactly one verified physical file.
     pub fn source_binding(&self) -> Option<&SourceBinding> {
-        self.source_binding.as_ref()
+        match self.source_bindings.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Physical sources of this reader. A multi-shard receipt retains every contributing file.
+    pub fn source_bindings(&self) -> &[SourceBinding] {
+        &self.source_bindings
     }
 
     /// This host's native-execution declaration.
@@ -1244,6 +1264,176 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    #[test]
+    fn sharded_receipts_bind_every_prepared_reader_member_and_reject_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("part-a.safetensors");
+        let b = temp.path().join("part-b.safetensors");
+        let aux = temp.path().join("text.safetensors");
+        for path in [&a, &b, &aux] {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let mut spec = crate::LoadSpec::new(crate::WeightsSource::Dir(temp.path().into()));
+        spec.bind_source_inventory(crate::SourceInventory::capture(&spec).unwrap())
+            .unwrap();
+        let scope = crate::CheckpointReceiptScope::for_load(&spec).unwrap();
+        let observed = || {
+            Ok(CheckpointWeightFacts::new(
+                &mixed_plan(),
+                nvfp4_capability(),
+                honest_receipt(),
+            )?)
+        };
+        scope.with(|| {
+            crate::CheckpointReceiptScope::register(&[b.clone(), a.clone()], observed);
+            crate::CheckpointReceiptScope::register(std::slice::from_ref(&aux), observed);
+        });
+        let groups = scope.try_snapshots().unwrap();
+        let sharded = groups
+            .iter()
+            .find(|f| f.source_bindings().len() == 2)
+            .unwrap();
+        assert!(sharded.source_binding().is_none());
+        assert_eq!(
+            sharded
+                .source_bindings()
+                .iter()
+                .map(|b| b.canonical_path().file_name().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec![a.file_name().unwrap(), b.file_name().unwrap()]
+        );
+        assert!(scope.facts().is_none()); // directory with two independent models
+        std::fs::write(&b, b"replacement").unwrap();
+        assert!(scope.try_snapshots().is_err());
+    }
+
+    #[test]
+    fn prepared_secondary_binding_never_replaces_primary_and_early_unprepared_pin_detects_retarget()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("z.safetensors");
+        let aux = temp.path().join("a.safetensors");
+        for p in [&primary, &aux] {
+            std::fs::write(p, b"source").unwrap();
+        }
+        let mut spec = crate::LoadSpec::new(crate::WeightsSource::File(primary.clone()));
+        let before_open = crate::CheckpointReceiptScope::for_load(&spec).unwrap();
+        spec.components
+            .insert("text".into(), crate::WeightsSource::File(aux.clone()));
+        spec.bind_source_inventory(crate::SourceInventory::capture(&spec).unwrap())
+            .unwrap();
+        let prepared = crate::CheckpointReceiptScope::for_load(&spec).unwrap();
+        let observed = || {
+            Ok(CheckpointWeightFacts::new(
+                &mixed_plan(),
+                nvfp4_capability(),
+                honest_receipt(),
+            )?)
+        };
+        prepared.with(|| {
+            for p in [&primary, &aux] {
+                crate::CheckpointReceiptScope::register(std::slice::from_ref(p), observed);
+            }
+        });
+        assert_eq!(prepared.try_snapshots().unwrap().len(), 2);
+        assert_eq!(
+            prepared
+                .facts()
+                .unwrap()
+                .source_binding()
+                .unwrap()
+                .canonical_path()
+                .file_name(),
+            primary.file_name()
+        );
+        std::fs::write(&primary, b"swapped before reader registration").unwrap();
+        before_open.with(|| {
+            crate::CheckpointReceiptScope::register(std::slice::from_ref(&primary), observed)
+        });
+        assert!(before_open.try_snapshots().is_err());
+    }
+
+    #[test]
+    fn routed_fp8_views_charge_shared_scale_once_for_materialized_experts() {
+        use crate::checkpoint_codec::{ScalarScaleSource, FP8_E4M3_SCALAR_CODEC};
+        let codec = FP8_E4M3_SCALAR_CODEC.codec_id;
+        let mut tensor = dense_tensor("bank");
+        tensor.encoding = WeightEncoding::Fp8E4M3;
+        tensor.shape = vec![3, 4, 8];
+        tensor.source_bytes = 96;
+        tensor.codec_id = codec;
+        tensor.codec = TensorCodecSpec::ScalarFp8 {
+            scale: ScalarScaleSource::Companion {
+                physical_key: "bank.weight_scale".into(),
+            },
+            input_scale: None,
+            full_precision_matrix_mult: false,
+        };
+        tensor.residency = PlannedResidency {
+            mode: ResidencyMode::Packed,
+            resident_bytes: 96,
+        };
+        let mut scale = scale_companion("bank", 4);
+        scale.source_bytes = 4;
+        scale.physical_key = "bank.weight_scale".into();
+        let plan = LogicalWeightPlan {
+            mapping_id: MAPPING,
+            tensors: vec![tensor],
+            companions: vec![scale],
+            source_bytes: 100,
+        };
+        let tracker = crate::CheckpointReadAccounting::new(
+            std::sync::Arc::new(plan),
+            NativeExecutionCapability::new([codec]),
+            &[],
+        );
+        for start in [8, 0, 8] {
+            tracker
+                .record_shared_matrix_slice("bank", start, 4, 8, 36)
+                .unwrap();
+        }
+        let facts = tracker.facts().unwrap();
+        let row = facts
+            .materialized_as(codec, ExecutionRepresentation::NativePacked)
+            .unwrap();
+        assert_eq!(row.tensor_count, 2);
+        assert_eq!(row.resident_bytes, 68);
+    }
+
+    #[test]
+    fn reader_counts_repeated_materialization_once_and_applies_declared_compute_width() {
+        use ExecutionRepresentation::{DenseFallback, NativePacked};
+        let tracker = crate::CheckpointReadAccounting::new(
+            std::sync::Arc::new(mixed_plan()),
+            nvfp4_capability(),
+            &[],
+        );
+        assert_eq!(
+            tracker.receipt().materialization,
+            LogicalReadMaterialization::Deferred
+        );
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        assert!(tracker.record("packed", NativePacked, 2305).is_err());
+        assert_eq!(tracker.facts().unwrap().receipt().tensor_count, 1);
+        tracker.declare_dense_layout("plain", &[8, 8], 4).unwrap();
+        assert!(tracker.declare_dense_layout("plain", &[8, 8], 2).is_err());
+        assert!(tracker.declare_dense_layout("plain", &[16, 4], 4).is_err());
+        tracker.record("plain", DenseFallback, 256).unwrap();
+        tracker.record("fallback", DenseFallback, 8192).unwrap();
+        let completed = tracker.facts().unwrap();
+        assert_eq!(
+            completed.receipt().materialization,
+            LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(completed.receipt().source_bytes, mixed_plan().source_bytes);
+        assert_eq!(completed.resident_bytes(), 2304 + 8192 + 256);
+        tracker.record("packed", DenseFallback, 8192).unwrap();
+        tracker.record("packed", NativePacked, 2304).unwrap();
+        assert_eq!(tracker.materialized_bytes("packed"), Some(8192));
+        assert_eq!(tracker.facts().unwrap().receipt().demotions.len(), 1);
     }
 
     /// **The three facts are separate and correlated (epic E8).** The source inventory says

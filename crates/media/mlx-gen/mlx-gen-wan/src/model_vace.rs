@@ -699,11 +699,22 @@ pub(crate) fn vace_dit_resident_bytes(path: &std::path::Path, quant: Option<Quan
     let Ok(headers) = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path) else {
         return 0;
     };
+    let Ok(encoded) = mlx_gen::asset_facts::source_bytes(path, &headers, |h| {
+        if crate::vace::vace_tensor_kept_f32(&h.name) {
+            4
+        } else {
+            2
+        }
+    }) else {
+        return 0;
+    };
     let ratio = crate::model::quant_resident_ratio(quant);
     headers
         .iter()
         .map(|header| {
-            if !header.is_float() {
+            if let Some(bytes) = encoded.get(&header.name) {
+                *bytes
+            } else if !header.is_float() {
                 header.data_bytes
             } else if crate::vace::vace_tensor_kept_f32(&header.name) {
                 header.materialized_bytes(4).unwrap_or(header.data_bytes)

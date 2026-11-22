@@ -25,6 +25,8 @@ pub enum TensorCodecSpec {
         input_scale: Option<String>,
         full_precision_matrix_mult: bool,
     },
+    /// Dynamic per-token activation quantization and one original F32 weight scale per output row.
+    RowwiseFp8 { scale: String },
     /// MXFP8: stored 32×32-padded E4M3 values + swizzled E8M0 block scales.
     Mxfp8 {
         scale: String,
@@ -38,6 +40,11 @@ pub enum TensorCodecSpec {
     Int8PerRow {
         scale: String,
         full_precision_matrix_mult: bool,
+    },
+    /// Original rotated I8 codes and a separate F32 row-scale plane.
+    ConvRotInt8 {
+        scale: String,
+        geometry: crate::convrot_int8::ConvRotInt8,
     },
     /// NVFP4: `U8` `[rows, cols/2]` E2M1 nibbles + `to_blocked` E4M3 block scales + one `F32`
     /// per-tensor scale.
@@ -66,7 +73,7 @@ pub enum TensorCodecSpec {
 impl TensorCodecSpec {
     pub fn full_precision_matrix_mult(&self) -> bool {
         match self {
-            Self::Dense => false,
+            Self::Dense | Self::RowwiseFp8 { .. } | Self::ConvRotInt8 { .. } => false,
             Self::ScalarFp8 {
                 full_precision_matrix_mult,
                 ..
@@ -108,6 +115,17 @@ pub struct PlannedResidency {
 /// generation, feature gates). A layer whose descriptor sets `full_precision_matrix_mult` never
 /// runs a packed matmul, so a policy must answer [`ResidencyMode::Dense`] for it.
 pub trait CodecResidencyPolicy {
+    /// An architecture can declare a physical tensor as stacked matrices for a routed operator.
+    fn residency_for_key(
+        &self,
+        _key: &str,
+        codec: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        shape: &[usize],
+    ) -> ResidencyMode {
+        self.residency(codec, spec, shape)
+    }
+
     fn residency(
         &self,
         codec: &CheckpointCodecRegistration,
@@ -116,8 +134,8 @@ pub trait CodecResidencyPolicy {
     ) -> ResidencyMode;
 }
 
-/// The always-dense policy: every codec decodes to its dense resident encoding. MLX (no packed
-/// fp8/int8 matmul on the seam) and any backend without the matching hardware use this.
+/// Price dense coefficient consumers at their decoded element width. Backends with native
+/// projection operators supply a device- and geometry-specific policy instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DenseResidencyPolicy;
 
@@ -129,5 +147,24 @@ impl CodecResidencyPolicy for DenseResidencyPolicy {
         _stored_shape: &[usize],
     ) -> ResidencyMode {
         ResidencyMode::Dense
+    }
+}
+
+/// Header-only source inspection. ConvRot has no dense decode. Pricing its packed bytes here
+/// identifies the stored representation without asserting any device can execute it.
+pub struct SourceCodecResidency;
+
+impl CodecResidencyPolicy for SourceCodecResidency {
+    fn residency(
+        &self,
+        _: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        _: &[usize],
+    ) -> ResidencyMode {
+        if matches!(spec, TensorCodecSpec::ConvRotInt8 { .. }) {
+            ResidencyMode::Packed
+        } else {
+            ResidencyMode::Dense
+        }
     }
 }

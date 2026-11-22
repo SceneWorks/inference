@@ -32,59 +32,13 @@ fn resident_component(
     path: &std::path::Path,
     require_float_source: bool,
 ) -> gen_core::Result<MemoryResidentComponent> {
-    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
-    let resident_bytes = headers.into_iter().try_fold(0_u64, |total, tensor| {
-        // FP8 posture: `is_float` excludes `F8_E4M3` precisely because the shared loader's
-        // `coerce_float` leaves fp8 at stored width. PuLID has no fp8 dequant seam, so an fp8
-        // identity/EVA checkpoint is refused here rather than priced as if it were upcast.
-        if require_float_source && !tensor.is_float() {
-            return Err(gen_core::Error::Msg(format!(
-                "{PROVIDER_ID}: {id} tensor {} uses {:?}; PuLID/EVA admission requires float-only weights because the shared loader preserves non-float storage width",
-                tensor.name, tensor.dtype
-            )));
-        }
-        let elements = tensor.shape.iter().try_fold(1_u64, |elements, &dimension| {
-            let dimension = u64::try_from(dimension).map_err(|_| {
-                gen_core::Error::Msg(format!(
-                    "{PROVIDER_ID}: {id} tensor {} has an unrepresentable shape",
-                    tensor.name
-                ))
-            })?;
-            elements.checked_mul(dimension).ok_or_else(|| {
-                gen_core::Error::Msg(format!(
-                    "{PROVIDER_ID}: {id} tensor {} element count overflowed",
-                    tensor.name
-                ))
-            })
-        })?;
-        let stored_bytes = elements
-            .checked_mul(tensor.dtype.size() as u64)
-            .ok_or_else(|| {
-                gen_core::Error::Msg(format!(
-                    "{PROVIDER_ID}: {id} tensor {} stored byte count overflowed",
-                    tensor.name
-                ))
-            })?;
-        if stored_bytes != tensor.data_bytes {
-            return Err(gen_core::Error::Msg(format!(
-                "{PROVIDER_ID}: {id} tensor {} declares {} bytes but dtype/shape require {stored_bytes}",
-                tensor.name, tensor.data_bytes
-            )));
-        }
-        // PuLID/EVA floats and every face-stack tensor are materialized as F32 by their owning
-        // loaders. Price tensors after that cast rather than the potentially smaller source file.
-        let loaded_bytes = elements.checked_mul(4).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "{PROVIDER_ID}: {id} tensor {} F32 byte count overflowed",
-                tensor.name
-            ))
-        })?;
-        total.checked_add(loaded_bytes).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "{PROVIDER_ID}: {id} resident byte count overflowed"
-            ))
-        })
-    })?;
+    let resident_bytes = candle_gen::logical_weights::component_f32_bytes(
+        path,
+        require_float_source,
+        |name, shape| {
+            shape.len() == 2 && name.ends_with(".weight") && !name.ends_with("embedding.weight")
+        },
+    )?;
     if resident_bytes == 0 {
         return Err(gen_core::Error::Msg(format!(
             "{PROVIDER_ID}: resident identity component {id} has no loadable safetensors bytes at {}",
@@ -464,6 +418,8 @@ mod tests {
             ("bf16.safetensors", "BF16", 3, 6, 12),
             ("f16.safetensors", "F16", 5, 10, 20),
             ("f32.safetensors", "F32", 7, 28, 28),
+            // Rank-one FP8 coefficients use the dense F32 operator even on a native-GEMM device.
+            ("fp8.safetensors", "F8_E5M2", 7, 7, 28),
         ] {
             let path = root.join(name);
             write_typed_safetensors(&path, dtype, elements, stored_bytes);
@@ -485,7 +441,7 @@ mod tests {
         let error = resident_component("pulid_idformer_ca", &path, true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("float-only weights"), "{error}");
+        assert!(error.contains("requires floating weights"), "{error}");
 
         // The face loader differs intentionally: it casts every tensor, including integer sources,
         // so the same three elements really do occupy three F32 values after load.

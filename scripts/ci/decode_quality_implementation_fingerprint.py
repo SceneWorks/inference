@@ -30,6 +30,8 @@ SOURCE_ROOTS = (
     "Cargo.toml",
     "crates/contracts/gen-core/Cargo.toml",
     "crates/contracts/gen-core/src",
+    "crates/layers/mlx-layers/Cargo.toml",
+    "crates/layers/mlx-layers/src",
     "crates/media/mlx-gen/Cargo.toml",
     "crates/media/mlx-gen/src",
     "crates/media/mlx-gen/mlx-gen-z-image/Cargo.toml",

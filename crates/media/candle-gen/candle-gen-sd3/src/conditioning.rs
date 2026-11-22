@@ -25,7 +25,7 @@ use candle_gen::candle_core::IndexOp;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{Linear, Module};
 use candle_gen::{CandleError, Result as CandleResult};
-use candle_transformers::models::stable_diffusion::{self, clip};
+use candle_transformers::models::stable_diffusion::clip;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use tokenizers::Tokenizer;
 
@@ -302,10 +302,8 @@ root.join("tokenizer_3/tokenizer.json"),
 
         let l_file = artifacts.clip_l;
         let g_file = artifacts.clip_g;
-        let clip_l = stable_diffusion::build_clip_transformer(&cfg_l, &l_file, device, dtype)?;
-        let clip_g = stable_diffusion::build_clip_transformer(&cfg_g, &g_file, device, dtype)?;
-        let proj_l = load_text_projection(&l_file, "text_encoder", device, dtype)?;
-        let proj_g = load_text_projection(&g_file, "text_encoder_2", device, dtype)?;
+        let (clip_l, proj_l) = load_clip_with_projection(l_file, &cfg_l, device, dtype)?;
+        let (clip_g, proj_g) = load_clip_with_projection(g_file, &cfg_g, device, dtype)?;
 
         // T5-XXL (`text_encoder_3/`, sharded; config.json alongside).
         let t5_dir = root.join("text_encoder_3");
@@ -448,26 +446,20 @@ t5_dir.join("config.json"),
     }
 }
 
-/// Load a CLIP `text_projection.weight` (no bias) from a CLIP checkpoint into a [`Linear`]. SD3.5's
-/// CLIP-L and bigG are `CLIPTextModelWithProjection`s — `build_clip_transformer` reads only the
-/// `text_model.*`; the pooled head's projection lives at the top level as `text_projection.weight`.
-fn load_text_projection(
-    file: &Path,
-    sub: &str,
+/// Resolve the text tower and its pooled head from the same source and device.
+fn load_clip_with_projection(
+    file: std::path::PathBuf,
+    config: &clip::Config,
     device: &Device,
     dtype: DType,
-) -> CandleResult<Linear> {
-    // Header-only mmap read of the single pooled-head tensor (sc-8990 / F-010): `build_clip_transformer`
-    // already read this same file for `text_model.*`, so materializing the whole CLIP checkpoint on the
-    // GPU again just to grab one weight cost ~1.7 GB of transient VRAM plus a second full disk read.
-    let w = candle_gen::load_one_tensor(
-        file,
-        "text_projection.weight",
-        dtype,
-        device,
-        &format!("sd3 conditioning ({sub}/)"),
-    )?;
-    Ok(Linear::new(w, None))
+) -> CandleResult<(clip::ClipTextTransformer, Linear)> {
+    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
+    let head = vb.pp("text_projection");
+    let projection = match head.native_linear_weight("weight")? {
+        Some(native) => Linear::from_native(native, None),
+        None => Linear::new(head.get_unchecked("weight")?, None),
+    };
+    Ok((clip::ClipTextTransformer::new(vb, config)?, projection))
 }
 
 #[cfg(test)]

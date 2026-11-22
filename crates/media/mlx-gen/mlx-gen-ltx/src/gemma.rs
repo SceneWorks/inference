@@ -92,6 +92,7 @@ pub struct GemmaQuant {
 /// is present *and* the weights carry `.scales` (the reference predicate; the `÷64` skip never fires
 /// for Gemma-3-12b, whose every output dim is a multiple of 64).
 enum GemmaLinear {
+    Native(mlx_gen::adapters::AdaptableLinear),
     Dense {
         w: Array, // [out, in] bf16
     },
@@ -108,6 +109,9 @@ impl GemmaLinear {
     /// Load `{key}.weight` (+ `.scales`/`.biases` when quantized) at `key`. Quantized iff `quant` is
     /// `Some` and `{key}.scales` is present.
     fn load(w: &Weights, key: &str, quant: Option<GemmaQuant>) -> Result<Self> {
+        if let Some(native) = mlx_gen::quant::native_lin(w, key, false)? {
+            return Ok(Self::Native(native));
+        }
         let req =
             |k: &str| -> Result<&Array> { w.get(k).ok_or_else(|| Error::MissingTensor(k.into())) };
         match (quant, w.get(&format!("{key}.scales"))) {
@@ -128,6 +132,7 @@ impl GemmaLinear {
     /// accumulation), bit-identical to the reference `QuantizedLinear.__call__`.
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
+            Self::Native(native) => native.forward(x),
             GemmaLinear::Dense { w } => Ok(matmul(x, w.t())?),
             GemmaLinear::Quant {
                 q,

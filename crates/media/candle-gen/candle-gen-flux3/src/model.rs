@@ -151,6 +151,7 @@ impl gen_core::StagedHeavy for Heavy {
 
 /// A loaded distilled generator.
 pub struct Flux3Klein {
+    loaded_quant: Option<gen_core::Quant>,
     descriptor: ModelDescriptor,
     adapter_reports: Vec<gen_core::AdapterApplyReport>,
     config: Flux3Config,
@@ -397,6 +398,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         },
     )?;
     Ok(Flux3Klein {
+        loaded_quant: storage.quant()?,
         adapter_reports,
         descriptor: if base {
             descriptor_base()
@@ -793,7 +795,7 @@ impl Generator for Flux3Klein {
             );
             candle_gen::execution::policy(
                 "loaded/quantize",
-                format!("{:?}", self.spec.quantize).into(),
+                format!("{:?}", self.loaded_quant).into(),
             );
             candle_gen::execution::unobserved_adapters(
                 self.spec.adapters.len(),

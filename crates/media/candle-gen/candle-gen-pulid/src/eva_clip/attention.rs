@@ -34,19 +34,14 @@ impl Attention {
         num_heads: usize,
         head_dim: usize,
     ) -> GenResult<Self> {
-        let q_proj = Linear::new(
-            w.require(&join(prefix, "q_proj.weight"))?,
-            Some(w.require(&join(prefix, "q_bias"))?),
-        );
-        let k_proj = Linear::new(w.require(&join(prefix, "k_proj.weight"))?, None);
-        let v_proj = Linear::new(
-            w.require(&join(prefix, "v_proj.weight"))?,
-            Some(w.require(&join(prefix, "v_bias"))?),
-        );
-        let proj = Linear::new(
-            w.require(&join(prefix, "proj.weight"))?,
-            Some(w.require(&join(prefix, "proj.bias"))?),
-        );
+        let q_proj = w
+            .linear(&join(prefix, "q_proj"), false)?
+            .with_bias(Some(w.require(&join(prefix, "q_bias"))?));
+        let k_proj = w.linear(&join(prefix, "k_proj"), false)?;
+        let v_proj = w
+            .linear(&join(prefix, "v_proj"), false)?
+            .with_bias(Some(w.require(&join(prefix, "v_bias"))?));
+        let proj = w.linear(&join(prefix, "proj"), true)?;
         Ok(Self {
             q_proj,
             k_proj,

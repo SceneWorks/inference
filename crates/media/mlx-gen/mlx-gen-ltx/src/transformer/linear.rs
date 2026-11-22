@@ -12,6 +12,8 @@ use mlx_gen::adapters::{AdaptableLinear, Adapter};
 #[derive(Clone)]
 pub struct Linear {
     pub(super) inner: AdaptableLinear,
+    // Native codes retain storage precision when the trainer changes activation dtype.
+    compute_dtype: Dtype,
 }
 
 impl Linear {
@@ -19,6 +21,7 @@ impl Linear {
     #[cfg(test)]
     pub(crate) fn from_dense(weight: Array, bias: Option<Array>) -> Self {
         Self {
+            compute_dtype: weight.dtype(),
             inner: AdaptableLinear::dense(weight, bias),
         }
     }
@@ -41,6 +44,12 @@ impl Linear {
         has_bias: bool,
     ) -> Result<Self> {
         let dt = prec.dtype();
+        if let Some(inner) = mlx_gen::quant::native_lin(w, prefix, has_bias)? {
+            return Ok(Self {
+                inner,
+                compute_dtype: dt,
+            });
+        }
         let b = has_bias
             .then(|| to_dtype(w.require(&format!("{prefix}.bias"))?, dt))
             .transpose()?;
@@ -74,7 +83,10 @@ impl Linear {
                 AdaptableLinear::dense(to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?, b)
             }
         };
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            compute_dtype: dt,
+        })
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
@@ -124,14 +136,16 @@ impl Linear {
 
     /// The base weight's current compute dtype (sc-4942) — used to detect a prior bf16 cast.
     pub(crate) fn weight_dtype(&self) -> Dtype {
-        self.inner.compute_dtype().unwrap_or(Dtype::Float32)
+        self.inner.compute_dtype().unwrap_or(self.compute_dtype)
     }
 
     /// Cast the base weight to the training compute `dtype` in place (sc-4942 bf16 lever). Only the
     /// frozen base is touched; a LoRA overlay is installed AFTER the cast (at the compute dtype) by
     /// the trainer.
     pub(crate) fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        self.inner.cast_compute_dtype(dtype)
+        self.inner.cast_compute_dtype(dtype)?;
+        self.compute_dtype = dtype;
+        Ok(())
     }
 }
 

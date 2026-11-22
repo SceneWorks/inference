@@ -35,13 +35,10 @@ pub(crate) fn dit_window_for(
     pruned: bool,
 ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::h3_memory::window::WindowAllocation>>
 {
-    if !allocation.resolved
-        || !crate::block_stream::component_supported(path)
-            .map_err(|e| CoreError::Unsupported(e.to_string()))?
-    {
+    if !allocation.resolved {
         return Ok(None);
     }
-    let (_, _, decode) = runtime_payloads(path, false)?;
+    let (.., decode, fp8) = runtime_payloads_with_plan(path, false)?;
     let facts = candle_gen::gen_core::h3_memory::window::CudaWorkingSet {
         hidden: cfg.hidden_size as u64,
         heads: cfg.num_attention_heads as u64,
@@ -55,24 +52,68 @@ pub(crate) fn dit_window_for(
         candle_gen::gen_core::h3_memory::window::WindowAllocation::from_resident_tensors(
             &allocation.resident_by_name,
             &allocation.projections,
-            bytes.saturating_sub(allocation.resident_bytes),
+            add(
+                bytes.saturating_sub(allocation.resident_bytes),
+                if allocation.projections.is_empty() {
+                    0
+                } else {
+                    candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64
+                },
+            )?,
             pruned,
         )?
         .with_cuda_working_set(facts)?;
+    if let Some(plan) = &fp8 {
+        // ConvRot uses this same mapped-source execution context. H3 W4A8 uses its
+        // separate legacy context, so the FP8 handle is additional in that pairing.
+        let workspace = if allocation.projections.iter().any(|p| !p.w4a8)
+            && !allocation.projections.iter().any(|p| p.w4a8)
+        {
+            0
+        } else {
+            candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64
+        };
+        window = window.with_cuda_fp8(plan, workspace)?;
+    }
     if window.n_blocks() != cfg.num_layers {
         // A partial inventory can still price its existing resident contract. It cannot
         // advertise streaming without the complete contiguous configured block stack.
         return Ok(None);
     }
-    if !pruned {
-        window = window.with_cuda_adaln_working_sets(cuda_adaln_working_sets(path, cfg)?)?;
+    // A full resident image stack also uses this partition. Integer-native sources use
+    // their own descriptor working sets and cannot enter CUDA's host-copy window.
+    if !pruned
+        && crate::block_stream::component_supported(path)
+            .map_err(|e| CoreError::Unsupported(e.to_string()))?
+    {
+        window = window.with_cuda_adaln_working_sets(cuda_adaln_working_sets_for(
+            path,
+            cfg,
+            fp8.as_ref(),
+        )?)?;
     }
     Ok(Some(window))
 }
 
+#[cfg(test)]
 fn cuda_adaln_working_sets(
     path: &Path,
     cfg: &crate::dit::MiniMaxH3DitConfig,
+) -> candle_gen::gen_core::Result<Vec<candle_gen::gen_core::h3_memory::window::CudaAdalnWorkingSet>>
+{
+    let headers = weightsmeta::safetensors_path_tensor_headers(path)?;
+    let plan = fp8_plan(
+        path,
+        &headers,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+    )?;
+    cuda_adaln_working_sets_for(path, cfg, plan.as_ref())
+}
+
+fn cuda_adaln_working_sets_for(
+    path: &Path,
+    cfg: &crate::dit::MiniMaxH3DitConfig,
+    encoded: Option<&candle_gen::gen_core::LogicalWeightPlan>,
 ) -> candle_gen::gen_core::Result<Vec<candle_gen::gen_core::h3_memory::window::CudaAdalnWorkingSet>>
 {
     let invalid =
@@ -81,6 +122,11 @@ fn cuda_adaln_working_sets(
     let names = headers
         .iter()
         .map(|h| (h.name.as_str(), h))
+        .collect::<BTreeMap<_, _>>();
+    let encoded = encoded
+        .into_iter()
+        .flat_map(|p| p.tensors.iter())
+        .map(|r| (r.physical_key.as_str(), r))
         .collect::<BTreeMap<_, _>>();
     let output = (cfg.hidden_size as u64)
         .checked_mul(18)
@@ -104,7 +150,7 @@ fn cuda_adaln_working_sets(
             // just canonical [N]. Leading non-singletons would change output volume.
             let bias_columns = bias.shape.last().copied().unwrap_or(1);
             let bias_rows = bias.shape.iter().rev().nth(1).copied().unwrap_or(1) as u64;
-            if !bias.is_float()
+            if !(bias.is_float() || is_fp8_parameter(bias))
                 || bias_rows == 0
                 || bias_columns != 1 && bias_columns != output_dim
                 || bias.shape.iter().rev().skip(2).any(|&n| n != 1)
@@ -128,7 +174,18 @@ fn cuda_adaln_working_sets(
                 }
                 true
             } else {
-                if !weight.is_float() || weight.shape.as_slice() != [output_dim, input as usize] {
+                // Tiled MXFP8 can store a padded grid; the model supplies true N/K to the
+                // shared constructor and to the window's arithmetic below.
+                let wanted = [output_dim, input as usize];
+                let valid = match encoded.get(weight.name.as_str()) {
+                    Some(row) if row.undeclared_padded_storage().is_some() => {
+                        row.undeclared_padded_storage()
+                            == Some(candle_gen::gen_core::mxfp8_padded_shape(wanted))
+                    }
+                    Some(row) => row.shape.as_slice() == wanted,
+                    None => weight.is_float() && weight.shape.as_slice() == wanted,
+                };
+                if !valid {
                     return Err(invalid());
                 }
                 false
@@ -145,6 +202,49 @@ fn cuda_adaln_working_sets(
         .collect()
 }
 
+fn is_fp8_parameter(h: &weightsmeta::SafetensorsTensorHeader) -> bool {
+    matches!(
+        h.dtype,
+        weightsmeta::Dtype::F8_E4M3 | weightsmeta::Dtype::F8_E5M2
+    ) && candle_gen::gen_core::checkpoint_codec::projection_companion_base(&h.name).is_none()
+}
+
+fn fp8_plan(
+    path: &Path,
+    headers: &[weightsmeta::SafetensorsTensorHeader],
+    policy: &candle_gen::logical_weights::CandleCodecResidency,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::LogicalWeightPlan>> {
+    if !headers.iter().any(is_fp8_parameter) {
+        return Ok(None);
+    }
+    let by_name: BTreeMap<_, _> = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+    let files = candle_gen::loader::sorted_safetensors(path, "H3 projection source")
+        .map_err(|e| CoreError::Unsupported(e.to_string()))?;
+    candle_gen::gen_core::checkpoint_codec::projected_checkpoint_plan(
+        &files,
+        headers,
+        |key| by_name.get(key).is_some_and(|h| is_fp8_parameter(h)),
+        policy,
+        |key, shape| {
+            if key
+                .strip_prefix(crate::text_encoder::VISION_PREFIX)
+                .is_some_and(|suffix| suffix == ".patch_embed.proj.weight")
+                && shape.len() == 5
+            {
+                let k = shape[1..]
+                    .iter()
+                    .try_fold(1usize, |k, &d| k.checked_mul(d))?;
+                return Some(vec![shape[0], k]);
+            }
+            (shape.len() == 2
+                && key.ends_with(".weight")
+                && !key.ends_with("embed_tokens.weight")
+                && !key.ends_with("pos_embed.weight"))
+            .then(|| shape.to_vec())
+        },
+    )
+}
+
 /// Runtime payloads collapse affine triples into the exact GGUF container used by CUDA.
 /// Returns payload-by-source-name, host constructor peak and the largest root/body decode peak.
 /// Full AdaLN decode is priced separately at its current precompute projection, not in denoise.
@@ -152,6 +252,20 @@ pub(crate) fn runtime_payloads(
     path: &Path,
     text_encoder: bool,
 ) -> candle_gen::gen_core::Result<(BTreeMap<String, u64>, u64, u64)> {
+    let (payload, host, decode, _) = runtime_payloads_with_plan(path, text_encoder)?;
+    Ok((payload, host, decode))
+}
+
+type RuntimePayloads = (
+    BTreeMap<String, u64>,
+    u64,
+    u64,
+    Option<candle_gen::gen_core::LogicalWeightPlan>,
+);
+fn runtime_payloads_with_plan(
+    path: &Path,
+    text_encoder: bool,
+) -> candle_gen::gen_core::Result<RuntimePayloads> {
     let headers = weightsmeta::safetensors_path_tensor_headers(path)?;
     if headers.is_empty() {
         return Err(CoreError::Unsupported(format!(
@@ -163,6 +277,39 @@ pub(crate) fn runtime_payloads(
         .iter()
         .map(|h| (h.name.as_str(), h))
         .collect::<BTreeMap<_, _>>();
+    let fp8_plan = fp8_plan(
+        path,
+        &headers,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+    )?;
+    let fp8 = fp8_plan
+        .as_ref()
+        .map(|plan| {
+            candle_gen::gen_core::checkpoint_codec::projected_bytes_from_plan(plan, &headers, |h| {
+                if text_encoder {
+                    if h.name.starts_with(crate::text_encoder::VISION_PREFIX)
+                        || h.name.contains("layernorm")
+                        || h.name.contains("_norm.weight")
+                    {
+                        4
+                    } else {
+                        2
+                    }
+                } else {
+                    gen_core_h3::h3_memory::encoded_head_width(&h.name, &names).unwrap_or(2)
+                }
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let packed_fp8: std::collections::BTreeSet<_> = fp8_plan
+        .iter()
+        .flat_map(|p| &p.tensors)
+        .filter(|r| {
+            r.residency.mode == candle_gen::gen_core::checkpoint_codec::ResidencyMode::Packed
+        })
+        .map(|r| r.physical_key.as_str())
+        .collect();
     let mut payload = BTreeMap::new();
     let mut source = 0;
     let mut derived = 0;
@@ -234,17 +381,36 @@ pub(crate) fn runtime_payloads(
         }
         let norm =
             text_encoder && (h.name.contains("layernorm") || h.name.contains("_norm.weight"));
-        let width = if norm { 4 } else { 2 };
-        let bytes = if h.is_float() {
+        let width =
+            if norm || (text_encoder && h.name.starts_with(crate::text_encoder::VISION_PREFIX)) {
+                4
+            } else if !text_encoder
+                && !h.name.starts_with("transformer_blocks.")
+                && !h.name.starts_with("token_refiner.")
+                && h.is_float()
+            {
+                h.dtype.size() as u64
+            } else {
+                2
+            };
+        let bytes = if let Some(bytes) = fp8.get(&h.name) {
+            *bytes
+        } else if h.is_float() {
             h.materialized_bytes(width)?
         } else {
             h.data_bytes
         };
-        if bytes != h.data_bytes {
+        if bytes != h.data_bytes || fp8.contains_key(&h.name) {
             derived = add(derived, bytes)?;
         }
+        if is_fp8_parameter(h) && !packed_fp8.contains(h.name.as_str()) {
+            // Generic coefficient decode temporarily owns one F32 vector before the
+            // target-width tensor is installed. Other blocks' original codes remain mapped.
+            prepare_scratch = prepare_scratch.max(h.materialized_bytes(4)?);
+        }
         if h.shape.len() == 2
-            && h.is_float()
+            && !packed_fp8.contains(h.name.as_str())
+            && (h.is_float() || is_fp8_parameter(h))
             && !h.name.contains("embed_tokens")
             && !h.name.contains(".adaln_proj.linear.")
         {
@@ -258,6 +424,7 @@ pub(crate) fn runtime_payloads(
         payload,
         add(add(source, derived)?, prepare_scratch)?,
         decode,
+        fp8_plan,
     ))
 }
 
@@ -278,6 +445,47 @@ pub(crate) fn proof_dit_inventory(
     path: &Path,
 ) -> candle_gen::gen_core::Result<(BTreeMap<String, u64>, u64, u64)> {
     runtime_payloads(path, false)
+}
+
+pub(crate) struct TextPayloads {
+    pub by_name: BTreeMap<String, u64>,
+    pub host: u64,
+    pub decode: u64,
+    pub fp8: Vec<candle_gen::gen_core::h3_memory::window::CudaFp8Projection>,
+}
+
+pub(crate) fn text_payloads(path: &Path) -> candle_gen::gen_core::Result<TextPayloads> {
+    let (by_name, host, decode, plan) = runtime_payloads_with_plan(path, true)?;
+    let fp8 = plan
+        .as_ref()
+        .map(candle_gen::gen_core::h3_memory::window::CudaFp8Projection::from_plan)
+        .unwrap_or_default();
+    Ok(TextPayloads {
+        by_name,
+        host,
+        decode,
+        fp8,
+    })
+}
+
+pub(crate) fn text_fp8_work(
+    ops: &[candle_gen::gen_core::h3_memory::window::CudaFp8Projection],
+    vision: bool,
+    rows: u64,
+) -> candle_gen::gen_core::Result<u64> {
+    let mut peak = None;
+    for op in ops
+        .iter()
+        .filter(|p| p.key().starts_with(crate::text_encoder::VISION_PREFIX) == vision)
+    {
+        peak = Some(peak.unwrap_or(0u64).max(op.working_bytes(rows)?));
+    }
+    peak.map_or(Ok(0), |p| {
+        add(
+            p,
+            candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64,
+        )
+    })
 }
 
 pub(crate) fn text_encoder_stream(
@@ -419,7 +627,8 @@ mod tests {
         let mut header = serde_json::Map::new();
         let mut offset = 0;
         for (name, dtype, shape) in entries {
-            let bytes = shape.iter().product::<usize>() * if *dtype == "U32" { 4 } else { 2 };
+            let bytes =
+                shape.iter().product::<usize>() * weightsmeta::Dtype::parse(dtype).unwrap().size();
             header.insert(name.clone(), serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,offset+bytes]}));
             offset += bytes;
         }
@@ -431,6 +640,115 @@ mod tests {
         file.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
         file.write_all(&json).unwrap();
         file.set_len((8 + json.len() + offset) as u64).unwrap();
+    }
+
+    #[test]
+    fn resident_integer_partition_remains_priceable_without_a_copy_window() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::write_native_component(root.path(), 2);
+        assert!(!crate::block_stream::component_supported(root.path()).unwrap());
+        let allocation = super::super::dit_allocation(root.path(), false).unwrap();
+        let cfg = crate::dit::MiniMaxH3DitConfig::from_diffusers_json(
+            &std::fs::read_to_string(root.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let resident = dit_window_for(
+            root.path(),
+            &cfg,
+            &allocation,
+            allocation.resident_bytes,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resident.n_blocks(), cfg.num_layers);
+        let rows = candle_gen::gen_core::h3_memory::NativeRows {
+            task: candle_gen::gen_core::h3_memory::NativeTaskSelection::Base,
+            packed: 2,
+            conditioning: 1,
+            schedule: 1,
+            visual_elements: 0,
+            global: 0,
+        };
+        let task = candle_gen::gen_core::h3_memory::NativeTaskAllocation {
+            adapter: None,
+            resident_bytes: allocation.resident_bytes,
+            constructor_bytes: allocation.constructor_bytes,
+            patch_size: [1, 2, 2],
+            reference_task: false,
+            window: Some(resident.clone()),
+            evicted_bytes: 0,
+            table_bytes_per_timestep: 0,
+            projections: allocation.projections,
+        };
+        assert!(
+            resident
+                .denoise_peak_bytes_full(&task, super::super::native_backend(), rows)
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn window_admission_recognizes_bare_fp8_adaln_and_sharded_scales() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = crate::dit::MiniMaxH3DitConfig {
+            hidden_size: 16,
+            time_embed_dim: 32,
+            num_layers: 1,
+            ..Default::default()
+        };
+        let base = "transformer_blocks.0.adaln_proj.linear";
+        let file = root.path().join("model.safetensors");
+        let scales = root.path().join("scales.safetensors");
+        headers(
+            &file,
+            &[
+                (format!("{base}.weight"), "F8_E5M2", vec![288, 32]),
+                (format!("{base}.bias"), "F8_E5M2", vec![288]),
+            ],
+        );
+        assert!(crate::block_stream::component_supported(root.path()).unwrap());
+        let adaln = cuda_adaln_working_sets(root.path(), &cfg).unwrap();
+        assert_eq!(
+            (adaln[0].input, adaln[0].output, adaln[0].bias_rows),
+            (32, 288, 1)
+        );
+        headers(
+            &scales,
+            &[
+                (format!("{base}.input_scale"), "F32", vec![]),
+                (format!("{base}.weight_scale"), "F32", vec![]),
+            ],
+        );
+        assert!(crate::block_stream::component_supported(root.path()).unwrap());
+        use std::io::{Seek, SeekFrom, Write};
+        let mut scale_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&scales)
+            .unwrap();
+        scale_file.seek(SeekFrom::End(-8)).unwrap();
+        scale_file.write_all(&1f32.to_le_bytes().repeat(2)).unwrap();
+        drop(scale_file);
+        let headers = weightsmeta::safetensors_path_tensor_headers(root.path()).unwrap();
+        let native =
+            candle_gen::logical_weights::CandleCodecResidency::from_cuda_compute_cap((12, 0));
+        let plan = fp8_plan(root.path(), &headers, &native).unwrap().unwrap();
+        let resident = candle_gen::gen_core::checkpoint_codec::projected_bytes_from_plan(
+            &plan,
+            &headers,
+            |_| 2,
+        )
+        .unwrap();
+        assert_eq!(resident[&format!("{base}.weight")], 288 * 32);
+        assert_eq!(resident[&format!("{base}.weight_scale")], 4);
+        assert_eq!(resident[&format!("{base}.bias")], 288 * 2);
+        let ops = candle_gen::gen_core::h3_memory::window::CudaFp8Projection::from_plan(&plan);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0].working_bytes(8).unwrap(),
+            5 * 8 * 32 + 8 * 8 * 288 + 8
+        );
     }
 
     #[test]

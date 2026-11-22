@@ -11,12 +11,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
-use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
+use candle_gen::candle_core::{Device, Error, Result};
 use candle_gen::gen_core::IdentityKeyMapping;
 use candle_gen::logical_weights::{
     plan_logical_weights, CandleCodecResidency, LogicalTensor, LogicalWeightReader,
 };
-use candle_gen::quant::{Int8Context, Nvfp4Context, Nvfp4Tensor};
+use candle_gen::quant::{Nvfp4Context, Nvfp4Tensor};
 use safetensors::Dtype as SafetensorDtype;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,6 +25,9 @@ use crate::quant_eval::Ltx25QuantMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdvancedOperatorKind {
+    Fp8E4M3,
+    Fp8E5M2,
+    MxFp8,
     Dense,
     MlxAffine,
     Int8ConvRotIgemm,
@@ -34,6 +37,9 @@ pub enum AdvancedOperatorKind {
 impl AdvancedOperatorKind {
     pub const fn id(self) -> &'static str {
         match self {
+            Self::Fp8E4M3 => candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id,
+            Self::Fp8E5M2 => candle_gen::gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id,
+            Self::MxFp8 => candle_gen::gen_core::checkpoint_codec::MXFP8_CODEC.codec_id,
             Self::Dense => "dense-linear",
             Self::MlxAffine => "mlx-affine-dequant",
             Self::Int8ConvRotIgemm => "int8-convrot-rht-cublaslt-igemm",
@@ -158,6 +164,7 @@ pub fn inspect_transformer_source(
                 &CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 },
             )
             .map_err(|error| invalid(error.to_string()))?;
@@ -289,7 +296,6 @@ fn inspect_convrot(st: &MmapedSafetensors) -> Result<BTreeSet<String>> {
 enum AdvancedBackend {
     ConvRot {
         st: MmapedSafetensors,
-        context: Arc<Int8Context>,
     },
     Nvfp4 {
         reader: Box<LogicalWeightReader>,
@@ -313,20 +319,15 @@ impl AdvancedQuantSource {
         let inspection = inspect_transformer_source(path, mode)?;
         let backend = match mode {
             Ltx25QuantMode::Int8ConvRot => {
-                let context = Arc::new(Int8Context::new(device)?);
-                if !context.is_int8() {
-                    return Err(invalid(
-                        "LTX INT8-ConvRot could not construct a live cuBLASLt IGEMM context",
-                    ));
-                }
                 // Live weight backing: mapped through the audited loader seam (see its SAFETY doc).
                 let st = candle_gen::mmap_safetensors(path)?;
-                AdvancedBackend::ConvRot { st, context }
+                AdvancedBackend::ConvRot { st }
             }
             Ltx25QuantMode::Nvfp4 => {
                 let residency = CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 };
                 let plan = plan_logical_weights(path, &IdentityKeyMapping, &residency)
                     .map_err(|error| invalid(error.to_string()))?;
@@ -393,55 +394,18 @@ impl AdvancedQuantSource {
         _device: &Device,
     ) -> Result<LoadedAdvancedProjection> {
         match &self.backend {
-            AdvancedBackend::ConvRot { st, context } => {
+            AdvancedBackend::ConvRot { st } => {
                 let descriptor_name = format!("{base}.comfy_quant");
                 let descriptor = st.get(&descriptor_name)?;
-                let json: Value =
-                    candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
-                        serde_json::from_slice(bytes)
-                    })
-                    .map_err(|error| invalid(error.to_string()))?;
-                let group_size = json["convrot_groupsize"]
-                    .as_u64()
-                    .ok_or_else(|| invalid(format!("{descriptor_name} lost convrot_groupsize")))?
-                    as usize;
-                let weight_name = format!("{base}.weight");
-                let weight = st.get(&weight_name)?;
-                if weight.dtype() != SafetensorDtype::I8 {
-                    return Err(invalid(format!(
-                        "ConvRot `{weight_name}` changed dtype after validation"
-                    )));
-                }
-                let codes = Tensor::from_vec(
-                    candle_gen::candle_core::safetensors::read_tensor_bytes(&weight, |bytes| {
-                        bytes
-                            .iter()
-                            .map(|byte| *byte as i8 as i64)
-                            .collect::<Vec<_>>()
-                    }),
-                    weight.shape().to_vec(),
-                    &Device::Cpu,
-                )?;
-                let scale_name = format!("{base}.weight_scale");
-                let scale_view = st.get(&scale_name)?;
-                let scale = st
-                    .load(&scale_name, &Device::Cpu)?
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
+                let weight = st.get(&format!("{base}.weight"))?;
+                let scale_view = st.get(&format!("{base}.weight_scale"))?;
                 let attestation = sha256([
                     base.as_bytes(),
                     weight.data(),
                     scale_view.data(),
                     descriptor.data(),
                 ]);
-                Ok(LoadedAdvancedProjection::Int8ConvRot {
-                    codes,
-                    scale,
-                    group_size,
-                    context: Arc::clone(context),
-                    attestation,
-                })
+                Ok(LoadedAdvancedProjection::Int8ConvRot { attestation })
             }
             AdvancedBackend::Nvfp4 { reader, context } => {
                 let weight_key = format!("{base}.weight");
@@ -496,10 +460,6 @@ fn refuse_undeclared_convrot_tensor(st: &MmapedSafetensors, base: &str) -> Resul
 
 pub(crate) enum LoadedAdvancedProjection {
     Int8ConvRot {
-        codes: Tensor,
-        scale: Vec<f32>,
-        group_size: usize,
-        context: Arc<Int8Context>,
         attestation: String,
     },
     Nvfp4 {

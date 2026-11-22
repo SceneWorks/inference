@@ -33,7 +33,7 @@ pub fn convert_vae(raw: Weights, dt: DType) -> CResult<Weights> {
 const ATTN_SUBS: [&str; 4] = ["proj_qkv", "proj_out", "norm_q", "norm_k"];
 
 /// Map a raw DiT key to its converted target name(s) (two for a shared-layer attention `.all`).
-fn dit_targets(k: &str) -> Vec<String> {
+pub(crate) fn dit_targets(k: &str) -> Vec<String> {
     // output AdaLN scale/shift live under `vid_out_ada.` in the checkpoint, flat in the model.
     if let Some(rest) = k.strip_prefix("vid_out_ada.") {
         return vec![rest.to_string()];

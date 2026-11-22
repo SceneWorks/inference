@@ -863,10 +863,19 @@ fn native_mmvq(inner: &QMatMul, x: &Tensor) -> bool {
         )
 }
 
+/// Frozen native operator shared with the media spine. Construction captures geometry
+/// independently of optional coefficient caches and residuals.
+pub struct CheckpointProjection {
+    layer: QLinear,
+    dims: (usize, usize),
+}
+
 /// A linear projection weight, dense or quantized.
 pub enum Projection {
     /// A dense `[out, in]` weight wrapped in a Candle linear.
     Dense(Linear),
+    /// A checkpoint-native operator with frozen codes and source scales.
+    Checkpoint(Box<CheckpointProjection>, ProjectionKind),
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
     /// A compact Prism/Bonsai affine-2 or native ternary weight.
@@ -880,6 +889,17 @@ pub enum Projection {
 /// Which representation a loaded [`Projection`] actually holds — the load telemetry's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProjectionKind {
+    /// Native fp8_e4m3 projection.
+    Fp8E4m3,
+    /// FP8 E4M3 with a separate weight scale on each output row.
+    Fp8Rowwise,
+    /// Native fp8_e5m2 projection.
+    Fp8E5m2,
+    /// Native mxfp8 projection.
+    MxFp8,
+    /// Native convrot_int8 projection.
+    ConvRot,
+
     /// Dense float weight.
     Dense,
     /// GGML block-quantized (Q4_K / Q8_0 / GGUF block types).
@@ -894,6 +914,11 @@ impl ProjectionKind {
     /// Stable lower-case label for logs and evidence rows.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Fp8E4m3 => "fp8_e4m3",
+            Self::Fp8Rowwise => "fp8_e4m3_rowwise",
+            Self::Fp8E5m2 => "fp8_e5m2",
+            Self::MxFp8 => "mxfp8",
+            Self::ConvRot => "convrot_int8",
             Self::Dense => "dense",
             Self::Ggml => "ggml",
             Self::Prism => "prism",
@@ -937,6 +962,17 @@ impl ProjectionTally {
 /// reports every requested projection under `nvfp4`, never a dense projection under an NVFP4 label.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProjectionCensus {
+    /// Native fp8_e4m3 operands.
+    pub fp8_e4m3: ProjectionTally,
+    /// Native FP8 E4M3 row-scaled operands.
+    pub fp8_rowwise: ProjectionTally,
+    /// Native fp8_e5m2 operands.
+    pub fp8_e5m2: ProjectionTally,
+    /// Native mxfp8 operands.
+    pub mxfp8: ProjectionTally,
+    /// Native convrot_int8 operands.
+    pub convrot_int8: ProjectionTally,
+
     /// Dense float projections.
     pub dense: ProjectionTally,
     /// GGML block-quantized projections.
@@ -958,9 +994,57 @@ pub struct ProjectionCensus {
 }
 
 impl ProjectionCensus {
+    /// The complete source-native inventory also includes multimodal towers constructed from the
+    /// same checkpoint outside the causal decoder's weight census.
+    pub fn replace_native(&mut self, source: Self) {
+        self.fp8_e4m3 = source.fp8_e4m3;
+        self.fp8_rowwise = source.fp8_rowwise;
+        self.fp8_e5m2 = source.fp8_e5m2;
+        self.mxfp8 = source.mxfp8;
+        self.convrot_int8 = source.convrot_int8;
+    }
+
+    pub fn report(&self) -> Vec<core_llm::ProjectionReport> {
+        [
+            ProjectionKind::Dense,
+            ProjectionKind::Ggml,
+            ProjectionKind::Prism,
+            ProjectionKind::Nvfp4,
+            ProjectionKind::Fp8E4m3,
+            ProjectionKind::Fp8Rowwise,
+            ProjectionKind::Fp8E5m2,
+            ProjectionKind::MxFp8,
+            ProjectionKind::ConvRot,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            let tally = self.tally(kind);
+            (tally.count > 0).then(|| core_llm::ProjectionReport {
+                kind: kind.label().to_string(),
+                count: tally.count,
+                params: tally.params,
+                resident_bytes: tally.resident_bytes,
+            })
+        })
+        .collect()
+    }
+
+    pub fn checkpoint_report(&self) -> Option<core_llm::LoadReport> {
+        let projections = self.report();
+        (!projections.is_empty()).then(|| core_llm::LoadReport {
+            projections,
+            ..Default::default()
+        })
+    }
+
     /// Add one projection.
     pub fn record(&mut self, p: &Projection) {
         let tally = match p.kind() {
+            ProjectionKind::Fp8Rowwise => &mut self.fp8_rowwise,
+            ProjectionKind::Fp8E4m3 => &mut self.fp8_e4m3,
+            ProjectionKind::Fp8E5m2 => &mut self.fp8_e5m2,
+            ProjectionKind::MxFp8 => &mut self.mxfp8,
+            ProjectionKind::ConvRot => &mut self.convrot_int8,
             ProjectionKind::Dense => &mut self.dense,
             ProjectionKind::Ggml => &mut self.ggml,
             ProjectionKind::Prism => &mut self.prism,
@@ -985,6 +1069,11 @@ impl ProjectionCensus {
     /// The tally for one kind.
     pub fn tally(&self, kind: ProjectionKind) -> &ProjectionTally {
         match kind {
+            ProjectionKind::Fp8Rowwise => &self.fp8_rowwise,
+            ProjectionKind::Fp8E4m3 => &self.fp8_e4m3,
+            ProjectionKind::Fp8E5m2 => &self.fp8_e5m2,
+            ProjectionKind::MxFp8 => &self.mxfp8,
+            ProjectionKind::ConvRot => &self.convrot_int8,
             ProjectionKind::Dense => &self.dense,
             ProjectionKind::Ggml => &self.ggml,
             ProjectionKind::Prism => &self.prism,
@@ -995,7 +1084,17 @@ impl ProjectionCensus {
     /// All projections together.
     pub fn total(&self) -> ProjectionTally {
         let mut total = ProjectionTally::default();
-        for t in [&self.dense, &self.ggml, &self.prism, &self.nvfp4] {
+        for t in [
+            &self.dense,
+            &self.ggml,
+            &self.prism,
+            &self.nvfp4,
+            &self.fp8_e4m3,
+            &self.fp8_rowwise,
+            &self.fp8_e5m2,
+            &self.mxfp8,
+            &self.convrot_int8,
+        ] {
             total.add(t);
         }
         total
@@ -1004,6 +1103,11 @@ impl ProjectionCensus {
     /// Merge another census into this one.
     pub fn merge(&mut self, other: &Self) {
         self.dense.add(&other.dense);
+        self.fp8_e4m3.add(&other.fp8_e4m3);
+        self.fp8_rowwise.add(&other.fp8_rowwise);
+        self.fp8_e5m2.add(&other.fp8_e5m2);
+        self.mxfp8.add(&other.mxfp8);
+        self.convrot_int8.add(&other.convrot_int8);
         self.ggml.add(&other.ggml);
         self.prism.add(&other.prism);
         self.nvfp4.add(&other.nvfp4);
@@ -1020,6 +1124,14 @@ impl ProjectionCensus {
     /// decision was measured on a uniform-width prepared snapshot, so none applies to it.
     pub fn resident_quantization(&self) -> core_llm::ResidentQuantization {
         use core_llm::ResidentQuantization as R;
+        if self.fp8_e4m3.count > 0
+            || self.fp8_rowwise.count > 0
+            || self.fp8_e5m2.count > 0
+            || self.mxfp8.count > 0
+            || self.convrot_int8.count > 0
+        {
+            return R::Unknown;
+        }
         let (ggml, nvfp4, prism) = (self.ggml.count, self.nvfp4.count, self.prism.count);
         match (ggml, nvfp4, prism) {
             (0, 0, 0) => R::Dense,
@@ -1089,6 +1201,30 @@ impl WeightCensus {
 }
 
 impl Projection {
+    pub fn from_native(linear: Linear) -> Result<Self> {
+        let dims = linear.weight_dims()?;
+        Self::from_checkpoint(QLinear::from_dense(DenseLinear::Linear(linear)), dims)
+    }
+
+    fn from_checkpoint(layer: QLinear, dims: (usize, usize)) -> Result<Self> {
+        let kind = match layer.native_format_id() {
+            Some("fp8-e4m3-rowwise-v1") => ProjectionKind::Fp8Rowwise,
+            Some("fp8-e4m3-scalar-v1") => ProjectionKind::Fp8E4m3,
+            Some("fp8-e5m2-scalar-v1") => ProjectionKind::Fp8E5m2,
+            Some("mxfp8-v1") => ProjectionKind::MxFp8,
+            Some("convrot-int8-native") => ProjectionKind::ConvRot,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "unrecognized native projection codec {other:?}"
+                )))
+            }
+        };
+        Ok(Self::Checkpoint(
+            Box::new(CheckpointProjection { layer, dims }),
+            kind,
+        ))
+    }
+
     /// Load from a dense `[out, in]` weight, quantizing it if `quant` is set.
     pub fn load(weight: Tensor, quant: Option<QuantSpec>) -> Result<Self> {
         Self::load_with_bias(weight, None, quant)
@@ -1270,6 +1406,7 @@ impl Projection {
     /// (`BACK-1`, `BACK-4`).
     pub fn from_qlinear(q: &QLinear) -> Result<Self> {
         match q {
+            QLinear::Dense(DenseLinear::Linear(l)) if l.is_native() => Self::from_native(l.clone()),
             QLinear::Dense(DenseLinear::Linear(l)) => Ok(Projection::Dense(l.clone())),
             QLinear::Dense(DenseLinear::Transposed { weight_t, bias }) => Ok(Projection::Dense(
                 Linear::new(weight_t.t()?.contiguous()?, bias.clone()),
@@ -1297,6 +1434,12 @@ impl Projection {
                 inner: QuantizedWeight::Dequant(w.clone()),
                 bias: bias.clone(),
             })),
+            #[cfg(feature = "cuda")]
+            QLinear::Fp8(base) => Self::from_checkpoint(q.clone(), base.dims()),
+            QLinear::ConvRot(base) => {
+                let descriptor = base.descriptor();
+                Self::from_checkpoint(q.clone(), (descriptor.out_features, descriptor.in_features))
+            }
             QLinear::W4A8(_) => Err(Error::Unsupported(
                 "W4A8 QLinear has no GGML/dense LLM Projection".into(),
             )),
@@ -1307,6 +1450,7 @@ impl Projection {
     /// `candle-layers` spine (`BACK-1`, `BACK-4`).
     pub fn to_qlinear(&self) -> Result<QLinear> {
         match self {
+            Projection::Checkpoint(p, _) => Ok(p.layer.clone()),
             Projection::Dense(l) => Ok(QLinear::Dense(DenseLinear::Linear(l.clone()))),
             Projection::Quantized(q) => {
                 let weight = match &q.inner {
@@ -1339,6 +1483,7 @@ impl Projection {
         match &linear.base {
             Base::Dense(l) => Ok(Projection::Dense(l.clone())),
             Base::Packed(q) => Self::from_qlinear(q),
+            Base::ConvRot(base) => Self::from_qlinear(&QLinear::ConvRot(base.clone())),
             _ => Err(Error::Unsupported(
                 "AdaptLinear base has no direct GGML/dense LLM Projection".into(),
             )),
@@ -1350,6 +1495,9 @@ impl Projection {
     pub fn to_adapt_linear(&self) -> Result<AdaptLinear> {
         let (out_dim, in_dim) = self.dims();
         match self {
+            Projection::Checkpoint(p, _) => {
+                Ok(AdaptLinear::from_packed(p.layer.clone(), in_dim, out_dim))
+            }
             Projection::Dense(l) => Ok(AdaptLinear::from_dense(l.clone(), in_dim, out_dim)),
             Projection::Quantized(_) => Ok(AdaptLinear::from_packed(
                 self.to_qlinear()?,
@@ -1368,6 +1516,7 @@ impl Projection {
     /// cuBLASLt W4A4 GEMM, recording which ran ([`nvfp4_path`](super::nvfp4_path), sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
+            Projection::Checkpoint(p, _) => Ok(__model_proof_output!(p.layer.forward(x))?),
             Projection::Dense(l) => Ok(__model_proof_output!(l.forward(x))?),
             Projection::Quantized(q) => __model_proof_output!(q.forward(x)),
             Projection::Prism(weight) => __model_proof_output!(weight.forward(x)),
@@ -1395,6 +1544,7 @@ impl Projection {
     pub fn kind(&self) -> ProjectionKind {
         match self {
             Projection::Dense(_) => ProjectionKind::Dense,
+            Projection::Checkpoint(_, kind) => *kind,
             Projection::Quantized(_) => ProjectionKind::Ggml,
             Projection::Prism(_) => ProjectionKind::Prism,
             Projection::Nvfp4(_) => ProjectionKind::Nvfp4,
@@ -1405,6 +1555,10 @@ impl Projection {
     pub fn params(&self) -> u64 {
         (match self {
             Projection::Dense(l) => l.weight().elem_count(),
+            Projection::Checkpoint(_, _) => {
+                let (n, k) = self.dims();
+                n * k
+            }
             Projection::Quantized(q) => q.weight_elems(),
             Projection::Prism(w) => w.rows() * w.input_width(),
             Projection::Nvfp4(w) => {
@@ -1417,7 +1571,8 @@ impl Projection {
     /// The logical `(out, in)` weight shape.
     pub fn dims(&self) -> (usize, usize) {
         match self {
-            Projection::Dense(l) => l.weight().dims2().unwrap_or((0, 0)),
+            Projection::Checkpoint(p, _) => p.dims,
+            Projection::Dense(l) => l.weight_dims().unwrap_or((0, 0)),
             Projection::Quantized(q) => q.dims(),
             Projection::Prism(w) => (w.rows(), w.input_width()),
             Projection::Nvfp4(w) => w.shape(),
@@ -1429,6 +1584,7 @@ impl Projection {
     pub fn resident_bytes(&self) -> Option<u64> {
         let dense = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
         match self {
+            Projection::Checkpoint(p, _) => p.layer.native_resident_bytes(),
             Projection::Dense(l) => Some(dense(l.weight()) + l.bias().map_or(0, dense)),
             Projection::Quantized(q) => Some(q.resident_bytes() as u64),
             Projection::Prism(_) => None,

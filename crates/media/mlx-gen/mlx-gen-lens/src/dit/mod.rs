@@ -31,28 +31,35 @@ use mlx_gen::Result;
 /// cast to the working `dtype` at load. `Clone` is cheap (refcounted `Array`s) and required so a
 /// checkpoint segment can OWN its block copy (sc-5170, mirrors z-image).
 #[derive(Clone)]
-pub(crate) struct Linear {
-    w: Array, // [out, in]
-    b: Option<Array>,
+pub(crate) enum Linear {
+    Dense { weight: Array, bias: Option<Array> },
+    Native(mlx_gen::NativeProjection),
 }
 
 impl Linear {
     pub(crate) fn load(w: &Weights, prefix: &str, bias: bool, dtype: Dtype) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?,
-            b: if bias {
+        if let Some(p) = mlx_gen::NativeProjection::from_weights(w, prefix, bias)? {
+            return Ok(Self::Native(p));
+        }
+        Ok(Self::Dense {
+            weight: w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?,
+            bias: if bias {
                 Some(w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?)
             } else {
                 None
             },
         })
     }
-
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-        let y = matmul(x, self.w.t())?;
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
+        match self {
+            Self::Native(p) => Ok(p.forward(x)?),
+            Self::Dense { weight, bias } => {
+                let y = matmul(x, weight.t())?;
+                Ok(match bias {
+                    Some(b) => add(&y, b)?,
+                    None => y,
+                })
+            }
         }
     }
 }

@@ -229,10 +229,22 @@ fn klein_planned_dit_bytes(
     cfg: &crate::config::Flux2Config,
     residency: &dyn gen_core::checkpoint_codec::CodecResidencyPolicy,
 ) -> gen_core::Result<u64> {
-    use gen_core::checkpoint_codec::ResidencyMode;
+    price_planned_dit(
+        dit_path,
+        cfg,
+        residency,
+        &crate::single_file::Flux2BflToDiffusersMapping::new(cfg),
+    )
+}
 
-    let mapping = crate::single_file::Flux2BflToDiffusersMapping::new(cfg);
-    let plan = candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, residency)
+fn price_planned_dit(
+    dit_path: &std::path::Path,
+    cfg: &crate::config::Flux2Config,
+    residency: &dyn gen_core::checkpoint_codec::CodecResidencyPolicy,
+    mapping: &dyn gen_core::LogicalKeyMapping,
+) -> gen_core::Result<u64> {
+    use gen_core::checkpoint_codec::ResidencyMode;
+    let plan = candle_gen::logical_weights::plan_logical_weights(dit_path, mapping, residency)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
     let overflow = || gen_core::Error::Msg("FLUX.2 imported DiT resident byte sum overflow".into());
     // Pricing and loading must not disagree about what a row holds resident, and the loader's
@@ -256,7 +268,10 @@ fn klein_planned_dit_bytes(
     let mut packed_owner: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for tensor in &plan.tensors {
         let bytes = match tensor.residency.mode {
-            ResidencyMode::Packed if stays_packed(&tensor.logical_key) => {
+            ResidencyMode::Packed
+                if tensor.codec_id != gen_core::checkpoint_codec::NVFP4_CODEC.codec_id
+                    || stays_packed(&tensor.logical_key) =>
+            {
                 packed_owner.insert(tensor.physical_key.as_str());
                 tensor.residency.resident_bytes
             }
@@ -661,7 +676,9 @@ pub(crate) fn composed_provider_contract_for(
                             &klein_pricing_residency(),
                         )
                     } else {
-                        f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
+                        let cfg = Flux2Variant::Dev.config();
+                        let mapping = crate::single_file::Flux2BflToDiffusersMapping::for_dev(&cfg);
+                        price_planned_dit(p, &cfg, &klein_pricing_residency(), &mapping)
                     }
                 })?,
                 // Whole component, encoder half included — see the Dir arm above.
@@ -1879,8 +1896,13 @@ mod tests {
                 ("double_blocks.0.img_mlp.0.weight", "F8_E4M3", &[2, 32], 64),
                 ("double_blocks.0.img_mlp.0.weight_scale", "F32", &[], 4),
                 ("double_blocks.0.img_mlp.0.input_scale", "F32", &[], 4),
-                ("double_blocks.0.img_mlp.2.weight", "U8", &[2, 32], 64),
-                ("double_blocks.0.img_mlp.0.bias", "F16", &[2], 4),
+                ("double_blocks.0.img_mlp.2.weight", "BF16", &[2, 32], 128),
+                (
+                    "double_blocks.0.img_attn.norm.key_norm.scale",
+                    "F16",
+                    &[2],
+                    4,
+                ),
             ],
         );
         let mut spec = LoadSpec::new(WeightsSource::File(dit))
@@ -1931,7 +1953,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(packed.asset_facts.conditioning_bytes, packed_conditioning);
-        assert_eq!(packed.asset_facts.transformer_bytes, 36 + 36 + 8);
+        assert_eq!(
+            packed.asset_facts.transformer_bytes,
+            dense.asset_facts.transformer_bytes
+        );
         assert_eq!(packed.asset_facts.decoder_bytes, 32);
         assert_eq!(
             packed.asset_facts.base_bytes,

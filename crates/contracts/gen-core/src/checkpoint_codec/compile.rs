@@ -14,6 +14,38 @@ pub(super) fn scalar_scale_shape_ok(shape: &[usize]) -> bool {
     shape.is_empty() || shape == [1]
 }
 
+/// Open only the header and bounded descriptor payloads and compile a logical plan. The same
+/// entry point serves source classification and backend planning; the caller supplies residency.
+pub fn plan_safetensors(
+    path: &std::path::Path,
+    mapping: &dyn LogicalKeyMapping,
+    codecs: &CheckpointCodecRegistry,
+    residency: &dyn CodecResidencyPolicy,
+) -> crate::Result<LogicalWeightPlan> {
+    let headers = crate::safetensors_path_tensor_headers(path)?;
+    let descriptors = crate::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(DESCRIPTOR_SUFFIX),
+        65_536,
+    )?;
+    let metadata = crate::safetensors_path_quantization_metadata(path)?;
+    compile_logical_weight_plan_with_metadata(
+        &headers,
+        &descriptors,
+        metadata.as_deref(),
+        mapping,
+        codecs,
+        residency,
+    )
+    .map_err(|e| {
+        crate::Error::Msg(format!(
+            "logical weight plan for {} ({}): {e}",
+            path.display(),
+            mapping.mapping_id()
+        ))
+    })
+}
+
 /// Compile a header into a [`LogicalWeightPlan`]. Pure and deterministic: the same header,
 /// descriptor payloads, mapping, codec registry, and residency policy always produce the same plan,
 /// in logical-key order. Fails on the first tensor (in header order, sorted by physical key) that
@@ -91,7 +123,11 @@ pub fn compile_logical_weight_plan_with_metadata(
     if let Some(payload) = quantization_metadata {
         let table = crate::comfy_quant::parse_quantization_metadata(payload)
             .map_err(|error| LogicalWeightPlanError::QuantizationMetadata { error })?;
-        let prefix = resolve_metadata_prefix(&by_name, &table)?;
+        let prefix = if mapping.inline_fp8_scales() {
+            resolve_projection_metadata_prefix(&by_name, &table)?
+        } else {
+            resolve_metadata_prefix(&by_name, &table)?
+        };
         for (layer, descriptor) in table {
             metadata_descriptors.insert(format!("{prefix}{layer}"), (layer, descriptor));
         }
@@ -100,10 +136,11 @@ pub fn compile_logical_weight_plan_with_metadata(
     // ---- classify companions and validate descriptors, per layer ----------------------------
     let mut descriptors: BTreeMap<String, ComfyQuantDescriptor> = BTreeMap::new(); // by layer base
     for header in by_name.values() {
-        if header.name == LEGACY_MARKER_KEY
-            || LEGACY_SCALE_SUFFIXES
-                .iter()
-                .any(|suffix| header.name.ends_with(suffix))
+        if !mapping.inline_fp8_scales()
+            && (header.name == LEGACY_MARKER_KEY
+                || LEGACY_SCALE_SUFFIXES
+                    .iter()
+                    .any(|suffix| header.name.ends_with(suffix)))
         {
             return Err(LogicalWeightPlanError::LegacyScaledFp8 {
                 physical_key: header.name.clone(),
@@ -118,22 +155,47 @@ pub fn compile_logical_weight_plan_with_metadata(
             });
         }
         let weight_key = format!("{base}.weight");
-        if !by_name.contains_key(weight_key.as_str()) {
-            return Err(LogicalWeightPlanError::OrphanDescriptor {
-                physical_key: header.name.clone(),
-            });
-        }
+        let parameter_key = format!("{base}_weight");
+        let bare = mapping.inline_fp8_scales()
+            && by_name
+                .get(base)
+                .is_some_and(|h| matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2));
+        let parameter = mapping.inline_fp8_scales() && by_name.contains_key(parameter_key.as_str());
+        let candidates = [
+            by_name
+                .contains_key(weight_key.as_str())
+                .then_some(weight_key),
+            parameter.then_some(parameter_key),
+            bare.then(|| base.to_owned()),
+        ];
+        let mut candidates = candidates.into_iter().flatten();
+        let weight_key = match (candidates.next(), candidates.next()) {
+            (Some(key), None) => key,
+            (Some(_), Some(_)) => {
+                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                    physical_key: header.name.clone(),
+                    reason: "the descriptor has multiple physical weight owners",
+                })
+            }
+            (None, _) => {
+                return Err(LogicalWeightPlanError::OrphanDescriptor {
+                    physical_key: header.name.clone(),
+                })
+            }
+        };
         let payload = descriptor_payloads
             .get(header.name.as_str())
             .ok_or_else(|| LogicalWeightPlanError::DescriptorPayloadUnavailable {
                 physical_key: header.name.clone(),
             })?;
-        let descriptor = parse_comfy_quant_descriptor(payload).map_err(|defect| {
-            LogicalWeightPlanError::Descriptor {
-                layer: base.to_owned(),
-                physical_key: header.name.clone(),
-                defect,
-            }
+        let descriptor = crate::comfy_quant::parse_descriptor_with_geometry(
+            payload,
+            mapping.legacy_convrot_geometry(),
+        )
+        .map_err(|defect| LogicalWeightPlanError::Descriptor {
+            layer: base.to_owned(),
+            physical_key: header.name.clone(),
+            defect,
         })?;
         // The blob is authoritative. A file-level entry for the same layer only has to be
         // CONSISTENT with it: fields the entry omits are not a disagreement (the real-artifact
@@ -144,7 +206,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                 return Err(LogicalWeightPlanError::DescriptorConflict {
                     physical_key: weight_key,
                     tensor: descriptor,
-                    metadata,
+                    metadata: Box::new(metadata),
                     disagreement,
                 });
             }
@@ -167,7 +229,82 @@ pub fn compile_logical_weight_plan_with_metadata(
         descriptors.insert(base, descriptor);
     }
 
+    let scalar_key =
+        |base: &str, modern: &str, legacy: &str| -> Result<String, LogicalWeightPlanError> {
+            let modern_key = format!("{base}{modern}");
+            let legacy_key = format!("{base}{legacy}");
+            if mapping.inline_fp8_scales() && by_name.contains_key(legacy_key.as_str()) {
+                if by_name.contains_key(modern_key.as_str()) {
+                    return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                        physical_key: legacy_key,
+                        reason: "both legacy and modern spellings describe the same scale",
+                    });
+                }
+                Ok(legacy_key)
+            } else {
+                Ok(modern_key)
+            }
+        };
+    if mapping.inline_fp8_scales() {
+        let mut inferred_owners = BTreeMap::new();
+        for header in by_name.values() {
+            if !matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
+                continue;
+            }
+            let base = if by_name.contains_key(format!("{}.scale_weight", header.name).as_str())
+                || by_name.contains_key(format!("{}.weight_scale", header.name).as_str())
+            {
+                header.name.as_str()
+            } else {
+                super::source::projection_weight_base(&header.name).unwrap_or(&header.name)
+            };
+            if !by_name
+                .contains_key(scalar_key(base, WEIGHT_SCALE_SUFFIX, ".scale_weight")?.as_str())
+            {
+                continue;
+            }
+            if inferred_owners.insert(base, &header.name).is_some() {
+                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                    physical_key: header.name.clone(),
+                    reason: "multiple physical FP8 weights share one scale owner",
+                });
+            }
+            let format = match header.dtype {
+                Dtype::F8_E4M3
+                    if header.shape.len() == 2
+                        && header.shape[0] > 1
+                        && by_name
+                            .get(format!("{base}.weight_scale").as_str())
+                            .is_some_and(|s| {
+                                s.shape == [header.shape[0]] && s.dtype == Dtype::F32
+                            }) =>
+                {
+                    ComfyQuantFormat::Fp8Rowwise
+                }
+                Dtype::F8_E4M3 => ComfyQuantFormat::Float8E4M3Fn,
+                Dtype::F8_E5M2 => ComfyQuantFormat::Float8E5M2,
+                _ => continue,
+            };
+            descriptors
+                .entry(base.to_owned())
+                .or_insert(ComfyQuantDescriptor {
+                    format,
+                    full_precision_matrix_mult: false,
+                    orig_shape: None,
+                    rotation_group: None,
+                });
+        }
+    }
+
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
+        if mapping.inline_fp8_scales() {
+            if let Some(base) = name.strip_suffix(".scale_weight") {
+                return Some((base.to_owned(), CompanionRole::WeightScale));
+            }
+            if let Some(base) = name.strip_suffix(".scale_input") {
+                return Some((base.to_owned(), CompanionRole::InputScale));
+            }
+        }
         if let Some(base) = name.strip_suffix(DESCRIPTOR_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::Descriptor));
         }
@@ -206,6 +343,19 @@ pub fn compile_logical_weight_plan_with_metadata(
     let mut source_bytes = 0_u64;
     for header in by_name.values() {
         source_bytes = source_bytes.saturating_add(header.data_bytes);
+        if mapping.inline_fp8_scales() && header.name == LEGACY_MARKER_KEY {
+            let owner = by_name
+                .values()
+                .find(|h| {
+                    h.name != LEGACY_MARKER_KEY
+                        && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                })
+                .ok_or_else(|| LogicalWeightPlanError::LegacyScaledFp8 {
+                    physical_key: header.name.clone(),
+                })?;
+            consume_companion(header, CompanionRole::Descriptor, &owner.name, 0);
+            continue;
+        }
         if let Some((base, role)) = companion_owner(&header.name) {
             if role == CompanionRole::Descriptor {
                 // Validated above; recorded when its weight is planned.
@@ -296,14 +446,32 @@ pub fn compile_logical_weight_plan_with_metadata(
                 dtype: format!("{:?}", header.dtype),
             }
         })?;
-        let base = header.name.strip_suffix(".weight");
+        let base = if mapping.inline_fp8_scales() && descriptors.contains_key(&header.name) {
+            Some(header.name.as_str())
+        } else {
+            header.name.strip_suffix(".weight").or_else(|| {
+                mapping
+                    .inline_fp8_scales()
+                    .then(|| super::source::projection_weight_base(&header.name))
+                    .flatten()
+            })
+        };
         let descriptor = base.and_then(|base| descriptors.get(base));
+        let declared_source_shape = declared_source_shape.or_else(|| {
+            if mapping.accepts_descriptor_shape() {
+                descriptor.and_then(|d| d.orig_shape.clone())
+            } else {
+                None
+            }
+        });
         // Descriptor ↔ stored-dtype agreement first: "declared e4m3 but stored bf16" is the exact
         // defect, not a missing codec row.
         if let Some(descriptor) = descriptor {
             let expected_dtype = match descriptor.format {
-                ComfyQuantFormat::Int8TensorwisePerRow => Dtype::I8,
-                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
+                ComfyQuantFormat::Int8TensorwisePerRow | ComfyQuantFormat::ConvRotInt8 => Dtype::I8,
+                ComfyQuantFormat::Float8E4M3Fn
+                | ComfyQuantFormat::Fp8Rowwise
+                | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
                 ComfyQuantFormat::Float8E5M2 => Dtype::F8_E5M2,
                 // NVFP4 packs two E2M1 codes per byte; the file has no 4-bit dtype to declare.
                 ComfyQuantFormat::Nvfp4 => Dtype::U8,
@@ -366,25 +534,41 @@ pub fn compile_logical_weight_plan_with_metadata(
             None => (TensorCodecSpec::Dense, header.shape.clone()),
             Some(descriptor) => {
                 let base = base.expect("descriptor implies a `.weight` suffix");
-                if header.shape.len() != 2 {
+                if header.shape.len() != 2
+                    && !(mapping.inline_fp8_scales()
+                        && matches!(
+                            descriptor.format,
+                            ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+                        ))
+                {
                     return Err(LogicalWeightPlanError::QuantizedWeightRank {
                         physical_key: header.name.clone(),
                         format: descriptor.format,
                         shape: header.shape.clone(),
                     });
                 }
-                let scale_key = format!("{base}{WEIGHT_SCALE_SUFFIX}");
+                let scale_key = scalar_key(base, WEIGHT_SCALE_SUFFIX, ".scale_weight")?;
                 let scale = *by_name.get(scale_key.as_str()).ok_or_else(|| {
                     LogicalWeightPlanError::MissingCompanion {
                         physical_key: header.name.clone(),
                         companion: scale_key.clone(),
                     }
                 })?;
-                let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
+                let input_scale_key = scalar_key(base, INPUT_SCALE_SUFFIX, ".scale_input")?;
                 let input_scale = by_name.get(input_scale_key.as_str()).copied();
+                let scalar_dtype = |h: &SafetensorsTensorHeader| {
+                    h.dtype == Dtype::F32
+                        || (mapping.inline_fp8_scales()
+                            && (h.name.ends_with(".scale_weight")
+                                || h.name.ends_with(".scale_input"))
+                            && matches!(
+                                descriptor.format,
+                                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+                            )
+                            && matches!(h.dtype, Dtype::F16 | Dtype::BF16))
+                };
                 if let Some(input_scale) = input_scale {
-                    if input_scale.dtype != Dtype::F32 || !scalar_scale_shape_ok(&input_scale.shape)
-                    {
+                    if !scalar_dtype(input_scale) || !scalar_scale_shape_ok(&input_scale.shape) {
                         return Err(LogicalWeightPlanError::CompanionMalformed {
                             physical_key: input_scale.name.clone(),
                             defect: format!(
@@ -395,8 +579,22 @@ pub fn compile_logical_weight_plan_with_metadata(
                     }
                 }
                 match descriptor.format {
+                    ComfyQuantFormat::Fp8Rowwise => {
+                        if header.shape.len() != 2
+                            || scale.shape != [header.shape[0]]
+                            || scale.dtype != Dtype::F32
+                            || input_scale.is_some()
+                            || descriptor.full_precision_matrix_mult
+                        {
+                            return Err(LogicalWeightPlanError::CompanionMalformed{physical_key:scale_key,defect:"FP8R requires one F32 scale per output row and dynamic input calibration".to_owned()});
+                        }
+                        (
+                            TensorCodecSpec::RowwiseFp8 { scale: scale_key },
+                            header.shape.clone(),
+                        )
+                    }
                     ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2 => {
-                        if scale.dtype != Dtype::F32 || !scalar_scale_shape_ok(&scale.shape) {
+                        if !scalar_dtype(scale) || !scalar_scale_shape_ok(&scale.shape) {
                             return Err(LogicalWeightPlanError::CompanionMalformed {
                                 physical_key: scale.name.clone(),
                                 defect: format!(
@@ -499,6 +697,59 @@ pub fn compile_logical_weight_plan_with_metadata(
                             logical.to_vec(),
                         )
                     }
+                    ComfyQuantFormat::ConvRotInt8 => {
+                        if scale.dtype != Dtype::F32 {
+                            return Err(LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: scale.name.clone(),
+                                defect: "ConvRot weight_scale must be F32".into(),
+                            });
+                        }
+                        if let Some(declared) = &declared_source_shape {
+                            if declared != &header.shape {
+                                return Err(LogicalWeightPlanError::DescriptorOrigShape {
+                                    physical_key: header.name.clone(),
+                                    declared: declared.clone(),
+                                    logical: header.shape.clone(),
+                                });
+                            }
+                        }
+                        for suffix in [
+                            ".scales",
+                            ".biases",
+                            ".weight_s_rel",
+                            ".weight_s_channel",
+                            ".weight_codebook",
+                        ] {
+                            let key = format!("{base}{suffix}");
+                            if by_name.contains_key(key.as_str()) {
+                                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                                    physical_key: key,
+                                    reason: "contradictory ConvRot and affine/grouped operands",
+                                });
+                            }
+                        }
+                        let geometry = crate::convrot_int8::ConvRotInt8::from_source_geometry(
+                            descriptor
+                                .rotation_group
+                                .expect("complete ConvRot descriptor"),
+                            &header.shape,
+                            &scale.shape,
+                            mapping.legacy_convrot_geometry(),
+                        )
+                        .map_err(|defect| {
+                            LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: header.name.clone(),
+                                defect,
+                            }
+                        })?;
+                        (
+                            TensorCodecSpec::ConvRotInt8 {
+                                scale: scale.name.clone(),
+                                geometry,
+                            },
+                            header.shape.clone(),
+                        )
+                    }
                     ComfyQuantFormat::Int8TensorwisePerRow => {
                         let rows = header.shape[0];
                         let scalar_single_row = rows == 1 && scale.shape.is_empty();
@@ -550,8 +801,13 @@ pub fn compile_logical_weight_plan_with_metadata(
         let mode = if codec_spec.full_precision_matrix_mult() {
             ResidencyMode::Dense
         } else {
-            residency.residency(codec, &codec_spec, &header.shape)
+            residency.residency_for_key(&header.name, codec, &codec_spec, &header.shape)
         };
+        if matches!(codec_spec, TensorCodecSpec::ConvRotInt8 { .. })
+            && mode != ResidencyMode::Packed
+        {
+            return Err(LogicalWeightPlanError::UnsupportedFormat { physical_key: header.name.clone(), format: "ConvRot INT8 requires native integer execution with online Hadamard rotation for this device and matrix geometry".into() });
+        }
         // The adapter's declarative transform, resolved against this tensor's real geometry, its
         // codec and the residency just chosen (sc-21547) — the last plan-time gate before the
         // entries are emitted, and still before any tensor payload is read.
@@ -597,9 +853,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let ScalarScaleSource::Companion { physical_key } = scale {
                         let scale_header = by_name[physical_key.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => {
-                                scale_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
+                            ResidencyMode::Packed => 4_u64.saturating_mul(scalar_scale_copies),
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -612,9 +866,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let Some(input_scale) = input_scale {
                         let input_header = by_name[input_scale.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => {
-                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
+                            ResidencyMode::Packed => 4_u64.saturating_mul(scalar_scale_copies),
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -656,7 +908,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                         consume_companion(companion_header, role, &header.name, retained);
                     }
                 }
-                TensorCodecSpec::Mxfp8 { scale, .. }
+                TensorCodecSpec::RowwiseFp8 { scale }
+                | TensorCodecSpec::Mxfp8 { scale, .. }
+                | TensorCodecSpec::ConvRotInt8 { scale, .. }
                 | TensorCodecSpec::Int8PerRow { scale, .. } => {
                     let scale_header = by_name[scale.as_str()];
                     let retained = match mode {
@@ -671,17 +925,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                     );
                     let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
                     if let Some(input_header) = by_name.get(input_scale_key.as_str()) {
-                        // Same rule as the ScalarFp8 arm: a packed-native load keeps the activation
-                        // scale resident, a dense decode consumes it. Pricing it at zero
-                        // unconditionally would under-report a packed MXFP8 row. (Only the MXFP8
-                        // half of this arm can get here — the companion-surface check above refuses
-                        // an `input_scale` on an `int8_tensorwise` layer by format.)
-                        let retained = match mode {
-                            ResidencyMode::Packed => {
-                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
-                            ResidencyMode::Dense => 0,
-                        };
+                        // MXFP8 activation exponents are dynamic per block. Stored input_scale
+                        // remains a source fact but occupies no resident execution storage.
+                        let retained = 0;
                         consume_companion(
                             input_header,
                             CompanionRole::InputScale,
@@ -771,6 +1017,51 @@ pub fn compile_logical_weight_plan_with_metadata(
     })
 }
 
+/// Normalize layer-owned `.weight`/`_weight` and bare FP8 parameter spellings for the opted-in
+/// constructor mapping. Retain the metadata resolver's unique-prefix and whole-inventory checks.
+pub(super) fn resolve_projection_metadata_prefix<T>(
+    by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
+    table: &BTreeMap<String, T>,
+) -> Result<String, LogicalWeightPlanError> {
+    let mut names = BTreeSet::new();
+    for (key, header) in by_name {
+        if let Some(base) = super::source::projection_weight_base(key) {
+            let weight = format!("{base}.weight");
+            if !names.insert(weight)
+                && table.keys().any(|layer| {
+                    base == layer
+                        || base
+                            .strip_suffix(layer.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+            {
+                return Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+                    layer: base.to_owned(),
+                    reason: "multiple physical weight spellings resolve to one layer".into(),
+                });
+            }
+        }
+        if !key.ends_with(".weight") && matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
+            let weight = format!("{key}.weight");
+            if by_name.contains_key(weight.as_str())
+                && table.keys().any(|layer| {
+                    *key == layer
+                        || key
+                            .strip_suffix(layer.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+            {
+                return Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+                    layer: (*key).to_owned(),
+                    reason: "both bare and .weight FP8 source owners exist".into(),
+                });
+            }
+            names.insert(weight);
+        }
+    }
+    resolve_metadata_name_prefix(&names.iter().map(|key| (key.as_str(), ())).collect(), table)
+}
+
 /// Resolve the single state-dict prefix under which every `_quantization_metadata` layer name has a
 /// `{prefix}{layer}.weight` tensor in this file.
 ///
@@ -778,9 +1069,16 @@ pub fn compile_logical_weight_plan_with_metadata(
 /// prefix (`model.diffusion_model.`). Candidates are derived from one declared layer, then the whole
 /// table must resolve under exactly one of them — a table that resolves under two prefixes, or under
 /// none, refuses instead of the compiler picking one.
-pub(super) fn resolve_metadata_prefix(
-    by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
+pub fn resolve_metadata_prefix<T>(
+    by_name: &BTreeMap<&str, T>,
     table: &BTreeMap<String, PartialComfyQuantDescriptor>,
+) -> Result<String, LogicalWeightPlanError> {
+    resolve_metadata_name_prefix(by_name, table)
+}
+
+fn resolve_metadata_name_prefix<T, U>(
+    by_name: &BTreeMap<&str, T>,
+    table: &BTreeMap<String, U>,
 ) -> Result<String, LogicalWeightPlanError> {
     let (first, _) = table
         .iter()

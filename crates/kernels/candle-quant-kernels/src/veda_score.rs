@@ -28,6 +28,36 @@ pub fn tile_logits(
     pq: &[f32],
     pk: &[f32],
 ) -> Result<Vec<f32>> {
+    tile_logits_weights(
+        q,
+        k,
+        valid,
+        video,
+        Projection::Dense(pq),
+        Projection::Dense(pk),
+    )
+}
+
+pub enum Projection<'a> {
+    Dense(&'a [f32]),
+    Fp8 { codes: &'a [u8], scales: &'a [f32] },
+}
+impl Projection<'_> {
+    fn fits(&self, heads: usize, length: usize) -> bool {
+        match self {
+            Self::Dense(values) => values.len() == length,
+            Self::Fp8 { codes, scales } => codes.len() == length && scales.len() == heads,
+        }
+    }
+}
+pub fn tile_logits_weights(
+    q: &Tensor,
+    k: &Tensor,
+    valid: &[usize],
+    video: usize,
+    pq: Projection<'_>,
+    pk: Projection<'_>,
+) -> Result<Vec<f32>> {
     let (heads, tiles, rows, dim) = q.dims4()?;
     if k.dims() != q.dims()
         || rows != 128
@@ -37,8 +67,8 @@ pub fn tile_logits(
         || video > tiles
         || valid.len() != tiles
         || valid.iter().any(|&n| n > 128)
-        || pq.len() != heads * 3 * dim * dim
-        || pk.len() != pq.len()
+        || !pq.fits(heads, heads * 3 * dim * dim)
+        || !pk.fits(heads, heads * 3 * dim * dim)
         || !q.device().same_device(k.device())
     {
         candle_core::bail!("Veda scorer shape mismatch")
@@ -79,8 +109,8 @@ mod cuda {
         k: &Tensor,
         valid: &[usize],
         video: usize,
-        pq: &[f32],
-        pk: &[f32],
+        pq: Projection<'_>,
+        pk: Projection<'_>,
     ) -> Result<Vec<f32>> {
         let Device::Cuda(dev) = q.device() else {
             unreachable!()
@@ -98,11 +128,11 @@ mod cuda {
         let valid = stream
             .clone_htod(&valid.iter().map(|&n| n as u32).collect::<Vec<_>>())
             .map_err(candle_core::Error::wrap)?;
-        let (pq, pk) = (upload(pq)?, upload(pk)?);
+
         let (h, v, d) = (heads as i32, video as i32, dim as i32);
         let features = heads * video * dim;
         let mut projected = Vec::with_capacity(2);
-        for (x, p) in [(q, &pq), (k, &pk)] {
+        for (x, p) in [(q, pq), (k, pk)] {
             // Only the scored video tiles are converted; the kernel reads them as `[heads, video,
             // 128, dim]`.
             let x = x.narrow(1, 0, video)?.to_dtype(DType::F32)?.contiguous()?;
@@ -127,10 +157,31 @@ mod cuda {
                     .arg(&d)
                     .launch(grid(features)?)
                     .map_err(candle_core::Error::wrap)?;
-                stream
-                    .launch_builder(&project)
-                    .arg(&f)
-                    .arg(p)
+                // Keep staged slices alive through submission on the same stream.
+                let (codes, scale, coefficients);
+                let fp8_project;
+                let mut launch = match p {
+                    Projection::Dense(values) => {
+                        coefficients = upload(values)?;
+                        let mut launch = stream.launch_builder(&project);
+                        launch.arg(&f).arg(&coefficients);
+                        launch
+                    }
+                    Projection::Fp8 {
+                        codes: values,
+                        scales,
+                    } => {
+                        codes = stream
+                            .clone_htod(values)
+                            .map_err(candle_core::Error::wrap)?;
+                        scale = upload(scales)?;
+                        fp8_project = function("veda_project_fp8")?;
+                        let mut launch = stream.launch_builder(&fp8_project);
+                        launch.arg(&f).arg(&codes).arg(&scale);
+                        launch
+                    }
+                };
+                launch
                     .arg(&mut out)
                     .arg(&h)
                     .arg(&v)

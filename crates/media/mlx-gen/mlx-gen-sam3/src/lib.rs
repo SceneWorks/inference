@@ -40,9 +40,12 @@ pub mod vision;
 /// same fused `addmm` as the old `nn::linear`, so loading stays parity-preserving) and made
 /// quantizable in place via the per-module `quantize` cascades (Q8/Q4 affine, sc-4925).
 pub(crate) fn load_linear(w: &Weights, name: &str) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{name}.weight"))?.clone();
-    let bias = w.get(&format!("{name}.bias")).cloned();
-    Ok(AdaptableLinear::dense(weight, bias))
+    mlx_gen::quant::lin(
+        w,
+        name,
+        w.peek(&format!("{name}.bias")).is_some(),
+        mlx_gen::quant::DEFAULT_GROUP_SIZE,
+    )
 }
 
 /// Affine-quantize a linear in place to `bits` (Q8/Q4) at the default group size **iff** its

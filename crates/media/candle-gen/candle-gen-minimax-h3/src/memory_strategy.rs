@@ -23,7 +23,9 @@ pub use warm_estimate::{video_warm_estimate, VideoWarmEstimate, VideoWarmWeights
 // Shared with the MiniMax-H3-Image contract (SW-7095): the same block stack, loaders and adapter
 // install, priced by the same header-only inventory.
 pub(crate) use adapters::profile_for as adapter_profile_for;
-pub(crate) use streaming::{dit_window_for, runtime_payloads, text_encoder_stream};
+pub(crate) use streaming::{
+    dit_window_for, runtime_payloads, text_encoder_stream, text_fp8_work, text_payloads,
+};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -452,8 +454,12 @@ pub(crate) fn dit_allocation(
     path: &std::path::Path,
     pruned: bool,
 ) -> candle_gen::gen_core::Result<gen_core_h3::h3_memory::NativeComponentAllocation> {
-    let mut allocation =
-        gen_core_h3::h3_memory::component_allocation(path, native_backend(), 2, |h| {
+    let mut allocation = gen_core_h3::h3_memory::component_allocation_with_fp8_policy(
+        path,
+        native_backend(),
+        2,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+        |h| {
             if pruned
                 && (h.name == TABLE_KEY
                     || h.name.contains(".adaln_proj.linear.")
@@ -467,7 +473,8 @@ pub(crate) fn dit_allocation(
             } else {
                 None
             }
-        })?;
+        },
+    )?;
     if safetensors_path_bytes(path) > 0 {
         let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
         let by_name = headers

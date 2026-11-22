@@ -199,7 +199,16 @@ impl LinearNoBias {
 
     /// Load `{prefix}` — **packed** when `{prefix}.scales` is present, else dense at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
-        let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, false, dtype)?;
+        Self::load(w, prefix, dtype, None)
+    }
+
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        dtype: DType,
+        shape: Option<(usize, usize)>,
+    ) -> Result<Self> {
+        let loaded = crate::quant::lin_shaped(w, crate::quant::DIT, prefix, false, dtype, shape)?;
         Ok(Self {
             inner: loaded.linear,
             base_bytes: loaded.base_bytes,
@@ -483,10 +492,30 @@ impl DitAttention {
         expect(&norm_k, &[cfg.attention_head_dim], "norm_k")?;
 
         Ok(Self {
-            to_q: LinearNoBias::from_weights(w, &format!("{prefix}.to_q"), dtype)?,
-            to_k: LinearNoBias::from_weights(w, &format!("{prefix}.to_k"), dtype)?,
-            to_v: LinearNoBias::from_weights(w, &format!("{prefix}.to_v"), dtype)?,
-            to_out: LinearNoBias::from_weights(w, &format!("{prefix}.to_out.0"), dtype)?,
+            to_q: LinearNoBias::load(
+                w,
+                &format!("{prefix}.to_q"),
+                dtype,
+                Some((cfg.inner_dim(), cfg.hidden_size)),
+            )?,
+            to_k: LinearNoBias::load(
+                w,
+                &format!("{prefix}.to_k"),
+                dtype,
+                Some((cfg.inner_dim(), cfg.hidden_size)),
+            )?,
+            to_v: LinearNoBias::load(
+                w,
+                &format!("{prefix}.to_v"),
+                dtype,
+                Some((cfg.inner_dim(), cfg.hidden_size)),
+            )?,
+            to_out: LinearNoBias::load(
+                w,
+                &format!("{prefix}.to_out.0"),
+                dtype,
+                Some((cfg.hidden_size, cfg.inner_dim())),
+            )?,
             norm_q,
             norm_k,
             heads: cfg.num_attention_heads,
@@ -952,9 +981,28 @@ impl DitFeedForward {
 
     /// Load `{prefix}` (e.g. `transformer_blocks.0.ff`).
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
+        Self::load(w, prefix, dtype, None)
+    }
+
+    pub(crate) fn load(
+        w: &Weights,
+        prefix: &str,
+        dtype: DType,
+        cfg: Option<&MiniMaxH3DitConfig>,
+    ) -> Result<Self> {
         Ok(Self {
-            proj: LinearNoBias::from_weights(w, &format!("{prefix}.net.0.proj"), dtype)?,
-            out: LinearNoBias::from_weights(w, &format!("{prefix}.net.2"), dtype)?,
+            proj: LinearNoBias::load(
+                w,
+                &format!("{prefix}.net.0.proj"),
+                dtype,
+                cfg.map(|c| (2 * c.ffn_dim, c.hidden_size)),
+            )?,
+            out: LinearNoBias::load(
+                w,
+                &format!("{prefix}.net.2"),
+                dtype,
+                cfg.map(|c| (c.hidden_size, c.ffn_dim)),
+            )?,
         })
     }
 

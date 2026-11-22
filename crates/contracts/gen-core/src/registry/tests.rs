@@ -2295,7 +2295,11 @@ fn shipped_canonical_mapping_posture_is_pinned_per_dialect() {
         (
             FLUX2_CHECKPOINT_ADAPTER.adapter_id,
             &[
-                ("comfyui", "flux2-comfyui-to-diffusers-v1", &[]),
+                (
+                    "comfyui",
+                    "flux2-comfyui-to-diffusers-v1",
+                    &[CheckpointBackend::Candle],
+                ),
                 // sc-21485: the klein universal single file plans through the Candle
                 // `Flux2BflToDiffusersMapping`.
                 (

@@ -54,3 +54,101 @@ impl Weights {
         self.map.into_iter()
     }
 }
+
+/// Model construction accepts either already converted dense tensors or a mapped, source-preserving checkpoint.
+pub trait ModelWeights {
+    fn tensor(&self, key: &str) -> CResult<Tensor>;
+    fn contains(&self, key: &str) -> bool;
+    fn dtype(&self, key: &str) -> CResult<candle_gen::candle_core::DType> {
+        Ok(self.tensor(key)?.dtype())
+    }
+    fn native_projection(
+        &self,
+        _base: &str,
+        _bias: bool,
+    ) -> CResult<Option<candle_gen::candle_nn::Linear>> {
+        Ok(None)
+    }
+}
+impl ModelWeights for Weights {
+    fn tensor(&self, key: &str) -> CResult<Tensor> {
+        self.require(key).cloned()
+    }
+    fn contains(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+}
+
+/// Renaming a shared `.all` projection must preserve its codes, scales and shared allocation.
+pub(crate) struct SourceWeights {
+    source: candle_gen::Weights,
+    physical: HashMap<String, String>,
+    dtype: candle_gen::candle_core::DType,
+    layers: std::cell::RefCell<HashMap<(String, bool), candle_gen::candle_nn::Linear>>,
+}
+impl SourceWeights {
+    pub(crate) fn open(
+        path: &std::path::Path,
+        device: &Device,
+        dtype: candle_gen::candle_core::DType,
+        targets: impl Fn(&str) -> Vec<String>,
+    ) -> CResult<Self> {
+        let source = candle_gen::Weights::from_file(path, device, dtype)?;
+        let mut physical = HashMap::new();
+        for key in source.keys().filter(|k| !source.is_checkpoint_companion(k)) {
+            for target in targets(key) {
+                if physical.insert(target.clone(), key.clone()).is_some() {
+                    return Err(CandleError::Msg(format!(
+                        "duplicate converted SeedVR2 key {target}"
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            source,
+            physical,
+            dtype,
+            layers: Default::default(),
+        })
+    }
+    fn key(&self, key: &str) -> CResult<&str> {
+        self.physical
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| CandleError::Msg(format!("seedvr2: missing weight tensor `{key}`")))
+    }
+}
+impl ModelWeights for SourceWeights {
+    fn tensor(&self, key: &str) -> CResult<Tensor> {
+        Ok(self.source.require(self.key(key)?)?.to_dtype(self.dtype)?)
+    }
+    fn contains(&self, key: &str) -> bool {
+        self.physical.contains_key(key)
+    }
+    fn dtype(&self, key: &str) -> CResult<candle_gen::candle_core::DType> {
+        self.key(key)?;
+        Ok(self.dtype)
+    }
+    fn native_projection(
+        &self,
+        base: &str,
+        bias: bool,
+    ) -> CResult<Option<candle_gen::candle_nn::Linear>> {
+        let raw = self.key(&format!("{base}.weight"))?;
+        if self.source.source_format_id(raw).is_none() {
+            return Ok(None);
+        }
+        let physical = raw.strip_suffix(".weight").ok_or_else(|| {
+            CandleError::Msg(format!("SeedVR2 projection key {raw} has no weight suffix"))
+        })?;
+        let key = (physical.to_owned(), bias);
+        if let Some(layer) = self.layers.borrow().get(&key) {
+            return Ok(Some(layer.clone()));
+        }
+        let layer = self.source.native_linear(physical, bias)?;
+        if let Some(ref layer) = layer {
+            self.layers.borrow_mut().insert(key, layer.clone());
+        }
+        Ok(layer)
+    }
+}

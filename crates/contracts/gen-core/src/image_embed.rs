@@ -23,6 +23,14 @@ use crate::Result;
 /// `Sync`; the worker loads and runs the embedder entirely inside one `spawn_blocking` task, so it
 /// never crosses threads.
 pub trait ImageEmbedder {
+    /// Latest measured representation for the primary checkpoint.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+    /// Every source measured by this loaded model, including deferred components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
     /// Stable identity + advertised shape, constructible without loading weights.
     fn descriptor(&self) -> &ImageEmbedderDescriptor;
 

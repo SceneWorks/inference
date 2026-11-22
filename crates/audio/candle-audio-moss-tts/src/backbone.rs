@@ -52,6 +52,7 @@ impl BackboneCache {
 pub struct Backbone {
     /// Per-channel embeddings: `embeds[0]` over the text vocab, `embeds[1..]` over the codebook vocab.
     embeds: Vec<Embedding>,
+    native_heads: Vec<Option<candle_nn::Linear>>,
     layers: Vec<Layer>,
     norm: RmsNorm,
     head_dim: usize,
@@ -67,18 +68,20 @@ impl Backbone {
     pub fn new(cfg: &MossTtsdConfig, vb: VarBuilder) -> CandleResult<Self> {
         let model = vb.pp("model");
         let mut embeds = Vec::with_capacity(cfg.channels);
-        // Channel 0: text + speech-codebook-0, over the full text vocab.
-        embeds.push(candle_nn::embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            model.pp("embedding_list.0"),
-        )?);
-        // Channels 1..channels-1: the remaining audio codebooks, over the codebook vocab.
-        for c in 1..cfg.channels {
-            embeds.push(candle_nn::embedding(
-                cfg.speech_vocab_size,
+        let mut native_heads = Vec::with_capacity(cfg.channels);
+        for channel in 0..cfg.channels {
+            let rows = if channel == 0 {
+                cfg.vocab_size
+            } else {
+                cfg.speech_vocab_size
+            };
+            let source = model.pp(format!("embedding_list.{channel}"));
+            embeds.push(candle_nn::embedding(rows, cfg.hidden_size, source.clone())?);
+            native_heads.push(candle_audio::weights::native_tied_head(
+                &source,
+                "weight",
+                rows,
                 cfg.hidden_size,
-                model.pp(format!("embedding_list.{c}")),
             )?);
         }
 
@@ -95,6 +98,7 @@ impl Backbone {
         )?;
         Ok(Self {
             embeds,
+            native_heads,
             layers,
             norm,
             head_dim: cfg.head_dim,
@@ -224,9 +228,11 @@ impl Backbone {
     pub fn channel_logits(&self, hidden: &Tensor) -> CandleResult<Vec<Vec<f32>>> {
         let h = hidden.reshape((1, self.hidden_size))?; // [1, H]
         let mut out = Vec::with_capacity(self.channels);
-        for embed in &self.embeds {
-            let w = embed.embeddings(); // [V, H]
-            let logits = h.matmul(&w.t()?)?; // [1, V]
+        for (embed, native) in self.embeds.iter().zip(&self.native_heads) {
+            let logits = match native {
+                Some(head) => head.forward(&h)?,
+                None => h.matmul(&embed.embeddings().t()?)?,
+            };
             out.push(logits.reshape(((),))?.to_vec1::<f32>()?);
         }
         Ok(out)

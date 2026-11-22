@@ -814,12 +814,15 @@ pub(crate) fn load_conditioner(te_dir: &Path, device: &Device) -> Result<MiniMax
     } else {
         device
     };
-    let w = candle_gen::Weights::from_files_filtered_host_packed(
+    let mut w = candle_gen::Weights::from_files_filtered_host_packed(
         &shards,
         load_device,
         TE_STORE_DTYPE,
         &refs,
     )?;
+    if let Some(policy) = crate::block_stream::current() {
+        w.stage_projection_windows(&policy.device);
+    }
     let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
     drop(w);
     if let Some(policy) = policy {

@@ -157,34 +157,47 @@ impl CheckpointInventory {
             .map_or(4_u64, u64::from);
         let mut conditioning_bytes = 0_u64;
         let mut transformer_bytes = 0_u64;
-        for (path, _) in &self.files {
-            for header in gen_core::weightsmeta::safetensors_path_tensor_headers(path)? {
-                let bucket = match asset_component(&header.name) {
-                    Some(AssetComponent::Understanding) => &mut conditioning_bytes,
-                    Some(AssetComponent::Generation) => &mut transformer_bytes,
-                    None => {
-                        return Err(gen_core::Error::Unsupported(format!(
-                            "sensenova: cannot attribute tensor {} in {} to the understanding or \
+        let files: Vec<_> = self.files.iter().map(|(file, _)| file.clone()).collect();
+        let mut headers = Vec::new();
+        for file in &files {
+            headers.extend(gen_core::weightsmeta::safetensors_path_tensor_headers(
+                file,
+            )?);
+        }
+        let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+            &files,
+            &headers,
+            |h| materialized_element_width(&h.name, store_width),
+            &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+            candle_gen::logical_weights::standard_linear_weight,
+        )?;
+        for header in headers {
+            let bucket = match asset_component(&header.name) {
+                Some(AssetComponent::Understanding) => &mut conditioning_bytes,
+                Some(AssetComponent::Generation) => &mut transformer_bytes,
+                None => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "sensenova: cannot attribute tensor {} in {} to the understanding or \
                              generation path",
-                            header.name,
-                            path.display()
-                        )));
-                    }
-                };
-                // Integer payloads (the packed `U32` codes) are read at their native dtype and so
-                // occupy exactly their stored bytes; every float leaf is priced by key class.
-                let bytes = if header.is_float() {
-                    header
-                        .materialized_bytes(materialized_element_width(&header.name, store_width))?
-                } else {
-                    header.data_bytes
-                };
-                *bucket = bucket.checked_add(bytes).ok_or_else(|| {
-                    gen_core::Error::Unsupported(
-                        "sensenova: component byte total overflows u64".to_owned(),
-                    )
-                })?;
-            }
+                        header.name,
+                        self.root.display()
+                    )));
+                }
+            };
+            // Integer payloads (the packed `U32` codes) are read at their native dtype and so
+            // occupy exactly their stored bytes; every float leaf is priced by key class.
+            let bytes = if let Some(&bytes) = encoded.get(&header.name) {
+                bytes
+            } else if header.is_float() {
+                header.materialized_bytes(materialized_element_width(&header.name, store_width))?
+            } else {
+                header.data_bytes
+            };
+            *bucket = bucket.checked_add(bytes).ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "sensenova: component byte total overflows u64".to_owned(),
+                )
+            })?;
         }
         let base_bytes = conditioning_bytes
             .checked_add(transformer_bytes)

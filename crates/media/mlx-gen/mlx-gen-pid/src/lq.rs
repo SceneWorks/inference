@@ -25,9 +25,12 @@ const GN_GROUPS: i32 = 4; // ResBlock default num_groups
 
 /// Load a dense Linear (`[out, in]` weight + optional bias).
 fn lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.clone();
-    let bias = w.get(&format!("{prefix}.bias")).cloned();
-    Ok(AdaptableLinear::dense(weight, bias))
+    mlx_gen::quant::lin(
+        w,
+        prefix,
+        w.peek(&format!("{prefix}.bias")).is_some(),
+        mlx_gen::quant::DEFAULT_GROUP_SIZE,
+    )
 }
 
 /// A Conv2d that stores its weight in mlx NHWC `[out, kH, kW, in]` (transposed from the torch

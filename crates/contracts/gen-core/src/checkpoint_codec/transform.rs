@@ -10,6 +10,21 @@ use super::*;
 /// real implementation.
 pub trait LogicalKeyMapping {
     fn mapping_id(&self) -> &'static str;
+
+    /// This dialect requires per-matrix scalar FP8 companions even without a Comfy descriptor.
+    /// Older projected INT8 sources imply per-row scales and accept any power-of-four rotation width.
+    fn legacy_convrot_geometry(&self) -> bool {
+        false
+    }
+    fn inline_fp8_scales(&self) -> bool {
+        false
+    }
+
+    /// A shape-inferred model may consume an explicit pre-padding shape recorded by the exporter.
+    fn accepts_descriptor_shape(&self) -> bool {
+        false
+    }
+
     /// The canonical logical key for one on-disk key, or `None` when the key is foreign to this
     /// dialect (the plan compiler refuses; nothing is skipped silently).
     fn logical_key(&self, physical_key: &str) -> Option<String>;
@@ -514,7 +529,14 @@ pub(super) fn resolve_logical_transform(
             TensorCodecSpec::Mxfp8 { .. } | TensorCodecSpec::Nvfp4 { .. }
         );
         for output in &resolved {
-            if output.half_swap {
+            if output.half_swap
+                && !matches!(
+                    codec,
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                        | TensorCodecSpec::RowwiseFp8 { .. }
+                        | TensorCodecSpec::ScalarFp8 { .. }
+                )
+            {
                 return Err(LogicalTransformError::HalfSwapOnPackedResidency {
                     logical_key: output.logical_key.clone(),
                     codec_id,

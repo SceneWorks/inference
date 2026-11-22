@@ -25,6 +25,7 @@
 //! Compute follows the SigLIP path — runs in the loaded weights' dtype against the f32 patches, which
 //! MLX promotes to f32.
 
+use crate::primitives::Projection;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, sum_axis};
 use mlx_rs::Array;
@@ -131,14 +132,10 @@ struct VisionBlock {
     n1_b: Array,
     n2_w: Array,
     n2_b: Array,
-    qkv_w: Array,
-    qkv_b: Option<Array>,
-    proj_w: Array,
-    proj_b: Option<Array>,
-    fc1_w: Array,
-    fc1_b: Option<Array>,
-    fc2_w: Array,
-    fc2_b: Option<Array>,
+    qkv: Projection,
+    proj: Projection,
+    fc1: Projection,
+    fc2: Projection,
 }
 
 impl VisionBlock {
@@ -172,8 +169,7 @@ impl VisionBlock {
         let n = x.shape()[0];
         let hidden = num_heads * head_dim;
         // Fused QKV → [n, 3, heads, head_dim] → three [n, heads, head_dim].
-        let qkv =
-            linear(x, &self.qkv_w, self.qkv_b.as_ref())?.reshape(&[n, 3, num_heads, head_dim])?;
+        let qkv = self.qkv.forward(x)?.reshape(&[n, 3, num_heads, head_dim])?;
         let parts = split(&qkv, 3, 1)?;
         // RoPE expects [batch, seq, heads, head_dim]; cos/sin [1, n, head_dim] broadcast over heads.
         let q = apply_rope(
@@ -202,15 +198,15 @@ impl VisionBlock {
         let scale = (head_dim as f32).powf(-0.5);
         let out = vision_sdpa(&q, &k, &v, scale, cu_seqlens)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[n, hidden])?;
-        linear(&out, &self.proj_w, self.proj_b.as_ref())
+        self.proj.forward(&out)
     }
 
     fn mlp(&self, x: &Array) -> Result<Array> {
         let h = gelu_tanh(
-            &linear(x, &self.fc1_w, self.fc1_b.as_ref())?,
+            &self.fc1.forward(x)?,
             crate::primitives::activation::ActivationRole::VisionEncoder,
         )?;
-        linear(&h, &self.fc2_w, self.fc2_b.as_ref())
+        self.fc2.forward(&h)
     }
 }
 
@@ -218,10 +214,8 @@ impl VisionBlock {
 struct PatchMerger {
     norm_w: Array,
     norm_b: Array,
-    fc1_w: Array,
-    fc1_b: Option<Array>,
-    fc2_w: Array,
-    fc2_b: Option<Array>,
+    fc1: Projection,
+    fc2: Projection,
     merge_dim: i32,
     use_postshuffle_norm: bool,
 }
@@ -235,8 +229,8 @@ impl PatchMerger {
             layer_norm(x, Some(&self.norm_w), Some(&self.norm_b), LN_EPS)?
                 .reshape(&[-1, self.merge_dim])?
         };
-        let m = gelu(&linear(&m, &self.fc1_w, self.fc1_b.as_ref())?)?; // nn.GELU() default = exact erf
-        linear(&m, &self.fc2_w, self.fc2_b.as_ref())
+        let m = gelu(&self.fc1.forward(&m)?)?; // nn.GELU() default = exact erf
+        self.fc2.forward(&m)
     }
 }
 
@@ -254,7 +248,7 @@ pub type Qwen3VLVisionModel = Qwen35VisionModel;
 pub struct Qwen35VisionModel {
     frozen_hf_bf16: bool,
     patch_embed: PatchEmbed,
-    pos_embed: Array,
+    pos_embed: Projection,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
     deepstack_mergers: Vec<PatchMerger>,
@@ -307,7 +301,7 @@ impl Qwen35VisionModel {
             weight: patch_weight.reshape(&[cfg.hidden_size, cfg.patch_in()])?,
             bias: opt(p("patch_embed.proj.bias")),
         };
-        let pos_embed = req(p("pos_embed.weight"))?;
+        let pos_embed = Projection::from_named(w, &p("pos_embed.weight"), None, None)?;
 
         let blocks = (0..cfg.depth)
             .map(|i| {
@@ -318,14 +312,30 @@ impl Qwen35VisionModel {
                     n1_b: req(b("norm1.bias"))?,
                     n2_w: req(b("norm2.weight"))?,
                     n2_b: req(b("norm2.bias"))?,
-                    qkv_w: req(b("attn.qkv.weight"))?,
-                    qkv_b: opt(b("attn.qkv.bias")),
-                    proj_w: req(b("attn.proj.weight"))?,
-                    proj_b: opt(b("attn.proj.bias")),
-                    fc1_w: req(b("mlp.linear_fc1.weight"))?,
-                    fc1_b: opt(b("mlp.linear_fc1.bias")),
-                    fc2_w: req(b("mlp.linear_fc2.weight"))?,
-                    fc2_b: opt(b("mlp.linear_fc2.bias")),
+                    qkv: Projection::from_named(
+                        w,
+                        &b("attn.qkv.weight"),
+                        opt(b("attn.qkv.bias")),
+                        None,
+                    )?,
+                    proj: Projection::from_named(
+                        w,
+                        &b("attn.proj.weight"),
+                        opt(b("attn.proj.bias")),
+                        None,
+                    )?,
+                    fc1: Projection::from_named(
+                        w,
+                        &b("mlp.linear_fc1.weight"),
+                        opt(b("mlp.linear_fc1.bias")),
+                        None,
+                    )?,
+                    fc2: Projection::from_named(
+                        w,
+                        &b("mlp.linear_fc2.weight"),
+                        opt(b("mlp.linear_fc2.bias")),
+                        None,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -335,10 +345,18 @@ impl Qwen35VisionModel {
             Ok(PatchMerger {
                 norm_w: req(m("norm.weight"))?,
                 norm_b: req(m("norm.bias"))?,
-                fc1_w: req(m("linear_fc1.weight"))?,
-                fc1_b: opt(m("linear_fc1.bias")),
-                fc2_w: req(m("linear_fc2.weight"))?,
-                fc2_b: opt(m("linear_fc2.bias")),
+                fc1: Projection::from_named(
+                    w,
+                    &m("linear_fc1.weight"),
+                    opt(m("linear_fc1.bias")),
+                    None,
+                )?,
+                fc2: Projection::from_named(
+                    w,
+                    &m("linear_fc2.weight"),
+                    opt(m("linear_fc2.bias")),
+                    None,
+                )?,
                 merge_dim: cfg.merge_dim(),
                 use_postshuffle_norm,
             })
@@ -437,10 +455,10 @@ impl Qwen35VisionModel {
             self.cfg.spatial_merge_size,
         );
         let idx_arr = Array::from_slice(&idx, &[4 * n]);
-        let gathered =
-            self.pos_embed
-                .take_axis(&idx_arr, 0)?
-                .reshape(&[4, n, self.cfg.hidden_size])?;
+        let gathered = self
+            .pos_embed
+            .rows(&idx_arr)?
+            .reshape(&[4, n, self.cfg.hidden_size])?;
         let w_arr = Array::from_slice(&wts, &[4, n, 1]);
         if self.frozen_hf_bf16 {
             return Ok(sum_axis(multiply(&gathered, w_arr)?, 0, false)?.as_dtype(gathered.dtype())?);

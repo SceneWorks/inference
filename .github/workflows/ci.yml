@@ -415,13 +415,13 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
+          -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint Candle CPU model-proof hooks (no model execution)
         run: >-
           python3 -I scripts/ci/compile_model_proof_targets.py --lane cpu -- cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
+          -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint opt-in MOSS model tests without execution
@@ -448,7 +448,7 @@ jobs:
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-moss-image-policy -p sceneworks-gen-core-pag-policy -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
-          -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
+          -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
       # The three guards ride the lint job rather than a test job: `check-lock-poison.sh` shells out
       # to no build tool at all and `check-gen-core-skew.sh` only runs `cargo tree`, so neither
@@ -508,7 +508,7 @@ jobs:
         env:
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."
@@ -1076,7 +1076,7 @@ jobs:
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
-          -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
+          -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
       - name: Compile and lint Candle Metal model-proof hooks (no model execution)
         if: >-
@@ -1087,7 +1087,7 @@ jobs:
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
           python3 scripts/ci/run_ci_collection.py -- python3.12 -I scripts/ci/compile_model_proof_targets.py --lane metal -- cargo clippy --locked --keep-going
-          -p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
+          -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
       # The exact audited raw-arithmetic reduction case runs automatically: 312 rank-5/6
       # sum/mean/min/max/argmin/argmax comparisons guard the vendored strided-index fix.
@@ -1350,6 +1350,13 @@ jobs:
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
+      # This lane compiles every CUDA test target without executing model code. Full test
+      # debug/PDB output exceeded 100 GB and exhausted the shared runner disk while linking.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
       # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
       #
       # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
@@ -1468,7 +1475,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv --no-run
+          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv --no-run
       - name: Execute weights-free CUDA catalog conformance (no GPU required)
         shell: cmd
         run: |
@@ -1487,12 +1494,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
+          cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
       - name: Compile and lint Candle CUDA model-proof hooks (no model execution)
         shell: cmd
         run: |
           call "%VCVARS%"
-          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
+          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -1506,7 +1513,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: |
           call "%VCVARS%"
-          cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv
+          cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv
 
   windows-cuda:
     timeout-minutes: 180
@@ -1592,7 +1599,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo build --locked -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+          cargo build --locked -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       # Learned bodies stay compiled and ignored here; explicit model validation lives in real-weights.yml.
       - name: Test Candle CUDA packages
         if: ${{ !inputs.raw_training_math_only }}
@@ -1606,9 +1613,9 @@ jobs:
           IRIS_DIST_SHARE_DEVICE: "1"
         run: |
           call "%VCVARS%"
-          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
           if errorlevel 1 exit /b 1
-          python scripts/ci/test_suites.py routine -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python scripts/ci/test_suites.py routine -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       # sc-26856: raw QKV/adapter arithmetic only, explicitly selected in this
       # dispatch-only lane. Never override ignored learned bodies in ordinary CI.
       - name: Prove streaming training attention raw CUDA arithmetic

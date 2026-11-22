@@ -611,6 +611,7 @@ pub struct DiffVaeQuant {
 /// tier ships (sc-18775). The DiffVAE decoder is 99.96 % rank-2 Linear by parameter count, so this is
 /// where a q4/q8 tier's 834 MB → ~230 MB actually comes from.
 enum ProjWeight {
+    Native(mlx_gen::NativeProjection),
     Dense(Array),
     Quant {
         /// `[out, in·bits/32]` `U32` — never cast; the payload is bit-packed, not numeric.
@@ -633,6 +634,9 @@ impl ProjWeight {
     /// caller believes the file is dense while the file says otherwise, and loading the packed `U32`
     /// payload as a float weight would produce a decoder that runs and returns garbage.
     fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
+        if let Some(native) = mlx_gen::NativeProjection::from_weights(w, prefix, false)? {
+            return Ok(Self::Native(native));
+        }
         let key = format!("{prefix}.weight");
         let Some(scales) = w.get(&format!("{prefix}.scales")) else {
             return Ok(ProjWeight::Dense(weight(w, &key)?));
@@ -655,6 +659,7 @@ impl ProjWeight {
     /// `y = x Wᵀ (+ b)`. The SwiGLU projections pass `None` — they carry no bias.
     fn apply(&self, x: &Array, b: Option<&Array>) -> Result<Array> {
         match self {
+            Self::Native(native) => Ok(native.forward_with_bias(x, b)?),
             ProjWeight::Dense(w) => match b {
                 Some(b) => linear(x, w, b),
                 None => Ok(matmul(x, w.t())?),
@@ -673,6 +678,7 @@ impl ProjWeight {
     /// axis 0 of the packed `U32` weight exactly as it is of the dense one.
     fn out_features(&self) -> i32 {
         match self {
+            Self::Native(native) => native.shape()[0],
             ProjWeight::Dense(w) => w.shape()[0],
             ProjWeight::Quant { q, .. } => q.shape()[0],
         }
@@ -687,6 +693,7 @@ impl ProjWeight {
     /// [`check_widths`]: NaDiffusionDecoder::check_widths
     fn in_features(&self) -> i32 {
         match self {
+            Self::Native(native) => native.shape()[1],
             ProjWeight::Dense(w) => w.shape()[1],
             ProjWeight::Quant { scales, group, .. } => scales.shape()[1] * group,
         }
@@ -697,6 +704,7 @@ impl ProjWeight {
     /// packing and the scales grid both run along the input axis, so every row is self-contained.
     fn slice_out(&self, start: i32, end: i32) -> Result<Self> {
         Ok(match self {
+            Self::Native(native) => Self::Native(native.slice_rows(start, end)?),
             ProjWeight::Dense(w) => ProjWeight::Dense(contiguous(&slice_range(w, 0, start, end)?)?),
             ProjWeight::Quant {
                 q,

@@ -10,18 +10,12 @@ use candle_gen::Result;
 /// Bias-less dense `Linear` loaded from `{name}.weight` (shape read from disk via `get_unchecked`, so a
 /// packed/dense weight of any `[out, in]` loads unchanged) — the candle twin of the MLX `lin` helper.
 pub fn lin(vb: &VarBuilder, name: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get_unchecked(&format!("{name}.weight"))?,
-        None,
-    ))
+    Ok(Linear::from_var_builder(&vb.pp(name), false)?)
 }
 
 /// `Linear` **with** bias loaded from `{name}.weight` + `{name}.bias` (the conditioner MLP + out_proj).
 pub fn lin_bias(vb: &VarBuilder, name: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get_unchecked(&format!("{name}.weight"))?,
-        Some(vb.get_unchecked(&format!("{name}.bias"))?),
-    ))
+    Ok(Linear::from_var_builder(&vb.pp(name), true)?)
 }
 
 /// Plain RMSNorm `w · x / sqrt(mean(x²) + eps)` over the last dim (matches `mlx_rs::fast::rms_norm`).

@@ -104,13 +104,7 @@ fn layer_norm(w: &Weights, prefix: &str) -> Result<LayerNorm> {
 
 /// `candle_nn::Linear` (`[out, in]` weight) from `{prefix}.weight` (+ `{prefix}.bias` when `bias`).
 fn linear(w: &Weights, prefix: &str, bias: bool) -> Result<Linear> {
-    let weight = w.require(&format!("{prefix}.weight"))?;
-    let b = if bias {
-        Some(w.require(&format!("{prefix}.bias"))?)
-    } else {
-        None
-    };
-    Ok(Linear::new(weight, b))
+    w.linear(prefix, bias)
 }
 
 /// Multi-head scaled-dot-product attention over `[B, heads, Nq, dim_head]` queries against

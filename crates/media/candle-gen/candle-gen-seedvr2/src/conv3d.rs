@@ -14,7 +14,7 @@
 
 use candle_gen::candle_core::{Result, Tensor};
 
-use crate::weights::Weights;
+use crate::weights::ModelWeights;
 
 /// Max im2col elements (`batch · H_out · W_out · C · kH · kW`) per `conv2d` call. candle's CUDA conv2d
 /// builds an im2col buffer of this size; above a few hundred million it silently corrupts (an
@@ -129,15 +129,15 @@ impl CausalConv3d {
     /// Load `{prefix}.weight` (`[O,I,kT,kH,kW]`) + `{prefix}.bias` (`[O]`). `stride`/`padding` are
     /// `(t,h,w)`; `use_padding_causal` selects the `2·pt` causal-pad rule (else `kt-1`).
     pub fn load(
-        w: &Weights,
+        w: &impl ModelWeights,
         prefix: &str,
         stride: (usize, usize, usize),
         padding: (usize, usize, usize),
         use_padding_causal: bool,
     ) -> candle_gen::Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.clone();
+        let weight = w.tensor(&format!("{prefix}.weight"))?.clone();
         let (_o, _i, kt, _kh, _kw) = weight.dims5()?;
-        let bias = w.require(&format!("{prefix}.bias"))?;
+        let bias = w.tensor(&format!("{prefix}.bias"))?;
         let o = bias.dim(0)?;
         let bias = bias.reshape((1, o, 1, 1, 1))?;
         debug_assert_eq!(padding.1, padding.2, "seedvr2 conv: ph == pw");

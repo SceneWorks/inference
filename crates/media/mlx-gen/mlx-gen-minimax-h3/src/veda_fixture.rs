@@ -237,7 +237,7 @@ pub(crate) fn decode_audio(latents: &Array) -> Result<mlx_gen::media::AudioTrack
         ..Default::default()
     })
 }
-/// Tiny genuine FP8/scaled/BF16-loaded predictor, with nonzero learned weights.
+/// Tiny predictor with nonzero FP8 weights and per-head scales.
 pub(crate) fn predictor() -> crate::veda::contract::Bundle {
     use serde_json::json;
     let heads = 4usize;
@@ -411,15 +411,26 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
 #[test]
 #[ignore = "requires the exclusive local Metal token"]
 fn selected_kernel_actual_device_smoke() {
+    assert!(matches!(
+        mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
+        mlx_rs::DeviceType::Gpu
+    ));
     crate::veda::device_self_test().unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda_fixture::selected_kernel_actual_device_smoke");
 }
 
 #[test]
-fn predictor_fixture_strict_loader_and_bf16_storage() {
+fn predictor_fixture_retains_fp8_codes_and_rounds_coefficients_to_bf16() {
     let p = predictor();
     assert_eq!((p.layers, p.heads, p.dim), (2, 4, 128));
-    assert!(p.q.iter().flatten().any(|&v| v != 0));
-    let proj = p.projection(0, &[0], true);
+    let head = p.selected_projection(0, &[0], true);
+    let (codes, scales) = head
+        .packed()
+        .expect("FP8 predictor must retain packed weights");
+    assert_eq!(&codes[..2], &[0x9b, 0x1a]);
+    assert_eq!(scales.as_ref(), &[0.03]);
+    let proj = head.dense();
     assert!(proj.iter().all(|x| x.to_bits() & 0xffff == 0));
     assert_eq!(p.choose([37, 24, 42]).name, "16x9_t37");
     assert_eq!(p.choose([37, 42, 24]).name, "16x9_t37_T");

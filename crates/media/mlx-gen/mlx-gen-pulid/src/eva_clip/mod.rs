@@ -21,7 +21,6 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis};
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -89,8 +88,8 @@ pub struct EvaVisionTransformer {
     blocks: Vec<Block>,
     norm_w: Array,
     norm_b: Array,
-    head_w: Array,
-    head_b: Array,
+    head_w: mlx_gen::adapters::AdaptableLinear,
+
     rope: VisionRope,
     cfg: EvaConfig,
 }
@@ -110,8 +109,12 @@ impl EvaVisionTransformer {
             blocks,
             norm_w: w.require(&p("norm.weight"))?.clone(),
             norm_b: w.require(&p("norm.bias"))?.clone(),
-            head_w: w.require(&p("head.weight"))?.clone(),
-            head_b: w.require(&p("head.bias"))?.clone(),
+            head_w: mlx_gen::quant::lin_with_bias(
+                w,
+                &p("head"),
+                Some(w.require(&p("head.bias"))?.clone()),
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             rope,
             cfg,
         })
@@ -150,7 +153,7 @@ impl EvaVisionTransformer {
         let cls_tok = x
             .take_axis(Array::from_slice(&[0i32], &[1]), 1)?
             .reshape(&[b, self.cfg.embed_dim])?;
-        let id_cond_vit = linear(&cls_tok, &self.head_w, &self.head_b)?;
+        let id_cond_vit = self.head_w.forward(&cls_tok)?;
         Ok(EvaOutput {
             id_cond_vit,
             hidden,

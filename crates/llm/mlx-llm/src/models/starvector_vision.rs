@@ -4,6 +4,7 @@
 //! OpenAI-CLIP style `VisionTransformer` weights and a BatchNorm-over-token-rows adapter.  Keeping
 //! that distinction here prevents silently applying the later 8B SigLIP preprocessing/projection.
 
+use crate::primitives::Projection;
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, subtract,
 };
@@ -11,7 +12,7 @@ use mlx_rs::Array;
 
 use crate::error::Result;
 use crate::primitives::attention::{sdpa, AttnMask};
-use crate::primitives::nn::{conv2d, layer_norm, linear};
+use crate::primitives::nn::{conv2d, layer_norm};
 use crate::primitives::Weights;
 
 /// Published StarVector-1B visual geometry: CLIP ViT-L/14-like, 224 pixels and 257 rows.
@@ -104,16 +105,12 @@ impl StarVectorClipVision {
 struct ClipBlock {
     ln_1_weight: Array,
     ln_1_bias: Array,
-    in_proj_weight: Array,
-    in_proj_bias: Array,
-    out_proj_weight: Array,
-    out_proj_bias: Array,
+    in_proj: Projection,
+    out_proj: Projection,
     ln_2_weight: Array,
     ln_2_bias: Array,
-    fc_weight: Array,
-    fc_bias: Array,
-    mlp_proj_weight: Array,
-    mlp_proj_bias: Array,
+    fc: Projection,
+    mlp_proj: Projection,
 }
 
 impl ClipBlock {
@@ -122,16 +119,32 @@ impl ClipBlock {
         Ok(Self {
             ln_1_weight: w.require(&key("ln_1.weight"))?.clone(),
             ln_1_bias: w.require(&key("ln_1.bias"))?.clone(),
-            in_proj_weight: w.require(&key("attn.in_proj_weight"))?.clone(),
-            in_proj_bias: w.require(&key("attn.in_proj_bias"))?.clone(),
-            out_proj_weight: w.require(&key("attn.out_proj.weight"))?.clone(),
-            out_proj_bias: w.require(&key("attn.out_proj.bias"))?.clone(),
+            in_proj: Projection::from_named(
+                w,
+                &key("attn.in_proj_weight"),
+                Some(w.require(&key("attn.in_proj_bias"))?.clone()),
+                None,
+            )?,
+            out_proj: Projection::from_named(
+                w,
+                &key("attn.out_proj.weight"),
+                Some(w.require(&key("attn.out_proj.bias"))?.clone()),
+                None,
+            )?,
             ln_2_weight: w.require(&key("ln_2.weight"))?.clone(),
             ln_2_bias: w.require(&key("ln_2.bias"))?.clone(),
-            fc_weight: w.require(&key("mlp.c_fc.weight"))?.clone(),
-            fc_bias: w.require(&key("mlp.c_fc.bias"))?.clone(),
-            mlp_proj_weight: w.require(&key("mlp.c_proj.weight"))?.clone(),
-            mlp_proj_bias: w.require(&key("mlp.c_proj.bias"))?.clone(),
+            fc: Projection::from_named(
+                w,
+                &key("mlp.c_fc.weight"),
+                Some(w.require(&key("mlp.c_fc.bias"))?.clone()),
+                None,
+            )?,
+            mlp_proj: Projection::from_named(
+                w,
+                &key("mlp.c_proj.weight"),
+                Some(w.require(&key("mlp.c_proj.bias"))?.clone()),
+                None,
+            )?,
         })
     }
 
@@ -139,7 +152,7 @@ impl ClipBlock {
         let shape = hidden.shape();
         let (batch, sequence) = (shape[0], shape[1]);
         let normed = layer_norm(hidden, Some(&self.ln_1_weight), Some(&self.ln_1_bias), 1e-5)?;
-        let qkv = linear(&normed, &self.in_proj_weight, Some(&self.in_proj_bias))?;
+        let qkv = self.in_proj.forward(&normed)?;
         let parts = split_sections(&qkv, &[WIDTH, 2 * WIDTH], 2)?;
         let head_dim = WIDTH / HEADS;
         let heads = |x: &Array| -> Result<Array> {
@@ -158,20 +171,17 @@ impl ClipBlock {
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[batch, sequence, WIDTH])?;
-        let hidden = add(
-            hidden,
-            &linear(&attended, &self.out_proj_weight, Some(&self.out_proj_bias))?,
-        )?;
+        let hidden = add(hidden, &self.out_proj.forward(&attended)?)?;
         let normed = layer_norm(
             &hidden,
             Some(&self.ln_2_weight),
             Some(&self.ln_2_bias),
             1e-5,
         )?;
-        let mlp = linear(&normed, &self.fc_weight, Some(&self.fc_bias))?;
+        let mlp = self.fc.forward(&normed)?;
         let scale = Array::from_f32(1.702).as_dtype(mlp.dtype())?;
         let mlp = multiply(&mlp, &sigmoid(&multiply(&mlp, &scale)?)?)?;
-        let mlp = linear(&mlp, &self.mlp_proj_weight, Some(&self.mlp_proj_bias))?;
+        let mlp = self.mlp_proj.forward(&mlp)?;
         Ok(add(&hidden, &mlp)?)
     }
 }
@@ -179,10 +189,8 @@ impl ClipBlock {
 /// The StarVector image-to-language connector. The upstream checkpoint uses `BatchNorm1d(257)`
 /// over `[batch, token_row, hidden]`, rather than a hidden-dimension LayerNorm.
 pub struct StarVectorAdapter {
-    fc_weight: Array,
-    fc_bias: Array,
-    proj_weight: Array,
-    proj_bias: Array,
+    fc: Projection,
+    proj: Projection,
     norm_weight: Array,
     norm_bias: Array,
     running_mean: Array,
@@ -194,10 +202,18 @@ impl StarVectorAdapter {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
         let model = Self {
-            fc_weight: w.require(&key("c_fc.weight"))?.clone(),
-            fc_bias: w.require(&key("c_fc.bias"))?.clone(),
-            proj_weight: w.require(&key("c_proj.weight"))?.clone(),
-            proj_bias: w.require(&key("c_proj.bias"))?.clone(),
+            fc: Projection::from_named(
+                w,
+                &key("c_fc.weight"),
+                Some(w.require(&key("c_fc.bias"))?.clone()),
+                None,
+            )?,
+            proj: Projection::from_named(
+                w,
+                &key("c_proj.weight"),
+                Some(w.require(&key("c_proj.bias"))?.clone()),
+                None,
+            )?,
             norm_weight: w.require(&key("norm.weight"))?.clone(),
             norm_bias: w.require(&key("norm.bias"))?.clone(),
             running_mean: w.require(&key("norm.running_mean"))?.clone(),
@@ -209,9 +225,9 @@ impl StarVectorAdapter {
 
     /// Map CLIP rows `[B,257,1024]` into decoder rows `[B,257,2048]`.
     pub fn forward(&self, image: &Array) -> Result<Array> {
-        let hidden = linear(image, &self.fc_weight, Some(&self.fc_bias))?;
+        let hidden = self.fc.forward(image)?;
         let hidden = multiply(&hidden, &sigmoid(&hidden)?)?;
-        let hidden = linear(&hidden, &self.proj_weight, Some(&self.proj_bias))?;
+        let hidden = self.proj.forward(&hidden)?;
         let row = |x: &Array| x.reshape(&[1, IMAGE_TOKENS, 1]);
         let eps = Array::from_f32(1e-5).as_dtype(hidden.dtype())?;
         let centered = subtract(&hidden, &row(&self.running_mean)?)?;

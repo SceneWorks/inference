@@ -81,6 +81,8 @@ fn quant_spec(precision: Option<BlockDraftPrecision>) -> Option<QuantSpec> {
 pub enum DraftSource {
     /// The checkpoint's `*.safetensors` shards, memory-mapped.
     Disk(candle_core::safetensors::MmapedSafetensors),
+    /// A mapped checkpoint whose declared operands keep their source precision.
+    Checkpoint(candle_checkpoint::ProjectionSource),
     /// Stored tensors already in memory.
     Map(HashMap<String, Tensor>),
 }
@@ -88,6 +90,10 @@ pub enum DraftSource {
 impl DraftSource {
     /// Map every `*.safetensors` shard in `dir`.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_on_device(dir, &Device::Cpu)
+    }
+
+    fn open_on_device(dir: &Path, device: &Device) -> Result<Self> {
         let mut shards: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
@@ -107,11 +113,31 @@ impl DraftSource {
             crate::model_input_proof::InputRole::ModelWeights,
             &shards,
         );
-        Ok(Self::Disk(mapped))
+        Ok(
+            match candle_checkpoint::ProjectionSource::from_mapped(mapped, &shards, device)? {
+                Ok(source) => Self::Checkpoint(source),
+                Err(plain) => Self::Disk(plain),
+            },
+        )
     }
 
     fn names(&self) -> Vec<String> {
         match self {
+            Self::Checkpoint(s) => {
+                let companions: std::collections::HashSet<_> = s
+                    .reader()
+                    .plan()
+                    .companions
+                    .iter()
+                    .map(|c| c.physical_key.as_str())
+                    .collect();
+                s.mmap()
+                    .tensors()
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .filter(|k| !companions.contains(k.as_str()))
+                    .collect()
+            }
             Self::Disk(m) => m.tensors().into_iter().map(|(n, _)| n).collect(),
             Self::Map(m) => m.keys().cloned().collect(),
         }
@@ -119,6 +145,11 @@ impl DraftSource {
 
     fn shape(&self, name: &str) -> Option<Vec<usize>> {
         match self {
+            Self::Checkpoint(s) => s
+                .reader()
+                .planned(name)
+                .map(|r| r.shape.clone())
+                .or_else(|| s.mmap().get(name).ok().map(|v| v.shape().to_vec())),
             Self::Disk(m) => m.get(name).ok().map(|v| v.shape().to_vec()),
             Self::Map(m) => m.get(name).map(|t| t.dims().to_vec()),
         }
@@ -127,6 +158,11 @@ impl DraftSource {
     /// `name` as stored, on the host.
     fn host(&self, name: &str) -> Result<Tensor> {
         match self {
+            Self::Checkpoint(s) if s.reader().planned(name).is_some() => Ok(s
+                .on_device(&Device::Cpu)?
+                .reader()
+                .read_dense(name, DType::F32, &Device::Cpu)?),
+            Self::Checkpoint(s) => Ok(s.mmap().load(name, &Device::Cpu)?),
             Self::Disk(m) => Ok(m.load(name, &Device::Cpu)?),
             Self::Map(m) => Ok(m
                 .get(name)
@@ -161,18 +197,35 @@ impl<'a> GroupReader<'a> {
         }
     }
 
-    fn host(&self, name: &str) -> Result<Tensor> {
-        if !self.tensors.iter().any(|t| t == name) {
-            return Err(Error::Msg(format!(
+    fn check_group(&self, name: &str) -> Result<()> {
+        if self.tensors.iter().any(|t| t == name) {
+            Ok(())
+        } else {
+            Err(Error::Msg(format!(
                 "`{name}` is read outside its priced load group"
-            )));
+            )))
         }
+    }
+
+    fn host(&self, name: &str) -> Result<Tensor> {
+        self.check_group(name)?;
         self.source.host(name)
     }
 
-    /// `name` in the compute dtype on the device (a norm, a codebook, a base kernel).
+    /// Coefficients such as a norm, codebook or convolution kernel in the requested compute dtype.
     pub(crate) fn dense(&self, name: &str) -> Result<Tensor> {
+        self.check_group(name)?;
+        if let DraftSource::Checkpoint(s) = self.source {
+            if s.reader().planned(name).is_some() {
+                return Ok(s.on_device(self.device)?.reader().read_dense(
+                    name,
+                    self.dtype,
+                    self.device,
+                )?);
+            }
+        }
         Ok(self
+            .source
             .host(name)?
             .to_dtype(self.dtype)?
             .to_device(self.device)?)
@@ -181,6 +234,19 @@ impl<'a> GroupReader<'a> {
     /// The `[out, in]` matrix `name` as a projection: quantized on the host and placed on the
     /// device as GGML blocks under `quant`, else dense in the compute dtype.
     pub(crate) fn proj(&self, name: &str, quant: Option<QuantSpec>) -> Result<Projection> {
+        if let DraftSource::Checkpoint(source) = self.source {
+            if source.reader().planned(name).is_some() {
+                self.check_group(name)?;
+                let source = source.on_device(self.device)?;
+                if let Some(op) = source.native_linear(name, self.dtype, self.device, None)? {
+                    return Projection::from_native(op);
+                }
+                return Projection::load(
+                    source.reader().read_dense(name, self.dtype, self.device)?,
+                    None,
+                );
+            }
+        }
         match quant {
             None => Projection::load(self.dense(name)?, None),
             Some(q) => {
@@ -1037,7 +1103,7 @@ impl BlockDraft {
         device: &Device,
         dtype: DType,
     ) -> std::result::Result<Self, BlockDraftRefusal> {
-        let source = DraftSource::open(dir)
+        let source = DraftSource::open_on_device(dir, device)
             .map_err(|e| BlockDraftRefusal::Tensors(format!("read the weights: {e}")))?;
         Self::from_source(&source, cfg, Some(precision), device, dtype)
     }

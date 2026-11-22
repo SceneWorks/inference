@@ -92,8 +92,12 @@ pub(super) fn dit_allocation(
     } else {
         2
     };
-    let mut allocation =
-        gen_core_h3::h3_memory::component_allocation(path, native_backend(), width, |h| {
+    let mut allocation = gen_core_h3::h3_memory::component_allocation_with_fp8_policy(
+        path,
+        native_backend(),
+        width,
+        &mlx_gen::logical_weights::MlxCodecResidency,
+        |h| {
             if pruned
                 && (h.name == TABLE_KEY
                     || h.name.contains(".adaln_proj.linear.")
@@ -107,7 +111,8 @@ pub(super) fn dit_allocation(
             } else {
                 None
             }
-        })?;
+        },
+    )?;
     // Unresolved inventory probes name no tensor the DiT consumes. Retain their established
     // file-size bound; real dense/native sources use the materialized header facts above.
     if allocation.projections.is_empty() && safetensors_path_bytes(path) > 0 {

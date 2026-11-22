@@ -4,6 +4,7 @@
 //! and a biasful GELU MLP. Keeping that shape separate prevents a compatible-looking checkpoint
 //! from being decoded with StarVector-1B's learned-position MQA math.
 
+use crate::primitives::Projection;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
@@ -11,7 +12,7 @@ use crate::decode::Decode;
 use crate::error::Result;
 use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, gelu_tanh, layer_norm, linear};
+use crate::primitives::nn::{gelu_tanh, layer_norm};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::Weights;
 
@@ -53,7 +54,7 @@ impl StarCoder2Config {
 
 /// Native StarCoder2 decoder with tied input/output embeddings.
 pub struct StarCoder2 {
-    embed_tokens: Array,
+    embed_tokens: Projection,
     layers: Vec<StarCoder2Layer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
@@ -70,12 +71,18 @@ impl StarCoder2 {
     /// accepting an unrelated optional head.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: StarCoder2Config) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        let embed_tokens = w.require(&key("model.embed_tokens.weight"))?.clone();
+        let embed_tokens =
+            Projection::from_named(w, &key("model.embed_tokens.weight"), None, None)?;
+        let actual = match &embed_tokens {
+            Projection::Dense { weight, .. } => weight.shape().to_vec(),
+            Projection::Native(p) => p.shape().to_vec(),
+            _ => unreachable!("from_named binds stock or native"),
+        };
         let expected_embedding_shape = [cfg.vocab_size, cfg.hidden_size];
-        if embed_tokens.shape() != expected_embedding_shape {
+        if actual != expected_embedding_shape {
             return Err(crate::error::Error::Config(format!(
                 "StarCoder2 tied embedding/head must be {expected_embedding_shape:?}, got {:?}",
-                embed_tokens.shape()
+                actual
             )));
         }
         let mut layers = Vec::with_capacity(cfg.layers);
@@ -100,7 +107,7 @@ impl StarCoder2 {
 
     /// Embed token ids without any positional addition; StarCoder2 positions are RoPE-only.
     pub fn embed(&self, ids: &Array) -> Result<Array> {
-        embed(&self.embed_tokens, ids)
+        self.embed_tokens.rows(ids)
     }
 
     /// Prefill or decode precomputed embeddings, returning last-position logits.
@@ -123,7 +130,7 @@ impl StarCoder2 {
             self.cfg.layer_norm_eps,
         )?;
         let last = hidden.take_axis(Array::from_slice(&[hidden.shape()[1] - 1], &[1]), 1)?;
-        let logits = linear(&last, &self.embed_tokens, None)?;
+        let logits = self.embed_tokens.forward(&last)?;
         Ok(logits.reshape(&[hidden.shape()[0], self.cfg.vocab_size])?)
     }
 
@@ -149,10 +156,8 @@ struct StarCoder2Layer {
     attn: StarCoder2Attention,
     post_attn_norm_weight: Array,
     post_attn_norm_bias: Array,
-    mlp_fc_weight: Array,
-    mlp_fc_bias: Array,
-    mlp_proj_weight: Array,
-    mlp_proj_bias: Array,
+    mlp_fc: Projection,
+    mlp_proj: Projection,
     eps: f32,
 }
 
@@ -165,10 +170,18 @@ impl StarCoder2Layer {
             attn: StarCoder2Attention::from_weights(w, &key("self_attn"), cfg)?,
             post_attn_norm_weight: w.require(&key("post_attention_layernorm.weight"))?.clone(),
             post_attn_norm_bias: w.require(&key("post_attention_layernorm.bias"))?.clone(),
-            mlp_fc_weight: w.require(&key("mlp.c_fc.weight"))?.clone(),
-            mlp_fc_bias: w.require(&key("mlp.c_fc.bias"))?.clone(),
-            mlp_proj_weight: w.require(&key("mlp.c_proj.weight"))?.clone(),
-            mlp_proj_bias: w.require(&key("mlp.c_proj.bias"))?.clone(),
+            mlp_fc: Projection::from_named(
+                w,
+                &key("mlp.c_fc.weight"),
+                Some(w.require(&key("mlp.c_fc.bias"))?.clone()),
+                None,
+            )?,
+            mlp_proj: Projection::from_named(
+                w,
+                &key("mlp.c_proj.weight"),
+                Some(w.require(&key("mlp.c_proj.bias"))?.clone()),
+                None,
+            )?,
             eps: cfg.layer_norm_eps,
         })
     }
@@ -196,23 +209,19 @@ impl StarCoder2Layer {
             self.eps,
         )?;
         let mlp = gelu_tanh(
-            &linear(&normed, &self.mlp_fc_weight, Some(&self.mlp_fc_bias))?,
+            &self.mlp_fc.forward(&normed)?,
             crate::primitives::activation::ActivationRole::LlmDecode,
         )?;
-        let mlp = linear(&mlp, &self.mlp_proj_weight, Some(&self.mlp_proj_bias))?;
+        let mlp = self.mlp_proj.forward(&mlp)?;
         Ok(add(&hidden, &mlp)?)
     }
 }
 
 struct StarCoder2Attention {
-    q_weight: Array,
-    q_bias: Array,
-    k_weight: Array,
-    k_bias: Array,
-    v_weight: Array,
-    v_bias: Array,
-    o_weight: Array,
-    o_bias: Array,
+    q: Projection,
+    k: Projection,
+    v: Projection,
+    o: Projection,
     cfg: StarCoder2Config,
 }
 
@@ -220,14 +229,30 @@ impl StarCoder2Attention {
     fn from_weights(w: &Weights, prefix: &str, cfg: StarCoder2Config) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
         Ok(Self {
-            q_weight: w.require(&key("q_proj.weight"))?.clone(),
-            q_bias: w.require(&key("q_proj.bias"))?.clone(),
-            k_weight: w.require(&key("k_proj.weight"))?.clone(),
-            k_bias: w.require(&key("k_proj.bias"))?.clone(),
-            v_weight: w.require(&key("v_proj.weight"))?.clone(),
-            v_bias: w.require(&key("v_proj.bias"))?.clone(),
-            o_weight: w.require(&key("o_proj.weight"))?.clone(),
-            o_bias: w.require(&key("o_proj.bias"))?.clone(),
+            q: Projection::from_named(
+                w,
+                &key("q_proj.weight"),
+                Some(w.require(&key("q_proj.bias"))?.clone()),
+                None,
+            )?,
+            k: Projection::from_named(
+                w,
+                &key("k_proj.weight"),
+                Some(w.require(&key("k_proj.bias"))?.clone()),
+                None,
+            )?,
+            v: Projection::from_named(
+                w,
+                &key("v_proj.weight"),
+                Some(w.require(&key("v_proj.bias"))?.clone()),
+                None,
+            )?,
+            o: Projection::from_named(
+                w,
+                &key("o_proj.weight"),
+                Some(w.require(&key("o_proj.bias"))?.clone()),
+                None,
+            )?,
             cfg,
         })
     }
@@ -242,24 +267,18 @@ impl StarCoder2Attention {
     ) -> Result<Array> {
         let (batch, sequence) = (hidden.shape()[0], hidden.shape()[1]);
         let head_dim = self.cfg.head_dim();
-        let query = linear(hidden, &self.q_weight, Some(&self.q_bias))?.reshape(&[
-            batch,
-            sequence,
-            self.cfg.heads,
-            head_dim,
-        ])?;
-        let key = linear(hidden, &self.k_weight, Some(&self.k_bias))?.reshape(&[
-            batch,
-            sequence,
-            self.cfg.kv_heads,
-            head_dim,
-        ])?;
-        let value = linear(hidden, &self.v_weight, Some(&self.v_bias))?.reshape(&[
-            batch,
-            sequence,
-            self.cfg.kv_heads,
-            head_dim,
-        ])?;
+        let query =
+            self.q
+                .forward(hidden)?
+                .reshape(&[batch, sequence, self.cfg.heads, head_dim])?;
+        let key =
+            self.k
+                .forward(hidden)?
+                .reshape(&[batch, sequence, self.cfg.kv_heads, head_dim])?;
+        let value =
+            self.v
+                .forward(hidden)?
+                .reshape(&[batch, sequence, self.cfg.kv_heads, head_dim])?;
         let query = apply_rope(&query, cos, sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
         let key = apply_rope(&key, cos, sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
         let value = value.transpose_axes(&[0, 2, 1, 3])?;
@@ -270,7 +289,7 @@ impl StarCoder2Attention {
             sequence,
             self.cfg.hidden_size,
         ])?;
-        linear(&merged, &self.o_weight, Some(&self.o_bias))
+        self.o.forward(&merged)
     }
 }
 

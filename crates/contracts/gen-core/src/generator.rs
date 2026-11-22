@@ -23,6 +23,8 @@ use crate::{
     MemoryStrategy, MemoryStructuralResidentEvidence, Result,
 };
 
+mod receipt;
+pub(crate) use receipt::ReceiptGenerator;
 mod traits;
 pub use traits::*;
 

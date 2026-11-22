@@ -346,6 +346,18 @@ pub fn validate_checkpoint_headers(
         .map_err(|e| Error::Unsupported(e.to_string()))
 }
 
+pub(crate) fn validate_source_checkpoint(
+    cfg: &DitConfig,
+    storage: gen_core_flux3::artifacts::NativeDitStorage,
+    path: &Path,
+    headers: &[candle_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> Result<bool> {
+    check_ref_time_pair(cfg, |key| headers.iter().any(|h| h.name == key))?;
+    storage
+        .validate_source_headers(cfg, path, headers)
+        .map_err(|e| Error::Unsupported(e.to_string()))
+}
+
 impl Flux3Dit {
     /// Install one preflight-validated projection; unknown paths remain typed refusals.
     pub fn install_lora(
@@ -459,7 +471,7 @@ impl Flux3Dit {
         // `ref_time_in` pair the resolved flow_map) before one tensor byte is read.
         let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
             .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
-        validate_checkpoint_headers(cfg, storage, &headers)?;
+        validate_source_checkpoint(cfg, storage, path, &headers)?;
         use gen_core_flux3::quantization::DitFormat;
         let targets = || {
             storage
@@ -515,7 +527,13 @@ impl Flux3Dit {
         packed: Option<&PackedSource>,
         publisher: Option<&PublisherSource>,
     ) -> Result<Self> {
+        let expected = gen_core_flux3::quantization::expected_tensors(
+            cfg,
+            gen_core_flux3::quantization::DitFormat::Dense,
+        )
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
         let l = Loader {
+            expected: &expected,
             vb,
             compute,
             device,

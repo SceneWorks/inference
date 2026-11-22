@@ -45,6 +45,11 @@ use crate::config::Flux2Quant;
 /// dev Mistral TE is ~45 GB bf16; this is what keeps it off the load-time memory floor). `key` is
 /// the `….weight` tensor name.
 pub(crate) fn lin(w: &Weights, key: &str, quant: Option<Flux2Quant>) -> Result<AdaptableLinear> {
+    if let Some(native) =
+        mlx_gen::quant::native_lin(w, key.strip_suffix(".weight").unwrap_or(key), false)?
+    {
+        return Ok(native);
+    }
     if let Some(q) = quant {
         let base = key.strip_suffix(".weight").unwrap_or(key);
         if let Some(scales) = w.get(&format!("{base}.scales")) {

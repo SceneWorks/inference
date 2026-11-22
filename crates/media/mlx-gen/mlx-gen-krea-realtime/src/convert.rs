@@ -73,8 +73,8 @@ pub fn normalize_krea_keys(raw: HashMap<String, Array>) -> HashMap<String, Array
 /// `.scales`/`.biases` companions are floats and are cast (a no-op: MLX packs them at the source
 /// weight's bf16).
 fn cast_floats(map: &mut HashMap<String, Array>, dtype: Dtype) -> Result<()> {
-    for v in map.values_mut() {
-        if v.dtype().is_float() && v.dtype() != dtype {
+    for (key, v) in map.iter_mut() {
+        if !key.ends_with(".weight_scale") && v.dtype().is_float() && v.dtype() != dtype {
             *v = v.as_dtype(dtype)?;
         }
     }

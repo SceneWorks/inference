@@ -1,11 +1,13 @@
 //! Descriptor-driven symmetric INT8 projections, not MLX's affine Q8 format (sc-26683).
 //! Only activations and the tiny rotation matrix are floating; stored weights stay I8.
 
-use crate::{MlxWeightSource, Result};
+use crate::Result;
 use gen_core::convrot_int8::{ConvRotInt8, MAX_DESCRIPTOR_BYTES};
+#[cfg(any(test, feature = "test-support"))]
+use mlx_rs::fast::MetalKernel;
 use mlx_rs::{ops::matmul, transforms::eval, Array, Dtype};
 #[cfg(any(test, feature = "test-support"))]
-use {mlx_rs::fast::MetalKernel, std::cell::RefCell};
+use std::cell::RefCell;
 
 /// The original serial kernels (sc-26683), kept ONLY as the parity reference for the tiled path in
 /// [`crate::int8_gemm`]: one row per thread for the quantizer and one 32-lane SIMD group per output
@@ -29,7 +31,7 @@ for (uint j=0; j<K; ++j) {
 "#;
 /// See [`REFERENCE_QUANT`]. Shared verbatim (same name and source) with the W4A8 reference.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) const REFERENCE_PROJECT: &str = r#"
+pub const REFERENCE_PROJECT: &str = r#"
 uint lane = thread_position_in_threadgroup.x;
 uint out = thread_position_in_grid.y;
 uint row = thread_position_in_grid.z;
@@ -74,17 +76,122 @@ fn reference_kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>)
     })
 }
 
+pub use crate::MlxWeightSource;
+
+pub fn descriptor(blob: &Array, base: &str) -> Result<gen_core::comfy_quant::ComfyQuantDescriptor> {
+    if blob.dtype() != Dtype::Uint8 || blob.ndim() != 1 || blob.size() > MAX_DESCRIPTOR_BYTES {
+        return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
+    }
+    blob.eval()?;
+    gen_core::comfy_quant::parse_comfy_quant_descriptor(blob.as_slice::<u8>())
+        .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))
+}
+
+/// Restore a complete declaration for consumers that rename keys through a raw MLX map.
+pub fn descriptor_array(group: usize) -> Array {
+    let json = format!(
+        r#"{{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":{group},"per_row":true}}"#
+    );
+    Array::from_slice(json.as_bytes(), &[json.len() as i32])
+}
+
 /// Compact native integer base, shareable by adapter-bearing projections.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConvRotLinear {
-    pub(crate) descriptor: ConvRotInt8,
+    descriptor: ConvRotInt8,
+    observation: Option<crate::source::Observation>,
     codes: Array,
     scales: Array,
-    pub(crate) bias: Option<Array>,
+    bias: Option<Array>,
     rotation: Array,
 }
 
 impl ConvRotLinear {
+    /// Slice output rows without changing signed codes, bias, row scales or rotation.
+    pub fn slice_rows(&self, lo: i32, hi: i32) -> Result<Self> {
+        use mlx_rs::ops::indexing::IndexOp;
+        if lo < 0 || hi <= lo || hi as usize > self.descriptor.out_features {
+            return Err("ConvRot row slice is outside the stored projection".into());
+        }
+        let n = (hi - lo) as usize;
+        let layout = ConvRotInt8::from_geometry(
+            self.descriptor.rotation_group,
+            &[n, self.descriptor.in_features],
+            &[n, 1],
+        )
+        .map_err(crate::Error::Msg)?;
+        Ok(Self {
+            descriptor: layout,
+            observation: self.observation.clone(),
+            codes: self.codes.index((lo..hi, ..)),
+            scales: self.scales.index((lo..hi, ..)),
+            bias: self.bias.as_ref().map(|b| b.index(lo..hi)),
+            rotation: self.rotation.clone(),
+        })
+    }
+
+    pub fn bias(&self) -> Option<&Array> {
+        self.bias.as_ref()
+    }
+
+    pub fn set_bias(&mut self, bias: Array) -> Result<()> {
+        if bias.shape() != [self.descriptor.out_features as i32]
+            || !matches!(
+                bias.dtype(),
+                Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+            )
+        {
+            return Err("ConvRot bias does not match the output width".into());
+        }
+        self.bias = Some(bias);
+        Ok(())
+    }
+
+    pub(crate) fn observe(&mut self, obs: crate::source::Observation) -> Result<()> {
+        obs.bind(&self.codes, &self.scales, None)?;
+        self.observation = Some(obs);
+        Ok(())
+    }
+    pub fn codes(&self) -> &Array {
+        &self.codes
+    }
+    /// Invert the orthonormal activation rotation on the requested coefficient rows.
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
+        self.rows_as(ids, Dtype::Bfloat16)
+    }
+    pub fn rows_as(&self, ids: &Array, dtype: Dtype) -> Result<Array> {
+        if self.observation.as_ref().is_some_and(|o| o.pending()) {
+            self.materialize()?;
+        }
+        let flat = ids.reshape(&[-1])?;
+        let weight = self.codes.take_axis(&flat, 0)?.as_dtype(Dtype::Float32)?;
+        let scales = self.scales.take_axis(&flat, 0)?;
+        let g = self.descriptor.rotation_group as i32;
+        let k = self.descriptor.in_features as i32;
+        let rotated = matmul(&weight.reshape(&[-1, g])?, &self.rotation)?.reshape(&[-1, k])?;
+        let values = mlx_rs::ops::multiply(rotated, &scales)?.as_dtype(dtype)?;
+        let mut shape = ids.shape().to_vec();
+        shape.push(k);
+        Ok(values.reshape(&shape)?)
+    }
+
+    pub fn scales(&self) -> &Array {
+        &self.scales
+    }
+
+    pub fn rotation(&self) -> &Array {
+        &self.rotation
+    }
+
+    pub fn push_arrays(&self, out: &mut Vec<Array>) {
+        out.extend([
+            self.codes.clone(),
+            self.scales.clone(),
+            self.rotation.clone(),
+        ]);
+        out.extend(self.bias.iter().cloned());
+    }
+
     /// Validated geometry cannot be mutated independently of the resident buffers.
     pub fn descriptor(&self) -> ConvRotInt8 {
         self.descriptor
@@ -96,46 +203,77 @@ impl ConvRotLinear {
         base: &str,
         bias: bool,
     ) -> Result<Option<Self>> {
+        Self::from_key(w, base, &format!("{base}.weight"), bias)
+    }
+
+    /// Bind the physical weight key for architectures with nonstandard names.
+    pub fn from_key(
+        w: &(impl MlxWeightSource + ?Sized),
+        base: &str,
+        weight_key: &str,
+        bias: bool,
+    ) -> Result<Option<Self>> {
         let dk = format!("{base}.comfy_quant");
         let sk = format!("{base}.weight_scale");
-        let codes = w.require(&format!("{base}.weight"))?;
-        if w.get(&dk).is_none() {
-            if w.get(&sk).is_some() || codes.dtype() == Dtype::Int8 {
-                return Err(format!(
-                    "{base}: INT8 requires an authoritative .comfy_quant descriptor"
-                )
-                .into());
+        let require = |key: &str| {
+            w.get(key)
+                .ok_or_else(|| crate::Error::Msg(format!("missing tensor {key}")))
+        };
+        let codes = require(weight_key)?;
+        let planned = w.planned_geometry(base);
+        let declaration = if planned.is_none() {
+            if let Some(payload) = w.get(&dk) {
+                if payload.dtype() != Dtype::Uint8
+                    || payload.ndim() != 1
+                    || payload.size() > MAX_DESCRIPTOR_BYTES
+                {
+                    return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
+                }
+                payload.eval()?;
+                let descriptor =
+                    gen_core::comfy_quant::parse_comfy_quant_descriptor(payload.as_slice::<u8>())
+                        .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
+                if descriptor.format != gen_core::comfy_quant::ComfyQuantFormat::ConvRotInt8 {
+                    return Ok(None);
+                }
+                descriptor.rotation_group
+            } else {
+                if codes.dtype() == Dtype::Int8 {
+                    return Err(format!(
+                        "{base}: INT8 requires an authoritative .comfy_quant descriptor"
+                    )
+                    .into());
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
+        } else {
+            planned.map(|g| g.rotation_group)
+        };
+        let group = declaration
+            .ok_or_else(|| crate::Error::Msg(format!("{base}: missing ConvRot group")))?;
         if w.get(&format!("{base}.scales")).is_some() || w.get(&format!("{base}.biases")).is_some()
         {
             return Err(format!("{base}: contradictory affine and ConvRot operands").into());
         }
-        let payload = w.require(&dk)?;
-        if payload.dtype() != Dtype::Uint8
-            || payload.ndim() != 1
-            || payload.size() > MAX_DESCRIPTOR_BYTES
-        {
-            return Err(format!("{base}: .comfy_quant must be a bounded U8 vector").into());
-        }
-        let scales = w.require(&sk)?;
+        let scales = require(&sk)?;
         if codes.dtype() != Dtype::Int8 || scales.dtype() != Dtype::Float32 {
-            return Err(format!(
-                "{base}: ConvRot requires I8 codes and F32 scales without casting"
-            )
-            .into());
+            return Err(
+                format!("{base}: ConvRot requires original I8 codes and F32 scales").into(),
+            );
         }
-        eval([payload, scales])?;
+        scales.eval()?;
         let shape: Vec<usize> = codes.shape().iter().map(|&v| v as usize).collect();
         let scale_shape: Vec<usize> = scales.shape().iter().map(|&v| v as usize).collect();
-        let descriptor = ConvRotInt8::parse(payload.as_slice::<u8>(), &shape, &scale_shape)
-            .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
+        let descriptor =
+            ConvRotInt8::from_geometry(group, &shape, &scale_shape).map_err(crate::Error::Msg)?;
+        if planned.is_some_and(|d| d != descriptor) {
+            return Err(format!("{base}: ConvRot operands changed since planning").into());
+        }
         descriptor
             .validate_scales(scales.as_slice::<f32>())
             .map_err(crate::Error::Msg)?;
         let bias = if bias {
-            Some(w.require(&format!("{base}.bias"))?.clone())
+            Some(require(&format!("{base}.bias"))?.clone())
         } else {
             None
         };
@@ -168,6 +306,7 @@ impl ConvRotLinear {
         });
         Ok(Some(Self {
             descriptor,
+            observation: None,
             codes: codes.clone(),
             scales: scales.clone(),
             bias,
@@ -203,8 +342,8 @@ impl ConvRotLinear {
 
     /// The F32 epilogue bias: the stored bias rounded to the activation dtype first, as the S4
     /// ConvRot authority adds it.
-    fn epilogue_bias(&self, x: &Array) -> Result<Array> {
-        Ok(match &self.bias {
+    fn epilogue_bias(&self, x: &Array, bias: Option<&Array>) -> Result<Array> {
+        Ok(match bias {
             Some(b) => b.as_dtype(x.dtype())?.as_dtype(Dtype::Float32)?,
             None => mlx_rs::ops::zeros::<f32>(&[self.descriptor.out_features as i32])?,
         })
@@ -222,7 +361,21 @@ impl ConvRotLinear {
     /// FP32 `simdgroup_matrix` products, bit-identical to the serial reference (that module states
     /// the exactness bound).
     pub fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_with_bias(x, self.bias.as_ref())
+    }
+
+    /// Bind an architecture's external bias in the same F32 epilogue as a stored projection bias.
+    pub fn forward_with_bias(&self, x: &Array, bias: Option<&Array>) -> Result<Array> {
+        if bias.is_some_and(|b| {
+            b.shape() != [self.descriptor.out_features as i32]
+                || !matches!(b.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+        }) {
+            return Err("ConvRot bias requires one floating value per output row".into());
+        }
         let d = self.descriptor;
+        if self.observation.as_ref().is_some_and(|obs| obs.pending()) {
+            self.materialize()?;
+        }
         let (rotated, rows) = self.rotate(x)?;
         let (codes, scales) = crate::int8_gemm::quantize_rows(
             &rotated,
@@ -231,7 +384,7 @@ impl ConvRotLinear {
             x.dtype(),
             crate::int8_gemm::Numerator::ConvRot,
         )?;
-        let bias = self.epilogue_bias(x)?;
+        let bias = self.epilogue_bias(x, bias)?;
         let y = crate::int8_gemm::project(
             &codes,
             &scales,
@@ -253,7 +406,7 @@ impl ConvRotLinear {
         let d = self.descriptor;
         let (rotated, rows) = self.rotate(x)?;
         let (m, k, n) = (rows as i32, d.in_features as i32, d.out_features as i32);
-        let bias = self.epilogue_bias(x)?;
+        let bias = self.epilogue_bias(x, self.bias.as_ref())?;
         reference_kernels(|quant, project| {
             let mut q = quant
                 .apply()
@@ -298,6 +451,9 @@ impl ConvRotLinear {
                 .into_iter()
                 .chain(self.bias.iter()),
         )?;
+        if let Some(obs) = &self.observation {
+            obs.record_packed()?;
+        }
         Ok(())
     }
     /// Projection-owned bytes; the two immutable rotation constants are shared per load.

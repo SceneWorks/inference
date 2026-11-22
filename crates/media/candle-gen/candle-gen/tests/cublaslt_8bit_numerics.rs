@@ -309,3 +309,448 @@ fn int8_degrades_on_activation_outlier_no_rotation() {
          {err}); if this fails, per-tensor int8 is outlier-safe and ConvRot is unnecessary"
     );
 }
+
+/// Checkpoint input, stock Candle constructor, immutable packed projection, and additive adapter.
+/// These fixed reference products come from the independent host float8 implementation.
+#[test]
+#[ignore = "dedicated CUDA checkpoint-numerics proof"]
+fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Error>> {
+    use candle_gen::candle_nn::Module;
+    use candle_gen::quant::AdaptLinear;
+    use float8::{F8E4M3, F8E5M2};
+    use half::bf16;
+    use safetensors::{tensor::TensorView, Dtype};
+    fn assert_windows(
+        path: &std::path::Path,
+        base: &str,
+        resident: &candle_gen::candle_nn::Linear,
+        x: &Tensor,
+        expected: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use candle_gen::quant::AdaptLinear;
+        let scope = candle_gen::gen_core::CheckpointReceiptScope::default();
+        scope.with(|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut weights = candle_gen::Weights::from_files_native_int8(&[path], &Device::Cpu)?;
+            weights.stage_projection_windows(x.device());
+            let (n, k) = resident.weight_dims()?;
+            let host = weights
+                .native_linear_shaped(base, resident.bias().is_some(), Some((n, k)), x.dtype())?
+                .expect("prepared source");
+            let id = resident.native_format_id().expect("native resident source");
+            let bytes = resident.native_resident_bytes().unwrap();
+            assert_eq!(host.native_format_id(), Some(id));
+            assert_eq!(host.native_resident_bytes(), Some(bytes));
+            let host = AdaptLinear::from_dense(host, k, n);
+            assert!(scope.try_snapshots()?.is_empty());
+            drop(weights);
+            for _ in 0..2 {
+                let window = host.copy_to_device(x.device())?;
+                assert_eq!(
+                    window.base_qlinear().and_then(|q| q.native_format_id()),
+                    Some(id)
+                );
+                let actual = __model_proof_output!(window.forward_upcast(x))?;
+                assert_eq!(actual.dtype(), x.dtype());
+                assert_eq!(
+                    actual
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    expected
+                );
+                let facts = scope.try_snapshots()?;
+                assert_eq!(facts.len(), 1);
+                assert_eq!(facts[0].resident_bytes(), bytes);
+            }
+            Ok(())
+        })
+    }
+    let dev = Device::new_cuda(0)?;
+    let tmp = tempfile::tempdir()?;
+    let scalar = |e5: bool, v: f32| {
+        if e5 {
+            F8E5M2::from_f32(v).to_f32()
+        } else {
+            F8E4M3::from_f32(v).to_f32()
+        }
+    };
+    for e5 in [false, true] {
+        for sx in [None, Some(0.5f32)] {
+            let format = if e5 { "float8_e5m2" } else { "float8_e4m3fn" };
+            let dtype = if e5 { Dtype::F8_E5M2 } else { Dtype::F8_E4M3 };
+            let mut codes = vec![0u8; 16 * 16];
+            let mut w = Vec::new();
+            for row in 0..16 {
+                let v = if row % 2 == 0 { 1.5 } else { -0.75 };
+                codes[row * 16 + row] = if e5 {
+                    F8E5M2::from_f32(v).to_bits()
+                } else {
+                    F8E4M3::from_f32(v).to_bits()
+                };
+                w.push(v);
+            }
+            let desc = format!(r#"{{"format":"{format}"}}"#);
+            let sw = 2f32.to_le_bytes();
+            let input_scale = sx.unwrap_or(1.).to_le_bytes();
+            let mut tensors = vec![
+                (
+                    "linear.weight",
+                    TensorView::new(dtype, vec![16, 16], &codes)?,
+                ),
+                (
+                    "linear.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![desc.len()], desc.as_bytes())?,
+                ),
+                (
+                    "linear.weight_scale",
+                    TensorView::new(Dtype::F32, vec![], &sw)?,
+                ),
+            ];
+            if sx.is_some() {
+                tensors.push((
+                    "linear.input_scale",
+                    TensorView::new(Dtype::F32, vec![], &input_scale)?,
+                ));
+            }
+            let path = tmp
+                .path()
+                .join(format!("scalar-{e5}-{}.safetensors", sx.is_some()));
+            safetensors::tensor::serialize_to_file(tensors, None, &path)?;
+            let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
+            {
+                let staged = vb.clone().stage_dense_on(Device::Cpu).pp("linear");
+                let native = candle_gen::candle_nn::linear_no_bias(16, 16, staged.clone())?;
+                assert!(native.is_native() && native.device().same_device(&dev));
+                assert!(staged.get_unchecked("weight_scale")?.device().is_cpu());
+                let repaired = native
+                    .with_bias(Some(Tensor::zeros(16, DType::BF16, &Device::Cpu)?))
+                    .to_device(&dev)?;
+                assert!(repaired.bias().unwrap().device().same_device(&dev));
+            }
+            let lin = candle_gen::candle_nn::linear_no_bias(16, 16, vb.pp("linear"))?;
+            assert_eq!(
+                lin.native_format_id(),
+                Some(if e5 {
+                    "fp8-e5m2-scalar-v1"
+                } else {
+                    "fp8-e4m3-scalar-v1"
+                })
+            );
+            let input: Vec<bf16> = (0..18 * 16)
+                .map(|i| {
+                    bf16::from_f32(
+                        [0.5, -1.375, 0.001953125, 300.0, 0.375, -0.25, 0.125, 1.0][i % 8],
+                    )
+                })
+                .collect();
+            let x = Tensor::from_slice(&input, (18, 16), &dev)?.narrow(0, 1, 17)?;
+            let got = __model_proof_output!(lin.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
+            assert_windows(
+                &path,
+                "linear",
+                &lin,
+                &x,
+                &got.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            )?;
+            let mut adapted = AdaptLinear::from_dense(lin, 16, 16);
+            let mut a = vec![bf16::ZERO; 16];
+            a[0] = bf16::ONE;
+            adapted.push_lora_checked(
+                Tensor::from_slice(&a, (16, 1), &dev)?,
+                Tensor::ones((1, 16), DType::BF16, &dev)?,
+                1.0,
+            )?;
+            let got_adapted = __model_proof_output!(adapted.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
+            for row in 0..17 {
+                for j in 0..16 {
+                    let xij = input[(row + 1) * 16 + j].to_f32();
+                    let s = sx.unwrap_or(1.);
+                    let sat = if e5 { 57344.0 } else { 448.0 };
+                    let expected =
+                        bf16::from_f32(scalar(e5, (xij / s).clamp(-sat, sat)) * s * w[j] * 2.);
+                    assert_eq!(
+                        got[row * 16 + j],
+                        expected,
+                        "{format} scale {sx:?} [{row},{j}]"
+                    );
+                    assert_eq!(
+                        got_adapted[row * 16 + j],
+                        bf16::from_f32(expected.to_f32() + input[(row + 1) * 16].to_f32())
+                    );
+                }
+            }
+        }
+    }
+    // One term distinguishes native F16/F32 output from a BF16 intermediate and bias-before-rounding.
+    for (format, dtype, unit) in [
+        (
+            "float8_e4m3fn",
+            Dtype::F8_E4M3,
+            F8E4M3::from_f32(1.).to_bits(),
+        ),
+        (
+            "float8_e5m2",
+            Dtype::F8_E5M2,
+            F8E5M2::from_f32(1.).to_bits(),
+        ),
+    ] {
+        let path = tmp.path().join(format!("{format}-bias.safetensors"));
+        let mut codes = [0u8; 16 * 16];
+        for row in 0..16 {
+            codes[row * 16 + row] = unit;
+        }
+        let scale = (1.0_f32 + 1.0 / 512.).to_le_bytes();
+        let bias = (-1.0_f32).to_le_bytes().repeat(16);
+        let desc = format!(r#"{{"format":"{format}"}}"#);
+        safetensors::tensor::serialize_to_file(
+            [
+                (
+                    "linear.weight",
+                    TensorView::new(dtype, vec![16, 16], &codes)?,
+                ),
+                (
+                    "linear.weight_scale",
+                    TensorView::new(Dtype::F32, vec![], &scale)?,
+                ),
+                ("linear.bias", TensorView::new(Dtype::F32, vec![16], &bias)?),
+                (
+                    "linear.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![desc.len()], desc.as_bytes())?,
+                ),
+            ],
+            None,
+            &path,
+        )?;
+        for output in [DType::BF16, DType::F16, DType::F32] {
+            let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+            let op = candle_gen::candle_nn::linear(16, 16, vb.pp("linear"))?;
+            assert!(op.native_format_id().is_some());
+            let y = op.forward(&Tensor::ones((1, 16), output, &dev)?)?;
+            assert_eq!(y.dtype(), output);
+            let expected = if output == DType::BF16 { 0. } else { 1. / 512. };
+            assert_eq!(
+                y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                vec![expected; 16]
+            );
+        }
+    }
+    let (m, n, k) = (17usize, 23usize, 61usize);
+    let mut codes = vec![0u8; 32 * 64];
+    let mut scales = vec![127u8; 128 * 4];
+    let mut factors = Vec::new();
+    for row in 0..n {
+        let col = (row * 7) % k;
+        let code = F8E4M3::from_f32(if row % 2 == 0 { 1.5 } else { -0.75 });
+        let exponent = (row % 5) as i32 - 2;
+        codes[row * 64 + col] = code.to_bits();
+        scales[(row % 32) * 16 + (row / 32) * 4 + col / 32] = (exponent + 127) as u8;
+        factors.push((col, code.to_f32() * 2f32.powi(exponent)));
+    }
+    let desc = br#"{"format":"mxfp8"}"#;
+    let path = tmp.path().join("mx.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "linear.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![32, 64], &codes)?,
+            ),
+            (
+                "linear.weight_scale",
+                TensorView::new(Dtype::U8, vec![128, 4], &scales)?,
+            ),
+            (
+                "linear.comfy_quant",
+                TensorView::new(Dtype::U8, vec![desc.len()], desc)?,
+            ),
+        ],
+        None,
+        &path,
+    )?;
+    let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
+    let lin = candle_gen::candle_nn::linear_no_bias(k, n, vb.pp("linear"))?;
+    assert_eq!(lin.native_format_id(), Some("mxfp8-v1"));
+    let input: Vec<bf16> = (0..(m + 1) * k)
+        .map(|i| bf16::from_f32([0.25, 0.5, -1., 1.875][i % 4]))
+        .collect();
+    let x = Tensor::from_slice(&input, (m + 1, k), &dev)?.narrow(0, 1, m)?;
+    let got = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
+    assert_windows(
+        &path,
+        "linear",
+        &lin,
+        &x,
+        &got.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+    )?;
+    for row in 0..m {
+        for (j, &(col, w)) in factors.iter().enumerate() {
+            assert_eq!(
+                got[row * n + j],
+                bf16::from_f32(input[(row + 1) * k + col].to_f32() * w),
+                "MX [{row},{j}]"
+            );
+        }
+    }
+    // Publisher FP8R scales its activation per token and the weight per output.
+    let k = 16;
+    let mut codes = vec![0; k * k];
+    let mut scales = Vec::new();
+    let mut scale_bytes = Vec::new();
+    for col in 0..k {
+        codes[col * k + col] = F8E4M3::from_f32(1.5).to_bits();
+        let scale = 0.25 + col as f32 * 0.03125;
+        scales.push(scale);
+        scale_bytes.extend(scale.to_le_bytes());
+    }
+    let path = tmp.path().join("rowwise.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &codes)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+        ],
+        None,
+        &path,
+    )?;
+    let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
+    let lin = candle_gen::candle_nn::linear_no_bias(k, k, vb.pp("proj"))?;
+    assert_eq!(lin.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+    let inputs: Vec<_> = (0..17 * k)
+        .map(|i| bf16::from_f32(((i / k) as f32 - 8.) * ((i % k) as f32 - 7.5) * 0.125))
+        .collect();
+    let x = Tensor::from_slice(&inputs, (17, k), &dev)?;
+    let outputs = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
+    assert_windows(
+        &path,
+        "proj",
+        &lin,
+        &x,
+        &outputs.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+    )?;
+    for (row, (input, output)) in inputs
+        .chunks_exact(k)
+        .zip(outputs.chunks_exact(k))
+        .enumerate()
+    {
+        let max = input.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+        let sx = (max / 448.).max(1e-12);
+        for col in 0..k {
+            let code = F8E4M3::from_f32((input[col].to_f32() / sx).clamp(-448., 448.)).to_f32();
+            assert_eq!(
+                output[col],
+                bf16::from_f32((code * 1.5 * sx) * scales[col]),
+                "FP8R [{row},{col}]"
+            );
+        }
+    }
+    // The BFL activation is BF16 before row quantization. Preserve the consumer's
+    // F16/F32 scale product before adding its bias, including near rounding ties.
+    let mut identity = vec![0; k * k];
+    let row_scales: Vec<f32> = (0..k).map(|j| 1. + (5 + 2 * j) as f32 / 4096.).collect();
+    for i in 0..k {
+        identity[i * k + i] = F8E4M3::from_f32(1.).to_bits();
+    }
+    let scale_bytes: Vec<u8> = row_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let bias = (-1.0f32).to_le_bytes().repeat(k);
+    let path = tmp.path().join("rowwise-typed.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &identity)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+            ("proj.bias", TensorView::new(Dtype::F32, vec![k], &bias)?),
+        ],
+        None,
+        &path,
+    )?;
+    for output in [DType::F16, DType::F32] {
+        let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+        let op = candle_gen::candle_nn::linear(k, k, vb.pp("proj"))?;
+        assert_eq!(op.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+        let x = Tensor::from_slice(&vec![1.0f32 + 1. / 512.; k], (1, k), &dev)?.to_dtype(output)?;
+        let y = __model_proof_output!(op.forward(&x))?;
+        assert_eq!(y.dtype(), output);
+        assert_eq!(y.dims(), [1, k]);
+        let expected: Vec<f32> = row_scales
+            .iter()
+            .map(|&scale| {
+                let product = (448.0f32 * (1.0f32 / 448.0)) * scale;
+                match output {
+                    DType::F16 => half::f16::from_f32(product).to_f32() - 1.,
+                    _ => product - 1.,
+                }
+            })
+            .collect();
+        assert_windows(&path, "proj", &op, &x, &expected)?;
+        assert_eq!(
+            y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+            expected
+        );
+    }
+    // The H3 Veda predictor has a separate per-head calibration and a frozen serial scorer.
+    // The first coefficient rounds to one in BF16 only after applying its stored FP32 scale.
+    use candle_gen::quant::veda_score::{self, Projection};
+    let valid = [127usize, 2];
+    let qs = [1., -2., 0.5, 4.];
+    let ks = [0.25, 3., -1., 2.];
+    let tiles = |values: &[f32; 4]| -> candle_core::Result<Tensor> {
+        let mut rows = vec![0f32; 4 * 128];
+        for (i, &value) in values.iter().enumerate() {
+            rows[i * 128..i * 128 + valid[i % 2]].fill(value);
+        }
+        Tensor::from_vec(rows, (2, 2, 128, 1), &dev)
+    };
+    let qcodes = [0x38, 0, 0, 0x3c, 0, 0];
+    let qscales = [1. + 1. / 512., 0.75];
+    let kcodes = [0x38, 0, 0, 0xb8, 0, 0];
+    let kscales = [0.5, 1.25];
+    let got = veda_score::tile_logits_weights(
+        &tiles(&qs)?,
+        &tiles(&ks)?,
+        &valid,
+        2,
+        Projection::Fp8 {
+            codes: &qcodes,
+            scales: &qscales,
+        },
+        Projection::Fp8 {
+            codes: &kcodes,
+            scales: &kscales,
+        },
+    )?;
+    for head in 0..2 {
+        let q =
+            bf16::from_f32(F8E4M3::from_bits(qcodes[3 * head]).to_f32() * qscales[head]).to_f32();
+        let k =
+            bf16::from_f32(F8E4M3::from_bits(kcodes[3 * head]).to_f32() * kscales[head]).to_f32();
+        for row in 0..2 {
+            let scores = &got[head * 4 + row * 2..head * 4 + row * 2 + 2];
+            let expected = [0usize, 1].map(|col| {
+                (qs[head * 2 + row] * q + qs[head * 2 + row])
+                    * (ks[head * 2 + col] * k + ks[head * 2 + col])
+            });
+            assert_eq!(scores, expected);
+            assert_eq!(scores[0] > scores[1], expected[0] > expected[1]);
+        }
+    }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16");
+    Ok(())
+}

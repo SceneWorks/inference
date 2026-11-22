@@ -135,6 +135,9 @@ fn linear(
     bias: bool,
     quant: Option<(i32, i32)>,
 ) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::quant::native_lin(w, prefix, bias)? {
+        return Ok(native);
+    }
     let b = if bias {
         Some(require(w, &format!("{prefix}.bias"))?)
     } else {

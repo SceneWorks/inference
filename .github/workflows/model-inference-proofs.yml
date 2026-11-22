@@ -311,6 +311,8 @@ jobs:
             exit /b 1
           )
           set "RUSTC_WRAPPER="
+          set "TEMP=%RUNNER_TEMP%"
+          set "TMP=%RUNNER_TEMP%"
           "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
       - name: Validate owned evidence tree before any upload
         working-directory: ${{ env.MODEL_PROOF_CWD }}

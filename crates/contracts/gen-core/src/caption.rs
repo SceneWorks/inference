@@ -12,6 +12,14 @@ use crate::{Error, Result};
 
 /// An image captioning provider.
 pub trait Captioner {
+    /// Latest measured representation for the primary checkpoint.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+    /// Every source measured by this loaded model, including deferred components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
     /// Stable identity + capability metadata, constructible without loading weights through the
     /// registry.
     fn descriptor(&self) -> &CaptionerDescriptor;

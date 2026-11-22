@@ -15,15 +15,14 @@
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::rnn::{LSTMConfig, RNN};
-use candle_nn::{VarBuilder, LSTM};
+use candle_nn::{Linear, Module, VarBuilder, LSTM};
 
 use crate::config;
 
 /// The loaded speaker encoder: three stacked forward LSTM layers + a linear projection.
 pub struct SpeakerEncoder {
     layers: Vec<LSTM>,
-    proj_w: Tensor,
-    proj_b: Tensor,
+    proj: Linear,
     device: Device,
 }
 
@@ -50,12 +49,10 @@ impl SpeakerEncoder {
                 lstm_vb.clone(),
             )?);
         }
-        let proj_w = vb.get((config::EMBED_DIM, config::HIDDEN), "proj.weight")?;
-        let proj_b = vb.get(config::EMBED_DIM, "proj.bias")?;
+        let proj = candle_nn::linear(config::HIDDEN, config::EMBED_DIM, vb.pp("proj"))?;
         Ok(Self {
             layers,
-            proj_w,
-            proj_b,
+            proj,
             device,
         })
     }
@@ -84,7 +81,7 @@ impl SpeakerEncoder {
         }
         let h = final_h.expect("at least one LSTM layer"); // [1, HIDDEN]
                                                            // proj: h @ Wᵀ + b, then ReLU.
-        let projected = h.matmul(&self.proj_w.t()?)?.broadcast_add(&self.proj_b)?;
+        let projected = self.proj.forward(&h)?;
         let projected = projected.relu()?;
         projected.flatten_all()?.to_vec1::<f32>()
     }

@@ -47,6 +47,7 @@ use crate::config::DitConfig;
 /// `AdaptableLinear::quantize`'s bf16 cast, so migrating would move the pinned parity numerics.
 #[derive(Clone)]
 enum LinearWeight {
+    Native(mlx_gen::adapters::AdaptableLinear),
     Dense(Array),
     Quant {
         wq: Array,
@@ -63,6 +64,12 @@ struct Linear {
 }
 impl Linear {
     fn load(w: &Weights, prefix: &str, bias: bool) -> Result<Self> {
+        if let Some(native) = mlx_gen::quant::native_lin(w, prefix, bias)? {
+            return Ok(Self {
+                w: LinearWeight::Native(native),
+                b: None,
+            });
+        }
         Ok(Self {
             w: LinearWeight::Dense(w.require(&format!("{prefix}.weight"))?.clone()),
             b: if bias {
@@ -74,6 +81,7 @@ impl Linear {
     }
     fn forward(&self, x: &Array) -> Result<Array> {
         match &self.w {
+            LinearWeight::Native(native) => native.forward(x),
             LinearWeight::Dense(w) => {
                 let y = matmul(x, w.t())?;
                 match &self.b {

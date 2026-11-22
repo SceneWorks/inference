@@ -32,7 +32,7 @@ pub const DEFAULT_SELECTED_LAYERS: [usize; 4] = [5, 11, 17, 23];
 /// The Lens gpt-oss-20b text encoder, run encoder-only with multi-layer hidden capture.
 pub struct LensTextEncoder {
     /// `model.embed_tokens.weight`, `[vocab, hidden]`.
-    embed_tokens: Array,
+    embed_tokens: mlx_gen::nn::TokenEmbedding,
     /// Decoder layers `0..=max_selected` (the stack is truncated at the last captured layer — the
     /// remaining layers, the final `norm`, and the LM head are never built).
     layers: Vec<GptOssDecoderLayer>,
@@ -88,7 +88,7 @@ impl LensTextEncoder {
     ) -> Result<Self> {
         let max_layer = validate_selected_layers(cfg, &selected_layers)?;
 
-        let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        let embed_tokens = mlx_gen::quant::embedding_compute(&w, "model.embed_tokens", dtype)?;
         // Each source is materialized before it is drained: left lazy, the first encode's command
         // buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
         // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
@@ -139,7 +139,7 @@ impl LensTextEncoder {
         quant: Option<Quant>,
     ) -> Result<Self> {
         validate_selected_layers(cfg, &selected_layers)?;
-        let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        let embed_tokens = mlx_gen::quant::embedding_compute(&w, "model.embed_tokens", dtype)?;
         // Materialize the resident embedding at load (sc-24245); the layers stay in the stream.
         w.materialize_accessed()?;
         // The view owns a refcounted handle to every tensor it returned. Drain the embedding handle
@@ -209,7 +209,7 @@ impl LensTextEncoder {
         let full_mask = attention_mask(l, None, self.dtype)?;
         let sliding_mask = attention_mask(l, Some(self.sliding_window), self.dtype)?;
 
-        let mut hidden = self.embed_tokens.take_axis(input_ids, 0)?; // [B, L, hidden]
+        let mut hidden = self.embed_tokens.rows(input_ids)?; // [B, L, hidden]
 
         // Capture slots, filled in selection order (matches the reference's `index_lookup`).
         let mut captured: Vec<Option<Array>> = vec![None; self.selected_layers.len()];
@@ -258,7 +258,7 @@ impl LensTextEncoder {
         let l = input_ids.shape()[1];
         let full_mask = attention_mask(l, None, self.dtype)?;
         let sliding_mask = attention_mask(l, Some(self.sliding_window), self.dtype)?;
-        let hidden = self.embed_tokens.take_axis(input_ids, 0)?;
+        let hidden = self.embed_tokens.rows(input_ids)?;
         let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)?;
         super::stream::run_windowed_layers(
             stream,

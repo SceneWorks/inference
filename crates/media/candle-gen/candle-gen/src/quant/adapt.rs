@@ -16,6 +16,75 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn native_checkpoint_refuses_folds_and_preserves_its_operand_on_device_copy(
+    ) -> candle_core::Result<()> {
+        use candle_nn::linear::NativeLinearWeight;
+
+        struct StoredCodes;
+        impl NativeLinearWeight for StoredCodes {
+            fn forward(&self, _: &Tensor, _: Option<&Tensor>) -> candle_core::Result<Tensor> {
+                panic!("metadata-only test must never execute the operand")
+            }
+            fn dense_weight(&self) -> candle_core::Result<Tensor> {
+                panic!("a fold must refuse before decoding the checkpoint")
+            }
+            fn format_id(&self) -> &'static str {
+                gen_core::convrot_int8::CODEC_ID
+            }
+            fn resident_bytes(&self) -> u64 {
+                64 * 64 + 64 * 4
+            }
+            fn dims(&self) -> (usize, usize) {
+                (64, 64)
+            }
+            fn device(&self) -> &Device {
+                &Device::Cpu
+            }
+        }
+
+        let operand: Arc<dyn NativeLinearWeight> = Arc::new(StoredCodes);
+        let native = CandleNnLinear::from_native(operand.clone(), None);
+        let mut layer = AdaptLinear::from_dense(native, 64, 64);
+        assert!(layer.is_convrot_int8());
+        for result in [
+            layer.quantize(Quant::Q8),
+            layer.quantize_onto(Quant::Q4, &Device::Cpu),
+            layer.quantize_dequant_onto(Quant::Q8, &Device::Cpu),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(operand.format_id()), "{error}");
+            assert!(error.contains("refuses re-quantization"), "{error}");
+        }
+        layer.quantize_component(Quant::Q4, crate::quant::ComponentFold::DequantDense)?;
+        layer.quantize_component(
+            Quant::Q8,
+            crate::quant::ComponentFold::Int8FastOnto(&Device::Cpu),
+        )?;
+        let copy = layer.copy_to_device(&Device::Cpu)?;
+        let llm = candle_layers::Projection::from_adapt_linear(&layer).unwrap();
+        assert_eq!(llm.kind(), candle_layers::ProjectionKind::ConvRot);
+        assert_eq!(llm.dims(), (64, 64));
+        assert_eq!(llm.resident_bytes(), Some(operand.resident_bytes()));
+        let round_trip = llm.to_adapt_linear().unwrap();
+        for projection in [&layer, &copy, &round_trip] {
+            let Base::Packed(base @ QLinear::Dense(DenseLinear::Linear(linear))) = &projection.base
+            else {
+                panic!("expected the original checkpoint projection");
+            };
+            assert!(Arc::ptr_eq(&operand, &linear.native_weight().unwrap()));
+            assert_eq!(
+                linear.native_resident_bytes(),
+                Some(operand.resident_bytes())
+            );
+            assert_eq!(
+                base.resident_weight_bytes() as u64,
+                operand.resident_bytes()
+            );
+        }
+        Ok(())
+    }
+
     /// Ownership only: seed valid CPU preparation entries directly, without a learned forward.
     /// A window must own its caches even for a same-device copy (CPU is the portable control).
     #[test]

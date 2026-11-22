@@ -2,7 +2,7 @@
 //! `encode` then applies the fork's prompt post-processing (drop the leading system-prompt tokens).
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -44,7 +44,7 @@ impl QwenTextEncoderConfig {
 }
 
 pub struct QwenTextEncoder {
-    embed_tokens: Array,
+    embed_tokens: mlx_gen::nn::TokenEmbedding,
     layers: Vec<QwenEncoderLayer>,
     norm: Array,
     rope: TextRope,
@@ -68,7 +68,7 @@ impl QwenTextEncoder {
             )?);
         }
         Ok(Self {
-            embed_tokens: w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
+            embed_tokens: mlx_gen::quant::embedding(w, &join(prefix, "embed_tokens"), 64)?,
             layers,
             norm: w.require(&join(prefix, "norm.weight"))?.clone(),
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
@@ -80,10 +80,7 @@ impl QwenTextEncoder {
     /// Token embedding (f32): `input_ids` `[b, s]` int32 → `[b, s, hidden]`. Exposed so the VL
     /// encoder can splice vision embeds into the stream before running the layers.
     pub fn embed(&self, input_ids: &Array) -> Result<Array> {
-        Ok(self
-            .embed_tokens
-            .take_axis(input_ids, 0)?
-            .as_dtype(Dtype::Float32)?)
+        self.embed_tokens.forward(input_ids)
     }
 
     /// Run the decoder stack (RoPE + 28 layers + final RMSNorm) over pre-embedded `[b, s, hidden]`

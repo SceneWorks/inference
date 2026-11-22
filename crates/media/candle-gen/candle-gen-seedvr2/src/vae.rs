@@ -11,26 +11,26 @@ use candle_gen::candle_core::{Result, Tensor};
 use crate::config::VaeConfig;
 use crate::conv3d::CausalConv3d;
 use crate::nn;
-use crate::weights::Weights;
+use crate::weights::ModelWeights;
 
 type CResult<T> = candle_gen::Result<T>;
 
 /// `[out,in]`-weight dense layer (the VAE attention projections). Stores the weight pre-transposed to
 /// `[in,out]` so the per-forward matmul has no transpose/copy (sc-8997/F-017).
-struct Linear {
-    wt: Tensor,
-    b: Tensor,
-}
+struct Linear(candle_gen::quant::QLinear);
 impl Linear {
-    fn load(w: &Weights, prefix: &str) -> CResult<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?; // [out, in]
-        Ok(Self {
-            wt: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
+    fn load(w: &impl ModelWeights, prefix: &str) -> CResult<Self> {
+        use candle_gen::quant::{DenseLinear, QLinear};
+        if let Some(layer) = w.native_projection(prefix, true)? {
+            return Ok(Self(QLinear::from_dense(DenseLinear::Linear(layer))));
+        }
+        Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: nn::transpose_weight(&w.tensor(&format!("{prefix}.weight"))?)?,
+            bias: Some(w.tensor(&format!("{prefix}.bias"))?),
+        })))
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        __model_proof_output!(nn::linear(x, &self.wt, Some(&self.b)))
+        __model_proof_output!(self.0.forward(x))
     }
 }
 
@@ -52,8 +52,8 @@ struct ResnetBlock3d {
     eps: f64,
 }
 impl ResnetBlock3d {
-    fn load(w: &Weights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
-        let shortcut = if w.get(&format!("{prefix}.conv_shortcut.weight")).is_some() {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
+        let shortcut = if w.contains(&format!("{prefix}.conv_shortcut.weight")) {
             Some(CausalConv3d::load(
                 w,
                 &format!("{prefix}.conv_shortcut"),
@@ -65,11 +65,11 @@ impl ResnetBlock3d {
             None
         };
         Ok(Self {
-            norm1_w: w.require(&format!("{prefix}.norm1.weight"))?.clone(),
-            norm1_b: w.require(&format!("{prefix}.norm1.bias"))?.clone(),
+            norm1_w: w.tensor(&format!("{prefix}.norm1.weight"))?.clone(),
+            norm1_b: w.tensor(&format!("{prefix}.norm1.bias"))?.clone(),
             conv1: CausalConv3d::load(w, &format!("{prefix}.conv1"), (1, 1, 1), (1, 1, 1), false)?,
-            norm2_w: w.require(&format!("{prefix}.norm2.weight"))?.clone(),
-            norm2_b: w.require(&format!("{prefix}.norm2.bias"))?.clone(),
+            norm2_w: w.tensor(&format!("{prefix}.norm2.weight"))?.clone(),
+            norm2_b: w.tensor(&format!("{prefix}.norm2.bias"))?.clone(),
             conv2: CausalConv3d::load(w, &format!("{prefix}.conv2"), (1, 1, 1), (1, 1, 1), false)?,
             shortcut,
             groups: cfg.group_norm_groups,
@@ -102,10 +102,10 @@ struct Attention3d {
     eps: f64,
 }
 impl Attention3d {
-    fn load(w: &Weights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
         Ok(Self {
-            gn_w: w.require(&format!("{prefix}.group_norm.weight"))?.clone(),
-            gn_b: w.require(&format!("{prefix}.group_norm.bias"))?.clone(),
+            gn_w: w.tensor(&format!("{prefix}.group_norm.weight"))?.clone(),
+            gn_b: w.tensor(&format!("{prefix}.group_norm.bias"))?.clone(),
             to_q: Linear::load(w, &format!("{prefix}.to_q"))?,
             to_k: Linear::load(w, &format!("{prefix}.to_k"))?,
             to_v: Linear::load(w, &format!("{prefix}.to_v"))?,
@@ -165,7 +165,7 @@ struct Downsample3d {
     conv: CausalConv3d,
 }
 impl Downsample3d {
-    fn load(w: &Weights, prefix: &str, temporal: bool) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, temporal: bool) -> CResult<Self> {
         let (st, pt) = if temporal { (2, 1) } else { (1, 0) };
         Ok(Self {
             conv: CausalConv3d::load(w, &format!("{prefix}.conv"), (st, 2, 2), (pt, 0, 0), false)?,
@@ -186,7 +186,7 @@ struct Upsample3d {
     tf: usize,
 }
 impl Upsample3d {
-    fn load(w: &Weights, prefix: &str, temporal: bool) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, temporal: bool) -> CResult<Self> {
         Ok(Self {
             upscale_conv: CausalConv3d::load(
                 w,
@@ -226,7 +226,7 @@ struct DownBlock3d {
 }
 impl DownBlock3d {
     fn load(
-        w: &Weights,
+        w: &impl ModelWeights,
         prefix: &str,
         n: usize,
         temporal: bool,
@@ -268,7 +268,7 @@ struct UpBlock3d {
 }
 impl UpBlock3d {
     fn load(
-        w: &Weights,
+        w: &impl ModelWeights,
         prefix: &str,
         n: usize,
         temporal: bool,
@@ -308,7 +308,7 @@ struct MidBlock3d {
     resnet1: ResnetBlock3d,
 }
 impl MidBlock3d {
-    fn load(w: &Weights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &VaeConfig) -> CResult<Self> {
         Ok(Self {
             resnet0: ResnetBlock3d::load(w, &format!("{prefix}.resnets.0"), cfg)?,
             attn: Attention3d::load(w, &format!("{prefix}.attentions.0"), cfg)?,
@@ -333,7 +333,7 @@ struct Encoder3d {
     eps: f64,
 }
 impl Encoder3d {
-    fn load(w: &Weights, cfg: &VaeConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, cfg: &VaeConfig) -> CResult<Self> {
         let n = cfg.enc_layers_per_block;
         // down0 spatial-only; down1/down2 temporal; down3 no sampler.
         let down_blocks = vec![
@@ -346,8 +346,8 @@ impl Encoder3d {
             conv_in: CausalConv3d::load(w, "encoder.conv_in", (1, 1, 1), (1, 1, 1), false)?,
             down_blocks,
             mid: MidBlock3d::load(w, "encoder.mid_block", cfg)?,
-            norm_out_w: w.require("encoder.conv_norm_out.weight")?.clone(),
-            norm_out_b: w.require("encoder.conv_norm_out.bias")?.clone(),
+            norm_out_w: w.tensor("encoder.conv_norm_out.weight")?.clone(),
+            norm_out_b: w.tensor("encoder.conv_norm_out.bias")?.clone(),
             conv_out: CausalConv3d::load(w, "encoder.conv_out", (1, 1, 1), (1, 1, 1), false)?,
             groups: cfg.group_norm_groups,
             eps: cfg.group_norm_eps,
@@ -381,7 +381,7 @@ struct Decoder3d {
     eps: f64,
 }
 impl Decoder3d {
-    fn load(w: &Weights, cfg: &VaeConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, cfg: &VaeConfig) -> CResult<Self> {
         let n = cfg.dec_layers_per_block;
         // up0/up1 temporal; up2 spatial-only; up3 no sampler.
         let up_blocks = vec![
@@ -394,8 +394,8 @@ impl Decoder3d {
             conv_in: CausalConv3d::load(w, "decoder.conv_in", (1, 1, 1), (1, 1, 1), false)?,
             mid: MidBlock3d::load(w, "decoder.mid_block", cfg)?,
             up_blocks,
-            norm_out_w: w.require("decoder.conv_norm_out.weight")?.clone(),
-            norm_out_b: w.require("decoder.conv_norm_out.bias")?.clone(),
+            norm_out_w: w.tensor("decoder.conv_norm_out.weight")?.clone(),
+            norm_out_b: w.tensor("decoder.conv_norm_out.bias")?.clone(),
             conv_out: CausalConv3d::load(w, "decoder.conv_out", (1, 1, 1), (1, 1, 1), false)?,
             groups: cfg.group_norm_groups,
             eps: cfg.group_norm_eps,
@@ -428,7 +428,7 @@ pub struct Seedvr2Vae {
 }
 
 impl Seedvr2Vae {
-    pub fn from_weights(w: &Weights) -> CResult<Self> {
+    pub fn from_weights(w: &impl ModelWeights) -> CResult<Self> {
         let cfg = VaeConfig::seedvr2();
         Ok(Self {
             encoder: Encoder3d::load(w, &cfg)?,

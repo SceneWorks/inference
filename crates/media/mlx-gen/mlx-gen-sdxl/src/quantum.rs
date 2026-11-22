@@ -1445,6 +1445,7 @@ impl LinearWork {
             base: mlx_gen::adapters::LinearFacts {
                 base_shape: weight.shape.clone(),
                 is_quantized: false,
+                source_packed: false,
                 has_live_adapters: false,
                 adapter_count: 0,
                 bias_shape: bias.as_ref().map(|b| b.shape.clone()),
@@ -1596,6 +1597,7 @@ mod linear_dtype_cast_tests {
                     base: mlx_gen::adapters::LinearFacts {
                         base_shape: vec![2, 64],
                         is_quantized: true,
+                        source_packed: false,
                         has_live_adapters: false,
                         adapter_count: 0,
                         bias_shape: bias.map(|_| vec![2]),
@@ -1622,6 +1624,7 @@ mod linear_dtype_cast_tests {
                 base: mlx_gen::adapters::LinearFacts {
                     base_shape: vec![2, 64],
                     is_quantized: true,
+                    source_packed: false,
                     has_live_adapters: false,
                     adapter_count: 0,
                     bias_shape: Some(vec![3, 2]),

@@ -25,10 +25,11 @@ use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{LoadSpec, WeightsSource};
+use candle_audio::weights::AudioCheckpoint;
 use candle_audio::{AudioError, Result};
+use candle_nn::var_builder::SimpleBackend;
 use candle_nn::VarBuilder;
 
 use crate::config::{ModelConfig, StableAudioConfig};
@@ -236,7 +237,7 @@ impl SnapshotLayout {
         let root_backend = if metal {
             packed_metal_backend(&self.weights_path, root_dtype, device, None)?
         } else {
-            mmap_backend(&self.weights_path)?
+            mmap_backend(&self.weights_path, device)?
         };
         let root_backend = match adapters {
             Some(plan) if !plan.is_empty() => Box::new(crate::adapters::AdapterBackend::new(
@@ -305,51 +306,6 @@ fn packs_root_on_metal(kind: SnapshotKind) -> bool {
 /// The persisted shape is still verified against the requested shape before substituting, read from
 /// the safetensors header without touching the data, so this does not weaken the inventory check it
 /// exists to preserve.
-struct ZeroElementSafeMmap {
-    inner: MmapedSafetensors,
-}
-
-impl candle_nn::var_builder::SimpleBackend for ZeroElementSafeMmap {
-    fn get(
-        &self,
-        shape: candle_audio::candle_core::Shape,
-        name: &str,
-        hints: candle_nn::Init,
-        dtype: DType,
-        device: &Device,
-    ) -> candle_audio::candle_core::Result<Tensor> {
-        if shape.elem_count() == 0 {
-            let view = self.inner.get(name)?;
-            if view.shape() != shape.dims() {
-                return Err(candle_audio::candle_core::Error::Msg(format!(
-                    "{name}: persisted shape {:?} does not match the requested empty shape {:?}",
-                    view.shape(),
-                    shape.dims()
-                )));
-            }
-            return Tensor::zeros(shape, dtype, device);
-        }
-        candle_nn::var_builder::SimpleBackend::get(&self.inner, shape, name, hints, dtype, device)
-    }
-
-    fn get_unchecked(
-        &self,
-        name: &str,
-        dtype: DType,
-        device: &Device,
-    ) -> candle_audio::candle_core::Result<Tensor> {
-        let view = self.inner.get(name)?;
-        if view.shape().iter().product::<usize>() == 0 {
-            return Tensor::zeros(view.shape(), dtype, device);
-        }
-        candle_nn::var_builder::SimpleBackend::get_unchecked(&self.inner, name, dtype, device)
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        candle_nn::var_builder::SimpleBackend::contains_tensor(&self.inner, name)
-    }
-}
-
 fn mmap_builder(
     path: &Path,
     dtype: DType,
@@ -359,7 +315,7 @@ fn mmap_builder(
     let backend = if pack_on_metal && matches!(device, Device::Metal(_)) {
         packed_metal_backend(path, dtype, device, None)?
     } else {
-        mmap_backend(path)?
+        mmap_backend(path, device)?
     };
     Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
 }
@@ -369,11 +325,13 @@ fn mmap_builder(
 /// Split out so [`SnapshotLayout::full_pipeline_builders_with_adapters`] can interpose
 /// [`crate::adapters::AdapterBackend`] between the mmap and the builder. Nothing else changed: the
 /// no-adapter path composes exactly the same backend it always did.
-fn mmap_backend(path: &Path) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
+fn mmap_backend(
+    path: &Path,
+    device: &Device,
+) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
     // The returned backend owns its mmap for the lifetime of the 'static VarBuilder; the
     // caller-provisioned-file contract is `candle_audio::weights`'.
-    let safetensors = candle_audio::weights::mmap_safetensors(path)?;
-    Ok(Box::new(ZeroElementSafeMmap { inner: safetensors }))
+    Ok(Box::new(AudioCheckpoint::open(path, device)?))
 }
 
 /// Coalesce persisted weights into bounded shared-storage packs on Metal.
@@ -391,11 +349,10 @@ fn packed_metal_backend(
 ) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
     // All values are copied into owned Candle storage before this function returns; the
     // caller-provisioned-file contract is `candle_audio::weights`'.
-    let safetensors = candle_audio::weights::mmap_safetensors(path)?;
+    let safetensors = AudioCheckpoint::open(path, &Device::Cpu)?;
     let mut names = safetensors
-        .tensors()
+        .names()
         .into_iter()
-        .map(|(name, _)| name)
         .filter(|name| prefix.is_none_or(|prefix| name.starts_with(prefix)))
         .collect::<Vec<_>>();
     if names.is_empty() {
@@ -412,7 +369,7 @@ fn packed_metal_backend(
     let mut pending_elements = 0usize;
 
     for name in names {
-        let tensor = safetensors.load(&name, &Device::Cpu)?.to_dtype(dtype)?;
+        let tensor = safetensors.get_unchecked(&name, dtype, &Device::Cpu)?;
         let elements = tensor.elem_count();
         if !pending.is_empty() && pending_elements.saturating_add(elements) > max_elements {
             flush_weight_pack(&mut pending, &mut tensors, device)?;
@@ -799,7 +756,7 @@ mod tests {
     /// Stable Audio 3 checkpoints carry `bottleneck.noise_scaling_factor` as an empty `[1, 0, 1]`
     /// buffer. Candle's stock mmap backend cannot materialize that on an accelerator — Metal
     /// rejects the zero-byte buffer outright, and CUDA accepts the buffer but rejects the dtype
-    /// cast's zero-sized kernel launch. [`ZeroElementSafeMmap`] is the fix, and this is its control.
+    /// cast's zero-sized kernel launch. [`AudioCheckpoint`] is the fix, and this is its control.
     ///
     /// It also covers the requested dtype, because the CUDA half of the failure was in the *cast*:
     /// serializing F32 and requesting F16 is the exact combination that failed to load

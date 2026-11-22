@@ -11,7 +11,7 @@
 //! factored `(q·s)@(k·s)` + f32-softmax attention is reproduced by MLX SDPA(scale=dim_head^-0.5).
 
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::{matmul, multiply, split};
+use mlx_rs::ops::{multiply, split};
 use mlx_rs::Array;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -83,9 +83,9 @@ pub struct PerceiverAttentionCA {
     norm1_b: Array,
     norm2_w: Array, // over dim (image)
     norm2_b: Array,
-    to_q: Array,
-    to_kv: Array,
-    to_out: Array,
+    to_q: mlx_gen::adapters::AdaptableLinear,
+    to_kv: mlx_gen::adapters::AdaptableLinear,
+    to_out: mlx_gen::adapters::AdaptableLinear,
     heads: i32,
     dim_head: i32,
 }
@@ -97,9 +97,24 @@ impl PerceiverAttentionCA {
             norm1_b: w.require(&join(prefix, "norm1.bias"))?.clone(),
             norm2_w: w.require(&join(prefix, "norm2.weight"))?.clone(),
             norm2_b: w.require(&join(prefix, "norm2.bias"))?.clone(),
-            to_q: w.require(&join(prefix, "to_q.weight"))?.clone(),
-            to_kv: w.require(&join(prefix, "to_kv.weight"))?.clone(),
-            to_out: w.require(&join(prefix, "to_out.weight"))?.clone(),
+            to_q: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "to_q"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            to_kv: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "to_kv"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            to_out: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "to_out"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             heads,
             dim_head,
         })
@@ -122,8 +137,8 @@ impl PerceiverAttentionCA {
         let n_kv = x.shape()[1];
         let (h, hd) = (self.heads, self.dim_head);
 
-        let q = matmul(&lat, self.to_q.t())?; // [B, S, inner]
-        let kv = matmul(&x, self.to_kv.t())?; // [B, 32, inner*2]
+        let q = self.to_q.forward(&lat)?; // [B, S, inner]
+        let kv = self.to_kv.forward(&x)?; // [B, 32, inner*2]
         let parts = split(&kv, 2, 2)?;
         let to_heads = |t: &Array, n: i32| -> Result<Array> {
             Ok(t.reshape(&[b, n, h, hd])?.transpose_axes(&[0, 2, 1, 3])?)
@@ -137,7 +152,7 @@ impl PerceiverAttentionCA {
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, h * hd])?;
-        Ok(matmul(&out, self.to_out.t())?)
+        self.to_out.forward(&out)
     }
 }
 

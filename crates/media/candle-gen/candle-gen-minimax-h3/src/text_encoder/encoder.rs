@@ -84,8 +84,15 @@ impl Proj {
     }
 
     /// Load `{key}` — **packed** when `{key}.scales` is present, else dense at `dtype`.
-    fn load(w: &Weights, key: &str, dtype: DType) -> Result<Self> {
-        let loaded = crate::quant::lin(w, crate::quant::TEXT_ENCODER, key, false, dtype)?;
+    fn load(w: &Weights, key: &str, dtype: DType, shape: (usize, usize)) -> Result<Self> {
+        let loaded = crate::quant::lin_shaped(
+            w,
+            crate::quant::TEXT_ENCODER,
+            key,
+            false,
+            dtype,
+            Some(shape),
+        )?;
         Ok(Self {
             inner: loaded.linear,
             base_bytes: loaded.base_bytes,
@@ -175,10 +182,30 @@ impl Qwen3Attention {
             }
         }
         Ok(Self {
-            q_proj: Proj::load(w, &format!("{prefix}.q_proj"), dtype)?,
-            k_proj: Proj::load(w, &format!("{prefix}.k_proj"), dtype)?,
-            v_proj: Proj::load(w, &format!("{prefix}.v_proj"), dtype)?,
-            o_proj: Proj::load(w, &format!("{prefix}.o_proj"), dtype)?,
+            q_proj: Proj::load(
+                w,
+                &format!("{prefix}.q_proj"),
+                dtype,
+                (cfg.num_heads * cfg.head_dim, cfg.hidden_size),
+            )?,
+            k_proj: Proj::load(
+                w,
+                &format!("{prefix}.k_proj"),
+                dtype,
+                (cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
+            )?,
+            v_proj: Proj::load(
+                w,
+                &format!("{prefix}.v_proj"),
+                dtype,
+                (cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
+            )?,
+            o_proj: Proj::load(
+                w,
+                &format!("{prefix}.o_proj"),
+                dtype,
+                (cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+            )?,
             q_norm,
             k_norm,
             num_heads: cfg.num_heads,
@@ -241,11 +268,26 @@ impl Qwen3Mlp {
         Ok(copy)
     }
 
-    fn load(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         Ok(Self {
-            gate: Proj::load(w, &format!("{prefix}.gate_proj"), dtype)?,
-            up: Proj::load(w, &format!("{prefix}.up_proj"), dtype)?,
-            down: Proj::load(w, &format!("{prefix}.down_proj"), dtype)?,
+            gate: Proj::load(
+                w,
+                &format!("{prefix}.gate_proj"),
+                dtype,
+                (cfg.intermediate_size, cfg.hidden_size),
+            )?,
+            up: Proj::load(
+                w,
+                &format!("{prefix}.up_proj"),
+                dtype,
+                (cfg.intermediate_size, cfg.hidden_size),
+            )?,
+            down: Proj::load(
+                w,
+                &format!("{prefix}.down_proj"),
+                dtype,
+                (cfg.hidden_size, cfg.intermediate_size),
+            )?,
         })
     }
 
@@ -322,7 +364,7 @@ impl Qwen3DecoderLayer {
                 .require(&format!("{prefix}.post_attention_layernorm.weight"))?
                 .to_dtype(DType::F32)?,
             attn: Qwen3Attention::load(w, &format!("{prefix}.self_attn"), cfg, dtype)?,
-            mlp: Qwen3Mlp::load(w, &format!("{prefix}.mlp"), dtype)?,
+            mlp: Qwen3Mlp::load(w, &format!("{prefix}.mlp"), cfg, dtype)?,
             eps: cfg.rms_norm_eps,
         })
     }
@@ -493,7 +535,12 @@ impl MiniMaxH3TextEncoder {
         }
         // The store dtype is passed through so the gathered rows come back exactly as the dense path
         // produced them; `embed` widens to the compute dtype after the gather, not before.
-        let embed_tokens = crate::quant::embed(w, &format!("{prefix}.embed_tokens"), dtype)?;
+        let embed_tokens = crate::quant::embed_shaped(
+            w,
+            &format!("{prefix}.embed_tokens"),
+            dtype,
+            Some((cfg.vocab_size, cfg.hidden_size)),
+        )?;
         // A packed table is a `QTensor` with no `Tensor` to ask for a device, so the rotary table is
         // built on the device the *weights* are on — falling back to the `embed_tokens` weight
         // itself, which exists on both paths (a float table, or the u32 code stream) and is what a

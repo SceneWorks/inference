@@ -6,11 +6,12 @@
 //! `attention.{BasicTransformerBlock,TemporalBasicTransformerBlock}`. NHWC I/O.
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, matmul, multiply, sigmoid, split, subtract};
+use mlx_rs::ops::{add, broadcast_to, multiply, sigmoid, split, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_exact, group_norm, linear};
+use mlx_gen::nn::{gelu_exact, group_norm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -21,17 +22,21 @@ const GN_EPS: f32 = 1e-6;
 const LN_EPS: f32 = 1e-5;
 
 /// Load a `(weight, bias)` Linear.
-fn lin(w: &Weights, name: &str) -> Result<(Array, Array)> {
+fn norm_pair(w: &Weights, name: &str) -> Result<(Array, Array)> {
     Ok((
         w.require(&format!("{name}.weight"))?.clone(),
         w.require(&format!("{name}.bias"))?.clone(),
     ))
 }
 
+fn lin(w: &Weights, name: &str) -> Result<AdaptableLinear> {
+    mlx_gen::quant::lin(w, name, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
+}
+
 /// GEGLU feed-forward: `proj` is `ff.net.0.proj` (`[2·inner, D]`), split into value/gate halves;
 /// `out` is `ff.net.2`. `value · gelu(gate) → out`.
-fn geglu(x: &Array, proj: &(Array, Array), out: &(Array, Array)) -> Result<Array> {
-    let p = linear(x, &proj.0, &proj.1)?;
+fn geglu(x: &Array, proj: &AdaptableLinear, out: &AdaptableLinear) -> Result<Array> {
+    let p = proj.forward(x)?;
     // Split the fused `[..., 2·inner]` projection into the contiguous value/gate halves on-device.
     // `split(_, 2, last)` returns `[p[..0:inner], p[..inner:2·inner]]` — identical to the previous
     // `take_axis` gathers but without the per-call host index vectors + gather kernels in the hot
@@ -39,22 +44,29 @@ fn geglu(x: &Array, proj: &(Array, Array), out: &(Array, Array)) -> Result<Array
     let last = (p.shape().len() - 1) as i32;
     let halves = split(&p, 2, last)?;
     let y = multiply(&halves[0], &gelu_exact(&halves[1])?)?;
-    linear(&y, &out.0, &out.1)
+    out.forward(&y)
 }
 
 /// Multi-head attention: bias-free q/k/v, biased `to_out.0`, no mask. `head_dim = inner/heads`,
 /// `scale = head_dim^-0.5`. Self-attn passes `context == x`; cross-attn passes the memory.
 struct Attention {
-    q: Array,
-    k: Array,
-    v: Array,
-    out: (Array, Array),
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    out: AdaptableLinear,
     heads: i32,
 }
 
 impl Attention {
     fn from_weights(w: &Weights, prefix: &str, heads: i32) -> Result<Self> {
-        let req = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
+        let req = |n: &str| {
+            mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.{n}"),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )
+        };
         Ok(Self {
             q: req("to_q")?,
             k: req("to_k")?,
@@ -68,12 +80,12 @@ impl Attention {
     fn forward(&self, x: &Array, context: &Array) -> Result<Array> {
         let (b, lq) = (x.shape()[0], x.shape()[1]);
         let lk = context.shape()[1];
-        let q = matmul(x, self.q.t())?; // [B, Lq, inner]
+        let q = self.q.forward(x)?; // [B, Lq, inner]
         let inner = q.shape()[2];
         let head_dim = inner / self.heads;
         let scale = (head_dim as f32).powf(-0.5);
-        let k = matmul(context, self.k.t())?;
-        let v = matmul(context, self.v.t())?;
+        let k = self.k.forward(context)?;
+        let v = self.v.forward(context)?;
         let to_heads = |a: Array, n: i32| -> Result<Array> {
             Ok(a.reshape(&[b, n, self.heads, head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?)
@@ -83,7 +95,7 @@ impl Attention {
         let v = to_heads(v, lk)?;
         let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, lq, inner])?;
-        linear(&o, &self.out.0, &self.out.1)
+        self.out.forward(&o)
     }
 }
 
@@ -94,18 +106,18 @@ struct BasicBlock {
     norm2: (Array, Array),
     attn2: Attention,
     norm3: (Array, Array),
-    ff_proj: (Array, Array),
-    ff_out: (Array, Array),
+    ff_proj: AdaptableLinear,
+    ff_out: AdaptableLinear,
 }
 
 impl BasicBlock {
     fn from_weights(w: &Weights, prefix: &str, heads: i32) -> Result<Self> {
         Ok(Self {
-            norm1: lin(w, &format!("{prefix}.norm1"))?,
+            norm1: norm_pair(w, &format!("{prefix}.norm1"))?,
             attn1: Attention::from_weights(w, &format!("{prefix}.attn1"), heads)?,
-            norm2: lin(w, &format!("{prefix}.norm2"))?,
+            norm2: norm_pair(w, &format!("{prefix}.norm2"))?,
             attn2: Attention::from_weights(w, &format!("{prefix}.attn2"), heads)?,
-            norm3: lin(w, &format!("{prefix}.norm3"))?,
+            norm3: norm_pair(w, &format!("{prefix}.norm3"))?,
             ff_proj: lin(w, &format!("{prefix}.ff.net.0.proj"))?,
             ff_out: lin(w, &format!("{prefix}.ff.net.2"))?,
         })
@@ -125,28 +137,28 @@ impl BasicBlock {
 /// `is_res`) → self-attn → cross-attn → ff (+residual), then reshape back.
 struct TemporalBlock {
     norm_in: (Array, Array),
-    ffin_proj: (Array, Array),
-    ffin_out: (Array, Array),
+    ffin_proj: AdaptableLinear,
+    ffin_out: AdaptableLinear,
     norm1: (Array, Array),
     attn1: Attention,
     norm2: (Array, Array),
     attn2: Attention,
     norm3: (Array, Array),
-    ff_proj: (Array, Array),
-    ff_out: (Array, Array),
+    ff_proj: AdaptableLinear,
+    ff_out: AdaptableLinear,
 }
 
 impl TemporalBlock {
     fn from_weights(w: &Weights, prefix: &str, heads: i32) -> Result<Self> {
         Ok(Self {
-            norm_in: lin(w, &format!("{prefix}.norm_in"))?,
+            norm_in: norm_pair(w, &format!("{prefix}.norm_in"))?,
             ffin_proj: lin(w, &format!("{prefix}.ff_in.net.0.proj"))?,
             ffin_out: lin(w, &format!("{prefix}.ff_in.net.2"))?,
-            norm1: lin(w, &format!("{prefix}.norm1"))?,
+            norm1: norm_pair(w, &format!("{prefix}.norm1"))?,
             attn1: Attention::from_weights(w, &format!("{prefix}.attn1"), heads)?,
-            norm2: lin(w, &format!("{prefix}.norm2"))?,
+            norm2: norm_pair(w, &format!("{prefix}.norm2"))?,
             attn2: Attention::from_weights(w, &format!("{prefix}.attn2"), heads)?,
-            norm3: lin(w, &format!("{prefix}.norm3"))?,
+            norm3: norm_pair(w, &format!("{prefix}.norm3"))?,
             ff_proj: lin(w, &format!("{prefix}.ff.net.0.proj"))?,
             ff_out: lin(w, &format!("{prefix}.ff.net.2"))?,
         })
@@ -181,19 +193,19 @@ impl TemporalBlock {
 /// The full spatio-temporal transformer at one resolution.
 pub struct TransformerSpatioTemporal {
     norm: (Array, Array),
-    proj_in: (Array, Array),
+    proj_in: AdaptableLinear,
     blocks: Vec<BasicBlock>,
     temporal_blocks: Vec<TemporalBlock>,
     time_pos_embed: TimestepEmbedding,
     mix_factor: Array,
-    proj_out: (Array, Array),
+    proj_out: AdaptableLinear,
     in_channels: i32,
 }
 
 impl TransformerSpatioTemporal {
     /// `prefix` addresses the `attentions.{i}` module; `heads` is the block's head count.
     pub fn from_weights(w: &Weights, prefix: &str, heads: i32, num_layers: usize) -> Result<Self> {
-        let norm = lin(w, &format!("{prefix}.norm"))?;
+        let norm = norm_pair(w, &format!("{prefix}.norm"))?;
         let in_channels = norm.0.shape()[0];
         let blocks = (0..num_layers)
             .map(|i| {
@@ -243,7 +255,7 @@ impl TransformerSpatioTemporal {
 
         let residual = x.clone();
         let n = group_norm(x, &self.norm.0, &self.norm.1, GN_GROUPS, GN_EPS)?;
-        let mut tokens = linear(&n.reshape(&[bf, seq, c])?, &self.proj_in.0, &self.proj_in.1)?;
+        let mut tokens = self.proj_in.forward(&n.reshape(&[bf, seq, c])?)?;
 
         // Per-frame position embedding: arange(F) tiled over the batch.
         let nframes: Vec<f32> = (0..b)
@@ -264,7 +276,7 @@ impl TransformerSpatioTemporal {
             tokens = add(&multiply(&tokens, &alpha)?, &multiply(&mix, &one_minus)?)?;
         }
 
-        let tokens = linear(&tokens, &self.proj_out.0, &self.proj_out.1)?;
+        let tokens = self.proj_out.forward(&tokens)?;
         Ok(add(&tokens.reshape(&[bf, h_, w_, c])?, &residual)?)
     }
 }

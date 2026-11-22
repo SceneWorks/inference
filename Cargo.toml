@@ -41,6 +41,7 @@ members = [
     "crates/contracts/gen-core-tokenizer",
     "crates/contracts/gen-core-train",
     "crates/kernels/candle-quant-kernels",
+    "crates/layers/candle-checkpoint",
     "crates/layers/mlx-layers",
     "crates/layers/candle-layers",
     "crates/bundles/*",
@@ -54,6 +55,7 @@ members = [
 ]
 exclude = [
     "crates/media/candle-gen/vendor/candle-core",
+    "crates/media/candle-gen/vendor/candle-nn",
     "crates/media/candle-gen/vendor/candle-flash-attn",
     "crates/media/candle-gen/vendor/candle-kernels",
     "crates/media/candle-gen/vendor/candle-metal-kernels",
@@ -65,6 +67,7 @@ exclude = [
 # Internal packages are paths so a checkout has one contract package, one
 # provider registry, and no dependency on unpublished repository state.
 [workspace.dependencies]
+candle-checkpoint = { path = "crates/layers/candle-checkpoint" }
 sceneworks-gen-cv = { path = "crates/media/gen-cv" }
 sceneworks-load-progress = { path = "crates/contracts/load-progress" }
 core-llm = { path = "crates/contracts/core-llm" }
@@ -188,6 +191,7 @@ opt-level = 3
 # carry the same three entries.
 [patch."https://github.com/huggingface/candle"]
 candle-core = { path = "crates/media/candle-gen/vendor/candle-core" }
+candle-nn = { path = "crates/media/candle-gen/vendor/candle-nn" }
 candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }
 candle-metal-kernels = { path = "crates/media/candle-gen/vendor/candle-metal-kernels" }
 

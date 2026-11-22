@@ -18,7 +18,7 @@ use candle_core::{DType, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::attention::AttnMask;
-use crate::primitives::nn::{conv2d, gelu, layer_norm, linear};
+use crate::primitives::nn::{conv2d, gelu, layer_norm};
 use crate::primitives::{sdpa, Weights};
 
 /// Geometry of a SigLIP vision tower.
@@ -128,7 +128,7 @@ impl SiglipVisionTower {
         let p = |leaf: &str| join(prefix, leaf);
         let f32w = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(DType::F32)?) };
         let f32_opt = |key: &str| -> Result<Option<Tensor>> {
-            match w.get(key) {
+            match w.optional(key)? {
                 Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
                 None => Ok(None),
             }
@@ -244,14 +244,10 @@ impl SiglipEncoderLayer {
 }
 
 struct SiglipAttention {
-    q_w: Tensor,
-    q_b: Option<Tensor>,
-    k_w: Tensor,
-    k_b: Option<Tensor>,
-    v_w: Tensor,
-    v_b: Option<Tensor>,
-    out_w: Tensor,
-    out_b: Option<Tensor>,
+    q_w: crate::primitives::Projection,
+    k_w: crate::primitives::Projection,
+    v_w: crate::primitives::Projection,
+    out_w: crate::primitives::Projection,
     num_heads: usize,
     head_dim: usize,
     scale: f32,
@@ -259,25 +255,35 @@ struct SiglipAttention {
 
 impl SiglipAttention {
     fn from_weights(w: &Weights, prefix: &str, cfg: &SiglipVisionConfig) -> Result<Self> {
-        let f32w = |leaf: &str| -> Result<Tensor> {
-            Ok(w.require(&join(prefix, leaf))?.to_dtype(DType::F32)?)
-        };
         let bias = |leaf: &str| -> Result<Option<Tensor>> {
-            match w.get(&join(prefix, leaf)) {
-                Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+            let key = join(prefix, leaf);
+            match w.optional(&key)? {
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&key, DType::F32))?)),
                 None => Ok(None),
             }
         };
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q_w: f32w("q_proj.weight")?,
-            q_b: bias("q_proj.bias")?,
-            k_w: f32w("k_proj.weight")?,
-            k_b: bias("k_proj.bias")?,
-            v_w: f32w("v_proj.weight")?,
-            v_b: bias("v_proj.bias")?,
-            out_w: f32w("out_proj.weight")?,
-            out_b: bias("out_proj.bias")?,
+            q_w: w.linear(
+                &join(prefix, "q_proj.weight"),
+                DType::F32,
+                bias("q_proj.bias")?,
+            )?,
+            k_w: w.linear(
+                &join(prefix, "k_proj.weight"),
+                DType::F32,
+                bias("k_proj.bias")?,
+            )?,
+            v_w: w.linear(
+                &join(prefix, "v_proj.weight"),
+                DType::F32,
+                bias("v_proj.bias")?,
+            )?,
+            out_w: w.linear(
+                &join(prefix, "out_proj.weight"),
+                DType::F32,
+                bias("out_proj.bias")?,
+            )?,
             num_heads: cfg.num_attention_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -291,60 +297,42 @@ impl SiglipAttention {
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = to_heads(__model_proof_output!(linear(
-            x,
-            &self.q_w,
-            self.q_b.as_ref()
-        ))?)?;
-        let k = to_heads(__model_proof_output!(linear(
-            x,
-            &self.k_w,
-            self.k_b.as_ref()
-        ))?)?;
-        let v = to_heads(__model_proof_output!(linear(
-            x,
-            &self.v_w,
-            self.v_b.as_ref()
-        ))?)?;
+        let q = to_heads(__model_proof_output!(self.q_w.forward(x))?)?;
+        let k = to_heads(__model_proof_output!(self.k_w.forward(x))?)?;
+        let v = to_heads(__model_proof_output!(self.v_w.forward(x))?)?;
         // SigLIP attention is fully bidirectional — no mask, no softcap.
         let out = sdpa(&q, &k, &v, self.scale, None, AttnMask::None)?;
         let out = out
             .transpose(1, 2)?
             .reshape((b, n, self.num_heads * self.head_dim))?;
-        __model_proof_output!(linear(&out, &self.out_w, self.out_b.as_ref()))
+        __model_proof_output!(self.out_w.forward(&out))
     }
 }
 
 struct SiglipMlp {
-    fc1_w: Tensor,
-    fc1_b: Option<Tensor>,
-    fc2_w: Tensor,
-    fc2_b: Option<Tensor>,
+    fc1_w: crate::primitives::Projection,
+    fc2_w: crate::primitives::Projection,
 }
 
 impl SiglipMlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let f32w = |leaf: &str| -> Result<Tensor> {
-            Ok(w.require(&join(prefix, leaf))?.to_dtype(DType::F32)?)
-        };
         let bias = |leaf: &str| -> Result<Option<Tensor>> {
-            match w.get(&join(prefix, leaf)) {
-                Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+            let key = join(prefix, leaf);
+            match w.optional(&key)? {
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&key, DType::F32))?)),
                 None => Ok(None),
             }
         };
         Ok(Self {
-            fc1_w: f32w("fc1.weight")?,
-            fc1_b: bias("fc1.bias")?,
-            fc2_w: f32w("fc2.weight")?,
-            fc2_b: bias("fc2.bias")?,
+            fc1_w: w.linear(&join(prefix, "fc1.weight"), DType::F32, bias("fc1.bias")?)?,
+            fc2_w: w.linear(&join(prefix, "fc2.weight"), DType::F32, bias("fc2.bias")?)?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = __model_proof_output!(linear(x, &self.fc1_w, self.fc1_b.as_ref()))?;
+        let x = __model_proof_output!(self.fc1_w.forward(x))?;
         let x = gelu(&x)?; // gelu_pytorch_tanh
-        __model_proof_output!(linear(&x, &self.fc2_w, self.fc2_b.as_ref()))
+        __model_proof_output!(self.fc2_w.forward(&x))
     }
 }
 

@@ -15,12 +15,13 @@
 //! [`SiglipVisionConfig::default`] is the so400m-patch14-384 geometry; nothing here is
 //! JoyCaption-specific (the feature-layer choice lives with the VLM in [`crate::joycaption`]).
 
+use crate::primitives::Projection;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
 use crate::error::{Error, Result};
 use crate::primitives::attention::AttnMask;
-use crate::primitives::nn::{conv2d, gelu_tanh, layer_norm, linear};
+use crate::primitives::nn::{conv2d, gelu_tanh, layer_norm};
 use crate::primitives::sdpa;
 use crate::primitives::Weights;
 
@@ -216,14 +217,10 @@ impl SiglipEncoderLayer {
 }
 
 struct SiglipAttention {
-    q_w: Array,
-    q_b: Option<Array>,
-    k_w: Array,
-    k_b: Option<Array>,
-    v_w: Array,
-    v_b: Option<Array>,
-    out_w: Array,
-    out_b: Option<Array>,
+    q: Projection,
+    k: Projection,
+    v: Projection,
+    out: Projection,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -234,14 +231,30 @@ impl SiglipAttention {
         let bias = |leaf: &str| w.get(&join(prefix, leaf)).cloned();
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q_w: w.require(&join(prefix, "q_proj.weight"))?.clone(),
-            q_b: bias("q_proj.bias"),
-            k_w: w.require(&join(prefix, "k_proj.weight"))?.clone(),
-            k_b: bias("k_proj.bias"),
-            v_w: w.require(&join(prefix, "v_proj.weight"))?.clone(),
-            v_b: bias("v_proj.bias"),
-            out_w: w.require(&join(prefix, "out_proj.weight"))?.clone(),
-            out_b: bias("out_proj.bias"),
+            q: Projection::from_named(
+                w,
+                &join(prefix, "q_proj.weight"),
+                bias("q_proj.bias"),
+                None,
+            )?,
+            k: Projection::from_named(
+                w,
+                &join(prefix, "k_proj.weight"),
+                bias("k_proj.bias"),
+                None,
+            )?,
+            v: Projection::from_named(
+                w,
+                &join(prefix, "v_proj.weight"),
+                bias("v_proj.bias"),
+                None,
+            )?,
+            out: Projection::from_named(
+                w,
+                &join(prefix, "out_proj.weight"),
+                bias("out_proj.bias"),
+                None,
+            )?,
             num_heads: cfg.num_attention_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -255,42 +268,48 @@ impl SiglipAttention {
             Ok(a.reshape(&[b, n, self.num_heads, self.head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = to_heads(linear(x, &self.q_w, self.q_b.as_ref())?)?;
-        let k = to_heads(linear(x, &self.k_w, self.k_b.as_ref())?)?;
-        let v = to_heads(linear(x, &self.v_w, self.v_b.as_ref())?)?;
+        let q = to_heads(self.q.forward(x)?)?;
+        let k = to_heads(self.k.forward(x)?)?;
+        let v = to_heads(self.v.forward(x)?)?;
         // SigLIP attention is fully bidirectional — no mask.
         let out = sdpa(&q, &k, &v, self.scale, AttnMask::None)?;
         let out =
             out.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, n, self.num_heads * self.head_dim])?;
-        linear(&out, &self.out_w, self.out_b.as_ref())
+        self.out.forward(&out)
     }
 }
 
 struct SiglipMlp {
-    fc1_w: Array,
-    fc1_b: Option<Array>,
-    fc2_w: Array,
-    fc2_b: Option<Array>,
+    fc1: Projection,
+    fc2: Projection,
 }
 
 impl SiglipMlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            fc1_w: w.require(&join(prefix, "fc1.weight"))?.clone(),
-            fc1_b: w.get(&join(prefix, "fc1.bias")).cloned(),
-            fc2_w: w.require(&join(prefix, "fc2.weight"))?.clone(),
-            fc2_b: w.get(&join(prefix, "fc2.bias")).cloned(),
+            fc1: Projection::from_named(
+                w,
+                &join(prefix, "fc1.weight"),
+                w.get(&join(prefix, "fc1.bias")).cloned(),
+                None,
+            )?,
+            fc2: Projection::from_named(
+                w,
+                &join(prefix, "fc2.weight"),
+                w.get(&join(prefix, "fc2.bias")).cloned(),
+                None,
+            )?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let x = linear(x, &self.fc1_w, self.fc1_b.as_ref())?;
+        let x = self.fc1.forward(x)?;
         let x = gelu_tanh(
             &x,
             crate::primitives::activation::ActivationRole::VisionEncoder,
         )?;
-        linear(&x, &self.fc2_w, self.fc2_b.as_ref())
+        self.fc2.forward(&x)
     }
 }
 

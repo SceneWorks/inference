@@ -9,6 +9,7 @@ use candle_gen::{CandleError, Result};
 #[derive(Clone)]
 pub(crate) struct Policy {
     pub window: usize,
+    pub device: candle_gen::candle_core::Device,
     pub cancel: CancelFlag,
 }
 
@@ -59,6 +60,7 @@ impl RequestGuard {
                 Ok(Policy {
                     window,
                     cancel: request.cancel.clone(),
+                    device: device.clone(),
                 })
             })
             .transpose()?;
@@ -90,28 +92,42 @@ impl Drop for RequestGuard {
     }
 }
 
-/// Check source representation before any tensor is materialized. Native specialized bases
-/// currently refuse cross-device migration; their valid resident route remains available.
+/// Check the source representation across the exact shards opened by the window loader.
 pub(crate) fn component_supported(dir: &std::path::Path) -> Result<bool> {
+    use candle_gen::gen_core::weightsmeta::{self, Dtype};
     let files = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 streaming source")?;
+    let mut weights = std::collections::BTreeMap::new();
     for file in files {
-        let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&file)
-            .map_err(|error| CandleError::Msg(error.to_string()))?;
-        if headers.iter().any(|header| {
-            [
-                ".comfy_quant",
-                ".weight_codebook",
-                ".weight_s_rel",
-                ".weight_s_channel",
-                ".weight_scale",
-            ]
-            .iter()
-            .any(|suffix| header.name.ends_with(suffix))
-        }) {
-            return Ok(false);
+        for h in weightsmeta::safetensors_path_tensor_headers(&file)
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+        {
+            if weights.insert(h.name.clone(), h.dtype).is_some() {
+                return Err(CandleError::Msg(format!(
+                    "duplicate H3 source tensor {}",
+                    h.name
+                )));
+            }
         }
     }
-    Ok(true)
+    // A descriptor or scale may be in another shard. FP8 windows bind all original
+    // operands; the integer-specialized H3 operators still have a resident-only contract.
+    Ok(!weights.keys().any(|name| {
+        if [".weight_codebook", ".weight_s_rel", ".weight_s_channel"]
+            .iter()
+            .any(|s| name.ends_with(s))
+        {
+            return true;
+        }
+        [".comfy_quant", ".weight_scale"]
+            .iter()
+            .find_map(|s| name.strip_suffix(s))
+            .is_some_and(|base| {
+                !matches!(
+                    weights.get(format!("{base}.weight").as_str()),
+                    Some(Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                )
+            })
+    }))
 }
 
 #[cfg(test)]

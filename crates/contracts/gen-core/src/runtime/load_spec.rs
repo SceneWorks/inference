@@ -209,6 +209,10 @@ pub struct IdentityWeights {
 }
 
 impl LoadSpec {
+    pub(crate) fn has_source_guard(&self) -> bool {
+        self.prepared_file_pins.is_prepared() || self.source_inventory.is_some()
+    }
+
     /// Full borrowed-spec ownership, guarded BEFORE the existing Clone executes.
     /// The exhaustive owned-field/container law covers every field, including
     /// nested quality policies, prepared receipts and split/deep component maps.

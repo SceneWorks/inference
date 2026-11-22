@@ -716,14 +716,22 @@ mod tests {
         let (weights, receipt) =
             normalized_native_weights_with_receipt(&fp8, DeclaredLogicalShapes::NotInScope)
                 .unwrap();
-        let weight = mlx_gen::weights::to_f32(weights.require("img_in.weight").unwrap()).unwrap();
-        assert_eq!(weight.as_slice::<f32>(), [1.0, 2.0]);
+        let weight = weights.require("img_in.weight").unwrap();
+        assert_eq!(weight.dtype(), Dtype::Uint8);
+        assert_eq!(weight.as_slice::<u8>(), [0x38, 0x40]);
+        assert!(
+            mlx_gen::NativeProjection::from_weights(&weights, "img_in", false)
+                .unwrap()
+                .is_some()
+        );
         let bias = mlx_gen::weights::to_f32(weights.require("img_in.bias").unwrap()).unwrap();
         assert_eq!(bias.as_slice::<f32>(), [-1.0, 4.0]);
-        assert_eq!(receipt.residency.len(), 1);
-        assert_eq!(receipt.residency[0].codec_id, "fp8-e4m3-scalar-v1");
-        // fp8 → bf16 residency: twice the stored bytes, measured from the arrays.
-        assert_eq!(receipt.resident_bytes(), 2 * receipt.source_bytes);
+        assert_eq!(receipt.residency.len(), 2);
+        assert!(receipt
+            .residency
+            .iter()
+            .all(|r| r.codec_id == "fp8-e4m3-scalar-v1"));
+        assert_eq!(receipt.resident_bytes(), 2 + 4);
 
         // Foreign key: refuses naming the tensor.
         let foreign = dir.path().join("foreign-native.safetensors");
@@ -1063,25 +1071,22 @@ mod tests {
             logical.to_vec(),
             "a declared logical shape must unpad the 32-padded storage"
         );
-        // Dense residency is priced from the LOGICAL element count, not the padded one.
         assert_eq!(
             declared.resident_bytes(),
-            (logical[0] * logical[1] * 2) as u64
+            (stored.iter().product::<usize>() + scale_shape.iter().product::<usize>()) as u64
         );
-
-        // ...and the decoded array really is that shape, so the DiT's own architecture validation
-        // (which is what refused a genuine MXFP8 Krea before sc-20644) now accepts the tensor.
-        let (weights, _) =
+        let (weights, receipt) =
             normalized_native_weights_with_receipt(&path, DeclaredLogicalShapes::FromConfig(&cfg))
-                .expect("the mxfp8 layer decodes through the codec seam");
-        assert_eq!(
-            weights
-                .require("transformer_blocks.0.attn.to_q.weight")
-                .unwrap()
-                .shape(),
-            &[logical[0] as i32, logical[1] as i32],
-        );
-
+                .unwrap();
+        let bound = mlx_gen::NativeProjection::from_weights(
+            &weights,
+            "transformer_blocks.0.attn.to_q",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bound.shape(), [logical[0] as i32, logical[1] as i32]);
+        assert_eq!(receipt.resident_bytes(), declared.resident_bytes());
         // With no config in scope the pre-sc-20644 behaviour is unchanged: the stored padded shape.
         let undeclared = mlx_gen::logical_weights::plan_logical_weights(
             &path,
@@ -1257,7 +1262,10 @@ mod tests {
         );
         // Residency: fp8 layers double (→ bf16), dense rows keep their stored bytes. Summing the
         // two is the real relationship the blanket `2 * declared` was standing in for.
-        let fp8_source: u64 = fp8.iter().map(|tensor| tensor.source_bytes).sum();
+        let fp8_resident: u64 = fp8
+            .iter()
+            .map(|t| t.source_bytes * if t.shape.len() == 2 { 1 } else { 2 })
+            .sum();
         let dense_source: u64 = plan
             .tensors
             .iter()
@@ -1266,8 +1274,8 @@ mod tests {
             .sum();
         assert_eq!(
             plan.resident_bytes(),
-            2 * fp8_source + dense_source,
-            "fp8 → bf16 doubles; dense rows are byte-preserving"
+            fp8_resident + dense_source,
+            "matrix codes remain packed and non-matrix coefficients decode to BF16"
         );
         let (lazy, receipt) =
             normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
@@ -1507,24 +1515,6 @@ mod tests {
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
 
-        // ---- the whole dense-fallback residency sum, term by term (sc-20651) -------------------
-        //
-        // The sc-20651 campaign's FP8 admission refusal was diagnosed as this model omitting the 96
-        // `full_precision_matrix_mult: true` layers. It does not omit them, and this arithmetic is
-        // the disproof: every fp8 layer — fpmm or not — is decoded to bf16 by
-        // `mlx_gen::logical_weights::decode`'s `ScalarFp8` arm and priced at 2 bytes/element here,
-        // and the four terms below sum to the plan's own total with nothing left over.
-        //
-        // On `kreamania_variant1_fp8` the terms are:
-        //   96 fpmm fp8 layers      5_055_709_184 stored → ×2 → 10_111_418_368
-        //  160 plain fp8 layers     7_442_792_448 stored → ×2 → 14_885_584_896
-        //  174 dense bf16 rows                                     643_142_808  (byte-preserving)
-        //  256 weight_scale + 256 comfy_quant companions                     0  (consumed)
-        //                                                     = 25_640_146_072
-        //
-        // Mutation: drop the fpmm term (price those 96 layers at their stored fp8 bytes instead of
-        // the bf16 the decode materializes) and the total falls 5_055_709_184 short — this
-        // assertion reds, as does `receipt.resident_bytes() == plan.resident_bytes()`.
         let group_source = |fpmm_wanted: bool| -> u64 {
             fp8.iter()
                 .filter(|tensor| tensor.codec.full_precision_matrix_mult() == fpmm_wanted)
@@ -1545,14 +1535,10 @@ mod tests {
             .sum();
         assert_eq!(
             plan.resident_bytes(),
-            2 * fpmm_source + 2 * plain_fp8_source + dense_source + companion_resident,
-            "the fpmm layers are priced at the bf16 the dense fallback materializes, exactly like \
-             the plain fp8 ones — nothing about the flag removes the widening"
+            2 * fpmm_source + plain_fp8_source + dense_source + companion_resident,
+            "only full_precision_matrix_mult projections decode to BF16"
         );
-        assert_eq!(
-            companion_resident, 0,
-            "scale companions are consumed, not retained"
-        );
+        assert_eq!(companion_resident, 4 * (fp8.len() - fpmm) as u64);
         // Per-layer, not just in aggregate: every fpmm layer's own residency is 2× its stored bytes.
         assert!(
             fp8.iter()
@@ -1568,12 +1554,11 @@ mod tests {
 
         let (lazy, receipt) =
             normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
-                .expect("deferred read through the seam");
+                .unwrap();
         assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
-        assert!(
-            lazy.keys()
-                .all(|key| !key.ends_with(".comfy_quant") && !key.ends_with(".weight_scale")),
-            "companions are consumed, never remapped"
+        assert_eq!(
+            lazy.keys().filter(|k| k.ends_with(".weight_scale")).count(),
+            fp8.len() - fpmm
         );
         assert_eq!(
             receipt.materialization,

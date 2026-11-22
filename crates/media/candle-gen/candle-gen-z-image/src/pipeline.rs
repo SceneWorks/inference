@@ -802,16 +802,12 @@ impl Pipeline {
                 ));
             }
             candle_gen::check_cancel(cancel)?;
-            let map = crate::comfyui::normalize_fp8_map(
-                sources.transformer_map()?,
+            let vb = sources.builder(
+                crate::comfyui::CombinedComponent::Transformer,
                 self.dtype,
-                "z-image transformer",
+                &self.device,
             )?;
-            let map = crate::comfyui::remap_dit_comfyui_to_diffusers(map)?;
-            let mut dit = PackedDit::new(
-                &dit_cfg,
-                VarBuilder::from_tensors(map, self.dtype, &self.device),
-            )?;
+            let mut dit = PackedDit::new(&dit_cfg, vb)?;
             if !self.adapters.is_empty() {
                 crate::adapters::install_additive(&mut dit, &self.adapters)?;
             }
@@ -865,13 +861,12 @@ impl Pipeline {
     /// attention projections exactly as the historical resident aggregate did.
     pub(crate) fn load_vae(&self) -> Result<AutoEncoderKL> {
         if let Some(sources) = &self.comfyui {
-            let map =
-                crate::comfyui::normalize_fp8_map(sources.vae_map()?, self.dtype, "z-image VAE")?;
-            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
-            return Ok(AutoEncoderKL::new(
-                &VaeConfig::z_image(),
-                VarBuilder::from_tensors(map, self.dtype, &self.device),
-            )?);
+            let vb = sources.builder(
+                crate::comfyui::CombinedComponent::Vae,
+                self.dtype,
+                &self.device,
+            )?;
+            return Ok(AutoEncoderKL::new(&VaeConfig::z_image(), vb)?);
         }
         if self.component_is_packed("vae")? {
             Ok(AutoEncoderKL::new(
@@ -893,13 +888,12 @@ impl Pipeline {
     /// latent transfer; this is slower, but it is the quality-preserving constrained path.
     pub(crate) fn load_vae_cpu(&self) -> Result<AutoEncoderKL> {
         if let Some(sources) = &self.comfyui {
-            let map =
-                crate::comfyui::normalize_fp8_map(sources.vae_map()?, DType::F32, "z-image VAE")?;
-            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
-            return Ok(AutoEncoderKL::new(
-                &VaeConfig::z_image(),
-                VarBuilder::from_tensors(map, DType::F32, &Device::Cpu),
-            )?);
+            let vb = sources.builder(
+                crate::comfyui::CombinedComponent::Vae,
+                DType::F32,
+                &Device::Cpu,
+            )?;
+            return Ok(AutoEncoderKL::new(&VaeConfig::z_image(), vb)?);
         }
         let device = Device::Cpu;
         let vb = if self.component_is_packed("vae")? {
@@ -1055,14 +1049,14 @@ impl Pipeline {
             let sources = self.comfyui.as_ref().ok_or_else(|| {
                 CandleError::Msg("z-image text encoder source is unavailable".into())
             })?;
-            let map = crate::comfyui::normalize_fp8_map(
-                sources.text_encoder_map()?,
+            let vb = sources.builder(
+                crate::comfyui::CombinedComponent::TextEncoder,
                 self.dtype,
-                "z-image text encoder",
+                &self.device,
             )?;
             return Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
                 &TextEncoderConfig::z_image(),
-                VarBuilder::from_tensors(map, self.dtype, &self.device),
+                vb,
             )?)));
         };
 
@@ -1073,12 +1067,12 @@ impl Pipeline {
         if self.text_encoder_is_packed(source)? {
             return Ok(TextEnc::Packed(Box::new(PackedTe::new(
                 &TextEncoderConfig::z_image(),
-                self.text_encoder_vb(source, false)?,
+                self.text_encoder_vb(source)?,
             )?)));
         }
         Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
-            self.text_encoder_vb(source, true)?,
+            self.text_encoder_vb(source)?,
         )?)))
     }
 
@@ -1109,21 +1103,11 @@ impl Pipeline {
         Ok(candle_gen::quant::PackedConfig::from_config(&value).is_some())
     }
 
-    fn text_encoder_vb(
-        &self,
-        source: &WeightsSource,
-        normalize_dense_file: bool,
-    ) -> Result<VarBuilder<'static>> {
+    fn text_encoder_vb(&self, source: &WeightsSource) -> Result<VarBuilder<'static>> {
         match source {
             WeightsSource::Dir(path) => {
                 let files = candle_gen::sorted_safetensors(path, "z-image text encoder")?;
                 candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
-            }
-            WeightsSource::File(path) if normalize_dense_file => {
-                let map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)?;
-                let map =
-                    crate::comfyui::normalize_fp8_map(map, self.dtype, "z-image text encoder")?;
-                Ok(VarBuilder::from_tensors(map, self.dtype, &self.device))
             }
             WeightsSource::File(path) => {
                 candle_gen::mmap_var_builder(std::slice::from_ref(path), self.dtype, &self.device)
@@ -1210,10 +1194,11 @@ impl Pipeline {
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
         let vb = if let Some(sources) = &self.comfyui {
-            let map =
-                crate::comfyui::normalize_fp8_map(sources.vae_map()?, ENC_DTYPE, "z-image VAE")?;
-            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
-            VarBuilder::from_tensors(map, ENC_DTYPE, &self.device)
+            sources.builder(
+                crate::comfyui::CombinedComponent::Vae,
+                ENC_DTYPE,
+                &self.device,
+            )?
         } else if self.component_is_packed("vae")? {
             self.vae_vb_dequantized(ENC_DTYPE)?
         } else {

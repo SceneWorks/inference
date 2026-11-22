@@ -406,8 +406,7 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
         CheckpointCanonicalMappingRegistration {
             dialect: "comfyui",
             mapping_id: "flux2-comfyui-to-diffusers-v1",
-            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
-            plan_driven_backends: &[],
+            plan_driven_backends: &[CheckpointBackend::Candle],
         },
         // Plan-driven on Candle (sc-21485): `candle_gen_flux2::single_file` ships the
         // `LogicalKeyMapping` with this id — renames plus the declarative fused-QKV row slices

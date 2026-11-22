@@ -99,6 +99,24 @@ pub fn component_allocation(
     activation_width: u64,
     width: impl Fn(&SafetensorsTensorHeader) -> Option<u64>,
 ) -> Result<NativeComponentAllocation> {
+    component_allocation_with_fp8_policy(
+        path,
+        backend,
+        activation_width,
+        &gen_core::checkpoint_codec::DenseResidencyPolicy,
+        width,
+    )
+}
+
+/// Resolve the same FP8 geometry as the consuming backend, including forced high-precision layers
+/// and retained scales. The H3-specific integer workspace and Curve table accounting remain shared.
+pub fn component_allocation_with_fp8_policy(
+    path: &Path,
+    backend: NativeBackend,
+    activation_width: u64,
+    policy: &dyn gen_core::checkpoint_codec::CodecResidencyPolicy,
+    width: impl Fn(&SafetensorsTensorHeader) -> Option<u64>,
+) -> Result<NativeComponentAllocation> {
     if weightsmeta::safetensors_path_bytes(path) == 0 {
         return Ok(NativeComponentAllocation {
             resident_by_name: Vec::new(),
@@ -118,7 +136,30 @@ pub fn component_allocation(
         |h| h.name.ends_with(".comfy_quant"),
         4096,
     )?;
-    allocation_from_headers(&headers, &payloads, backend, activation_width, width)
+    let mut tables = Vec::new();
+    if headers.iter().any(is_fp8_operand) {
+        let mut files = Vec::new();
+        if path.is_dir() {
+            weightsmeta::collect_safetensors_files(path, &mut files)?;
+        } else {
+            files.push(path.to_owned());
+        }
+        files.sort();
+        for file in files {
+            if let Some(table) = weightsmeta::safetensors_path_quantization_metadata(file)? {
+                tables.push(table);
+            }
+        }
+    }
+    allocation_with_fp8(
+        &headers,
+        &payloads,
+        backend,
+        activation_width,
+        width,
+        policy,
+        &tables,
+    )
 }
 
 /// H3's packed audio axis is channel-major over both output channels.
@@ -169,6 +210,54 @@ pub fn allocation_from_headers(
     activation_width: u64,
     width: impl Fn(&SafetensorsTensorHeader) -> Option<u64>,
 ) -> Result<NativeComponentAllocation> {
+    allocation_with_fp8(
+        headers,
+        payloads,
+        backend,
+        activation_width,
+        width,
+        &gen_core::checkpoint_codec::DenseResidencyPolicy,
+        &[],
+    )
+}
+
+fn is_fp8_operand(h: &SafetensorsTensorHeader) -> bool {
+    matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+        && gen_core::checkpoint_codec::projection_companion_base(&h.name).is_none()
+}
+
+/// When both parameters are encoded, H3 supplies the role's compute dtype. A surviving
+/// ordinary weight or bias otherwise retains the checkpoint's mixed precision.
+pub fn encoded_head_width(
+    key: &str,
+    headers: &BTreeMap<&str, &SafetensorsTensorHeader>,
+) -> Option<u64> {
+    let (base, field) = key.rsplit_once('.')?;
+    if !matches!(field, "weight" | "bias") {
+        return None;
+    }
+    let keeps_fp32 = crate::h3_projection_keeps_fp32(base);
+    if !keeps_fp32 && !matches!(base, "context_embedder" | "norm_out.linear") {
+        return None;
+    }
+    let other = if field == "weight" { "bias" } else { "weight" };
+    let partner = headers.get(format!("{base}.{other}").as_str());
+    Some(
+        partner
+            .filter(|h| h.is_float())
+            .map_or(if keeps_fp32 { 4 } else { 2 }, |h| h.dtype.size() as u64),
+    )
+}
+
+fn allocation_with_fp8(
+    headers: &[SafetensorsTensorHeader],
+    payloads: &BTreeMap<String, Vec<u8>>,
+    backend: NativeBackend,
+    activation_width: u64,
+    width: impl Fn(&SafetensorsTensorHeader) -> Option<u64>,
+    policy: &dyn gen_core::checkpoint_codec::CodecResidencyPolicy,
+    tables: &[String],
+) -> Result<NativeComponentAllocation> {
     let by_name = headers
         .iter()
         .map(|h| (h.name.as_str(), h))
@@ -177,7 +266,40 @@ pub fn allocation_from_headers(
     let mut rotations = BTreeSet::new();
     let mut projections = Vec::new();
     let mut copied_native_companions = 0u64;
-    for h in headers {
+    let mut encoded_bytes = BTreeMap::new();
+    let mut native_fp8 = false;
+    if headers.iter().any(is_fp8_operand) {
+        use gen_core::checkpoint_codec::*;
+        let registry = CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied())
+            .map_err(|e| invalid(e.to_string()))?;
+        let selected = |name: &str| by_name.get(name).is_some_and(|h| is_fp8_operand(h));
+        if let Some(plan) =
+            plan_projection_source_headers(headers, payloads, selected, tables, &registry, policy)?
+        {
+            for t in plan.tensors {
+                let bytes = if t.residency.mode == ResidencyMode::Packed {
+                    native_fp8 = true;
+                    t.residency.resident_bytes
+                } else {
+                    let w = encoded_head_width(&t.physical_key, &by_name)
+                        .or_else(|| width(by_name[t.physical_key.as_str()]))
+                        .unwrap_or(activation_width);
+                    t.shape
+                        .iter()
+                        .try_fold(w, |a, &n| a.checked_mul(n as u64))
+                        .ok_or_else(|| invalid("FP8 materialized size overflow"))?
+                };
+                encoded_bytes.insert(t.physical_key, bytes);
+            }
+            for c in plan.companions {
+                encoded_bytes.insert(c.physical_key, c.resident_bytes);
+            }
+        }
+    }
+    for h in headers
+        .iter()
+        .filter(|h| !encoded_bytes.contains_key(&h.name))
+    {
         for suffix in [
             ".weight_scale",
             ".weight_s_rel",
@@ -205,7 +327,10 @@ pub fn allocation_from_headers(
     let mut resident_by_name = Vec::new();
     let mut adaln_bytes = 0u64;
     let mut table_bytes_per_timestep = 0u64;
-    for h in headers.iter().filter(|h| h.name.ends_with(".comfy_quant")) {
+    for h in headers
+        .iter()
+        .filter(|h| h.name.ends_with(".comfy_quant") && !encoded_bytes.contains_key(&h.name))
+    {
         let base = h.name.strip_suffix(".comfy_quant").unwrap();
         let payload = payloads
             .get(&h.name)
@@ -360,7 +485,9 @@ pub fn allocation_from_headers(
                 .strip_suffix(suffix)
                 .is_some_and(|base| affine.contains(base))
         });
-        let bytes = if packed {
+        let bytes = if let Some(&bytes) = encoded_bytes.get(&h.name) {
+            bytes
+        } else if packed {
             h.data_bytes
         } else if let Some(w) = width(h).filter(|_| h.is_float()) {
             h.materialized_bytes(w)?
@@ -401,7 +528,7 @@ pub fn allocation_from_headers(
                 .strip_suffix(suffix)
                 .is_some_and(|base| affine.contains(base))
         });
-        if native.contains(name) || packed || !h.is_float() {
+        if native.contains(name) || encoded_bytes.contains_key(name) || packed || !h.is_float() {
             continue;
         }
         if let Some(w) = width(h) {
@@ -423,13 +550,20 @@ pub fn allocation_from_headers(
             .checked_add(4 * g * g)
             .ok_or_else(|| invalid("rotation byte overflow"))?;
     }
-    if !projections.is_empty() {
+    if native_fp8 || !projections.is_empty() {
         if let NativeBackend::Candle {
             workspace_bytes, ..
         } = backend
         {
             resident_bytes = resident_bytes
                 .checked_add(workspace_bytes)
+                .and_then(|n| {
+                    if native_fp8 && projections.iter().any(|p| p.w4a8) {
+                        n.checked_add(workspace_bytes)
+                    } else {
+                        Some(n)
+                    }
+                })
                 .ok_or_else(|| invalid("workspace byte overflow"))?;
         }
     }
@@ -1040,8 +1174,15 @@ impl NativeAllocationFactsInternal for NativeAllocationFacts {
             .projections
             .iter()
             .fold(0u64, |n, p| n.saturating_add(p.descriptor_bytes));
+        let fp8 = task
+            .window
+            .as_ref()
+            .map(|w| w.fp8_precompute_bytes(rows))
+            .transpose()?
+            .unwrap_or(0);
         Ok(task.constructor_bytes.max(
             task.resident_bytes
+                .saturating_add(fp8)
                 .saturating_add(descriptors.max(refiner.max(tables.saturating_add(precompute)))),
         ))
     }
@@ -1099,6 +1240,84 @@ mod tests {
             dtype,
             shape: shape.to_vec(),
             data_bytes: (shape.iter().product::<usize>() * dtype.size()) as u64,
+        }
+    }
+    #[test]
+    fn fp8_heads_and_blocks_price_the_selected_layout_beside_integer_weights() {
+        use gen_core::checkpoint_codec::*;
+        struct Native;
+        impl CodecResidencyPolicy for Native {
+            fn residency(
+                &self,
+                _: &CheckpointCodecRegistration,
+                spec: &TensorCodecSpec,
+                _: &[usize],
+            ) -> ResidencyMode {
+                if spec.full_precision_matrix_mult() {
+                    ResidencyMode::Dense
+                } else {
+                    ResidencyMode::Packed
+                }
+            }
+        }
+        let (mut headers, payloads) = fixture(true, &[256]);
+        let base = "transformer_blocks.1.attn.to_q";
+        let weight = format!("{base}.weight");
+        let scale = format!("{base}.weight_scale");
+        headers.push(header(&weight, Dtype::F8_E4M3, &[16, 16]));
+        headers.push(header(&scale, Dtype::F32, &[16]));
+        headers.push(header("head.weight", Dtype::F8_E5M2, &[16, 16]));
+        for (policy, matrix_bytes, scales) in [
+            (&Native as &dyn CodecResidencyPolicy, 256, 64),
+            (&DenseResidencyPolicy, 1024, 0),
+        ] {
+            let actual =
+                allocation_with_fp8(&headers, &payloads, CUDA, 2, |_| Some(4), policy, &[])
+                    .unwrap();
+            let operands: BTreeMap<_, _> = actual.resident_by_name.into_iter().collect();
+            assert_eq!(operands[&weight], matrix_bytes);
+            assert_eq!(operands["head.weight"], matrix_bytes);
+            assert_eq!(operands[&scale], scales);
+            assert_eq!(actual.projections.len(), 1);
+        }
+    }
+    #[test]
+    fn mixed_head_fallback_prices_original_bias_or_weight_then_the_model_role() {
+        use gen_core::checkpoint_codec::DenseResidencyPolicy;
+        let headers = vec![
+            header("proj_in.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("proj_in.bias", Dtype::F32, &[3]),
+            header("time_embedder.linear_1.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("time_embedder.linear_1.bias", Dtype::F8_E5M2, &[3]),
+            header("context_embedder.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("context_embedder.bias", Dtype::F8_E5M2, &[3]),
+            header("proj_out.weight", Dtype::F16, &[3, 5]),
+            header("proj_out.bias", Dtype::F8_E5M2, &[3]),
+        ];
+        let allocation = allocation_with_fp8(
+            &headers,
+            &BTreeMap::new(),
+            CUDA,
+            2,
+            |_| None,
+            &DenseResidencyPolicy,
+            &[],
+        )
+        .unwrap();
+        let bytes: BTreeMap<_, _> = allocation.resident_by_name.into_iter().collect();
+        for base in [
+            "proj_in",
+            "time_embedder.linear_1",
+            "context_embedder",
+            "proj_out",
+        ] {
+            let width = if matches!(base, "proj_in" | "time_embedder.linear_1") {
+                4
+            } else {
+                2
+            };
+            assert_eq!(bytes[&format!("{base}.weight")], 15 * width);
+            assert_eq!(bytes[&format!("{base}.bias")], 3 * width);
         }
     }
     fn fixture(

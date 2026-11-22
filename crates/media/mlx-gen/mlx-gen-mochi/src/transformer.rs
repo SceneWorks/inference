@@ -167,9 +167,13 @@ fn linear_b(x: &Array, w: &Array, b: &Array) -> Result<Array> {
 /// path (`.scales` probe → `quantized_matmul`) on a single Linear slice.
 #[derive(Clone)]
 pub enum MochiLinear {
+    Native(mlx_gen::adapters::AdaptableLinear, Dtype),
     /// Dense base — `matmul(x, Wᵀ)` (`+ b` fused via `addmm` when biased). Bit-identical to the
     /// previous raw-`Array` path (f32 activations make `addmm == matmul + add`).
-    Dense { w: Array, b: Option<Array> },
+    Dense {
+        w: Array,
+        b: Option<Array>,
+    },
     /// Quantized base — `quantized_matmul` (fp32-accumulate) over the packed weight, then optional
     /// dense-bias add. Activations are cast to `compute` before the matmul, matching the Wan path
     /// (bf16 activations × quantized weights in production; f32 in the parity suites).
@@ -198,6 +202,9 @@ impl MochiLinear {
         quant: Option<MochiQuant>,
         dtype: Dtype,
     ) -> Result<Self> {
+        if let Some(native) = mlx_gen::quant::native_lin(w, prefix, bias)? {
+            return Ok(Self::Native(native, dtype));
+        }
         let wkey = format!("{prefix}.weight");
         let bkey = format!("{prefix}.bias");
         if let (Some(q), Some(scales)) = (quant, w.get(&format!("{prefix}.scales"))) {
@@ -233,6 +240,7 @@ impl MochiLinear {
     /// leave the f32 RoPE/norm stream) to this before the shared SDPA.
     pub fn compute_dtype(&self) -> Dtype {
         match self {
+            Self::Native(_, dtype) => *dtype,
             MochiLinear::Dense { w, .. } => w.dtype(),
             MochiLinear::Quant { compute, .. } => *compute,
         }
@@ -242,6 +250,7 @@ impl MochiLinear {
         match self {
             // Cast the (f32-stream) activation to the weight dtype so the matmul runs at the compute
             // precision (bf16 in production; a no-op in the f32 parity path — weight is f32 there).
+            Self::Native(native, dtype) => native.forward(&x.as_dtype(*dtype)?),
             MochiLinear::Dense { w, b } => {
                 let x = x.as_dtype(w.dtype())?;
                 match b {

@@ -232,6 +232,7 @@ fn routing_owner_tracks_widening_and_dmd_weight_replacement() {
     let _device = crate::cpu_test_device();
     let original = full(&[2, 2], 0.25).as_dtype(Dtype::Bfloat16).unwrap();
     let mut p = Projection {
+        native_compute: None,
         weight: original.clone(),
         bias: None,
         adapter: None,
