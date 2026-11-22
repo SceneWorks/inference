@@ -23,9 +23,97 @@ UUID = "GPU-a123bcde-4321-abcd-abcd-0123456789ab"
 REQUEST = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
            "cuda_device_uuid": UUID, "download_missing": True}
 DIAGNOSTIC = dict(REQUEST, cuda_device_uuid=comparison.WINDOWS_DEV_GPU, diagnostic="windows-dev-memory")
+APPLE_DIAGNOSTIC = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
+                    "runner": "nax", "download_missing": True, "diagnostic": comparison.APPLE_DEV_DIAGNOSTIC}
 
 
 class TerminalTests(unittest.TestCase):
+    def test_apple_diagnostic_uses_only_the_registered_dev_route_and_two_opposite_order_pairs(self):
+        self.assertIs(comparison.profile_for("mlx", APPLE_DIAGNOSTIC), ltx_mlx)
+        for overrides in ({"variant": "distilled"}, {"profile": "wan"}, {"runner": "nax-primary"},
+                          {"download_missing": False}):
+            with self.assertRaises(ValueError):
+                comparison.profile_for("mlx", {**APPLE_DIAGNOSTIC, **overrides})
+        with self.assertRaises(ValueError):
+            comparison.profile_for("candle-cuda", dict(DIAGNOSTIC, diagnostic=comparison.APPLE_DEV_DIAGNOSTIC))
+        self.assertEqual(comparison.sample_schedule(APPLE_DIAGNOSTIC),
+                         [("warmup-base", "base"), ("warmup-head", "head"),
+                          ("pair-1-base", "base"), ("pair-1-head", "head"),
+                          ("pair-2-head", "head"), ("pair-2-base", "base")])
+
+    def test_apple_diagnostic_overlay_only_times_existing_eval_and_reports_after_the_loop(self):
+        loop = b'''() -> Result<(Array, Array)> {
+    for i in 0..sigmas.len() - 1 {
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        mlx_rs::transforms::eval([&vlat, &alat])?;
+        on_step(i + 1);
+    }
+    Ok((vlat, alat))
+}
+'''
+        for arm in comparison.ARMS:
+            names = [b"pub fn " + name if arm == "base" else b"fn " + name + b"_with_scales"
+                     for name in (b"denoise_av_dev", b"denoise_av")]
+            source = b"\n".join(name + loop for name in names)
+            updated = ltx_mlx.instrument_steps(source, arm)
+            self.assertEqual(updated.count(b"transforms::eval("), source.count(b"transforms::eval("))
+            for stage, name in enumerate(names):
+                body = updated.split(name + b"(", 1)[1].split(b"\n}\n", 1)[0]
+                markers = (b"sga_graph_start =", b"let (sigma,", b"sga_eval_start =", b"transforms::eval(",
+                           b"sga_eval_end =", b"on_step(i + 1);\n    }", f"SGA_LTX_STEP {stage}".encode())
+                self.assertEqual(sorted(body.index(marker) for marker in markers),
+                                 [body.index(marker) for marker in markers])
+            with self.assertRaises(ValueError):
+                ltx_mlx.instrument_steps(source.replace(b"transforms::eval(", b"transforms::async_eval("), arm)
+
+    def test_apple_step_receipt_requires_all_exact_timings_within_each_native_stage(self):
+        steps, durations = [30, 3], [300, 30]
+        markers = [f"SGA_LTX_STEP {stage} {i} 1 2" for stage, count in enumerate(steps) for i in range(count)]
+        stages = ltx_mlx.read_step_timings(markers, steps, durations)
+        self.assertEqual(stages[0], {"stage_ns": 300, "steps": [{"host_graph_ns": 1, "eval_wall_ns": 2}] * 30})
+        self.assertEqual(stages[1], {"stage_ns": 30, "steps": [{"host_graph_ns": 1, "eval_wall_ns": 2}] * 3})
+        for lines in (markers[:-1], markers + markers[-1:], markers[::-1], markers + ["SGA_LTX_STEP malformed"]):
+            with self.assertRaisesRegex(ValueError, "step timings"):
+                ltx_mlx.read_step_timings(lines, steps, durations)
+        with self.assertRaisesRegex(ValueError, "exceed their synchronized stage"):
+            ltx_mlx.read_step_timings(markers, steps, [89, 30])
+
+    def test_apple_diagnostic_upload_replays_steps_and_cannot_claim_acceptance(self):
+        sample = {"identity": {"video": "same", "audio": "same"}, "timing": {"e2e_ns": 1000},
+                  "step_timings": [{"stage_ns": 100, "steps": [{"host_graph_ns": 10, "eval_wall_ns": 85}]}]}
+        observations = {name: sample for name, _ in comparison.APPLE_DIAGNOSTIC_SAMPLES}
+        arm = {"overlay_sha256": "fixture", "binary_sha256": "a" * 64, "preflight_stdout": "fixture",
+               "toolchain": {"rustc_version": "rustc fixture", "cargo_version": "cargo fixture"}}
+        contract = {"request": APPLE_DIAGNOSTIC, "base": {}, "head": {}, "policy": {},
+                    "overlay_sha256": {name: "fixture" for name in comparison.ARMS}}
+        receipt = {**contract, "run_id": "1", "run_attempt": "1", "files": {}, "accepted": False,
+                   "diagnostic_completed": True, "arms": {name: arm for name in comparison.ARMS},
+                   "diagnostic_result": comparison.summarize_apple_diagnostic(observations, None),
+                   "physical_claim": {"post_execution_verified": True}}
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            args = SimpleNamespace(output=root)
+            env = {"RUNNER_TEMP": str(root), "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}
+            path = root / "receipt.json"
+            with (patch.dict(comparison.os.environ, env), patch.object(comparison, "sample_limits", return_value={}),
+                  patch.object(comparison, "read_sample", return_value=sample),
+                  patch.object(comparison, "verify_assets"), patch.object(ltx_mlx, "preflight", return_value=None)):
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                comparison.verify(args, contract, ltx_mlx)
+                for changes in ({"accepted": True}, {"comparison_result": {}}, {"diagnostic_completed": False},
+                                {"arms": {"base": arm}}):
+                    path.write_text(json.dumps({**receipt, **changes}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "unscored and paired"):
+                        comparison.verify(args, contract, ltx_mlx)
+                forged = deepcopy(receipt)
+                forged["diagnostic_result"]["samples"]["pair-2-base"]["stages"][0]["steps"][0]["eval_wall_ns"] += 1
+                path.write_text(json.dumps(forged), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "does not reproduce"):
+                    comparison.verify(args, contract, ltx_mlx)
+        observations["pair-2-base"] = {**sample, "identity": {"video": "drift", "audio": "same"}}
+        with self.assertRaisesRegex(ValueError, "terminal output"):
+            comparison.summarize_apple_diagnostic(observations, None)
+
     def test_request_is_one_known_route_on_one_declared_device(self):
         self.assertIs(comparison.profile_for("candle-cuda", REQUEST), ltx)
         for request in (dict(REQUEST, variant="../nested"), dict(REQUEST, profile="../ltx25"),

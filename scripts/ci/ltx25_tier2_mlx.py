@@ -57,7 +57,39 @@ def package(backend):
     return "mlx-gen-ltx"
 
 
-def overlay(read, arm, backend, binary):
+def instrument_steps(source, arm):
+    samplers = (b"denoise_av_dev", b"denoise_av")
+    for stage, sampler in enumerate(samplers):
+        start = {"base": b"pub fn " + sampler, "head": b"fn " + sampler + b"_with_scales"}[arm] + b"("
+        if source.count(start) != 1:
+            raise ValueError(f"expected one native LTX step loop in {start!r}")
+        before, rest = source.split(start, 1)
+        stop = b"\n}\n"
+        body, after = rest.split(stop, 1)
+        loop = b"    for i in 0..sigmas.len() - 1 {"
+        body = edit_once(body, loop,
+                         b"    let mut sga_step_timings = Vec::with_capacity(sigmas.len() - 1);\n" + loop)
+        sigma = b"        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);"
+        body = edit_once(body, sigma, b"        let sga_graph_start = std::time::Instant::now();\n" + sigma)
+        evaluate = b"        mlx_rs::transforms::eval([&vlat, &alat])?;"
+        body = edit_once(body, evaluate,
+                         b"        let sga_eval_start = std::time::Instant::now();\n" + evaluate + b"\n"
+                         b"        let sga_eval_end = std::time::Instant::now();\n"
+                         b"        sga_step_timings.push((\n"
+                         b"            sga_eval_start.duration_since(sga_graph_start).as_nanos(),\n"
+                         b"            sga_eval_end.duration_since(sga_eval_start).as_nanos(),\n"
+                         b"        ));")
+        result = b"    Ok((vlat, alat))"
+        prefix = f"SGA_LTX_STEP {stage}".encode()
+        body = edit_once(body, result,
+                         b"    for (i, (host_graph_ns, eval_wall_ns)) in sga_step_timings.into_iter().enumerate() {\n"
+                         b'        println!("' + prefix + b' {i} {host_graph_ns} {eval_wall_ns}");\n'
+                         b"    }\n" + result)
+        source = before + start + body + stop + after
+    return source
+
+
+def overlay(read, arm, backend, binary, *, step_timing=False):
     source = f"crates/media/mlx-gen/{package(backend)}/src"
     pipeline = f"{source}/pipeline.rs"
     staging = f"{source}/model/staging.rs"
@@ -96,6 +128,8 @@ fn sga_ltx25_timer_end(start: std::time::Instant, video: &Array, audio: &Array,
     Ok(())
 }
 '''
+    if step_timing:
+        pipeline_data = instrument_steps(pipeline_data, arm)
     install = b'''                crate::adapters::apply_ltx25_adapters(
                     &mut transformer,
                     &self.adapters,
@@ -115,7 +149,23 @@ def preflight(stdout, variant):
     return {"case": CASE[variant], "steps": [STAGE1[variant], 3]}
 
 
-def observe(stdout, result, runner, variant):
+def read_step_timings(lines, steps, durations):
+    markers = [line for line in lines if line.startswith("SGA_LTX_STEP")]
+    matches = [re.fullmatch(r"SGA_LTX_STEP (0|1) (0|[1-9][0-9]?) ([1-9][0-9]{0,14}) ([1-9][0-9]{0,14})", line)
+               for line in markers]
+    rows = [tuple(map(int, match.groups())) for match in matches if match is not None]
+    if (len(rows) != len(markers)
+            or [row[:2] for row in rows] != [(stage, i) for stage, count in enumerate(steps) for i in range(count)]):
+        raise ValueError("missing, malformed or unordered MLX denoise step timings")
+    timings = [[{"host_graph_ns": graph, "eval_wall_ns": evaluate}
+                for index, _, graph, evaluate in rows if index == stage] for stage in range(len(steps))]
+    if any(sum(step["host_graph_ns"] + step["eval_wall_ns"] for step in stage) > duration
+           for stage, duration in zip(timings, durations, strict=True)):
+        raise ValueError("MLX denoise step timings exceed their synchronized stage span")
+    return [{"stage_ns": duration, "steps": stage} for stage, duration in zip(timings, durations, strict=True)]
+
+
+def observe(stdout, result, runner, variant, *, step_timing=False):
     if runner != "nax":
         raise ValueError("unexpected native LTX MLX runner route")
     lines = stdout.splitlines()
@@ -146,7 +196,11 @@ def observe(stdout, result, runner, variant):
             or type(audio["samples"]) is not int or audio["samples"] <= 0 or audio["samples"] % 2
             or not re.fullmatch(r"[0-9a-f]{64}", audio["f32_sha256"])):
         raise ValueError("native MLX LTX decoded image/audio receipt is malformed")
-    return {"identity": {"video": video, "audio": audio, "steps": steps,
-                         "adapter_targets": ADAPTER_TARGETS if variant == "dev" else 0},
-            "timing": {"e2e_ns": row["e2e_ns"], "denoise_ns_per_outer_step": sum(durations) / total,
-                       "base_ns_per_outer_step": durations[0] / steps[0], "refinement_ns_per_outer_step": durations[1] / steps[1]}}
+    observation = {"identity": {"video": video, "audio": audio, "steps": steps,
+                                "adapter_targets": ADAPTER_TARGETS if variant == "dev" else 0},
+                   "timing": {"e2e_ns": row["e2e_ns"], "denoise_ns_per_outer_step": sum(durations) / total,
+                              "base_ns_per_outer_step": durations[0] / steps[0],
+                              "refinement_ns_per_outer_step": durations[1] / steps[1]}}
+    if step_timing:
+        observation["step_timings"] = read_step_timings(lines, steps, durations)
+    return observation

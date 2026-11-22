@@ -3,6 +3,7 @@
 
 import argparse
 from dataclasses import asdict
+from functools import partial
 import importlib
 import json
 import os
@@ -33,6 +34,7 @@ WINDOWS_DEV_DIAGNOSTIC = "windows-dev-memory"
 WINDOWS_DEV_GPU = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
 WINDOWS_DEV_REPAIR = "713e73daf3af2ac0012a6606e750e90ae644091e"
 DIAGNOSTIC_SAMPLES = (("warmup-base", "base"),)
+APPLE_DEV_DIAGNOSTIC = "apple-dev-step-timing"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
             ("mlx", "ltx25"): "ltx25_tier2_mlx",
             ("candle-cuda", "z-image"): "z_image_tier2_fixture",
@@ -44,6 +46,7 @@ ORDER = (ARMS, tuple(reversed(ARMS)))
 SAMPLES = [(f"warmup-{arm}", arm) for arm in ARMS] + [
     (f"pair-{index+1}-{arm}", arm) for index in range(PAIRS) for arm in ORDER[index % len(ORDER)]
 ]
+APPLE_DIAGNOSTIC_SAMPLES = SAMPLES[:len(ARMS) * (1 + len(ORDER))]
 PREFLIGHT_SECONDS = 180
 
 
@@ -62,7 +65,10 @@ def profile_for(backend, request):
     if (backend == "mlx" and request[binding] != "nax") or (backend == "candle-cuda" and not
             re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request[binding])):
         raise ValueError("terminal route requires the secondary Mac or an exact physical CUDA UUID")
-    if diagnostic and (backend, request["profile"], request["variant"], request[binding], request["diagnostic"]) != (
+    if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
+        if (backend, request["profile"], request["variant"], request[binding]) != ("mlx", "ltx25", "dev", "nax"):
+            raise ValueError("Apple Dev timing diagnostic requires the registered MLX LTX Dev nax route")
+    elif diagnostic and (backend, request["profile"], request["variant"], request[binding], request["diagnostic"]) != (
             "candle-cuda", "ltx25", "dev", WINDOWS_DEV_GPU, WINDOWS_DEV_DIAGNOSTIC):
         raise ValueError("Windows Dev memory diagnostic requires the approved Candle LTX Dev CUDA device")
     module = importlib.import_module("scripts.ci." + PROFILES[backend, request["profile"]])
@@ -74,6 +80,8 @@ def profile_for(backend, request):
 
 
 def terminal_overlay(profile, backend, request, head):
+    if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
+        return partial(profile.overlay, step_timing=True), {}
     if (backend, request["profile"], request["variant"]) != ("candle-cuda", "ltx25", "dev"):
         return profile.overlay, {}
     diagnostic = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
@@ -97,7 +105,8 @@ def terminal_overlay(profile, backend, request, head):
 
 
 def sample_schedule(request):
-    return DIAGNOSTIC_SAMPLES if request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC else SAMPLES
+    return {WINDOWS_DEV_DIAGNOSTIC: DIAGNOSTIC_SAMPLES,
+            APPLE_DEV_DIAGNOSTIC: APPLE_DIAGNOSTIC_SAMPLES}.get(request.get("diagnostic"), SAMPLES)
 
 
 def plan(backend, request, head):
@@ -114,20 +123,26 @@ def plan(backend, request, head):
         load_policy(checked_policy)
     overlays = {}
     make_overlay, provenance = terminal_overlay(profile, backend, request, head)
-    diagnostic = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
-    sources = (("base", BASE),) if diagnostic else zip(ARMS, (BASE, head), strict=True)
+    baseline_only = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
+    sources = (("base", BASE),) if baseline_only else zip(ARMS, (BASE, head), strict=True)
     for arm, revision in sources:
         overlay = make_overlay(lambda path: subprocess.check_output(["git", "show", f"{revision}:{path}"],
                                cwd=ROOT, timeout=30), arm, backend, source_pair.PROOF_BIN)
         overlays[arm] = source_pair.overlay_identity(overlay)
     runner = proof.NAX_ROUTES[binding]["labels"] if backend == "mlx" else proof.RUNNERS[backend]
     profile_contract = profile.contract(request["variant"])
-    if diagnostic:
+    if "diagnostic" in request:
         del profile_contract["comparison"]
+    if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
+        profile_contract["diagnostic_measurement"] = {
+            "host_graph_ns": "from step sigma selection to entry to the existing MLX eval",
+            "eval_wall_ns": "wall time in the existing MLX eval, including dispatch and completion",
+            "stages": ["guided base", "refinement"], "step_index": "zero-based within stage",
+        }
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,
             "base": {"revision": BASE, "tree": paired.git(ROOT, "rev-parse", BASE + "^{tree}")},
-            ("diagnostic_source" if diagnostic else "head"): candidate, "overlay_sha256": overlays,
+            ("diagnostic_source" if baseline_only else "head"): candidate, "overlay_sha256": overlays,
             "expected_samples": [name for name, _ in sample_schedule(request)],
             **profile_contract, **provenance}
 
@@ -168,8 +183,9 @@ def read_sample(name, directory, profile, contract, *, upload=False):
         peaks.update(cuda_process_bytes=guard["peak_gpu_bytes"], cuda_pool_used_bytes=pool["poolUsedHighBytes"],
                      cuda_pool_reserved_bytes=pool["poolReservedHighBytes"])
     req = contract["request"]
+    options = {"step_timing": True} if req.get("diagnostic") == APPLE_DEV_DIAGNOSTIC else {}
     readback = profile.observe(file("stdout.log").read_text(encoding="utf-8"), file("result.json"),
-                               req[DEVICE_KEY[contract["backend"]]], req["variant"])
+                               req[DEVICE_KEY[contract["backend"]]], req["variant"], **options)
     measured_peaks = readback.get("peaks", {})
     if peaks.keys() & measured_peaks.keys():
         raise ValueError("terminal profile attempted to override an external peak observation")
@@ -180,13 +196,7 @@ def read_sample(name, directory, profile, contract, *, upload=False):
 def summarize(samples, preflight=None):
     if list(samples) != [name for name, _ in SAMPLES]:
         raise ValueError("terminal decision requires every frozen sample in exact execution order")
-    reference = samples["warmup-base"]
-    if "plan" in reference["identity"] and reference["identity"]["plan"] != preflight:
-        raise ValueError("terminal runtime changed the compiled preflight plan")
-    if "e2e_ns" not in reference["timing"] or any(
-           row["identity"] != reference["identity"] or row["timing"].keys() != reference["timing"].keys()
-           for row in samples.values()):
-        raise ValueError("terminal output or metric surface differed across paired and warmup samples")
+    reference = paired_reference(samples, preflight)
     metrics = {}
     for domain, compare in (("timing", compare_timing), ("peaks", compare_peaks)):
         metrics[domain] = {}
@@ -196,6 +206,25 @@ def summarize(samples, preflight=None):
     statuses = {item["status"] for domain in metrics.values() for item in domain.values()}
     status = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
     return {"status": status, "fidelity": reference["identity"], **metrics}
+
+
+def paired_reference(samples, preflight):
+    reference = samples["warmup-base"]
+    if "plan" in reference["identity"] and reference["identity"]["plan"] != preflight:
+        raise ValueError("terminal runtime changed the compiled preflight plan")
+    if "e2e_ns" not in reference["timing"] or any(
+           row["identity"] != reference["identity"] or row["timing"].keys() != reference["timing"].keys()
+           for row in samples.values()):
+        raise ValueError("terminal output or metric surface differed across paired and warmup samples")
+    return reference
+
+
+def summarize_apple_diagnostic(samples, preflight):
+    if list(samples) != [name for name, _ in APPLE_DIAGNOSTIC_SAMPLES]:
+        raise ValueError("Apple Dev timing diagnostic requires both warmups and both opposite-order pairs")
+    return {"fidelity": paired_reference(samples, preflight)["identity"],
+            "samples": {name: {"e2e_ns": row["timing"]["e2e_ns"], "stages": row["step_timings"]}
+                        for name, row in samples.items()}}
 
 
 def require_sm120(uuid):
@@ -243,7 +272,8 @@ def execute(args, contract, profile):
     work_root = source_pair.attempt_work_root(env, args.backend)
     artifact = proof.owned_output(args.output, tmp)
     request = contract["request"]
-    diagnostic = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
+    diagnostic = request.get("diagnostic")
+    baseline_only = diagnostic == WINDOWS_DEV_DIAGNOSTIC
     samples = sample_schedule(request)
     receipt = {**contract, **identity, "accepted": False, "arms": {}, "files": {}}
     if diagnostic:
@@ -251,7 +281,7 @@ def execute(args, contract, profile):
     proof.write_json(artifact / "receipt.json", receipt)
     work = work_root / f"sga-terminal-{identity['run_id']}-{identity['run_attempt']}"
     baseline = ROOT / "sga-terminal-baseline"
-    sources = {"base": baseline} if diagnostic else {"base": baseline, "head": ROOT}
+    sources = {"base": baseline} if baseline_only else {"base": baseline, "head": ROOT}
     proof.unlinked_path(work, work_root)
     work.mkdir()
     try:
@@ -275,7 +305,7 @@ def execute(args, contract, profile):
             child_env.update(CUDA_VISIBLE_DEVICES=binding, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUBLAS_WORKSPACE_CONFIG=":4096:8",
                              SCENEWORKS_CUDA_PROOF_POOL_BYTES=str(contract["settings"]["pool_cap_bytes"]))
         executables, preflight_rows = {}, []
-        controller = contract["diagnostic_source" if diagnostic else "head"]
+        controller = contract["diagnostic_source" if baseline_only else "head"]
         make_overlay, _ = terminal_overlay(profile, args.backend, request, controller["revision"])
         for arm, origin in sources.items():
             arm_env = child_env.copy()
@@ -290,7 +320,7 @@ def execute(args, contract, profile):
                 raise ValueError("terminal constructor preflight exceeded its retained metadata limit")
             preflight_rows.append(profile.preflight(preflight.stdout, variant))
             receipt["arms"][arm]["preflight_stdout"] = preflight.stdout
-        if not diagnostic:
+        if not baseline_only:
             if preflight_rows[0] != preflight_rows[1]:
                 raise ValueError("terminal source arms resolved different preflight metadata")
             if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
@@ -331,6 +361,8 @@ def execute(args, contract, profile):
                 or profile.staged_assets(variant, model_hub, stage=False) != (snapshot, receipt["assets"])):
             raise ValueError("terminal physical release or staged model asset identity changed")
         if diagnostic:
+            if diagnostic == APPLE_DEV_DIAGNOSTIC:
+                receipt["diagnostic_result"] = summarize_apple_diagnostic(observations, preflight_rows[0])
             receipt["diagnostic_completed"] = True
         else:
             receipt["comparison_result"] = summarize(observations, preflight_rows[0])
@@ -349,6 +381,7 @@ def execute(args, contract, profile):
             receipt["accepted"] = False
             if diagnostic:
                 receipt["diagnostic_completed"] = False
+                receipt.pop("diagnostic_result", None)
             receipt["cleanup_failed"] = True
             raise
         finally:
@@ -372,15 +405,25 @@ def verify(args, contract, profile):
         path = source_pair.bounded_owned_file(args.output / name, tmp, allowed[name])
         if path.stat().st_size != item["bytes"] or sha(path) != item["sha256"]:
             raise ValueError("terminal upload artifact changed")
-    if contract["request"].get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC:
+    diagnostic = contract["request"].get("diagnostic")
+    if diagnostic == WINDOWS_DEV_DIAGNOSTIC:
         verify_diagnostic(args, contract, profile, receipt, set(allowed))
         return
-    if not receipt["accepted"]:
+    apple_diagnostic = diagnostic == APPLE_DEV_DIAGNOSTIC
+    if apple_diagnostic:
+        completed = receipt.get("diagnostic_completed")
+        if (receipt["accepted"] or {"comparison", "comparison_result", "diagnostic_source"} & receipt.keys()
+                or type(completed) is not bool or ("diagnostic_result" in receipt) != completed
+                or (completed and set(receipt["arms"]) != set(ARMS))):
+            raise ValueError("Apple Dev timing diagnostic receipt must remain unscored and paired")
+        if not completed:
+            return
+    elif not receipt["accepted"]:
         return
     verify_assets(contract, receipt.get("assets"))
-    required = set(allowed) - {f"{name}.guard.jsonl" for name, _ in SAMPLES}
+    required = set(allowed) - {f"{name}.guard.jsonl" for name, _ in samples}
     if not required <= receipt["files"].keys() or receipt["physical_claim"].get("post_execution_verified") is not True:
-        raise ValueError("accepted terminal receipt lacks exact supervised sample evidence")
+        raise ValueError("completed terminal receipt lacks exact supervised sample evidence")
     preflight_rows = []
     for arm in ARMS:
         build = receipt["arms"][arm]
@@ -390,7 +433,11 @@ def verify(args, contract, profile):
         raise ValueError("retained terminal source arms resolved different preflight metadata")
     if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
         raise ValueError("terminal artifact compiler identity changed")
-    observations = {name: read_sample(name, args.output, profile, contract, upload=True) for name, _ in SAMPLES}
+    observations = {name: read_sample(name, args.output, profile, contract, upload=True) for name, _ in samples}
+    if apple_diagnostic:
+        if summarize_apple_diagnostic(observations, preflight_rows[0]) != receipt["diagnostic_result"]:
+            raise ValueError("terminal upload does not reproduce its Apple Dev timing observations")
+        return
     verified = summarize(observations, preflight_rows[0])
     if verified != receipt["comparison_result"] or verified["status"] != "pass":
         raise ValueError("terminal upload does not reproduce its acceptance decision")
