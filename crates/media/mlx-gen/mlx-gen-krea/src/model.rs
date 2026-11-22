@@ -1414,7 +1414,9 @@ impl Krea {
                 Some(&compiled)
             }
             None if self.descriptor.id == KREA_2_TURBO_ID => {
-                compiled = compile_turbo_plan(&self.descriptor, &self.file_pin_spec, req)?;
+                // This plan stays inside the loaded generator. In particular, a
+                // direct caller may have omitted file pins for its PiD or adapters.
+                compiled = compile_turbo_plan(&self.descriptor, req, None)?;
                 Some(&compiled)
             }
             None => None,
@@ -2049,28 +2051,30 @@ fn resolve_krea_trajectory(
 
 fn compile_turbo_plan(
     descriptor: &ModelDescriptor,
-    spec: &LoadSpec,
     req: &GenerationRequest,
+    admitted_load: Option<&LoadSpec>,
 ) -> Result<RenderPlan> {
     let reference_strength =
         resolve_img2img_reference(descriptor.id, req)?.map(|(_, strength)| strength);
     let trajectory =
         resolve_krea_trajectory(req, false, krea_steps(req, false), reference_strength)?;
     let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
-    Ok(RenderPlan::packed_image_trajectory_with_exact_load(
-        descriptor,
-        spec,
-        req,
-        gen_core::render::PackedImagePass {
-            pixel_stride: RES_MULTIPLE,
-            token_width: 64,
-            sampler: solver.name(),
-            guidance: req.guidance.unwrap_or(0.0),
-            sigmas: trajectory.sigmas[trajectory.start_step..].to_vec(),
-            executed_steps: trajectory.executed_steps(),
-            capture_sigma: trajectory.capture_sigma,
-        },
-    )?)
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: RES_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance: req.guidance.unwrap_or(0.0),
+        sigmas: trajectory.sigmas[trajectory.start_step..].to_vec(),
+        executed_steps: trajectory.executed_steps(),
+        capture_sigma: trajectory.capture_sigma,
+    };
+    let plan = match admitted_load {
+        Some(spec) => {
+            RenderPlan::packed_image_trajectory_with_exact_load(descriptor, spec, req, pass)
+        }
+        None => RenderPlan::packed_image_trajectory(descriptor, req, pass),
+    }?;
+    Ok(plan)
 }
 
 pub(crate) fn compile_turbo_render_plan(
@@ -2085,7 +2089,7 @@ pub(crate) fn compile_turbo_render_plan(
         validate_base_krea_load_axes(spec, descriptor.id)?;
         mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor)?;
     }
-    Ok(Some(compile_turbo_plan(&descriptor, spec, req)?))
+    Ok(Some(compile_turbo_plan(&descriptor, req, Some(spec))?))
 }
 
 fn compile_multiphase_plan(
@@ -2500,6 +2504,69 @@ mod tests {
             applied_adapter_controls(&source),
             applied_adapter_controls(&reversed)
         );
+    }
+
+    #[test]
+    fn direct_turbo_generation_preserves_unprepared_file_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = footprint_snapshot(&dir);
+        let adapter = dir.path().join("adapter.safetensors");
+        write_minimal_safetensors(&adapter);
+        let pid = dir.path().join("pid.safetensors");
+        write_minimal_safetensors(&pid);
+        let base =
+            LoadSpec::new(WeightsSource::Dir(root)).with_offload_policy(OffloadPolicy::Sequential);
+        let with_adapter = base.clone().with_adapters(vec![AdapterSpec::new(
+            adapter,
+            0.75,
+            mlx_gen::AdapterKind::Lora,
+        )]);
+        let with_pid = base.with_pid(
+            WeightsSource::File(pid),
+            WeightsSource::Dir(dir.path().join("gemma")),
+        );
+        let registry = crate::provider_registry().unwrap();
+        let request = GenerationRequest {
+            prompt: "a canceled Turbo render".into(),
+            width: 256,
+            height: 256,
+            seed: Some(5),
+            ..Default::default()
+        };
+        // The ordinary request must cross planning and reach cancellation before
+        // the deferred residency touches text, transformer, VAE or PiD weights.
+        request.cancel.cancel();
+        let mut progress = |_| panic!("canceled request must not start loading weights");
+        for spec in [with_adapter, with_pid] {
+            let generator = load(&spec).unwrap();
+            assert!(matches!(
+                generator.generate(&request, &mut progress),
+                Err(gen_core::Error::Canceled)
+            ));
+            let error = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &spec, &request)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("require finalized file source pins"));
+
+            let mut prepared = spec;
+            prepared.prepare_file_sources().unwrap();
+            let plan = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &prepared, &request)
+                .unwrap()
+                .unwrap();
+            assert!(generator
+                .generate_planned(&request, &plan, None, &mut progress)
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("different model or adapter stack")));
+            let generator = load(&prepared).unwrap();
+            assert!(matches!(
+                generator.generate_planned(&request, &plan, None, &mut progress),
+                Err(gen_core::Error::Canceled)
+            ));
+        }
     }
 
     #[test]
