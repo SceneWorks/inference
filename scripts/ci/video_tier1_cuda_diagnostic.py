@@ -5,6 +5,7 @@ import subprocess
 import time
 
 from scripts.ci import video_tier1_cohorts as cohorts
+from scripts.ci.wan_pair import production_timing
 
 NAME = "sw-6954-targeted-cuda-v1"
 MANIFEST = "scripts/ci/video_tier1_cuda_diagnostic_retained.json"
@@ -110,8 +111,8 @@ MOCHI_GPU0_HISTORY = {
     "archive_sha256": "ff6853ec2c7d57b96ff835ac8bb864a254eb5fce6ad8c56909e0cc5ae7f1b745",
     "retained_passing_slots": {"cuda-mochi-masked-euler": [2], "cuda-svd-euler-cfg": [2]},
 }
-GPU0_CONTINUATIONS = (GPU0_TIMING, GPU0_MEMORY, MOCHI_P1)
-TIMING_CONTINUATIONS = (TIMING_CONTINUATION, GPU0_TIMING)
+GPU0_CONTINUATIONS = (GPU0_TIMING, GPU0_MEMORY, MOCHI_P1, production_timing.NAME)
+TIMING_CONTINUATIONS = (TIMING_CONTINUATION, GPU0_TIMING, production_timing.NAME)
 MEMORY_CONTINUATIONS = (MEMORY_CONTINUATION, GPU0_MEMORY, MOCHI_P1)
 CONTINUATIONS = (*TIMING_CONTINUATIONS, *MEMORY_CONTINUATIONS)
 # Recorded GPU0 inventory from the two-card Windows real-weights host.

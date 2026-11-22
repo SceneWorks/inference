@@ -22,6 +22,7 @@ from scripts.ci import video_tier1_cohorts as cohorts
 from scripts.ci import video_tier1_evidence as evidence
 from scripts.ci import video_tier1_followup as followup
 from scripts.ci import video_tier1_cuda_diagnostic as targeted
+from scripts.ci.wan_pair import production_timing
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.media_campaign_supervisor import load_policy, runtime_guarded_admission, validate_admission
@@ -65,6 +66,9 @@ def schedule(case, extension=None):
     for group, slots, repeats in groups:
         for slot in slots:
             order = ARMS if slot % 2 else ARMS[::-1]
+            if extension and extension["name"] == production_timing.NAME:
+                # AB BA BA AB: balance first position and same/switch predecessors over blocks.
+                order = ARMS if slot % 4 in (0, 1) else ARMS[::-1]
             prefix = f"{case}-{group}" if group else case
             for arm in order:
                 yield slot, arm, f"{prefix}-p{slot}-{arm}", repeats
@@ -93,6 +97,11 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
         raise ValueError("expected a fixed video Tier 1 proof selection")
     selection = value["selection"]
     base = BASE if selection == SELECTION else cohorts.VIDEO_BASE
+    production = value.get("followup") == production_timing.NAME
+    if production:
+        if backend != "candle-cuda" or selection != SELECTION or os.environ.get("GITHUB_RUN_ATTEMPT", "1") != "1":
+            raise ValueError("Wan production timing requires the first attempt on CUDA GPU0")
+        base = production_timing.BASE
     if base != value["base"] or head == base:
         raise ValueError("comparison requires its trusted distinct migration base")
     cases = cohorts.cases(selection, backend)
@@ -100,7 +109,14 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     subprocess.run(["git", "merge-base", "--is-ancestor", base, head], cwd=ROOT, check=True)
     engine_head, extension = head, None
     extra_contract = {}
-    if "followup" in value:
+    if production:
+        subprocess.run(["git", "merge-base", "--is-ancestor", production_timing.FEATURE, head], cwd=ROOT, check=True)
+        _, _, prior = followup.bind(head, backend, selection, tracked, value["policy"], production_timing.NAME)
+        cases = [production_timing.CASE]
+        extension = production_timing.bind(prior, targeted.GPU0_HARDWARE, targeted.TIMING_CALLS[cases[0]],
+                                           targeted.CONTINUATION_PAIRS)
+        extra_contract = {"followup": extension, "controller_revision": head, "controller_tree": source["tree"]}
+    elif "followup" in value:
         cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"], value["followup"])
         if value["followup"] in targeted.DIAGNOSTICS:
             cases, extension = targeted.bind(head, backend, selection, tracked, extension)
@@ -250,7 +266,10 @@ def overlay_source(head, backend, arm):
 
 def compiled_overlay(head, backend, arm, model, engine_head, extension):
     module, blob, edits = cohorts.overlay_files(head, backend, arm, model, tracked, overlay_source, engine_head=engine_head)
-    if extension and extension["name"] in targeted.CONTINUATIONS:
+    if extension and extension["name"] == production_timing.NAME:
+        original = targeted.TARGETED_HISTORY[SELECTION]["measured_targets"][arm]["wan"]["module_sha256"]
+        blob = production_timing.prepare_overlay(arm, blob, original, tracked(head, targeted.CONDITIONING_TEMPLATE))
+    elif extension and extension["name"] in targeted.CONTINUATIONS:
         previous = extension["prior_targeted"]["measured_targets"][arm][model]
         if hashlib.sha256(blob).hexdigest() != previous["module_sha256"]:
             raise ValueError("fixture differs from the module used by the historical executable")

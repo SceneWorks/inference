@@ -5,6 +5,7 @@ import statistics
 
 from scripts.ci import video_tier1_cohorts as cohorts
 from scripts.ci import video_tier1_evidence as evidence
+from scripts.ci.wan_pair import production_timing
 from scripts.ci import video_tier1_cuda_diagnostic as targeted
 
 NAME = "sw-6954-timing-memory-v1"
@@ -122,17 +123,23 @@ def compare(case, retained, observations, settings, name=NAME, *, adapter=None):
     parity_ok = all(r["terminal"]["sha256"] == retained["terminal_sha256"] and r["trace_sha256"] == retained["trace_sha256"]
                     for r in observations.values())
     verdicts = ["pass" if initial_ok and parity_ok else "fail"]
-    result = {"retained_run_id": retained["run_id"], "retained_receipt_sha256": retained["receipt_sha256"],
-              "retained_peaks": retained["retained_peaks"], "initial_noise": "pass" if initial_ok else "fail",
+    result = {"initial_noise": "pass" if initial_ok else "fail",
               "parity": ("pass" if parity_ok else "fail") if initial_ok else "inconclusive"}
-    expected_adapter = retained["dedicated_adapter"] if case in MEMORY else None
+    if name == production_timing.NAME:
+        result["previous_comparison"] = production_timing.PRIOR
+    else:
+        result.update(retained_run_id=retained["run_id"], retained_receipt_sha256=retained["receipt_sha256"],
+                      retained_peaks=retained["retained_peaks"])
+    expected_adapter = retained["dedicated_adapter"] if case in MEMORY and name != production_timing.NAME else None
     if name in targeted.GPU0_CONTINUATIONS:
         from scripts.ci import wddm_process_memory
         expected_adapter = wddm_process_memory.validate_adapter(adapter, targeted.GPU0_HARDWARE["uuid"])
         if any(row["cuda_process"]["dedicated"]["adapter"] != expected_adapter for row in observations.values()):
             raise ValueError("fresh CUDA role used a different physical adapter")
-        result.update(fresh_cuda_uuid=expected_adapter["cuda_uuid"], retained_cuda_uuid=CUDA_UUID)
-    if diagnostic:
+        result.update(fresh_cuda_uuid=expected_adapter["cuda_uuid"])
+        if name != production_timing.NAME:
+            result.update(retained_cuda_uuid=CUDA_UUID)
+    if diagnostic and name != production_timing.NAME:
         result.update(followup_run_id=retained["followup_run_id"],
                       followup_receipt_sha256=retained["followup_receipt_sha256"])
     if "timing" in schedule:
