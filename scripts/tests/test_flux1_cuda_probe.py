@@ -54,6 +54,25 @@ class PairCudaProbeTests(unittest.TestCase):
         self.assertEqual(self.probe.gpu_free_and_tree_bytes(self.owner)[1], 120 * MIB)
         self.assertEqual(self.probe.gpu_usage_basis, "owned-process-attributed")
 
+    def test_opt_in_host_peaks_reuse_distinct_existing_windows_job_counters(self):
+        self.probe.windows_footprint_peaks = {}
+        for at, working, private, job in ((1, 500, 300, 450), (2, 450, 600, 550), (3, 400, 550, 700)):
+            self.probe.system.last_windows_footprint_details = {
+                "sampledProcessCount": 1,
+                "processes": [{"pid": 123, "workingSetBytes": working, "privateUsageBytes": private}],
+                "jobPeakMemoryUsedBytes": job,
+            }
+            self.probe.system.tree_footprint = lambda _owner: max(working, private, job)
+            with patch("scripts.ci.flux1_pair.cuda_probe.time.time_ns", return_value=at):
+                self.assertEqual(self.probe.tree_footprint(self.owner), max(working, private, job))
+        self.assertEqual(self.probe.windows_footprint_peaks, {
+            "pid": 123, "sample_count": 3, "working_set": {"bytes": 500, "at_unix_ns": 1},
+            "private_usage": {"bytes": 600, "at_unix_ns": 2}, "job_peak": {"bytes": 700, "at_unix_ns": 3},
+        })
+        self.probe.windows_footprint_peaks = None
+        self.assertEqual(self.probe.tree_footprint(self.owner), 700)
+        self.assertIsNone(self.probe.windows_footprint_peaks)
+
     def test_rejects_wrong_or_absent_owner_uuid_and_zero_or_unknown_counters(self):
         for change in ({"pid": 456}, {"cudaDeviceUuid": "GPU-00000000-0000-0000-0000-000000000000"},
                        {"poolUsedBytes": 0}, {"poolUsedHighBytes": 0},

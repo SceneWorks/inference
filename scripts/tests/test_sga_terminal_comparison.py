@@ -25,9 +25,62 @@ REQUEST = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "de
 DIAGNOSTIC = dict(REQUEST, cuda_device_uuid=comparison.WINDOWS_DEV_GPU, diagnostic="windows-dev-memory")
 APPLE_DIAGNOSTIC = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
                     "runner": "nax", "download_missing": True, "diagnostic": comparison.APPLE_DEV_DIAGNOSTIC}
+WAN_MEMORY_DIAGNOSTIC = dict(REQUEST, profile="wan", variant="a14b-t2v-candle",
+                             cuda_device_uuid=comparison.WAN_MEMORY_GPU, diagnostic=comparison.WAN_MEMORY_DIAGNOSTIC)
 
 
 class TerminalTests(unittest.TestCase):
+    def test_wan_memory_diagnostic_exact_route_and_adjacent_frozen_control(self):
+        self.assertIs(comparison.profile_for("candle-cuda", WAN_MEMORY_DIAGNOSTIC), wan)
+        for overrides in ({"cuda_device_uuid": comparison.WINDOWS_DEV_GPU}, {"variant": "a14b-t2v-mlx"},
+                          {"profile": "ltx25"}, {"download_missing": False}):
+            with self.assertRaises(ValueError):
+                comparison.profile_for("candle-cuda", {**WAN_MEMORY_DIAGNOSTIC, **overrides})
+        mlx_request = {key: value for key, value in WAN_MEMORY_DIAGNOSTIC.items() if key != "cuda_device_uuid"}
+        with self.assertRaises(ValueError):
+            comparison.profile_for("mlx", dict(mlx_request, runner="nax", variant="a14b-t2v-mlx"))
+        self.assertEqual(comparison.sample_schedule(WAN_MEMORY_DIAGNOSTIC),
+                         [("warmup-base", "base"), ("warmup-head", "head"),
+                          ("pair-1-base", "base"), ("pair-1-head", "head"),
+                          ("pair-2-head", "head"), ("pair-2-base", "base"), ("control-base", "base")])
+
+    def test_wan_memory_replay_keeps_monotonic_highs_and_checks_authentic_host_counters(self):
+        start = 1_795_000_000_000_000_000
+        lines = [f"SGA_WAN_MEMORY {phase} {start + i} 15 {40 + i} 60 {70 + i}"
+                 for i, phase in enumerate(wan.MEMORY_PHASES)]
+        pool = {"poolUsedHighBytes": 45, "poolReservedHighBytes": 80}
+        phases = wan.observe_memory("\n".join(lines), pool)
+        self.assertEqual(phases["low-drained"], {"at_unix_ns": start + 3, "poolUsedBytes": 15,
+                                                 "poolUsedHighBytes": 43, "poolReservedBytes": 60,
+                                                 "poolReservedHighBytes": 73})
+        for invalid in (lines[:-1], lines[::-1], [*lines[:-1], lines[-1].replace(" 44 ", " 39 ")],
+                        [*lines[:-1], lines[-1].replace(" 74", " 81")]):
+            with self.assertRaisesRegex(ValueError, "Wan diagnostic"):
+                wan.observe_memory("\n".join(invalid), pool)
+        host = {"pid": 201, "sample_count": 1, "working_set": {"bytes": 600, "at_unix_ns": start},
+                "private_usage": {"bytes": 250, "at_unix_ns": start}, "job_peak": {"bytes": 500, "at_unix_ns": start}}
+        guard = {"pid": 201, "peak_host_bytes": 600, "samples": [{"sample_kind": "process"}],
+                 "windows_host_peaks": host}
+        self.assertEqual(wan.observe_windows_host(guard), host)
+        for invalid in (dict(host, pid=202), dict(host, sample_count=2), dict(host, job_peak={"bytes": 700,
+                                                                                            "at_unix_ns": start})):
+            with self.assertRaisesRegex(ValueError, "exact single-child"):
+                wan.observe_windows_host(dict(guard, windows_host_peaks=invalid))
+
+    def test_wan_memory_summary_requires_matching_control_and_is_unscored(self):
+        sample = {"identity": {"video": "matching"}, "timing": {"e2e_ns": 1000},
+                  "peaks": {"host_process_bytes": 600}, "memory": {"phases": "same", "windows_host": "same"}}
+        samples = {name: sample for name, _ in comparison.WAN_MEMORY_SAMPLES}
+        row = comparison.summarize_wan_memory(samples, None)
+        self.assertEqual(set(row), {"fidelity", "samples"})
+        self.assertEqual(row["samples"]["control-base"], row["samples"]["pair-2-base"])
+        samples["control-base"] = dict(sample, identity={"video": "drift"})
+        with self.assertRaisesRegex(ValueError, "terminal output"):
+            comparison.summarize_wan_memory(samples, None)
+        del samples["control-base"]
+        with self.assertRaisesRegex(ValueError, "baseline repeat"):
+            comparison.summarize_wan_memory(samples, None)
+
     def test_apple_diagnostic_uses_only_the_registered_dev_route_and_two_opposite_order_pairs(self):
         self.assertIs(comparison.profile_for("mlx", APPLE_DIAGNOSTIC), ltx_mlx)
         for overrides in ({"variant": "distilled"}, {"profile": "wan"}, {"runner": "nax-primary"},

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
@@ -53,14 +54,35 @@ def _read_pool_proof(path: Path):
 
 
 class PairCudaProbe:
-    def __init__(self, policy, proof_path: Path):
+    def __init__(self, policy, proof_path: Path, *, retain_windows_footprint=False):
         self.policy = policy
         self.proof_path = proof_path
         self.system = SystemProbe(policy)
         self.gpu_usage_basis = "owned-process-attributed"
+        self.windows_footprint_peaks = {} if retain_windows_footprint else None
 
     def __getattr__(self, name):
         return getattr(self.system, name)
+
+    def tree_footprint(self, owner):
+        footprint = self.system.tree_footprint(owner)
+        peaks = self.windows_footprint_peaks
+        if peaks is None or footprint is None:
+            return footprint
+        details = self.system.last_windows_footprint_details
+        # The native probe spawns one process. Leave incomplete observations visible to replay.
+        if details is None or details["sampledProcessCount"] != 1 or len(details["processes"]) != 1:
+            return footprint
+        row, = details["processes"]
+        if peaks.setdefault("pid", row["pid"]) != row["pid"]:
+            return footprint
+        peaks["sample_count"] = peaks.get("sample_count", 0) + 1
+        at = time.time_ns()
+        for field, value in (("working_set", row["workingSetBytes"]), ("private_usage", row["privateUsageBytes"]),
+                             ("job_peak", details["jobPeakMemoryUsedBytes"])):
+            if field not in peaks or value > peaks[field]["bytes"]:
+                peaks[field] = {"bytes": value, "at_unix_ns": at}
+        return footprint
 
     def gpu_free_and_tree_bytes(self, owner):
         free, used = self.system.gpu_free_and_tree_bytes(owner)

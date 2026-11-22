@@ -35,6 +35,8 @@ WINDOWS_DEV_GPU = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
 WINDOWS_DEV_REPAIR = "713e73daf3af2ac0012a6606e750e90ae644091e"
 DIAGNOSTIC_SAMPLES = (("warmup-base", "base"),)
 APPLE_DEV_DIAGNOSTIC = "apple-dev-step-timing"
+WAN_MEMORY_DIAGNOSTIC = "windows-wan-memory"
+WAN_MEMORY_GPU = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
             ("mlx", "ltx25"): "ltx25_tier2_mlx",
             ("candle-cuda", "z-image"): "z_image_tier2_fixture",
@@ -47,6 +49,7 @@ SAMPLES = [(f"warmup-{arm}", arm) for arm in ARMS] + [
     (f"pair-{index+1}-{arm}", arm) for index in range(PAIRS) for arm in ORDER[index % len(ORDER)]
 ]
 APPLE_DIAGNOSTIC_SAMPLES = SAMPLES[:len(ARMS) * (1 + len(ORDER))]
+WAN_MEMORY_SAMPLES = [*APPLE_DIAGNOSTIC_SAMPLES, ("control-base", "base")]
 PREFLIGHT_SECONDS = 180
 
 
@@ -68,6 +71,10 @@ def profile_for(backend, request):
     if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
         if (backend, request["profile"], request["variant"], request[binding]) != ("mlx", "ltx25", "dev", "nax"):
             raise ValueError("Apple Dev timing diagnostic requires the registered MLX LTX Dev nax route")
+    elif request.get("diagnostic") == WAN_MEMORY_DIAGNOSTIC:
+        if (backend, request["profile"], request["variant"], request[binding]) != (
+                "candle-cuda", "wan", "a14b-t2v-candle", WAN_MEMORY_GPU):
+            raise ValueError("Wan memory diagnostic requires the registered CUDA A14B T2V route on its exact GPU")
     elif diagnostic and (backend, request["profile"], request["variant"], request[binding], request["diagnostic"]) != (
             "candle-cuda", "ltx25", "dev", WINDOWS_DEV_GPU, WINDOWS_DEV_DIAGNOSTIC):
         raise ValueError("Windows Dev memory diagnostic requires the approved Candle LTX Dev CUDA device")
@@ -82,6 +89,8 @@ def profile_for(backend, request):
 def terminal_overlay(profile, backend, request, head):
     if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
         return partial(profile.overlay, step_timing=True), {}
+    if request.get("diagnostic") == WAN_MEMORY_DIAGNOSTIC:
+        return partial(profile.overlay, phase_memory=True), {}
     if (backend, request["profile"], request["variant"]) != ("candle-cuda", "ltx25", "dev"):
         return profile.overlay, {}
     diagnostic = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
@@ -106,7 +115,8 @@ def terminal_overlay(profile, backend, request, head):
 
 def sample_schedule(request):
     return {WINDOWS_DEV_DIAGNOSTIC: DIAGNOSTIC_SAMPLES,
-            APPLE_DEV_DIAGNOSTIC: APPLE_DIAGNOSTIC_SAMPLES}.get(request.get("diagnostic"), SAMPLES)
+            APPLE_DEV_DIAGNOSTIC: APPLE_DIAGNOSTIC_SAMPLES,
+            WAN_MEMORY_DIAGNOSTIC: WAN_MEMORY_SAMPLES}.get(request.get("diagnostic"), SAMPLES)
 
 
 def plan(backend, request, head):
@@ -138,6 +148,13 @@ def plan(backend, request, head):
             "host_graph_ns": "from step sigma selection to entry to the existing MLX eval",
             "eval_wall_ns": "wall time in the existing MLX eval, including dispatch and completion",
             "stages": ["guided base", "refinement"], "step_index": "zero-based within stage",
+        }
+    elif request.get("diagnostic") == WAN_MEMORY_DIAGNOSTIC:
+        profile_contract["diagnostic_measurement"] = {
+            "pool_boundaries": list(profile.MEMORY_PHASES),
+            "pool_high_water": "cumulative since child launch",
+            "host": "existing supervisor Windows working set, private bytes and Job peak counters",
+            "baseline_repeat": ["pair-2-base", "control-base"],
         }
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,
@@ -184,8 +201,12 @@ def read_sample(name, directory, profile, contract, *, upload=False):
                      cuda_pool_reserved_bytes=pool["poolReservedHighBytes"])
     req = contract["request"]
     options = {"step_timing": True} if req.get("diagnostic") == APPLE_DEV_DIAGNOSTIC else {}
-    readback = profile.observe(file("stdout.log").read_text(encoding="utf-8"), file("result.json"),
+    stdout = file("stdout.log").read_text(encoding="utf-8")
+    readback = profile.observe(stdout, file("result.json"),
                                req[DEVICE_KEY[contract["backend"]]], req["variant"], **options)
+    if req.get("diagnostic") == WAN_MEMORY_DIAGNOSTIC:
+        readback["memory"] = {"phases": profile.observe_memory(stdout, pool),
+                              "windows_host": profile.observe_windows_host(guard)}
     measured_peaks = readback.get("peaks", {})
     if peaks.keys() & measured_peaks.keys():
         raise ValueError("terminal profile attempted to override an external peak observation")
@@ -225,6 +246,18 @@ def summarize_apple_diagnostic(samples, preflight):
     return {"fidelity": paired_reference(samples, preflight)["identity"],
             "samples": {name: {"e2e_ns": row["timing"]["e2e_ns"], "stages": row["step_timings"]}
                         for name, row in samples.items()}}
+
+
+def summarize_wan_memory(samples, preflight):
+    if list(samples) != [name for name, _ in WAN_MEMORY_SAMPLES]:
+        raise ValueError("Wan memory diagnostic requires both warmups, both opposite-order pairs and the baseline repeat")
+    return {"fidelity": paired_reference(samples, preflight)["identity"],
+            "samples": {name: {"timing": row["timing"], "peaks": row["peaks"], **row["memory"]}
+                        for name, row in samples.items()}}
+
+
+PAIRED_DIAGNOSTICS = {APPLE_DEV_DIAGNOSTIC: summarize_apple_diagnostic,
+                      WAN_MEMORY_DIAGNOSTIC: summarize_wan_memory}
 
 
 def require_sm120(uuid):
@@ -343,11 +376,12 @@ def execute(args, contract, profile):
         with execution_claim(args.backend, claim_policy, claim_dir, env,
                              original_deadline_monotonic=claim_deadline) as claim:
             receipt["physical_claim"] = claim
+            options = {"retain_windows_footprint": True} if diagnostic == WAN_MEMORY_DIAGNOSTIC else {}
             for name, arm in samples:
                 binary, arm_env = executables[arm]
                 run = work / name
                 try:
-                    paired.invoke(binary, work / arm, run, arm_env, policy, env, last_child_start=last_child_start)
+                    paired.invoke(binary, work / arm, run, arm_env, policy, env, last_child_start=last_child_start, **options)
                     if prepare_artifacts is not None:
                         prepare_artifacts(run, work, variant)
                     for leaf, cap in limits.items():
@@ -361,8 +395,8 @@ def execute(args, contract, profile):
                 or profile.staged_assets(variant, model_hub, stage=False) != (snapshot, receipt["assets"])):
             raise ValueError("terminal physical release or staged model asset identity changed")
         if diagnostic:
-            if diagnostic == APPLE_DEV_DIAGNOSTIC:
-                receipt["diagnostic_result"] = summarize_apple_diagnostic(observations, preflight_rows[0])
+            if diagnostic in PAIRED_DIAGNOSTICS:
+                receipt["diagnostic_result"] = PAIRED_DIAGNOSTICS[diagnostic](observations, preflight_rows[0])
             receipt["diagnostic_completed"] = True
         else:
             receipt["comparison_result"] = summarize(observations, preflight_rows[0])
@@ -409,13 +443,13 @@ def verify(args, contract, profile):
     if diagnostic == WINDOWS_DEV_DIAGNOSTIC:
         verify_diagnostic(args, contract, profile, receipt, set(allowed))
         return
-    apple_diagnostic = diagnostic == APPLE_DEV_DIAGNOSTIC
-    if apple_diagnostic:
+    summarize_diagnostic = PAIRED_DIAGNOSTICS.get(diagnostic)
+    if summarize_diagnostic is not None:
         completed = receipt.get("diagnostic_completed")
         if (receipt["accepted"] or {"comparison", "comparison_result", "diagnostic_source"} & receipt.keys()
                 or type(completed) is not bool or ("diagnostic_result" in receipt) != completed
                 or (completed and set(receipt["arms"]) != set(ARMS))):
-            raise ValueError("Apple Dev timing diagnostic receipt must remain unscored and paired")
+            raise ValueError("terminal diagnostic receipt must remain unscored and paired")
         if not completed:
             return
     elif not receipt["accepted"]:
@@ -434,9 +468,9 @@ def verify(args, contract, profile):
     if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
         raise ValueError("terminal artifact compiler identity changed")
     observations = {name: read_sample(name, args.output, profile, contract, upload=True) for name, _ in samples}
-    if apple_diagnostic:
-        if summarize_apple_diagnostic(observations, preflight_rows[0]) != receipt["diagnostic_result"]:
-            raise ValueError("terminal upload does not reproduce its Apple Dev timing observations")
+    if summarize_diagnostic is not None:
+        if summarize_diagnostic(observations, preflight_rows[0]) != receipt["diagnostic_result"]:
+            raise ValueError("terminal upload does not reproduce its diagnostic observations")
         return
     verified = summarize(observations, preflight_rows[0])
     if verified != receipt["comparison_result"] or verified["status"] != "pass":

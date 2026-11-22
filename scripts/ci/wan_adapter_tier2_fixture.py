@@ -90,7 +90,46 @@ def replace_once(raw, before, after):
     return raw.replace(before, after)
 
 
-def overlay(read, _arm, backend, binary):
+MEMORY_PHASES = ("te-drained", "high-drained", "high-released", "low-drained", "vae-materialized")
+POOL_FIELDS = ("poolUsedBytes", "poolUsedHighBytes", "poolReservedBytes", "poolReservedHighBytes")
+
+
+def memory_overlay(raw):
+    start = b"    fn render_sequential("
+    before, rest = raw.split(start, 1)
+    stop = b"\n    }\n}"
+    body, after = rest.split(stop, 1)
+    te = b"            self.device.synchronize()?;\n            (pos, neg)"
+    body = replace_once(body, te, b"            self.device.synchronize()?;\n"
+                        b'            sga_wan_pool("te-drained")?;\n            (pos, neg)')
+    swap = b"        staged_expert_swap("
+    body = replace_once(body, swap, b'        let mut sga_swap_phases = ["high-drained", "high-released", "low-drained"].into_iter();\n' + swap)
+    body = replace_once(body, b"            || Ok(self.device.synchronize()?),", b'''            || {
+                self.device.synchronize()?;
+                let phase = sga_swap_phases.next().ok_or_else(|| {
+                    CandleError::Msg("unexpected exact Wan expert sync".into())
+                })?;
+                sga_wan_pool(phase)
+            },''')
+    vae = b"        let images = frames_to_images(&decoded)?;"
+    body = replace_once(body, vae, vae + b'\n        sga_wan_pool("vae-materialized")?;')
+    return before + start + body + stop + after + b'''
+
+fn sga_wan_pool(phase: &str) -> CResult<()> {
+    let pool = candle_gen::candle_core::cuda_backend::proof_pool::snapshot(0)?
+        .ok_or_else(|| CandleError::Msg("Wan diagnostic CUDA pool was not installed".into()))?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CandleError::Msg(error.to_string()))?
+        .as_nanos();
+    println!("SGA_WAN_MEMORY {phase} {at} {} {} {} {}", pool.used_bytes, pool.used_high_bytes,
+             pool.reserved_bytes, pool.reserved_high_bytes);
+    Ok(())
+}
+'''
+
+
+def overlay(read, _arm, backend, binary, *, phase_memory=False):
     if backend == "candle-cuda":
         prefix = f"crates/media/candle-gen/{package(backend)}/src/"
         path = prefix + "wan14b.rs"
@@ -102,7 +141,11 @@ def overlay(read, _arm, backend, binary):
         marker = b"            *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)"
         raw = replace_once(raw, marker, marker + b"\n            self.device.synchronize()?;\n"
                            b"            println!(\"SGA_WAN_OUTER_STEP {} {} {}\", i + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());")
+        if phase_memory:
+            raw = memory_overlay(raw)
         return {path: raw, prefix + f"bin/{binary}.rs": CANDLE_PROBE.read_bytes()}
+    if phase_memory:
+        raise ValueError("Wan phase memory diagnostic requires the native CUDA fixture")
     prefix = f"crates/media/mlx-gen/{PACKAGE}/src/"
     path = prefix + "pipeline/moe.rs"
     raw = replace_once(read(path), b"        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;",
@@ -220,6 +263,41 @@ def staged_assets(variant, cache, *, stage=True):
 def preflight(stdout, variant):
     if stdout.splitlines() != [f"SGA_WAN_PREFLIGHT {CASE[variant]}"]:
         raise ValueError("Wan preflight did not authenticate the native packed route and adapter pair")
+
+
+def observe_memory(stdout, pool):
+    lines = [line for line in stdout.splitlines() if line.startswith("SGA_WAN_MEMORY")]
+    result, previous = {}, (0, 0, 0)
+    if len(lines) != len(MEMORY_PHASES):
+        raise ValueError("Wan diagnostic requires all five native memory boundaries")
+    for phase, line in zip(MEMORY_PHASES, lines, strict=True):
+        match = re.fullmatch(rf"SGA_WAN_MEMORY {phase} ([1-9][0-9]{{17,19}})((?: [1-9][0-9]{{0,11}}){{4}})", line)
+        if match is None:
+            raise ValueError("Wan diagnostic native memory boundary is missing, malformed or unordered")
+        at_ns = int(match[1])
+        used, used_high, reserved, reserved_high = map(int, match[2].split())
+        if (not previous[0] <= at_ns or not used <= min(reserved, used_high)
+                or not max(reserved, used_high) <= reserved_high <= min(POOL_BYTES, pool["poolReservedHighBytes"])
+                or not previous[1] <= used_high <= pool["poolUsedHighBytes"] or not previous[2] <= reserved_high):
+            raise ValueError("Wan diagnostic pool readings differ from the bounded child high-water counters")
+        result[phase] = {"at_unix_ns": at_ns, **dict(zip(POOL_FIELDS, (used, used_high, reserved, reserved_high), strict=True))}
+        previous = (at_ns, used_high, reserved_high)
+    return result
+
+
+def observe_windows_host(guard):
+    row = guard.get("windows_host_peaks")
+    kinds = ("working_set", "private_usage", "job_peak")
+    samples = [sample for sample in guard["samples"] if sample.get("sample_kind") == "process"]
+    if (not isinstance(row, dict) or set(row) != {"pid", "sample_count", *kinds}
+            or row["pid"] != guard["pid"] or type(row["sample_count"]) is not int
+            or not 0 < row["sample_count"] == len(samples)
+            or any(not isinstance(item := row[kind], dict) or set(item) != {"bytes", "at_unix_ns"}
+                   or type(item["bytes"]) is not int or item["bytes"] <= 0
+                   or type(item["at_unix_ns"]) is not int or item["at_unix_ns"] <= 0 for kind in kinds)
+            or max(row[kind]["bytes"] for kind in kinds) != guard["peak_host_bytes"]):
+        raise ValueError("Wan diagnostic requires exact single-child Windows host footprint counters")
+    return row
 
 
 def observe(stdout, path, binding, variant):
