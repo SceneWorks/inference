@@ -112,8 +112,8 @@ def build(work, origin, arm, contract, profile, env, *, release=False, cuda_feat
         destination = root / name
         proof.unlinked_path(destination, root)
         destination.parent.mkdir(exist_ok=True)
-        mode = "xb" if destination.name == PROOF_BIN + ".rs" else "wb"
-        with destination.open(mode) as output:
+        with (destination.open("xb") if destination.name == PROOF_BIN + ".rs"
+              else destination.open("wb")) as output:
             output.write(data)
     toolchain = proof.verified_toolchain(env, root=root)
     target = work / (arm + "-target")

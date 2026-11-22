@@ -211,7 +211,7 @@ def staged_assets(variant, cache, *, stage=True):
     snapshot = hub.snapshot_dir(cache, pin["repository"], pin["revision"]) / pin["subfolder"]
     completed = subprocess.run([sys.executable, "-I", str(Path(__file__)), "stage" if stage else "identify",
                                 backend, str(cache)], timeout=STAGE_TIMEOUT_SECONDS if stage else RECHECK_TIMEOUT_SECONDS,
-                               text=True, stdout=subprocess.PIPE, check=True)
+                               encoding="utf-8", stdout=subprocess.PIPE, check=True)
     return snapshot, json.loads(completed.stdout, object_pairs_hook=unique_object)
 
 

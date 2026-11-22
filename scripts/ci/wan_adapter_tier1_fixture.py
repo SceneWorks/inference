@@ -79,7 +79,8 @@ def fetch_range(url, start, end):
     validate_hub_url(url)
     request = Request(url, headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"})
     length = end - start + 1
-    with build_opener(HubRedirects()).open(request, timeout=30) as response:
+    open_range = build_opener(HubRedirects()).open
+    with open_range(request, timeout=30) as response:
         interval = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
         if (response.status != 206 or interval is None
                 or tuple(map(int, interval.groups()[:2])) != (start, end)

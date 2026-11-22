@@ -153,7 +153,7 @@ def require_sm120(uuid):
     from scripts.media_campaign_windows import trusted_nvidia_smi
 
     capability = subprocess.check_output([trusted_nvidia_smi(), "--id=" + uuid, "--query-gpu=compute_cap",
-                                          "--format=csv,noheader,nounits"], text=True, timeout=15).strip()
+                                          "--format=csv,noheader,nounits"], encoding="utf-8", timeout=15).strip()
     if capability != "12.0":
         raise ValueError("terminal CUDA comparison requires the approved consumer Blackwell capability")
     return "sm_120"
@@ -201,7 +201,7 @@ def execute(args, contract, profile):
             binary, receipt["arms"][arm] = source_pair.build(work, origin, arm, contract, profile, arm_env,
                                                               release=True, cuda_features=getattr(profile, "BUILD_FEATURES", "cuda"))
             executables[arm] = (binary, arm_env)
-            preflight = subprocess.run([str(binary), "--preflight"], cwd=work / arm, text=True, check=True,
+            preflight = subprocess.run([str(binary), "--preflight"], cwd=work / arm, encoding="utf-8", check=True,
                                        env=dict(arm_env, CUDA_VISIBLE_DEVICES=""), capture_output=True,
                                        timeout=PREFLIGHT_SECONDS)
             if len(preflight.stdout.encode("utf-8")) > source_pair.RESULT_LIMIT:
