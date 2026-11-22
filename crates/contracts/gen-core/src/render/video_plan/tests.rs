@@ -219,6 +219,10 @@ fn registry_video_provider_keeps_phase_scope_and_prepared_file_guard() {
         .unwrap();
     let plan = plan.bind_admission(&spec, None, &req).unwrap();
     let provider = registry.load(id, &spec).unwrap();
+    assert_eq!(
+        provider.video_load_binding(),
+        Some(&RenderLoadBinding::from_video_spec(&spec))
+    );
     assert_eq!(provider.video_plan_resident_weight_bytes(&plan), Some(64));
     provider.validate_video_plan(&plan, &req).unwrap();
 
