@@ -24,6 +24,7 @@ from scripts.ci.sga_paired_performance import PAIRS, compare_peaks, compare_timi
 from scripts.ci.stage_pinned_hub_snapshots import hub_root
 from scripts.ci.wan_adapter_tier1_fixture import unique_object
 from scripts.media_campaign_supervisor import load_policy
+from scripts.release.ensure_model_snapshot import runner_hub_cache
 
 SELECTION = "sga-terminal-tier2"
 BASE = "481a982db44b58937c15c2d3f0cbf918b116d04d"
@@ -185,7 +186,11 @@ def execute(args, contract, profile):
         receipt["hardware"] = paired.hardware(args.backend, policy)
         if cuda:
             receipt["hardware"]["capability"] = require_sm120(binding)
-        model_root = env.get(getattr(profile, "HUB_ENV", "MODEL_PROOF_HUB_ROOT")) or env.get("MODEL_PROOF_HUB_ROOT", "")
+        if cuda:
+            model_root = (env.get(getattr(profile, "HUB_ENV", "MODEL_PROOF_HUB_ROOT"))
+                          or env.get("MODEL_PROOF_HUB_ROOT", ""))
+        else:
+            model_root = str(runner_hub_cache(env))
         model_hub = hub_root(dict(env, MODEL_PROOF_HUB_ROOT=model_root))
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
         child_env = {key: value for key, value in env.items() if not proof.SENSITIVE_ENVIRONMENT.search(key)}

@@ -301,11 +301,6 @@ jobs:
           MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
-          # Terminal MLX runs on the secondary Mac. Use its existing runner-local Hub cache.
-          if [[ "$RUNNER_NAME" == nax-macos-2 && "$MODEL_PROOF_SCRIPT" == sga_terminal_comparison.py ]]; then
-            export MODEL_PROOF_HUB_ROOT="$HOME/sceneworks-rw-weights/hub"
-            export FLUX1_HUB="$MODEL_PROOF_HUB_ROOT"
-          fi
           "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
