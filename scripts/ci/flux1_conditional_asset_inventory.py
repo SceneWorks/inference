@@ -16,6 +16,7 @@ timeout is reported as `unreachable`, never as absent. Other repositories that h
 the same name are ignored, so a role cannot be ambiguous.
 """
 import argparse
+import errno
 import faulthandler
 import hashlib
 import json
@@ -351,8 +352,17 @@ def fetch_pinned(url, destination, token=None, opener=None):
             if os.name == "nt":
                 os.rename(temporary, destination)
             else:
-                os.link(temporary, destination)
-                temporary.unlink()
+                try:
+                    os.link(temporary, destination)
+                    temporary.unlink()
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                        raise
+                    # Filesystems without hardlinks (e.g. exFAT/SMB `/Volumes/Models`):
+                    # refuse to overwrite an existing file, then rename into place.
+                    if probe(destination)["exists"]:
+                        raise FileExistsError(destination) from exc
+                    os.replace(temporary, destination)
         except FileExistsError:
             if not _same_bytes(destination, size, sha):
                 raise ValueError(f"{destination} was placed concurrently with other bytes; not replaced")

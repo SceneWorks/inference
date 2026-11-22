@@ -496,6 +496,34 @@ class ConditionalAssetInventory(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "missing: PiD Gemma LICENSE"):
                             conditional.prepare_assets(retry, assets.ROOT, gemma)
 
+    def test_fetch_pinned_falls_back_to_replace_when_hardlinks_unsupported(self):
+        import errno
+        import io
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": "7"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                return FakeResponse(b"fetched")
+
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp).resolve() / "chat_template.jinja"
+            with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
+                size, sha, _, placed = assets.fetch_pinned(
+                    "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
+                    dest,
+                    opener=FakeOpener(),
+                )
+            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"fetched").hexdigest(), False))
+            self.assertEqual(dest.read_bytes(), b"fetched")
+
 
 if __name__ == "__main__":
     unittest.main()
