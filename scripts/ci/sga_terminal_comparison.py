@@ -170,7 +170,7 @@ def plan(backend, request, head):
         profile_contract["diagnostic_measurement"] = {
             "steps": "each Euler prediction and update, delimited by consecutive progress callbacks",
             "stream": "CUDA events on the latent stream, which can include idle time between enqueues",
-            "host": "wall intervals for enqueue and the existing synchronization calls",
+            "host": "wall time between callbacks and through final enqueue, including any waits, plus the existing barriers",
         }
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,

@@ -36,7 +36,7 @@ GIB = 2**30
 MIB = 2**20
 POOL_BYTES = 30 * GIB
 CHILD_SECONDS = 300
-TURBO_STEP_TIMING_PREFIX = "SGA_Z_IMAGE_TURBO_STEP_TIMING "
+TURBO_STEP_TIMING_MARKER = "SGA_Z_IMAGE_TURBO_STEP_TIMING"
 
 
 def package(backend):
@@ -291,7 +291,7 @@ def read_artifact_pixels(image, size):
 def observe(stdout, result, _uuid, variant, *, step_timing=False):
     if stdout.splitlines().count("SGA_Z_IMAGE_TIER2_BODY " + variant) != 1:
         raise ValueError("missing completed resident Z-Image generation")
-    if not step_timing and any(line.startswith(TURBO_STEP_TIMING_PREFIX) for line in stdout.splitlines()):
+    if not step_timing and turbo_step_timing_markers(stdout):
         raise ValueError("Z-Image Turbo step timing requires the unscored diagnostic")
     row = json.loads(result.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     if not isinstance(row, dict) or set(row) != {"plan", "sample", "progress", "e2e_ns", "denoise_ns", "phase_ns"}:
@@ -327,12 +327,19 @@ def observe(stdout, result, _uuid, variant, *, step_timing=False):
     return observation
 
 
+def turbo_step_timing_markers(stdout):
+    return [line for line in stdout.splitlines() if line.split(maxsplit=1)[:1] == [TURBO_STEP_TIMING_MARKER]]
+
+
 def read_turbo_step_timings(stdout, denoise, before_denoise):
-    prefix = TURBO_STEP_TIMING_PREFIX
-    markers = [line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)]
-    if len(markers) != 1:
-        raise ValueError("missing or duplicate Z-Image Turbo step timing receipt")
-    row = json.loads(markers[0], object_pairs_hook=unique_object)
+    prefix = TURBO_STEP_TIMING_MARKER + " "
+    markers = turbo_step_timing_markers(stdout)
+    if len(markers) != 1 or not markers[0].startswith(prefix):
+        raise ValueError("expected one well-formed Z-Image Turbo step timing marker")
+    try:
+        row = json.loads(markers[0].removeprefix(prefix), object_pairs_hook=unique_object)
+    except ValueError as error:
+        raise ValueError("invalid Z-Image Turbo step timing JSON") from error
     host_fields = {"start_barrier_ns", "before_first_step_ns", "tail_event_enqueue_ns", "finish_barrier_ns"}
     if (not isinstance(row, dict) or set(row) != host_fields | {"steps"}
             or any(type(row[key]) is not int or row[key] < 0 for key in host_fields)

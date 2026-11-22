@@ -72,7 +72,7 @@ class TerminalTests(unittest.TestCase):
         row = {"start_barrier_ns": 10, "before_first_step_ns": 1, "tail_event_enqueue_ns": 2,
                "finish_barrier_ns": 5,
                "steps": [{"host_enqueue_ns": 20, "stream_elapsed_ns": 18}] * 4}
-        prefix = z_image.TURBO_STEP_TIMING_PREFIX
+        prefix = z_image.TURBO_STEP_TIMING_MARKER + " "
         stdout = prefix + json.dumps(row)
         self.assertEqual(z_image.read_turbo_step_timings(stdout, 88, 10), row)
         for bad in ("", stdout + "\n" + stdout, prefix + json.dumps({**row, "steps": row["steps"][:-1]}),
@@ -82,6 +82,20 @@ class TerminalTests(unittest.TestCase):
                 z_image.read_turbo_step_timings(bad, 88, 10)
         with self.assertRaisesRegex(ValueError, "step timing requires the unscored"):
             z_image.observe("SGA_Z_IMAGE_TIER2_BODY turbo\n" + stdout, None, UUID, "turbo")
+
+    def test_z_turbo_step_marker_counts_bare_and_malformed_headers(self):
+        marker = z_image.TURBO_STEP_TIMING_MARKER
+        row = {"start_barrier_ns": 10, "before_first_step_ns": 1, "tail_event_enqueue_ns": 2,
+               "finish_barrier_ns": 5, "steps": [{"host_enqueue_ns": 20, "stream_elapsed_ns": 18}] * 4}
+        valid = marker + " " + json.dumps(row)
+        similar = marker + "_EXTRA {}"
+        self.assertEqual(z_image.read_turbo_step_timings(valid + "\n" + similar, 88, 10), row)
+        for invalid in (marker, marker + " ", marker + "\t{}", " " + marker + " {}", marker + " {"):
+            for stdout in (invalid, valid + "\n" + invalid):
+                with self.assertRaisesRegex(ValueError, "step timing"):
+                    z_image.read_turbo_step_timings(stdout, 88, 10)
+            with self.assertRaisesRegex(ValueError, "step timing requires the unscored"):
+                z_image.observe("SGA_Z_IMAGE_TIER2_BODY turbo\n" + invalid, None, UUID, "turbo")
 
     def test_wan_memory_diagnostic_exact_route_and_adjacent_frozen_control(self):
         self.assertIs(comparison.profile_for("candle-cuda", WAN_MEMORY_DIAGNOSTIC), wan)
