@@ -4092,7 +4092,14 @@ impl LlamaProvider {
         packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_resolving(req, on_event, observer, packed, prefix_cache, false)
+        self.generate_resolving(
+            req,
+            on_event,
+            observer,
+            packed,
+            prefix_cache,
+            AutoResolveFlags::default(),
+        )
     }
 
     /// Whether `auto` runs this provider's resident block draft ahead of MTP (SW-7200): the
@@ -4120,9 +4127,35 @@ impl LlamaProvider {
         ))
     }
 
-    /// [`generate_inner`](Self::generate_inner); `block_draft_withheld` resolves `auto` without
-    /// its block-draft preference (a request whose memory refused the preferred draft) and names
-    /// [`core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED`].
+    /// Filter an [`core_llm::AutoSpeculativePlan`] to candidates runnable on this loaded provider
+    /// and prompt shape (e.g. excluding `mtp`/`block_draft` on Gemma 4 multimodal prompts or when
+    /// the corresponding weights are absent).
+    fn filter_auto_plan(
+        &self,
+        mut plan: core_llm::AutoSpeculativePlan,
+        gemma4_mm_request: bool,
+    ) -> core_llm::AutoSpeculativePlan {
+        let has_mtp = matches!(&self.model, Decoder::Qwen35(m) if m.has_mtp());
+        let has_block = self.block_draft.is_some() && matches!(&self.model, Decoder::Qwen35(_));
+        let has_draft = self.draft.is_some();
+        plan.candidates.retain(|c| match c.proposer {
+            ProposerKind::Mtp => has_mtp && !gemma4_mm_request,
+            ProposerKind::BlockDraft => has_block && !gemma4_mm_request,
+            ProposerKind::DraftModel => has_draft,
+            ProposerKind::PromptLookup | ProposerKind::None => true,
+        });
+        if !plan
+            .candidates
+            .iter()
+            .any(|c| c.proposer == ProposerKind::None)
+        {
+            plan.candidates.push(core_llm::AutoCandidate::plain());
+        }
+        plan
+    }
+
+    /// [`generate_inner`](Self::generate_inner); `flags` retries `auto` with clamped adaptive
+    /// depth or without a resident draft when request memory admission refuses it.
     fn generate_resolving(
         &self,
         req: &TextLlmRequest,
@@ -4130,7 +4163,7 @@ impl LlamaProvider {
         observer: Option<&mut dyn crate::decode::observe::Observer>,
         packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
-        block_draft_withheld: bool,
+        flags: AutoResolveFlags,
     ) -> CoreResult<TextLlmOutput> {
         let _progress = req.install_progress();
         self.validate(req)?;
@@ -4236,18 +4269,58 @@ impl LlamaProvider {
         // campaign recorded it faster for this backend, draft format and target tier — and not
         // on a request whose memory refused it once already (resolved again without it, by name).
         let speculative_mode = req.speculative_or(self.speculative_default);
-        let resolution = core_llm::resolve_speculative_with(
-            speculative_mode,
-            &self.descriptor.capabilities,
-            !block_draft_withheld && self.auto_prefers_block_draft(),
-        );
-        let plan = resolution.plan;
-        let mut fallbacks: Vec<String> = block_draft_withheld
-            .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
-            .into_iter()
-            .chain(resolution.fallback)
-            .collect();
-        let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
+        let (plan, mut fallbacks, mut adaptive_plan) =
+            if speculative_mode == core_llm::Speculative::Auto {
+                let raw_plan = core_llm::resolve_auto_candidates(
+                    &self.descriptor.capabilities,
+                    core_llm::AutoCandidateContext {
+                        auto_prefers_block_draft: !flags.block_draft_withheld
+                            && self.auto_prefers_block_draft(),
+                        block_draft_withheld: flags.block_draft_withheld,
+                        draft_model_withheld: flags.draft_model_withheld,
+                        draft_context: self.draft_context(),
+                        prompt_tokens: admitted_prompt,
+                        max_new_tokens: req.max_new_tokens,
+                    },
+                );
+                let filtered = self.filter_auto_plan(raw_plan, gemma4_mm_request);
+                let primary = filtered.primary();
+                let plan = match primary.proposer {
+                    ProposerKind::None => core_llm::SpeculativePlan::Off,
+                    ProposerKind::Mtp => core_llm::SpeculativePlan::Run {
+                        proposer: SpeculativeProposer::Mtp,
+                        depth: primary.recommended_depth,
+                    },
+                    ProposerKind::PromptLookup => core_llm::SpeculativePlan::Run {
+                        proposer: SpeculativeProposer::PromptLookup,
+                        depth: primary.recommended_depth,
+                    },
+                    ProposerKind::DraftModel => core_llm::SpeculativePlan::Run {
+                        proposer: SpeculativeProposer::DraftModel,
+                        depth: primary.recommended_depth,
+                    },
+                    ProposerKind::BlockDraft => core_llm::SpeculativePlan::Run {
+                        proposer: SpeculativeProposer::BlockDraft,
+                        depth: primary.recommended_depth,
+                    },
+                };
+                let fb = filtered.fallbacks.clone();
+                (plan, fb, Some(filtered))
+            } else {
+                let resolution = core_llm::resolve_speculative_with(
+                    speculative_mode,
+                    &self.descriptor.capabilities,
+                    !flags.block_draft_withheld && self.auto_prefers_block_draft(),
+                );
+                let fb: Vec<String> = flags
+                    .block_draft_withheld
+                    .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
+                    .into_iter()
+                    .chain(resolution.fallback)
+                    .collect();
+                (resolution.plan, fb, None)
+            };
+        let route = self.speculative_route(plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
         // instead, by name (sc-24436, E2).
         let route = self.fit_draft_route(
@@ -4257,6 +4330,16 @@ impl LlamaProvider {
             gemma4_mm_request,
             &mut fallbacks,
         );
+        let adaptive_ceiling = if let Some(ref ap) = adaptive_plan {
+            if flags.clamp_adaptive_depth || route.width() == 0 {
+                route.width()
+            } else {
+                (ap.max_depth() as usize).max(route.width())
+            }
+        } else {
+            route.width()
+        };
+        let admission_route = route.with_width(adaptive_ceiling);
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
         // will actually run, at the advertised row bound — else linear, by name. An image or
         // video request verifies its tree too (SW-7209): the candidates are text tokens after the
@@ -4402,7 +4485,7 @@ impl LlamaProvider {
         // route holds beside it (verify overshoot, a draft model's own request, sc-24436/E7).
         let estimate = |format| {
             self.speculative_request_bytes(
-                route,
+                admission_route,
                 format,
                 admitted_prompt,
                 req.max_new_tokens,
@@ -4411,7 +4494,12 @@ impl LlamaProvider {
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
         };
         let tree_bytes = self
-            .tree_request_bytes(route, tree_rows, admitted_prompt, req.max_new_tokens)
+            .tree_request_bytes(
+                admission_route,
+                tree_rows,
+                admitted_prompt,
+                req.max_new_tokens,
+            )
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let estimate = |format| {
             estimate(format)?
@@ -4551,9 +4639,28 @@ impl LlamaProvider {
             required.saturating_add(snapshot_bytes),
             planned_admission.admission.available,
         ) {
-            // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
-            // prompt lookup or plain — what `auto` admitted before the preference), by name.
-            // Nothing has run: no K/V, no prefill, no preprocessing.
+            // Under `auto`, first drop adaptive depth growth headroom back to `recommended_depth`
+            // so a tight request that previously fit is never refused for adaptive ceiling sizing;
+            // then withdraw an un-admitted block draft or draft model and re-resolve cleanly.
+            if speculative_mode == core_llm::Speculative::Auto
+                && matches!(error, CoreError::RequestResourceExhausted(_))
+                && adaptive_ceiling > route.width()
+                && !flags.clamp_adaptive_depth
+            {
+                drop(compressed_outcome);
+                drop(_progress);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    observer,
+                    packed,
+                    prefix_cache,
+                    AutoResolveFlags {
+                        clamp_adaptive_depth: true,
+                        ..flags
+                    },
+                );
+            }
             if core_llm::withdraws_auto_block_draft(speculative_mode, route.proposer_kind(), &error)
             {
                 drop(compressed_outcome);
@@ -4564,7 +4671,28 @@ impl LlamaProvider {
                     observer,
                     packed,
                     prefix_cache,
-                    true,
+                    AutoResolveFlags {
+                        block_draft_withheld: true,
+                        clamp_adaptive_depth: false,
+                        ..flags
+                    },
+                );
+            }
+            if core_llm::withdraws_auto_draft_model(speculative_mode, route.proposer_kind(), &error)
+            {
+                drop(compressed_outcome);
+                drop(_progress);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    observer,
+                    packed,
+                    prefix_cache,
+                    AutoResolveFlags {
+                        draft_model_withheld: true,
+                        clamp_adaptive_depth: false,
+                        ..flags
+                    },
                 );
             }
             return Err(error);
@@ -4623,6 +4751,22 @@ impl LlamaProvider {
             gemma4_mm_request,
             &mut fallbacks,
         );
+        let provisioned_width = if route == SpeculativeRoute::Plain {
+            0
+        } else {
+            adaptive_ceiling.max(route.width())
+        };
+        if let Some(ap) = adaptive_plan.as_mut() {
+            if route.proposer_kind() != ap.primary().proposer {
+                ap.candidates
+                    .retain(|c| c.proposer != ProposerKind::DraftModel);
+            }
+            *ap = ap.clone().clamped_to(provisioned_width as u32);
+        }
+        let plain_reason = (route == SpeculativeRoute::Plain)
+            .then(|| fallbacks.first().cloned())
+            .flatten();
+        let engine_adaptive_plan = adaptive_plan.clone();
 
         let mut kv_report = match &kv_plan {
             KvPlan::Dense(report) => Some(report.clone()),
@@ -4767,6 +4911,9 @@ impl LlamaProvider {
                                         prefill_clock: clock,
                                         speculative_mode,
                                         tree_rows,
+                                        adaptive_plan: engine_adaptive_plan.clone(),
+                                        provisioned_max_depth: Some(provisioned_width),
+                                        plain_reason: plain_reason.clone(),
                                         ..EngineOptions::default()
                                     },
                                 )
@@ -4795,7 +4942,13 @@ impl LlamaProvider {
                                             &m.deepstack,
                                         )
                                         .map_err(to_core)?;
-                                    (route.plain_proposer(self.draft.as_ref()), logits, None)
+                                    (
+                                        route
+                                            .with_width(provisioned_width)
+                                            .plain_proposer(self.draft.as_ref()),
+                                        logits,
+                                        None,
+                                    )
                                 };
                                 generate_speculative(
                                     model,
@@ -4820,6 +4973,9 @@ impl LlamaProvider {
                                         prefill_clock: clock,
                                         speculative_mode,
                                         tree_rows,
+                                        adaptive_plan: engine_adaptive_plan.clone(),
+                                        provisioned_max_depth: Some(provisioned_width),
+                                        plain_reason: plain_reason.clone(),
                                         ..EngineOptions::default()
                                     },
                                 )
@@ -4839,7 +4995,9 @@ impl LlamaProvider {
                                 .map_err(to_core)?;
                             generate_speculative(
                                 model,
-                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                &mut *route
+                                    .with_width(provisioned_width)
+                                    .plain_proposer(self.draft.as_ref()),
                                 SpeculativePrompt::Prefilled {
                                     cache: &mut cache,
                                     logits,
@@ -4860,6 +5018,9 @@ impl LlamaProvider {
                                     prefill_clock: clock,
                                     speculative_mode,
                                     tree_rows,
+                                    adaptive_plan: engine_adaptive_plan.clone(),
+                                    provisioned_max_depth: Some(provisioned_width),
+                                    plain_reason: plain_reason.clone(),
                                     ..EngineOptions::default()
                                 },
                             )
@@ -4884,7 +5045,9 @@ impl LlamaProvider {
                         .map_err(to_core)?;
                     generate_speculative(
                         model,
-                        &mut *route.plain_proposer(self.draft.as_ref()),
+                        &mut *route
+                            .with_width(provisioned_width)
+                            .plain_proposer(self.draft.as_ref()),
                         SpeculativePrompt::Prefilled {
                             cache: &mut cache,
                             logits,
@@ -4905,6 +5068,9 @@ impl LlamaProvider {
                             prefill_clock: None,
                             speculative_mode,
                             tree_rows,
+                            adaptive_plan: engine_adaptive_plan.clone(),
+                            provisioned_max_depth: Some(provisioned_width),
+                            plain_reason: plain_reason.clone(),
                             ..EngineOptions::default()
                         },
                     )
@@ -4993,6 +5159,9 @@ impl LlamaProvider {
                         prefill_clock: Some(Instant::now()),
                         speculative_mode,
                         tree_rows,
+                        adaptive_plan: engine_adaptive_plan,
+                        provisioned_max_depth: Some(provisioned_width),
+                        plain_reason,
                         ..EngineOptions::default()
                     };
                     match &self.model {
@@ -5082,7 +5251,9 @@ impl LlamaProvider {
                             }
                             let run = generate_speculative(
                                 &DynCacheTarget(model),
-                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                &mut *route
+                                    .with_width(provisioned_width)
+                                    .plain_proposer(self.draft.as_ref()),
                                 SpeculativePrompt::Prefilled {
                                     cache: &mut cache,
                                     logits,
@@ -5160,7 +5331,9 @@ impl LlamaProvider {
                             }
                             let run = generate_speculative(
                                 model,
-                                &mut *route.plain_proposer(self.draft.as_ref()),
+                                &mut *route
+                                    .with_width(provisioned_width)
+                                    .plain_proposer(self.draft.as_ref()),
                                 SpeculativePrompt::Prefilled {
                                     cache: &mut cache,
                                     logits,
@@ -5286,7 +5459,9 @@ impl LlamaProvider {
                                         .resume_from(resume)
                                         .capture_at_many(&capture_lens)
                                 });
-                                let mut plain = route.plain_proposer(self.draft.as_ref());
+                                let mut plain = route
+                                    .with_width(provisioned_width)
+                                    .plain_proposer(self.draft.as_ref());
                                 let proposer: &mut dyn Proposer<Qwen35Model> = match head.as_mut() {
                                     Some(head) => head,
                                     None => &mut *plain,
@@ -5555,6 +5730,15 @@ fn tree_verify_capabilities(supported: bool) -> Option<core_llm::TreeVerifyCapab
     })
 }
 
+/// Retry flags for `auto` request admission (SW-7200 / SW-7237): clamp adaptive depth growth
+/// headroom before withdrawing a resident block draft or draft model on tight-memory requests.
+#[derive(Clone, Copy, Debug, Default)]
+struct AutoResolveFlags {
+    block_draft_withheld: bool,
+    draft_model_withheld: bool,
+    clamp_adaptive_depth: bool,
+}
+
 /// The proposer a request runs on the engine, after its resolved plan meets the request's shape
 /// (sc-24434, sc-24436). `width` is the drafts per verify step (`0` for plain decoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5583,6 +5767,16 @@ impl SpeculativeRoute {
             | SpeculativeRoute::PromptLookup { width }
             | SpeculativeRoute::DraftModel { width }
             | SpeculativeRoute::BlockDraft { width } => width,
+        }
+    }
+
+    fn with_width(self, width: usize) -> Self {
+        match self {
+            SpeculativeRoute::Plain => SpeculativeRoute::Plain,
+            SpeculativeRoute::Mtp { .. } => SpeculativeRoute::Mtp { width },
+            SpeculativeRoute::PromptLookup { .. } => SpeculativeRoute::PromptLookup { width },
+            SpeculativeRoute::DraftModel { .. } => SpeculativeRoute::DraftModel { width },
+            SpeculativeRoute::BlockDraft { .. } => SpeculativeRoute::BlockDraft { width },
         }
     }
 

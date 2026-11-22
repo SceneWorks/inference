@@ -2705,3 +2705,135 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(campaign.Refused, "prefix_checkpoints"):
                 campaign.compare_campaigns([bad_dir], LIVE_DEFAULTS)
+
+    def test_adaptive_speculative_paths_and_paired_compare_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            adaptive_auto = {
+                "adaptive": True,
+                "candidates": ["mtp", "prompt_lookup", "none"],
+                "initial_proposer": "mtp",
+                "initial_depth": 2,
+                "final_proposer": "prompt_lookup",
+                "final_depth": 4,
+                "depth_changes": 1,
+                "proposer_switches": 1,
+                "plain_reason": None,
+                "events": [
+                    {
+                        "token_offset": 32,
+                        "verify_step": 12,
+                        "kind": "proposer_switched",
+                        "from_proposer": "mtp",
+                        "from_depth": 3,
+                        "to_proposer": "prompt_lookup",
+                        "to_depth": 4,
+                        "reason": "probe beat incumbent",
+                    }
+                ],
+                "cost": {
+                    "proposal_ms": 2.0,
+                    "verify_ms": 10.0,
+                    "rollback_ms": 0.5,
+                    "sync_ms": 0.5,
+                    "total_ms": 13.0,
+                    "host_syncs": 10,
+                    "committed_tokens": 26,
+                    "ms_per_committed_token": 0.5,
+                },
+            }
+
+            # 1) paths_report & paths_markdown surface adaptive_speculative telemetry.
+            row_auto = path_row("code_edit", "predictable", "auto", tok_s=90.0, wall=150.0)
+            row_auto["adaptive_speculative"] = adaptive_auto
+            paths_dir = write_campaign(
+                Path(td) / "adaptive-paths",
+                [
+                    {
+                        "id": "p-adaptive",
+                        "runs": ["epic"],
+                        "process_repeats": 1,
+                        "document": lambda run, k: paths_document([row_auto]),
+                        "env": {},
+                    }
+                ],
+                lane="mlx",
+            )
+            pr = campaign.paths_report([paths_dir])
+            summary_ad = pr["summary"][0]["adaptive_speculative"]
+            self.assertIsNotNone(summary_ad)
+            self.assertTrue(summary_ad["adaptive"])
+            self.assertEqual(summary_ad["initial_proposers"], ["mtp"])
+            self.assertEqual(summary_ad["final_proposers"], ["prompt_lookup"])
+            self.assertEqual(summary_ad["depth_changes"], 1.0)
+            self.assertEqual(summary_ad["proposer_switches"], 1.0)
+            self.assertAlmostEqual(summary_ad["cost"]["ms_per_committed_token"], 0.5, places=2)
+            pmd = campaign.paths_markdown(pr)
+            self.assertIn("### Adaptive speculative", pmd)
+            self.assertIn("mtp -> prompt_lookup", pmd)
+
+            # 2) compare_campaigns & markdown_report emit adaptive_speculative paired rows
+            #    covering both auto-vs-off and vs_baseline_auto.
+            def make_doc(run, k):
+                def extra(p, o):
+                    is_epic_auto = run == "epic" and o == "auto"
+                    base = {
+                        "wall_ms": {"n": 3, "mean": (140.0 if is_epic_auto else 220.0) + jitter(k)},
+                        "peak_memory_bytes": {"n": 3, "mean": float(2 << 30)},
+                    }
+                    if is_epic_auto:
+                        base.update(
+                            {
+                                "adaptive_speculative": adaptive_auto,
+                                "mean_accepted_length": 3.0,
+                                "accepted_tokens": 60,
+                                "verify_steps": 20,
+                                "generated_tokens": 80,
+                            }
+                        )
+                    else:
+                        base.update(
+                            {
+                                "mean_accepted_length": 0.0,
+                                "accepted_tokens": 0,
+                                "verify_steps": 80,
+                                "generated_tokens": 80,
+                            }
+                        )
+                    return base
+
+                def val(p, o, m):
+                    if m == "decode_tok_s":
+                        return (92.0 if (run == "epic" and o == "auto") else 60.0) + jitter(k)
+                    if m == "ttft_ms":
+                        return 25.0 + jitter(k)
+                    return 50.0
+
+                return document(run, value=val, row_extra=extra)
+
+            cmp_dir = write_campaign(
+                Path(td) / "adaptive-cmp",
+                [{"id": "paired-adaptive", "runs": ["epic", "baseline"], "document": make_doc}],
+            )
+            report = campaign.compare_campaigns([cmp_dir], LIVE_DEFAULTS)
+            paired = report["adaptive_speculative"]
+            self.assertTrue(paired, "expected adaptive_speculative paired entries")
+            sample = paired[0]
+            self.assertAlmostEqual(sample["wall_ms"]["candidate"]["mean"], 140.0, places=1)
+            self.assertAlmostEqual(sample["wall_ms"]["reference"]["mean"], 220.0, places=1)
+            self.assertIsNotNone(sample["vs_baseline_auto"])
+            self.assertAlmostEqual(
+                sample["vs_baseline_auto"]["wall_ms"]["candidate"]["mean"], 140.0, places=1
+            )
+            self.assertAlmostEqual(
+                sample["vs_baseline_auto"]["wall_ms"]["reference"]["mean"], 220.0, places=1
+            )
+            self.assertEqual(sample["accepted_per_pass"], 3.0)
+            self.assertEqual(sample["tokens_per_pass"], 4.0)
+            self.assertEqual(sample["adaptive_speculative"]["final_proposers"], ["prompt_lookup"])
+            self.assertEqual(sample["adaptive_speculative"]["proposer_switches"], 1.0)
+
+            md = campaign.markdown_report(report)
+            self.assertIn("## Adaptive speculative — paired auto vs off (SW-7237)", md)
+            self.assertIn("### Adaptive speculative — candidate auto vs baseline auto", md)
+            self.assertIn("140.0 vs 220.0", md)
+            self.assertIn("mtp -> prompt_lookup", md)

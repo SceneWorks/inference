@@ -578,6 +578,297 @@ class ConditionalAssetInventory(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "missing: PiD Gemma LICENSE"):
                             conditional.prepare_assets(retry, assets.ROOT, gemma)
 
+    def test_fetch_pinned_falls_back_to_replace_when_hardlinks_unsupported(self):
+        import errno
+        import threading
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": "7"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                return FakeResponse(b"fetched")
+
+        class RacingResponse:
+            """Creates `destination` with `placed` once the stream finishes reading."""
+
+            def __init__(self, destination, body, placed):
+                self.destination, self.body, self.placed = destination, io.BytesIO(body), placed
+                self.headers = {"Content-Length": str(len(body))}
+
+            def read(self, size):
+                chunk = self.body.read(size)
+                if not chunk and not self.destination.exists():
+                    self.destination.write_bytes(self.placed)
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class RacingOpener:
+            def __init__(self, destination, body, placed):
+                self.destination, self.body, self.placed, self.linked_etag = destination, body, placed, None
+
+            def open(self, request, timeout=None):
+                return RacingResponse(self.destination, self.body, self.placed)
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            # Fresh placement succeeds on both the macOS `renamex_np` path and the lockfile fallback.
+            for mode, patch_renamex in (("renamex_or_lock", False), ("lock_fallback", True)):
+                with self.subTest(mode=mode):
+                    dest = root / mode / "chat_template.jinja"
+                    with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
+                        if patch_renamex:
+                            with patch.object(assets, "_renamex_excl", return_value=False):
+                                size, sha, _, placed = assets.fetch_pinned(
+                                    "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
+                                    dest,
+                                    opener=FakeOpener(),
+                                )
+                        else:
+                            size, sha, _, placed = assets.fetch_pinned(
+                                "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
+                                dest,
+                                opener=FakeOpener(),
+                            )
+                    self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"fetched").hexdigest(), False))
+                    self.assertEqual(dest.read_bytes(), b"fetched")
+                    self.assertEqual([p.name for p in dest.parent.iterdir()], ["chat_template.jinja"])
+
+            # Mid-download concurrent placement under ENOTSUP never overwrites `destination`.
+            for mode, patch_renamex in (("renamex_or_lock", False), ("lock_fallback", True)):
+                race_dir = root / f"race_{mode}"
+                race_dir.mkdir()
+                same_dest = race_dir / "same.safetensors"
+                diff_dest = race_dir / "diff.safetensors"
+                with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
+                    ctx = patch.object(assets, "_renamex_excl", return_value=False) if patch_renamex else patch.object(
+                        assets, "_renamex_excl", wraps=assets._renamex_excl
+                    )
+                    with ctx:
+                        with self.subTest(mode=mode, case="matching_bytes"):
+                            size, sha, _, placed = assets.fetch_pinned(
+                                "https://example/same",
+                                same_dest,
+                                opener=RacingOpener(same_dest, b"weights", b"weights"),
+                            )
+                            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"weights").hexdigest(), True))
+                            self.assertEqual(same_dest.read_bytes(), b"weights")
+                        with self.subTest(mode=mode, case="differing_bytes"):
+                            with self.assertRaisesRegex(ValueError, "placed concurrently"):
+                                assets.fetch_pinned(
+                                    "https://example/diff",
+                                    diff_dest,
+                                    opener=RacingOpener(diff_dest, b"weights", b"OTHER!!"),
+                                )
+                            self.assertEqual(diff_dest.read_bytes(), b"OTHER!!")
+                self.assertEqual(sorted(p.name for p in race_dir.iterdir()), ["diff.safetensors", "same.safetensors"])
+
+            # Two concurrent lockfile-fallback publishers serialize cleanly: both pass the initial
+            # pre-download probe before either publishes; t1 acquires the sibling lockfile while t2
+            # contends on it; t1 places once, then t2 observes FileExistsError and verifies via
+            # `_same_bytes` without clobbering.
+            real_replace = os.replace
+            real_os_open = os.open
+
+            class PlainOpener:
+                def __init__(self, body, on_open=None):
+                    self.body, self.on_open, self.linked_etag = body, on_open, None
+
+                def open(self, request, timeout=None):
+                    if self.on_open is not None:
+                        self.on_open()
+                    body = self.body
+
+                    class _Resp(io.BytesIO):
+                        headers = {"Content-Length": str(len(body))}
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *_):
+                            return False
+
+                    return _Resp(body)
+
+            for case, body_b, expect_error in (("identical", b"weights", False), ("divergent", b"DIFFER!", True)):
+                with self.subTest(concurrent_lock=case):
+                    conc_dir = root / f"concurrent_{case}"
+                    conc_dir.mkdir()
+                    dest = conc_dir / "model.safetensors"
+                    both_started = threading.Barrier(2)
+                    t1_holding_lock = threading.Event()
+                    t2_hit_lock = threading.Event()
+                    results = []
+
+                    def synchronized_replace(src, dst):
+                        t1_holding_lock.set()
+                        t2_hit_lock.wait(timeout=5.0)
+                        return real_replace(src, dst)
+
+                    def tracking_os_open(path, flags, *args, **kwargs):
+                        try:
+                            return real_os_open(path, flags, *args, **kwargs)
+                        except FileExistsError:
+                            if str(path).endswith(".place.lock"):
+                                t2_hit_lock.set()
+                            raise
+
+                    def run_worker(body, is_first):
+                        try:
+                            def sync_start():
+                                both_started.wait(timeout=5.0)
+                                if not is_first:
+                                    t1_holding_lock.wait(timeout=5.0)
+
+                            res = assets.fetch_pinned(
+                                "https://example/model",
+                                dest,
+                                opener=PlainOpener(body, on_open=sync_start),
+                            )
+                            results.append(("ok", body, res))
+                        except Exception as exc:  # noqa: BLE001
+                            results.append(("err", body, exc))
+
+                    with (
+                        patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                        patch.object(assets, "_renamex_excl", return_value=False),
+                        patch.object(assets.os, "replace", side_effect=synchronized_replace),
+                        patch.object(assets.os, "open", side_effect=tracking_os_open),
+                    ):
+                        t1 = threading.Thread(target=run_worker, args=(b"weights", True))
+                        t2 = threading.Thread(target=run_worker, args=(body_b, False))
+                        t1.start()
+                        t2.start()
+                        t1.join(timeout=10.0)
+                        t2.join(timeout=10.0)
+
+                    self.assertTrue(t2_hit_lock.is_set(), "second publisher must contend on sibling lockfile")
+                    self.assertEqual(dest.read_bytes(), b"weights")
+                    self.assertEqual([p.name for p in conc_dir.iterdir()], ["model.safetensors"])
+                    if expect_error:
+                        ok = [r for r in results if r[0] == "ok"]
+                        err = [r for r in results if r[0] == "err"]
+                        self.assertEqual(len(ok), 1, results)
+                        self.assertFalse(ok[0][2][3])
+                        self.assertEqual(len(err), 1, results)
+                        self.assertIsInstance(err[0][2], ValueError)
+                        self.assertIn("placed concurrently", str(err[0][2]))
+                    else:
+                        self.assertEqual(len(results), 2, results)
+                        self.assertTrue(all(r[0] == "ok" for r in results), results)
+                        placed_flags = sorted(r[2][3] for r in results)
+                        self.assertEqual(placed_flags, [False, True])
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock and dead-PID lock recovery test")
+    def test_fetch_pinned_recovers_placement_lock_after_publisher_death(self):
+        import errno
+        import fcntl
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": "7"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                return FakeResponse(b"weights")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+
+            # 1) Real child process acquires `flock` on `.place.lock` and is SIGKILLed before
+            #    unlinking it: kernel releases `flock` immediately, so `fetch_pinned` recovers
+            #    without timing out, places `dest`, and removes the leftover `.place.lock`.
+            kill_dir = root / "sigkill_recovery"
+            kill_dir.mkdir()
+            dest = kill_dir / "model.safetensors"
+            lock_path = kill_dir / f".{dest.name}.place.lock"
+            holder_script = (
+                "import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "print('LOCKED', flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", holder_script, str(lock_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "LOCKED")
+                self.assertTrue(lock_path.exists())
+                # Confirm the child actually holds the OS flock before killing it.
+                with open(lock_path, "r+b") as probe_handle:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                proc.kill()
+                proc.wait(timeout=10.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10.0)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            self.assertTrue(lock_path.exists(), "SIGKILLed child leaves sibling lockfile on disk")
+            with (
+                patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                patch.object(assets, "_renamex_excl", return_value=False),
+            ):
+                size, sha, _, placed = assets.fetch_pinned(
+                    "https://example/model",
+                    dest,
+                    opener=FakeOpener(),
+                )
+            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"weights").hexdigest(), False))
+            self.assertEqual(dest.read_bytes(), b"weights")
+            self.assertEqual([p.name for p in kill_dir.iterdir()], ["model.safetensors"])
+
+            # 2) Exotic filesystem where `flock` itself raises ENOTSUP: fallback `O_CREAT | O_EXCL`
+            #    records the owner PID and reclaims a stale lockfile left by a dead process.
+            notsup_dir = root / "enotsup_dead_pid_recovery"
+            notsup_dir.mkdir()
+            dest2 = notsup_dir / "model.safetensors"
+            lock_path2 = notsup_dir / f".{dest2.name}.place.lock"
+            dead_child = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead_child.wait(timeout=10.0)
+            lock_path2.write_bytes(f"{dead_child.pid}\n".encode("ascii"))
+
+            with (
+                patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                patch.object(assets, "_renamex_excl", return_value=False),
+                patch.object(fcntl, "flock", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+            ):
+                size2, sha2, _, placed2 = assets.fetch_pinned(
+                    "https://example/model",
+                    dest2,
+                    opener=FakeOpener(),
+                )
+            self.assertEqual((size2, sha2, placed2), (7, hashlib.sha256(b"weights").hexdigest(), False))
+            self.assertEqual(dest2.read_bytes(), b"weights")
+            self.assertEqual([p.name for p in notsup_dir.iterdir()], ["model.safetensors"])
+
 
 if __name__ == "__main__":
     unittest.main()

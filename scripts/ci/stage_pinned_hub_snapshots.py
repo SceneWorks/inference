@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import errno
 from functools import partial
 import json
 import os
@@ -39,6 +38,7 @@ import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci.file_lock import exclusive_file_lock, try_lock_handle  # noqa: E402
 from scripts.ci.flux1_conditional_asset_inventory import confined, publish_download  # noqa: E402
 from scripts.ci.model_inference_proofs import unlinked_path  # noqa: E402
 from scripts.ci.pinned_hub_source import pinned_file_identity, pinned_manifest, verify_pinned_hub_files  # noqa: E402
@@ -50,10 +50,6 @@ HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
 LOCK_POLL_SECONDS = 5
 # A holder may be downloading tens of GiB; say so periodically rather than going silent.
 LOCK_LOG_SECONDS = 180
-# Only these mean "another holder has it"; any other lock error (ENOLCK/ENOTSUP on a network
-# hub, EBADF, EINVAL) is raised instead of spinning forever.
-POSIX_LOCK_BUSY = frozenset((errno.EWOULDBLOCK, errno.EAGAIN))
-MSVCRT_LOCK_BUSY = frozenset((errno.EACCES, errno.EDEADLK))
 
 
 def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
@@ -61,20 +57,7 @@ def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
 
 
 def _try_lock(handle) -> bool:
-    windows = os.name == "nt"
-    try:
-        if windows:
-            import msvcrt
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError as error:
-        if error.errno in (MSVCRT_LOCK_BUSY if windows else POSIX_LOCK_BUSY):
-            return False
-        raise
+    return try_lock_handle(handle, is_windows=(os.name == "nt"))
 
 
 def staging_lock_path(hub: Path, repository: str, revision: str, file: str) -> Path:
@@ -140,40 +123,39 @@ def staging_lock(hub: Path, repository: str, revision: str, file: str):
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
     hub = hub.resolve(strict=True)
     path = staging_lock_path(hub, repository, revision, file)
-    _guard_lock(path, hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _guard_lock(path, hub)
 
     def open_lock(name, flags):
         return os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
 
-    with open(path, "a+b", opener=open_lock) as handle:
+    @contextmanager
+    def open_guarded(path):
         _guard_lock(path, hub)
-        opened = os.fstat(handle.fileno())
-        if opened.st_nlink != 1 or not os.path.samestat(opened, path.lstat()):
-            raise ValueError(f"staging lock changed during open: {path}")
-        if handle.seek(0, 2) == 0:
-            handle.write(b"0")
-            handle.flush()
-        if not _try_lock(handle):
-            started = logged = time.monotonic()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _guard_lock(path, hub)
+        with open(path, "a+b", opener=open_lock) as handle:
+            _guard_lock(path, hub)
+            opened = os.fstat(handle.fileno())
+            if opened.st_nlink != 1 or not os.path.samestat(opened, path.lstat()):
+                raise ValueError(f"staging lock changed during open: {path}")
+            yield handle
+
+    started = logged = 0.0
+
+    def on_wait(wait_count):
+        nonlocal started, logged
+        now = time.monotonic()
+        if wait_count == 0:
+            started = logged = now
             print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
-            while not _try_lock(handle):
-                time.sleep(LOCK_POLL_SECONDS)
-                if time.monotonic() - logged >= LOCK_LOG_SECONDS:
-                    logged = time.monotonic()
-                    print(f"still waiting ({logged - started:.0f} s) for another job staging "
-                          f"{repository}@{revision}/{file}", flush=True)
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif now - logged >= LOCK_LOG_SECONDS:
+            logged = now
+            print(f"still waiting ({logged - started:.0f} s) for another job staging "
+                  f"{repository}@{revision}/{file}", flush=True)
+
+    with exclusive_file_lock(path, poll_seconds=LOCK_POLL_SECONDS, on_wait=on_wait,
+                             try_lock=_try_lock, monotonic=time.monotonic, sleep=time.sleep,
+                             open_persistent=open_guarded):
+        yield
 
 
 def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:

@@ -31,13 +31,13 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_adaptive,
     graph_demoted_step_admission_bytes, graph_workspace_admission_bytes_with_hidden_row,
-    prefill_restored_with_plan, tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask,
-    CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason,
-    GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache,
-    PrefixRestoreOutcome, PrefixStats, Proposer, RequestSpan, RewindableConstraintMask,
-    SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
+    prefill_restored_with_plan, tree_extra_positions, AdaptiveEngineConfig, BlockDraftProposer,
+    Boundary, ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer,
+    FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer,
+    NoProposer, PrefixCache, PrefixRestoreOutcome, PrefixStats, Proposer, RequestSpan,
+    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
 };
 use crate::device::select_device;
 use crate::error::to_core;

@@ -16,6 +16,7 @@ timeout is reported as `unreachable`, never as absent. Other repositories that h
 the same name are ignored, so a role cannot be ambiguous.
 """
 import argparse
+import ctypes
 import errno
 import faulthandler
 import hashlib
@@ -33,6 +34,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci.file_lock import exclusive_file_lock
 from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 from scripts.ci.flux1_pair.fs_probe import Unreachable, probe
 
@@ -304,6 +306,9 @@ GEMMA_STAGE_FILES = ("config.json", "generation_config.json", "special_tokens_ma
 STAGE_CHUNK = 8 * 1024 * 1024
 STAGE_SOCKET_TIMEOUT = 120
 MAX_STAGE_SECONDS = 3_600
+_DARWIN_RENAME_EXCL = 0x00000004
+PLACE_LOCK_TIMEOUT_SECONDS = 30.0
+PLACE_LOCK_POLL_SECONDS = 0.02
 
 
 def pinned_path(hub, repo, revision, name):
@@ -340,21 +345,78 @@ def _same_bytes(path, size, sha):
     return read == size and state.hexdigest() == sha
 
 
+def _renamex_excl(source, destination):
+    """Atomically rename on macOS if the filesystem supports exclusive rename."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = libc.renamex_np
+    except (OSError, AttributeError):
+        return False
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    rc = renamex_np(os.fsencode(source), os.fsencode(destination), _DARWIN_RENAME_EXCL)
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(err, os.strerror(err), str(destination))
+    if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+        return False
+    raise OSError(err, os.strerror(err), str(source), None, str(destination))
+
+
+def _locked_replace_if_absent(temporary, destination):
+    """Serialize the legacy inventory's placement with its crash-safe sibling lock."""
+    lock_path = destination.parent / f".{destination.name}.place.lock"
+
+    def check_absent(_wait_count):
+        if probe(destination)["exists"]:
+            raise FileExistsError(destination)
+
+    with exclusive_file_lock(
+        lock_path,
+        poll_seconds=PLACE_LOCK_POLL_SECONDS,
+        timeout_seconds=PLACE_LOCK_TIMEOUT_SECONDS,
+        remove_on_exit=True,
+        fallback_excl_on_notsup=True,
+        on_wait=check_absent,
+    ):
+        check_absent(0)
+        os.replace(temporary, destination)
+
+
+def _place_without_overwrite(temporary, destination, *, guard, without_hardlinks):
+    if os.name == "nt":
+        os.rename(temporary, destination)
+        return
+    try:
+        os.link(temporary, destination)
+    except OSError as error:
+        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+        if guard is not None:
+            guard(destination)
+        if _renamex_excl(temporary, destination):
+            return
+        if guard is not None:
+            # The shared Hub can have writers which do not use the legacy inventory lock.
+            # Its fallback publishes a verified blob without replacing the snapshot leaf.
+            if sys.platform != "darwin" or without_hardlinks is None:
+                raise
+            without_hardlinks(temporary, destination)
+        else:
+            _locked_replace_if_absent(temporary, destination)
+
+
 def publish_download(temporary, destination, size, sha, *, guard=None, without_hardlinks=None):
     """Publish a verified partial atomically and reconcile a concurrent same-byte placement."""
     if guard is not None:
         guard(destination)
     try:
-        if os.name == "nt":
-            os.rename(temporary, destination)
-        else:
-            try:
-                os.link(temporary, destination)
-            except OSError as error:
-                if (sys.platform != "darwin" or without_hardlinks is None or guard is None
-                        or error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP)):
-                    raise
-                without_hardlinks(temporary, destination)
+        _place_without_overwrite(temporary, destination, guard=guard, without_hardlinks=without_hardlinks)
     except FileExistsError:
         if guard is not None:
             guard(destination)

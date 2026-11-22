@@ -18,6 +18,7 @@ import yaml
 
 from scripts.ci import model_inference_proofs as proofs
 from scripts.ci import stage_pinned_hub_snapshots as staging
+from scripts.ci import flux1_conditional_asset_inventory as inventory
 from scripts.ci.pinned_hub_source import verify_pinned_hub_files
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -229,6 +230,7 @@ class Staging(unittest.TestCase):
 
             error = OSError(errno.ENOTSUP, "hard links unavailable")
             with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                  patch.object(inventory, "_renamex_excl", return_value=False),
                   patch("os.symlink", side_effect=atomic) as commit, patch("os.replace") as replace):
                 result = self.stage_downloads(hub, self.FILES)
             commit.assert_called_once()
@@ -257,6 +259,7 @@ class Staging(unittest.TestCase):
 
                 error = OSError(errno.ENOTSUP, "hard links unavailable")
                 with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
                       patch("os.symlink", side_effect=placed), patch("os.replace") as replace):
                     if peer_data == b"weights":
                         result = self.stage_downloads(hub, self.FILES)
@@ -283,6 +286,7 @@ class Staging(unittest.TestCase):
                 error = OSError(errno.ENOTSUP, "publication unavailable")
 
                 with (patch.object(sys, "platform", platform), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
                       patch("os.symlink", side_effect=error) as link, patch("os.replace") as replace):
                     with self.assertRaises(OSError) as failure:
                         self.stage_downloads(hub, self.FILES)
@@ -313,6 +317,7 @@ class Staging(unittest.TestCase):
 
             error = OSError(errno.ENOTSUP, "hard links unavailable")
             with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                  patch.object(inventory, "_renamex_excl", return_value=False),
                   self.assertRaisesRegex(ValueError, "linked evidence ancestor")):
                 self.stage_downloads(hub, self.FILES)
             self.assertEqual(list(outside.iterdir()), [])
@@ -450,6 +455,18 @@ class Staging(unittest.TestCase):
                     / REV / "q8/model.safetensors.lock")
             self.assertTrue(lock.is_file())
             self.assertFalse(staging.snapshot_dir(hub, self.PIN["repository"], REV).exists())
+
+    def test_shared_locker_validates_the_opened_lock_before_seeding_or_waiting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary).resolve()
+            file = "q8/model.safetensors"
+            with (patch("os.path.samestat", return_value=False), patch.object(staging, "_try_lock") as attempt,
+                  self.assertRaisesRegex(ValueError, "staging lock changed during open")):
+                with staging.staging_lock(hub, self.PIN["repository"], REV, file):
+                    self.fail("an unbound lock should never be acquired")
+            attempt.assert_not_called()
+            lock = staging.staging_lock_path(hub, self.PIN["repository"], REV, file)
+            self.assertEqual(lock.read_bytes(), b"")
 
     def test_a_file_another_job_placed_mid_download_is_kept_not_fetched(self):
         with tempfile.TemporaryDirectory() as temporary:
