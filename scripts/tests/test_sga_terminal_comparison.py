@@ -163,8 +163,10 @@ class TerminalTests(unittest.TestCase):
             b"        let (vlat, alat) = (stage2.video, stage2.audio);",
         ))
         metadata = {f"{source}/quant_measurement.rs": b"\nfn terminal_generation_request("}
-        base = {**originals, **metadata, lib: ltx.ORIGINAL_INSTALL + b"\n" + other_markers + b"\n// frozen scales"}
-        head = {**shared, **metadata, lib: ltx.REPAIRED_INSTALL + b"\n" + other_markers + b"\n// request scopes"}
+        old_cancel = b"\n".join(original for original, _ in ltx.DEV_CANCELLATION_EDITS)
+        new_cancel = b"\n".join(repaired for _, repaired in ltx.DEV_CANCELLATION_EDITS)
+        base = {**originals, **metadata, lib: b"\n".join((ltx.ORIGINAL_INSTALL, other_markers, old_cancel, b"// frozen scales"))}
+        head = {**shared, **metadata, lib: b"\n".join((ltx.REPAIRED_INSTALL, other_markers, new_cancel, b"// request scopes"))}
         with patch.dict(ltx.DEV_LOADER_BASE_SHA256, frozen_sha, clear=True):
             base_overlay = ltx.overlay(base.__getitem__, "base", "candle-cuda", "test", dev_loader=shared)
             head_overlay = ltx.overlay(head.__getitem__, "head", "candle-cuda", "test", dev_loader=shared)
@@ -174,6 +176,8 @@ class TerminalTests(unittest.TestCase):
                 self.assertIn(marker, instrumented[lib])
                 self.assertEqual(instrumented[lib].count(b"SGA_LTX_ADAPTER"), 1)
                 self.assertIn(b"let sga_adapters = if self.transformer_variant.is_dev()", instrumented[lib])
+                self.assertIn(b"adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?\n", instrumented[lib])
+                self.assertIn(new_cancel, instrumented[lib])
             drift_path = f"{source}/adapters.rs"
             base[drift_path] = b"old source drift"
             with self.assertRaisesRegex(ValueError, "unexpected original LTX Dev loader"):

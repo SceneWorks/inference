@@ -48,10 +48,38 @@ DEV_LOADER_BASE_SHA256 = {
 DEV_LOADER_FILES = (*DEV_LOADER_BASE_SHA256, "adapters/refinement.rs")
 ORIGINAL_INSTALL = b"        adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
 REPAIRED_INSTALL = b"""        if self.transformer_variant.is_dev() {
-            adapters::install_ltx25_dev_adapters(&mut avdit, adapters)?;
+            adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?;
         } else {
             adapters::install_ltx25_adapters(&mut avdit, adapters)?;
         }"""
+DEV_CANCELLATION_EDITS = (
+    (b"""                memory_strategy_2_5::TransformerExecution::default(),
+            );""", b"""                memory_strategy_2_5::TransformerExecution::default(),
+                &gen_core::CancelFlag::new(),
+            );"""),
+    (b"""        execution: memory_strategy_2_5::TransformerExecution,
+    ) -> CResult<Components> {""", b"""        execution: memory_strategy_2_5::TransformerExecution,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<Components> {"""),
+    (b"""            *slot = None;
+            *slot = Some((
+                key,
+                pipe.load_components_split(&self.adapters, key.with_vae_encoder, execution)?,
+            ));""", b"""            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
+            *slot = None;
+            let components = pipe.load_components_split(
+                &self.adapters,
+                key.with_vae_encoder,
+                execution,
+                &req.cancel,
+            )?;
+            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
+            *slot = Some((key, components));"""),
+)
 
 
 def model_asset_contract(variant):
@@ -117,11 +145,14 @@ def overlay(read, arm, backend, binary, *, dev_loader=None):
                     raise ValueError(f"unexpected original LTX Dev loader source {name}")
             loader_overlay = dev_loader
             data = edit_once(data, ORIGINAL_INSTALL, REPAIRED_INSTALL)
-        elif dev_loader_sources(read) != dev_loader or REPAIRED_INSTALL not in data:
+            for original, repaired in DEV_CANCELLATION_EDITS:
+                data = edit_once(data, original, repaired)
+        elif (dev_loader_sources(read) != dev_loader or data.count(REPAIRED_INSTALL) != 1
+              or any(data.count(repaired) != 1 for _, repaired in DEV_CANCELLATION_EDITS)):
             raise ValueError("candidate LTX Dev loader differs from the baseline repair")
     report = b'\n        println!("SGA_LTX_ADAPTER {} {}", sga_adapters.applied, sga_adapters.skipped_keys);'
     if REPAIRED_INSTALL in data:
-        observed = REPAIRED_INSTALL.replace(b"        if ", b"        let sga_adapters = if ", 1).replace(b"adapters)?;", b"adapters)?")
+        observed = REPAIRED_INSTALL.replace(b"        if ", b"        let sga_adapters = if ", 1).replace(b")?;", b")?")
         data = edit_once(data, REPAIRED_INSTALL, observed + b";" + report)
     else:
         observed = b"        let sga_adapters = adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
