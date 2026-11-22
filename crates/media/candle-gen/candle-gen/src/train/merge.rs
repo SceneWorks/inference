@@ -245,6 +245,38 @@ pub fn build_kohya_table(
         .collect()
 }
 
+/// Resolve only the base coefficients named by one adapter file, retaining earlier folds in a stack.
+/// An incomplete or mismatched target that the family merge skips keeps its original backend.
+pub fn fold_checkpoint_file(
+    vb: &candle_nn::VarBuilder<'_>,
+    overrides: &mut HashMap<String, Tensor>,
+    file: &AdapterFile,
+    mut target: impl FnMut(&str) -> Option<String>,
+    merge: impl FnOnce(&mut HashMap<String, Tensor>) -> Result<()>,
+) -> Result<()> {
+    let cpu = vb.clone().set_device(candle_core::Device::Cpu);
+    let mut loaded = Vec::new();
+    for factor in file.tensors.keys() {
+        if let Some(key) = target(factor) {
+            if !overrides.contains_key(&key) && cpu.contains_tensor(&key) {
+                let coefficients = cpu.get_unchecked(&key)?;
+                loaded.push((key.clone(), coefficients.id()));
+                overrides.insert(key, coefficients);
+            }
+        }
+    }
+    merge(overrides)?;
+    for (key, original) in loaded {
+        if overrides
+            .get(&key)
+            .is_some_and(|weight| weight.id() == original)
+        {
+            overrides.remove(&key);
+        }
+    }
+    Ok(())
+}
+
 /// The shared zero-match loud error: a non-empty spec list that folded **no** target is a format /
 /// prefix misconfiguration, so the caller hard-errors (the worker then falls back rather than render
 /// an unadapted image silently). `family` is the crate tag, `expected` the per-family key-form hint.

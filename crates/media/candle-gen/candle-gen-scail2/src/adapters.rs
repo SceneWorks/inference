@@ -270,79 +270,129 @@ pub fn merge_adapters(
     map: &mut HashMap<String, Tensor>,
     specs: &[AdapterSpec],
 ) -> Result<MergeReport> {
-    if specs.is_empty() {
-        return Ok(MergeReport::default());
-    }
-    let mut report = MergeReport::default();
-    for spec in specs {
-        let af = read_adapter(&spec.path)?;
-        let has_unstamped_lokr =
-            !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str));
-        let has_unstamped_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
-        if spec.kind == AdapterKind::Lora && af.declares_lokr() {
-            return Err(CandleError::Msg(format!(
-                "scail2: adapter {} declared LoRA but its metadata says networkType=lokr",
-                spec.path.display()
-            )));
-        }
-        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
-            return Err(CandleError::Msg(format!(
-                "scail2: adapter {} declared LoKr but does not declare networkType=lokr",
-                spec.path.display()
-            )));
-        }
-        let before = report.merged;
-        // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
-        // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if has_unstamped_lokr {
-            merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
-            if report.merged == before {
-                return Err(CandleError::Msg(format!(
-                    "scail2: selected adapter {} matched no SCAIL-2 projection",
-                    spec.path.display()
-                )));
-            }
-            continue;
-        }
-        if has_unstamped_loha {
-            merge_loha_thirdparty(map, &af, spec.scale, &mut report)?;
-            if report.merged == before {
-                return Err(CandleError::Msg(format!(
-                    "scail2: selected adapter {} matched no SCAIL-2 projection",
-                    spec.path.display()
-                )));
-            }
-            continue;
-        }
-        match spec.kind {
-            AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &mut report)?,
-            AdapterKind::Lora => {
-                if af.declares_lokr() {
-                    return Err(CandleError::Msg(format!(
-                        "scail2: adapter {} declared Lora but its metadata says networkType=lokr",
-                        spec.path.display()
-                    )));
+    merge_with(specs, |spec, af, report| merge_file(map, spec, af, report))
+}
+
+/// SCAIL-2 folds deltas before model construction. Decode only targeted coefficients on the CPU;
+/// untargeted native matrices continue to bind and execute through the checkpoint reader.
+pub(crate) fn fold_checkpoint(
+    vb: candle_gen::candle_nn::VarBuilder<'static>,
+    specs: &[AdapterSpec],
+) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
+    let mut overrides = HashMap::new();
+    merge_with(specs, |spec, af, report| {
+        candle_gen::train::merge::fold_checkpoint_file(
+            &vb,
+            &mut overrides,
+            af,
+            |key| {
+                if let Some(stem) = key.strip_suffix(".diff_b") {
+                    return Some(format!("{}.bias", strip_lora_prefix(stem)));
                 }
-                merge_lora_file(map, &af, spec.scale, &mut report)?;
-            }
-        }
-        // lightx2v lightning hybrid: full-rank `.diff`/`.diff_b` deltas alongside the low-rank pairs.
-        // A no-op for a file without diff-patch keys (the DPO / general LoRA case). SCAIL-2 resolves a
-        // diff-patch stem the same way its low-rank `classify_*` does: strip the optional
-        // `transformer.`/`diffusion_model.` namespace, leaving the bare dotted base path.
-        merge_diff_patch_file(
-            map,
-            &af,
-            spec.scale,
-            |s| strip_lora_prefix(s).to_string(),
-            &mut report,
-        )?;
+                let path = key
+                    .strip_suffix(".diff")
+                    .map(|s| strip_lora_prefix(s).to_owned())
+                    .or_else(|| classify_lora_key(key).map(|(p, _)| p))
+                    .or_else(|| classify_lokr_key(key).map(|(p, _)| p))
+                    .or_else(|| {
+                        wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES)
+                            .or_else(|| wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES))
+                            .map(|(p, _)| strip_lora_prefix(p).to_owned())
+                    });
+                path.map(|p| format!("{p}.weight"))
+            },
+            |map| merge_file(map, spec, af, report),
+        )
+    })?;
+    Ok(candle_gen::loader::overlay_var_builder(vb, overrides))
+}
+
+fn merge_file(
+    map: &mut HashMap<String, Tensor>,
+    spec: &AdapterSpec,
+    af: &AdapterFile,
+    report: &mut MergeReport,
+) -> Result<()> {
+    let has_unstamped_lokr =
+        !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str));
+    let has_unstamped_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
+    if spec.kind == AdapterKind::Lora && af.declares_lokr() {
+        return Err(CandleError::Msg(format!(
+            "scail2: adapter {} declared LoRA but its metadata says networkType=lokr",
+            spec.path.display()
+        )));
+    }
+    if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+        return Err(CandleError::Msg(format!(
+            "scail2: adapter {} declared LoKr but does not declare networkType=lokr",
+            spec.path.display()
+        )));
+    }
+    let before = report.merged;
+    // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
+    // caller's declared `kind` can't label them — detect + route by keys before the kind match.
+    if has_unstamped_lokr {
+        merge_lokr_thirdparty(map, af, spec.scale, report)?;
         if report.merged == before {
             return Err(CandleError::Msg(format!(
                 "scail2: selected adapter {} matched no SCAIL-2 projection",
                 spec.path.display()
             )));
         }
+        return Ok(());
+    }
+    if has_unstamped_loha {
+        merge_loha_thirdparty(map, af, spec.scale, report)?;
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "scail2: selected adapter {} matched no SCAIL-2 projection",
+                spec.path.display()
+            )));
+        }
+        return Ok(());
+    }
+    match spec.kind {
+        AdapterKind::Lokr => merge_lokr_file(map, af, spec.scale, report)?,
+        AdapterKind::Lora => {
+            if af.declares_lokr() {
+                return Err(CandleError::Msg(format!(
+                    "scail2: adapter {} declared Lora but its metadata says networkType=lokr",
+                    spec.path.display()
+                )));
+            }
+            merge_lora_file(map, af, spec.scale, report)?;
+        }
+    }
+    // lightx2v lightning hybrid: full-rank `.diff`/`.diff_b` deltas alongside the low-rank pairs.
+    // A no-op for a file without diff-patch keys (the DPO / general LoRA case). SCAIL-2 resolves a
+    // diff-patch stem the same way its low-rank `classify_*` does: strip the optional
+    // `transformer.`/`diffusion_model.` namespace, leaving the bare dotted base path.
+    merge_diff_patch_file(
+        map,
+        af,
+        spec.scale,
+        |s| strip_lora_prefix(s).to_string(),
+        report,
+    )?;
+    if report.merged == before {
+        return Err(CandleError::Msg(format!(
+            "scail2: selected adapter {} matched no SCAIL-2 projection",
+            spec.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn merge_with(
+    specs: &[AdapterSpec],
+    mut apply: impl FnMut(&AdapterSpec, &AdapterFile, &mut MergeReport) -> Result<()>,
+) -> Result<MergeReport> {
+    if specs.is_empty() {
+        return Ok(MergeReport::default());
+    }
+    let mut report = MergeReport::default();
+    for spec in specs {
+        apply(spec, &read_adapter(&spec.path)?, &mut report)?;
     }
     if report.merged == 0 {
         return Err(no_target_matched(

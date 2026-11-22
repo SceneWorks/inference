@@ -121,7 +121,11 @@ impl HeaderWeights {
         self.tensors.get(name)
     }
 }
-fn header_linear(weights: &HeaderWeights, path: &str, biased: bool) -> Result<q::LinearWork> {
+pub(crate) fn header_linear(
+    weights: &HeaderWeights,
+    path: &str,
+    biased: bool,
+) -> Result<q::LinearWork> {
     // Exactly quant::lin's lookup order over the constructor's ALREADY cast leaves. This also
     // serves the VAE's optional resnet time projection under its distinct cast_all policy.
     let bias = if biased {
@@ -683,9 +687,9 @@ impl AttentionFacts {
         })
     }
 
-    fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
-        self.to_k_ip = Some(q::LinearWork::dense(k_ip, None));
-        self.to_v_ip = Some(q::LinearWork::dense(v_ip, None));
+    fn install_ip(&mut self, k_ip: q::LinearWork, v_ip: q::LinearWork) {
+        self.to_k_ip = Some(k_ip);
+        self.to_v_ip = Some(v_ip);
     }
 
     fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
@@ -801,7 +805,7 @@ impl TransformerBlockFacts {
         Ok(())
     }
 
-    fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
+    fn install_ip(&mut self, k_ip: q::LinearWork, v_ip: q::LinearWork) {
         self.attn2.install_ip(k_ip, v_ip);
     }
 
@@ -1204,7 +1208,10 @@ impl TransformerFacts {
         tensor(s, summed)
     }
 
-    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip(
+        &mut self,
+        pairs: &mut impl Iterator<Item = (q::LinearWork, q::LinearWork)>,
+    ) -> Result<()> {
         for block in &mut self.blocks {
             let (k_ip, v_ip) = pairs
                 .next()
@@ -1421,7 +1428,10 @@ impl BlockFacts {
         Ok((x, output_states))
     }
 
-    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip(
+        &mut self,
+        pairs: &mut impl Iterator<Item = (q::LinearWork, q::LinearWork)>,
+    ) -> Result<()> {
         if let Some(attns) = &mut self.attentions {
             for a in attns {
                 a.install_ip(pairs)?;
@@ -1743,7 +1753,7 @@ impl UNetFacts {
         Ok(eps)
     }
 
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(q::LinearWork, q::LinearWork)>) -> Result<()> {
         let expected = pairs.len();
         let mut it = pairs.into_iter();
         for b in &mut self.down_blocks {
@@ -2441,17 +2451,13 @@ impl TransformerFacts {
 }
 pub(crate) fn ip_pairs_from_headers(
     headers: &[SafetensorsTensorHeader],
-) -> Result<Vec<(Tensor, Tensor)>> {
+) -> Result<Vec<(q::LinearWork, q::LinearWork)>> {
     let weights = HeaderWeights::new(headers)?;
     crate::ip_adapter::ip_kv_indices(weights.tensors.keys().map(String::as_str))?
         .into_iter()
         .map(|index| {
-            let key = weights
-                .require(&format!("ip_adapter.{index}.to_k_ip.weight"))?
-                .clone();
-            let value = weights
-                .require(&format!("ip_adapter.{index}.to_v_ip.weight"))?
-                .clone();
+            let key = header_linear(&weights, &format!("ip_adapter.{index}.to_k_ip"), false)?;
+            let value = header_linear(&weights, &format!("ip_adapter.{index}.to_v_ip"), false)?;
             Ok((key, value))
         })
         .collect()

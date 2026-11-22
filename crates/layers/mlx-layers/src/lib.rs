@@ -170,6 +170,7 @@ impl NativeProjection {
         if let Some(p) = w.planned_fp8(base) {
             let mut p = p.clone();
             w.require(key)?;
+            w.get(&format!("{base}.comfy_quant"));
             w.get(&format!("{base}.weight_scale"));
             w.get(&format!("{base}.input_scale"));
             if bias {

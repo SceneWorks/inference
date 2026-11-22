@@ -207,7 +207,7 @@ impl CpuCastMmap {
     fn load_cpu(&self, name: &str, dtype: DType) -> CoreResult<Tensor> {
         if let candle_gen::loader::MappedWeights::Checkpoint(src) = &self.tensors {
             if src.reader().planned(name).is_some() {
-                return src.reader().read_dense(name, dtype, &Device::Cpu);
+                return src.get_unchecked(name, dtype, &Device::Cpu);
             }
         }
         let tensor = self.tensors.mmap().load(name, &Device::Cpu)?;
@@ -276,9 +276,7 @@ fn cpu_cast_mmap_var_builder(
     Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
 }
 
-/// Load a checkpoint to a CPU tensor map and widen every tensor to f32 there. Adapter merging and the
-/// shared VAE key remap require a mutable whole-model map, so they cannot use the bounded backend;
-/// this helper gives them the same no-bf16-on-CUDA invariant as the stock dense path.
+/// Widen the shared convolutional VAE's tensors on the host before its whole-model key remap.
 fn cpu_f32_tensor_map(files: &[PathBuf]) -> CResult<HashMap<String, Tensor>> {
     let tensors = candle_gen::mmap_safetensors_multi(files)?;
     let mut out = HashMap::new();
@@ -517,19 +515,8 @@ pub struct Scail2 {
 }
 
 impl Scail2 {
-    /// Build the DiT [`VarBuilder`] over the shared flat file or legacy `transformer/` snapshot. The
-    /// stock path streams one tensor at a time through the CPU f32 cast; with adapters, the base
-    /// tensors are loaded to a CPU map and each delta is folded in
-    /// ([`crate::adapters::merge_adapters`], f32 math — merge not residual, the chaos-sensitive-sampler
-    /// rationale), the **whole map is cast to f32 on the CPU**, then the DiT is built from it.
-    ///
-    /// The host-side f32 cast is load-bearing for memory: SCAIL-2's DiT is f32, so a bf16 base tensor
-    /// served through Candle's stock mmap backend would upload bf16 and cast bf16→f32 *on the GPU*,
-    /// and candle's CUDA
-    /// caching allocator retains the freed bf16 staging blocks — ~28 GiB piled on top of the ~56 GiB
-    /// f32 DiT, OOM-ing at the VAE-decode peak even on a 96 GiB card. Casting host-side (host RAM is
-    /// ample, the map is transient) makes `get` a pure f32 host→device move. The Wan-14B merge path
-    /// doesn't need this because its DiT is bf16, so `from_tensors` never casts on the GPU.
+    /// Open the flat or sharded DiT once. Dense tensors widen on CPU before GPU transfer, and
+    /// coefficient-fold adapters replace only the tensors they successfully modify.
     fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
         let files = match self.layout {
             SnapshotLayout::SharedMlxTier => vec![self.root.join("dit.safetensors")],
@@ -537,22 +524,12 @@ impl Scail2 {
                 candle_gen::sorted_safetensors(&self.root.join("transformer"), "scail2")?
             }
         };
+        let vb = cpu_cast_mmap_var_builder(&files, DType::F32, &self.device)?;
         if self.adapters.is_empty() {
-            return cpu_cast_mmap_var_builder(&files, DType::F32, &self.device);
+            Ok(vb)
+        } else {
+            crate::adapters::fold_checkpoint(vb, &self.adapters)
         }
-        let mut tensors = cpu_f32_tensor_map(&files)?;
-        // Discard the merge report — the silent twin (`candle-gen-z-image`'s
-        // `transformer_vb_with_adapters`) does the same; a mismatched adapter surface already errors
-        // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        // Cast host-side so `from_tensors` does no GPU-side bf16→f32 staging (see the doc note above).
-        for v in tensors.values_mut() {
-            if v.dtype() != DType::F32 {
-                *v = v.to_dtype(DType::F32)?;
-            }
-            debug_assert!(v.device().is_cpu());
-        }
-        Ok(VarBuilder::from_tensors(tensors, DType::F32, &self.device))
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -1693,7 +1670,7 @@ mod tests {
         );
         for required in [
             "let inner = cpu_cast_mmap_var_builder",
-            "return cpu_cast_mmap_var_builder(&files",
+            "let vb = cpu_cast_mmap_var_builder(&files, DType::F32",
             "SnapshotLayout::SharedMlxTier => cpu_cast_mmap_var_builder",
             "let map = cpu_f32_tensor_map(&[root.join(\"vae.safetensors\")])",
             "remap_vae_wan_mlx_to_diffusers(map)",
@@ -1704,7 +1681,7 @@ mod tests {
             );
         }
         assert!(
-            source.contains("let mut tensors = cpu_f32_tensor_map(&files)?"),
+            source.contains("crate::adapters::fold_checkpoint(vb, &self.adapters)"),
             "the adapter DiT must begin from the same CPU/F32 invariant as the stock path"
         );
     }

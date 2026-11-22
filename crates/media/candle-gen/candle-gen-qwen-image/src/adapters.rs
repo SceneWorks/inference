@@ -326,44 +326,81 @@ pub fn merge_adapters(
     map: &mut HashMap<String, Tensor>,
     specs: &[AdapterSpec],
 ) -> Result<MergeReport> {
-    merge_resolved(map, specs, |_, _| Ok(()))
+    merge_with(specs, |spec, af, report| merge_file(map, spec, af, report))
 }
 
-/// Fetch base coefficients only for named targets whose adapter recipe requires a weight fold.
+/// Fetch coefficient-fold targets on the host and keep all other projections in their original storage.
 pub(crate) fn fold_checkpoint(
     vb: candle_gen::candle_nn::VarBuilder<'static>,
     specs: &[AdapterSpec],
 ) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
-    let mut replacements = HashMap::new();
-    merge_resolved(&mut replacements, specs, |af, map| {
-        for key in af.tensors.keys() {
-            let path = classify_lora_key(key)
-                .map(|(k, _)| k)
-                .or_else(|| classify_lokr_key(key).map(|(k, _)| k))
-                .or_else(|| {
-                    wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES)
-                        .or_else(|| wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES))
-                        .map(|(k, _)| strip_lora_prefix(k).to_owned())
-                });
-            if let Some(path) = path {
-                let key = format!("{path}.weight");
-                if !map.contains_key(&key) && vb.contains_tensor(&key) {
-                    let coefficients = vb
-                        .get_unchecked(&key)?
-                        .to_device(&candle_gen::candle_core::Device::Cpu)?;
-                    map.insert(key, coefficients);
-                }
-            }
-        }
-        Ok(())
+    let mut overrides = HashMap::new();
+    merge_with(specs, |spec, af, report| {
+        candle_gen::train::merge::fold_checkpoint_file(
+            &vb,
+            &mut overrides,
+            af,
+            |key| {
+                let path = classify_lora_key(key)
+                    .map(|(k, _)| k)
+                    .or_else(|| classify_lokr_key(key).map(|(k, _)| k))
+                    .or_else(|| {
+                        wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES)
+                            .or_else(|| wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES))
+                            .map(|(k, _)| strip_lora_prefix(k).to_owned())
+                    });
+                path.map(|path| format!("{path}.weight"))
+            },
+            |map| merge_file(map, spec, af, report),
+        )
     })?;
-    Ok(candle_gen::loader::overlay_var_builder(vb, replacements))
+    Ok(candle_gen::loader::overlay_var_builder(vb, overrides))
 }
 
-fn merge_resolved(
+fn merge_file(
     map: &mut HashMap<String, Tensor>,
+    spec: &AdapterSpec,
+    af: &AdapterFile,
+    report: &mut MergeReport,
+) -> Result<()> {
+    let has_thirdparty_lokr = is_untagged_lycoris_lokr(af);
+    let has_thirdparty_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
+    if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: adapter {} declared LoKr but does not declare networkType=lokr",
+            spec.path.display()
+        )));
+    }
+    // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
+    // caller's declared `kind` can't label them — detect + route by keys before the kind match.
+    if has_thirdparty_lokr {
+        merge_lokr_thirdparty(map, af, spec.scale, report)?;
+        return Ok(());
+    }
+    if has_thirdparty_loha {
+        merge_loha_thirdparty(map, af, spec.scale, report)?;
+        return Ok(());
+    }
+    match spec.kind {
+        AdapterKind::Lokr => merge_lokr_file(map, af, spec.scale, report)?,
+        AdapterKind::Lora => {
+            // The file metadata is authoritative — a Lora-declared LoKr file has no lora_A/B keys
+            // and would merge nothing; surface the mismatch loudly rather than no-op.
+            if af.declares_lokr() {
+                return Err(CandleError::Msg(format!(
+                    "qwen edit: adapter {} declared Lora but its metadata says networkType=lokr",
+                    spec.path.display()
+                )));
+            }
+            merge_lora_file(map, af, spec.scale, report)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_with(
     specs: &[AdapterSpec],
-    mut resolve: impl FnMut(&AdapterFile, &mut HashMap<String, Tensor>) -> Result<()>,
+    mut apply: impl FnMut(&AdapterSpec, &AdapterFile, &mut MergeReport) -> Result<()>,
 ) -> Result<MergeReport> {
     if specs.is_empty() {
         return Ok(MergeReport::default());
@@ -371,42 +408,8 @@ fn merge_resolved(
     let mut report = MergeReport::default();
     for (index, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
-        resolve(&af, map)?;
-        let has_thirdparty_lokr = is_untagged_lycoris_lokr(&af);
-        let has_thirdparty_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
-        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
-            return Err(CandleError::Msg(format!(
-                "qwen edit: adapter {} declared LoKr but does not declare networkType=lokr",
-                spec.path.display()
-            )));
-        }
         let before = report.merged;
-        // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
-        // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if has_thirdparty_lokr {
-            merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
-            guard_adapter_file_matched(spec, index, report.merged - before)?;
-            continue;
-        }
-        if has_thirdparty_loha {
-            merge_loha_thirdparty(map, &af, spec.scale, &mut report)?;
-            guard_adapter_file_matched(spec, index, report.merged - before)?;
-            continue;
-        }
-        match spec.kind {
-            AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &mut report)?,
-            AdapterKind::Lora => {
-                // The file metadata is authoritative — a Lora-declared LoKr file has no lora_A/B keys
-                // and would merge nothing; surface the mismatch loudly rather than no-op.
-                if af.declares_lokr() {
-                    return Err(CandleError::Msg(format!(
-                        "qwen edit: adapter {} declared Lora but its metadata says networkType=lokr",
-                        spec.path.display()
-                    )));
-                }
-                merge_lora_file(map, &af, spec.scale, &mut report)?;
-            }
-        }
+        apply(spec, &af, &mut report)?;
         guard_adapter_file_matched(spec, index, report.merged - before)?;
     }
     if report.merged == 0 {

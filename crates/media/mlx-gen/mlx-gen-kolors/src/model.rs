@@ -417,7 +417,10 @@ impl KolorsHeavy {
 
     /// Install the IP-Adapter decoupled cross-attention K/V pairs into the U-Net's cross-attention
     /// layers (sc-3098). One-time setup; non-destructive to plain T2I.
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+    pub fn install_ip_adapter<P: Into<mlx_gen::adapters::AdaptableLinear>>(
+        &mut self,
+        pairs: Vec<(P, P)>,
+    ) -> Result<()> {
         self.unet.install_ip_adapter(pairs)
     }
 
@@ -1364,7 +1367,10 @@ impl Kolors {
 
     /// Install the IP-Adapter decoupled cross-attention K/V pairs (sc-3098). Delegates to
     /// [`KolorsHeavy::install_ip_adapter`].
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+    pub fn install_ip_adapter<P: Into<mlx_gen::adapters::AdaptableLinear>>(
+        &mut self,
+        pairs: Vec<(P, P)>,
+    ) -> Result<()> {
         self.heavy.install_ip_adapter(pairs)
     }
 

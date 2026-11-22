@@ -47,6 +47,28 @@ use candle_gen::{CandleError, Result};
 
 use crate::transformer::WanTransformer;
 
+/// Packed affine experts and descriptor-backed checkpoints keep their immutable base and install
+/// adapters through the same additive projection interface.
+pub fn requires_additive(
+    vb: &candle_gen::candle_nn::VarBuilder<'_>,
+    dir: &std::path::Path,
+    label: &str,
+    specs: &[AdapterSpec],
+) -> Result<bool> {
+    let affine = vb.contains_tensor("proj_out.scales");
+    if affine || specs.is_empty() {
+        return Ok(affine);
+    }
+    let files = candle_gen::sorted_safetensors(dir, label)?;
+    Ok(
+        candle_gen::gen_core::checkpoint_codec::classify_checkpoint_projection_sources(
+            &files,
+            candle_gen::logical_weights::baseline_codec_registry(),
+        )?
+        .is_some(),
+    )
+}
+
 /// LoRA-key namespace prefixes a Wan adapter may carry, longest-first so the more specific peft form
 /// wins. The candle trainer writes bare keys (matched by the trailing `""`).
 const LORA_PREFIXES: [&str; 5] = [
@@ -278,32 +300,87 @@ pub fn merge_adapters(
     map: &mut HashMap<String, Tensor>,
     specs: &[AdapterSpec],
 ) -> Result<MergeReport> {
+    let table = build_kohya_table(map, &[2]);
+    merge_with(specs, |spec, af, report| {
+        merge_file(map, &table, spec, af, report)
+    })
+}
+
+/// Preserve the VACE-Fun coefficient fold while leaving the other matrices source-backed.
+pub(crate) fn fold_checkpoint(
+    vb: candle_gen::candle_nn::VarBuilder<'static>,
+    files: &[std::path::PathBuf],
+    specs: &[AdapterSpec],
+) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
+    let mut table = BTreeMap::new();
+    for file in files {
+        for h in candle_gen::gen_core::safetensors_path_tensor_headers(file)? {
+            if let Some(path) = h
+                .name
+                .strip_suffix(".weight")
+                .filter(|_| h.shape.len() == 2)
+            {
+                table.insert(path.replace('.', "_"), path.to_owned());
+            }
+        }
+    }
+    let mut overrides = HashMap::new();
+    merge_with(specs, |spec, af, report| {
+        candle_gen::train::merge::fold_checkpoint_file(
+            &vb,
+            &mut overrides,
+            af,
+            |key| {
+                classify_lora_key(key, &table)
+                    .map(|(p, _)| p)
+                    .or_else(|| classify_lokr_key(key, &table).map(|(p, _)| p))
+                    .map(|p| format!("{p}.weight"))
+            },
+            |map| merge_file(map, &table, spec, af, report),
+        )
+    })?;
+    Ok(candle_gen::loader::overlay_var_builder(vb, overrides))
+}
+
+fn merge_file(
+    map: &mut HashMap<String, Tensor>,
+    table: &BTreeMap<String, String>,
+    spec: &AdapterSpec,
+    af: &AdapterFile,
+    report: &mut MergeReport,
+) -> Result<()> {
+    let merged_before = report.merged;
+    match spec.kind {
+        AdapterKind::Lokr => merge_lokr_file(map, af, spec.scale, table, report)?,
+        AdapterKind::Lora => {
+            if af.declares_lokr() {
+                return Err(CandleError::Msg(format!(
+                    "wan: adapter {} declared Lora but its metadata says networkType=lokr",
+                    spec.path.display()
+                )));
+            }
+            merge_lora_file(map, af, spec.scale, table, report)?;
+        }
+    }
+    if report.merged == merged_before {
+        return Err(CandleError::Msg(format!(
+            "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
+            spec.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn merge_with(
+    specs: &[AdapterSpec],
+    mut apply: impl FnMut(&AdapterSpec, &AdapterFile, &mut MergeReport) -> Result<()>,
+) -> Result<MergeReport> {
     if specs.is_empty() {
         return Ok(MergeReport::default());
     }
-    let table = build_kohya_table(map, &[2]);
     let mut report = MergeReport::default();
     for spec in specs {
-        let merged_before = report.merged;
-        let af = read_adapter(&spec.path)?;
-        match spec.kind {
-            AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
-            AdapterKind::Lora => {
-                if af.declares_lokr() {
-                    return Err(CandleError::Msg(format!(
-                        "wan: adapter {} declared Lora but its metadata says networkType=lokr",
-                        spec.path.display()
-                    )));
-                }
-                merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
-            }
-        }
-        if report.merged == merged_before {
-            return Err(CandleError::Msg(format!(
-                "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
-                spec.path.display()
-            )));
-        }
+        apply(spec, &read_adapter(&spec.path)?, &mut report)?;
     }
     if report.merged == 0 {
         return Err(no_target_matched(

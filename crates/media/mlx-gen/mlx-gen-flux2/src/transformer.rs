@@ -1355,7 +1355,7 @@ impl Flux2ControlBlock {
     }
 
     /// Quantize the block's base double block + the `after_proj`/`before_proj` projections (all
-    /// `% 64 == 0`). The only control Linear left dense is `control_img_in` (260 in-features), handled
+    /// `% 64 == 0`). The control Linear excluded from load-time packing is `control_img_in` (260 in-features), handled
     /// in [`Flux2ControlBranch::quantize`].
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.base.quantize(bits)?;
@@ -1371,8 +1371,8 @@ impl Flux2ControlBlock {
 /// plus the N control blocks injecting hints into the base double blocks at `control_layers`. Built
 /// from the Fun-Controlnet-Union checkpoint and driven by [`Flux2Transformer::forward_with_control`].
 pub struct Flux2ControlBranch {
-    /// `control_img_in`: 260 → inner. Kept **dense** (its 260 in-features is not a multiple of the
-    /// quant group size 64), matching the fork's `nn.quantize` predicate. Bias-carrying.
+    /// `control_img_in`: 260 → inner. Retains its source format because 260 is not group-64 aligned.
+    /// The fork's load-time affine quantization predicate skips it. Bias-carrying.
     control_img_in: AdaptableLinear,
     blocks: Vec<Flux2ControlBlock>,
     /// Base double-block indices each control block injects into (`control_layers`); `places[n]` is
@@ -1395,10 +1395,12 @@ impl Flux2ControlBranch {
         let heads = cfg.num_heads as i32;
         let head_dim = cfg.head_dim as i32;
         let places = cfg.control_layer_places();
-        let control_img_in = AdaptableLinear::dense(
-            w.require(&p("control_img_in.weight"))?.clone(),
-            Some(w.require(&p("control_img_in.bias"))?.clone()),
-        );
+        let control_img_in = mlx_gen::quant::lin(
+            w,
+            &p("control_img_in"),
+            true,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         let blocks = (0..places.len())
             .map(|i| {
                 Flux2ControlBlock::from_weights(
@@ -1417,7 +1419,7 @@ impl Flux2ControlBranch {
         })
     }
 
-    /// Quantize the control blocks (+ their `after_proj`/`before_proj`); `control_img_in` stays dense.
+    /// Quantize the control blocks (+ their `after_proj`/`before_proj`); `control_img_in` retains its source format.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for b in &mut self.blocks {
             b.quantize(bits)?;

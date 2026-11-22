@@ -32,8 +32,10 @@ use std::path::Path;
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::candle_nn::var_builder::SimpleBackend;
 use candle_gen::candle_nn::Linear;
 use candle_gen::gen_core::Quant;
+use candle_gen::loader::MappedWeights;
 use candle_gen::quant::{DenseLinear, QLinear, QUANT_BLOCK};
 use candle_gen::train::flow_match::{self, velocity_loss};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
@@ -125,7 +127,8 @@ fn rd(v: &Var, frozen: bool) -> Tensor {
 /// Registers every created [`Var`] under its checkpoint key, in a deterministic order, and builds each
 /// matmul leaf per the [`LeafMode`]. Scalars (norm/modulation) are always `Var`s; matmul leaves are
 /// dense `Var`-backed [`VLin`]s or packed [`QLinear`]s (sc-11743).
-struct VarReg {
+struct VarReg<'a> {
+    checkpoint: Option<&'a candle_gen::loader::ProjectionSource>,
     named: Vec<(String, Var)>,
     /// The device every leaf lands on. In [`LeafMode::Quant`] the checkpoint is staged in system RAM
     /// and each matmul leaf is folded **onto** this device, so the dense branch never lands in VRAM.
@@ -133,10 +136,15 @@ struct VarReg {
     mode: LeafMode,
 }
 
-impl VarReg {
-    fn new(device: Device, mode: LeafMode) -> Self {
+impl<'a> VarReg<'a> {
+    fn new(
+        device: Device,
+        mode: LeafMode,
+        checkpoint: Option<&'a candle_gen::loader::ProjectionSource>,
+    ) -> Self {
         Self {
             named: Vec::new(),
+            checkpoint,
             device,
             mode,
         }
@@ -154,10 +162,18 @@ impl VarReg {
     /// `Quant` → fold the `[out, in]` weight to a packed GGUF [`QLinear`] straight onto the device
     /// (dequant-on-forward, sc-7702) — the dense weight never lands in VRAM (the base DiT's packed
     /// pattern, sc-11727) and no trainable `Var` is registered (inference-only).
-    fn lin(&mut self, name: String, t: &Tensor) -> Result<BranchLin> {
+    fn lin(&mut self, name: String, get: &Getter) -> Result<BranchLin> {
+        if let Some(source) = self.checkpoint {
+            if let Some(op) = source.native_linear_weight(&name, None, DType::BF16, &self.device)? {
+                return Ok(BranchLin::Quant(QLinear::from_dense(DenseLinear::Linear(
+                    Linear::from_native(op, None),
+                ))));
+            }
+        }
+        let t = get(&name)?;
         match self.mode {
             LeafMode::Dense => Ok(BranchLin::Dense(VLin {
-                w: self.var(name, t)?,
+                w: self.var(name, &t)?,
             })),
             LeafMode::Quant(quant) => {
                 let mut ql = QLinear::from_dense(DenseLinear::Linear(Linear::new(t.clone(), None)));
@@ -205,11 +221,11 @@ impl ControlAttention {
     fn build(reg: &mut VarReg, get: &Getter, prefix: &str, cfg: &Krea2Config) -> Result<Self> {
         let key = |leaf: &str| format!("{prefix}.{leaf}");
         Ok(Self {
-            q: reg.lin(key("to_q.weight"), &get(&key("to_q.weight"))?)?,
-            k: reg.lin(key("to_k.weight"), &get(&key("to_k.weight"))?)?,
-            v: reg.lin(key("to_v.weight"), &get(&key("to_v.weight"))?)?,
-            gate: reg.lin(key("to_gate.weight"), &get(&key("to_gate.weight"))?)?,
-            o: reg.lin(key("to_out.0.weight"), &get(&key("to_out.0.weight"))?)?,
+            q: reg.lin(key("to_q.weight"), get)?,
+            k: reg.lin(key("to_k.weight"), get)?,
+            v: reg.lin(key("to_v.weight"), get)?,
+            gate: reg.lin(key("to_gate.weight"), get)?,
+            o: reg.lin(key("to_out.0.weight"), get)?,
             norm_q: reg.var(key("norm_q.weight_p1"), &get(&key("norm_q.weight_p1"))?)?,
             norm_k: reg.var(key("norm_k.weight_p1"), &get(&key("norm_k.weight_p1"))?)?,
             heads: cfg.num_attention_heads,
@@ -273,10 +289,10 @@ impl ControlBlock {
             prenorm: reg.var(key("norm1.weight_p1"), &get(&key("norm1.weight_p1"))?)?,
             postnorm: reg.var(key("norm2.weight_p1"), &get(&key("norm2.weight_p1"))?)?,
             attn: ControlAttention::build(reg, get, &key("attn"), cfg)?,
-            ff_gate: reg.lin(key("ff.gate.weight"), &get(&key("ff.gate.weight"))?)?,
-            ff_up: reg.lin(key("ff.up.weight"), &get(&key("ff.up.weight"))?)?,
-            ff_down: reg.lin(key("ff.down.weight"), &get(&key("ff.down.weight"))?)?,
-            proj_out: reg.lin(key("proj_out.weight"), &get(&key("proj_out.weight"))?)?,
+            ff_gate: reg.lin(key("ff.gate.weight"), get)?,
+            ff_up: reg.lin(key("ff.up.weight"), get)?,
+            ff_down: reg.lin(key("ff.down.weight"), get)?,
+            proj_out: reg.lin(key("proj_out.weight"), get)?,
             eps: cfg.norm_eps,
         })
     }
@@ -385,6 +401,7 @@ impl ControlBranch {
             inject_offset,
             w.device().clone(),
             LeafMode::Dense,
+            None,
         )
     }
 
@@ -394,7 +411,7 @@ impl ControlBranch {
     /// training-time layout). See [`from_checkpoint_quantized`](Self::from_checkpoint_quantized) for the
     /// small-card packed-inference load.
     pub fn from_checkpoint(path: &Path, cfg: &Krea2Config, device: &Device) -> Result<Self> {
-        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Dense)
+        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Dense, false)
     }
 
     /// Load a branch from a spike checkpoint with every matmul leaf **quantized to q4/q8 and kept
@@ -411,7 +428,23 @@ impl ControlBranch {
         device: &Device,
         quant: Quant,
     ) -> Result<Self> {
-        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Quant(quant))
+        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Quant(quant), true)
+    }
+
+    /// Bind the frozen overlay's native projections and optionally pack its dense leaves.
+    pub fn from_checkpoint_for_inference(
+        path: &Path,
+        cfg: &Krea2Config,
+        device: &Device,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        Self::from_checkpoint_impl(
+            path,
+            cfg,
+            device,
+            quant.map_or(LeafMode::Dense, LeafMode::Quant),
+            true,
+        )
     }
 
     fn from_checkpoint_impl(
@@ -419,6 +452,7 @@ impl ControlBranch {
         cfg: &Krea2Config,
         device: &Device,
         mode: LeafMode,
+        inference: bool,
     ) -> Result<Self> {
         // Quant mode stages the checkpoint in system RAM and folds each matmul leaf ONTO the device, so
         // the dense bf16 branch (~6.6 GB) never lands in VRAM; dense mode loads straight to the device.
@@ -426,10 +460,36 @@ impl ControlBranch {
             LeafMode::Quant(_) => Device::Cpu,
             LeafMode::Dense => device.clone(),
         };
-        let tensors = candle_gen::candle_core::safetensors::load(path, &load_device)?;
+        let tensors = MappedWeights::new(
+            candle_gen::mmap_safetensors(path)?,
+            &[path.to_owned()],
+            device,
+        )?;
+        let checkpoint = match &tensors {
+            MappedWeights::Checkpoint(source) => Some(source),
+            MappedWeights::Plain(_) => None,
+        };
+        let get = |key: &str| -> Result<Tensor> {
+            if let Some(source) = checkpoint.filter(|source| source.reader().planned(key).is_some())
+            {
+                return Ok(source.get_unchecked(key, DType::BF16, &load_device)?);
+            }
+            let view = tensors.mmap().get(key).map_err(|_| {
+                CandleError::Msg(format!(
+                    "control branch: missing key {key} in {}",
+                    path.display()
+                ))
+            })?;
+            Ok(candle_gen::candle_core::safetensors::Load::load(
+                &view,
+                &load_device,
+            )?)
+        };
         let n = 1 + tensors
-            .keys()
-            .filter_map(|k| split_block_key(k).ok().map(|(i, _)| i))
+            .mmap()
+            .tensors()
+            .into_iter()
+            .filter_map(|(k, _)| split_block_key(&k).ok().map(|(i, _)| i))
             .max()
             .ok_or_else(|| {
                 CandleError::Msg(format!(
@@ -437,25 +497,30 @@ impl ControlBranch {
                     path.display()
                 ))
             })?;
-        let inject_offset = match tensors.get(META_INJECT_OFFSET) {
+        let inject_offset = match tensors.mmap().get(META_INJECT_OFFSET).ok() {
             // A malformed/truncated overlay can ship a size-0 `meta.inject_offset`; route the read
             // through the hardened scalar reader (F-119 / sc-11208, F-009 class) so a corrupt
             // studio-trained checkpoint is a typed error at `Krea2Control::load`, not a worker panic.
-            Some(t) => {
-                candle_gen::train::merge::read_scalar(META_INJECT_OFFSET, "inject_offset", t)?
-                    as usize
-            }
+            Some(_) => candle_gen::train::merge::read_scalar(
+                META_INJECT_OFFSET,
+                "inject_offset",
+                &get(META_INJECT_OFFSET)?,
+            )? as usize,
             None => 0,
         };
-        let get = |key: &str| -> Result<Tensor> {
-            tensors.get(key).cloned().ok_or_else(|| {
-                CandleError::Msg(format!(
-                    "control branch: missing key {key} in {}",
-                    path.display()
-                ))
-            })
-        };
-        Self::build(&get, cfg, n, inject_offset, device.clone(), mode)
+        let mut branch = Self::build(
+            &get,
+            cfg,
+            n,
+            inject_offset,
+            device.clone(),
+            mode,
+            checkpoint.filter(|_| inference),
+        )?;
+        if inference {
+            branch.freeze();
+        }
+        Ok(branch)
     }
 
     fn build(
@@ -465,8 +530,9 @@ impl ControlBranch {
         inject_offset: usize,
         device: Device,
         mode: LeafMode,
+        checkpoint: Option<&candle_gen::loader::ProjectionSource>,
     ) -> Result<Self> {
-        let mut reg = VarReg::new(device, mode);
+        let mut reg = VarReg::new(device, mode, checkpoint);
         let blocks = (0..n)
             .map(|i| ControlBlock::build(&mut reg, get, i, cfg))
             .collect::<Result<Vec<_>>>()?;

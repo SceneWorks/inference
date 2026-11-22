@@ -72,6 +72,45 @@ use candle_nn::VarBuilder;
 
 use crate::{CandleError, Result};
 
+/// Adapt group-64 affine matrices to the stock diffusers VAE. All other projections keep the
+/// shared checkpoint backend, including descriptor-backed matrices in a mixed-format component.
+pub fn dequantized_vae_vb(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    let st = mmap_safetensors_multi(files)?;
+    let mut views = std::collections::BTreeMap::new();
+    let mut overrides = std::collections::HashMap::new();
+    for (key, _) in st.tensors() {
+        if key.ends_with(".scales") || key.ends_with(".biases") {
+            continue;
+        }
+        if let Some(base) = key.strip_suffix(".weight") {
+            let scales = format!("{base}.scales");
+            if st.get(&scales).is_ok() {
+                let codes = st.load(&key, &Device::Cpu)?;
+                if codes.dtype() != DType::U32 {
+                    return Err(CandleError::Msg(format!(
+                        "VAE {key}: affine scales require U32 codes"
+                    )));
+                }
+                let scales = st.load(&scales, &Device::Cpu)?.to_dtype(DType::F32)?;
+                let biases = st
+                    .load(&format!("{base}.biases"), &Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let weight =
+                    crate::quant::dequant_vae_grid(&codes, &scales, &biases)?.to_dtype(dtype)?;
+                overrides.insert(key, weight);
+                continue;
+            }
+        }
+        views.insert(key.clone(), vec![SourceView::Whole(key)]);
+    }
+    let source = candle_checkpoint::remapped_var_builder(st, files, dtype, device, views)?;
+    Ok(overlay_var_builder(source, overrides))
+}
+
 /// Replace only the dense operands that a coefficient-folding adapter actually changed.
 /// Every untouched key still resolves from the original checkpoint and native operand backend.
 pub fn overlay_var_builder(

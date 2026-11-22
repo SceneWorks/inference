@@ -1515,6 +1515,32 @@
       "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
     },
     {
+      "package": "candle-gen-z-image",
+      "kind": "lib",
+      "target": "candle_gen_z_image",
+      "test": "pipeline::tests::dequantized_vae_vb_folds_packed_triples_from_one_mapping",
+      "source": "crates/media/candle-gen/candle-gen-z-image/src/pipeline.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Writes two tiny CPU weight shards, opens the shared VAE weight builder and compares loaded affine, scaled FP8 and dense coefficients. This only reads and transforms checkpoint storage. No model, layer forward, activation, accelerator or inference kernel runs."
+    },
+    {
+      "package": "mlx-gen-sdxl",
+      "kind": "lib",
+      "target": "mlx_gen_sdxl",
+      "test": "ip_adapter::projection_source_tests::resampler_and_decoupled_kv_keep_native_operands_and_logical_widths",
+      "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Constructs tiny source-backed operators, verifies their signed storage, numeric slot order, logical shapes and metadata arithmetic. No forward or learned kernel runs."
+    },
+    {
       "package": "mlx-gen-sdxl",
       "kind": "lib",
       "target": "mlx_gen_sdxl",

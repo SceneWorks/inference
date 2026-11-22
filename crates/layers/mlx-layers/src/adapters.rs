@@ -841,6 +841,12 @@ pub struct AdaptableLinear {
     training_residual: bool,
 }
 
+impl From<Array> for AdaptableLinear {
+    fn from(weight: Array) -> Self {
+        Self::dense(weight, None)
+    }
+}
+
 impl AdaptableLinear {
     /// Build from a raw `[out, in]` weight (and optional bias) — the common path when
     /// loading dense (bf16/fp16/fp32) checkpoints via the `weights` module.

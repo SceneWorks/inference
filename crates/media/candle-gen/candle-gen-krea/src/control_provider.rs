@@ -678,11 +678,8 @@ fn load_control_heavy(
         }
     };
 
-    let mut branch = match branch_tier {
-        Some(quant) => ControlBranch::from_checkpoint_quantized(control, &cfg, device, quant)?,
-        None => ControlBranch::from_checkpoint(control, &cfg, device)?,
-    };
-    branch.freeze();
+    let mut branch =
+        ControlBranch::from_checkpoint_for_inference(control, &cfg, device, branch_tier)?;
     branch.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
     if chunk_attention {
         dit.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
