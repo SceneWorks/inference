@@ -2519,7 +2519,7 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
 
     def test_compare_and_paths_surface_wall_ttft_memory_and_checkpoint_overhead(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            def ckpt_row(row_id, mode, wall_base, ttft_base, peak_bytes, pc_extra):
+            def ckpt_row(row_id, mode, wall_base, ttft_base, peak_bytes, checkpoints):
                 def make(run, k):
                     def val(p, o, m):
                         if m == "decode_tok_s":
@@ -2539,7 +2539,7 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
                                 "stddev": 0.0,
                                 "n": 3,
                             },
-                            "prefix_checkpoints": pc_extra,
+                            "prefix_checkpoints": checkpoints[k - 1],
                         },
                     )
                     return doc
@@ -2565,6 +2565,11 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
                 "evicted_entries": 0,
                 "fallbacks": [],
             }
+            auto_checkpoints = [
+                {**auto_pc, "restore_ms": 1.0, "fallbacks": ["z", "a"]},
+                {**auto_pc, "restore_ms": 1.5, "fallbacks": ["a", 123]},
+                {**auto_pc, "restore_ms": True, "matched_kind": None, "fallbacks": None},
+            ]
             off_pc = {
                 "policy": "off",
                 "reused_tokens": 0,
@@ -2582,8 +2587,8 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             directory = write_campaign(
                 Path(td) / "ckpt-full",
                 [
-                    ckpt_row("ckpt-auto", "auto", 220.0, 35.0, 2 << 30, auto_pc),
-                    ckpt_row("ckpt-off", "off", 340.0, 120.0, 2 << 30, off_pc),
+                    ckpt_row("ckpt-auto", "auto", 220.0, 35.0, 2 << 30, auto_checkpoints),
+                    ckpt_row("ckpt-off", "off", 340.0, 120.0, 2 << 30, [off_pc] * 3),
                 ],
             )
             report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
@@ -2609,6 +2614,9 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             self.assertEqual(on_pc["reread_tokens"], 12)
             self.assertEqual(on_pc["resident_bytes"], 8192)
             self.assertEqual(on_pc["protected_bytes"], 4096)
+            self.assertEqual(on_pc["policies"], ["document"])
+            self.assertEqual(on_pc["matched_kinds"], ["document"])
+            self.assertEqual(on_pc["fallbacks"], ["a", "z"])
 
             md = campaign.markdown_report(report)
             self.assertIn("## Prefix checkpoints — paired on vs off rows", md)
@@ -2619,16 +2627,18 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             self.assertIn("4096 / 8192 / 4096", md)
 
             # `paths_report` / `paths_markdown` surface prefix_checkpoints overhead when present.
-            row_with_pc = path_row("chat", "open_ended", "off", tok_s=50.0, wall=220.0, hits=(96, 96))
-            row_with_pc["prefix_checkpoints"] = auto_pc
+            def path_document(run, k):
+                row = path_row("chat", "open_ended", "off", tok_s=50.0, wall=220.0, hits=(96, 96))
+                row["prefix_checkpoints"] = auto_checkpoints[k - 1]
+                return paths_document([row])
+
             paths_dir = write_campaign(
                 Path(td) / "ckpt-paths",
                 [
                     {
                         "id": "p-auto",
                         "runs": ["epic"],
-                        "process_repeats": 1,
-                        "document": lambda run, k: paths_document([row_with_pc]),
+                        "document": path_document,
                         "env": {
                             "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "default",
                             "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
@@ -2640,14 +2650,7 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             )
             pr = campaign.paths_report([paths_dir])
             summary_pc = pr["summary"][0]["prefix_checkpoints"]
-            self.assertIsNotNone(summary_pc)
-            self.assertEqual(summary_pc["capture_ms"], 2.75)
-            self.assertEqual(summary_pc["restore_ms"], 1.25)
-            self.assertEqual(summary_pc["captured_bytes"], 4096)
-            self.assertEqual(summary_pc["reused_tokens"], 96)
-            self.assertEqual(summary_pc["reread_tokens"], 12)
-            self.assertEqual(summary_pc["resident_bytes"], 8192)
-            self.assertEqual(summary_pc["protected_bytes"], 4096)
+            self.assertEqual(summary_pc, on_pc)
             pmd = campaign.paths_markdown(pr)
             self.assertIn("### Prefix checkpoints", pmd)
             self.assertIn("| off | document | 96 | 12 | 2.75 | 1.25 | 4096 | 8192 | 4096 | document |", pmd)

@@ -1,5 +1,16 @@
 # Repository Guidelines
 
+## Host scratch and cleanup
+
+- Use the existing `DEV_HOST_ROOT` (`D:\dev-host` on this Windows host) for new
+  scratch work. Use task-owned directories under `t/` and existing dev-host build
+  slots/cache facilities. Do not create new drive-root temp or campaign folders.
+- On Windows, keep model downloads in `E:\huggingface`; generated proof/runtime files go in
+  task-owned work storage. Clean owned disposable files after evidence publication,
+  preserve active work, and report intentionally retained paths. Use the existing
+  dev-host cleanup tooling for legacy migration and abandoned work; never sweep
+  the shared model cache as task cleanup.
+
 ## Project Structure & Module Organization
 
 This is the unified SceneWorks inference workspace. `crates/contracts/` holds

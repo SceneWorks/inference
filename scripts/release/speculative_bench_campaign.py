@@ -2214,6 +2214,10 @@ def _checkpoint_telemetry(processes: list[Process], prompt_id: str, option: str)
         pc = (table.get((prompt_id, option)) or {}).get("prefix_checkpoints")
         if isinstance(pc, dict):
             blocks.append(pc)
+    return _summarize_checkpoint_blocks(blocks)
+
+
+def _summarize_checkpoint_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not blocks:
         return None
     out: dict[str, Any] = {
@@ -2923,20 +2927,7 @@ def _summarize_path_checkpoints(bucket: list[dict[str, Any]]) -> dict[str, Any] 
         for e in bucket
         if isinstance(e["measurement"].get("prefix_checkpoints"), dict)
     ]
-    if not blocks:
-        return None
-    out: dict[str, Any] = {
-        field: _mean([v for v in (_number(b.get(field)) for b in blocks) if v is not None])
-        for field in _CHECKPOINT_NUMERIC_FIELDS
-    }
-    out["policies"] = sorted({b["policy"] for b in blocks if isinstance(b.get("policy"), str)})
-    out["matched_kinds"] = sorted(
-        {b["matched_kind"] for b in blocks if isinstance(b.get("matched_kind"), str)}
-    )
-    out["fallbacks"] = sorted(
-        {f for b in blocks for f in (b.get("fallbacks") or []) if isinstance(f, str)}
-    )
-    return out
+    return _summarize_checkpoint_blocks(blocks)
 
 
 AUTO_MTP_PATH = "mtp@recommended"
