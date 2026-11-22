@@ -18,16 +18,12 @@ use mlx_rs::Array;
 
 /// Convert the raw VAE checkpoint: transpose every 5-D conv weight to channels-last.
 pub fn convert_vae(raw: &Weights) -> Result<Weights> {
-    let mut out = Weights::empty();
-    let keys: Vec<String> = raw.keys().map(String::from).collect();
-    for k in keys {
-        let v = raw.require(&k)?;
-        let nv = if v.ndim() == 5 {
-            v.transpose_axes(&[0, 2, 3, 4, 1])?
-        } else {
-            v.clone()
-        };
-        out.insert(k, nv);
+    let mut out = raw.clone();
+    for key in raw.keys() {
+        let value = raw.require(key)?;
+        if value.ndim() == 5 {
+            out.insert(key, value.transpose_axes(&[0, 2, 3, 4, 1])?);
+        }
     }
     Ok(out)
 }
@@ -103,13 +99,20 @@ fn convert_dit_for_storage(raw: &Weights) -> Result<Weights> {
 /// materializes two buffers (MLX does not CSE across arrays), which is why
 /// `Seedvr2Pipeline::load` casts **before** converting (F-012).
 pub fn convert_dit(raw: &Weights) -> Result<Weights> {
-    let mut out = Weights::empty();
-    let keys: Vec<String> = raw.keys().map(String::from).collect();
-    for k in keys {
-        let v = raw.require(&k)?;
-        for target in dit_targets(&k) {
-            out.insert(target, v.clone());
+    let mut aliases = Vec::new();
+    let mut out = raw.select_renamed(|key| {
+        let mut targets = dit_targets(key).into_iter();
+        let primary = targets.next().expect("every DiT key has a target");
+        if let Some(secondary) = targets.next() {
+            aliases.push((primary.clone(), secondary));
         }
+        Some(primary)
+    });
+    // Bind a duplicated weight after aliasing its companions. Weights::alias carries the native
+    // operator and source observation to the second stream while sharing the physical payload.
+    aliases.sort_by_key(|(_, target)| target.ends_with(".weight"));
+    for (primary, secondary) in aliases {
+        out.alias(&primary, &secondary);
     }
     Ok(out)
 }

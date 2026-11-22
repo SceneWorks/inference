@@ -38,12 +38,10 @@ pub struct Seedvr2Pipeline {
     weights_bytes: usize,
 }
 
-/// Cast every tensor in `w` to `dt`.
+/// Cast the floating checkpoint tensors while preserving source-native operators and their scales.
 fn cast_weights(w: &Weights, dt: Dtype) -> Result<Weights> {
-    let mut out = Weights::empty();
-    for k in w.keys().map(String::from).collect::<Vec<_>>() {
-        out.insert(k.clone(), w.require(&k)?.as_dtype(dt)?);
-    }
+    let mut out = w.clone();
+    out.cast_all(dt)?;
     Ok(out)
 }
 
@@ -1232,6 +1230,56 @@ mod tests {
             t.as_slice::<f32>().as_ptr(),
             "convert-then-cast materializes two buffers (the F-012 waste)"
         );
+    }
+
+    #[test]
+    fn prepare_dit_preserves_file_backed_projection_across_shared_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.safetensors");
+        let base = "blocks.10.attn.proj_out.all";
+        let header = serde_json::json!({
+            (format!("{base}.weight")): {
+                "dtype": "F8_E4M3", "shape": [4, 4], "data_offsets": [0, 16]
+            },
+            (format!("{base}.weight_scale")): {
+                "dtype": "F32", "shape": [], "data_offsets": [16, 20]
+            }
+        });
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0x38u8; 16]);
+        let scale = 0.251_234_56_f32;
+        bytes.extend(scale.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let scope = mlx_gen::gen_core::CheckpointReceiptScope::default();
+        let prepared = scope
+            .with(|| prepare_dit(&Weights::from_file(&path).unwrap(), Dtype::Bfloat16))
+            .unwrap();
+        let vid_key = "blocks.10.attn.proj_out_vid.weight";
+        let txt_key = "blocks.10.attn.proj_out_txt.weight";
+        if mlx_gen::metal_available() {
+            let vid = prepared.source_projection(vid_key).unwrap().unwrap();
+            let txt = prepared.source_projection(txt_key).unwrap().unwrap();
+            let vid = vid.operands();
+            let txt = txt.operands();
+            assert_eq!(vid[0].1.as_slice::<u8>(), &[0x38; 16]);
+            assert_eq!(
+                vid[0].1.as_slice::<u8>().as_ptr(),
+                txt[0].1.as_slice::<u8>().as_ptr()
+            );
+            assert_eq!(vid[1].1.as_slice::<f32>(), &[scale]);
+            assert_eq!(txt[1].1.as_slice::<f32>(), &[scale]);
+        } else {
+            assert_eq!(prepared.peek(vid_key).unwrap().dtype(), Dtype::Bfloat16);
+            assert_eq!(prepared.peek(txt_key).unwrap().dtype(), Dtype::Bfloat16);
+        }
+        prepared.materialize().unwrap();
+        let facts = scope.facts().expect("a measured physical projection");
+        assert_eq!(facts.receipt().tensor_count, 1);
+        assert_eq!(facts.receipt().source_bytes, 20);
     }
 
     /// F-012 measurement harness (synthetic tensors at the real 3B shapes — the real weights are

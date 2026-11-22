@@ -62,25 +62,11 @@ pub fn load_transformer_weights(root: &Path) -> Result<Weights> {
     .map_err(|e| Error::Msg(e.to_string()))?
     {
         Some(paths) => paths,
-        None => {
-            let paths = resolve_directory_safetensors_shards(&dir, &roots)
-                .map_err(|e| Error::Msg(e.to_string()))?;
-            let paths: Vec<_> = paths.into_iter().map(|path| path.loader_path).collect();
-            return Weights::from_paths(&paths, &dir);
-        }
+        None => resolve_directory_safetensors_shards(&dir, &roots)
+            .map_err(|e| Error::Msg(e.to_string()))?,
     };
-
-    let mut combined = Weights::empty();
-    for path in paths {
-        let shard = Weights::from_file(path.loader_path)?;
-        let keys: Vec<String> = shard.keys().map(String::from).collect();
-        for k in keys {
-            if let Some(t) = shard.get(&k) {
-                combined.insert(k, t.clone());
-            }
-        }
-    }
-    Ok(combined)
+    let paths: Vec<_> = paths.into_iter().map(|path| path.loader_path).collect();
+    Weights::from_paths(&paths, &dir)
 }
 
 /// A pre-quantized tier's affine-quant geometry, read from the tier dir's `split_model.json` (the

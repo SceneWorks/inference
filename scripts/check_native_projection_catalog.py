@@ -106,6 +106,7 @@ OPEN = re.compile(
 BIND = re.compile(
     r"mlx_gen::quant::(?:native_lin|lin(?:_with_bias)?)\("
     r"|(?:mlx_gen::)?NativeProjection::from_(?:key|weights)\("
+    r"|\.source_projection\("
     r"|mlx_llm::text_registry\(|\.into_language_weights\(|DitBlock::from_weights\("
 )
 TEXT = {
