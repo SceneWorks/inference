@@ -400,7 +400,27 @@ pub fn load_auxiliary_bytes(
     selected: impl Fn(&str) -> bool,
     allocation: impl Fn(u64) -> Option<u64>,
 ) -> Option<u64> {
+    auxiliary_bytes(plan, selected, allocation, true)
+}
+
+/// Additional operands kept by a completed MLX source load, beyond the physical checkpoint
+/// rows. A source owns one rotation per geometry and uses the thread's shared FP8 unit scale.
+pub fn retained_auxiliary_bytes(
+    plan: &LogicalWeightPlan,
+    selected: impl Fn(&str) -> bool,
+    allocation: impl Fn(u64) -> Option<u64>,
+) -> Option<u64> {
+    auxiliary_bytes(plan, selected, allocation, false)
+}
+
+fn auxiliary_bytes(
+    plan: &LogicalWeightPlan,
+    selected: impl Fn(&str) -> bool,
+    allocation: impl Fn(u64) -> Option<u64>,
+    during_load: bool,
+) -> Option<u64> {
     let mut extra = 0u64;
+    let mut needs_unit = false;
     let mut rotations = std::collections::BTreeSet::new();
     let scales: HashMap<_, _> = plan
         .companions
@@ -423,23 +443,43 @@ pub fn load_auxiliary_bytes(
             continue;
         }
         if row.residency.mode == ResidencyMode::Packed {
-            // Source normalization creates a small descriptor, and scalar FP8 can bind
-            // one default unit scale and two F32-converted weight/input scale operands.
-            add(gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64, 1)?;
+            if during_load {
+                add(gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64, 1)?;
+            }
             match &row.codec {
                 TensorCodecSpec::ConvRotInt8 { geometry, .. }
                     if rotations.insert(geometry.rotation_group) =>
                 {
                     // from_slice copies the host rotation into its one shared MLX array.
                     let group = geometry.rotation_group as u64;
-                    add(group.checked_mul(group).and_then(|n| n.checked_mul(4))?, 2)?;
+                    add(
+                        group.checked_mul(group).and_then(|n| n.checked_mul(4))?,
+                        if during_load { 2 } else { 1 },
+                    )?;
                 }
-                TensorCodecSpec::ScalarFp8 { .. }
-                | TensorCodecSpec::RowwiseFp8 { .. }
-                | TensorCodecSpec::Mxfp8 { .. } => add(4, 3)?,
+                TensorCodecSpec::ScalarFp8 {
+                    scale, input_scale, ..
+                } => {
+                    let weight_scale = match scale {
+                        ScalarScaleSource::Unit => None,
+                        ScalarScaleSource::Companion { physical_key } => Some(physical_key),
+                    };
+                    needs_unit |= weight_scale.is_none() || input_scale.is_none();
+                    for key in [weight_scale, input_scale.as_ref()].into_iter().flatten() {
+                        let stored = *scales.get(key.as_str())?;
+                        if stored < 4 {
+                            // Legacy floating scalar scales are promoted to F32. Their
+                            // source bytes are already in the physical plan.
+                            add(if during_load { 4 } else { 4 - stored }, 1)?;
+                        }
+                    }
+                }
+                TensorCodecSpec::RowwiseFp8 { .. } | TensorCodecSpec::Mxfp8 { .. } => {
+                    needs_unit = true
+                }
                 _ => {}
             }
-        } else {
+        } else if during_load {
             // E4M3 decode can create three byte masks, two decoded F32 buffers and one
             // scaled F32 result before the BF16 coefficient buffer. E5M2's two U16
             // shifts also fit this bound. Price the padded source extent for MXFP8.
@@ -455,7 +495,47 @@ pub fn load_auxiliary_bytes(
             }
         }
     }
+    if needs_unit {
+        add(4, 1)?;
+    }
     Some(extra)
+}
+
+/// Physical operands retained by an MLX owner. Native operators bind a floating bias at its
+/// original width. An encoded bias follows its independently declared coefficient precision.
+pub fn projected_bytes_from_plan(
+    plan: &LogicalWeightPlan,
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    dense_width: impl Fn(&gen_core::weightsmeta::SafetensorsTensorHeader) -> u64,
+) -> gen_core::Result<std::collections::BTreeMap<String, u64>> {
+    use gen_core::weightsmeta::Dtype as Stored;
+    let mut bytes =
+        gen_core::checkpoint_codec::projected_bytes_from_plan(plan, headers, &dense_width)?;
+    let bias_keys: std::collections::HashSet<_> = plan
+        .tensors
+        .iter()
+        .filter(|r| r.residency.mode == ResidencyMode::Packed && bytes[&r.physical_key] != 0)
+        .map(|row| {
+            let key = &row.physical_key;
+            if let Some(base) = key.strip_suffix("_weight") {
+                format!("{base}_bias")
+            } else {
+                format!("{}.bias", key.strip_suffix(".weight").unwrap_or(key))
+            }
+        })
+        .collect();
+    for header in headers.iter().filter(|h| bias_keys.contains(&h.name)) {
+        let compute = dense_width(header);
+        let width = match header.dtype {
+            _ if compute == 0 => 0,
+            Stored::F32 => 4,
+            Stored::BF16 | Stored::F16 => 2,
+            Stored::F8_E4M3 | Stored::F8_E5M2 => compute,
+            _ => continue,
+        };
+        bytes.insert(header.name.clone(), header.materialized_bytes(width)?);
+    }
+    Ok(bytes)
 }
 
 /// Determine dense consumer precision from the original storage handles, before decoding either
@@ -663,8 +743,44 @@ mod admission_tests {
             companions: vec![],
             source_bytes: 2 * 32 * 64,
         };
+        let headers = [
+            (
+                "a.weight",
+                gen_core::weightsmeta::Dtype::I8,
+                vec![32, 64],
+                2048,
+            ),
+            ("a.bias", gen_core::weightsmeta::Dtype::F32, vec![32], 128),
+            (
+                "b.weight",
+                gen_core::weightsmeta::Dtype::I8,
+                vec![32, 64],
+                2048,
+            ),
+            (
+                "b.bias",
+                gen_core::weightsmeta::Dtype::F8_E4M3,
+                vec![32],
+                32,
+            ),
+        ]
+        .map(|(name, dtype, shape, data_bytes)| {
+            gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.into(),
+                dtype,
+                shape,
+                data_bytes,
+            }
+        });
+        let physical = projected_bytes_from_plan(&plan, &headers, |_| 2).unwrap();
+        assert_eq!(physical["a.bias"], 128);
+        assert_eq!(physical["b.bias"], 64);
         let descriptor = gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64;
         let rotation = 64 * 64 * 4 * 2;
+        assert_eq!(
+            retained_auxiliary_bytes(&plan, |_| true, Some),
+            Some(rotation / 2)
+        );
         assert_eq!(
             load_auxiliary_bytes(&plan, |_| true, Some),
             Some(2 * descriptor + rotation)

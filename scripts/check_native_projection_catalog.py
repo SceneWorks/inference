@@ -162,7 +162,8 @@ def check_mlx(root: Path) -> list[str]:
             issues.append(f"{path.relative_to(root)} lost the shared {module}::{symbol} export")
     for path, needle in (
         (media / "src/weights.rs", "mlx_layers::source::prepare_sources("),
-        (llm / "primitives/weights.rs", "mlx_layers::source::prepare_sources_with_experts("),
+        (llm / "primitives/weights.rs", "mlx_layers::source::prepare_sources_for_consumers("),
+        (llm / "primitives/weights.rs", "crate::models::qwen35::stacked_expert_key,"),
         (llm / "primitives/moe.rs", "obs.expert("),
         (llm / "models/qwen35.rs", "SwitchLinear::from_checkpoint("),
         (media / "mlx-gen-sdxl/src/ldm.rs", "insert_source_projection("),

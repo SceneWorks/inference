@@ -67,6 +67,10 @@ fn from_llm(e: mlx_llm::Error) -> Error {
     }
 }
 
+pub(crate) fn is_text_tower_tensor(key: &str, untied_head: bool) -> bool {
+    key.starts_with("model.language_model.") || (untied_head && key.starts_with("lm_head."))
+}
+
 /// The safetensors files [`Flux3TextEncoder::load`] opens for the snapshot at `dir`: the shards
 /// its `model.safetensors.index.json` names, else the single `model.safetensors`. Shared with the
 /// memory contract's asset pricing so both read one file list.
@@ -176,7 +180,7 @@ impl Flux3TextEncoder {
             }
         }
         let weights = mlx_llm::primitives::Weights::from_selected_shards(&files, |key| {
-            key.starts_with("model.language_model.") || key.starts_with("lm_head.")
+            is_text_tower_tensor(key, !model_cfg.tie_word_embeddings)
         })
         .map_err(from_llm)?;
         // `from_weights` evaluates every parameter group it built (the load boundary), so no
