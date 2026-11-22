@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use mlx_layers::quantization_cache::quantize_cached as quantize;
-pub use mlx_layers::quantization_cache::quantize_cached;
+pub use mlx_layers::quantization_cache::{quantize_cached, quantize_linear_cached};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
