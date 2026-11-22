@@ -1019,6 +1019,24 @@ pub(crate) fn counting_cache_clones<R>(f: impl FnOnce() -> R) -> (R, usize) {
 }
 
 impl Qwen35Cache {
+    /// Synthetic single-attention-layer `Qwen35Cache` holding `seq` positions for
+    /// non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_attn_only_for_test(seq: i32) -> Self {
+        let mut kv = ContiguousKvCache::new(1);
+        if seq > 0 {
+            let ones = Array::ones::<f32>(&[1, 1, seq, 2]).unwrap();
+            kv.update(0, &ones, &ones).unwrap();
+        }
+        Self {
+            loop_plan: None,
+            layers: vec![Qwen35LayerCache::Attn(AttnKv {
+                kv,
+                tree_mask: None,
+            })],
+        }
+    }
+
     fn check_plan(&self, cfg: &Qwen35Config) -> Result<()> {
         if self.loop_plan != cfg.sensenova_loop || self.layers.len() != cfg.visit_count() {
             return Err(Error::Config(
@@ -1149,6 +1167,16 @@ impl Qwen35Cache {
         for l in &mut self.layers {
             if let Qwen35LayerCache::Delta(c) = l {
                 c.capture_at(position);
+            }
+        }
+    }
+
+    /// Ask the next forward outside any checkpoint window to capture every DeltaNet layer's state
+    /// at every boundary in `positions` strictly inside that forward (SW-F356).
+    pub fn capture_boundaries(&mut self, positions: &[i32]) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at_many(positions);
             }
         }
     }
@@ -1479,6 +1507,15 @@ pub struct MtpCache {
 }
 
 impl MtpCache {
+    /// Empty MTP cache for non-inference prefix-checkpoint unit tests.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            layers: Vec::new(),
+            steps: 0,
+        }
+    }
+
     /// Bytes the predictor's KV block buffers hold (story sc-24437).
     pub fn bytes(&self) -> u64 {
         self.layers.iter().map(|a| a.kv.bytes()).sum()

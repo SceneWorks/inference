@@ -170,6 +170,7 @@ fn ac1_verify_step_rollback_to_every_position_matches_a_fresh_decode() {
                     want_hidden: false,
                     prefill: false,
                     snapshot_at: None,
+                    snapshot_points: Vec::new(),
                 },
             )
             .unwrap();

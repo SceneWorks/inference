@@ -1509,6 +1509,17 @@ enum Qwen35PrefixLayer {
 }
 
 impl Qwen35PrefixState {
+    /// Dummy prefix state covering `len` positions for non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(len: usize) -> Self {
+        let t = Tensor::ones((1, 1, len, 2), DType::F32, &Device::Cpu).unwrap();
+        Self {
+            owner: std::sync::Arc::new([0]),
+            layers: vec![Qwen35PrefixLayer::Attn(Some((t.clone(), t)))],
+            len,
+        }
+    }
+
     /// The positions the state covers.
     pub fn len(&self) -> usize {
         self.len
@@ -1570,6 +1581,16 @@ impl Qwen35Cache {
         for l in &mut self.layers {
             if let Qwen35LayerCache::Delta(c) = l {
                 c.capture_at(position);
+            }
+        }
+    }
+
+    /// Ask the next prefill forward to capture every linear layer's state at all boundaries in
+    /// `positions` strictly inside that prefill (SW-F356).
+    pub fn capture_boundaries(&mut self, positions: &[i32]) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at_many(positions);
             }
         }
     }
@@ -2160,6 +2181,12 @@ pub struct Qwen35MtpCache {
 }
 
 impl Qwen35MtpCache {
+    /// Empty MTP cache for non-inference prefix-checkpoint unit tests.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { layers: Vec::new() }
+    }
+
     /// Clear every MTP layer's speculative attention state.
     pub fn reset(&mut self) {
         for layer in &mut self.layers {
@@ -3609,17 +3636,25 @@ impl Qwen35Model {
         self.validate_cache(cache)?;
         let offset = cache.offset() + cache.rope_delta();
         let ids = request.tokens.ids(&self.device)?;
+        let mut captures = request.snapshot_points.clone();
         if let Some(b) = request.snapshot_at {
-            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
-            // its first `b` tokens; the attention KV is narrowed there afterwards.
+            captures.push(b);
+        }
+        if !captures.is_empty() {
+            // The boundary snapshots (SW-F356 / sc-24446): a prefill keeps every linear layer's
+            // state after its first `b` tokens; the attention KV is narrowed there afterwards.
             let n = request.len()?;
-            if !request.prefill || b == 0 || b >= n {
-                return Err(Error::Msg(format!(
-                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
-                     prefill step that continues past it"
-                )));
+            for &b in &captures {
+                if !request.prefill || b == 0 || b >= n {
+                    return Err(Error::Msg(format!(
+                        "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
+                         prefill step that continues past it"
+                    )));
+                }
             }
-            cache.capture_boundary(cache.offset() + b as i32);
+            let base = cache.offset();
+            let abs: Vec<i32> = captures.into_iter().map(|b| base + b as i32).collect();
+            cache.capture_boundaries(&abs);
         }
         let _prefill = crate::primitives::prefill_scope(request.prefill);
         let run = (|| -> Result<(Tensor, Option<Tensor>)> {
@@ -7071,6 +7106,7 @@ pub(crate) mod tests {
                         want_hidden: false,
                         prefill: false,
                         snapshot_at: None,
+                        snapshot_points: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -7897,8 +7933,8 @@ pub(crate) mod tests {
                 } else {
                     StepRequest::last(tokens)
                 };
-                let h = host_model.forward_step(&mut hc, req).unwrap();
-                let d = dev_model.forward_step(&mut dc, req).unwrap();
+                let h = host_model.forward_step(&mut hc, req.clone()).unwrap();
+                let d = dev_model.forward_step(&mut dc, req.clone()).unwrap();
                 let g = dev_model.forward_step(&mut gc, req).unwrap();
                 assert_rows_close(&format!("{what} step {n}"), &d.logits, &h.logits);
                 assert_eq!(host(&g.logits), host(&d.logits), "{what} step {n}: growing");

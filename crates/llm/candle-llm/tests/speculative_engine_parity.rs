@@ -357,6 +357,7 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
                         want_hidden: false,
                         prefill: false,
                         snapshot_at: None,
+                        snapshot_points: Vec::new(),
                     },
                 )
                 .unwrap()
@@ -579,6 +580,7 @@ fn llama_teacher_forced(
                         want_hidden: false,
                         prefill: false,
                         snapshot_at: None,
+                        snapshot_points: Vec::new(),
                     },
                 )
                 .unwrap()

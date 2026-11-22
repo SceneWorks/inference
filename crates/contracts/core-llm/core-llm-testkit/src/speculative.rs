@@ -24,9 +24,10 @@
 //!   setting the requests carried ([`BenchThinking`], `SPECULATIVE_BENCH_THINKING`).
 
 use core_llm::{
-    DecodeReport, FinishReason, LoadReport, LoadSpec, Message, ProposerKind, Quantize,
-    ReasoningEffort, Sampling, Speculative, SpeculativeProposer, SpeculativeVerify, StreamEvent,
-    TextLlm, TextLlmCapabilities, TextLlmRequest, ThinkingMode,
+    DecodeReport, FinishReason, LoadReport, LoadSpec, Message, PrefixCheckpointMode,
+    PrefixCheckpointPolicy, PrefixDocumentSpan, ProposerKind, Quantize, ReasoningEffort, Sampling,
+    Speculative, SpeculativeProposer, SpeculativeVerify, StreamEvent, TextLlm, TextLlmCapabilities,
+    TextLlmRequest, ThinkingMode,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -443,6 +444,8 @@ pub struct BenchPrompt {
     pub class: PromptClass,
     /// The conversation sent.
     pub messages: Vec<Message>,
+    /// Optional per-prompt prefix checkpoint policy (used when checkpoints are enabled or unset).
+    pub prefix_checkpoints: Option<PrefixCheckpointPolicy>,
 }
 
 impl BenchPrompt {
@@ -452,6 +455,62 @@ impl BenchPrompt {
             id: id.into(),
             class,
             messages: vec![Message::user(text)],
+            prefix_checkpoints: None,
+        }
+    }
+
+    /// A multi-message conversation prompt with optional prefix checkpoint policy.
+    pub fn conversation(
+        id: impl Into<String>,
+        class: PromptClass,
+        messages: Vec<Message>,
+        prefix_checkpoints: Option<PrefixCheckpointPolicy>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            class,
+            messages,
+            prefix_checkpoints,
+        }
+    }
+}
+
+/// Which prompt set a benchmark run executes (`SPECULATIVE_BENCH_PROMPT_SET`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BenchPromptSet {
+    /// The canonical 5-prompt speculative decode set (`speculative_prompt_set`).
+    #[default]
+    Default,
+    /// The paired short/long edited-turn and repeated-document prompt set
+    /// (`prefix_checkpoint_prompt_set`, SW-F356).
+    PrefixCheckpoints,
+}
+
+impl BenchPromptSet {
+    /// Parse `SPECULATIVE_BENCH_PROMPT_SET` (`"default"` or `"prefix_checkpoints"`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "default" => Ok(Self::Default),
+            "prefix_checkpoints" => Ok(Self::PrefixCheckpoints),
+            other => Err(format!(
+                "SPECULATIVE_BENCH_PROMPT_SET must be default or prefix_checkpoints, got {other}"
+            )),
+        }
+    }
+
+    /// Canonical label (`"default"` | `"prefix_checkpoints"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::PrefixCheckpoints => "prefix_checkpoints",
+        }
+    }
+
+    /// The prompt list for this prompt set.
+    pub fn prompts(self) -> Vec<BenchPrompt> {
+        match self {
+            Self::Default => speculative_prompt_set(),
+            Self::PrefixCheckpoints => prefix_checkpoint_prompt_set(),
         }
     }
 }
@@ -500,6 +559,199 @@ pub fn speculative_prompt_set() -> Vec<BenchPrompt> {
     ]
 }
 
+fn long_technical_document() -> String {
+    let modules = [
+        ("admission", "memory budget validation", 12, "megabytes"),
+        (
+            "tokenizer",
+            "UTF-8 incremental detokenizer",
+            256,
+            "codepoints",
+        ),
+        ("scheduler", "bounded queue admission", 16, "requests"),
+        ("checkpoint", "prefix boundary planning", 4, "boundaries"),
+        ("deltanet", "recurrent gate state snapshot", 32, "layers"),
+        (
+            "attention",
+            "contiguous KV sequence window",
+            4096,
+            "positions",
+        ),
+        ("proposer", "draft speculative verification", 3, "tokens"),
+        (
+            "sampler",
+            "deterministic seed PRNG draw",
+            1024,
+            "vocab_slice",
+        ),
+        (
+            "retention",
+            "protected document eviction rule",
+            75,
+            "percent_cap",
+        ),
+        (
+            "telemetry",
+            "prefix reuse and fallback counters",
+            64,
+            "metrics",
+        ),
+        ("transport", "OpenAI SSE JSON streaming", 8192, "bytes"),
+        (
+            "watchdog",
+            "cancellation flag propagation",
+            50,
+            "milliseconds",
+        ),
+        ("quantizer", "packed 4-bit block weights", 128, "elements"),
+        (
+            "loader",
+            "safetensors shard header verification",
+            512,
+            "entries",
+        ),
+        ("compiler", "captured step graph replay", 8, "buckets"),
+        (
+            "diagnostics",
+            "offline regression matrix check",
+            10,
+            "suites",
+        ),
+    ];
+    let mut doc = String::from("Architecture and Operations Reference Handbook\n\n");
+    for (idx, (name, role, limit, unit)) in modules.iter().enumerate() {
+        let section = idx + 1;
+        doc.push_str(&format!(
+            "Section {section}: The `{name}` subsystem owns {role}. \
+             Under nominal production traffic it enforces a ceiling of {limit} {unit} per turn, \
+             records exact transition boundaries before speculative verification begins, and \
+             coordinates with neighboring subsystems so an edited tail turn never invalidates \
+             earlier validated prefix blocks. Operators inspecting section {section} must verify \
+             that retry backoff starts at {} ms, circuit-breaker trip threshold stays at {} errors, \
+             and protected retention entries outlive transient near-tail entries.\n\n",
+            (idx + 1) * 25,
+            idx + 3,
+        ));
+    }
+    doc
+}
+
+/// The paired prefix-checkpoint prompt set (SW-F356): short and long multi-turn edited-turn pairs
+/// (`short_turn1` / `short_turn1_edited`, `long_turn1` / `long_turn1_edited`) and short and long
+/// repeated-document question pairs (`short_doc_q1` / `short_doc_q2`, `long_doc_q1` / `long_doc_q2`).
+pub fn prefix_checkpoint_prompt_set() -> Vec<BenchPrompt> {
+    let short_context = format!("{RAG_ANSWER}\n\n{SUMMARY}");
+    let short_reply = "The Lindqvist Bridge opened in 1932; Maren Lindqvist designed it and a pedestrian walkway was added in 2004. The release review moved the date to March 12.";
+    let long_doc = long_technical_document();
+    let long_reply = "Sections 1 through 16 specify exact capacity limits across admission, checkpoint planning, DeltaNet state snapshots, and protected retention caps up to 75 percent for designated documents.";
+    let short_doc_policy = Some(PrefixCheckpointPolicy::with_document(
+        PrefixDocumentSpan::MessageChars {
+            message: 0,
+            chars: CODE_EDIT.chars().count(),
+        },
+    ));
+    let long_doc_policy = Some(PrefixCheckpointPolicy::with_document(
+        PrefixDocumentSpan::Messages { count: 3 },
+    ));
+
+    vec![
+        BenchPrompt::conversation(
+            "short_turn1",
+            PromptClass::Predictable,
+            vec![
+                Message::user(short_context.clone()),
+                Message::assistant(short_reply),
+                Message::user(
+                    "List the exact dates mentioned for both projects in one short sentence.",
+                ),
+            ],
+            Some(PrefixCheckpointPolicy::auto()),
+        ),
+        BenchPrompt::conversation(
+            "short_turn1_edited",
+            PromptClass::Predictable,
+            vec![
+                Message::user(short_context),
+                Message::assistant(short_reply),
+                Message::user("Instead name only the people mentioned above, separated by commas."),
+            ],
+            Some(PrefixCheckpointPolicy::auto()),
+        ),
+        BenchPrompt::conversation(
+            "short_doc_q1",
+            PromptClass::Predictable,
+            vec![Message::user(format!(
+                "{CODE_EDIT}\n\nWhat struct fields does Item define? Answer concisely."
+            ))],
+            short_doc_policy,
+        ),
+        BenchPrompt::conversation(
+            "short_doc_q2",
+            PromptClass::Predictable,
+            vec![Message::user(format!(
+                "{CODE_EDIT}\n\nWhat does `average` return when `items` is empty? Answer concisely."
+            ))],
+            short_doc_policy,
+        ),
+        BenchPrompt::conversation(
+            "long_turn1",
+            PromptClass::Predictable,
+            vec![
+                Message::user(long_doc.clone()),
+                Message::assistant(long_reply),
+                Message::user(
+                    "Which section defines protected document eviction and what percent cap applies?",
+                ),
+            ],
+            Some(PrefixCheckpointPolicy::auto()),
+        ),
+        BenchPrompt::conversation(
+            "long_turn1_edited",
+            PromptClass::Predictable,
+            vec![
+                Message::user(long_doc.clone()),
+                Message::assistant(long_reply),
+                Message::user(
+                    "Actually list only the subsystem names from Sections 1, 4, and 5 in one line.",
+                ),
+            ],
+            Some(PrefixCheckpointPolicy::auto()),
+        ),
+        BenchPrompt::conversation(
+            "long_doc_q1",
+            PromptClass::Predictable,
+            vec![
+                Message::user(
+                    "Use the architecture reference below to answer concise factual questions.",
+                ),
+                Message::assistant("Understood. Share the reference."),
+                Message::user(long_doc.clone()),
+                Message::assistant("Ready for the first question."),
+                Message::user(
+                    "What is the ceiling limit and unit for the `deltanet` subsystem in Section 5?",
+                ),
+            ],
+            long_doc_policy,
+        ),
+        BenchPrompt::conversation(
+            "long_doc_q2",
+            PromptClass::Predictable,
+            vec![
+                Message::user(
+                    "Use the architecture reference below to answer concise factual questions.",
+                ),
+                Message::assistant("Understood. Share the reference."),
+                Message::user(long_doc),
+                Message::assistant("Ready for the next question."),
+                Message::user(
+                    "What retry backoff and circuit-breaker error threshold apply to Section 9?",
+                ),
+            ],
+            long_doc_policy,
+        ),
+    ]
+}
+
 /// A request over `prompt` under `sampling` with `speculative` set explicitly (never the legacy
 /// field), seed pinned — the request the parity suite (greedy) and the benchmark (its configured
 /// [`BenchConfig::sampling`]) send.
@@ -515,6 +767,7 @@ pub fn bench_request(
         max_new_tokens,
         seed: Some(0),
         speculative: Some(speculative),
+        prefix_checkpoints: prompt.prefix_checkpoints,
         ..Default::default()
     }
 }
@@ -1015,9 +1268,9 @@ impl BenchOption {
     }
 }
 
-/// The row keys the harness writes beyond the pre-epic schema (SW-7200's per-path telemetry):
+/// The row keys the harness writes beyond the pre-epic schema (SW-7200/SW-F356 per-path telemetry):
 /// the baseline driver predates them, so a schema comparison leaves them out.
-pub const BENCH_PATH_ROW_KEYS: [&str; 8] = [
+pub const BENCH_PATH_ROW_KEYS: [&str; 9] = [
     "speculative",
     "verify",
     "wall_ms",
@@ -1026,6 +1279,7 @@ pub const BENCH_PATH_ROW_KEYS: [&str; 8] = [
     "draft_time",
     "tree_verify",
     "peak_memory_bytes",
+    "prefix_checkpoints",
 ];
 
 /// The document keys the harness writes beyond the pre-epic schema (SW-7200).
@@ -1052,6 +1306,10 @@ pub struct BenchConfig {
     pub repeats: u32,
     /// The reasoning setting every request (warm-ups included) carries.
     pub thinking: BenchThinking,
+    /// Which prompt set this benchmark config targets (`SPECULATIVE_BENCH_PROMPT_SET`).
+    pub prompt_set: BenchPromptSet,
+    /// Optional policy override applied to every request (`SPECULATIVE_BENCH_PREFIX_CHECKPOINTS`).
+    pub prefix_checkpoints: Option<PrefixCheckpointMode>,
 }
 
 /// One measured repeat of a [`BenchRow`].
@@ -1296,7 +1554,25 @@ impl BenchRow {
         let draft = report
             .and_then(|r| r.draft.as_ref())
             .map(|d| json!({"source": d.source, "format": d.format, "precision": d.precision}));
-        // The SW-7200 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
+        let prefix_checkpoints = report
+            .and_then(|r| r.prefix_checkpoints.as_ref())
+            .map(|pc| {
+                json!({
+                    "policy": pc.policy,
+                    "reused_tokens": pc.reused_tokens,
+                    "reread_tokens": pc.reread_tokens,
+                    "matched_kind": pc.matched_kind,
+                    "checkpoints_captured": pc.checkpoints_captured,
+                    "captured_bytes": pc.captured_bytes,
+                    "restore_ms": ms(pc.restore_time),
+                    "capture_ms": ms(pc.capture_time),
+                    "resident_bytes": pc.resident_bytes,
+                    "protected_bytes": pc.protected_bytes,
+                    "evicted_entries": pc.evicted_entries,
+                    "fallbacks": pc.fallbacks,
+                })
+            });
+        // The SW-7200/SW-F356 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
         let path_keys = [
             ("speculative", json!(self.speculative)),
             ("verify", json!(self.verify)),
@@ -1306,6 +1582,10 @@ impl BenchRow {
             ("draft_time", draft_time.unwrap_or(Value::Null)),
             ("tree_verify", tree.unwrap_or(Value::Null)),
             ("peak_memory_bytes", BenchStats::json_of(&peaks)),
+            (
+                "prefix_checkpoints",
+                prefix_checkpoints.unwrap_or(Value::Null),
+            ),
         ];
         if let Some(object) = row.as_object_mut() {
             for (key, value) in path_keys {
@@ -1464,45 +1744,116 @@ pub fn run_speculative_bench_with(
         let (speculative, verify) = option.request(&capabilities);
         let mut req = bench_request(prompt, speculative, &config.sampling, config.max_new_tokens);
         req.speculative_verify = verify;
+        req.prefix_checkpoints = match config.prefix_checkpoints {
+            Some(PrefixCheckpointMode::Off) => Some(PrefixCheckpointPolicy::off()),
+            Some(PrefixCheckpointMode::Auto) => Some(
+                prompt
+                    .prefix_checkpoints
+                    .unwrap_or_else(PrefixCheckpointPolicy::auto),
+            ),
+            None => prompt.prefix_checkpoints,
+        };
         config.thinking.apply(&mut req);
         req
     };
     let mut rows = Vec::with_capacity(prompts.len() * config.options.len());
-    for prompt in prompts {
-        for option in &config.options {
-            let req = request(prompt, option);
-            let tag = format!("[{}] {}", prompt.id, option.to_wire());
+    if config.prompt_set == BenchPromptSet::PrefixCheckpoints {
+        struct Cell {
+            req: TextLlmRequest,
+            first: Option<(Observed, &'static str)>,
+            samples: Vec<BenchSample>,
+        }
+        let mut cells: Vec<Vec<Cell>> = prompts
+            .iter()
+            .map(|prompt| {
+                config
+                    .options
+                    .iter()
+                    .map(|option| Cell {
+                        req: request(prompt, option),
+                        first: None,
+                        samples: Vec::with_capacity(config.repeats as usize),
+                    })
+                    .collect()
+            })
+            .collect();
+        for (o_idx, option) in config.options.iter().enumerate() {
+            let opt_tag = option.to_wire();
             if config.warmup {
-                let warm = if isolated_warmup {
-                    request(&warmup_prompt, option)
-                } else {
-                    req.clone()
-                };
-                observe(provider, &warm).map_err(|e| format!("{tag} warm-up: {e}"))?;
+                let warm = request(&warmup_prompt, option);
+                observe(provider, &warm).map_err(|e| format!("{opt_tag} warm-up: {e}"))?;
             }
-            let mut first = None;
-            let mut samples = Vec::with_capacity(config.repeats as usize);
             for repeat in 0..config.repeats {
-                let run = observe_with(provider, &req, memory)
-                    .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
-                let (sample, timing_source) = bench_sample(&run);
-                samples.push(sample);
-                first.get_or_insert((run, timing_source));
+                // Start every repeat and option from a clean prefix cache so multi-turn sequences
+                // (`turn1 -> turn1_edited`, `doc_q1 -> doc_q2`) never contaminate later repeats.
+                provider.clear_prefix_cache();
+                for (p_idx, prompt) in prompts.iter().enumerate() {
+                    let cell = &mut cells[p_idx][o_idx];
+                    let tag = format!("[{}] {}", prompt.id, opt_tag);
+                    let run = observe_with(provider, &cell.req, memory)
+                        .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
+                    let (sample, timing_source) = bench_sample(&run);
+                    cell.samples.push(sample);
+                    cell.first.get_or_insert((run, timing_source));
+                }
             }
-            let (run, timing_source) = first.expect("at least one repeat ran");
-            rows.push(BenchRow {
-                prompt_id: prompt.id.clone(),
-                class: prompt.class,
-                requested: *option,
-                speculative: req.speculative_mode(),
-                verify: req.speculative_verify,
-                thinking: config.thinking,
-                prompt_tokens: run.prompt_tokens,
-                generated_tokens: run.generated,
-                timing_source,
-                report: run.report,
-                samples,
-            });
+        }
+        for (p_idx, prompt) in prompts.iter().enumerate() {
+            for (o_idx, option) in config.options.iter().enumerate() {
+                let cell = &mut cells[p_idx][o_idx];
+                let (run, timing_source) = cell.first.take().expect("at least one repeat ran");
+                rows.push(BenchRow {
+                    prompt_id: prompt.id.clone(),
+                    class: prompt.class,
+                    requested: *option,
+                    speculative: cell.req.speculative_mode(),
+                    verify: cell.req.speculative_verify,
+                    thinking: config.thinking,
+                    prompt_tokens: run.prompt_tokens,
+                    generated_tokens: run.generated,
+                    timing_source,
+                    report: run.report,
+                    samples: std::mem::take(&mut cell.samples),
+                });
+            }
+        }
+    } else {
+        for prompt in prompts {
+            for option in &config.options {
+                let req = request(prompt, option);
+                let tag = format!("[{}] {}", prompt.id, option.to_wire());
+                if config.warmup {
+                    let warm = if isolated_warmup {
+                        request(&warmup_prompt, option)
+                    } else {
+                        req.clone()
+                    };
+                    observe(provider, &warm).map_err(|e| format!("{tag} warm-up: {e}"))?;
+                }
+                let mut first = None;
+                let mut samples = Vec::with_capacity(config.repeats as usize);
+                for repeat in 0..config.repeats {
+                    let run = observe_with(provider, &req, memory)
+                        .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
+                    let (sample, timing_source) = bench_sample(&run);
+                    samples.push(sample);
+                    first.get_or_insert((run, timing_source));
+                }
+                let (run, timing_source) = first.expect("at least one repeat ran");
+                rows.push(BenchRow {
+                    prompt_id: prompt.id.clone(),
+                    class: prompt.class,
+                    requested: *option,
+                    speculative: req.speculative_mode(),
+                    verify: req.speculative_verify,
+                    thinking: config.thinking,
+                    prompt_tokens: run.prompt_tokens,
+                    generated_tokens: run.generated,
+                    timing_source,
+                    report: run.report,
+                    samples,
+                });
+            }
         }
     }
     Ok(BenchDocument {
@@ -1589,11 +1940,18 @@ pub fn bench_config(
             format!("{name}@{format}")
         }
     });
+    let prompt_set = match var("SPECULATIVE_BENCH_PROMPT_SET") {
+        Some(value) => BenchPromptSet::parse(&value)?,
+        None => BenchPromptSet::Default,
+    };
     let options = match var("SPECULATIVE_BENCH_OPTIONS") {
         Some(json) => serde_json::from_str::<Vec<Value>>(&json)
             .map_err(|e| e.to_string())
             .and_then(|list| list.iter().map(BenchOption::from_wire).collect())
             .map_err(|e| format!("SPECULATIVE_BENCH_OPTIONS is not a JSON option list: {e}"))?,
+        None if prompt_set == BenchPromptSet::PrefixCheckpoints => {
+            vec![Speculative::Off.into()]
+        }
         None => vec![Speculative::Off.into(), Speculative::Auto.into()],
     };
     let sampling = match var("SPECULATIVE_BENCH_SAMPLING") {
@@ -1602,6 +1960,21 @@ pub fn bench_config(
         }
         None => Sampling::greedy(),
     };
+    let default_repeats = if prompt_set == BenchPromptSet::PrefixCheckpoints {
+        1
+    } else {
+        BENCH_DEFAULT_REPEATS
+    };
+    let prefix_checkpoints = match var("SPECULATIVE_BENCH_PREFIX_CHECKPOINTS").as_deref() {
+        None => None,
+        Some("off") => Some(PrefixCheckpointMode::Off),
+        Some("auto") => Some(PrefixCheckpointMode::Auto),
+        Some(other) => {
+            return Err(format!(
+                "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS must be off or auto, got {other}"
+            ))
+        }
+    };
     Ok(BenchConfig {
         model,
         backend: var("SPECULATIVE_BENCH_BACKEND").unwrap_or_else(|| default_backend.into()),
@@ -1609,15 +1982,18 @@ pub fn bench_config(
         sampling,
         options,
         warmup: var("SPECULATIVE_BENCH_WARMUP").as_deref() != Some("0"),
-        repeats: count("SPECULATIVE_BENCH_REPEATS", BENCH_DEFAULT_REPEATS)?,
+        repeats: count("SPECULATIVE_BENCH_REPEATS", default_repeats)?,
         thinking: bench_thinking(var)?,
+        prompt_set,
+        prefix_checkpoints,
     })
 }
 
 /// The real-weight benchmark entry both backends' `#[ignore]`d `speculative_bench` tests call
 /// (epic sc-24432 acceptance test 3 / E6): load `SPECULATIVE_BENCH_SNAPSHOT` through `load`, run
-/// [`run_speculative_bench`] over [`speculative_prompt_set`], and write the document to
-/// `SPECULATIVE_BENCH_OUTPUT` (never over an existing file). Returns the path and the document.
+/// [`run_speculative_bench`] over the selected prompt set ([`BenchConfig::prompt_set`]), and write
+/// the document to `SPECULATIVE_BENCH_OUTPUT` (never over an existing file). Returns the path and
+/// the document.
 /// Every input is passed in; nothing is derived from a cache:
 ///
 /// | variable | meaning |
@@ -1630,6 +2006,8 @@ pub fn bench_config(
 /// | `SPECULATIVE_BENCH_DRAFT` | draft model snapshot (`LoadSpec::draft_source`; default none) |
 /// | `SPECULATIVE_BENCH_MTP_HEAD` | companion MTP head artifact (`LoadSpec::mtp_head_source`; default none) |
 /// | `SPECULATIVE_BENCH_PREFIX_CACHE_BYTES` | prefix-cache budget (`LoadSpec::prefix_cache_bytes`): default `0` (off — a cold-prefill TTFT), a byte count, or `default` for the backend default |
+/// | `SPECULATIVE_BENCH_PROMPT_SET` | prompt suite (`default` for [`speculative_prompt_set`], `prefix_checkpoints` for [`prefix_checkpoint_prompt_set`]) |
+/// | `SPECULATIVE_BENCH_PREFIX_CHECKPOINTS` | checkpoint mode override (`off` or `auto`) |
 /// | `SPECULATIVE_BENCH_NEW_TOKENS` | tokens generated per run (default [`BENCH_DEFAULT_NEW_TOKENS`]) |
 /// | `SPECULATIVE_BENCH_REPEATS` | measured repeats per row (default [`BENCH_DEFAULT_REPEATS`]) |
 /// | `SPECULATIVE_BENCH_MODEL` | model label recorded verbatim (default: the snapshot's directory name, `@<format>` appended unless bf16) |
@@ -1664,14 +2042,10 @@ pub fn run_speculative_bench_from_env(
     }
     let spec = bench_load_spec(&snapshot, &bench_env)?;
     let config = bench_config(&snapshot, default_backend, &bench_env)?;
+    let prompts = config.prompt_set.prompts();
     BenchProvenance::collect(Vec::new(), &bench_env)?;
     let provider = load(&spec).map_err(|e| format!("load {snapshot}: {e}"))?;
-    let mut doc = run_speculative_bench_with(
-        provider.as_ref(),
-        &speculative_prompt_set(),
-        &config,
-        memory,
-    )?;
+    let mut doc = run_speculative_bench_with(provider.as_ref(), &prompts, &config, memory)?;
     doc.provenance = BenchProvenance::collect(switches(), &bench_env)?;
     doc.write_new(&output)
         .map_err(|e| format!("write {}: {e}", output.display()))?;
@@ -1717,6 +2091,8 @@ pub fn check_speculative_bench_on_fixture(
         warmup: true,
         repeats: 2,
         thinking: bench_thinking(&|_| None)?,
+        prompt_set: BenchPromptSet::Default,
+        prefix_checkpoints: None,
     };
     let mut failures = Vec::new();
 
@@ -1901,6 +2277,10 @@ mod tests {
         seen_thinking: RefCell<Vec<(ThinkingMode, Option<ReasoningEffort>)>>,
         /// Each request's speculative option and verify layout, in request order.
         seen_speculative: RefCell<Vec<(Speculative, SpeculativeVerify)>>,
+        /// Each request's prefix checkpoint policy, in request order.
+        seen_prefix_checkpoints: RefCell<Vec<Option<PrefixCheckpointPolicy>>>,
+        /// Number of `clear_prefix_cache` resets requested by the harness.
+        prefix_clears: std::cell::Cell<usize>,
     }
 
     fn stub(diverge: bool, mislabel: bool) -> SpeculativeStub {
@@ -1916,6 +2296,11 @@ mod tests {
                         max_depth: 7,
                         recommended_depth: 4,
                     }],
+                    prefix_checkpoints: Some(core_llm::PrefixCheckpointCapabilities {
+                        max_checkpoints_per_request: core_llm::MAX_CHECKPOINTS_PER_REQUEST as u32,
+                        supports_document_span: true,
+                        supports_hybrid_boundaries: true,
+                    }),
                     ..Default::default()
                 },
             },
@@ -1925,12 +2310,18 @@ mod tests {
             seen: RefCell::default(),
             seen_thinking: RefCell::default(),
             seen_speculative: RefCell::default(),
+            seen_prefix_checkpoints: RefCell::default(),
+            prefix_clears: std::cell::Cell::new(0),
         }
     }
 
     impl TextLlm for SpeculativeStub {
         fn descriptor(&self) -> &TextLlmDescriptor {
             &self.descriptor
+        }
+
+        fn clear_prefix_cache(&self) {
+            self.prefix_clears.set(self.prefix_clears.get() + 1);
         }
 
         fn load_report(&self) -> Option<LoadReport> {
@@ -1963,6 +2354,9 @@ mod tests {
             self.seen_speculative
                 .borrow_mut()
                 .push((req.speculative_mode(), req.speculative_verify));
+            self.seen_prefix_checkpoints
+                .borrow_mut()
+                .push(req.prefix_checkpoints);
             let speculating = plan.proposer() != ProposerKind::None;
             let mut text = String::new();
             for i in 0..req.max_new_tokens as usize {
@@ -2031,6 +2425,22 @@ mod tests {
                         calls: 4,
                         host_synchronized_calls: 4,
                         total: Duration::from_millis(8),
+                    }),
+                    prefix_checkpoints: req.prefix_checkpoints.map(|policy| {
+                        core_llm::PrefixCheckpointReport {
+                            policy: policy.label().to_string(),
+                            reused_tokens: 2,
+                            reread_tokens: 2,
+                            matched_kind: Some("shared_root".into()),
+                            checkpoints_captured: 1,
+                            captured_bytes: 512,
+                            restore_time: Duration::from_millis(1),
+                            capture_time: Duration::from_millis(2),
+                            resident_bytes: 512,
+                            protected_bytes: if policy.document.is_some() { 512 } else { 0 },
+                            evicted_entries: 0,
+                            fallbacks: Vec::new(),
+                        }
                     }),
                     ..Default::default()
                 }),
@@ -2122,6 +2532,8 @@ mod tests {
             sampling: Sampling::greedy(),
             repeats: 3,
             thinking: BenchThinking::Default,
+            prompt_set: BenchPromptSet::Default,
+            prefix_checkpoints: None,
         }
     }
 
@@ -2927,11 +3339,167 @@ mod tests {
             json["rows"][0]["samples"][0]["peak_memory_bytes"],
             Value::Null
         );
-        // Every SW-7200 key is on every row.
+        // Every SW-7200 / SW-F356 key is on every row.
         for row in json["rows"].as_array().unwrap() {
             for key in BENCH_PATH_ROW_KEYS {
                 assert!(row.get(key).is_some(), "row lacks `{key}`");
             }
         }
+    }
+
+    #[test]
+    fn prefix_checkpoint_prompt_set_knobs_and_telemetry_work_end_to_end_on_stub() {
+        let prompts = prefix_checkpoint_prompt_set();
+        let ids: Vec<_> = prompts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "short_turn1",
+                "short_turn1_edited",
+                "short_doc_q1",
+                "short_doc_q2",
+                "long_turn1",
+                "long_turn1_edited",
+                "long_doc_q1",
+                "long_doc_q2",
+            ]
+        );
+        // Paired short document questions designate `MessageChars` and long document questions
+        // designate `Messages { count: 3 }`.
+        assert_eq!(
+            prompts[2].prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::MessageChars {
+                    message: 0,
+                    chars: CODE_EDIT.chars().count(),
+                }
+            ))
+        );
+        assert_eq!(
+            prompts[6].prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 3 }
+            ))
+        );
+        // Short & long prompts validate against Capabilities.
+        let caps = TextLlmCapabilities {
+            prefix_checkpoints: Some(core_llm::PrefixCheckpointCapabilities {
+                max_checkpoints_per_request: 4,
+                supports_document_span: true,
+                supports_hybrid_boundaries: true,
+            }),
+            ..Default::default()
+        };
+        for prompt in &prompts {
+            let req = bench_request(prompt, Speculative::Off, &Sampling::greedy(), 4);
+            caps.validate_request("stub", &req).unwrap();
+        }
+        assert!(
+            prompts[4].messages[0].text_content().len()
+                > prompts[0].messages[0].text_content().len()
+        );
+
+        let knobs = |name: &str| match name {
+            "SPECULATIVE_BENCH_PROMPT_SET" => Some("prefix_checkpoints".to_string()),
+            "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS" => Some("off".to_string()),
+            _ => None,
+        };
+        let off_cfg = bench_config("/snap/Model-7B", "mlx", &knobs).unwrap();
+        assert_eq!(off_cfg.prompt_set, BenchPromptSet::PrefixCheckpoints);
+        assert_eq!(off_cfg.prefix_checkpoints, Some(PrefixCheckpointMode::Off));
+        // Unset options/repeats default to ["off"] and 1 for paired checkpoint sequences.
+        assert_eq!(off_cfg.options, vec![BenchOption::Plain(Speculative::Off)]);
+        assert_eq!(off_cfg.repeats, 1);
+        assert!(bench_config("/snap/Model-7B", "mlx", &|k| {
+            (k == "SPECULATIVE_BENCH_PROMPT_SET").then(|| "unknown".to_string())
+        })
+        .is_err());
+        assert!(bench_config("/snap/Model-7B", "mlx", &|k| {
+            (k == "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS").then(|| "always".to_string())
+        })
+        .is_err());
+
+        // `off` override forces every request (even `short_doc_q1`) to `off`, runs one isolated
+        // unrelated warmup before the timed sequence, and clears the prefix cache before repeat 0.
+        let off_provider = stub(false, false);
+        let off_doc = run_speculative_bench(&off_provider, &prompts, &off_cfg).unwrap();
+        assert_eq!(off_provider.prefix_clears.get(), 1);
+        assert_eq!(off_provider.seen_prefix_checkpoints.borrow().len(), 9);
+        assert_eq!(off_provider.seen.borrow()[0], BENCH_WARMUP_PROMPT);
+        assert!(off_provider
+            .seen_prefix_checkpoints
+            .borrow()
+            .iter()
+            .all(|p| *p == Some(PrefixCheckpointPolicy::off())));
+        let off_json = off_doc.to_json();
+        assert_eq!(off_json["rows"][2]["prefix_checkpoints"]["policy"], "off");
+
+        // `auto` override with warmup off runs the 8-prompt sequence cleanly without a warmup.
+        let auto_provider = stub(false, false);
+        let auto_cfg = BenchConfig {
+            prefix_checkpoints: Some(PrefixCheckpointMode::Auto),
+            warmup: false,
+            ..off_cfg.clone()
+        };
+        let auto_doc = run_speculative_bench(&auto_provider, &prompts, &auto_cfg).unwrap();
+        assert_eq!(auto_provider.prefix_clears.get(), 1);
+        assert_eq!(auto_provider.seen_prefix_checkpoints.borrow().len(), 8);
+        assert_eq!(
+            auto_provider.seen_prefix_checkpoints.borrow()[0],
+            Some(PrefixCheckpointPolicy::auto())
+        );
+        assert_eq!(
+            auto_provider.seen_prefix_checkpoints.borrow()[2],
+            prompts[2].prefix_checkpoints
+        );
+        assert_eq!(
+            auto_provider.seen_prefix_checkpoints.borrow()[6],
+            prompts[6].prefix_checkpoints
+        );
+        let auto_json = auto_doc.to_json();
+        assert_eq!(
+            auto_json["rows"][2]["prefix_checkpoints"]["policy"],
+            "document"
+        );
+        assert_eq!(
+            auto_json["rows"][2]["prefix_checkpoints"]["protected_bytes"],
+            512
+        );
+        for key in BENCH_PATH_ROW_KEYS {
+            assert!(auto_json["rows"][2].get(key).is_some(), "lacks {key}");
+        }
+
+        // Multiple options and repeats execute per-option -> per-repeat full sequences with
+        // prefix-cache resets in between, while returning rows in prompt-major order.
+        let multi_provider = stub(false, false);
+        let multi_cfg = BenchConfig {
+            options: vec![Speculative::Off.into(), Speculative::Auto.into()],
+            repeats: 2,
+            warmup: true,
+            ..off_cfg
+        };
+        let multi_doc = run_speculative_bench(&multi_provider, &prompts, &multi_cfg).unwrap();
+        assert_eq!(multi_provider.prefix_clears.get(), 4);
+        assert_eq!(multi_provider.seen.borrow().len(), 2 * (1 + 2 * 8));
+        assert_eq!(multi_provider.seen.borrow()[0], BENCH_WARMUP_PROMPT);
+        assert_eq!(multi_provider.seen.borrow()[1 + 2 * 8], BENCH_WARMUP_PROMPT);
+        assert_eq!(
+            multi_provider.seen.borrow()[1],
+            prompts[0].messages[0].text_content()
+        );
+        assert_eq!(
+            multi_provider.seen.borrow()[2],
+            prompts[1].messages[0].text_content()
+        );
+        assert_eq!(
+            multi_provider.seen.borrow()[9],
+            prompts[0].messages[0].text_content()
+        );
+        assert_eq!(multi_doc.rows.len(), 16);
+        assert_eq!(multi_doc.rows[0].prompt_id, "short_turn1");
+        assert_eq!(multi_doc.rows[0].requested, Speculative::Off);
+        assert_eq!(multi_doc.rows[1].prompt_id, "short_turn1");
+        assert_eq!(multi_doc.rows[1].requested, Speculative::Auto);
+        assert_eq!(multi_doc.rows[0].samples.len(), 2);
     }
 }

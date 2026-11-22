@@ -174,6 +174,11 @@ pub trait TextLlm {
         self.generate(req, &mut |_| {})
     }
 
+    /// Drop any cross-request prefix-cache entries held by this provider so multi-turn benchmark
+    /// sequences start from a clean cache state across repeats and options. Providers without a
+    /// prefix cache inherit this no-op default.
+    fn clear_prefix_cache(&self) {}
+
     /// Generate several independent requests (sc-20681), streaming `(request index, event)`
     /// through `on_event` and returning one result per request, in request order. A backend with
     /// continuous batching decodes the requests it can batch together (each keeping its own

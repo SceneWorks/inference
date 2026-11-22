@@ -202,28 +202,75 @@ pub fn gated_delta_recurrence_capturing(
              the run"
         )));
     }
+    let (y, last, mut captured) =
+        gated_delta_recurrence_capturing_many(q, k, v, g, beta, state, &[at])?;
+    let at_state = captured.pop().map(|(_, s)| s).ok_or_else(|| {
+        Error::Msg("gated_delta_recurrence_capturing: no state at the capture".into())
+    })?;
+    Ok((y, last, at_state))
+}
+
+/// Recurrence output `(y, last_state, captured_boundary_states)` returned by
+/// [`gated_delta_recurrence_capturing_many`].
+pub type GatedDeltaMultiCapture = (Tensor, Tensor, Vec<(usize, Tensor)>);
+
+/// [`gated_delta_recurrence_capturing`] returning the state after EVERY boundary in `positions`
+/// (`0 < p < T`) inside the run (SW-F356), in ascending position order, **without changing the
+/// recurrence**: `y` and the final state remain bit for bit those of the uncaptured call.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_recurrence_capturing_many(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    positions: &[usize],
+) -> Result<GatedDeltaMultiCapture> {
+    let t = q.dim(1)?;
+    if positions.is_empty() {
+        let (y, last) = gated_delta_recurrence(q, k, v, g, beta, state)?;
+        return Ok((y, last, Vec::new()));
+    }
+    let mut cuts = positions.to_vec();
+    cuts.sort_unstable();
+    cuts.dedup();
+    if let Some(&bad) = cuts.iter().find(|&&p| p == 0 || p >= t) {
+        return Err(Error::Msg(format!(
+            "gated_delta_recurrence_capturing_many: a capture after {bad} of {t} tokens is not \
+             inside the run"
+        )));
+    }
     if !runs_chunked(t, q.device()) {
-        let mut captured = None;
+        let mut captured = Vec::with_capacity(cuts.len());
         let (y, last) = gated_delta_recurrence_per_token(q, k, v, g, beta, state, &mut |ti, s| {
-            if ti + 1 == at {
-                captured = Some(s.clone());
+            if cuts.binary_search(&(ti + 1)).is_ok() {
+                captured.push((ti + 1, s.clone()));
             }
             Ok(())
         })?;
-        let captured = captured.ok_or_else(|| {
-            Error::Msg("gated_delta_recurrence_capturing: no state at the capture".into())
-        })?;
+        if captured.len() != cuts.len() {
+            return Err(Error::Msg(
+                "gated_delta_recurrence_capturing_many: missing captured state".into(),
+            ));
+        }
         return Ok((y, last, captured));
     }
-    let (y, last, captured) = chunked(q, k, v, g, beta, state, Some(at))?;
+    let (y, last, captured) = chunked(q, k, v, g, beta, state, &cuts)?;
     let state_dtype = state.map_or(q.dtype(), Tensor::dtype);
-    let captured = captured.ok_or_else(|| {
-        Error::Msg("gated_delta_recurrence_capturing: no state at the capture".into())
-    })?;
+    let captured = captured
+        .into_iter()
+        .map(|(p, st)| Ok((p, st.to_dtype(state_dtype)?)))
+        .collect::<Result<Vec<_>>>()?;
+    if captured.len() != cuts.len() {
+        return Err(Error::Msg(
+            "gated_delta_recurrence_capturing_many: missing captured chunk state".into(),
+        ));
+    }
     Ok((
         y.to_dtype(q.dtype())?,
         last.to_dtype(state_dtype)?,
-        captured.to_dtype(state_dtype)?,
+        captured,
     ))
 }
 
@@ -425,15 +472,12 @@ pub fn gated_delta_chunked(
     beta: &Tensor,
     state: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
-    let (y, state, _) = chunked(q, k, v, g, beta, state, None)?;
+    let (y, state, _) = chunked(q, k, v, g, beta, state, &[])?;
     Ok((y, state))
 }
 
-/// [`gated_delta_chunked`], also returning the state after the first `capture` tokens when asked
-/// (`0 < capture < T`, f32 `[B, Hv, Dv, Dk]`): at a chunk boundary it is the hand-off state
-/// there; inside chunk `[c₀, c₀ + C)` at `r = capture − c₀` tokens in, it is that chunk's
-/// hand-off cut at `r` — `S_r = Γ_r S₀ + Δ[..r]ᵀ (K[..r] Γ_r/Γ)`, `Γ_r` the chunk's cumulative
-/// gate after its `r`-th token. The recurrence itself is unchanged.
+/// [`gated_delta_chunked`], also returning states after every position in `captures` (`0 < p < T`,
+/// sorted ascending, f32 `[B, Hv, Dv, Dk]`). The recurrence itself is unchanged.
 fn chunked(
     q: &Tensor,
     k: &Tensor,
@@ -441,8 +485,8 @@ fn chunked(
     g: &Tensor,
     beta: &Tensor,
     state: Option<&Tensor>,
-    capture: Option<usize>,
-) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+    captures: &[usize],
+) -> Result<GatedDeltaMultiCapture> {
     let f = DType::F32;
     let c = GDN_CHUNK;
     let (b, t, hk, dk) = q.dims4()?;
@@ -497,10 +541,10 @@ fn chunked(
         None => Tensor::zeros((n, dv, dk), f, dev)?,
     };
     let mut ys: Vec<Tensor> = Vec::with_capacity(n_chunks);
-    // The chunk holding the capture and the tokens of it before the capture (`0`: the capture is
-    // the hand-off state entering that chunk).
-    let capture = capture.map(|p| (p / c, p % c));
-    let mut captured = None;
+    // Capture slots mapped to `(chunk, in_chunk_pos)` sorted by position.
+    let capture_slots: Vec<(usize, usize, usize)> =
+        captures.iter().map(|&p| (p, p / c, p % c)).collect();
+    let mut captured: Vec<(usize, Tensor)> = Vec::with_capacity(captures.len());
     let mut seg_start = 0;
     while seg_start < n_chunks {
         let m = GDN_SEGMENT_CHUNKS.min(n_chunks - seg_start);
@@ -549,32 +593,54 @@ fn chunked(
             per_chunk(&k_tail)?,
             per_chunk(&chunk_decay)?,
         );
+        let needs_in_chunk = capture_slots
+            .iter()
+            .any(|&(_, chunk, r)| chunk >= seg_start && chunk < seg_start + m && r > 0);
+        let cum_chunks = if needs_in_chunk {
+            Some(per_chunk(&cum)?)
+        } else {
+            None
+        };
+        let kc_chunks = if needs_in_chunk {
+            Some(per_chunk(&kc)?)
+        } else {
+            None
+        };
         for i in 0..m {
+            let abs_chunk = seg_start + i;
             let pick = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, i, 1)?.squeeze(1)?) };
-            let here = capture.filter(|&(chunk, _)| chunk == seg_start + i);
-            if let Some((_, 0)) = here {
-                captured = Some(state.clone());
+            for &(pos, chunk, r) in &capture_slots {
+                if chunk == abs_chunk && r == 0 {
+                    captured.push((pos, state.clone()));
+                }
             }
             let s_t = state.transpose(1, 2)?.contiguous()?; // S₀ᵀ              [N, Dk, Dv]
             let delta = pick(&u)?.sub(&pick(&w)?.contiguous()?.matmul(&s_t)?)?; // [N, C, Dv]
-            if let Some((_, r)) = here.filter(|&(_, r)| r > 0) {
-                // The hand-off cut at `r` tokens in: Γ_r S₀ + Δ[..r]ᵀ (K[..r] Γ_r/Γ).
-                let cum_i = pick(&per_chunk(&cum)?)?; //                        [N, C]
-                let at = cum_i.narrow(1, r - 1, 1)?; // ln Γ_r                     [N, 1]
-                let k_r = pick(&per_chunk(&kc)?)?.narrow(1, 0, r)?.broadcast_mul(
-                    &at.broadcast_sub(&cum_i.narrow(1, 0, r)?)?
-                        .exp()?
-                        .unsqueeze(2)?,
-                )?; //                                                         [N, r, Dk]
-                captured = Some(
-                    state.broadcast_mul(&at.exp()?.unsqueeze(2)?)?.add(
-                        &delta
-                            .narrow(1, 0, r)?
-                            .transpose(1, 2)?
-                            .contiguous()?
-                            .matmul(&k_r.contiguous()?)?,
-                    )?,
-                );
+            if capture_slots
+                .iter()
+                .any(|&(_, chunk, r)| chunk == abs_chunk && r > 0)
+            {
+                let cum_i = pick(cum_chunks.as_ref().expect("pre-shaped cum chunks"))?; // [N, C]
+                let kc_i = pick(kc_chunks.as_ref().expect("pre-shaped kc chunks"))?; // [N, C, Dk]
+                for &(pos, chunk, r) in &capture_slots {
+                    if chunk == abs_chunk && r > 0 {
+                        // The hand-off cut at `r` tokens in: Γ_r S₀ + Δ[..r]ᵀ (K[..r] Γ_r/Γ).
+                        let at = cum_i.narrow(1, r - 1, 1)?; // ln Γ_r             [N, 1]
+                        let k_r = kc_i.narrow(1, 0, r)?.broadcast_mul(
+                            &at.broadcast_sub(&cum_i.narrow(1, 0, r)?)?
+                                .exp()?
+                                .unsqueeze(2)?,
+                        )?; //                                                     [N, r, Dk]
+                        let cut_state = state.broadcast_mul(&at.exp()?.unsqueeze(2)?)?.add(
+                            &delta
+                                .narrow(1, 0, r)?
+                                .transpose(1, 2)?
+                                .contiguous()?
+                                .matmul(&k_r.contiguous()?)?,
+                        )?;
+                        captured.push((pos, cut_state));
+                    }
+                }
             }
             let y = pick(&q_gamma)?
                 .contiguous()?
@@ -600,7 +666,10 @@ fn chunked(
         .narrow(2, 0, t)?
         .transpose(1, 2)?
         .contiguous()?; // [B, T, Hv, Dv]
-    let captured = captured.map(|s| s.reshape((b, hv, dv, dk))).transpose()?;
+    let captured = captured
+        .into_iter()
+        .map(|(p, s)| Ok((p, s.reshape((b, hv, dv, dk))?)))
+        .collect::<Result<Vec<_>>>()?;
     Ok((y, state.reshape((b, hv, dv, dk))?, captured))
 }
 
@@ -994,12 +1063,12 @@ pub struct DeltaNetCache {
     /// [`preallocate`](Self::preallocate) or the first [`advance`](Self::advance)).
     spec: Option<RingSpec>,
     ring: Option<StateRing>,
-    /// The position the next [`advance_prefill`](Self::advance_prefill) captures its state at
-    /// ([`capture_at`](Self::capture_at)), if any.
-    capture: Option<i32>,
-    /// `(position, conv tail, SSM state)` the last prefill captured — compact copies, never views
-    /// of the ring ([`captured`](Self::captured)).
-    captured: Option<(i32, Tensor, Tensor)>,
+    /// Positions the next [`advance_prefill`](Self::advance_prefill) captures its state at
+    /// ([`capture_at`](Self::capture_at) / [`capture_at_many`](Self::capture_at_many)), if any.
+    captures: Vec<i32>,
+    /// `(position, conv tail, SSM state)` entries the last prefill captured — compact copies,
+    /// never views of the ring ([`captured`](Self::captured)).
+    captured: Vec<(i32, Tensor, Tensor)>,
     /// The per-row states of a tree verify forward not yet kept or dropped (feature SW-F328).
     tree: Option<TreeStates>,
 }
@@ -1085,8 +1154,8 @@ impl DeltaNetCache {
                 offset: self.offset,
                 spec: None,
                 ring: None,
-                capture: None,
-                captured: None,
+                captures: Vec::new(),
+                captured: Vec::new(),
                 tree: None,
             });
         };
@@ -1097,8 +1166,8 @@ impl DeltaNetCache {
             offset: self.offset,
             spec: Some(spec),
             ring: None,
-            capture: None,
-            captured: None,
+            captures: Vec::new(),
+            captured: Vec::new(),
             tree: None,
         };
         if self.ring.is_none() && self.conv_state.is_none() {
@@ -1442,22 +1511,27 @@ impl DeltaNetCache {
     /// the prefix cache's boundary snapshot taken inside one prefill forward (sc-24446). Read it
     /// back with [`captured`](Self::captured).
     pub fn capture_at(&mut self, position: i32) {
-        self.capture = Some(position);
+        self.captures = vec![position];
     }
 
-    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
-    /// failed before reaching this layer): a later prefill must never capture a stale boundary.
+    /// Ask the next [`advance_prefill`](Self::advance_prefill) to capture states at every boundary
+    /// in `positions` strictly inside that prefill (SW-F356).
+    pub fn capture_at_many(&mut self, positions: &[i32]) {
+        self.captures = positions.to_vec();
+    }
+
+    /// Drop pending captures the last forward did not consume (it failed before reaching this
+    /// layer): a later prefill must never capture a stale boundary.
     pub fn clear_capture(&mut self) {
-        self.capture = None;
+        self.captures.clear();
     }
 
-    /// The `(conv tail, SSM state)` the last prefill captured at `position`
-    /// ([`capture_at`](Self::capture_at)), or `None` when it captured none there. Compact copies,
-    /// never views of the ring.
+    /// The `(conv tail, SSM state)` the last prefill captured at `position`, or `None` when it
+    /// captured none there. Compact copies, never views of the ring.
     pub fn captured(&self, position: i32) -> Option<(&Tensor, &Tensor)> {
         self.captured
-            .as_ref()
-            .filter(|(p, _, _)| *p == position)
+            .iter()
+            .find(|(p, _, _)| *p == position)
             .map(|(_, conv, ssm)| (conv, ssm))
     }
 
@@ -1503,31 +1577,33 @@ impl DeltaNetCache {
         }
         let offset = self.offset;
         let next = offset + t as i32;
-        self.captured = None;
-        let split = self
-            .capture
-            .take()
+        self.captured.clear();
+        let pending = std::mem::take(&mut self.captures);
+        let mut cuts: Vec<usize> = pending
+            .into_iter()
             .filter(|&p| p > offset && p < next)
-            .map(|p| (p - offset) as usize);
+            .map(|p| (p - offset) as usize)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
         let state = self.ssm_state.as_ref();
-        let (y, last, captured) = match split {
-            None => {
-                let (y, last) = gated_delta_recurrence(q, k, v, g, beta, state)?;
-                (y, last, None)
-            }
-            Some(b) => {
-                // The recurrence of the uncaptured prefill, with the state at `b` read off on the
-                // way — never split there (see `gated_delta_recurrence_capturing`).
-                let (y, last, at) = gated_delta_recurrence_capturing(q, k, v, g, beta, state, b)?;
-                // The conv tail is a view of this forward's trace: copied compact. The state is
-                // the recurrence's own tensor, never a view of the ring.
-                let captured = (
+        let (y, last, captured_list) = if cuts.is_empty() {
+            let (y, last) = gated_delta_recurrence(q, k, v, g, beta, state)?;
+            (y, last, Vec::new())
+        } else {
+            // The recurrence of the uncaptured prefill, with the states at `cuts` read off on the
+            // way — never split there (see `gated_delta_recurrence_capturing_many`).
+            let (y, last, ats) =
+                gated_delta_recurrence_capturing_many(q, k, v, g, beta, state, &cuts)?;
+            let mut list = Vec::with_capacity(ats.len());
+            for (b, at) in ats {
+                list.push((
                     offset + b as i32,
                     conv.tail_after(b - 1)?.force_contiguous()?,
                     at,
-                );
-                (y, last, Some(captured))
+                ));
             }
+            (y, last, list)
         };
         let conv_tail = conv.tail_after(t - 1)?;
         match self.ring.as_mut() {
@@ -1557,7 +1633,7 @@ impl DeltaNetCache {
                 self.ssm_state = Some(last);
             }
         }
-        self.captured = captured;
+        self.captured = captured_list;
         self.offset = next;
         Ok(y)
     }
@@ -1791,8 +1867,8 @@ impl DeltaNetCache {
         self.conv_state = None;
         self.ssm_state = None;
         self.offset = 0;
-        self.capture = None;
-        self.captured = None;
+        self.captures.clear();
+        self.captured.clear();
         self.tree = None;
         if let Some(ring) = self.ring.as_mut() {
             ring.lo = 1;
@@ -1825,7 +1901,7 @@ impl DeltaNetCache {
             offset: self.offset,
             spec: self.spec.clone(),
             ring,
-            capture: None,
+            captures: Vec::new(),
             captured: self.captured.clone(),
             tree: None,
         })
@@ -3668,6 +3744,61 @@ mod tests {
                 diff <= 1e-4 * scale,
                 "at {at}: the captured state differs by {diff}"
             );
+        }
+    }
+
+    #[test]
+    fn delta_cache_captures_multiple_boundaries_in_chunked_and_per_token_prefills() {
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}");
+            let scale = want.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+            let diff = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff <= 1e-4 * scale, "{what}: differs by {diff}");
+        };
+        // Both per-token (< 64 tokens) and chunked (>= 64 tokens, spanning multiple chunks AND
+        // multiple cuts inside the same chunk + exact chunk boundary 64 and 128).
+        for (a, cuts, t) in [
+            (0usize, vec![3usize, 7, 10], 14usize),
+            (0usize, vec![12usize, 64, 70, 128, 195], 210usize),
+            (25usize, vec![64usize, 70, 140], 160usize),
+        ] {
+            let fixture = ring_inputs(t, 11);
+            let seed_prefix = |cache: &mut DeltaNetCache| {
+                if a > 0 {
+                    feed_prefill(cache, &fixture, 0, a);
+                }
+            };
+            let mut one = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            seed_prefix(&mut one);
+            let mut req_cuts: Vec<i32> = cuts.iter().map(|&c| c as i32).collect();
+            req_cuts.push(0); // out of range -> filtered
+            req_cuts.push(t as i32); // end -> filtered
+            req_cuts.push(cuts[1] as i32); // duplicate -> deduped
+            req_cuts.reverse();
+            one.capture_at_many(&req_cuts);
+            let y_one = feed_prefill(&mut one, &fixture, a, t - a);
+
+            let mut plain = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+            seed_prefix(&mut plain);
+            let y_plain = feed_prefill(&mut plain, &fixture, a, t - a);
+            assert_eq!(host(&y_one), host(&y_plain), "a={a} t={t}: outputs");
+            assert_eq!(live(&one), live(&plain), "a={a} t={t}: final state");
+            assert!(one.captured(0).is_none());
+            assert!(one.captured(t as i32).is_none());
+
+            for &b in &cuts {
+                let mut split = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+                seed_prefix(&mut split);
+                feed_prefill(&mut split, &fixture, a, b - a);
+                let (conv_b, ssm_b) = live(&split).unwrap();
+                let (conv, ssm) = one.captured(b as i32).expect("captured boundary");
+                assert_eq!(host(conv), conv_b, "b={b}: conv tail");
+                close(&host(ssm), &ssm_b, &format!("a={a} b={b} t={t}: ssm"));
+            }
         }
     }
 }

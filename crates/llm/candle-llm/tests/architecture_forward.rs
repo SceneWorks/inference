@@ -906,7 +906,12 @@ fn every_architecture_steps_identically_on_device_positions() {
             } else {
                 StepRequest::last(tokens)
             };
-            let h = host(&host_model.forward_step(&mut hc, req).unwrap().logits);
+            let h = host(
+                &host_model
+                    .forward_step(&mut hc, req.clone())
+                    .unwrap()
+                    .logits,
+            );
             let d = host(&dev_model.forward_step(&mut dc, req).unwrap().logits);
             let scale = h.iter().fold(1f32, |m, x| m.max(x.abs()));
             for (i, (x, y)) in d.iter().zip(&h).enumerate() {

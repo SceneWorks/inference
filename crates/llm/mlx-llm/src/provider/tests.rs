@@ -1066,6 +1066,7 @@ fn qwen35_provider(model: Qwen35Model) -> LlamaProvider {
         prefix: RefCell::new(PrefixCache::with_budget(
             core_llm::defaults::MLX.prefix_cache_bytes,
         )),
+        prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
         block_draft: None,
@@ -1101,6 +1102,7 @@ fn qwen35_moe_provider() -> LlamaProvider {
         prefix: RefCell::new(PrefixCache::with_budget(
             core_llm::defaults::MLX.prefix_cache_bytes,
         )),
+        prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
         block_draft: None,
@@ -7472,4 +7474,244 @@ fn auto_block_draft_decision_is_keyed_on_the_resident_draft_and_target() {
     let without = qwen35_mtp_provider();
     assert_eq!(without.auto_block_draft_key(), None);
     assert!(!without.auto_prefers_block_draft());
+}
+
+#[test]
+fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
+    let desc = provider_descriptor();
+    assert_eq!(
+        desc.capabilities.prefix_checkpoints,
+        Some(core_llm::PrefixCheckpointCapabilities {
+            max_checkpoints_per_request: core_llm::MAX_CHECKPOINTS_PER_REQUEST as u32,
+            supports_document_span: true,
+            supports_hybrid_boundaries: true,
+        })
+    );
+
+    let mut provider = causal_provider();
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::defaults::MLX.prefix_checkpoints
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Off);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Off
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Auto);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Auto
+    );
+
+    let req = TextLlmRequest {
+        messages: vec![
+            Message::system("t1 t2 t3"),
+            Message::user("t4 t5 t6 t7"),
+            Message::assistant("t8 t9"),
+            Message::user("t10 t11"),
+        ],
+        ..Default::default()
+    };
+    let rendered = provider
+        .template
+        .render_with(
+            &req.messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+                date_string: None,
+            },
+        )
+        .unwrap();
+    let prompt_ids: Vec<i32> = provider
+        .tokenizer
+        .encode(&rendered, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
+
+    // `Messages { count: 2 }` aligns cleanly and populates shared_root, prev_message, conversation_end.
+    let policy_msg =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Messages {
+            count: 2,
+        });
+    let (cands, unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_msg);
+    assert!(!unaligned);
+    let root = cands.shared_root.expect("shared_root");
+    let doc = cands.document.expect("document");
+    let prev = cands.prev_message.expect("prev_message");
+    let conv = cands.conversation_end.expect("conversation_end");
+    assert!(root > 0 && root < doc && doc < prev && prev < conv && conv < prompt_ids.len());
+
+    // `MessageChars` splits at token boundary and backs off safely on mid-token splits via dual sentinels.
+    let doc_text = "t4 t5 t6 t7";
+    let exact_chars = "t4 t5 ".len();
+    let policy_exact = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: exact_chars,
+        },
+    );
+    let (exact_cands, exact_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_exact);
+    assert!(!exact_unaligned);
+    let exact_doc = exact_cands.document.expect("message_chars exact doc");
+
+    let mid_chars = "t4 t".len();
+    let policy_mid = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: mid_chars,
+        },
+    );
+    let (mid_cands, mid_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_mid);
+    assert!(!mid_unaligned);
+    let mid_doc = mid_cands.document.expect("message_chars mid-token doc");
+    assert!(
+        mid_doc > root && mid_doc < exact_doc && exact_doc < prev,
+        "mid-token split ({mid_doc}) must back off strictly before exact boundary ({exact_doc})"
+    );
+
+    // Out-of-range char offset flags unaligned instead of guessing or crashing.
+    let policy_oob = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: doc_text.chars().count() + 10,
+        },
+    );
+    let (oob_cands, oob_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_oob);
+    assert!(oob_cands.document.is_none());
+    assert!(oob_unaligned);
+
+    // `Tokens` accepts valid `< prompt_ids.len()` and rejects `>= prompt_ids.len()`.
+    let policy_tok =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: root,
+        });
+    let (tok_cands, tok_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok);
+    assert!(!tok_unaligned);
+    assert_eq!(tok_cands.document, Some(root));
+
+    let policy_tok_bad =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: prompt_ids.len(),
+        });
+    let (tok_bad_cands, tok_bad_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok_bad);
+    assert!(tok_bad_cands.document.is_none());
+    assert!(tok_bad_unaligned);
+}
+
+#[test]
+fn prefix_checkpoint_clear_prefix_cache_and_widest_kv_boundary_pricing() {
+    use core_llm::{PlannedBoundary, PrefixKind, TextLlm};
+
+    let mut provider = causal_provider();
+    provider = provider.with_prefix_budget(1 << 20);
+    // Seed a raw ContiguousKvCache entry directly into provider.prefix (no learned forward).
+    let mut kv = crate::primitives::kv_cache::ContiguousKvCache::new(1);
+    let ones = mlx_rs::Array::ones::<f32>(&[1, 1, 8, 2]).unwrap();
+    kv.update(0, &ones, &ones).unwrap();
+    provider
+        .prefix
+        .borrow_mut()
+        .store(&[1, 2, 3, 4, 5, 6, 7, 8], &[], kv, None, None);
+    assert!(provider.prefix_cache_resident_bytes() > 0);
+    TextLlm::clear_prefix_cache(&provider);
+    assert_eq!(provider.prefix_cache_resident_bytes(), 0);
+
+    // Gemma 4 config where full_attention (`k_eq_v`: 1 x 512) has fewer heads than sliding
+    // (`8 x 256` = 2048 > 512), plus trailing KV-shared layers: widest_layer picks 8 x 256,
+    // without crossing sliding's 8 heads with full's 512 head_dim.
+    let gemma4_json = serde_json::json!({
+        "model_type": "gemma4_text",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "num_global_key_value_heads": 1,
+        "attention_k_eq_v": true,
+        "num_kv_shared_layers": 2,
+        "sliding_window": 512,
+        "vocab_size": 256,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+        ]
+    });
+    let gemma4_cfg = crate::config::ModelConfig::from_json(&gemma4_json).unwrap();
+    assert_eq!(super::causal_widest_kv_layer(&gemma4_cfg), (8, 256));
+
+    // Config where full_attention is genuinely wider than sliding (`2 x 512` = 1024 > `2 x 256`;
+    // scalar config still exposes 256 while widest_layer sees 512).
+    let wide_full_json = serde_json::json!({
+        "model_type": "gemma4_text",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "attention_k_eq_v": false,
+        "num_kv_shared_layers": 0,
+        "sliding_window": 512,
+        "vocab_size": 256,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+        ]
+    });
+    let wide_full_cfg = crate::config::ModelConfig::from_json(&wide_full_json).unwrap();
+    assert_eq!(wide_full_cfg.head_dim, 256);
+    assert_eq!(super::causal_widest_kv_layer(&wide_full_cfg), (2, 512));
+
+    // DeepSeek-V2 MLA config uses `(num_heads, max(q_head_dim, v_head_dim))`.
+    let mla_json = serde_json::json!({
+        "model_type": "deepseek_v2",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "kv_lora_rank": 128,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 256
+    });
+    let mla_cfg = crate::config::ModelConfig::from_json(&mla_json).unwrap();
+    assert_eq!(super::causal_widest_kv_layer(&mla_cfg), (8, 192));
+
+    // Boundary pricing charges 0 for unprotected Causal Conversation and aligned non-zero bytes
+    // for protected Document/SharedRoot slices.
+    let unprot = PlannedBoundary {
+        position: 32,
+        kind: PrefixKind::Conversation,
+        protected: false,
+    };
+    let prot = PlannedBoundary {
+        position: 32,
+        kind: PrefixKind::Document,
+        protected: true,
+    };
+    assert_eq!(provider.boundary_snapshot_bytes(unprot, false), Some(0));
+    assert!(provider.boundary_snapshot_bytes(prot, false).unwrap() > 0);
 }

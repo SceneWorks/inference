@@ -340,6 +340,8 @@ fn the_baseline_driver_writes_the_harness_schema() {
             warmup: true,
             repeats: 3,
             thinking: BenchThinking::Off,
+            prompt_set: core_llm_testkit::BenchPromptSet::Default,
+            prefix_checkpoints: None,
         },
         load: Some(LoadReport::default()),
         capabilities: caps.clone(),

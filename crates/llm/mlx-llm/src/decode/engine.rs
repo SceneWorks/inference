@@ -2586,6 +2586,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         speculative_monitor: stats.monitor,
         prefix_hit_tokens: 0,
         prefix_cache: none(),
+        prefix_checkpoints: None,
         fallbacks: Vec::new(),
         tree_verify: stats.tree,
         draft_time: stats.draft_time,

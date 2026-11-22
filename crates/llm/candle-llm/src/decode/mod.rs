@@ -46,8 +46,9 @@ pub use graph::{
     GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV, PARAM_CACHE_ADMISSION_BYTES,
 };
 pub use prefix::{
-    generate_cached, prefill_restored, Boundary, PrefixCache, PrefixEntry, PrefixPrefill,
-    PrefixSnapshot, PrefixStats, Restored,
+    generate_cached, prefill_restored, prefill_restored_with_plan, Boundary, PrefixCache,
+    PrefixEntry, PrefixPrefill, PrefixRestoreOutcome, PrefixSnapshot, PrefixStats,
+    PrefixStoreOutcome, Restored,
 };
 pub use proposers::{DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer};
 pub use record::{
