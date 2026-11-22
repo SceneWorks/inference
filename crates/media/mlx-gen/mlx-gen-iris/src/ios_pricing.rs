@@ -1,9 +1,9 @@
 //! Header-only iOS counted pricing of the three Iris routes (epic 16774): `iris_3b` (generation,
 //! including prompt batches), `iris_3b_restore` and `iris_3b_depth`.
 //!
-//! [`ios_pricing`] prices one request per phase â€” the component bytes resident under the request's
+//! [`ios_pricing`] prices one request per phase — the component bytes resident under the request's
 //! regime (eager or streamed load, staged or warm, the rung-4 window and scope, the rung-3 pixel-row
-//! bound) plus the LARGEST counted quantum the phase checks â€” through the very formulas the runtime
+//! bound) plus the LARGEST counted quantum the phase checks — through the very formulas the runtime
 //! guards check ([`crate::dit`], [`crate::text_encoder`], [`crate::stream`], [`crate::solver`],
 //! [`crate::model`], [`crate::depth`], [`crate::restoration`]), each fed the widths the loaded
 //! module would have, read here from the safetensors headers and the configs. Adapter inventory
@@ -15,8 +15,8 @@
 //! The compatibility phase summary is a conservative envelope: maximum retained ownership plus
 //! the largest guard scratch (and that scratch's binding), which need not come from one window.
 //! Certificates use the exact windows, never a subtraction of independent summary maxima. `stream_tests::the_pricing_states_the_largest_check_of_
-//! every_phase` checks the guard formulas real runs observe â€” every quantum
-//! label priced at its largest observed check, no label priced that the run never checks â€”
+//! every_phase` checks the guard formulas real runs observe — every quantum
+//! label priced at its largest observed check, no label priced that the run never checks —
 //! for generation (eager rung 0 / rung 3, deferred rung 4 under each scope, text and prompt batch,
 //! dense, quantized at load and packed), restoration and depth (eager, deferred, packed).
 //!
@@ -921,9 +921,9 @@ pub fn pricing_facts_with_depth_token(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Pricing {
     /// Price a dense artifact asked for at `q8`/`q4` as the packed export of that tier
-    /// (`crate::packed`) â€” what an iOS load reads â€” instead of the dense file.
+    /// (`crate::packed`) — what an iOS load reads — instead of the dense file.
     pub assume_packed: bool,
-    /// Rung 3 runs the PiT stage per batch row. `false` prices the batched stage under rung 3 â€”
+    /// Rung 3 runs the PiT stage per batch row. `false` prices the batched stage under rung 3 —
     /// the route before that lever existed (the prediction's "before" column).
     pub pixel_rows: bool,
 }
@@ -1554,9 +1554,9 @@ impl Backbone {
         // locals): the timestep embedding and both modulation cores, and the trunk's image and text
         // RoPE tables (cos and sin, `[positions, head_dim / 2]` f32). The trunk adds its image and
         // text streams. The PiT stage adds the trunk's text stream (kept to the end), the pixel
-        // RoPE tables, the per-patch conditioning and the pixel stream â€” run per row, the first
-        // block's batched input stays allocated until its last row is replaced, beside the `b âˆ’ 1`
-        // rows already produced â€” and the finished rows.
+        // RoPE tables, the per-patch conditioning and the pixel stream — run per row, the first
+        // block's batched input stays allocated until its last row is replaced, beside the `b − 1`
+        // rows already produced — and the finished rows.
         let rope = |positions: u64, head_dim: u64| 2 * allocated(4 * positions * (head_dim / 2));
         let head_dim = hidden / heads.max(1);
         let t_out = self.rows("t_embedder.mlp.2")?;

@@ -1,26 +1,26 @@
-//! Rung 4 â€” **bounded transformer residency** for the Iris routes (epic 16774): the window
+//! Rung 4 — **bounded transformer residency** for the Iris routes (epic 16774): the window
 //! materialization both streamed components share, and the header-only price of one window read.
 //!
 //! A streamed component holds only its skeleton (embeddings, modulation cores, norms, heads)
-//! resident; each block stack â€” the backbone's trunk, PiT, text-adapter layerwise and refiner
-//! blocks, the Qwen3-VL tower's decoder layers â€” is read from the checkpoint ONE WINDOW at a time,
+//! resident; each block stack — the backbone's trunk, PiT, text-adapter layerwise and refiner
+//! blocks, the Qwen3-VL tower's decoder layers — is read from the checkpoint ONE WINDOW at a time,
 //! inside the window's own priced read quantum, run, and released before the next window is read.
 //! The schedule is the shared [`mlx_gen::block_residency::run_windowed`] driver (evaluate the carry
 //! before the window drops; drain the allocator after it).
 //!
 //! **The read is the eager loader's, per window.** Every tensor of the window is taken OUT of a
 //! freshly opened lazy view, its file bytes read on MLX's CPU stream first (a GPU cast over an unread
-//! load makes the command buffer wait on the disk â€” sc-24245), cast exactly as the eager loader casts
+//! load makes the command buffer wait on the disk — sc-24245), cast exactly as the eager loader casts
 //! it (`CastPolicy`), and evaluated before the next tensor is read, so a window's read peak is the
-//! window as held plus ONE source tensor beside its cast â€” never the whole window at both widths.
+//! window as held plus ONE source tensor beside its cast — never the whole window at both widths.
 //! The block is then built from those materialized tensors by the SAME constructors the resident
 //! load uses, so a streamed block is the resident block, value for value.
 //!
 //! **Only stored tiers stream.** A streamed load reads a tier exactly as the artifact stores it: the
 //! dense release at the dense tier, or a packed export (`crate::packed`) at its own tier. A dense
-//! artifact asked for at `q8`/`q4` would re-quantize every window on every forward â€” a load-time
+//! artifact asked for at `q8`/`q4` would re-quantize every window on every forward — a load-time
 //! requantization no capture measured, which publishes no calibration identity on any route
-//! ([`crate::memory_strategy`]) â€” so the streamed loaders refuse it by name
+//! ([`crate::memory_strategy`]) — so the streamed loaders refuse it by name
 //! (`refuse_stream_requantization`).
 //!
 //! `window_read_bytes` prices a window from the checkpoint's HEADERS with the rule
@@ -46,12 +46,12 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 /// The window rung 4 runs at when a selection names none.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
-/// How a materialization casts one tensor â€” the loader whose cast it replays.
+/// How a materialization casts one tensor — the loader whose cast it replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CastPolicy {
     /// The backbone loaders ([`crate::model::load_backbone_quantized`],
     /// [`crate::depth::load_depth_export`]) at ordinary floating storage: floating matrices
-    /// (rank â‰¥ 2) but the text position table and packed parts to compute; vectors as stored.
+    /// (rank ≥ 2) but the text position table and packed parts to compute; vectors as stored.
     /// The existing window policy leaves numeric/F64 matrices stored, unlike root eager reads;
     /// constructor accounting must therefore use this policy's actual post-read dtype.
     Backbone { compute: Dtype },
@@ -80,7 +80,7 @@ fn is_position_table(name: &str) -> bool {
 }
 
 /// Whether a stored tensor is part of a packed projection (its u32 codes, stored scales or biases)
-/// â€” the rule of [`crate::model::is_packed_part`], from a header.
+/// — the rule of [`crate::model::is_packed_part`], from a header.
 pub(crate) fn is_packed_part_header(header: &SafetensorsTensorHeader) -> bool {
     header.dtype == Stored::U32
         || header.name.ends_with(".scales")
@@ -137,7 +137,7 @@ pub(crate) fn tensor_read(header: &SafetensorsTensorHeader, policy: CastPolicy) 
     }
 }
 
-/// A same-width cast that still changes the dtype (f16 â†’ bf16) is a new buffer too.
+/// A same-width cast that still changes the dtype (f16 → bf16) is a new buffer too.
 fn mismatched(stored: Stored, target: Dtype) -> bool {
     matches!(
         (stored, target),
@@ -921,7 +921,7 @@ fn checked_group_alignment(input: usize) -> Result<()> {
 }
 
 /// Every stored-grid allocation is emitted by the same NN operator graph consumed by the
-/// native cumulative ledger. Padding and computeâ†’BF16 conversions precede that graph.
+/// native cumulative ledger. Padding and compute→BF16 conversions precede that graph.
 pub(crate) fn backbone_quantization_bytes(
     headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
     compute: Dtype,
@@ -1301,7 +1301,7 @@ pub(crate) fn refuse_stream_requantization(
         return Err(Error::Unsupported(format!(
             "{id}: a deferred-materialization (streamed) load reads {what} as stored, and it is \
              the dense artifact while LoadSpec::quantize asks for {requested:?}; streaming would \
-             re-quantize every window on every forward â€” use the packed {requested:?} export \
+             re-quantize every window on every forward — use the packed {requested:?} export \
              (`crate::packed`), or an eager load"
         )));
     }
