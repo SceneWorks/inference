@@ -109,7 +109,7 @@ pub struct SpanCounters {
 }
 
 /// Measured counters for one generation request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeRecord {
     /// Which path ran.
     pub path: DecodePath,
@@ -183,6 +183,8 @@ pub struct DecodeRecord {
     pub prefix_cache: &'static str,
     /// Why the cache was bypassed, or why this request's state was not kept.
     pub prefix_cache_reason: Option<&'static str>,
+    /// Multi-boundary prefix checkpoint report (`core_llm::DecodeReport::prefix_checkpoints`).
+    pub prefix_checkpoints: Option<core_llm::PrefixCheckpointReport>,
     /// Tokens generated when `auto`'s acceptance monitor demoted the speculative engine to
     /// token-at-a-time steps (sc-24446) — see
     /// [`core_llm::DecodeReport::speculative_demoted_at`]; `None` when nothing was demoted.
@@ -230,6 +232,7 @@ impl DecodeRecord {
             prefix_hit_tokens: 0,
             prefix_cache: "none",
             prefix_cache_reason: None,
+            prefix_checkpoints: None,
             speculative_demoted_at: None,
             speculative_monitor: None,
             tree_verify: None,
@@ -349,6 +352,7 @@ impl DecodeRecord {
             prefix_hit_tokens: 0,
             prefix_cache: "none",
             prefix_cache_reason: None,
+            prefix_checkpoints: None,
             speculative_demoted_at: stats.demoted_at.map(|n| n as u64),
             speculative_monitor: stats.monitor,
             tree_verify: stats.tree,
@@ -446,6 +450,7 @@ impl DecodeRecord {
                 path: self.prefix_cache.to_string(),
                 reason: self.prefix_cache_reason.map(str::to_string),
             },
+            prefix_checkpoints: self.prefix_checkpoints.clone(),
             fallbacks: self
                 .tree_fallback
                 .map(tree_fallback_reason)
@@ -713,6 +718,7 @@ mod tests {
         assert_eq!(plain.proposer.label(), "none");
         assert_eq!(plain.host_syncs_per_verify_step(), None);
         let stamped = plain
+            .clone()
             .with_kv_cache(KvCacheKind::Static)
             .with_attn_formulation(AttnFormulation::Expanded)
             .with_proposer(ProposerKind::PromptLookup);
@@ -769,7 +775,7 @@ mod tests {
         // (`(verify_steps + replay_forwards) / verify_steps`) would still say 1.25.
         let uncounted = DecodeRecord {
             target_forwards: 9,
-            ..spec
+            ..spec.clone()
         };
         assert_eq!(uncounted.target_forwards_per_verify_step(), Some(2.0));
         assert_eq!(spec.path.label(), "mtp");

@@ -94,8 +94,10 @@ def sample_limits(profile, policy):
     return limits
 
 
-def collect_sample(name, root, limits, out, work):
+def collect_sample(name, root, limits, out, work, *, skip=()):
     for filename, cap in limits.items():
+        if filename in skip:
+            continue
         source = root / filename
         if source.exists() or proof.linked(source):
             target = f"{name}.{filename}"
@@ -160,6 +162,17 @@ def require_sm120(uuid):
     return "sm_120"
 
 
+def terminal_hub_root(backend, profile, env):
+    if backend == "candle-cuda":
+        model_root = (env.get(getattr(profile, "HUB_ENV", "MODEL_PROOF_HUB_ROOT"))
+                      or env.get("MODEL_PROOF_HUB_ROOT", ""))
+        return hub_root(dict(env, MODEL_PROOF_HUB_ROOT=model_root))
+    # The MLX terminal presets use only the fleet's configured runner cache.
+    root = runner_hub_cache(env)
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve(strict=True)
+
+
 def execute(args, contract, profile):
     env = os.environ.copy()
     cuda = args.backend == "candle-cuda"
@@ -186,12 +199,7 @@ def execute(args, contract, profile):
         receipt["hardware"] = paired.hardware(args.backend, policy)
         if cuda:
             receipt["hardware"]["capability"] = require_sm120(binding)
-        if cuda:
-            model_root = (env.get(getattr(profile, "HUB_ENV", "MODEL_PROOF_HUB_ROOT"))
-                          or env.get("MODEL_PROOF_HUB_ROOT", ""))
-        else:
-            model_root = str(runner_hub_cache(env))
-        model_hub = hub_root(dict(env, MODEL_PROOF_HUB_ROOT=model_root))
+        model_hub = terminal_hub_root(args.backend, profile, env)
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
         child_env = {key: value for key, value in env.items() if not proof.SENSITIVE_ENVIRONMENT.search(key)}
         child_env.update(CARGO_INCREMENTAL="0", PAIR_TIER2_VARIANT=variant, PAIR_TIER2_SNAPSHOT=str(snapshot))
@@ -230,6 +238,8 @@ def execute(args, contract, profile):
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
         observations = {}
         limits = sample_limits(profile, contract["policy"])
+        profile_artifacts = getattr(profile, "ARTIFACT_LIMITS", {})
+        prepare_artifacts = getattr(profile, "prepare_artifacts", None)
         with execution_claim(args.backend, claim_policy, claim_dir, env,
                              original_deadline_monotonic=claim_deadline) as claim:
             receipt["physical_claim"] = claim
@@ -238,12 +248,15 @@ def execute(args, contract, profile):
                 run = work / name
                 try:
                     paired.invoke(binary, work / arm, run, arm_env, policy, env, last_child_start=last_child_start)
+                    if prepare_artifacts is not None:
+                        prepare_artifacts(run, work, variant)
                     for leaf, cap in limits.items():
                         if leaf != "guard.jsonl":
                             source_pair.bounded_owned_file(run / leaf, work, cap)
                     observations[name] = read_sample(name, run, profile, contract)
                 finally:
-                    receipt["files"].update(collect_sample(name, run, limits, artifact, work))
+                    unverified = () if name in observations else profile_artifacts
+                    receipt["files"].update(collect_sample(name, run, limits, artifact, work, skip=unverified))
         if (claim.get("post_execution_verified") is not True
                 or profile.staged_assets(variant, model_hub, stage=False) != (snapshot, receipt["assets"])):
             raise ValueError("terminal physical release or staged model asset identity changed")

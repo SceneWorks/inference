@@ -18,6 +18,8 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import model_inference_proofs as proof
+from scripts.ci import stage_pinned_hub_snapshots as hub_snapshots
+from scripts.ci.flux1_conditional_asset_inventory import confined, fetch_pinned
 from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
@@ -102,7 +104,10 @@ def plan(backend, value, head, tier):
     if eng4b and backend != "candle-cuda":
         raise ValueError("ENG-4b FLUX.1 comparison requires the Candle CUDA lane")
     selection = "flux1-eng4b-pair" if eng4b else "flux1-base-pair"
-    if (type(value) is not dict or set(value) != {"selection", "policy", *({"runner"} if backend == "mlx" else set())}
+    fields = {"selection", "policy", *({"runner"} if backend == "mlx" else set())}
+    if measured and type(value) is dict and type(value.get("download_missing")) is bool:
+        fields.add("download_missing")
+    if (type(value) is not dict or set(value) != fields
             or value["selection"] != selection or (backend == "mlx" and value.get("runner") != "nax")):
         raise ValueError(f"comparison requires exact {selection} selection and secondary MLX runner where applicable")
     if value["policy"]["backend"] != proof.POLICY_BACKENDS[backend]:
@@ -180,19 +185,67 @@ def build(work, sources, arm, backend, tier, env):
                     "macos_deployment_target": env.get("MACOSX_DEPLOYMENT_TARGET") if backend == "mlx" else None}
 
 
-def snapshots(work, tier):
+def stage_terminal_snapshots(hub, provenance):
+    hub = hub.resolve(strict=True)
+    pins = {variant: {"repository": provenance[variant]["repo"],
+                      "revision": provenance[variant]["snapshot"], "subfolder": "q4"}
+            for variant in variants(ENG4B_REAL)}
+    expected = {(pin["repository"], pin["revision"]): provenance[variant]["q4_files"]
+                for variant, pin in pins.items()}
+    by_destination = {}
+    for (repository, revision), files in expected.items():
+        root = hub_snapshots.snapshot_dir(hub, repository, revision)
+        for relative, identity in files.items():
+            name = "q4/" + relative
+            destination = root / name
+            confined(destination.resolve(), hub, destination)
+            lock = hub_snapshots.staging_lock_path(hub, repository, revision, name)
+            proof.unlinked_path(lock, hub)
+            if lock.exists() and (not lock.is_file() or lock.stat().st_nlink != 1):
+                raise ValueError("FLUX.1 staging lock must be a regular unshared file")
+            by_destination[destination] = identity
+
+    def terminal_manifest(repository, revision):
+        tree, raw, upstream = hub_snapshots.pinned_manifest(repository, revision)
+        selected = {}
+        for relative, identity in expected[repository, revision].items():
+            name = "q4/" + relative
+            asset = upstream.get(name, {})
+            lfs = asset.get("lfs")
+            if (asset.get("size") != identity["bytes"]
+                    or ((lfs is not None or name.endswith(".safetensors")) and (
+                        not isinstance(lfs, dict) or lfs.get("sha256") != identity["sha256"]
+                        or lfs.get("size") != identity["bytes"]))):
+                raise ValueError(f"FLUX.1 Hub inventory differs from the exact fixture for {name}")
+            selected[name] = asset
+        return tree, raw, selected
+
+    def fetch(url, destination):
+        identity = by_destination[destination]
+        confined(destination.parent.resolve(), hub, destination)
+        return fetch_pinned(url, destination, expected_sha256=identity["sha256"],
+                            expected_bytes=identity["bytes"])
+
+    hub_snapshots.stage(pins, hub, manifest=terminal_manifest, fetch=fetch)
+
+
+def snapshots(work, tier, *, download_missing=False):
     paths, identities = {}, {}
     provenance = json.loads((fixture.HERE / "headers.json").read_text(encoding="utf-8"))
+    if tier not in ("tier1", ENG4B):
+        hub = Path(os.environ["FLUX1_HUB"])
+        if not hub.is_absolute():
+            raise ValueError("real proof requires the configured local model hub")
+        if tier == ENG4B_REAL and download_missing:
+            hub.mkdir(parents=True, exist_ok=True)
+            stage_terminal_snapshots(hub, provenance)
     for variant in variants(tier):
         if tier in ("tier1", ENG4B):
             root = work / ("random-" + variant)
             fixture.make_snapshot(root, variant, q4=tier == ENG4B)
         else:
             src = provenance[variant]
-            hub = Path(os.environ["FLUX1_HUB"])
-            if not hub.is_absolute():
-                raise ValueError("real proof requires the configured local model hub")
-            root = hub / ("models--" + src["repo"].replace("/", "--")) / "snapshots" / src["snapshot"] / "q4"
+            root = hub_snapshots.snapshot_dir(hub, src["repo"], src["snapshot"]) / "q4"
         paths[variant] = root
         identities[variant] = fixture.snapshot_identity(root, variant, tier)
     return paths, identities
@@ -373,7 +426,8 @@ def execute(args, contract):
             raise ValueError("baseline is not the profile's exact reviewed engine")
         if tier in fixture.ENG4B_TIERS and git(sources["base"], "rev-parse", "HEAD^{tree}") != contract["base_tree"]:
             raise ValueError("ENG-4b baseline tree differs from the reviewed merge")
-        paths, receipt["fixtures"] = snapshots(work, tier)
+        paths, receipt["fixtures"] = snapshots(
+            work, tier, download_missing=contract["request"].get("download_missing", False))
         policy_path = work / "policy.json"
         write(policy_path, contract["request"]["policy"])
         policy = load_policy(policy_path)

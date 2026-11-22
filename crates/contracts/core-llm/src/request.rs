@@ -184,6 +184,89 @@ pub enum SpeculativeVerify {
     },
 }
 
+/// Exact multi-boundary prefix-checkpoint mode (feature SW-F356).
+///
+/// Wire form: `"off"` or `"auto"`.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixCheckpointMode {
+    /// Legacy single conversation-boundary behavior.
+    #[default]
+    Off,
+    /// Capture reusable exact checkpoints at message, near-tail, shared-root, and any designated
+    /// document-text boundaries within the per-model byte cap.
+    Auto,
+}
+
+/// Explicitly designated reusable document/context prefix span whose checkpoint the cache protects
+/// across intervening turns (feature SW-F356).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixDocumentSpan {
+    /// Leading `count` messages of `messages`.
+    Messages { count: usize },
+    /// Leading `chars` UTF-8 scalar values of `messages[message]` (including preceding messages).
+    MessageChars { message: usize, chars: usize },
+    /// Leading `count` rendered prompt tokens.
+    Tokens { count: usize },
+}
+
+/// Request-level exact prefix-checkpoint policy (feature SW-F356).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrefixCheckpointPolicy {
+    /// Checkpoint mode (`"off"` or `"auto"`).
+    #[serde(default)]
+    pub mode: PrefixCheckpointMode,
+    /// Optional designated reusable document span to protect in the prefix store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<PrefixDocumentSpan>,
+}
+
+impl PrefixCheckpointPolicy {
+    /// Disable multi-boundary prefix checkpoints (legacy single-boundary behavior).
+    pub const fn off() -> Self {
+        Self {
+            mode: PrefixCheckpointMode::Off,
+            document: None,
+        }
+    }
+
+    /// Enable automatic message, near-tail, and shared-root prefix checkpoints.
+    pub const fn auto() -> Self {
+        Self {
+            mode: PrefixCheckpointMode::Auto,
+            document: None,
+        }
+    }
+
+    /// Enable prefix checkpoints and protect a designated document-text span.
+    pub const fn with_document(span: PrefixDocumentSpan) -> Self {
+        Self {
+            mode: PrefixCheckpointMode::Auto,
+            document: Some(span),
+        }
+    }
+
+    /// Whether multi-boundary checkpointing or document protection is requested.
+    pub const fn is_active(&self) -> bool {
+        matches!(self.mode, PrefixCheckpointMode::Auto) || self.document.is_some()
+    }
+
+    /// Stable lower-case policy label (`"off"`, `"auto"`, or `"document"`).
+    pub const fn label(&self) -> &'static str {
+        if self.document.is_some() {
+            "document"
+        } else {
+            match self.mode {
+                PrefixCheckpointMode::Off => "off",
+                PrefixCheckpointMode::Auto => "auto",
+            }
+        }
+    }
+}
+
 impl From<MtpMode> for Speculative {
     fn from(mode: MtpMode) -> Self {
         match mode {
@@ -559,6 +642,9 @@ pub struct TextLlmRequest {
     /// [`KvCompressionPolicy::Off`]: crate::KvCompressionPolicy::Off
     /// [`KvCompressionPolicy::Qualified`]: crate::KvCompressionPolicy::Qualified
     pub kv_compression: crate::kv_compression::KvCompressionPolicy,
+    /// Exact multi-boundary prefix-checkpoint policy (feature SW-F356). `None` defers to the
+    /// backend's [`DecodeDefaults::prefix_checkpoints`](crate::DecodeDefaults::prefix_checkpoints).
+    pub prefix_checkpoints: Option<PrefixCheckpointPolicy>,
 }
 
 impl TextLlmRequest {
@@ -615,6 +701,14 @@ impl TextLlmRequest {
     /// which only an explicit proposer can trip).
     pub fn speculative_mode(&self) -> Speculative {
         self.speculative_or(Speculative::Off)
+    }
+
+    /// Effective exact prefix-checkpoint policy on a backend whose default is `default`.
+    pub fn prefix_checkpoints_or(&self, default: PrefixCheckpointMode) -> PrefixCheckpointPolicy {
+        self.prefix_checkpoints.unwrap_or(PrefixCheckpointPolicy {
+            mode: default,
+            document: None,
+        })
     }
 }
 
@@ -865,6 +959,62 @@ mod tests {
         let spec = spec.with_draft("draft-dir");
         assert_eq!(spec.draft_source.as_deref(), Some("draft-dir"));
         assert_eq!(spec.source, "model.gguf", "naming a draft keeps the target");
+    }
+
+    #[test]
+    fn prefix_checkpoint_policy_round_trips_and_resolves_defaults() {
+        for (policy, expected_active, expected_label) in [
+            (PrefixCheckpointPolicy::off(), false, "off"),
+            (PrefixCheckpointPolicy::auto(), true, "auto"),
+            (
+                PrefixCheckpointPolicy::with_document(PrefixDocumentSpan::Messages { count: 2 }),
+                true,
+                "document",
+            ),
+            (
+                PrefixCheckpointPolicy::with_document(PrefixDocumentSpan::MessageChars {
+                    message: 1,
+                    chars: 42,
+                }),
+                true,
+                "document",
+            ),
+            (
+                PrefixCheckpointPolicy::with_document(PrefixDocumentSpan::Tokens { count: 128 }),
+                true,
+                "document",
+            ),
+            (
+                PrefixCheckpointPolicy {
+                    mode: PrefixCheckpointMode::Off,
+                    document: Some(PrefixDocumentSpan::Tokens { count: 16 }),
+                },
+                true,
+                "document",
+            ),
+        ] {
+            let encoded = serde_json::to_value(policy).unwrap();
+            let decoded: PrefixCheckpointPolicy = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, policy);
+            assert_eq!(policy.is_active(), expected_active);
+            assert_eq!(policy.label(), expected_label);
+        }
+
+        let mut req = TextLlmRequest::new(Vec::new(), 8);
+        assert_eq!(req.prefix_checkpoints, None);
+        assert_eq!(
+            req.prefix_checkpoints_or(PrefixCheckpointMode::Off),
+            PrefixCheckpointPolicy::off()
+        );
+        assert_eq!(
+            req.prefix_checkpoints_or(PrefixCheckpointMode::Auto),
+            PrefixCheckpointPolicy::auto()
+        );
+        req.prefix_checkpoints = Some(PrefixCheckpointPolicy::off());
+        assert_eq!(
+            req.prefix_checkpoints_or(PrefixCheckpointMode::Auto),
+            PrefixCheckpointPolicy::off()
+        );
     }
 }
 

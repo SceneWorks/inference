@@ -291,6 +291,11 @@ class ConditionalAssetInventory(unittest.TestCase):
                 assets.fetch_pinned("https://example/x", other, opener=Opener(b"bad", etag=hashlib.sha256(b"bad").hexdigest()),
                                     expected_sha256="c" * 64)
             self.assertFalse(other.exists())
+            for opener, message in ((Opener(b"oversized"), "response length differs"),
+                                    (Opener(b"oversized", length=3), "exceeds the sealed byte count")):
+                with self.assertRaisesRegex(ValueError, message):
+                    assets.fetch_pinned("https://example/x", other, opener=opener, expected_bytes=3)
+                self.assertFalse(other.exists())
             self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
 
     def test_fetch_accepts_a_concurrently_placed_identical_file_and_refuses_other_bytes(self):

@@ -43,8 +43,8 @@ pub struct MtpProposer<'a> {
     cache: Qwen35MtpCache,
     after_cur: Option<Qwen35MtpCache>,
     resume: Option<MtpBoundary>,
-    capture_at: Option<usize>,
-    captured: Option<MtpBoundary>,
+    capture_at: Vec<usize>,
+    captured: Vec<MtpBoundary>,
 }
 
 /// The MTP head's state at a prompt boundary `len` (story sc-24437): its cache after warming on
@@ -59,6 +59,21 @@ pub struct MtpBoundary {
 }
 
 impl MtpBoundary {
+    /// Dummy boundary carrying `len` positions for non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(len: usize) -> Self {
+        Self {
+            cache: Qwen35MtpCache::empty_for_test(),
+            hidden: Tensor::zeros(
+                (1, 1, 2),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            len,
+        }
+    }
+
     /// The prompt positions the state covers.
     pub fn len(&self) -> usize {
         self.len
@@ -85,8 +100,8 @@ impl<'a> MtpProposer<'a> {
             cache: mtp.new_cache(),
             after_cur: None,
             resume: None,
-            capture_at: None,
-            captured: None,
+            capture_at: Vec::new(),
+            captured: Vec::new(),
         }
     }
 
@@ -101,13 +116,25 @@ impl<'a> MtpProposer<'a> {
     /// [`take_captured`](Self::take_captured)); ignored unless `len` falls strictly inside the
     /// warmed span.
     pub fn capture_at(mut self, len: Option<usize>) -> Self {
-        self.capture_at = len;
+        self.capture_at = len.into_iter().collect();
         self
     }
 
-    /// The state captured by [`capture_at`](Self::capture_at), once.
+    /// Record the head's state at all boundary positions in `lens` strictly inside the warmed span
+    /// (SW-F356; see [`take_captured_all`](Self::take_captured_all)).
+    pub fn capture_at_many(mut self, lens: &[usize]) -> Self {
+        self.capture_at = lens.to_vec();
+        self
+    }
+
+    /// The first state captured by [`capture_at`](Self::capture_at), once (clearing any remainder).
     pub fn take_captured(&mut self) -> Option<MtpBoundary> {
-        self.captured.take()
+        std::mem::take(&mut self.captured).into_iter().next()
+    }
+
+    /// All states captured during the last warm-up, in boundary order.
+    pub fn take_captured_all(&mut self) -> Vec<MtpBoundary> {
+        std::mem::take(&mut self.captured)
     }
 
     /// Warm the predictor from a **multimodal** prompt: the fused (vision-spliced) prompt
@@ -186,18 +213,23 @@ impl Proposer for MtpProposer<'_> {
             }
         };
         let first = offset.max(1);
-        let split = self
-            .capture_at
-            .take()
-            .filter(|&b| b > offset && b < prompt.len());
-        let mut segments = Vec::with_capacity(2);
+        self.captured.clear();
+        let mut splits: Vec<usize> = std::mem::take(&mut self.capture_at)
+            .into_iter()
+            .filter(|&b| b > offset && b < prompt.len())
+            .collect();
+        splits.sort_unstable();
+        splits.dedup();
+        let mut segments: Vec<(std::ops::Range<usize>, Option<usize>)> =
+            Vec::with_capacity(splits.len() + 1);
         let mut from = first;
-        if let Some(b) = split {
-            segments.push(from..b);
+        for b in splits {
+            let start = from.min(b);
+            segments.push((start..b, Some(b)));
             from = b;
         }
-        segments.push(from..prompt.len());
-        for segment in segments {
+        segments.push((from..prompt.len(), None));
+        for (segment, cap) in segments {
             if !segment.is_empty() {
                 let previous = target_rows(segment.start - 1, segment.len())?;
                 self.mtp.warm_sequence(
@@ -207,11 +239,11 @@ impl Proposer for MtpProposer<'_> {
                     &mut self.cache,
                 )?;
             }
-            if split == Some(segment.end) {
-                self.captured = Some(MtpBoundary {
+            if let Some(boundary_len) = cap {
+                self.captured.push(MtpBoundary {
                     cache: self.cache.clone(),
-                    hidden: target_rows(segment.end - 1, 1)?.copy()?,
-                    len: segment.end,
+                    hidden: target_rows(boundary_len - 1, 1)?.copy()?,
+                    len: boundary_len,
                 });
             }
         }

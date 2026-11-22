@@ -28,7 +28,7 @@ from contextlib import contextmanager
 import errno
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import sys
@@ -73,12 +73,16 @@ def _try_lock(handle) -> bool:
         raise
 
 
+def staging_lock_path(hub: Path, repository: str, revision: str, file: str) -> Path:
+    return (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
+            / revision / (file + ".lock"))
+
+
 @contextmanager
 def staging_lock(hub: Path, repository: str, revision: str, file: str):
     """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
-    path = (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
-            / revision / (file + ".lock"))
+    path = staging_lock_path(hub, repository, revision, file)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+b") as handle:
         if handle.seek(0, 2) == 0:
@@ -116,13 +120,27 @@ def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:
     return files
 
 
-def hub_root(env: dict[str, str]) -> Path:
-    configured = env.get("MODEL_PROOF_HUB_ROOT", "")
+def resolve_hub_root(env: dict[str, str], *, platform: str | None = None) -> Path:
+    configured = env.get("MODEL_PROOF_HUB_ROOT", "").strip()
     if not configured:
         raise ValueError("MODEL_PROOF_HUB_ROOT (the runner model root variable) is unset")
-    root = Path(os.path.expanduser(configured))
-    if not root.is_absolute():
+    expanded = os.path.expanduser(configured)
+    root = Path(expanded)
+    if not (root.is_absolute() or PureWindowsPath(expanded).is_absolute()):
         raise ValueError("MODEL_PROOF_HUB_ROOT must be an absolute or ~ path")
+    # On macOS, repo variables point at an external volume (for example /Volumes/Models/...).
+    # When that external volume is not mounted on the runner, /Volumes is root-owned and mkdir
+    # fails with EACCES; fall back to the runner account's local macOS cache directory.
+    active_platform = sys.platform if platform is None else platform
+    if active_platform == "darwin" and len(root.parts) >= 3 and root.parts[:2] == ("/", "Volumes"):
+        if not Path("/", "Volumes", root.parts[2]).exists():
+            home = Path(os.path.expanduser(env.get("HOME") or "~"))
+            return home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+    return root
+
+
+def hub_root(env: dict[str, str]) -> Path:
+    root = resolve_hub_root(env)
     root.mkdir(parents=True, exist_ok=True)
     return Path(os.path.realpath(root))
 

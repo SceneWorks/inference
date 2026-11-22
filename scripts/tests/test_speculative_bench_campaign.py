@@ -2441,3 +2441,254 @@ class CudaCardSelectionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GITHUB_ENV": str(self.directory / "e")}), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.select.main(["GPU-1", str(self.directory)]), 1)
+
+
+class PrefixCheckpointsCampaignTests(unittest.TestCase):
+    """SW-F356: campaign planning, default parsing, and paired E5 decision support."""
+
+    def test_prompt_set_and_prefix_checkpoints_knobs_plan_and_refuse_baseline(self) -> None:
+        (row,) = plan(
+            {
+                "rows": [
+                    {
+                        "id": "ckpt-auto",
+                        "snapshot": "bonsai-mlx",
+                        "runs": ["epic"],
+                        "prefix_cache_bytes": "default",
+                        "prompt_set": "prefix_checkpoints",
+                        "prefix_checkpoints": "auto",
+                    }
+                ]
+            },
+            lane="mlx",
+        )["rows"]
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PROMPT_SET"], "prefix_checkpoints")
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PREFIX_CHECKPOINTS"], "auto")
+
+        for bad in (
+            {"id": "bad-ps", "snapshot": "bonsai-mlx", "runs": ["epic"], "prompt_set": "other"},
+            {"id": "bad-cp", "snapshot": "bonsai-mlx", "runs": ["epic"], "prefix_checkpoints": "all"},
+            {"id": "ps-base", "snapshot": "bonsai-mlx", "prompt_set": "prefix_checkpoints"},
+            {"id": "cp-base", "snapshot": "bonsai-mlx", "prefix_checkpoints": "off"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [bad]}, lane="mlx")
+
+    def test_defaults_table_reports_prefix_checkpoints_auto_as_measured_and_pairs_twins(self) -> None:
+        entries = {e["entry"]: e for e in campaign.default_entries(LIVE_DEFAULTS)}
+        for key in (
+            "MLX.prefix_checkpoints",
+            "CANDLE_CUDA.prefix_checkpoints",
+            "CANDLE_METAL.prefix_checkpoints",
+            "CANDLE_CPU.prefix_checkpoints",
+        ):
+            self.assertIn(key, entries)
+            self.assertTrue(entries[key]["on"])
+            self.assertFalse(entries[key]["provisional"])
+            self.assertEqual(entries[key]["kind"], "prefix_checkpoints")
+            self.assertEqual(entries[key]["value"], "PrefixCheckpointMode::Auto")
+
+        with tempfile.TemporaryDirectory() as td:
+            def ckpt_row(row_id, mode, ttft):
+                def make(run, k):
+                    return document(
+                        run,
+                        prefix_cache_bytes=1 << 20,
+                        value=lambda p, o, m: (50.0 if m == "decode_tok_s" else ttft) + jitter(k),
+                        row_extra=lambda p, o: {"prefix_checkpoints": {"policy": mode}},
+                    )
+
+                env = {
+                    "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "1048576",
+                    "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                    "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": mode,
+                }
+                return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+            directory = write_campaign(
+                Path(td) / "ckpt",
+                [ckpt_row("ckpt-auto", "auto", 40.0), ckpt_row("ckpt-off", "off", 100.0)],
+            )
+            decisions = {
+                d["entry"]: d
+                for d in campaign.compare_campaigns([directory], LIVE_DEFAULTS)["defaults"]
+            }
+            decision = decisions["CANDLE_CUDA.prefix_checkpoints"]
+            self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+            self.assertFalse(decision["flip"])
+
+    def test_compare_and_paths_surface_wall_ttft_memory_and_checkpoint_overhead(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            def ckpt_row(row_id, mode, wall_base, ttft_base, peak_bytes, pc_extra):
+                def make(run, k):
+                    def val(p, o, m):
+                        if m == "decode_tok_s":
+                            return 60.0 + jitter(k)
+                        if m == "ttft_ms":
+                            return ttft_base + jitter(k)
+                        return 0.0
+
+                    doc = document(
+                        run,
+                        prefix_cache_bytes=1 << 20,
+                        value=val,
+                        row_extra=lambda p, o: {
+                            "wall_ms": {"mean": wall_base + jitter(k), "stddev": 0.5, "n": 3},
+                            "peak_memory_bytes": {
+                                "mean": float(peak_bytes),
+                                "stddev": 0.0,
+                                "n": 3,
+                            },
+                            "prefix_checkpoints": pc_extra,
+                        },
+                    )
+                    return doc
+
+                env = {
+                    "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "1048576",
+                    "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                    "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": mode,
+                }
+                return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+            auto_pc = {
+                "policy": "document",
+                "reused_tokens": 96,
+                "reread_tokens": 12,
+                "matched_kind": "document",
+                "checkpoints_captured": 2,
+                "captured_bytes": 4096,
+                "restore_ms": 1.25,
+                "capture_ms": 2.75,
+                "resident_bytes": 8192,
+                "protected_bytes": 4096,
+                "evicted_entries": 0,
+                "fallbacks": [],
+            }
+            off_pc = {
+                "policy": "off",
+                "reused_tokens": 0,
+                "reread_tokens": 108,
+                "matched_kind": None,
+                "checkpoints_captured": 0,
+                "captured_bytes": 0,
+                "restore_ms": 0.0,
+                "capture_ms": 0.0,
+                "resident_bytes": 0,
+                "protected_bytes": 0,
+                "evicted_entries": 0,
+                "fallbacks": [],
+            }
+            directory = write_campaign(
+                Path(td) / "ckpt-full",
+                [
+                    ckpt_row("ckpt-auto", "auto", 220.0, 35.0, 2 << 30, auto_pc),
+                    ckpt_row("ckpt-off", "off", 340.0, 120.0, 2 << 30, off_pc),
+                ],
+            )
+            report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
+            decision = {d["entry"]: d for d in report["defaults"]}["CANDLE_CUDA.prefix_checkpoints"]
+            self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+            wall_judged = [j for j in decision["judged"] if j["metric"] == "wall_ms"]
+            self.assertTrue(wall_judged, "wall_ms must be judged for prefix_checkpoints")
+            self.assertTrue(all(j["verdict"] == "pass" for j in wall_judged))
+
+            paired = report["prefix_checkpoints"]
+            self.assertEqual(len(paired), 6)
+            sample = paired[0]
+            self.assertEqual(sample["wall_ms"]["verdict"], "pass")
+            self.assertAlmostEqual(sample["wall_ms"]["candidate"]["mean"], 220.0, places=2)
+            self.assertAlmostEqual(sample["wall_ms"]["reference"]["mean"], 340.0, places=2)
+            self.assertEqual(sample["ttft_ms"]["verdict"], "pass")
+            self.assertEqual(sample["peak_memory_bytes"]["on"]["mean"], float(2 << 30))
+            on_pc = sample["prefix_checkpoints"]["on"]
+            self.assertEqual(on_pc["capture_ms"], 2.75)
+            self.assertEqual(on_pc["restore_ms"], 1.25)
+            self.assertEqual(on_pc["captured_bytes"], 4096)
+            self.assertEqual(on_pc["reused_tokens"], 96)
+            self.assertEqual(on_pc["reread_tokens"], 12)
+            self.assertEqual(on_pc["resident_bytes"], 8192)
+            self.assertEqual(on_pc["protected_bytes"], 4096)
+
+            md = campaign.markdown_report(report)
+            self.assertIn("## Prefix checkpoints — paired on vs off rows", md)
+            self.assertIn("220.0 vs 340.0", md)
+            self.assertIn("96 / 12 (document)", md)
+            self.assertIn("2.75", md)
+            self.assertIn("1.25", md)
+            self.assertIn("4096 / 8192 / 4096", md)
+
+            # `paths_report` / `paths_markdown` surface prefix_checkpoints overhead when present.
+            row_with_pc = path_row("chat", "open_ended", "off", tok_s=50.0, wall=220.0, hits=(96, 96))
+            row_with_pc["prefix_checkpoints"] = auto_pc
+            paths_dir = write_campaign(
+                Path(td) / "ckpt-paths",
+                [
+                    {
+                        "id": "p-auto",
+                        "runs": ["epic"],
+                        "process_repeats": 1,
+                        "document": lambda run, k: paths_document([row_with_pc]),
+                        "env": {
+                            "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "default",
+                            "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                            "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": "auto",
+                        },
+                    }
+                ],
+                lane="mlx",
+            )
+            pr = campaign.paths_report([paths_dir])
+            summary_pc = pr["summary"][0]["prefix_checkpoints"]
+            self.assertIsNotNone(summary_pc)
+            self.assertEqual(summary_pc["capture_ms"], 2.75)
+            self.assertEqual(summary_pc["restore_ms"], 1.25)
+            self.assertEqual(summary_pc["captured_bytes"], 4096)
+            self.assertEqual(summary_pc["reused_tokens"], 96)
+            self.assertEqual(summary_pc["reread_tokens"], 12)
+            self.assertEqual(summary_pc["resident_bytes"], 8192)
+            self.assertEqual(summary_pc["protected_bytes"], 4096)
+            pmd = campaign.paths_markdown(pr)
+            self.assertIn("### Prefix checkpoints", pmd)
+            self.assertIn("| off | document | 96 | 12 | 2.75 | 1.25 | 4096 | 8192 | 4096 | document |", pmd)
+
+    def test_cross_revision_epic_with_checkpoints_compares_against_pre_epic_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            def make_doc(run, k):
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": "auto"}})
+                    if run == "epic"
+                    else None
+                )
+                return document(
+                    run,
+                    value=lambda p, o, m: (
+                        (55.0 if run == "epic" else 50.0) if m == "decode_tok_s" else 80.0
+                    ) + jitter(k),
+                    row_extra=extra,
+                )
+
+            directory = write_campaign(
+                Path(td) / "cross-rev",
+                [{"id": "paired", "runs": ["epic", "baseline"], "document": make_doc}],
+            )
+            report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
+            self.assertEqual(report["schema"], campaign.COMPARE_SCHEMA)
+            self.assertEqual(len(report["rows"]), 1)
+
+            # Within the same run (`epic`), conflicting checkpoint modes are still refused.
+            def mixed_epic(run, k):
+                policy = "auto" if k == 1 else "off"
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": policy}})
+                    if run == "epic"
+                    else None
+                )
+                return document(run, row_extra=extra)
+
+            bad_dir = write_campaign(
+                Path(td) / "mixed-epic",
+                [{"id": "mixed", "runs": ["epic", "baseline"], "document": mixed_epic}],
+            )
+            with self.assertRaisesRegex(campaign.Refused, "prefix_checkpoints"):
+                campaign.compare_campaigns([bad_dir], LIVE_DEFAULTS)

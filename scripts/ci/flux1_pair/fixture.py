@@ -162,13 +162,16 @@ def snapshot_identity(root, variant, tier):
         if config.exists():
             files.append(config)
     files.append(root / "tokenizer_2" / "tokenizer.json")
+    if tier in ("tier2", ENG4B_REAL):
+        identity = real_snapshot_identity(variant, tier)
+        if {p.relative_to(root).as_posix() for p in files} != identity["files"].keys():
+            raise ValueError("installed Q4 snapshot differs from pinned file names")
     digests = {p.relative_to(root).as_posix(): sha(p) for p in files}
     dt_config = json.loads((root / "transformer/config.json").read_text(encoding="utf-8"))
     depths = [dt_config["num_layers"], dt_config["num_single_layers"]]
     if depths != ([1, 1] if tier in ("tier1", ENG4B) else [19, 38]):
         raise ValueError("wrong DiT depth for proof tier")
     if tier in ("tier2", ENG4B_REAL):
-        identity = real_snapshot_identity(variant, tier)
         if dt_config.get("quantization", {}).get("bits") != 4 or digests != identity["files"]:
             raise ValueError("installed Q4 snapshot differs from pinned files")
         return identity

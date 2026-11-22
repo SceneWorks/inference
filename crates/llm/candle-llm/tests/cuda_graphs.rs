@@ -207,6 +207,7 @@ fn qwen38_27b_step_census() {
                 want_hidden: true,
                 prefill: false,
                 snapshot_at: None,
+                snapshot_points: Vec::new(),
             },
         )
         .unwrap();
@@ -229,6 +230,7 @@ fn qwen38_27b_step_census() {
             want_hidden: true,
             prefill: false,
             snapshot_at: None,
+            snapshot_points: Vec::new(),
         },
     )
     .unwrap();

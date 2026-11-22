@@ -1654,7 +1654,7 @@ mod cuda {
                 let htod = dev.enable_cuda_graph_htod_cache();
                 // The eager reference first: the warm-up proved the step runs, its outputs give
                 // the staging tensors their shapes, and it is what the caller gets either way.
-                let eager = match eager_reference(runner, cache, request, base)? {
+                let eager = match eager_reference(runner, cache, request.clone(), base)? {
                     Ok(eager) => eager,
                     Err(eager) => return Ok(eager),
                 };
@@ -1688,6 +1688,7 @@ mod cuda {
                             want_hidden: request.want_hidden,
                             prefill: request.prefill,
                             snapshot_at: request.snapshot_at,
+                            snapshot_points: request.snapshot_points.clone(),
                         },
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
@@ -1761,7 +1762,7 @@ mod cuda {
                 // that catches a stale scalar or an unstable state address, which the capture
                 // step's own check (same inputs, same position) cannot. Eager first: until the
                 // replay runs, a cache that cannot roll back still holds the eager step.
-                let eager = match eager_reference(runner, cache, request, base)? {
+                let eager = match eager_reference(runner, cache, request.clone(), base)? {
                     Ok(eager) => eager,
                     Err(eager) => return Ok(eager),
                 };
@@ -1812,6 +1813,7 @@ mod cuda {
             want_hidden: request.want_hidden,
             prefill: request.prefill,
             snapshot_at: request.snapshot_at,
+            snapshot_points: request.snapshot_points.clone(),
         }
     }
 

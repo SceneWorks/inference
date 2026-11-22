@@ -177,6 +177,13 @@ class FluxPairTests(unittest.TestCase):
                 comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
             policy["deadlineSeconds"] = 360
             contract = comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
+            download = dict(request, download_missing=True)
+            self.assertTrue(comparison.plan("candle-cuda", download, head, fixture.ENG4B_REAL)
+                            ["request"]["download_missing"])
+            for bad, tier in ((dict(request, download_missing=1), fixture.ENG4B_REAL),
+                              (download, fixture.ENG4B)):
+                with self.assertRaisesRegex(ValueError, "exact flux1-eng4b-pair"):
+                    comparison.plan("candle-cuda", bad, head, tier)
         self.assertEqual((contract["base"], contract["head"]),
                          ("be45bdf746c5d4a12d4db76f9653b8686e7f33f8", head))
         self.assertEqual(contract["base_tree"], "4d6eb59e08edcd257fd907247acd5e8f0cc5c545")
@@ -193,6 +200,88 @@ class FluxPairTests(unittest.TestCase):
                                        "measure-dev-2-head", "measure-dev-2-base"))
         self.assertEqual(phases[-1], "measure-schnell-6-base")
         self.assertLess(contract["cuda_claim_budget_seconds"], 200 * 60)
+
+    def test_terminal_staging_binds_only_exact_fixture_paths_and_transfer_seals(self):
+        provenance = json.loads((fixture.HERE / "headers.json").read_text(encoding="utf-8"))
+        fixtures = {(row["repo"], row["snapshot"]): row["q4_files"]
+                    for row in provenance.values()}
+        inventories = {
+            source: {"q4/" + name: dict(size=identity["bytes"], **(
+                {"lfs": {"size": identity["bytes"], "sha256": identity["sha256"]}}
+                if name.endswith(".safetensors") else {}))
+                     for name, identity in files.items()}
+            for source, files in fixtures.items()
+        }
+        for inventory in inventories.values():
+            inventory["q4/unused.safetensors"] = {"size": 1}
+        def upstream(repository, revision):
+            return "manifest", b"document", inventories[repository, revision]
+
+        def stage(pins, root, *, manifest, fetch):
+            self.assertEqual(set(pins), {"dev", "schnell"})
+            for pin in pins.values():
+                repo, revision = pin["repository"], pin["revision"]
+                approved = fixtures[repo, revision]
+                self.assertEqual(pin["subfolder"], "q4")
+                _, _, selected = manifest(repo, revision)
+                self.assertEqual(set(selected), {"q4/" + name for name in approved})
+                base = comparison.hub_snapshots.snapshot_dir(root, repo, revision)
+                for path in selected:
+                    fetch("reviewed immutable URL", base / path)
+
+        with (TemporaryDirectory() as directory,
+              patch.object(comparison.hub_snapshots, "pinned_manifest", side_effect=upstream),
+              patch.object(comparison.hub_snapshots, "stage", side_effect=stage),
+              patch.object(comparison, "fetch_pinned") as transfer):
+            root = Path(directory).resolve()
+            comparison.stage_terminal_snapshots(root, provenance)
+            self.assertEqual(len(transfer.call_args_list), 18)
+            seals = {(item.args[1], item.kwargs["expected_sha256"], item.kwargs["expected_bytes"])
+                     for item in transfer.call_args_list}
+            self.assertEqual(seals, {
+                (comparison.hub_snapshots.snapshot_dir(root, repo, revision) / "q4" / name,
+                 identity["sha256"], identity["bytes"])
+                for (repo, revision), files in fixtures.items() for name, identity in files.items()
+            })
+            first = provenance["dev"]
+            inventories[first["repo"], first["snapshot"]]["q4/transformer/model.safetensors"]["lfs"]["sha256"] = "0" * 64
+            transfer.reset_mock()
+            with self.assertRaisesRegex(ValueError, "exact fixture"):
+                comparison.stage_terminal_snapshots(root, provenance)
+            transfer.assert_not_called()
+
+    def test_terminal_staging_refuses_cache_and_lock_paths_outside_the_hub(self):
+        provenance = json.loads((fixture.HERE / "headers.json").read_text(encoding="utf-8"))
+        with TemporaryDirectory() as directory, patch.object(comparison.hub_snapshots, "stage") as stage:
+            root = Path(directory).resolve()
+            hub, outside = root / "hub", root / "elsewhere"
+            hub.mkdir()
+            outside.mkdir()
+            dev = provenance["dev"]
+            tier = comparison.hub_snapshots.snapshot_dir(hub, dev["repo"], dev["snapshot"]) / "q4"
+            tier.parent.mkdir(parents=True)
+            for path, message in ((tier, "escapes configured model hub"),
+                                  (hub / ".locks", "linked evidence ancestor")):
+                try:
+                    path.symlink_to(outside, target_is_directory=True)
+                except (NotImplementedError, PermissionError):
+                    self.skipTest("this host cannot create directory symlinks for the fixture")
+                with self.assertRaisesRegex(ValueError, message):
+                    comparison.stage_terminal_snapshots(hub, provenance)
+                path.unlink()
+            stage.assert_not_called()
+
+    def test_terminal_snapshot_refuses_unlisted_weights_before_opening_any_file(self):
+        with TemporaryDirectory() as directory, patch.object(fixture, "sha") as digest:
+            root = Path(directory)
+            pinned = fixture.real_snapshot_identity("dev", fixture.ENG4B_REAL)["files"]
+            for relative in (*pinned, "transformer/extra.safetensors"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            with self.assertRaisesRegex(ValueError, "pinned file names"):
+                fixture.snapshot_identity(root, "dev", fixture.ENG4B_REAL)
+            digest.assert_not_called()
 
     def test_paired_timing_distinguishes_pass_fail_and_inconclusive(self):
         rows = {phase: dict.fromkeys((*performance.TIMING, *performance.MEMORY), 100)

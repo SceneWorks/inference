@@ -1,15 +1,18 @@
 """No model compute: terminal pairing decisions and native receipt contracts."""
 
+import hashlib
 import json
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+import zlib
 
 from scripts.ci import ltx25_tier2_fixture as ltx
 from scripts.ci import sga_terminal_comparison as comparison
 from scripts.ci import wan_adapter_tier2_fixture as wan
+from scripts.ci import z_image_tier2_fixture as z_image
 
 UUID = "GPU-a123bcde-4321-abcd-abcd-0123456789ab"
 REQUEST = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
@@ -111,6 +114,67 @@ class TerminalTests(unittest.TestCase):
                           log.replace(trace[-1].split()[2], trace[0].split()[2])):
                 with self.assertRaises(ValueError):
                     wan.observe(wrong, result, UUID, variant)
+
+    def test_z_image_archives_only_verified_png_with_exact_rgb_pixels(self):
+        with TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            archive = Path(directory) / "evidence"
+            archive.mkdir()
+            for variant, size in z_image.SIZE.items():
+                with self.subTest(variant=variant):
+                    sample = work / variant
+                    sample.mkdir(parents=True)
+                    pixels = bytes(range(256)) * (size * size * 3 // 256)
+                    (sample / "image.rgb").write_bytes(pixels)
+                    z_image.prepare_artifacts(sample, work, variant)
+                    steps = z_image.STEPS[variant]
+                    sigmas = [0x3F800000 - index * 65536 for index in range(steps)] + [0]
+                    row = {"plan": dict(z_image.request(variant), sigmas_bits=sigmas),
+                           "sample": {"dtype": "BF16", "device": "candle-cuda:0", "sigmas_bits": sigmas,
+                                      "latent_shape": [1, 16, 1, size // 8, size // 8]},
+                           "progress": list(range(1, steps + 1)), "e2e_ns": 1000, "denoise_ns": 600}
+                    result = sample / "result.json"
+                    result.write_text(json.dumps(row), encoding="utf-8")
+                    log = "SGA_Z_IMAGE_TIER2_BODY " + variant
+                    (sample / "stdout.log").write_text(log, encoding="utf-8")
+                    limits = comparison.sample_limits(z_image, z_image.policy(variant, UUID))
+                    rejected = dict(comparison.collect_sample(variant + "-failed", sample, limits,
+                                                              archive, work, skip=z_image.ARTIFACT_LIMITS))
+                    self.assertIn(variant + "-failed.stdout.log", rejected)
+                    self.assertNotIn(variant + "-failed.image.png", rejected)
+                    sealed = dict(comparison.collect_sample(variant, sample, limits, archive, work))
+                    self.assertIn(variant + ".image.png", sealed)
+                    self.assertNotIn(variant + ".image.rgb", sealed)
+                    original = z_image.observe(log, result, UUID, variant)
+                    replay = z_image.observe(log, archive / (variant + ".result.json"), UUID, variant)
+                    self.assertEqual(original, replay)
+                    self.assertEqual(replay["identity"]["rgb_sha256"], hashlib.sha256(pixels).hexdigest())
+
+    def test_z_image_refuses_corrupt_or_oversized_png_data(self):
+        with TemporaryDirectory() as directory:
+            image = Path(directory) / "image.png"
+            good = z_image.png(1, 1, b"abc")
+            image.write_bytes(good[:-1] + bytes([good[-1] ^ 1]))
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                z_image.read_artifact_pixels(image, 1)
+            for compressed in (zlib.compress(b"\0abcd"), zlib.compress(b"\0abc") + zlib.compress(b"extra")):
+                kind = b"IDAT"
+                idat = struct.pack(">I", len(compressed)) + kind + compressed
+                idat += struct.pack(">I", zlib.crc32(kind + compressed))
+                image.write_bytes(good[:33] + idat + good[-12:])
+                with self.assertRaisesRegex(ValueError, "exact unfiltered RGB8"):
+                    z_image.read_artifact_pixels(image, 1)
+
+    def test_mlx_terminal_uses_configured_cache_without_implicit_fallback(self):
+        with TemporaryDirectory() as directory, patch.object(comparison, "hub_root") as generic:
+            cache = Path(directory) / "fleet"
+            env = {"HF_HUB_CACHE": str(cache)}
+            self.assertEqual(comparison.terminal_hub_root("mlx", ltx, env), cache.resolve())
+            unavailable = Path(directory) / "ordinary-file"
+            unavailable.touch()
+            with self.assertRaises(FileExistsError):
+                comparison.terminal_hub_root("mlx", ltx, {"HF_HUB_CACHE": str(unavailable)})
+            generic.assert_not_called()
 
 
 if __name__ == "__main__":

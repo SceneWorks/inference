@@ -335,7 +335,7 @@ def _same_bytes(path, size, sha):
     return state.hexdigest() == sha
 
 
-def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=None):
+def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=None, expected_bytes=None):
     """Stream `url` to a temporary file beside `destination`, then place it without overwriting.
 
     Returns (bytes, sha256, linked_etag, placed_by_another_job). The temporary file is this process's own (a unique
@@ -344,7 +344,7 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
     on the same host places the destination first (run 44431653018: several runner listeners
     share one hub), this download is discarded if the placed file has the same size and SHA-256
     (`placed_by_another_job` is then True), and refused otherwise.
-    An optional receipt hash must match before either publication path.
+    Optional sealed file lengths bound the transfer, and receipt hashes must match before publication.
     """
     if probe(destination)["exists"]:
         raise FileExistsError(f"refusing to overwrite existing asset {destination}")
@@ -365,14 +365,20 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
     try:
         with os.fdopen(descriptor, "wb") as sink, request_url(request, timeout=STAGE_SOCKET_TIMEOUT) as source:
             expected = source.headers.get("Content-Length")
+            if expected_bytes is not None and expected is not None and int(expected) != expected_bytes:
+                raise ValueError(f"response length differs from the sealed byte count for {url}")
             while chunk := source.read(STAGE_CHUNK):
+                size += len(chunk)
+                if expected_bytes is not None and size > expected_bytes:
+                    raise ValueError(f"download exceeds the sealed byte count for {url}")
                 sink.write(chunk)
                 digest_state.update(chunk)
-                size += len(chunk)
             sink.flush()
             os.fsync(sink.fileno())
         if expected is not None and int(expected) != size:
             raise ValueError(f"short download for {url}: {size} of {expected} bytes")
+        if expected_bytes is not None and size != expected_bytes:
+            raise ValueError(f"download length differs from the sealed byte count for {url}")
         sha = digest_state.hexdigest()
         if expected_sha256 is not None and sha != expected_sha256:
             raise ValueError(f"downloaded bytes differ from the sealed SHA-256 for {url}")
