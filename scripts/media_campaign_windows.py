@@ -272,11 +272,15 @@ class WindowsJob:
         return result
 
     def footprint_bytes(self) -> int:
+        """Keep the counters behind the same conservative, guarded total."""
+        self.last_footprint_details = None
         pids = self.members()
         if not pids:
             raise WindowsJobError("owned Job disappeared during memory sample")
         total = 0
-        for pid in pids:
+        count = 0
+        readings = []
+        for pid in sorted(pids):
             process = self.kernel.OpenProcess(0x0400 | 0x0010, False, pid)  # QUERY_INFO|VM_READ
             if not process:
                 if pid not in self.members():
@@ -291,12 +295,19 @@ class WindowsJob:
                         continue  # Exited during the sample.
                     raise _failed(f"GetProcessMemoryInfo({pid})")
                 total += max(counters.WorkingSetSize, counters.PrivateUsage)
+                count += 1
+                if len(readings) < 32:
+                    readings.append({"pid": pid, "workingSetBytes": counters.WorkingSetSize,
+                                     "privateUsageBytes": counters.PrivateUsage})
             finally:
                 self.kernel.CloseHandle(process)
         limits = _ExtendedLimits()
         if not self.kernel.QueryInformationJobObject(self.handle, 9, ctypes.byref(limits),
                                                       ctypes.sizeof(limits), None):
             raise _failed("QueryInformationJobObject/peak-memory")
+        self.last_footprint_details = {"processContributionBytes": total,
+                                       "jobPeakMemoryUsedBytes": limits.PeakJobMemoryUsed,
+                                       "sampledProcessCount": count, "processes": readings}
         return max(total, limits.PeakJobMemoryUsed)
 
     def _accounting(self) -> dict[str, int]:
