@@ -1312,6 +1312,8 @@ fn decode(
             input_scale,
             full_precision_matrix_mult,
         } => {
+            #[cfg(not(feature = "cuda"))]
+            let _ = full_precision_matrix_mult;
             let (expected_dtype, element) = match tensor.encoding {
                 WeightEncoding::Fp8E4M3 => (
                     StDtype::F8_E4M3,
