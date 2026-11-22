@@ -8553,6 +8553,35 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             .compile_render_plan(KREA_2_TURBO_ID, &spec, &refine)
             .unwrap()
             .unwrap();
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            // Exercise the real registry wrapper before any components are materialized.
+            let loaded = registry.load(KREA_2_TURBO_ID, &spec).unwrap();
+            let mut context = context.clone();
+            let contract = loaded.memory_strategy_contract().unwrap();
+            let calibration = contract.calibration.as_ref().unwrap();
+            context.calibration_abi = calibration.abi;
+            context
+                .calibration_fingerprint
+                .clone_from(&calibration.fingerprint);
+            context.load_shape = contract.load_shape;
+            let mut scope = loaded
+                .begin_planned_memory_strategy_request(&refine, refiner, &context)
+                .unwrap()
+                .unwrap();
+            scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+            assert!(loaded
+                .begin_planned_memory_strategy_request(&refine, &standalone, &context)
+                .is_err());
+            context.budget.total_bytes = 64;
+            assert!(loaded
+                .begin_planned_memory_strategy_request(&refine, refiner, &context)
+                .is_err());
+            assert_eq!(
+                loaded.retained_component_state().unwrap(),
+                Some(gen_core::generator::GeneratorComponentResidency::default())
+            );
+        }
         assert!(generator
             .begin_planned_memory_strategy_request(&refine, &standalone, &context)
             .is_err());
