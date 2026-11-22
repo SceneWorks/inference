@@ -1593,6 +1593,30 @@
         "win32"
       ],
       "reason": "Loads a tiny real adapter file into a metadata-only CPU NativeLinearWeight through the production additive installer. Preserves apply/skip/base-kind assertions; explicit panic guards prohibit base forward and dense materialization. No learned or GPU execution."
+    },
+    {
+      "package": "mlx-gen-ios-catalog",
+      "kind": "lib",
+      "target": "mlx_gen_ios_catalog",
+      "test": "ios_admission::tests::sana_bound_generator_rechecks_geometry_tile_mode_and_capacity_before_the_provider",
+      "source": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Checks metadata admission and exact forwarding of two fake checkpoint receipts through a bound generator. The fake generator only updates call counters and returns an empty image list. No model load or compute executes."
+    },
+    {
+      "package": "mlx-gen-ios-catalog",
+      "kind": "lib",
+      "target": "mlx_gen_ios_catalog",
+      "test": "ios_admission::tests::restore_and_depth_are_keyed_admitted_and_request_bound",
+      "source": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Checks admission metadata, request guards and exact receipt forwarding through a bound transform with fake delegates. The transform clones image bytes and the depth fake returns a typed error. No model load or compute executes."
     }
   ]
 }

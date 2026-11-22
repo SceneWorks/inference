@@ -862,7 +862,8 @@ class RunGraph:
             # Exact bare-parameter declarations remain attached under component selection.
             # The adapter file installer uses a CPU metadata-native base whose forward
             # and dense-materialization methods panic; only installation/routing is exercised.
-            controls_sha = 'f18ad05cd8beec0962738d595e68320d506ef775cafff6bf41647d55bc94a741'
+            # iOS admission wrappers forward mock checkpoint receipts; these controls use fake providers only.
+            controls_sha = 'a6190ec5e0b6557fe36105e001d619954961eb5047cb1a99e637a3d9fbd439e0'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
