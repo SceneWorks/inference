@@ -13,13 +13,18 @@
 //! Each CUDA kernel has its own device and layout requirements. Model-declared shapes
 //! determine the logical dimensions of padded blocks.
 //!
-//! Coefficient consumers and full-precision projections decode supported source formats
-//! to the requested F32, BF16 or F16 dtype. Measured receipts charge the actual resident
+//! Coefficient consumers decode supported source formats to the requested F32, BF16 or F16 dtype.
+//! Scalar weight-only projections retain their codes and preserve activation precision.
+//! Measured receipts charge the actual resident
 //! representation, retained scale operands and any dense coefficient copies.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
+
+#[cfg(feature = "model-inference-proof")]
+static DENSE_FP8_REFERENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 use gen_core::checkpoint_codec::{
     CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyPolicy, LogicalKeyMapping,
@@ -93,6 +98,13 @@ pub struct CandleCodecResidency {
 }
 
 impl CandleCodecResidency {
+    /// One-way reference policy for a fresh, separately guarded model-proof process.
+    /// Ordinary product builds expose no precision override.
+    #[cfg(feature = "model-inference-proof")]
+    pub fn force_dense_fp8_for_model_proof() {
+        DENSE_FP8_REFERENCE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The dense-only policy (CPU, Metal, or CUDA below both floors).
     pub const DENSE: Self = Self {
         fp8_e4m3_native: false,
@@ -136,7 +148,13 @@ impl CandleCodecResidency {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(dev) = device {
             if let Ok(cap) = candle_quant_kernels::device_compute_cap(dev) {
-                return Self::from_cuda_compute_cap(cap);
+                #[allow(unused_mut)]
+                let mut policy = Self::from_cuda_compute_cap(cap);
+                #[cfg(feature = "model-inference-proof")]
+                if DENSE_FP8_REFERENCE.load(std::sync::atomic::Ordering::SeqCst) {
+                    policy.fp8_e4m3_native = false;
+                }
+                return policy;
             }
         }
         let _ = device;
@@ -220,9 +238,8 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         spec: &TensorCodecSpec,
         stored_shape: &[usize],
     ) -> ResidencyMode {
-        // The compiler already forces Dense for `full_precision_matrix_mult` layers; checking it
-        // here keeps this predicate honest if that ever moved.
-        if spec.full_precision_matrix_mult() {
+        // Scalar FP8 has a packed weight-only operator; other full-precision codecs still decode.
+        if spec.full_precision_matrix_mult() && !matches!(spec, TensorCodecSpec::ScalarFp8 { .. }) {
             return ResidencyMode::Dense;
         }
         if self.mxfp8_native && matches!(spec, TensorCodecSpec::Mxfp8 { .. }) {
@@ -323,6 +340,8 @@ pub enum LogicalTensor {
         weight_scale_from_companion: bool,
         /// The retained `input_scale` companion value, when the checkpoint carries one.
         input_scale: Option<f32>,
+        /// Keep activations at their compute dtype instead of quantizing them to FP8.
+        full_precision_matrix_mult: bool,
     },
     /// The packed-native NVFP4 form (sc-20641): the checkpoint's E2M1 nibbles and both scale levels
     /// repacked into the canonical container [`candle_quant_kernels::Nvfp4Linear::from_packed_in`] consumes.
@@ -763,6 +782,7 @@ impl LogicalWeightReader {
                 codes,
                 weight_scale,
                 input_scale,
+                full_precision_matrix_mult,
                 ..
             } => {
                 let codes = if transpose {
@@ -777,7 +797,9 @@ impl LogicalWeightReader {
                     );
                 }
                 let codes = codes.to_device(&self.device)?;
-                if codes.dtype() == DType::U8 {
+                if *full_precision_matrix_mult {
+                    Fp8Linear::from_weight_only_codes(codes, *weight_scale, bias, lt)?
+                } else if codes.dtype() == DType::U8 {
                     Fp8Linear::from_e5m2_parts(codes, *weight_scale, *input_scale, bias, lt)?
                 } else {
                     Fp8Linear::from_parts(codes, *weight_scale, *input_scale, bias, lt)?
@@ -894,7 +916,7 @@ impl LogicalWeightReader {
         let TensorCodecSpec::ScalarFp8 {
             scale,
             input_scale,
-            full_precision_matrix_mult: false,
+            full_precision_matrix_mult,
         } = &row.codec
         else {
             return Ok(None);
@@ -934,7 +956,9 @@ impl LogicalWeightReader {
         let ctx = self.resources.int8_context(&self.device)?;
         let lt = ctx.handle_for(&self.device)?.clone();
         use candle_quant_kernels::fp8_linear::Fp8Linear;
-        let op = if expected.1 == DType::U8 {
+        let op = if *full_precision_matrix_mult {
+            Fp8Linear::from_weight_only_codes(codes, sw, None, lt)?
+        } else if expected.1 == DType::U8 {
             Fp8Linear::from_e5m2_parts(codes, sw, sx, None, lt)?
         } else {
             Fp8Linear::from_parts(codes, sw, sx, None, lt)?
@@ -1284,8 +1308,12 @@ fn decode(
             LogicalTensor::Dense(st.load(&tensor.physical_key, device)?)
         }
         TensorCodecSpec::ScalarFp8 {
-            scale, input_scale, ..
+            scale,
+            input_scale,
+            full_precision_matrix_mult,
         } => {
+            #[cfg(not(feature = "cuda"))]
+            let _ = full_precision_matrix_mult;
             let (expected_dtype, element) = match tensor.encoding {
                 WeightEncoding::Fp8E4M3 => (
                     StDtype::F8_E4M3,
@@ -1340,6 +1368,7 @@ fn decode(
                             weight_scale,
                             weight_scale_from_companion,
                             input_scale,
+                            full_precision_matrix_mult: *full_precision_matrix_mult,
                         }
                     }
                     #[cfg(not(feature = "cuda"))]
@@ -1745,6 +1774,7 @@ pub fn apply_transform(
             weight_scale,
             weight_scale_from_companion,
             input_scale,
+            full_precision_matrix_mult,
         } => {
             let sliced = codes.narrow(0, start, len)?;
             let codes = if transform.half_swap {
@@ -1767,6 +1797,7 @@ pub fn apply_transform(
                 weight_scale,
                 weight_scale_from_companion,
                 input_scale,
+                full_precision_matrix_mult,
             })
         }
         LogicalTensor::PackedNvfp4 {

@@ -186,9 +186,6 @@ impl NativeProjection {
             let desc = convrot_int8::descriptor(blob, base)?;
             use gen_core::comfy_quant::ComfyQuantFormat::*;
             if matches!(desc.format, Float8E4M3Fn | Float8E5M2 | Fp8Rowwise | Mxfp8) {
-                if desc.full_precision_matrix_mult {
-                    return Err(format!("{base}: full precision FP8 requires the dense decode selected by the checkpoint").into());
-                }
                 let codes = w.require(key)?.clone();
                 let shape: Vec<_> = codes.shape().iter().map(|&n| n as usize).collect();
                 let logical = if desc.format == Mxfp8 {
@@ -203,13 +200,14 @@ impl NativeProjection {
                 let bias = bias
                     .then(|| w.require(&format!("{base}.bias")).cloned())
                     .transpose()?;
-                return Ok(Some(Self::Fp8(fp8::Fp8Linear::new(
+                return Ok(Some(Self::Fp8(fp8::Fp8Linear::from_source(
                     desc.format,
                     codes,
                     Some(scale),
                     sx,
                     logical,
                     bias,
+                    desc.full_precision_matrix_mult,
                 )?)));
             }
             if desc.format != ConvRotInt8 {

@@ -48,10 +48,7 @@ impl CodecResidencyPolicy for MlxCodecResidency {
                 spec,
                 TensorCodecSpec::ConvRotInt8 { .. }
                     | TensorCodecSpec::RowwiseFp8 { .. }
-                    | TensorCodecSpec::ScalarFp8 {
-                        full_precision_matrix_mult: false,
-                        ..
-                    }
+                    | TensorCodecSpec::ScalarFp8 { .. }
                     | TensorCodecSpec::Mxfp8 {
                         full_precision_matrix_mult: false,
                         ..
@@ -362,13 +359,7 @@ pub fn projection_plan(
             if shape.len() == 3
                 && (self.expert)(key)
                 && metal_available()
-                && matches!(
-                    spec,
-                    TensorCodecSpec::ScalarFp8 {
-                        full_precision_matrix_mult: false,
-                        ..
-                    }
-                )
+                && matches!(spec, TensorCodecSpec::ScalarFp8 { .. })
             {
                 ResidencyMode::Packed
             } else if (self.expert)(key) {
@@ -689,7 +680,7 @@ fn bind_layout_with_dtypes(
             let shape = (format == ComfyQuantFormat::Mxfp8).then_some(t.shape.as_slice());
             tensors.insert(
                 format!("{base}.comfy_quant"),
-                crate::fp8::descriptor_array(format, false, shape),
+                crate::fp8::descriptor_array(format, t.codec.full_precision_matrix_mult(), shape),
             );
             tensors.insert(
                 format!("{base}.weight_scale"),
