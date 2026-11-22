@@ -346,7 +346,45 @@ pub fn x_decode(report: &DecodeReport) -> Value {
             "fallbacks": pc.fallbacks,
         });
     }
+    if let Some(ref adaptive) = report.adaptive_speculative {
+        v["adaptive_speculative"] = adaptive_speculative_json(adaptive);
+    }
     v
+}
+
+/// Adaptive speculative telemetry for `x_decode` (SW-F357 / SW-7237).
+fn adaptive_speculative_json(a: &mlx_llm::core_llm::AdaptiveSpeculativeReport) -> Value {
+    json!({
+        "adaptive": a.adaptive,
+        "candidates": a.candidates.iter().map(|c| c.label()).collect::<Vec<_>>(),
+        "initial_proposer": a.initial_proposer.label(),
+        "initial_depth": a.initial_depth,
+        "final_proposer": a.final_proposer.label(),
+        "final_depth": a.final_depth,
+        "depth_changes": a.depth_changes,
+        "proposer_switches": a.proposer_switches,
+        "plain_reason": a.plain_reason,
+        "events": a.events.iter().map(|e| json!({
+            "token_offset": e.token_offset,
+            "verify_step": e.verify_step,
+            "kind": e.kind.label(),
+            "from_proposer": e.from_proposer.label(),
+            "from_depth": e.from_depth,
+            "to_proposer": e.to_proposer.label(),
+            "to_depth": e.to_depth,
+            "reason": e.reason,
+        })).collect::<Vec<_>>(),
+        "cost": a.cost.map(|c| json!({
+            "proposal_ms": c.proposal_ms(),
+            "verify_ms": c.verify_ms(),
+            "rollback_ms": c.rollback_ms(),
+            "sync_ms": c.sync_ms(),
+            "total_ms": c.total_ms(),
+            "host_syncs": c.host_syncs,
+            "committed_tokens": c.committed_tokens,
+            "ms_per_committed_token": c.ms_per_committed_token(),
+        })),
+    })
 }
 
 /// `auto`'s last judged window (sc-24446,
@@ -696,5 +734,75 @@ mod tests {
         assert_eq!(v["usage"]["prompt_tokens"], 3);
         assert_eq!(v["usage"]["completion_tokens"], 2);
         assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn x_decode_serializes_adaptive_speculative_report() {
+        use mlx_llm::core_llm::{
+            AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent,
+            AdaptiveSpeculativeReport, ProposerKind,
+        };
+        let report = DecodeReport {
+            proposer: ProposerKind::Mtp,
+            draft_tokens: Some(3),
+            adaptive_speculative: Some(AdaptiveSpeculativeReport {
+                adaptive: true,
+                candidates: vec![
+                    ProposerKind::Mtp,
+                    ProposerKind::PromptLookup,
+                    ProposerKind::None,
+                ],
+                initial_proposer: ProposerKind::Mtp,
+                initial_depth: 2,
+                final_proposer: ProposerKind::PromptLookup,
+                final_depth: 4,
+                depth_changes: 1,
+                proposer_switches: 1,
+                plain_reason: None,
+                events: vec![AdaptiveSpeculativeEvent {
+                    token_offset: 48,
+                    verify_step: 16,
+                    kind: AdaptiveEventKind::ProposerSwitched,
+                    from_proposer: ProposerKind::Mtp,
+                    from_depth: 3,
+                    to_proposer: ProposerKind::PromptLookup,
+                    to_depth: 4,
+                    reason: "probe prompt_lookup beat mtp".into(),
+                }],
+                cost: Some(AdaptiveCostSummary {
+                    proposal_ns: 4_000_000,
+                    verify_ns: 20_000_000,
+                    rollback_ns: 500_000,
+                    sync_ns: 1_500_000,
+                    total_ns: 26_000_000,
+                    host_syncs: 8,
+                    committed_tokens: 26,
+                }),
+            }),
+            ..Default::default()
+        };
+        let v = x_decode(&report);
+        let a = &v["adaptive_speculative"];
+        assert_eq!(a["adaptive"], true);
+        assert_eq!(a["candidates"], json!(["mtp", "prompt_lookup", "none"]));
+        assert_eq!(a["initial_proposer"], "mtp");
+        assert_eq!(a["initial_depth"], 2);
+        assert_eq!(a["final_proposer"], "prompt_lookup");
+        assert_eq!(a["final_depth"], 4);
+        assert_eq!(a["depth_changes"], 1);
+        assert_eq!(a["proposer_switches"], 1);
+        assert_eq!(a["events"][0]["kind"], "proposer_switched");
+        assert_eq!(a["events"][0]["to_proposer"], "prompt_lookup");
+        let expected_cost = json!({
+            "proposal_ms": 4.0,
+            "verify_ms": 20.0,
+            "rollback_ms": 0.5,
+            "sync_ms": 1.5,
+            "total_ms": 26.0,
+            "host_syncs": 8,
+            "committed_tokens": 26,
+            "ms_per_committed_token": 1.0,
+        });
+        assert_eq!(a["cost"], expected_cost);
     }
 }

@@ -2294,6 +2294,169 @@ def prefix_checkpoints_paired(
     return out
 
 
+_ADAPTIVE_COST_FIELDS = (
+    "proposal_ms",
+    "verify_ms",
+    "rollback_ms",
+    "sync_ms",
+    "total_ms",
+    "ms_per_committed_token",
+)
+
+
+def _summarize_adaptive_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not blocks:
+        return None
+    costs = [b["cost"] for b in blocks if isinstance(b.get("cost"), dict)]
+    cost_summary = (
+        {
+            field: _mean([v for v in (_number(c.get(field)) for c in costs) if v is not None])
+            for field in _ADAPTIVE_COST_FIELDS
+        }
+        if costs
+        else None
+    )
+    return {
+        "adaptive": any(bool(b.get("adaptive")) for b in blocks),
+        "initial_proposers": sorted(
+            {b["initial_proposer"] for b in blocks if isinstance(b.get("initial_proposer"), str)}
+        ),
+        "final_proposers": sorted(
+            {b["final_proposer"] for b in blocks if isinstance(b.get("final_proposer"), str)}
+        ),
+        "initial_depth": _mean(
+            [v for v in (_number(b.get("initial_depth")) for b in blocks) if v is not None]
+        ),
+        "final_depth": _mean(
+            [v for v in (_number(b.get("final_depth")) for b in blocks) if v is not None]
+        ),
+        "depth_changes": _mean(
+            [v for v in (_number(b.get("depth_changes")) for b in blocks) if v is not None]
+        ),
+        "proposer_switches": _mean(
+            [v for v in (_number(b.get("proposer_switches")) for b in blocks) if v is not None]
+        ),
+        "plain_reasons": sorted(
+            {b["plain_reason"] for b in blocks if isinstance(b.get("plain_reason"), str)}
+        ),
+        "cost": cost_summary,
+    }
+
+
+def _adaptive_telemetry(processes: list[Process], prompt_id: str, option: str) -> dict[str, Any] | None:
+    blocks = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        block = (table.get((prompt_id, option)) or {}).get("adaptive_speculative")
+        if isinstance(block, dict):
+            blocks.append(block)
+    return _summarize_adaptive_blocks(blocks)
+
+
+def _row_ratio_mean(processes: list[Process], prompt_id: str, option: str, field: str) -> float | None:
+    vals = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        row = table.get((prompt_id, option)) or {}
+        if field == "tokens_per_pass":
+            gen = _number(row.get("generated_tokens"))
+            ver = _number(row.get("verify_steps"))
+            if gen is not None and ver:
+                vals.append(gen / ver)
+        else:
+            v = _number(row.get(field))
+            if v is not None:
+                vals.append(v)
+    return _mean(vals)
+
+
+def adaptive_speculative_paired(
+    groups: dict[tuple[str, str], list[Process]], max_noise: float
+) -> list[dict[str, Any]]:
+    """Paired ``auto`` vs ``off`` (and ``epic/auto`` vs ``baseline/auto`` when present)
+    adaptive speculative summaries (SW-7237 AC3): full-request time, TTFT, decode rate,
+    accepted tokens per target pass, tokens per pass, peak memory, and adaptive transitions."""
+    out: list[dict[str, Any]] = []
+    for (_, _), processes in sorted(groups.items()):
+        epic = sorted((p for p in processes if p.run == "epic"), key=lambda p: p.index)
+        if not epic:
+            continue
+        config = document_config(epic[0])
+        options = set(config["options"])
+        if not ({"auto", "off"} <= options):
+            continue
+        has_adaptive = any(
+            isinstance(
+                (rows_by_key(p)[0].get((prompt_id, "auto")) or {}).get("adaptive_speculative"),
+                dict,
+            )
+            for p in epic
+            for prompt_id, _ in config["prompts"]
+        )
+        if not has_adaptive:
+            continue
+        baseline = sorted((p for p in processes if p.run == "baseline"), key=lambda p: p.index)
+        backend = epic[0].document.get("backend")
+        model = family_label(epic[0])
+        row_label = f"{epic[0].campaign}/{epic[0].row}"
+        for prompt_id, prompt_class in config["prompts"]:
+            vs_off: dict[str, Any] = {}
+            for metric, higher in (
+                ("wall_ms", False),
+                ("ttft_ms", False),
+                ("decode_tok_s", True),
+            ):
+                vs_off[metric] = verdict(
+                    metric_values(epic, prompt_id, "auto", metric),
+                    metric_values(epic, prompt_id, "off", metric),
+                    higher,
+                    max_noise,
+                )
+            vs_baseline_auto: dict[str, Any] | None = None
+            if baseline and "auto" in set(document_config(baseline[0])["options"]):
+                vs_baseline_auto = {
+                    metric: verdict(
+                        metric_values(epic, prompt_id, "auto", metric),
+                        metric_values(baseline, prompt_id, "auto", metric),
+                        higher,
+                        max_noise,
+                    )
+                    for metric, higher in (
+                        ("wall_ms", False),
+                        ("ttft_ms", False),
+                        ("decode_tok_s", True),
+                    )
+                }
+            out.append(
+                {
+                    "backend": backend,
+                    "model": model,
+                    "row": row_label,
+                    "prompt_id": prompt_id,
+                    "class": prompt_class,
+                    "sampling": epic[0].document.get("sampling"),
+                    "epic_n": len(epic),
+                    "baseline_n": len(baseline),
+                    "wall_ms": vs_off["wall_ms"],
+                    "ttft_ms": vs_off["ttft_ms"],
+                    "decode_tok_s": vs_off["decode_tok_s"],
+                    "vs_baseline_auto": vs_baseline_auto,
+                    "accepted_per_pass": _row_ratio_mean(
+                        epic, prompt_id, "auto", "mean_accepted_length"
+                    ),
+                    "tokens_per_pass": _row_ratio_mean(
+                        epic, prompt_id, "auto", "tokens_per_pass"
+                    ),
+                    "peak_memory_bytes": {
+                        "auto": series(metric_values(epic, prompt_id, "auto", "peak_memory_bytes")),
+                        "off": series(metric_values(epic, prompt_id, "off", "peak_memory_bytes")),
+                    },
+                    "adaptive_speculative": _adaptive_telemetry(epic, prompt_id, "auto"),
+                }
+            )
+    return out
+
+
 def _fmt(value: Any, digits: int = 1) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
 
@@ -2465,6 +2628,42 @@ def markdown_report(report: dict[str, Any]) -> str:
                 f"{_cmp_cell(item['wall_ms'], 1)} | {_cmp_cell(item['ttft_ms'], 1)} | "
                 f"{_cmp_cell(item['decode_tok_s'], 2)} | {peak_cell} | {reuse_cell} | "
                 f"{cap_ms} | {res_ms} | {bytes_cell} |"
+            )
+    if report.get("adaptive_speculative"):
+        gib = 1024**3
+        lines += [
+            "",
+            "## Adaptive speculative — paired auto vs off (SW-7237)",
+            "",
+            "| backend | family | row | prompt | wall ms (auto vs off, Δ %) | TTFT ms (auto vs off, Δ %) | decode tok/s (auto vs off, Δ %) | accepted/pass | tok/pass | peak mem GiB (auto / off) | initial -> final | depthΔ / switches |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for item in report["adaptive_speculative"]:
+            def _cmp_adaptive(m: dict[str, Any], digits: int = 1) -> str:
+                c = (m.get("candidate") or {}).get("mean")
+                r = (m.get("reference") or {}).get("mean")
+                d = m.get("delta_pct")
+                delta = "—" if d is None else f"{d:+.1f}%"
+                return f"{_fmt(c, digits)} vs {_fmt(r, digits)} ({delta})"
+
+            auto_peak = ((item.get("peak_memory_bytes") or {}).get("auto") or {}).get("mean")
+            off_peak = ((item.get("peak_memory_bytes") or {}).get("off") or {}).get("mean")
+            peak_cell = (
+                f"{'—' if auto_peak is None else f'{auto_peak / gib:.2f}'} / "
+                f"{'—' if off_peak is None else f'{off_peak / gib:.2f}'}"
+            )
+            ad = item.get("adaptive_speculative") or {}
+            init_p = ",".join(ad.get("initial_proposers") or []) or "—"
+            fin_p = ",".join(ad.get("final_proposers") or []) or "—"
+            transitions = (
+                f"{_fmt(ad.get('depth_changes'), 1)} / {_fmt(ad.get('proposer_switches'), 1)}"
+            )
+            lines.append(
+                f"| {item['backend']} | {item['model']} | {item['row']} | {item['prompt_id']} | "
+                f"{_cmp_adaptive(item['wall_ms'], 1)} | {_cmp_adaptive(item['ttft_ms'], 1)} | "
+                f"{_cmp_adaptive(item['decode_tok_s'], 2)} | {_fmt(item.get('accepted_per_pass'), 2)} | "
+                f"{_fmt(item.get('tokens_per_pass'), 2)} | {peak_cell} | {init_p} -> {fin_p} | "
+                f"{transitions} |"
             )
     if report.get("incomplete"):
         lines += [
@@ -2639,6 +2838,7 @@ def compare_campaigns(
         "not_comparable": not_comparable,
         "defaults": defaults,
         "prefix_checkpoints": prefix_checkpoints_paired(groups, max_noise),
+        "adaptive_speculative": adaptive_speculative_paired(groups, max_noise),
         "incomplete": incomplete,
         "notes": notes,
     }
@@ -2754,6 +2954,11 @@ def path_measurement(row: dict[str, Any], context: str) -> dict[str, Any] | None
         "prefix_checkpoints": (
             row.get("prefix_checkpoints")
             if isinstance(row.get("prefix_checkpoints"), dict)
+            else None
+        ),
+        "adaptive_speculative": (
+            row.get("adaptive_speculative")
+            if isinstance(row.get("adaptive_speculative"), dict)
             else None
         ),
     }
@@ -2911,10 +3116,20 @@ def summarize_paths(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     default=None,
                 ),
                 "prefix_checkpoints": _summarize_path_checkpoints(bucket),
+                "adaptive_speculative": _summarize_path_adaptive(bucket),
                 "speedup_vs_off": ratios,
             }
         )
     return out
+
+
+def _summarize_path_adaptive(bucket: list[dict[str, Any]]) -> dict[str, Any] | None:
+    blocks = [
+        e["measurement"]["adaptive_speculative"]
+        for e in bucket
+        if isinstance(e["measurement"].get("adaptive_speculative"), dict)
+    ]
+    return _summarize_adaptive_blocks(blocks)
 
 
 def _summarize_path_checkpoints(bucket: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -3067,6 +3282,28 @@ def paths_markdown(report: dict[str, Any]) -> str:
                     f"{_fmt(pc.get('capture_ms'), 2)} | {_fmt(pc.get('restore_ms'), 2)} | "
                     f"{_fmt(pc.get('captured_bytes'), 0)} | {_fmt(pc.get('resident_bytes'), 0)} | "
                     f"{_fmt(pc.get('protected_bytes'), 0)} | {','.join(pc.get('matched_kinds') or []) or '—'} |"
+                )
+        if any(r.get("adaptive_speculative") for r in rows):
+            lines += [
+                "",
+                "### Adaptive speculative",
+                "",
+                "| path | adaptive | initial -> final | depth (init -> final) | depthΔ | switches | ms/tok | plain reason |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            for row in rows:
+                ad = row.get("adaptive_speculative")
+                if not ad:
+                    continue
+                init_p = ",".join(ad.get("initial_proposers") or []) or "—"
+                fin_p = ",".join(ad.get("final_proposers") or []) or "—"
+                ms_tok = _fmt((ad.get("cost") or {}).get("ms_per_committed_token"), 2)
+                plain_r = "; ".join(ad.get("plain_reasons") or []) or "—"
+                lines.append(
+                    f"| {row['path']} | {ad.get('adaptive')} | {init_p} -> {fin_p} | "
+                    f"{_fmt(ad.get('initial_depth'), 1)} -> {_fmt(ad.get('final_depth'), 1)} | "
+                    f"{_fmt(ad.get('depth_changes'), 1)} | {_fmt(ad.get('proposer_switches'), 1)} | "
+                    f"{ms_tok} | {plain_r} |"
                 )
     if report["auto_inputs"]:
         lines += [

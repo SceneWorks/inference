@@ -264,8 +264,10 @@ where
         _: i32,
     ) -> Result<()> {
         let Some(fed) = self.fed.take() else {
-            // A step with no proposal (the budget clamped it to no drafts): `cur` was never fed.
+            // A step with no proposal from this proposer (budget clamp, plain probe, or another
+            // adaptive proposer ran): queue `cur` and any accepted drafts for the next proposal.
             self.pending.push(cur);
+            self.pending.extend_from_slice(accepted);
             return Ok(());
         };
         let draft = self.draft;

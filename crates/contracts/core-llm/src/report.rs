@@ -10,6 +10,9 @@
 
 use crate::request::Quantize;
 use crate::speculative::ProposerKind;
+pub use crate::speculative::{
+    AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent, AdaptiveSpeculativeReport,
+};
 
 /// Whether one optional backend feature is available on this host, and why not when it is not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -348,6 +351,11 @@ pub struct DecodeReport {
     pub draft_time: Option<DraftTime>,
     /// Exact multi-boundary prefix-checkpoint accounting (feature SW-F356).
     pub prefix_checkpoints: Option<PrefixCheckpointReport>,
+    /// Adaptive speculative decoding decisions, transitions, and cost summary (feature SW-F357,
+    /// story SW-7237): populated for both `auto` (adaptive) and explicit (`off` / `{proposer,
+    /// depth}`) requests so every effective proposer, depth change, switch, fallback, and
+    /// decision reason is visible.
+    pub adaptive_speculative: Option<AdaptiveSpeculativeReport>,
 }
 
 impl DecodeReport {
@@ -358,9 +366,19 @@ impl DecodeReport {
     /// `none` ([`CAPTIONER_NO_PREFIX_CACHE`](crate::CAPTIONER_NO_PREFIX_CACHE)). One call, so both
     /// backends' captioners report the same words (E8).
     pub fn with_captioner_reasons(mut self, mode: crate::Speculative) -> Self {
-        self.fallbacks = crate::no_proposer_fallback(mode, crate::CAPTIONER_NO_PROPOSER)
-            .into_iter()
-            .collect();
+        let fallback = crate::no_proposer_fallback(mode, crate::CAPTIONER_NO_PROPOSER);
+        self.adaptive_speculative = Some(match mode {
+            crate::Speculative::Auto => AdaptiveSpeculativeReport::auto_stayed_plain(
+                fallback
+                    .clone()
+                    .unwrap_or_else(|| crate::CAPTIONER_NO_PROPOSER.to_string()),
+                vec![ProposerKind::None],
+            ),
+            crate::Speculative::Off | crate::Speculative::Proposer { .. } => {
+                AdaptiveSpeculativeReport::explicit(ProposerKind::None, 0, fallback.clone(), None)
+            }
+        });
+        self.fallbacks = fallback.into_iter().collect();
         self.prefix_cache.reason = Some(crate::CAPTIONER_NO_PREFIX_CACHE.to_string());
         self
     }
