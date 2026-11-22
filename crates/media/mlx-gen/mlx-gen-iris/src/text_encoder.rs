@@ -431,6 +431,17 @@ pub(crate) fn tower_layer_of(name: &str) -> Option<usize> {
 /// Per decoder layer, its `(file key, built key)` pairs; and its read price.
 pub(crate) type TowerInventory = (Vec<Vec<(String, String)>>, Vec<crate::stream::BlockRead>);
 
+pub(crate) fn is_streamed_resident(name: &str) -> bool {
+    let Some(name) = name.strip_prefix(LANGUAGE_TOWER_PREFIX) else {
+        return false;
+    };
+    matches!(name, "embed_tokens.weight" | "norm.weight")
+        || matches!(
+            gen_core::checkpoint_codec::projection_companion_base(name),
+            Some("embed_tokens" | "norm")
+        )
+}
+
 pub(crate) fn tower_layer_inventory(
     files: &[std::path::PathBuf],
     layers: usize,
@@ -439,9 +450,20 @@ pub(crate) fn tower_layer_inventory(
     for file in files {
         headers.extend(crate::stream::headers(file)?);
     }
+    let prices = crate::stream::SourcePrices::compile(files, &headers, |name| {
+        tower_layer_of(name).is_some()
+    })?;
+    tower_inventory_from_headers(&headers, layers, &prices)
+}
+
+pub(crate) fn tower_inventory_from_headers(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    layers: usize,
+    prices: &crate::stream::SourcePrices,
+) -> Result<TowerInventory> {
     let mut grouped: Vec<Vec<&gen_core::weightsmeta::SafetensorsTensorHeader>> =
         vec![Vec::new(); layers];
-    for header in &headers {
+    for header in headers {
         if let Some(i) = tower_layer_of(&header.name) {
             grouped
                 .get_mut(i)
@@ -463,6 +485,7 @@ pub(crate) fn tower_layer_inventory(
         .map(|layer| {
             let mut keys: Vec<(String, String)> = layer
                 .iter()
+                .filter(|h| !prices.is_companion(&h.name))
                 .map(|h| (h.name.clone(), h.name.clone()))
                 .collect();
             keys.sort();
@@ -471,8 +494,8 @@ pub(crate) fn tower_layer_inventory(
         .collect();
     let reads = grouped
         .iter()
-        .map(|layer| crate::stream::block_read(layer, crate::stream::CastPolicy::Tower))
-        .collect();
+        .map(|layer| prices.block_read(layer, crate::stream::CastPolicy::Tower))
+        .collect::<Result<_>>()?;
     Ok((keys, reads))
 }
 
@@ -523,7 +546,8 @@ thread_local! {
 impl StreamedTower {
     /// Read and build layer `i` from a fresh view (the read proof's body), returning its arrays.
     pub(crate) fn read_layer(&self, i: usize) -> Result<Vec<Array>> {
-        let mut view = mlx_gen::weights::Weights::from_paths(&self.files, Path::new(""))?;
+        let mut view =
+            crate::stream::open_window(&self.files, std::slice::from_ref(&self.keys[i]))?;
         let map =
             crate::stream::materialize(&mut view, &self.keys[i], crate::stream::CastPolicy::Tower)?;
         let layer = StreamedLayer::build(&map, i, self.stored_quant)?;
@@ -538,7 +562,8 @@ impl StreamedTower {
 
     /// Read and build layer `i` (the streamed-layer proof runs its forward).
     pub(crate) fn build_layer(&self, i: usize) -> Result<StreamedLayer> {
-        let mut view = mlx_gen::weights::Weights::from_paths(&self.files, Path::new(""))?;
+        let mut view =
+            crate::stream::open_window(&self.files, std::slice::from_ref(&self.keys[i]))?;
         let map =
             crate::stream::materialize(&mut view, &self.keys[i], crate::stream::CastPolicy::Tower)?;
         StreamedLayer::build(&map, i, self.stored_quant)
@@ -804,12 +829,7 @@ impl IrisTextEncoder {
         let embed_key = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
         let norm_key = format!("{LANGUAGE_TOWER_PREFIX}norm.weight");
         let embed_base = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens");
-        let resident = |name: &str| {
-            name == embed_key
-                || name == norm_key
-                || gen_core::checkpoint_codec::projection_companion_base(name)
-                    == Some(embed_base.as_str())
-        };
+        let resident = is_streamed_resident;
         // iOS: only the embedding and the final norm are read here; every decoder layer is read
         // inside its own window's priced read quantum.
         crate::stream::before_tower_load(quanta::LOAD, &files, resident, &model_cfg, quant)?;
@@ -1223,7 +1243,7 @@ impl IrisTextEncoder {
             &plan,
             cancel,
             h,
-            || mlx_gen::weights::Weights::from_paths(&tower.files, Path::new("")),
+            || Ok(mlx_gen::weights::Weights::empty()),
             |mut h, view, range| {
                 #[cfg(test)]
                 TOWER_WINDOW_HOOK.with(|hook| {
@@ -1235,6 +1255,7 @@ impl IrisTextEncoder {
                     quanta::LAYER_READ,
                     crate::stream::window_read_bytes(&tower.reads[range.clone()]),
                 )?;
+                *view = crate::stream::open_window(&tower.files, &tower.keys[range.clone()])?;
                 let mut built = Vec::with_capacity(range.len());
                 for i in range.clone() {
                     let map = crate::stream::materialize(

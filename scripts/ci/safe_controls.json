@@ -1703,6 +1703,18 @@
         "darwin"
       ],
       "reason": "Array-handle and source-layout metadata only: validates companion remapping, alias observations, atomic refusal and constructor-read tracking without tensor evaluation, projection construction, forward or kernel execution."
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "lib",
+      "target": "mlx_gen_iris",
+      "test": "stream::tests::selected_codec_windows_price_original_operands_rotation_and_coefficient_decode",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/src/stream.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Synthetic headers and a bounded JSON codec declaration feed pure source-plan, constructor, allocation and window arithmetic. No backend tensor, device probe or model execution."
     }
   ]
 }

@@ -1,33 +1,37 @@
-//! Rung 4 — **bounded transformer residency** for the Iris routes (epic 16774): the window
+//! Rung 4 â€” **bounded transformer residency** for the Iris routes (epic 16774): the window
 //! materialization both streamed components share, and the header-only price of one window read.
 //!
 //! A streamed component holds only its skeleton (embeddings, modulation cores, norms, heads)
-//! resident; each block stack — the backbone's trunk, PiT, text-adapter layerwise and refiner
-//! blocks, the Qwen3-VL tower's decoder layers — is read from the checkpoint ONE WINDOW at a time,
+//! resident; each block stack â€” the backbone's trunk, PiT, text-adapter layerwise and refiner
+//! blocks, the Qwen3-VL tower's decoder layers â€” is read from the checkpoint ONE WINDOW at a time,
 //! inside the window's own priced read quantum, run, and released before the next window is read.
 //! The schedule is the shared [`mlx_gen::block_residency::run_windowed`] driver (evaluate the carry
 //! before the window drops; drain the allocator after it).
 //!
 //! **The read is the eager loader's, per window.** Every tensor of the window is taken OUT of a
 //! freshly opened lazy view, its file bytes read on MLX's CPU stream first (a GPU cast over an unread
-//! load makes the command buffer wait on the disk — sc-24245), cast exactly as the eager loader casts
+//! load makes the command buffer wait on the disk â€” sc-24245), cast exactly as the eager loader casts
 //! it (`CastPolicy`), and evaluated before the next tensor is read, so a window's read peak is the
-//! window as held plus ONE source tensor beside its cast — never the whole window at both widths.
+//! window as held plus ONE source tensor beside its cast â€” never the whole window at both widths.
 //! The block is then built from those materialized tensors by the SAME constructors the resident
 //! load uses, so a streamed block is the resident block, value for value.
 //!
 //! **Only stored tiers stream.** A streamed load reads a tier exactly as the artifact stores it: the
 //! dense release at the dense tier, or a packed export (`crate::packed`) at its own tier. A dense
-//! artifact asked for at `q8`/`q4` would re-quantize every window on every forward — a load-time
+//! artifact asked for at `q8`/`q4` would re-quantize every window on every forward â€” a load-time
 //! requantization no capture measured, which publishes no calibration identity on any route
-//! ([`crate::memory_strategy`]) — so the streamed loaders refuse it by name
+//! ([`crate::memory_strategy`]) â€” so the streamed loaders refuse it by name
 //! (`refuse_stream_requantization`).
 //!
 //! `window_read_bytes` prices a window from the checkpoint's HEADERS with the rule
 //! `materialize` executes; the runtime guard and the iOS pricing ([`crate::ios_pricing`]) both
 //! call it, and `crate::quantum_proofs` proves it against MLX's measured peak of a real read.
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use mlx_gen::gen_core::checkpoint_codec::{LogicalWeightPlan, ResidencyMode, TensorCodecSpec};
+use mlx_llm::mlx_layers::source;
 
 use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader};
 use mlx_gen::weights::Weights;
@@ -42,12 +46,12 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 /// The window rung 4 runs at when a selection names none.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
-/// How a materialization casts one tensor — the loader whose cast it replays.
+/// How a materialization casts one tensor â€” the loader whose cast it replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CastPolicy {
     /// The backbone loaders ([`crate::model::load_backbone_quantized`],
     /// [`crate::depth::load_depth_export`]) at ordinary floating storage: floating matrices
-    /// (rank ≥ 2) but the text position table and packed parts to compute; vectors as stored.
+    /// (rank â‰¥ 2) but the text position table and packed parts to compute; vectors as stored.
     /// The existing window policy leaves numeric/F64 matrices stored, unlike root eager reads;
     /// constructor accounting must therefore use this policy's actual post-read dtype.
     Backbone { compute: Dtype },
@@ -76,7 +80,7 @@ fn is_position_table(name: &str) -> bool {
 }
 
 /// Whether a stored tensor is part of a packed projection (its u32 codes, stored scales or biases)
-/// — the rule of [`crate::model::is_packed_part`], from a header.
+/// â€” the rule of [`crate::model::is_packed_part`], from a header.
 pub(crate) fn is_packed_part_header(header: &SafetensorsTensorHeader) -> bool {
     header.dtype == Stored::U32
         || header.name.ends_with(".scales")
@@ -133,7 +137,7 @@ pub(crate) fn tensor_read(header: &SafetensorsTensorHeader, policy: CastPolicy) 
     }
 }
 
-/// A same-width cast that still changes the dtype (f16 → bf16) is a new buffer too.
+/// A same-width cast that still changes the dtype (f16 â†’ bf16) is a new buffer too.
 fn mismatched(stored: Stored, target: Dtype) -> bool {
     matches!(
         (stored, target),
@@ -158,6 +162,272 @@ fn bias_cast(
     streamed_constructor_cast_bytes(header, &view, compute, policy)
 }
 
+/// The physical and generated operands of this checkpoint's compiled source plan. Compilation
+/// reads bounded codec metadata once per inventory; block prices use the selected physical keys.
+#[derive(Default)]
+pub(crate) struct SourcePrices {
+    plan: Option<LogicalWeightPlan>,
+    physical: BTreeMap<String, u64>,
+    decoded: BTreeMap<String, Vec<usize>>,
+    companions: HashSet<String>,
+}
+
+impl SourcePrices {
+    pub(crate) fn compile(
+        paths: &[PathBuf],
+        headers: &[SafetensorsTensorHeader],
+        selected: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
+        let plan = mlx_gen::gen_core::checkpoint_codec::projected_checkpoint_plan(
+            paths,
+            headers,
+            selected,
+            &source::MlxCodecResidency,
+            |_, shape| (shape.len() == 2).then(|| shape.to_vec()),
+        )?;
+        let Some(plan) = plan else {
+            return Ok(Self::default());
+        };
+        Self::from_plan(plan, headers)
+    }
+
+    fn from_plan(plan: LogicalWeightPlan, headers: &[SafetensorsTensorHeader]) -> Result<Self> {
+        // Both Iris loaders request the shared decoder's default BF16 file coefficients.
+        // Raw floating native biases retain their original width in the backend helper.
+        let physical = source::projected_bytes_from_plan(&plan, headers, |_| 2)?;
+        let decoded = plan
+            .tensors
+            .iter()
+            .filter(|row| {
+                row.residency.mode == ResidencyMode::Dense
+                    && !matches!(row.codec, TensorCodecSpec::Dense)
+            })
+            .map(|row| (row.physical_key.clone(), row.shape.clone()))
+            .collect();
+        let companions = plan
+            .companions
+            .iter()
+            .map(|c| c.physical_key.clone())
+            .collect();
+        Ok(Self {
+            plan: Some(plan),
+            physical,
+            decoded,
+            companions,
+        })
+    }
+
+    /// A physical companion belongs to its verified weight. Selecting the owner opens it;
+    /// take_renamed carries the normalized/generated spelling or the decoded coefficient.
+    pub(crate) fn is_companion(&self, name: &str) -> bool {
+        self.companions.contains(name)
+    }
+
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        self.physical.contains_key(name)
+    }
+
+    pub(crate) fn has_encoded(&self) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(LogicalWeightPlan::has_encoded_weights)
+    }
+
+    fn auxiliary(&self, selected: impl Fn(&str) -> bool, loading: bool) -> Result<u64> {
+        let Some(plan) = &self.plan else {
+            return Ok(0);
+        };
+        let alloc =
+            |n| mlx_gen::ios_quantum::fresh_metal_allocation_bytes(n, crate::retention::PAGE_BYTES);
+        if loading {
+            source::load_auxiliary_bytes(plan, selected, alloc)
+        } else {
+            source::retained_auxiliary_bytes(plan, selected, alloc)
+        }
+        .ok_or_else(load_overflow)
+    }
+
+    pub(crate) fn load_extra(&self, selected: impl Fn(&str) -> bool) -> Result<u64> {
+        self.auxiliary(selected, true)
+    }
+
+    pub(crate) fn ordinary_rows<'a>(
+        &self,
+        headers: &'a [SafetensorsTensorHeader],
+    ) -> std::borrow::Cow<'a, [SafetensorsTensorHeader]> {
+        if self.plan.is_none() {
+            return std::borrow::Cow::Borrowed(headers);
+        }
+        std::borrow::Cow::Owned(
+            headers
+                .iter()
+                .filter_map(|h| {
+                    if !self.owns(&h.name) {
+                        return Some(h.clone());
+                    }
+                    let shape = self.decoded.get(&h.name)?;
+                    let mut coefficient = h.clone();
+                    coefficient.shape.clone_from(shape);
+                    coefficient.dtype = Stored::BF16;
+                    coefficient.data_bytes = self.physical[&h.name];
+                    Some(coefficient)
+                })
+                .collect(),
+        )
+    }
+
+    /// A decoded backbone norm can finish in F32 although the file reader supplied a BF16
+    /// coefficient. Model-owned constructor precision affects retention, outside the read stage.
+    pub(crate) fn backbone_resident_rows<'a>(
+        &self,
+        headers: &'a [SafetensorsTensorHeader],
+        compute: Dtype,
+    ) -> Result<std::borrow::Cow<'a, [SafetensorsTensorHeader]>> {
+        let mut rows = self.ordinary_rows(headers);
+        if self.decoded.is_empty() {
+            return Ok(rows);
+        }
+        let view = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+        for row in rows
+            .to_mut()
+            .iter_mut()
+            .filter(|h| h.shape.len() == 1 && self.decoded.contains_key(&h.name))
+        {
+            if let Some(target) = backbone_constructor_target(&row.name, row, &view, compute) {
+                // A native matrix owns its bias at the source coefficient precision.
+                let native_bias = row.name.strip_suffix(".bias").is_some_and(|base| {
+                    let weight = format!("{base}.weight");
+                    self.owns(&weight) && !self.decoded.contains_key(&weight)
+                });
+                if !native_bias {
+                    row.data_bytes = row.materialized_bytes(crate::nn::dtype_bytes(target))?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(crate) fn packed_resident(&self, selected: impl Fn(&str) -> bool) -> Result<u64> {
+        self.resident(|name| selected(name) && !self.decoded.contains_key(name))
+    }
+
+    pub(crate) fn resident(&self, selected: impl Fn(&str) -> bool) -> Result<u64> {
+        let extra = self.auxiliary(&selected, false)?;
+        self.physical
+            .iter()
+            .filter(|(name, _)| selected(name))
+            .try_fold(extra, |n, (_, &bytes)| {
+                n.checked_add(source_allocation(bytes)?)
+                    .ok_or_else(load_overflow)
+            })
+    }
+
+    /// Apply ordinary constructor laws only to decoded coefficients. The encoded file bytes
+    /// and generated native operands are included separately in the same load quantum.
+    pub(crate) fn load_extras(
+        &self,
+        headers: &[SafetensorsTensorHeader],
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<(u64, u64)> {
+        let generated = self.auxiliary(&keep, false)?;
+        let upper = headers
+            .iter()
+            .filter(|h| keep(&h.name) && self.owns(&h.name))
+            .try_fold(self.load_extra(&keep)?, |n, h| {
+                n.checked_add(source_allocation(h.data_bytes)?)
+                    .ok_or_else(load_overflow)
+            })?;
+        Ok((upper, generated))
+    }
+
+    pub(crate) fn tower_load_output(
+        &self,
+        headers: &[SafetensorsTensorHeader],
+        keep: impl Fn(&str) -> bool,
+        rope: u64,
+    ) -> Result<(u64, u64)> {
+        if self.plan.is_none() {
+            return tower_load_output_bytes(headers, keep, rope);
+        }
+        let logical = headers
+            .iter()
+            .filter(|h| keep(&h.name))
+            .try_fold(0u64, |n, h| n.checked_add(h.data_bytes))
+            .ok_or_else(load_overflow)?;
+        let (source, _) = self.load_extras(headers, &keep)?;
+        let (dense, extra) = tower_load_output_bytes(&self.ordinary_rows(headers), keep, rope)?;
+        let additional = dense
+            .checked_add(extra)
+            .and_then(|n| n.checked_add(source))
+            .and_then(|n| n.checked_sub(logical))
+            .ok_or_else(load_overflow)?;
+        Ok((logical, additional))
+    }
+
+    pub(crate) fn block_read(
+        &self,
+        headers: &[&SafetensorsTensorHeader],
+        policy: CastPolicy,
+    ) -> Result<BlockRead> {
+        if !headers.iter().any(|h| self.owns(&h.name)) {
+            return Ok(block_read(headers, policy));
+        }
+        let selected: HashSet<_> = headers.iter().map(|h| h.name.as_str()).collect();
+        let keep = |name: &str| selected.contains(name);
+        let mut ordinary = Vec::new();
+        let mut decoded = Vec::new();
+        let mut held = self.auxiliary(keep, false)?;
+        let mut source_staging = self
+            .load_extra(keep)?
+            .checked_sub(held)
+            .ok_or_else(load_overflow)?;
+        for &h in headers {
+            let Some(&bytes) = self.physical.get(&h.name) else {
+                ordinary.push(h);
+                continue;
+            };
+            if let Some(shape) = self.decoded.get(&h.name) {
+                // materialize sees a decoded coefficient, then applies its ordinary cast and
+                // constructor. The raw file remains live while the source normalizes the window.
+                let mut coefficient = h.clone();
+                coefficient.shape.clone_from(shape);
+                coefficient.dtype = Stored::BF16;
+                coefficient.data_bytes = bytes;
+                decoded.push(coefficient);
+            } else {
+                held = held
+                    .checked_add(source_allocation(bytes)?)
+                    .ok_or_else(load_overflow)?;
+            }
+            if self.decoded.contains_key(&h.name) || bytes == 0 {
+                source_staging = source_staging
+                    .checked_add(source_allocation(h.data_bytes)?)
+                    .ok_or_else(load_overflow)?;
+            }
+        }
+        ordinary.extend(decoded.iter());
+        let mut read = block_read(&ordinary, policy);
+        read.held = read.held.checked_add(held).ok_or_else(load_overflow)?;
+        read.source_staging = source_staging;
+        Ok(read)
+    }
+}
+
+/// Open only the guarded window. Other layers' generated operands are allocated when their own
+/// windows open. The shared reader retains declarations and companion ownership across shards.
+pub(crate) fn open_window(paths: &[PathBuf], blocks: &[Vec<(String, String)>]) -> Result<Weights> {
+    let keys: HashSet<_> = blocks
+        .iter()
+        .flatten()
+        .map(|(file_key, _)| file_key.as_str())
+        .collect();
+    Weights::from_selected_files(paths, |_, key| {
+        keys.contains(key)
+            || mlx_gen::gen_core::checkpoint_codec::projection_companion_base(key)
+                .is_some_and(|base| keys.contains(base))
+    })
+}
+
 /// The price of one block's read: what the materialized block holds, and the largest source
 /// tensor alive beside its cast while it is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -165,6 +435,8 @@ pub(crate) struct BlockRead {
     /// Bytes the built block holds (its materialized tensors plus every constructor/getter
     /// target, conservatively retaining completed targets rather than assuming retirement).
     pub held: u64,
+    /// Source normalization may stage every decoded row in the opened window together.
+    pub source_staging: u64,
     /// The largest single [`TensorRead::transient`] of the block.
     pub transient: u64,
 }
@@ -196,7 +468,9 @@ pub(crate) fn block_read(headers: &[&SafetensorsTensorHeader], policy: CastPolic
 pub(crate) fn window_read_bytes(blocks: &[BlockRead]) -> u64 {
     let held = blocks.iter().fold(0u64, |a, b| a.saturating_add(b.held));
     let transient = blocks.iter().map(|b| b.transient).max().unwrap_or(0);
-    held.saturating_add(transient)
+    blocks.iter().fold(held.saturating_add(transient), |n, b| {
+        n.saturating_add(b.source_staging)
+    })
 }
 
 /// What a window of `blocks` holds while it runs (its read's transient released).
@@ -298,24 +572,37 @@ pub(crate) fn before_materialized_load(
     label: &str,
     components: &[std::path::PathBuf],
     keep: impl Fn(&str) -> bool,
-) -> Result<Option<LoadSources>> {
+) -> Result<Option<PricedLoadSources>> {
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(None);
     }
     let mut sources = Vec::with_capacity(components.len());
     let mut total = 0u64;
+    let mut source_extra = 0u64;
+    let mut generated = 0u64;
     for path in components {
-        let selected: Vec<_> = headers(path)?
-            .into_iter()
-            .filter(|h| keep(&h.name))
-            .collect();
+        let all = headers(path)?;
+        let prices = SourcePrices::compile(std::slice::from_ref(path), &all, &keep)?;
         total = total
-            .checked_add(materialized_load_bytes(&selected, |_| true)?)
+            .checked_add(materialized_load_bytes(&all, &keep)?)
             .ok_or_else(load_overflow)?;
-        sources.push(selected);
+        let (extra, retained) = prices.load_extras(&all, &keep)?;
+        let rows = prices
+            .ordinary_rows(&all)
+            .iter()
+            .filter(|h| keep(&h.name))
+            .cloned()
+            .collect();
+        source_extra = source_extra.checked_add(extra).ok_or_else(load_overflow)?;
+        generated = generated.checked_add(retained).ok_or_else(load_overflow)?;
+        sources.push(rows);
     }
     mlx_gen::ios_quantum::before(label, total)?;
-    Ok(Some(sources))
+    Ok(Some(PricedLoadSources {
+        headers: sources,
+        source_extra,
+        generated,
+    }))
 }
 
 /// A real pre-materialization stage, after the unchanged raw floor and before any native read,
@@ -339,6 +626,13 @@ pub(crate) fn before_export_targets(constructors: u64, elements: usize) -> Resul
 /// Selected headers from the ORIGINAL raw-floor read. The first file is the backbone, remaining
 /// files are shipped empty-prompt sources. No tensor data is read and no second parse is needed.
 pub(crate) type LoadSources = Vec<Vec<SafetensorsTensorHeader>>;
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct PricedLoadSources {
+    headers: LoadSources,
+    source_extra: u64,
+    generated: u64,
+}
 
 fn load_overflow() -> Error {
     Error::Unsupported("Iris joint load byte arithmetic overflow".into())
@@ -627,7 +921,7 @@ fn checked_group_alignment(input: usize) -> Result<()> {
 }
 
 /// Every stored-grid allocation is emitted by the same NN operator graph consumed by the
-/// native cumulative ledger. Padding and compute→BF16 conversions precede that graph.
+/// native cumulative ledger. Padding and computeâ†’BF16 conversions precede that graph.
 pub(crate) fn backbone_quantization_bytes(
     headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
     compute: Dtype,
@@ -920,7 +1214,7 @@ pub(crate) fn backbone_pending_plan(
 }
 
 pub(crate) fn before_backbone_targets(
-    sources: Option<LoadSources>,
+    sources: Option<PricedLoadSources>,
     prefix: &str,
     compute: Dtype,
     quant: Option<crate::nn::BackboneQuant>,
@@ -932,7 +1226,18 @@ pub(crate) fn before_backbone_targets(
     let Some(sources) = sources else {
         return Ok(PendingBackbone::default());
     };
-    let (total, pending) = backbone_pending_plan(&sources, prefix, compute, quant)?;
+    let (total, mut pending) = backbone_pending_plan(&sources.headers, prefix, compute, quant)?;
+    let total = total
+        .checked_add(sources.source_extra)
+        .ok_or_else(load_overflow)?;
+    pending.constructors = pending
+        .constructors
+        .checked_add(sources.generated)
+        .ok_or_else(load_overflow)?;
+    pending.evaluation = pending
+        .evaluation
+        .checked_add(sources.generated)
+        .ok_or_else(load_overflow)?;
     mlx_gen::ios_quantum::before(LOAD_TARGET_QUANTUM, total)?;
     Ok(pending)
 }
@@ -954,25 +1259,27 @@ pub(crate) fn before_tower_load(
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
-    let mut selected = Vec::new();
+    let mut all = Vec::new();
     for path in components {
         let file = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
             .map_err(|e| Error::Msg(e.to_string()))?;
-        selected.extend(file.into_iter().filter(|h| keep(&h.name)));
+        all.extend(file);
     }
+    let prices = SourcePrices::compile(components, &all, &keep)?;
+    let selected: Vec<_> = all.into_iter().filter(|h| keep(&h.name)).collect();
     let logical = selected.iter().try_fold(0u64, |sum, h| {
         sum.checked_add(h.data_bytes).ok_or_else(load_overflow)
     })?;
     mlx_gen::ios_quantum::before(label, logical)?;
     let (same_logical, additional) =
-        tower_load_output_bytes(&selected, |_| true, tower_rope_bytes(cfg)?)?;
+        prices.tower_load_output(&selected, |_| true, tower_rope_bytes(cfg)?)?;
     debug_assert_eq!(logical, same_logical);
     let quant = if cfg.quantization.is_none() {
         crate::text_encoder::text_encoder_quant_spec(cfg, requested)?
     } else {
         None
     };
-    let quantized = tower_quantization_bytes(&selected, |_| true, quant)?;
+    let quantized = tower_quantization_bytes(&prices.ordinary_rows(&selected), |_| true, quant)?;
     mlx_gen::ios_quantum::before(
         LOAD_TARGET_QUANTUM,
         logical
@@ -994,7 +1301,7 @@ pub(crate) fn refuse_stream_requantization(
         return Err(Error::Unsupported(format!(
             "{id}: a deferred-materialization (streamed) load reads {what} as stored, and it is \
              the dense artifact while LoadSpec::quantize asks for {requested:?}; streaming would \
-             re-quantize every window on every forward — use the packed {requested:?} export \
+             re-quantize every window on every forward â€” use the packed {requested:?} export \
              (`crate::packed`), or an eager load"
         )));
     }
@@ -1079,8 +1386,78 @@ mod tests {
     }
 
     #[test]
+    fn selected_codec_windows_price_original_operands_rotation_and_coefficient_decode() {
+        use mlx_gen::gen_core::checkpoint_codec::{
+            plan_projection_source_headers, CheckpointCodecRegistry, SourceCodecResidency,
+            BASELINE_CHECKPOINT_CODECS,
+        };
+        let row = |name: &str, dtype, shape: &[usize], data_bytes| SafetensorsTensorHeader {
+            name: name.into(),
+            dtype,
+            shape: shape.into(),
+            data_bytes,
+        };
+        let headers = vec![
+            row("blocks.0.q.weight", Stored::I8, &[2, 64], 128),
+            row("blocks.0.q.bias", Stored::F32, &[2], 8),
+            row("blocks.0.q.weight_scale", Stored::F32, &[2, 1], 8),
+            row("blocks.1.gain.weight", Stored::F8_E4M3, &[64], 64),
+            row("blocks.1.extra.weight", Stored::BF16, &[32], 64),
+        ];
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let tables = [r#"{"layers":{"blocks.0.q":{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64}}}"#.into()];
+        let plan = plan_projection_source_headers(
+            &headers,
+            &BTreeMap::new(),
+            |_| true,
+            &tables,
+            &registry,
+            &SourceCodecResidency,
+        )
+        .unwrap()
+        .unwrap();
+        let prices = SourcePrices::from_plan(plan, &headers).unwrap();
+        assert!(prices.is_companion("blocks.0.q.weight_scale"));
+        assert!(!prices.is_companion("blocks.1.extra.weight"));
+        let first: Vec<_> = headers[..3].iter().collect();
+        let block = prices.block_read(&first, CastPolicy::Tower).unwrap();
+        let rotation = 64 * 64 * 4;
+        let descriptor = mlx_gen::gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64;
+        assert_eq!(block.held, 128 + 8 + 8 + rotation);
+        assert_eq!(block.source_staging, rotation + descriptor);
+        let one = |name: &str| name.starts_with("blocks.0.");
+        assert_eq!(prices.resident(one).unwrap(), block.held);
+        let (raw, extra) = prices.tower_load_output(&headers, one, 0).unwrap();
+        assert_eq!(raw + extra, window_read_bytes(&[block]));
+        let gain = prices
+            .block_read(&[&headers[3]], CastPolicy::Tower)
+            .unwrap();
+        let held = prices
+            .backbone_resident_rows(&headers, Dtype::Bfloat16)
+            .unwrap();
+        assert_eq!(
+            held.iter()
+                .find(|h| h.name == "blocks.1.gain.weight")
+                .unwrap()
+                .data_bytes,
+            64 * 4
+        );
+        assert_eq!(gain.held, 64 * 2);
+        assert!(gain.source_staging > 64 * 4);
+        assert_eq!(
+            window_read_bytes(&[gain, block]),
+            window_read_bytes(&[gain]) + window_read_bytes(&[block])
+        );
+    }
+
+    #[test]
     fn the_largest_window_walks_ragged_windows() {
-        let b = |held, transient| BlockRead { held, transient };
+        let b = |held, transient| BlockRead {
+            held,
+            transient,
+            ..Default::default()
+        };
         let blocks = [b(10, 1), b(20, 5), b(30, 2)];
         assert_eq!(largest_window(&blocks, 1), (32, 30));
         assert_eq!(largest_window(&blocks, 2), (35, 30));
@@ -1227,8 +1604,17 @@ mod disabled_guard_tests {
                 .is_err()
         );
         assert_eq!(
-            before_backbone_targets(Some(vec![vec![overflowing]]), "", Dtype::Bfloat16, None)
-                .unwrap(),
+            before_backbone_targets(
+                Some(PricedLoadSources {
+                    headers: vec![vec![overflowing]],
+                    source_extra: 0,
+                    generated: 0
+                }),
+                "",
+                Dtype::Bfloat16,
+                None
+            )
+            .unwrap(),
             PendingBackbone::default()
         );
         before_export_targets(u64::MAX, usize::MAX).unwrap();

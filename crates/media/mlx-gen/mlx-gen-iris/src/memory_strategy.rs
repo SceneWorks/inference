@@ -664,7 +664,31 @@ pub(crate) fn backbone_bytes_where(
     keep: impl Fn(&str) -> bool,
 ) -> CoreResult<u64> {
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
-    backbone_bytes_from_headers(&headers, precision, quant, keep)
+    let prices = crate::stream::SourcePrices::compile(&[weights.to_owned()], &headers, &keep)?;
+    backbone_resident(&headers, precision, quant, keep, &prices)
+}
+
+pub(crate) fn backbone_resident(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    precision: Precision,
+    quant: Option<crate::nn::BackboneQuant>,
+    keep: impl Fn(&str) -> bool,
+    prices: &crate::stream::SourcePrices,
+) -> CoreResult<u64> {
+    let compute = match precision {
+        Precision::Bf16 => mlx_rs::Dtype::Bfloat16,
+        Precision::Fp32 => mlx_rs::Dtype::Float32,
+    };
+    let ordinary_bytes = backbone_bytes_from_headers(
+        &prices.backbone_resident_rows(headers, compute)?,
+        precision,
+        quant,
+        &keep,
+    )?;
+    // Decoded coefficients are already counted at their actual constructor precision.
+    ordinary_bytes
+        .checked_add(prices.packed_resident(keep)?)
+        .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: backbone resident byte overflow")))
 }
 
 pub(crate) fn backbone_bytes_from_headers(

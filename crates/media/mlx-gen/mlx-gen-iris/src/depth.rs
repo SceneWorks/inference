@@ -204,8 +204,10 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
     )?;
     let pending =
         crate::stream::before_backbone_targets(load_sources, BACKBONE_PREFIX, compute, None)?;
-    let mut source = Weights::from_file(&path)
-        .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
+    let mut source = Weights::from_selected_files(std::slice::from_ref(&path), |_, key| {
+        !streamed || !is_stack_key(key)
+    })
+    .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     // Split the export into the backbone (`pixel.*`, prefix stripped) and the reducer, casting each
     // backbone matrix to the compute dtype one tensor at a time (the generation loader's policy).
     let backbone_keys: Vec<_> = source
