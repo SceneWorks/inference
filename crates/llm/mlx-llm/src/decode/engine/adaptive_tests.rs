@@ -446,7 +446,8 @@ fn adaptive_resizes_depth_switches_proposers_and_hands_off_to_pipelined_plain() 
     for i in 0..75 {
         seq.push(30 + (i % 90));
     }
-    // Phase 2 (75..155): repeated prompt spans; prompt_lookup wins bounded probe.
+    // Phase 2 (75..155): repeated prompt spans; MTP lags on verbatim spans while prompt_lookup
+    // wins bounded probe.
     for i in 0..80 {
         seq.push(prompt[i % prompt.len()]);
     }
@@ -454,9 +455,10 @@ fn adaptive_resizes_depth_switches_proposers_and_hands_off_to_pipelined_plain() 
     for i in 0..60 {
         seq.push(30 + ((i * 7 + 13) % 90));
     }
-    // Phase 4 (215..300): MTP stops matching on expensive verify -> demotes to pipelined plain!
+    // Phase 4 (215..300): non-repeating tokens where MTP stops matching on expensive verify ->
+    // demotes to pipelined plain!
     for i in 0..85 {
-        seq.push(1 + (i % 9));
+        seq.push((i * 17 + i * i) % 120);
     }
 
     let config = greedy_config(seq.len());
@@ -489,7 +491,7 @@ fn adaptive_resizes_depth_switches_proposers_and_hands_off_to_pipelined_plain() 
         seq.clone(),
         clock.clone(),
         Duration::from_millis(8),
-        [0..215].to_vec(),
+        vec![0..75, 155..215],
     );
 
     let run = with_decode_clock(Some(clock), || {
@@ -1001,7 +1003,7 @@ fn adaptive_switch_to_prompt_lookup_runs_linear_when_primary_does_not_build_tree
             seq.clone(),
             clock.clone(),
             Duration::from_millis(8),
-            std::iter::once(0..seq.len()).collect(),
+            std::iter::once(0..32).collect(),
         );
         let plan = AutoSpeculativePlan {
             candidates: vec![

@@ -49,8 +49,14 @@ pub const ADAPTIVE_MAX_DEPTH_CHANGES: u32 = 6;
 /// Hard cap on mid-request proposer switches per request, including fallback to plain.
 pub const ADAPTIVE_MAX_SWITCHES: u32 = 4;
 
-/// Acceptance ratio (`accepted / proposed`) at or above which depth may grow toward `max_depth`.
+/// Acceptance ratio (`accepted / proposed`) and depth saturation (`accepted / (verifies * depth)`)
+/// at or above which depth may grow toward `max_depth`.
 pub const ADAPTIVE_GROW_ACCEPTANCE_RATIO: f64 = 0.75;
+
+/// Minimum fraction of the depth window (`proposed / (verifies * depth)`) that must be filled
+/// before depth may grow. Fixed-width proposers always have fill ratio `1.0`; for variable-width
+/// `prompt_lookup`, this prevents growing depth when matches only partially fill the current depth.
+pub const ADAPTIVE_GROW_FILL_RATIO: f64 = 0.80;
 
 /// Acceptance ratio (`accepted / proposed`) below which depth shrinks (when `accepted > 0`).
 pub const ADAPTIVE_SHRINK_ACCEPTANCE_RATIO: f64 = 0.35;
@@ -63,9 +69,21 @@ pub const ADAPTIVE_SWITCH_IMPROVEMENT_MARGIN: f64 = 0.08;
 /// probe to commit a switch over the incumbent.
 pub const ADAPTIVE_UNTIMED_SWITCH_GAIN: f64 = 1.25;
 
-/// Consecutive steps where CPU `prompt_lookup` peek finds a match of length `>= 2` before
-/// triggering a bounded probe from a GPU proposer to `prompt_lookup`.
+/// Consecutive steps where CPU `prompt_lookup` peek finds a match challenging the incumbent depth
+/// before triggering a bounded probe from a GPU proposer to `prompt_lookup`.
 pub const ADAPTIVE_LOOKUP_TRIGGER_MATCHES: u32 = 3;
+
+/// Minimum incumbent verify steps observed before a GPU proposer may be interrupted to probe
+/// `prompt_lookup`.
+pub const ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES: u32 = 4;
+
+/// Incumbent acceptance ratio (`accepted / proposed`) at or above which a GPU proposer is
+/// considered near saturation and will not be interrupted to probe `prompt_lookup` on MLX.
+pub const ADAPTIVE_LOOKUP_MAX_INCUMBENT_ACCEPT_RATIO: f64 = 0.70;
+
+/// Stricter incumbent acceptance-ratio ceiling on Candle/CUDA, where probing variable-width
+/// `prompt_lookup` incurs eager CUDA graph warm-ups and captures for new verify shapes.
+pub const ADAPTIVE_LOOKUP_MAX_INCUMBENT_ACCEPT_RATIO_CANDLE: f64 = 0.55;
 
 /// Consecutive zero-acceptance steps under `prompt_lookup` before probing an eligible synced
 /// GPU proposer (if one is available and not ruled out).
@@ -710,10 +728,12 @@ pub struct AdaptiveSpeculativeController {
 
     incumbent_ns_per_token: Option<f64>,
     incumbent_tokens_per_verify: f64,
+    incumbent_accept_ratio: Option<f64>,
     prev_depth_baseline: Option<(ProposerKind, u32, f64)>,
 
     active_probe: Option<ProbeState>,
     lookup_match_streak: u32,
+    last_lookup_peek_len: usize,
     lookup_dry_streak: u32,
 
     cooldown_remaining: u32,
@@ -807,9 +827,11 @@ impl AdaptiveSpeculativeController {
                 measured_window_seen: false,
                 incumbent_ns_per_token: None,
                 incumbent_tokens_per_verify: 1.0,
+                incumbent_accept_ratio: None,
                 prev_depth_baseline: None,
                 active_probe: None,
                 lookup_match_streak: 0,
+                last_lookup_peek_len: 0,
                 lookup_dry_streak: 0,
                 cooldown_remaining: 0,
                 depth_changes: 0,
@@ -883,9 +905,11 @@ impl AdaptiveSpeculativeController {
                 measured_window_seen: false,
                 incumbent_ns_per_token: None,
                 incumbent_tokens_per_verify: 1.0,
+                incumbent_accept_ratio: None,
                 prev_depth_baseline: None,
                 active_probe: None,
                 lookup_match_streak: 0,
+                last_lookup_peek_len: 0,
                 lookup_dry_streak: 0,
                 cooldown_remaining: 0,
                 depth_changes: 0,
@@ -947,9 +971,11 @@ impl AdaptiveSpeculativeController {
             measured_window_seen: false,
             incumbent_ns_per_token: None,
             incumbent_tokens_per_verify: 1.0,
+            incumbent_accept_ratio: None,
             prev_depth_baseline: None,
             active_probe: None,
             lookup_match_streak: 0,
+            last_lookup_peek_len: 0,
             lookup_dry_streak: 0,
             cooldown_remaining: 0,
             depth_changes: 0,
@@ -1089,7 +1115,9 @@ impl AdaptiveSpeculativeController {
         self.cooldown_remaining = self.cooldown_remaining.saturating_sub(1);
 
         // Track CPU prompt-lookup match streaks for repeated-context <-> open-ended switching.
-        if input.lookup_peek_len >= 2 {
+        self.last_lookup_peek_len = input.lookup_peek_len;
+        let lookup_min_peek = self.lookup_probe_min_peek();
+        if input.lookup_peek_len >= lookup_min_peek {
             self.lookup_match_streak = self.lookup_match_streak.saturating_add(1);
         } else {
             self.lookup_match_streak = 0;
@@ -1164,6 +1192,9 @@ impl AdaptiveSpeculativeController {
         }
         self.incumbent_tokens_per_verify =
             window_committed as f64 / f64::from(window_verifies.max(1));
+        if window_proposed > 0 {
+            self.incumbent_accept_ratio = Some(window_accepted as f64 / window_proposed as f64);
+        }
 
         self.reset_window();
 
@@ -1397,6 +1428,7 @@ impl AdaptiveSpeculativeController {
         };
 
         self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
+        self.incumbent_accept_ratio = None;
         self.reset_window();
         self.reset_clear_loss();
 
@@ -1466,20 +1498,70 @@ impl AdaptiveSpeculativeController {
         }
     }
 
+    /// Minimum `prompt_lookup` peek match length required to count toward a bounded probe streak.
+    ///
+    /// When the incumbent is a GPU proposer (`mtp`, `block_draft`, `draft_model`), require the
+    /// peeked match to meaningfully challenge the incumbent's current depth (at least 3 tokens,
+    /// and at least `active_depth`, capped at `prompt_lookup`'s own probe depth so deep lagging
+    /// GPU proposers can still be challenged within the engine's peek horizon).
+    fn lookup_probe_min_peek(&self) -> usize {
+        if is_gpu_proposer(self.active_proposer) {
+            let probe_depth = self.candidate_recommended_depth(ProposerKind::PromptLookup) as usize;
+            (self.active_depth as usize).max(3).min(probe_depth.max(2))
+        } else {
+            2
+        }
+    }
+
+    fn max_incumbent_accept_ratio_for_lookup(&self) -> f64 {
+        match self.plain {
+            PlainDecode::Candle => ADAPTIVE_LOOKUP_MAX_INCUMBENT_ACCEPT_RATIO_CANDLE,
+            PlainDecode::MlxPipelined | PlainDecode::MlxUnpipelined => {
+                ADAPTIVE_LOOKUP_MAX_INCUMBENT_ACCEPT_RATIO
+            }
+        }
+    }
+
+    /// Current incumbent acceptance ratio (`accepted / proposed`) once at least
+    /// [`ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES`] verify steps have been observed for the
+    /// incumbent, or `None` if insufficient samples exist yet.
+    fn current_incumbent_accept_ratio(&self) -> Option<f64> {
+        if self.window_verifies >= ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES
+            && self.window_proposed > 0
+        {
+            Some(self.window_accepted as f64 / self.window_proposed as f64)
+        } else if self.window_verifies > 0 && self.window_proposed > 0 {
+            let prev = self.incumbent_accept_ratio?;
+            let partial = self.window_accepted as f64 / self.window_proposed as f64;
+            Some(prev.max(partial))
+        } else {
+            self.incumbent_accept_ratio
+        }
+    }
+
     fn maybe_start_probe(&mut self, generated_tokens: u64) -> Option<AdaptiveAction> {
         let have_baseline =
             self.incumbent_ns_per_token.is_some() || (!self.timed && self.total_verifies >= 4);
-        let (probe_proposer, reason, is_dry_recovery) = if self.active_proposer
-            != ProposerKind::PromptLookup
+        let (probe_proposer, reason, is_dry_recovery) = if is_gpu_proposer(self.active_proposer)
             && self.lookup_match_streak >= ADAPTIVE_LOOKUP_TRIGGER_MATCHES
             && self.can_switch_to(ProposerKind::PromptLookup)
-            && (have_baseline || self.window_verifies >= 4)
+            && (have_baseline || self.window_verifies >= ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES)
         {
+            let max_inc_ratio = self.max_incumbent_accept_ratio_for_lookup();
+            let inc_ratio = self.current_incumbent_accept_ratio()?;
+            if inc_ratio >= max_inc_ratio {
+                return None;
+            }
+            let min_peek = self.lookup_probe_min_peek();
             (
                 ProposerKind::PromptLookup,
                 format!(
-                    "prompt_lookup matched >=2 tokens for {} consecutive steps; starting bounded probe",
-                    self.lookup_match_streak
+                    "prompt_lookup matched >={min_peek} tokens for {} consecutive steps while `{}` \
+                     acceptance {:.0}% < {:.0}%; starting bounded probe",
+                    self.lookup_match_streak,
+                    self.active_proposer.label(),
+                    inc_ratio * 100.0,
+                    max_inc_ratio * 100.0,
                 ),
                 false,
             )
@@ -1512,9 +1594,15 @@ impl AdaptiveSpeculativeController {
         // streak, compare against the dry streak's own recent cost (or plain baseline) rather
         // than a stale repeated-context rate from earlier in the request.
         let inc_ns_per_tok = if is_dry_recovery {
-            let dry_n = (self.lookup_dry_streak as usize).min(self.window_timed.len());
-            let dry_tail = &self.window_timed[self.window_timed.len().saturating_sub(dry_n)..];
-            let stretch = Stretch::of(dry_tail);
+            let dry_tail: Vec<TimedStep> = self
+                .window_timed
+                .iter()
+                .rev()
+                .take(self.lookup_dry_streak as usize)
+                .take_while(|ts| ts.tokens <= 1)
+                .copied()
+                .collect();
+            let stretch = Stretch::of(&dry_tail);
             (stretch.steps >= 2 && stretch.tokens > 0 && stretch.ns > 0)
                 .then(|| stretch.ns as f64 / stretch.tokens as f64)
                 .or_else(|| self.plain_step_ns().map(|p| p as f64))
@@ -1550,6 +1638,7 @@ impl AdaptiveSpeculativeController {
         self.active_proposer = probe_proposer;
         self.active_depth = probe_depth;
         self.lookup_match_streak = 0;
+        self.last_lookup_peek_len = 0;
         self.lookup_dry_streak = 0;
         self.events.push(AdaptiveSpeculativeEvent {
             token_offset: generated_tokens,
@@ -1594,6 +1683,7 @@ impl AdaptiveSpeculativeController {
             self.depth_changes += 1;
             self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
             self.prev_depth_baseline = None;
+            self.incumbent_accept_ratio = None;
             self.reset_clear_loss();
             // Record the window as non-demoting so `speculative_demoted_at` and
             // `speculative_monitor.demoted` remain consistent.
@@ -1652,7 +1742,7 @@ impl AdaptiveSpeculativeController {
                     return false;
                 }
                 if k == ProposerKind::PromptLookup {
-                    self.lookup_match_streak >= 1
+                    self.lookup_match_streak >= 1 || self.last_lookup_peek_len >= 2
                 } else {
                     true
                 }
@@ -1665,6 +1755,9 @@ impl AdaptiveSpeculativeController {
                 self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
                 self.prev_depth_baseline = None;
                 self.incumbent_ns_per_token = None;
+                self.incumbent_accept_ratio = None;
+                self.lookup_match_streak = 0;
+                self.last_lookup_peek_len = 0;
                 self.reset_window();
                 self.reset_clear_loss();
                 self.last_monitor = Some(MonitorDecision {
@@ -1747,6 +1840,7 @@ impl AdaptiveSpeculativeController {
                     self.depth_changes += 1;
                     self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
                     self.prev_depth_baseline = None;
+                    self.incumbent_accept_ratio = None;
                     let reason = format!(
                         "depth {depth} cost {:.2} ms/tok > prior depth {prev_d} cost {:.2} ms/tok; \
                          reverted and capped max_depth={prev_d}",
@@ -1777,18 +1871,34 @@ impl AdaptiveSpeculativeController {
             return None;
         }
         let acceptance_ratio = window_accepted as f64 / window_proposed as f64;
+        let depth_capacity = (u64::from(window_verifies.max(1)) * u64::from(depth.max(1))) as f64;
+        let depth_fill_ratio = window_proposed as f64 / depth_capacity;
+        let depth_saturation = window_accepted as f64 / depth_capacity;
         let mal = window_accepted as f64 / f64::from(window_verifies.max(1));
 
-        // 2. Grow depth when acceptance ratio is high and (if timed) gain exceeds break-even + margin.
+        // 2. Grow depth only when the current depth window is genuinely saturated (both fill ratio
+        //    and accepted/capacity meet threshold — equivalent to `acceptance_ratio >= 0.75` for
+        //    fixed-width proposers, while preventing variable-width `prompt_lookup` from growing
+        //    depth when matches only partially fill the current depth) and (if timed) gain exceeds
+        //    break-even + margin.
         let gain_allows_grow = match decision.gain() {
             Some(g) => g >= 1.0 + MEASURED_GAIN_MARGIN,
             None => true,
         };
         if depth < max_depth
             && acceptance_ratio >= ADAPTIVE_GROW_ACCEPTANCE_RATIO
+            && depth_fill_ratio >= ADAPTIVE_GROW_FILL_RATIO
+            && depth_saturation >= ADAPTIVE_GROW_ACCEPTANCE_RATIO
             && gain_allows_grow
         {
-            let step = (depth / 2).max(1);
+            let step =
+                if self.plain == PlainDecode::Candle && proposer == ProposerKind::PromptLookup {
+                    // Variable-width `prompt_lookup` on Candle pays CUDA graph warm-up/capture for
+                    // each new verify shape; grow conservatively by +1 per saturated window.
+                    1
+                } else {
+                    (depth / 2).clamp(1, 2)
+                };
             let next_depth = (depth + step).min(max_depth);
             if next_depth > depth {
                 if let Some(curr_ns) = window_ns_per_tok {
@@ -1797,10 +1907,13 @@ impl AdaptiveSpeculativeController {
                 self.active_depth = next_depth;
                 self.depth_changes += 1;
                 self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
+                self.incumbent_accept_ratio = None;
                 let reason = format!(
-                    "window {} acceptance {:.0}% (mal {:.2}/{}) >= {:.0}%; grew depth {} -> {} (cap {})",
+                    "window {} acceptance {:.0}% (fill {:.0}%, saturation {:.0}%, mal {:.2}/{}) >= {:.0}%; grew depth {} -> {} (cap {})",
                     decision.window,
                     acceptance_ratio * 100.0,
+                    depth_fill_ratio * 100.0,
+                    depth_saturation * 100.0,
                     mal,
                     depth,
                     ADAPTIVE_GROW_ACCEPTANCE_RATIO * 100.0,
@@ -1833,6 +1946,7 @@ impl AdaptiveSpeculativeController {
                 self.depth_changes += 1;
                 self.cooldown_remaining = ADAPTIVE_COOLDOWN_VERIFIES;
                 self.prev_depth_baseline = None;
+                self.incumbent_accept_ratio = None;
                 let reason = format!(
                     "window {} acceptance {:.0}% (mal {:.2}/{}) < {:.0}%; shrunk depth {} -> {}",
                     decision.window,
@@ -1862,6 +1976,13 @@ impl AdaptiveSpeculativeController {
 
         None
     }
+}
+
+fn is_gpu_proposer(kind: ProposerKind) -> bool {
+    matches!(
+        kind,
+        ProposerKind::Mtp | ProposerKind::BlockDraft | ProposerKind::DraftModel
+    )
 }
 
 fn describe_loss(decision: &MonitorDecision, clear_loss: bool) -> String {
@@ -2183,7 +2304,8 @@ mod tests {
         let mut tokens = 1u64;
         run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
 
-        // Establish MTP baseline (~6ms/tok: 18ms for 3 tokens), then trigger repeated context.
+        // Establish lagging MTP baseline (avg 1.5/3 = 50% acceptance, ~6ms/tok: 15ms for 2.5
+        // tokens), then trigger repeated context.
         let mut probe_started = false;
         for step in 0..ACCEPTANCE_PROBE_VERIFIES + 4 {
             let p = ctrl.next_step();
@@ -2191,18 +2313,20 @@ mod tests {
                 probe_started = true;
                 break;
             }
-            tokens += 3;
+            let accepted = if step % 2 == 0 { 1 } else { 2 };
+            let committed = 1 + accepted;
+            tokens += committed as u64;
             let peek = if step >= ACCEPTANCE_PROBE_VERIFIES {
                 4
             } else {
                 0
             };
             let action = ctrl.observe_step(AdaptiveStepInput {
-                accepted: 2,
+                accepted,
                 drafts: 3,
-                committed: 3,
+                committed,
                 generated_tokens: tokens,
-                cost: step_cost(6_000_000, 10_000_000, 500_000, 1_500_000, 1),
+                cost: step_cost(4_000_000, 9_000_000, 500_000, 1_500_000, 1),
                 lookup_peek_len: peek,
             });
             if matches!(
@@ -2323,14 +2447,15 @@ mod tests {
         let mut tokens = 1u64;
         run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
 
-        // 4 steps with lookup_peek_len >= 2 trigger probe of PromptLookup.
+        // 4 steps with a lagging MTP incumbent (1/3 = 33% < 55%) and lookup_peek_len >= 3
+        // trigger a bounded probe of PromptLookup.
         let mut started = false;
         for _ in 0..6 {
-            tokens += 3;
+            tokens += 2;
             let action = ctrl.observe_step(AdaptiveStepInput {
-                accepted: 2,
+                accepted: 1,
                 drafts: 3,
-                committed: 3,
+                committed: 2,
                 generated_tokens: tokens,
                 cost: step_cost(3_000_000, 8_000_000, 500_000, 500_000, 1),
                 lookup_peek_len: 3,
@@ -2635,14 +2760,15 @@ mod tests {
         let mut tokens = 1u64;
         run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
 
-        // Establish a fast MTP baseline and trigger a bounded probe to PromptLookup.
+        // Establish a lagging MTP baseline (1/2 = 50% < 55%) and trigger a bounded probe to
+        // PromptLookup.
         let mut started_probe = false;
         for _ in 0..8 {
-            tokens += 3;
+            tokens += 2;
             let action = ctrl.observe_step(AdaptiveStepInput {
-                accepted: 2,
+                accepted: 1,
                 drafts: 2,
-                committed: 3,
+                committed: 2,
                 generated_tokens: tokens,
                 cost: step_cost(1_000_000, 10_000_000, 100_000, 200_000, 1),
                 lookup_peek_len: 4,
@@ -2707,5 +2833,404 @@ mod tests {
             "must not emit ProbeReverted to retired incumbent: {:?}",
             report.events
         );
+    }
+
+    #[test]
+    fn saturated_gpu_proposer_does_not_probe_prompt_lookup_on_short_or_repeated_streaks() {
+        let caps = caps_all();
+        for plain in [PlainDecode::Candle, PlainDecode::MlxPipelined] {
+            let plan = resolve_auto_candidates(&caps, Default::default());
+            let mut ctrl = AdaptiveSpeculativeController::for_request(
+                Speculative::Auto,
+                plan,
+                vec![
+                    ProposerKind::Mtp,
+                    ProposerKind::PromptLookup,
+                    ProposerKind::None,
+                ],
+                plain,
+                true,
+                3,
+                ProposerKind::Mtp,
+                3,
+                None,
+            );
+            let mut tokens = 1u64;
+            run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
+
+            // Saturated MTP@3 (3/3 accepted = 100%, 6.18ms/tok): neither short match=2 streaks
+            // nor sustained match=4 streaks may interrupt it for a wasteful PromptLookup probe.
+            for step in 0..32u32 {
+                let p = ctrl.next_step();
+                assert_eq!((p.proposer, p.depth), (ProposerKind::Mtp, 3));
+                tokens += 4;
+                let peek = if step < 16 { 2 } else { 4 };
+                let action = ctrl.observe_step(AdaptiveStepInput {
+                    accepted: 3,
+                    drafts: 3,
+                    committed: 4,
+                    generated_tokens: tokens,
+                    cost: step_cost(1_200_000, 22_000_000, 0, 1_520_000, 0),
+                    lookup_peek_len: peek,
+                });
+                assert_eq!(
+                    action,
+                    AdaptiveAction::Continue,
+                    "saturated MTP@3 on {plain:?} must not probe PromptLookup at step {step} (peek={peek})"
+                );
+            }
+            let report = ctrl.report();
+            assert_eq!(report.final_proposer, ProposerKind::Mtp);
+            assert_eq!(report.proposer_switches, 0);
+            assert!(
+                !report
+                    .events
+                    .iter()
+                    .any(|e| e.kind == AdaptiveEventKind::ProbeStarted),
+                "unexpected ProbeStarted on saturated MTP@3 ({plain:?}): {:?}",
+                report.events
+            );
+        }
+
+        // On Candle (strict 0.55 ceiling), even 2/3 (67%) MTP must not trigger a variable-width
+        // PromptLookup probe, whereas on MLX (0.70 ceiling) 2/3 DOES probe on match>=3 (not match=2).
+        let plan = resolve_auto_candidates(&caps, Default::default());
+        let mut candle_ctrl = AdaptiveSpeculativeController::for_request(
+            Speculative::Auto,
+            plan.clone(),
+            vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            PlainDecode::Candle,
+            true,
+            4,
+            ProposerKind::Mtp,
+            3,
+            None,
+        );
+        let mut tokens = 1u64;
+        run_plain_probe(&mut candle_ctrl, 10_000_000, &mut tokens);
+        for _ in 0..12 {
+            tokens += 3;
+            let action = candle_ctrl.observe_step(AdaptiveStepInput {
+                accepted: 2,
+                drafts: 3,
+                committed: 3,
+                generated_tokens: tokens,
+                cost: step_cost(2_000_000, 14_000_000, 200_000, 800_000, 1),
+                lookup_peek_len: 4,
+            });
+            assert_eq!(
+                action,
+                AdaptiveAction::Continue,
+                "Candle MTP@3 at 67% acceptance (>= 55%) must not probe PromptLookup"
+            );
+        }
+
+        let mut mlx_ctrl = AdaptiveSpeculativeController::for_request(
+            Speculative::Auto,
+            plan,
+            vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            PlainDecode::MlxPipelined,
+            true,
+            4,
+            ProposerKind::Mtp,
+            3,
+            None,
+        );
+        let mut mlx_tokens = 1u64;
+        run_plain_probe(&mut mlx_ctrl, 10_000_000, &mut mlx_tokens);
+        // Short match=2 streak must not trigger even on MLX at 67%.
+        for _ in 0..6 {
+            mlx_tokens += 3;
+            let action = mlx_ctrl.observe_step(AdaptiveStepInput {
+                accepted: 2,
+                drafts: 3,
+                committed: 3,
+                generated_tokens: mlx_tokens,
+                cost: step_cost(2_000_000, 14_000_000, 200_000, 800_000, 1),
+                lookup_peek_len: 2,
+            });
+            assert_eq!(action, AdaptiveAction::Continue);
+        }
+        // Challenging match=3 streak on MLX at 67% (< 70%) DOES trigger a probe.
+        let mut mlx_probed = false;
+        for _ in 0..ADAPTIVE_LOOKUP_TRIGGER_MATCHES {
+            mlx_tokens += 3;
+            let action = mlx_ctrl.observe_step(AdaptiveStepInput {
+                accepted: 2,
+                drafts: 3,
+                committed: 3,
+                generated_tokens: mlx_tokens,
+                cost: step_cost(2_000_000, 14_000_000, 200_000, 800_000, 1),
+                lookup_peek_len: 3,
+            });
+            if matches!(
+                action,
+                AdaptiveAction::SwitchProposer {
+                    to: ProposerKind::PromptLookup,
+                    ..
+                }
+            ) {
+                mlx_probed = true;
+            }
+        }
+        assert!(
+            mlx_probed,
+            "MLX MTP@3 at 67% (< 70%) should probe on match=3 streak"
+        );
+    }
+
+    #[test]
+    fn lagging_gpu_proposer_probes_and_switches_to_prompt_lookup_and_back_when_dry() {
+        let caps = caps_all();
+        let plan = resolve_auto_candidates(&caps, Default::default());
+        let mut ctrl = AdaptiveSpeculativeController::for_request(
+            Speculative::Auto,
+            plan,
+            vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            PlainDecode::Candle,
+            true,
+            7,
+            ProposerKind::Mtp,
+            3,
+            None,
+        );
+        let mut tokens = 1u64;
+        run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
+
+        // First 3 steps (< ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES = 4): even with low acceptance
+        // and lookup_peek_len = 4, wait until at least 4 incumbent verifies are observed.
+        for step in 0..(ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES - 1) {
+            tokens += 2;
+            let action = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 1,
+                drafts: 3,
+                committed: 2,
+                generated_tokens: tokens,
+                cost: step_cost(4_000_000, 10_000_000, 500_000, 1_500_000, 1),
+                lookup_peek_len: 4,
+            });
+            assert_eq!(
+                action,
+                AdaptiveAction::Continue,
+                "must wait for minimum incumbent verifies before probing (step {step})"
+            );
+        }
+
+        // Step 4 with short peek=2 resets the streak and still does not probe.
+        tokens += 2;
+        assert_eq!(
+            ctrl.observe_step(AdaptiveStepInput {
+                accepted: 1,
+                drafts: 3,
+                committed: 2,
+                generated_tokens: tokens,
+                cost: step_cost(4_000_000, 10_000_000, 500_000, 1_500_000, 1),
+                lookup_peek_len: 2,
+            }),
+            AdaptiveAction::Continue
+        );
+
+        // Now 3 consecutive steps with peek=4 on a lagging incumbent (1/3 = 33% < 55%) start
+        // a bounded PromptLookup probe.
+        let mut probe_started = false;
+        for _ in 0..ADAPTIVE_LOOKUP_TRIGGER_MATCHES {
+            tokens += 2;
+            let action = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 1,
+                drafts: 3,
+                committed: 2,
+                generated_tokens: tokens,
+                cost: step_cost(4_000_000, 10_000_000, 500_000, 1_500_000, 1),
+                lookup_peek_len: 4,
+            });
+            if matches!(
+                action,
+                AdaptiveAction::SwitchProposer {
+                    from: ProposerKind::Mtp,
+                    to: ProposerKind::PromptLookup,
+                    ..
+                }
+            ) {
+                probe_started = true;
+            }
+        }
+        assert!(
+            probe_started,
+            "lagging MTP should trigger PromptLookup probe on peek=4 streak"
+        );
+
+        // PromptLookup wins the bounded probe (4/4 accepted at 12ms -> 2.4ms/tok vs 8ms/tok).
+        for _ in 0..ADAPTIVE_PROBE_STEPS {
+            tokens += 5;
+            assert_eq!(
+                ctrl.observe_step(AdaptiveStepInput {
+                    accepted: 4,
+                    drafts: 4,
+                    committed: 5,
+                    generated_tokens: tokens,
+                    cost: step_cost(10_000, 10_500_000, 200_000, 1_290_000, 1),
+                    lookup_peek_len: 4,
+                }),
+                AdaptiveAction::Continue
+            );
+        }
+        assert_eq!(ctrl.next_step().proposer, ProposerKind::PromptLookup);
+
+        // Burn cooldown, then PromptLookup goes dry -> probes and switches back to MTP.
+        for _ in 0..ADAPTIVE_COOLDOWN_VERIFIES {
+            tokens += 5;
+            let _ = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 4,
+                drafts: 4,
+                committed: 5,
+                generated_tokens: tokens,
+                cost: step_cost(10_000, 10_500_000, 200_000, 1_290_000, 1),
+                lookup_peek_len: 4,
+            });
+        }
+        let mut switched_back = false;
+        for _ in 0..ADAPTIVE_LOOKUP_DRY_STEPS {
+            tokens += 1;
+            let action = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 0,
+                drafts: 0,
+                committed: 1,
+                generated_tokens: tokens,
+                cost: step_cost(10_000, 9_500_000, 0, 490_000, 1),
+                lookup_peek_len: 0,
+            });
+            if matches!(
+                action,
+                AdaptiveAction::SwitchProposer {
+                    from: ProposerKind::PromptLookup,
+                    to: ProposerKind::Mtp,
+                    ..
+                }
+            ) {
+                switched_back = true;
+            }
+        }
+        assert!(switched_back, "dry PromptLookup must probe back to MTP");
+        for _ in 0..ADAPTIVE_PROBE_STEPS {
+            tokens += 3;
+            let _ = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 2,
+                drafts: 3,
+                committed: 3,
+                generated_tokens: tokens,
+                cost: step_cost(2_000_000, 10_000_000, 200_000, 800_000, 1),
+                lookup_peek_len: 0,
+            });
+        }
+        assert_eq!(ctrl.next_step().proposer, ProposerKind::Mtp);
+        assert_eq!(ctrl.report().proposer_switches, 2);
+    }
+
+    #[test]
+    fn prompt_lookup_depth_growth_requires_depth_saturation_not_just_proposed_ratio() {
+        for (plain, expected_next_depth) in [
+            (PlainDecode::Candle, 5u32),
+            (PlainDecode::MlxPipelined, 6u32),
+        ] {
+            let plan = AutoSpeculativePlan::single(ProposerKind::PromptLookup, 4, 7);
+            let mut ctrl = AdaptiveSpeculativeController::for_request(
+                Speculative::Auto,
+                plan,
+                vec![ProposerKind::PromptLookup, ProposerKind::None],
+                plain,
+                true,
+                7,
+                ProposerKind::PromptLookup,
+                4,
+                None,
+            );
+            let mut tokens = 1u64;
+            run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
+
+            // Window 1: proposed = 2, accepted = 2 (100% of proposed, mean_accepted = 2.0/4 = 50%
+            // depth saturation and 50% fill) -> MUST NOT grow depth!
+            for _ in 0..ACCEPTANCE_PROBE_VERIFIES {
+                let p = ctrl.next_step();
+                assert_eq!((p.proposer, p.depth), (ProposerKind::PromptLookup, 4));
+                tokens += 3;
+                let action = ctrl.observe_step(AdaptiveStepInput {
+                    accepted: 2,
+                    drafts: 2,
+                    committed: 3,
+                    generated_tokens: tokens,
+                    cost: step_cost(10_000, 10_500_000, 100_000, 390_000, 1),
+                    lookup_peek_len: 0,
+                });
+                assert_eq!(
+                    action,
+                    AdaptiveAction::Continue,
+                    "partial-fill PromptLookup (2/4) on {plain:?} must not grow depth"
+                );
+            }
+            assert_eq!(ctrl.next_step().depth, 4);
+            assert_eq!(ctrl.report().depth_changes, 0);
+
+            // Window 2: proposed = 3, accepted = 3 (100% of proposed, 75% saturation, but only
+            // 75% fill < 80% — never even filled depth 4) -> MUST NOT grow depth!
+            for _ in 0..ACCEPTANCE_PROBE_VERIFIES {
+                let p = ctrl.next_step();
+                assert_eq!((p.proposer, p.depth), (ProposerKind::PromptLookup, 4));
+                tokens += 4;
+                let action = ctrl.observe_step(AdaptiveStepInput {
+                    accepted: 3,
+                    drafts: 3,
+                    committed: 4,
+                    generated_tokens: tokens,
+                    cost: step_cost(10_000, 11_000_000, 100_000, 390_000, 1),
+                    lookup_peek_len: 0,
+                });
+                assert_eq!(
+                    action,
+                    AdaptiveAction::Continue,
+                    "sub-fill PromptLookup (3/4 = 75% fill < 80%) on {plain:?} must not grow depth"
+                );
+            }
+            assert_eq!(ctrl.next_step().depth, 4);
+            assert_eq!(ctrl.report().depth_changes, 0);
+
+            // Window 3: proposed = 4, accepted = 3 (100% fill >= 80%, 75% saturation >= 75%,
+            // mean_accepted = 3.0/4) -> DOES grow depth!
+            let mut grew_to = None;
+            for _ in 0..ACCEPTANCE_PROBE_VERIFIES {
+                let p = ctrl.next_step();
+                assert_eq!((p.proposer, p.depth), (ProposerKind::PromptLookup, 4));
+                tokens += 4;
+                let action = ctrl.observe_step(AdaptiveStepInput {
+                    accepted: 3,
+                    drafts: 4,
+                    committed: 4,
+                    generated_tokens: tokens,
+                    cost: step_cost(10_000, 11_500_000, 100_000, 390_000, 1),
+                    lookup_peek_len: 0,
+                });
+                if let AdaptiveAction::ResizeDepth { from, to } = action {
+                    assert_eq!(from, 4);
+                    grew_to = Some(to);
+                }
+            }
+            assert_eq!(
+                grew_to,
+                Some(expected_next_depth),
+                "saturated PromptLookup (proposed=4, accepted=3) on {plain:?} must grow depth"
+            );
+            assert_eq!(ctrl.next_step().depth, expected_next_depth);
+        }
     }
 }
