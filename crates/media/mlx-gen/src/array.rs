@@ -122,7 +122,7 @@ fn is_row_major(x: &Array) -> bool {
 
 /// MLX's `contiguous` op (not wrapped by mlx-rs): a row-major copy unless already row-contiguous.
 fn mlx_contiguous(x: &Array) -> Result<Array> {
-    Ok(mlx_layers::contiguous_weight(x)?)
+    mlx_layers::contiguous_weight(x)
 }
 
 /// Split `shape` into two contiguous dimension groups `[a, b]` (`a·b == Π shape`) with each factor
