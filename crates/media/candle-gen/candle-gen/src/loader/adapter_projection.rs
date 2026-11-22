@@ -283,7 +283,7 @@ pub(crate) mod tests {
         let input = Tensor::new(&[[0.75f32, -0.25]], &Device::Cpu)?;
         // Native round(x) + adapted bias, plus both matrix deltas applied to the original input.
         assert_eq!(
-            layer.forward(&input)?.to_vec2::<f32>()?,
+            __model_proof_output!(layer.forward(&input))?.to_vec2::<f32>()?,
             [[2.75 + 1.0 / 1024.0, 2.25]]
         );
         Ok(())
