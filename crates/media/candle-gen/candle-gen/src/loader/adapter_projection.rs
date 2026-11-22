@@ -1,5 +1,6 @@
 //! A native checkpoint projection with ordered, reconstructed adapter deltas.
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_layers::adapt::{AdaptLinear, Adapter};
 use candle_nn::{linear::NativeLinearWeight, Linear};
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ pub(super) enum DeltaView {
 
 pub(super) struct AdapterProjection {
     base: Native,
-    deltas: Vec<Linear>,
+    residuals: AdaptLinear,
 }
 
 impl AdapterProjection {
@@ -26,32 +27,40 @@ impl AdapterProjection {
         let (Some(base), Some(deltas)) = (&base, deltas) else {
             return Ok(base);
         };
-        let mut layers = Vec::with_capacity(deltas.len());
-        for delta in deltas {
-            let delta = match view {
-                DeltaView::Matrix => delta.clone(),
-                DeltaView::Transposed => delta.t()?.contiguous()?,
-                DeltaView::Flattened => delta.reshape(base.dims())?,
-            };
-            if delta.dims2()? != base.dims() {
-                candle_core::bail!(
-                    "adapter delta {:?} does not match native projection {:?}",
-                    delta.dims(),
-                    base.dims()
-                );
-            }
-            layers.push(Linear::new(delta.to_device(base.device())?, None));
+        let matrices = deltas.iter().map(|delta| match view {
+            DeltaView::Matrix => Ok(delta.clone()),
+            DeltaView::Transposed => delta.t()?.contiguous(),
+            DeltaView::Flattened => delta.reshape(base.dims()),
+        });
+        Ok(Some(Self::from_matrices(base.clone(), matrices)?))
+    }
+
+    fn from_matrices(
+        base: Native,
+        matrices: impl Iterator<Item = Result<Tensor>>,
+    ) -> Result<Native> {
+        let (rows, cols) = base.dims();
+        let mut residuals = AdaptLinear::for_external_base(cols, rows, DType::F32, base.device())
+            .map_err(candle_core::Error::wrap)?;
+        for matrix in matrices {
+            residuals
+                .push_matrix_delta(matrix?.to_device(base.device())?)
+                .map_err(candle_core::Error::wrap)?;
         }
-        Ok(Some(Arc::new(Self {
-            base: base.clone(),
-            deltas: layers,
-        })))
+        Ok(Arc::new(Self { base, residuals }))
+    }
+
+    fn matrices(&self) -> impl Iterator<Item = Result<Tensor>> + '_ {
+        self.residuals.adapters.iter().map(|adapter| match adapter {
+            Adapter::MatrixDelta(delta) => Ok(delta.weight.clone()),
+            _ => candle_core::bail!("checkpoint overlay expected a reconstructed matrix delta"),
+        })
     }
 
     fn fold_coefficients(&self, base: &Tensor) -> Result<Tensor> {
         let mut weight = base.to_dtype(DType::F32)?;
-        for delta in &self.deltas {
-            weight = (weight + delta.try_weight()?.to_device(base.device())?)?;
+        for delta in self.matrices() {
+            weight = (weight + delta?.to_device(base.device())?)?;
         }
         weight.to_dtype(base.dtype())
     }
@@ -60,12 +69,9 @@ impl AdapterProjection {
 impl NativeLinearWeight for AdapterProjection {
     fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         let base = self.base.forward(x, bias)?;
-        let mut output = base.to_dtype(DType::F32)?;
-        let input = x.to_dtype(DType::F32)?;
-        for delta in &self.deltas {
-            output = (output + delta.forward(&input)?)?;
-        }
-        output.to_dtype(base.dtype())
+        self.residuals
+            .apply_residuals(&x.to_dtype(DType::F32)?, base.to_dtype(DType::F32)?)?
+            .to_dtype(base.dtype())
     }
     fn dense_weight(&self) -> Result<Tensor> {
         self.fold_coefficients(&self.base.dense_weight()?)
@@ -82,13 +88,8 @@ impl NativeLinearWeight for AdapterProjection {
     fn relocated(&self, device: &Device) -> Result<Linear> {
         let moved = self.base.relocated(device)?;
         if let Some(base) = moved.native_weight() {
-            let deltas = self
-                .deltas
-                .iter()
-                .map(|d| d.to_device(device))
-                .collect::<Result<_>>()?;
             Ok(Linear::from_native(
-                Arc::new(Self { base, deltas }),
+                Self::from_matrices(base, self.matrices())?,
                 moved.bias().cloned(),
             ))
         } else {
@@ -102,15 +103,7 @@ impl NativeLinearWeight for AdapterProjection {
         self.base.format_id()
     }
     fn resident_bytes(&self) -> u64 {
-        self.base.resident_bytes()
-            + self
-                .deltas
-                .iter()
-                .map(|delta| {
-                    let t = delta.weight();
-                    (t.elem_count() * t.dtype().size_in_bytes()) as u64
-                })
-                .sum::<u64>()
+        self.base.resident_bytes() + self.residuals.frozen_adapter_bytes() as u64
     }
     fn dims(&self) -> (usize, usize) {
         self.base.dims()
@@ -124,7 +117,7 @@ impl NativeLinearWeight for AdapterProjection {
 pub(crate) mod tests {
     use super::*;
     use crate::train::merge::{merge_diff_patch_file, AdapterFile, CheckpointDeltas, MergeReport};
-    use candle_core::Shape;
+    use candle_core::{Module, Shape};
     use candle_nn::var_builder::{SimpleBackend, TensorInfo};
     use candle_nn::{Init, VarBuilder};
     use std::collections::HashMap;

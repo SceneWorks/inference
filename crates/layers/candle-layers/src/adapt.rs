@@ -14,6 +14,9 @@
 //!     delta — the one path Wan's old copy lacked (it fell back to a dense `[out,in]` delta, packed-
 //!     rejected).
 //!
+//! A full-weight diff or an already reconstructed LoHa/LoKr can also use one `MatrixDelta`
+//! projection while the external checkpoint base retains its native activation policy.
+//!
 //! **The base weight is NEVER mutated.** On a packed q4/q8 DiT that is the whole point: the packed
 //! codes survive load (`is_packed()` stays true, no dense `[out,in]` weight is materialized), and each
 //! adapter rides *unmerged* as small matmuls per forward. On a **dense** base the fold path
@@ -473,6 +476,31 @@ pub enum Adapter {
     /// baked into [`LokrFactors::w2`], so a LoKr applies WITHOUT ever forming the `[out,in]` delta (the
     /// packed-capable path the whole hoist adds over Wan's old dense-only delta).
     LokrStructured { factors: LokrFactors },
+    /// Already scaled, full-rank `[out, in]` residual (diff patch or reconstructed adapter).
+    MatrixDelta(MatrixDelta),
+}
+
+#[derive(Clone, Debug)]
+pub struct MatrixDelta {
+    pub weight: Tensor,
+}
+
+impl MatrixDelta {
+    pub fn to_device(&self, device: &Device) -> candle_core::Result<Self> {
+        Ok(Self {
+            weight: self.weight.to_device(device)?,
+        })
+    }
+
+    pub fn nbytes(&self) -> usize {
+        tensor_bytes(&self.weight)
+    }
+}
+
+impl Module for MatrixDelta {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        CandleNnLinear::new(self.weight.to_dtype(x.dtype())?, None).forward(x)
+    }
 }
 
 /// The second Kronecker factor of a trainable LoKr: a full `w2` leaf, or PEFT's low-rank
@@ -564,6 +592,7 @@ impl Adapter {
             | Adapter::TrainableLora { scale, .. }
             | Adapter::TrainableLokr { scale, .. } => *scale,
             Adapter::LokrStructured { factors } => factors.scale,
+            Adapter::MatrixDelta(_) => 1.0,
         }
     }
 
@@ -587,6 +616,14 @@ impl Adapter {
         override_scale: f64,
     ) -> candle_core::Result<Tensor> {
         match self {
+            Adapter::MatrixDelta(delta) => {
+                let y = delta.forward(x)?;
+                if override_scale == 1.0 {
+                    Ok(y)
+                } else {
+                    y * override_scale
+                }
+            }
             Adapter::Lora { a, b, prepared, .. } => {
                 let xd = x.dtype();
                 let (a, b) = prepared.factors(a, b, xd)?;
@@ -654,6 +691,7 @@ impl Adapter {
     /// Move this residual's factors onto `device`, in place (the dense-leaf migration seam, sc-11105).
     fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
         match self {
+            Adapter::MatrixDelta(delta) => *delta = delta.to_device(device)?,
             Adapter::Lora { a, b, prepared, .. } => {
                 *a = a.to_device(device)?;
                 *b = b.to_device(device)?;
@@ -1064,10 +1102,11 @@ impl AdaptLinear {
             .map(|adapter| match adapter {
                 Adapter::Lora { a, b, scale, .. } => Ok((a.clone(), b.clone(), *scale)),
                 Adapter::LokrStructured { .. }
+                | Adapter::MatrixDelta(_)
                 | Adapter::TrainableLora { .. }
-                | Adapter::TrainableLokr { .. } => candle_core::bail!(
-                    "frozen LoRA proof observation refuses structured or trainable adapters"
-                ),
+                | Adapter::TrainableLokr { .. } => {
+                    candle_core::bail!("frozen LoRA proof observation requires frozen LoRA factors")
+                }
             })
             .collect()
     }
@@ -1082,7 +1121,9 @@ impl AdaptLinear {
             match adapter {
                 Adapter::Lora { prepared, .. } => *prepared = PreparedLora::default(),
                 Adapter::LokrStructured { factors } => factors.prepared = Arc::default(),
-                Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => {}
+                Adapter::MatrixDelta(_)
+                | Adapter::TrainableLora { .. }
+                | Adapter::TrainableLokr { .. } => {}
             }
         }
         if let Base::Packed(base) = &self.base {
@@ -1608,9 +1649,25 @@ impl AdaptLinear {
                     tensor_bytes(a) + tensor_bytes(b) + prepared.owned_bytes(a.dtype())
                 }
                 Adapter::LokrStructured { factors } => factors.device_bytes(),
+                Adapter::MatrixDelta(delta) => delta.nbytes(),
                 Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => 0,
             })
             .sum()
+    }
+
+    /// Attach an already reconstructed matrix. The adapter owns its scale-adjusted coefficients.
+    pub fn push_matrix_delta(&mut self, weight: Tensor) -> Result<()> {
+        if weight.dims2()? != self.base_shape() {
+            return Err(CandleError::Msg(format!(
+                "adapter delta {:?} does not match projection {:?}",
+                weight.dims(),
+                self.base_shape()
+            )));
+        }
+        self.check_factor_admissible("matrix delta", &weight)?;
+        self.adapters
+            .push(Adapter::MatrixDelta(MatrixDelta { weight }));
+        Ok(())
     }
 
     /// Attach a forward-time **LoRA** residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b`
@@ -1756,6 +1813,7 @@ impl AdaptLinear {
             .map(|adapter| match adapter {
                 Adapter::Lora { prepared, .. } => prepared.count(),
                 Adapter::LokrStructured { factors } => factors.preparation_count(),
+                Adapter::MatrixDelta(_) => 0,
                 Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => 0,
             })
             .sum()
@@ -1816,7 +1874,8 @@ impl AdaptLinear {
                 Adapter::TrainableLora { frozen, .. } | Adapter::TrainableLokr { frozen, .. } => {
                     *frozen = freeze
                 }
-                Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {}
+                Adapter::MatrixDelta(_) | Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {
+                }
             }
         }
     }
@@ -1842,7 +1901,8 @@ impl AdaptLinear {
                     }
                     found = true;
                 }
-                Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {}
+                Adapter::MatrixDelta(_) | Adapter::Lora { .. } | Adapter::LokrStructured { .. } => {
+                }
             }
         }
         found

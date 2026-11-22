@@ -113,6 +113,7 @@ enum Adapter {
 /// so a LoKr stays packed too). Multiple residuals stack, applied in push order after the base.
 #[derive(Debug, Clone)]
 enum AdditiveResidual {
+    MatrixDelta(candle_layers::adapt::MatrixDelta),
     /// `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank`
     /// folded in). The deferred two-matmul form — never the `[out,in]` product — so it stays memory-free
     /// on a packed base. Mirrors [`crate::quant::AdaptLinear`]'s `Lora` arm exactly.
@@ -138,6 +139,7 @@ impl AdditiveResidual {
     /// unused non-finite data cannot contaminate the host output.
     fn scale_at(&self, pass: usize) -> candle_core::Result<f64> {
         let scales = match self {
+            AdditiveResidual::MatrixDelta(_) => return Ok(1.0),
             AdditiveResidual::Lora { scales, .. }
             | AdditiveResidual::LokrStructured { scales, .. } => scales,
         };
@@ -179,6 +181,7 @@ impl AdditiveResidual {
                 super::projection::scaled_lora(x, &a.to_dtype(xd)?, &b.to_dtype(xd)?, scale)
             }
             AdditiveResidual::LokrStructured { factors, .. } => factors.residual(x)? * scale,
+            AdditiveResidual::MatrixDelta(delta) => delta.forward(x),
         }
     }
 }
@@ -273,6 +276,9 @@ impl LoraLinear {
         let mut additive = Vec::new();
         for a in adapt.adapters {
             match a {
+                candle_layers::adapt::Adapter::MatrixDelta(delta) => {
+                    additive.push(AdditiveResidual::MatrixDelta(delta))
+                }
                 candle_layers::adapt::Adapter::Lora { a, b, scale, .. } => {
                     additive.push(AdditiveResidual::Lora {
                         a,
@@ -416,6 +422,7 @@ impl LoraLinear {
             .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         for residual in &mut self.additive {
             match residual {
+                AdditiveResidual::MatrixDelta(delta) => *delta = delta.to_device(device)?,
                 AdditiveResidual::Lora { a, b, .. } => {
                     *a = a.to_device(device)?;
                     *b = b.to_device(device)?;
@@ -503,6 +510,7 @@ impl LoraLinear {
         self.additive
             .iter()
             .map(|residual| match residual {
+                AdditiveResidual::MatrixDelta(delta) => delta.nbytes(),
                 AdditiveResidual::Lora { a, b, .. } => {
                     a.elem_count() * a.dtype().size_in_bytes()
                         + b.elem_count() * b.dtype().size_in_bytes()
