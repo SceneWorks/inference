@@ -207,14 +207,14 @@ fn assert_native_receipt(scope: &CheckpointReceiptScope, path: &Path) {
 fn source_native_fp8_and_convrot_match_eager_and_windowed_on_metal() {
     assert!(mlx_gen::metal_available());
     mlx_rs::with_new_default_stream(Stream::gpu(), || {
-        assert_eq!(
+        assert!(matches!(
             Stream::task_local_or_default()
                 .get_device()
                 .unwrap()
                 .get_type()
                 .unwrap(),
             DeviceType::Gpu
-        );
+        ));
 
         let original = backbone_dir();
         let temp = tempfile::tempdir().unwrap();
