@@ -42,7 +42,9 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 // carries `From<std::io::Error>` (the `Io` variant) + a `Msg` constructor, so the converter's many
 // filesystem `?` calls just work and a `candle_core::Error` flows up to the worker (which maps it to a
 // String). candle-gen's `CandleError` has no `From<io::Error>`, so it would force a `.map_err` per fs call.
-use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
+#[cfg(test)]
+use candle_gen::candle_core::DType;
+use candle_gen::candle_core::{Device, Error, Result, Tensor};
 
 /// Borrowed-from-base subdirs the candle [`crate`] loader consumes (`text_encoder` / `vae` /
 /// `tokenizer`). A transformer-only fine-tune does not touch these, so taking them from the installed
@@ -57,7 +59,7 @@ const BORROWED_SUBDIRS_OPTIONAL: &[&str] = &["scheduler"];
 const BORROWED_FILES: &[&str] = &["model_index.json"];
 
 /// Top-level (non-block) direct renames: original → diffusers.
-const TOP_RENAMES: &[(&str, &str)] = &[
+pub(crate) const TOP_RENAMES: &[(&str, &str)] = &[
     ("img_in.weight", "x_embedder.weight"),
     ("txt_in.weight", "context_embedder.weight"),
     (
@@ -84,12 +86,12 @@ const TOP_RENAMES: &[(&str, &str)] = &[
 ];
 
 /// Handled separately (scale/shift swap): `final_layer.adaLN_modulation.1` → `norm_out.linear`.
-const ADALN_SOURCE: &str = "final_layer.adaLN_modulation.1.weight";
-const ADALN_TARGET: &str = "norm_out.linear.weight";
+pub(crate) const ADALN_SOURCE: &str = "final_layer.adaLN_modulation.1.weight";
+pub(crate) const ADALN_TARGET: &str = "norm_out.linear.weight";
 
 /// Per-double-block renames (original suffix → diffusers suffix), excluding the fused qkv tensors
 /// which are row-split below.
-const DOUBLE_RENAMES: &[(&str, &str)] = &[
+pub(crate) const DOUBLE_RENAMES: &[(&str, &str)] = &[
     ("img_attn.norm.query_norm.weight", "attn.norm_q.weight"),
     ("img_attn.norm.key_norm.weight", "attn.norm_k.weight"),
     ("img_attn.proj.weight", "attn.to_out.0.weight"),
@@ -106,7 +108,7 @@ const DOUBLE_RENAMES: &[(&str, &str)] = &[
 ];
 
 /// Fused qkv suffix → `(q, k, v)` target suffixes, per stream.
-const DOUBLE_QKV: &[(&str, [&str; 3])] = &[
+pub(crate) const DOUBLE_QKV: &[(&str, [&str; 3])] = &[
     (
         "img_attn.qkv.weight",
         ["attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight"],
@@ -122,7 +124,7 @@ const DOUBLE_QKV: &[(&str, [&str; 3])] = &[
 ];
 
 /// Per-single-block renames (1:1; diffusers keeps the fused single block).
-const SINGLE_RENAMES: &[(&str, &str)] = &[
+pub(crate) const SINGLE_RENAMES: &[(&str, &str)] = &[
     ("linear1.weight", "attn.to_qkv_mlp_proj.weight"),
     ("linear2.weight", "attn.to_out.weight"),
     ("norm.query_norm.weight", "attn.norm_q.weight"),
@@ -271,7 +273,7 @@ pub(crate) fn build_target_state_dict(src: &MmapedSafetensors) -> Result<HashMap
 /// `time_guidance_embed.guidance_embedder.linear_{1,2}` (the structural twin of the `time_in` →
 /// `timestep_embedder` entries in [`TOP_RENAMES`]). `Flux2Transformer::new` gates the guidance embedder
 /// on the presence of `guidance_embedder.linear_1.weight`, so these keys switch the DiT into dev mode.
-const COMFY_GUIDANCE_RENAMES: &[(&str, &str)] = &[
+pub(crate) const COMFY_GUIDANCE_RENAMES: &[(&str, &str)] = &[
     (
         "guidance_in.in_layer.weight",
         "time_guidance_embed.guidance_embedder.linear_1.weight",
@@ -284,7 +286,7 @@ const COMFY_GUIDANCE_RENAMES: &[(&str, &str)] = &[
 
 /// Per-double-block renames for the BFL-official checkpoint — identical to [`DOUBLE_RENAMES`] except the
 /// per-head RMSNorm SOURCE suffixes are `.scale` (BFL-official) rather than `.weight` (klein community).
-const COMFY_DOUBLE_RENAMES: &[(&str, &str)] = &[
+pub(crate) const COMFY_DOUBLE_RENAMES: &[(&str, &str)] = &[
     ("img_attn.norm.query_norm.scale", "attn.norm_q.weight"),
     ("img_attn.norm.key_norm.scale", "attn.norm_k.weight"),
     ("img_attn.proj.weight", "attn.to_out.0.weight"),
@@ -299,112 +301,26 @@ const COMFY_DOUBLE_RENAMES: &[(&str, &str)] = &[
 
 /// Per-single-block renames for the BFL-official checkpoint — as [`SINGLE_RENAMES`] but with `.scale`
 /// RMSNorm source suffixes.
-const COMFY_SINGLE_RENAMES: &[(&str, &str)] = &[
+pub(crate) const COMFY_SINGLE_RENAMES: &[(&str, &str)] = &[
     ("linear1.weight", "attn.to_qkv_mlp_proj.weight"),
     ("linear2.weight", "attn.to_out.weight"),
     ("norm.query_norm.scale", "attn.norm_q.weight"),
     ("norm.key_norm.scale", "attn.norm_k.weight"),
 ];
 
-/// Build the diffusers-key transformer tensor map for an **in-place ComfyUI FLUX.2-dev fp8-mixed** DiT
-/// (epic 10451 Phase 2e, sc-10680) — the dequant-aware sibling of [`build_target_state_dict`], for
-/// `VarBuilder::from_tensors`. Same structural remap (renames + qkv row-split + adaLN half-swap) with
-/// the dev guidance embedder ([`COMFY_GUIDANCE_RENAMES`]) and the BFL-official `.scale` norm spellings
-/// ([`COMFY_DOUBLE_RENAMES`]/[`COMFY_SINGLE_RENAMES`]), plus **inline-scale fp8 dequant** applied inside
-/// the load closure: an `F8_E4M3` weight is `w = w_fp8·weight_scale → dtype`; every other tensor is a
-/// plain cast to `dtype`. `weight_scale` is a per-tensor F32 scalar; `input_scale` (the activation
-/// scale) is never referenced. `dtype` is the pipeline compute dtype (f32).
-///
-/// **Typed reject** (surfaced, never a silent degraded load) when an `F8_E4M3` weight has no
-/// `.weight_scale` sibling — a partial/unsupported checkpoint. Source tensors are loaded lazily from the
-/// mmap and dropped after each op, so only the produced map is held resident. Leaves the tested
-/// [`build_target_state_dict`]/[`convert_and_assemble`] (klein, bf16, no dequant) untouched.
-pub(crate) fn build_comfyui_dit_map(
-    src: &MmapedSafetensors,
-    dtype: DType,
-) -> Result<HashMap<String, Tensor>> {
-    let cpu = Device::Cpu;
-    let names: Vec<String> = src.tensors().into_iter().map(|(name, _)| name).collect();
-    // Dequant-aware load: an `F8_E4M3` `.weight` is multiplied by its `.weight_scale` sibling and
-    // upcast to `dtype`; every other tensor is a plain cast. `chunk3`/`swap_halves` receive the
-    // already-cast tensor (the qkv + adaLN are BF16, so no dequant runs through them).
-    let load = |name: &str| -> Result<Tensor> {
-        let t = src
-            .load(name, &cpu)
-            .map_err(|e| Error::Msg(format!("flux2 comfyui: source is missing `{name}`: {e}")))?;
-        if t.dtype() != DType::F8E4M3 {
-            return t.to_dtype(dtype);
-        }
-        // Inline-scale fp8: dequant against the `.weight_scale` sibling (typed-reject if absent).
-        let base = name.strip_suffix(".weight").ok_or_else(|| {
-            Error::Msg(format!(
-                "flux2 comfyui: fp8 tensor `{name}` does not end in `.weight`"
-            ))
-        })?;
-        let scale_name = format!("{base}.weight_scale");
-        let scale = src.load(&scale_name, &cpu).map_err(|e| {
-            Error::Msg(format!(
-                "flux2 comfyui: fp8 weight `{name}` is missing its `{scale_name}` scale sibling \
-                 (partial/unsupported checkpoint?): {e}"
-            ))
-        })?;
-        // Scalar (shape `[]`); flatten so a stray `[1]` shape is tolerated too.
-        let s = scale
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let s = *s
-            .first()
-            .ok_or_else(|| Error::Msg(format!("flux2 comfyui: `{scale_name}` is empty")))?;
-        t.to_dtype(DType::F32)?
-            .affine(s as f64, 0.0)?
-            .to_dtype(dtype)
-    };
-
-    let mut out: HashMap<String, Tensor> = HashMap::new();
-    for (s, d) in TOP_RENAMES {
-        out.insert((*d).to_string(), load(s)?);
-    }
-    for (s, d) in COMFY_GUIDANCE_RENAMES {
-        out.insert((*d).to_string(), load(s)?);
-    }
-    out.insert(ADALN_TARGET.to_string(), swap_halves(&load(ADALN_SOURCE)?)?);
-
-    let n_double = count_blocks(names.iter().map(String::as_str), "double_blocks");
-    for i in 0..n_double {
-        let (s, d) = (
-            format!("double_blocks.{i}"),
-            format!("transformer_blocks.{i}"),
-        );
-        for (src_suffix, [q, k, v]) in DOUBLE_QKV {
-            let [tq, tk, tv] = chunk3(&load(&format!("{s}.{src_suffix}"))?)?;
-            out.insert(format!("{d}.{q}"), tq);
-            out.insert(format!("{d}.{k}"), tk);
-            out.insert(format!("{d}.{v}"), tv);
-        }
-        for (src_suffix, dst_suffix) in COMFY_DOUBLE_RENAMES {
-            out.insert(
-                format!("{d}.{dst_suffix}"),
-                load(&format!("{s}.{src_suffix}"))?,
-            );
-        }
-    }
-
-    let n_single = count_blocks(names.iter().map(String::as_str), "single_blocks");
-    for i in 0..n_single {
-        let (s, d) = (
-            format!("single_blocks.{i}"),
-            format!("single_transformer_blocks.{i}"),
-        );
-        for (src_suffix, dst_suffix) in COMFY_SINGLE_RENAMES {
-            out.insert(
-                format!("{d}.{dst_suffix}"),
-                load(&format!("{s}.{src_suffix}"))?,
-            );
-        }
-    }
-
-    Ok(out)
+#[cfg(test)]
+fn fixture_plan(
+    path: &Path,
+    inner: usize,
+) -> candle_gen::Result<candle_gen::gen_core::LogicalWeightPlan> {
+    let mut cfg = crate::config::Flux2Variant::Dev.config();
+    cfg.num_heads = 1;
+    cfg.head_dim = inner;
+    candle_gen::logical_weights::plan_logical_weights(
+        path,
+        &crate::single_file::Flux2BflToDiffusersMapping::for_dev(&cfg),
+        &candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    )
 }
 
 /// The `.safetensors` shards in a transformer dir (sorted).
@@ -1020,10 +936,19 @@ mod tests {
         let tmp = tmp_guard.path().to_path_buf();
         let (file, expect) = write_comfyui_fixture(&tmp, d, true);
 
-        // SAFETY: read-only mmap of the fixture we just wrote.
-        let mmap = unsafe { MmapedSafetensors::new(&file).unwrap() };
-        let map = build_comfyui_dit_map(&mmap, DType::F32).unwrap();
-
+        let plan = fixture_plan(&file, d).unwrap();
+        let reader =
+            candle_gen::logical_weights::LogicalWeightReader::open(&file, plan, &Device::Cpu)
+                .unwrap();
+        let mut map = HashMap::new();
+        for row in &reader.plan().tensors {
+            let candle_gen::logical_weights::LogicalTensor::Dense(value) =
+                reader.read(&row.logical_key).unwrap()
+            else {
+                panic!("CPU reference is dense");
+            };
+            map.insert(row.logical_key.clone(), value.to_dtype(DType::F32).unwrap());
+        }
         // Every fp8 MLP leaf dequants to exactly `(w_fp8 → f32)·weight_scale` under its diffusers key.
         for (dkey, expected, scale) in &expect {
             let got = map
@@ -1069,8 +994,7 @@ mod tests {
         let tmp = tmp_guard.path().to_path_buf();
         // Omit `single_blocks.0.linear1.weight_scale` → the fp8 weight has no scale sibling.
         let (file, _) = write_comfyui_fixture(&tmp, d, false);
-        let mmap = unsafe { MmapedSafetensors::new(&file).unwrap() };
-        let err = build_comfyui_dit_map(&mmap, DType::F32).expect_err(
+        let err = fixture_plan(&file, d).expect_err(
             "an fp8 weight with no .weight_scale must be a typed reject, not a silent load",
         );
         let msg = format!("{err}");

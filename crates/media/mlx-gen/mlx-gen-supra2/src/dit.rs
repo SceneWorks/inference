@@ -30,7 +30,7 @@ fn lin(w: &Weights, prefix: &str, shape: [usize; 2]) -> Result<AdaptableLinear> 
             bias.shape()
         )));
     }
-    Ok(AdaptableLinear::dense(weight.clone(), Some(bias.clone())))
+    mlx_gen::quant::lin(w, prefix, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 /// `x * (1 + scale[:, None]) + shift[:, None]`.

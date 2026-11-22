@@ -253,6 +253,16 @@ impl DitAttention {
         expect(&norm_q, &[cfg.attention_head_dim], "norm_q")?;
         expect(&norm_k, &[cfg.attention_head_dim], "norm_k")?;
 
+        for name in ["to_q", "to_k", "to_v"] {
+            w.declare_projection_shape(
+                &format!("{prefix}.{name}"),
+                [cfg.inner_dim(), cfg.hidden_size],
+            )?;
+        }
+        w.declare_projection_shape(
+            &format!("{prefix}.to_out.0"),
+            [cfg.hidden_size, cfg.inner_dim()],
+        )?;
         Ok(Self {
             to_q: LinearNoBias::from_weights(w, &format!("{prefix}.to_q"), dtype)?,
             to_k: LinearNoBias::from_weights(w, &format!("{prefix}.to_k"), dtype)?,
@@ -448,6 +458,19 @@ pub struct DitFeedForward {
 }
 
 impl DitFeedForward {
+    pub(crate) fn from_model_weights(
+        w: &mut Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        w.declare_projection_shape(
+            &format!("{prefix}.net.0.proj"),
+            [2 * cfg.ffn_dim, cfg.hidden_size],
+        )?;
+        w.declare_projection_shape(&format!("{prefix}.net.2"), [cfg.hidden_size, cfg.ffn_dim])?;
+        Self::from_weights(w, prefix, dtype)
+    }
     pub fn from_weights(w: &mut Weights, prefix: &str, dtype: Dtype) -> Result<Self> {
         Ok(Self {
             proj: LinearNoBias::from_weights(w, &format!("{prefix}.net.0.proj"), dtype)?,

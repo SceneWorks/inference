@@ -120,7 +120,7 @@ impl ClipImageEmbedder {
             LN_EPS,
         );
         // `visual_projection` is a bias-free Linear with weight [proj, hidden] (768×1024).
-        let visual_projection = Linear::new(w.require("visual_projection.weight")?, None);
+        let visual_projection = w.linear("visual_projection", false)?;
         Ok(Self {
             body,
             post_ln,
@@ -135,7 +135,7 @@ impl ClipImageEmbedder {
     /// 0), then `post_layernorm` and `visual_projection`. Mirrors diffusers
     /// `image_encoder(image).image_embeds`.
     pub fn image_embeds(&self, image: &Image) -> Result<Tensor> {
-        let device = self.visual_projection.weight().device().clone();
+        let device = self.visual_projection.device().clone();
         let dtype = self.body.dtype();
         let px = preprocess_clip_image_sized(image, self.image_size, &device)?.to_dtype(dtype)?;
         let last = self.body.last_hidden(&px)?; // [1, num_positions, 1024]
@@ -214,7 +214,7 @@ root.join("tokenizer.json"),
 
     /// Encode one text string into projected CLIP `text_embeds` `[1, 768]` as f32.
     pub fn text_embeds(&self, text: &str) -> Result<Tensor> {
-        let device = self.text_projection.weight().device();
+        let device = self.text_projection.device();
         let mut ids: Vec<u32> = self
             .tokenizer
             .encode(text, true)

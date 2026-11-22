@@ -26,7 +26,7 @@ use gen_core_iris::IrisTask;
 
 use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 use crate::model::compute_dtype;
-use crate::nn::{expect_shape, safetensors_keys, Checkpoint, Linear};
+use crate::nn::{safetensors_keys, Checkpoint, Linear};
 
 /// Model id of the depth task.
 pub const DEPTH_MODEL_ID: &str = gen_core_iris::DEPTH_MODEL_ID;
@@ -115,8 +115,7 @@ pub fn load_depth_export(export: TaskExport, compute: DType, device: &Device) ->
     drop(backbone);
 
     let reducer = Checkpoint::open_prefixed(&path, device, REDUCER_PREFIX)?;
-    let weight = reducer.take("weight")?;
-    let bias = reducer.take("bias")?;
+    let head = reducer.pointwise_linear(model.in_channels, compute)?;
     let leftover = reducer.unused_keys();
     if !leftover.is_empty() {
         return Err(Error::Msg(format!(
@@ -124,16 +123,7 @@ pub fn load_depth_export(export: TaskExport, compute: DType, device: &Device) ->
             leftover[0]
         )));
     }
-    expect_shape(
-        "depth_reducer.weight",
-        &weight,
-        &[1, model.in_channels, 1, 1],
-    )?;
-    expect_shape("depth_reducer.bias", &bias, &[1])?;
-    let reducer = Linear::from_parts(
-        weight.reshape((1, model.in_channels))?.to_dtype(compute)?,
-        Some(bias.to_dtype(compute)?),
-    );
+    let reducer = head;
 
     // The spec this export and compute dtype are a load of, so a model built here publishes the
     // same contract a `load_depth` of that spec would.

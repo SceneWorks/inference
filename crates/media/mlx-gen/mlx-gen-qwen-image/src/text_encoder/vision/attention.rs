@@ -9,18 +9,17 @@
 use mlx_rs::ops::split;
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::windowed_sdpa;
-use mlx_gen::nn::{apply_rope_rotate_half_f32, linear};
+use mlx_gen::nn::apply_rope_rotate_half_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::text_encoder::join;
 
 pub struct VisionAttention {
-    qkv_w: Array,
-    qkv_b: Array,
-    proj_w: Array,
-    proj_b: Array,
+    qkv: AdaptableLinear,
+    proj: AdaptableLinear,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -29,10 +28,18 @@ pub struct VisionAttention {
 impl VisionAttention {
     pub fn from_weights(w: &Weights, prefix: &str, num_heads: i32, head_dim: i32) -> Result<Self> {
         Ok(Self {
-            qkv_w: w.require(&join(prefix, "qkv.weight"))?.clone(),
-            qkv_b: w.require(&join(prefix, "qkv.bias"))?.clone(),
-            proj_w: w.require(&join(prefix, "proj.weight"))?.clone(),
-            proj_b: w.require(&join(prefix, "proj.bias"))?.clone(),
+            qkv: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "qkv"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            proj: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "proj"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -45,7 +52,7 @@ impl VisionAttention {
         let seq = x.shape()[0];
         let (h, hd) = (self.num_heads, self.head_dim);
 
-        let qkv = linear(x, &self.qkv_w, &self.qkv_b)?.reshape(&[seq, 3, h, hd])?;
+        let qkv = self.qkv.forward(x)?.reshape(&[seq, 3, h, hd])?;
         let parts = split(&qkv, 3, 1)?; // each [seq, 1, h, hd]
         let to_heads = |p: &Array| -> Result<Array> {
             // [seq, 1, h, hd] → [h, seq, hd]
@@ -58,6 +65,6 @@ impl VisionAttention {
         let attn = windowed_sdpa(&q, &k, &v, cu, self.scale)?; // [h, seq, hd]
 
         let out = attn.transpose_axes(&[1, 0, 2])?.reshape(&[seq, h * hd])?;
-        linear(&out, &self.proj_w, &self.proj_b)
+        self.proj.forward(&out)
     }
 }

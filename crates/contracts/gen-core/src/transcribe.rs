@@ -16,6 +16,16 @@ use crate::{Error, Result};
 /// A speech/audio-to-text transcription provider — the audio analog of
 /// [`Captioner`](crate::caption::Captioner).
 pub trait Transcriber {
+    /// Checkpoint execution and measured resident bytes for the primary source, when available.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+
+    /// Measured checkpoints, including separately loaded encoder and decoder components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
+
     /// Stable identity + capability metadata, constructible without loading weights through the
     /// registry.
     fn descriptor(&self) -> &TranscriberDescriptor;

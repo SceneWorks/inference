@@ -188,7 +188,7 @@ impl PrismMlxCheckpoint {
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Config("Prism config missing modules array".into()))?;
         let loaded = Weights::from_dir(dir, device)?;
-        let mut tensors = loaded.into_map();
+        let mut tensors = loaded.try_into_map()?;
         let mut packed = HashMap::with_capacity(modules.len());
         let mut declared = BTreeSet::new();
         let mut declared_weights = BTreeSet::new();

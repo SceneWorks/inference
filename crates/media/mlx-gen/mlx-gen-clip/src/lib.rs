@@ -12,8 +12,8 @@
 //! ([`ClipVisionEncoder`], [`VisionConfig::vit_l_14`], [`preprocess_clip_image`]); only the small
 //! pooling + projection head lives here.
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::matmul;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::runtime::{LoadSpec, WeightsSource};
@@ -74,7 +74,7 @@ pub struct ClipImageEmbedder {
     post_ln_w: Array,
     post_ln_b: Array,
     /// `visual_projection.weight` `[projection_dim, hidden]` (no bias). 768×1024 for ViT-L/14.
-    visual_projection: Array,
+    visual_projection: AdaptableLinear,
     /// Compute dtype (the loaded weight dtype).
     dtype: Dtype,
 }
@@ -84,12 +84,19 @@ impl ClipImageEmbedder {
     /// `vision_model.post_layernorm.*` + top-level `visual_projection.weight`.
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let body = ClipVisionEncoder::from_weights(w, &VisionConfig::vit_l_14())?;
-        let visual_projection = w.require("visual_projection.weight")?.clone();
+        let visual_projection = mlx_gen::quant::lin(
+            w,
+            "visual_projection",
+            false,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         Ok(Self {
             body,
             post_ln_w: w.require("vision_model.post_layernorm.weight")?.clone(),
             post_ln_b: w.require("vision_model.post_layernorm.bias")?.clone(),
-            dtype: visual_projection.dtype(),
+            dtype: visual_projection
+                .weight_dtype()
+                .unwrap_or(w.require("vision_model.post_layernorm.weight")?.dtype()),
             visual_projection,
         })
     }
@@ -106,7 +113,7 @@ impl ClipImageEmbedder {
         let cls = last.take_axis(Array::from_int(0), 1)?; // [B, 1024] (CLS token, axis dropped)
         let pooled = layer_norm(&cls, Some(&self.post_ln_w), Some(&self.post_ln_b), LN_EPS)?;
         // visual_projection is a bias-free Linear with weight [proj, hidden] → embeds = pooled · Wᵀ.
-        let embeds = matmul(&pooled, &self.visual_projection.transpose_axes(&[1, 0])?)?;
+        let embeds = self.visual_projection.forward(&pooled)?;
         Ok(embeds.as_dtype(Dtype::Float32)?)
     }
 

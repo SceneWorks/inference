@@ -80,13 +80,9 @@ pub(crate) fn detect_linear(vb: &VarBuilder, base: &str, bias: bool) -> Result<Q
             &device,
         )?);
     }
-    let w = vb.get_unchecked(&format!("{base}.weight"))?;
-    let b = if bias {
-        Some(vb.get_unchecked(&format!("{base}.bias"))?)
-    } else {
-        None
-    };
-    Ok(QLinear::from_dense(DenseLinear::Linear(Linear::new(w, b))))
+    Ok(QLinear::from_dense(DenseLinear::Linear(
+        Linear::from_var_builder(&vb.pp(base), bias)?,
+    )))
 }
 
 /// Read `key` at **f32** regardless of the VarBuilder's store dtype — the compute dtype for every

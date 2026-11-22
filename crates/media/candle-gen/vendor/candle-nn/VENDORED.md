@@ -1,0 +1,1 @@
+Vendored from huggingface/candle at `1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d` (candle-nn 0.10.2). The standalone manifest expands upstream workspace dependencies. SceneWorks adds an optional typed projection operation to VarBuilder and Linear so model constructors can consume checkpoint-native weights.

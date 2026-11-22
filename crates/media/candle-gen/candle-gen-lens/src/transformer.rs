@@ -22,6 +22,7 @@ use candle_gen::candle_nn::{
 };
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::quant::PackedWeightSidecars;
 use std::sync::Arc;
 
@@ -243,9 +244,12 @@ impl GateMlp {
     }
 
     fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.w1.quantize(quant)?;
-        self.w2.quantize(quant)?;
-        self.w3.quantize(quant)?;
+        self.w1
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.w2
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.w3
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         Ok(())
     }
 
@@ -307,10 +311,14 @@ impl JointAttention {
     /// merge (the merge folds `W += δ` into the dense weight before the DiT is built, so the quantized
     /// base already carries the adapter delta). The QK-norm weights stay full precision.
     fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.img_qkv.quantize(quant)?;
-        self.txt_qkv.quantize(quant)?;
-        self.to_out.quantize(quant)?;
-        self.to_add_out.quantize(quant)?;
+        self.img_qkv
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.txt_qkv
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_add_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         Ok(())
     }
 
@@ -747,9 +755,12 @@ impl LensTransformer {
     /// (not 4-bit weight precision), and [`QLinear`] now dequantizes to a dense matmul — so uniform Q4
     /// is coherent end-to-end with the full weight-VRAM saving (no MLP-stays-Q8 carve-out needed).
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.img_in.quantize(quant)?;
-        self.txt_in.quantize(quant)?;
-        self.proj_out.quantize(quant)?;
+        self.img_in
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.txt_in
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.proj_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
             return Err(candle_gen::candle_core::Error::Msg(
                 "lens: streamed transformer blocks must come from an already-packed tier".into(),

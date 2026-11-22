@@ -244,7 +244,10 @@ impl MiniMaxH3Dit {
         // (the F32 table, the BF16 reduced weights, the F16 folded biases included), so
         // `from_weights`'s curve inspection sees the checkpoint's actual bytes and no curve
         // operand is ever re-read or re-cast.
-        let w = Weights::from_files_native_int8(&shards, device)?;
+        let mut w = Weights::from_files_native_int8(&shards, device)?;
+        if let Some(policy) = crate::block_stream::current() {
+            w.stage_projection_windows(&policy.device);
+        }
         let model = Self::from_weights(&w, &cfg, device, dtype)?;
         // Drop the map here rather than at the call site: every tensor in it shares storage with
         // the model's, and a surviving clone is exactly what makes an eviction free nothing.

@@ -93,6 +93,7 @@ pub struct ChatGlmQuant {
 /// A ChatGLM projection — dense or affine-quantized — with an **optional Linear bias** (the fused
 /// `query_key_value` carries one; `dense` / MLP projections do not, per `add_bias_linear=false`).
 enum ChatGlmLinear {
+    Native(mlx_gen::adapters::AdaptableLinear),
     Dense {
         w: Array, // [out, in]
         bias: Option<Array>,
@@ -122,6 +123,9 @@ impl ChatGlmLinear {
         with_bias: bool,
         dtype: Dtype,
     ) -> Result<Self> {
+        if let Some(native) = mlx_gen::quant::native_lin(w, key, with_bias)? {
+            return Ok(Self::Native(native));
+        }
         let bias = if with_bias {
             Some(w.require(&format!("{key}.bias"))?.as_dtype(dtype)?)
         } else {
@@ -196,6 +200,7 @@ impl ChatGlmLinear {
     /// [`mlx_gen::nn::linear`]); quant uses `quantized_matmul` (transpose, fp32 accumulation).
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
+            Self::Native(native) => native.forward(x),
             ChatGlmLinear::Dense { w, bias } => match bias {
                 Some(b) => Ok(addmm(b, x, w.t(), 1.0, 1.0)?),
                 None => Ok(matmul(x, w.t())?),

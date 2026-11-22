@@ -71,7 +71,7 @@ impl Encoder {
             |k| k.starts_with("language_model."),
             cancel,
         )?;
-        let weights = mlx_llm::primitives::Weights::from_map(w.into_tensors());
+        let weights = w.into_language_weights();
         let model = Qwen35Model::from_weights_headless_moss_frozen_hf(
             &weights,
             MOSS_TEXT_ENCODER_PREFIX,

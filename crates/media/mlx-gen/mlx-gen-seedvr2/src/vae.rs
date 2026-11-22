@@ -22,19 +22,25 @@ use mlx_rs::{Array, Dtype};
 use crate::config::VaeConfig;
 
 /// `[out,in]`-weight dense layer (`y = x·Wᵀ + b`).
-struct Linear {
-    w: Array,
-    b: Array,
+enum Linear {
+    Dense(Array, Array),
+    Native(mlx_gen::adapters::AdaptableLinear),
 }
 impl Linear {
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
+        if let Some(native) = mlx_gen::quant::native_lin(w, prefix, true)? {
+            return Ok(Self::Native(native));
+        }
+        Ok(Self::Dense(
+            w.require(&format!("{prefix}.weight"))?.clone(),
+            w.require(&format!("{prefix}.bias"))?.clone(),
+        ))
     }
     fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(add(&matmul(x, self.w.t())?, &self.b)?)
+        match self {
+            Self::Native(n) => n.forward(x),
+            Self::Dense(w, b) => Ok(add(&matmul(x, w.t())?, b)?),
+        }
     }
 }
 

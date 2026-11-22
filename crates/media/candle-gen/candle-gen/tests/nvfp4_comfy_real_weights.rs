@@ -118,6 +118,7 @@ fn kreamania_variant7_plans_decodes_and_prices_both_residencies() {
     let native = CandleCodecResidency {
         fp8_e4m3_native: false,
         nvfp4_native: true,
+        mxfp8_native: false,
     };
     let packed_plan = plan_logical_weights(&path, &IdentityKeys, &native).expect("packed plan");
     let packed_rows: Vec<_> = packed_plan

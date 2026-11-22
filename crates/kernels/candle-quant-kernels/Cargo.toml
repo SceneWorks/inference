@@ -9,6 +9,7 @@ keywords = ["candle", "cuda", "nvfp4", "quantization", "inference"]
 categories = ["science"]
 
 [dependencies]
+sceneworks-gen-core = { workspace = true }
 # Same workspace candle pin as candle-gen / candle-llm, so the whole stack resolves ONE candle build.
 candle-core = { workspace = true }
 candle-nn = { workspace = true }

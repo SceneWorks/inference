@@ -152,6 +152,14 @@ impl ProjectionHost {
             // placeholder of its LOGICAL `[out, in]` shape (a broadcast scalar — never a dense
             // copy), and [`crate::nn::Loader::linear`] moves the installed adapters onto the
             // stored pack. The adapters never read the base, so this is the dense install exactly.
+            if let Some(native) = mlx_gen::quant::native_lin(
+                weights,
+                path,
+                weights.peek(&format!("{path}.bias")).is_some(),
+            )? {
+                linears.insert(path.to_owned(), native);
+                continue;
+            }
             if peek(weights, &format!("{path}.scales")).is_some() {
                 // Reuse the actual first try_item conversion under this exclusive Weights
                 // borrow. Re-reading a non-I32 marker would allocate another cast buffer.
@@ -183,9 +191,7 @@ impl ProjectionHost {
 /// A handle on `key`'s tensor that leaves `weights`' consumed-key accounting untouched (`remove`
 /// and `insert` are not reads); the array is reference-counted, so this copies no data.
 fn peek(weights: &mut Weights, key: &str) -> Option<Array> {
-    let array = weights.remove(key)?;
-    weights.insert(key, array.clone());
-    Some(array)
+    weights.peek(key).cloned()
 }
 
 /// Shapes the actual dense install host exposes, including the logical (unpadded) width of an

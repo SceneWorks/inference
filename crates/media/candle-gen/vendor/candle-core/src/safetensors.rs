@@ -508,6 +508,7 @@ struct SafeTensors_<'a>(SafeTensors<'a>);
 
 pub struct MmapedSafetensors {
     safetensors: Vec<yoke::Yoke<SafeTensors_<'static>, memmap2::Mmap>>,
+    owned: Vec<BufferedSafetensors>,
     routing: Option<HashMap<String, usize>>,
     _reads: Vec<std::sync::Arc<crate::safetensors_progress::MappedRead>>,
 }
@@ -544,6 +545,7 @@ impl MmapedSafetensors {
         );
         Ok(Self {
             safetensors: vec![safetensors],
+            owned: Vec::new(),
             routing: None,
             _reads: vec![read],
         })
@@ -602,9 +604,55 @@ impl MmapedSafetensors {
         );
         Ok(Self {
             safetensors,
+            owned: Vec::new(),
             routing: Some(routing),
             _reads: reads,
         })
+    }
+
+    /// Index the exact immutable buffers authenticated by a provider. The owned representation
+    /// moves each Vec without copying its data or reopening its path.
+    pub fn from_buffers(buffers: impl IntoIterator<Item = Result<Vec<u8>>>) -> Result<Self> {
+        let mut owned = Vec::new();
+        let mut routing = HashMap::new();
+        for buffer in buffers {
+            let shard = BufferedSafetensors::new(buffer?)?;
+            for (key, _) in shard.tensors() {
+                if routing.insert(key.clone(), owned.len()).is_some() {
+                    crate::bail!("duplicate tensor across owned shards: {key}")
+                }
+            }
+            owned.push(shard);
+        }
+        Ok(Self {
+            safetensors: Vec::new(),
+            owned,
+            routing: Some(routing),
+            _reads: Vec::new(),
+        })
+    }
+
+    /// Read classifier tables from the same bytes as the tensor views, including owned snapshots.
+    pub fn quantization_tables(&self) -> Result<Vec<String>> {
+        self.safetensors
+            .iter()
+            .map(|s| s.backing_cart().as_ref())
+            .chain(
+                self.owned
+                    .iter()
+                    .map(|s| s.safetensors.backing_cart().as_slice()),
+            )
+            .try_fold(Vec::new(), |mut tables, bytes| {
+                let (_, meta) = SafeTensors::read_metadata(bytes)?;
+                if let Some(table) = meta
+                    .metadata()
+                    .as_ref()
+                    .and_then(|m| m.get("_quantization_metadata"))
+                {
+                    tables.push(table.clone());
+                }
+                Ok(tables)
+            })
     }
 
     pub fn load(&self, name: &str, dev: &Device) -> Result<Tensor> {
@@ -616,6 +664,7 @@ impl MmapedSafetensors {
         for safetensors in self.safetensors.iter() {
             tensors.push(safetensors.get().0.tensors())
         }
+        tensors.extend(self.owned.iter().map(BufferedSafetensors::tensors));
         tensors.into_iter().flatten().collect()
     }
 
@@ -632,6 +681,9 @@ impl MmapedSafetensors {
                 *index
             }
         };
+        if let Some(shard) = self.owned.get(index) {
+            return shard.get(name);
+        }
         Ok(self.safetensors[index].get().0.tensor(name)?)
     }
 }

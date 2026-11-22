@@ -52,6 +52,12 @@ impl Loader<'_> {
 
     /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`), stored in the compute dtype.
     pub fn linear(&self, prefix: &str) -> Result<Linear> {
+        if let Some(inner) = mlx_gen::quant::native_lin(self.weights, prefix, false)? {
+            return Ok(Linear {
+                inner,
+                compute: self.compute,
+            });
+        }
         if let Some(affine) = self
             .affine
             .filter(|a| a.targets.contains(&format!("{prefix}.weight")))
@@ -164,15 +170,7 @@ impl Linear {
 
     /// Every base parameter (dense weight, or packed codes + scales + biases), for eval.
     pub fn arrays(&self) -> Vec<&Array> {
-        if let Some((weight, bias)) = self.inner.dense_weight() {
-            return std::iter::once(weight).chain(bias).collect();
-        }
-        match self.inner.quantized_params() {
-            Some((wq, scales, biases, bias, _, _)) => {
-                [wq, scales, biases].into_iter().chain(bias).collect()
-            }
-            None => Vec::new(),
-        }
+        self.inner.base_arrays()
     }
 }
 

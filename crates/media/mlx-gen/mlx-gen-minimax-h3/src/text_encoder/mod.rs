@@ -463,25 +463,15 @@ pub const VISION_SHARD: u32 = 14;
 /// Public so the sc-19120 tier measurement can exercise **this** mapping rather than a copy of it:
 /// a per-stage memory figure taken from a re-implementation measures the re-implementation.
 pub fn map_shards(dir: &Path, with_vision: bool) -> Result<Weights> {
-    let mut w = Weights::empty();
-    let shards: Vec<u32> = if with_vision {
-        TE_SHARDS.chain(std::iter::once(VISION_SHARD)).collect()
-    } else {
-        TE_SHARDS.collect()
-    };
-    for i in shards {
-        let shard = format!("model-{i:05}-of-00014.safetensors");
-        let part = Weights::from_file(dir.join(&shard))?;
-        let keys: Vec<String> = part.keys().map(str::to_owned).collect();
-        for k in keys {
-            if with_vision && i == VISION_SHARD && !k.starts_with(VISION_PREFIX) {
-                continue;
-            }
-            let t = part.require(&k)?.clone();
-            w.insert(k, t);
-        }
+    let shard = |i| dir.join(format!("model-{i:05}-of-00014.safetensors"));
+    let vision = shard(VISION_SHARD);
+    let mut paths: Vec<_> = TE_SHARDS.map(shard).collect();
+    if with_vision {
+        paths.push(vision.clone());
     }
-    Ok(w)
+    Weights::from_selected_files(&paths, |path, key| {
+        path != vision.as_path() || key.starts_with(VISION_PREFIX)
+    })
 }
 
 /// Load a bias-less Qwen3 projection from its `{base}.weight` key, auto-detecting a pre-quantized

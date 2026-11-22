@@ -80,7 +80,7 @@ use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
-use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
+use candle_transformers::models::stable_diffusion::{clip, StableDiffusionConfig};
 
 use crate::SdxlVaeDecoder;
 
@@ -180,13 +180,13 @@ impl DualClip {
             candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
             &[&l_tok_file, &g_tok_file],
         );
-        let l = stable_diffusion::build_clip_transformer(
+        let l = crate::loaders::load_stock_clip(
             l_cfg,
             snapshot_file(root, l_weights)?,
             device,
             DType::F32,
         )?;
-        let g = stable_diffusion::build_clip_transformer(
+        let g = crate::loaders::load_stock_clip(
             g_cfg,
             snapshot_file(root, g_weights)?,
             device,

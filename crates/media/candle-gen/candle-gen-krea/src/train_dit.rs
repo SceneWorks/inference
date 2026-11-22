@@ -131,7 +131,7 @@ pub(crate) fn sdpa_diff_budgeted(
 /// PEFT module path the harness matches against.
 fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
     let base = linear(w, path, bias)?;
-    let (out_f, in_f) = base.weight().dims2()?;
+    let (out_f, in_f) = base.weight_dims()?;
     Ok(ComposableLinear::Adapt(LoraLinear::from_linear(
         base,
         in_f,
@@ -147,7 +147,7 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
 pub(crate) enum ComposableLinear {
     Adapt(LoraLinear),
     ConvRot(KreaQLinear),
-    NativeNvfp4(KreaQLinear),
+    NativeCheckpoint(KreaQLinear),
 }
 
 impl ComposableLinear {
@@ -161,7 +161,7 @@ impl ComposableLinear {
                         other => candle_gen::candle_core::Error::Msg(other.to_string()),
                     })
             }
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => {
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => {
                 linear.quantize_onto(quant, device)
             }
         }
@@ -198,13 +198,13 @@ impl ComposableLinear {
     fn lora(&self) -> Option<&LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
+            Self::ConvRot(_) | Self::NativeCheckpoint(_) => None,
         }
     }
     fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
+            Self::ConvRot(_) | Self::NativeCheckpoint(_) => None,
         }
     }
 
@@ -215,10 +215,12 @@ impl ComposableLinear {
     ) -> candle_gen::Result<()> {
         match self {
             Self::Adapt(linear) => f(path, linear),
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => match linear.as_additive_mut() {
-                Some(linear) => f(path, linear),
-                None => Ok(()),
-            },
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => {
+                match linear.as_additive_mut() {
+                    Some(linear) => f(path, linear),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -232,7 +234,7 @@ impl Module for ComposableLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Adapt(linear) => linear.forward(x),
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => linear.forward(x),
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => linear.forward(x),
         }
     }
 }
@@ -294,8 +296,8 @@ fn proj_loader(
     plan: &DitPlan,
 ) -> impl Fn(&Weights, &str, bool) -> Result<ComposableLinear> + '_ {
     move |weights, path, bias| {
-        if packed && weights.is_native_nvfp4() {
-            Ok(ComposableLinear::NativeNvfp4(linear_detect_planned(
+        if packed && (weights.is_native_nvfp4() || weights.is_native_projection(path)) {
+            Ok(ComposableLinear::NativeCheckpoint(linear_detect_planned(
                 weights, path, bias, plan,
             )?))
         } else if packed {
@@ -695,7 +697,7 @@ impl KreaTrainDit {
             &self.txt_in_l2,
             &self.final_linear,
         ] {
-            if let ComposableLinear::NativeNvfp4(projection) = projection {
+            if let ComposableLinear::NativeCheckpoint(projection) = projection {
                 add(projection);
             }
         }
@@ -707,7 +709,7 @@ impl KreaTrainDit {
                 &block.attn.gate,
                 &block.attn.o,
             ] {
-                if let ComposableLinear::NativeNvfp4(projection) = projection {
+                if let ComposableLinear::NativeCheckpoint(projection) = projection {
                     add(projection);
                 }
             }
@@ -1243,11 +1245,12 @@ mod tests {
         candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
         for quant in [Quant::Q4, Quant::Q8] {
             let (dit, native_nvfp4) = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .unwrap();
             assert!(!native_nvfp4);
@@ -1295,11 +1298,12 @@ mod tests {
         let (path, cfg) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
         for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
             let error = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .err()
             .unwrap()
@@ -1611,31 +1615,23 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_time_mod_projection_is_exposed_to_additive_adapter_walk() {
-        let dev = Device::Cpu;
-        let canonical = Tensor::from_vec(
-            vec![
-                0.5f32, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
-                -0.1,
-            ],
-            (4, 4),
-            &dev,
-        )
-        .unwrap();
-        let rotation = candle_gen::quant::regular_hadamard(4, &dev).unwrap();
+        let dev = Device::new_cuda(0).unwrap();
+        let canonical = Tensor::ones((16, 64), DType::F32, &dev).unwrap();
+        let rotation = candle_gen::quant::regular_hadamard(64, &dev).unwrap();
         let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
         let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
         let mut projection = ComposableLinear::ConvRot(
-            KreaQLinear::convrot_int8(parts.q, parts.scale, 4, None, &dev).unwrap(),
+            KreaQLinear::convrot_int8(parts.q, parts.scale, 64, None, &dev).unwrap(),
         );
-        let x = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        let x = Tensor::ones((1, 64), DType::F32, &dev).unwrap();
         let bare = projection.forward(&x).unwrap();
         let mut visited = 0usize;
         projection
             .visit_additive("time_mod_proj", &mut |path, host| {
                 assert_eq!(path, "time_mod_proj");
                 host.add_lora(
-                    Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
-                    Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
+                    Tensor::ones((64, 1), DType::F32, &dev).unwrap(),
+                    Tensor::ones((1, 16), DType::F32, &dev).unwrap(),
                     0.5,
                 )?;
                 visited += 1;

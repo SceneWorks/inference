@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Weights {
     tensors: HashMap<String, Array>,
+    source_reads: mlx_layers::source::SourceReads,
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
     accessed: RefCell<HashSet<String>>,
@@ -105,15 +106,26 @@ impl Weights {
     pub fn from_map(tensors: HashMap<String, Array>) -> Self {
         Self {
             tensors,
+            source_reads: Default::default(),
             accessed: RefCell::new(HashSet::new()),
             released: HashSet::new(),
+        }
+    }
+
+    pub fn from_observed_map(
+        tensors: HashMap<String, Array>,
+        source_reads: mlx_layers::source::SourceReads,
+    ) -> Self {
+        Self {
+            source_reads,
+            ..Self::from_map(tensors)
         }
     }
 
     /// Load every tensor from a single `.safetensors` file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let tensors = crate::load_progress::load(path)
+        let (mut tensors, metadata) = crate::load_progress::load_with_metadata(path)
             .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -121,7 +133,21 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &[path],
         );
-        Ok(Self::from_map(tensors))
+        let declarations: Vec<_> = metadata
+            .get("_quantization_metadata")
+            .cloned()
+            .into_iter()
+            .collect();
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+            &mut tensors,
+            &[path.to_owned()],
+            &declarations,
+            crate::models::qwen35::stacked_expert_key,
+        )?;
+        Ok(Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        })
     }
 
     /// Load and merge every `*.safetensors` shard in a snapshot directory.
@@ -146,10 +172,19 @@ impl Weights {
         let __input_paths = shards.clone(); // deterministic merge order
         crate::load_progress::register_files(&shards);
         let mut tensors = HashMap::new();
-        for shard in shards {
-            let part = crate::load_progress::load(&shard)
+        let mut declarations = Vec::new();
+        for shard in &shards {
+            let (part, meta) = crate::load_progress::load_with_metadata(shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
-            tensors.extend(part);
+            declarations.extend(meta.get("_quantization_metadata").cloned());
+            for (name, tensor) in part {
+                if tensors.insert(name.clone(), tensor).is_some() {
+                    return Err(Error::Msg(format!(
+                        "duplicate key {name} in {}",
+                        shard.display()
+                    )));
+                }
+            }
         }
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -157,7 +192,16 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &__input_paths,
         );
-        Ok(Self::from_map(tensors))
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+            &mut tensors,
+            &shards,
+            &declarations,
+            crate::models::qwen35::stacked_expert_key,
+        )?;
+        Ok(Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        })
     }
 
     /// Inspect its header without marking a tensor for materialization.
@@ -227,6 +271,11 @@ impl Weights {
     pub fn materialize_accessed(&self) -> Result<()> {
         let accessed = self.accessed.borrow();
         mlx_rs::transforms::eval(accessed.iter().filter_map(|key| self.tensors.get(key)))?;
+        for key in accessed.iter() {
+            if let Some(array) = self.tensors.get(key) {
+                self.source_reads.materialized(key, array)?;
+            }
+        }
         Ok(())
     }
 
@@ -262,6 +311,11 @@ impl Weights {
         }
         if !batch.is_empty() {
             Self::verify_batch(&batch)?;
+        }
+        for key in accessed.iter() {
+            if let Some(array) = self.tensors.get(key) {
+                self.source_reads.materialized(key, array)?;
+            }
         }
         Ok(())
     }
@@ -370,6 +424,7 @@ impl Weights {
                 .map(|a| a.nbytes() as u64)
                 .sum();
             for key in read {
+                self.source_reads.materialized(&key, &self.tensors[&key])?;
                 self.tensors.remove(&key);
                 self.released.insert(key);
                 report.released += 1;
@@ -470,6 +525,21 @@ pub(crate) fn eval_groups(groups: &[Vec<Array>]) -> Result<()> {
         mlx_rs::memory::clear_cache();
     }
     Ok(())
+}
+
+impl mlx_layers::MlxWeightSource for Weights {
+    fn peek(&self, key: &str) -> Option<&Array> {
+        self.metadata(key)
+    }
+    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
+        self.source_reads.get(key)
+    }
+    fn get(&self, key: &str) -> Option<&Array> {
+        self.get(key)
+    }
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.source_reads.rotation(group, build)
+    }
 }
 
 #[cfg(test)]

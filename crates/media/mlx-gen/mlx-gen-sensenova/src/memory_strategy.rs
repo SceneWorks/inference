@@ -316,24 +316,12 @@ impl PinnedArtifact {
         let weights = if let [only] = self.files.as_slice() {
             mlx_gen::weights::Weights::from_file(only.seal.loader_path())?
         } else {
-            let mut tensors = HashMap::new();
-            for path in self.loader_paths() {
-                let shard = mlx_gen::weights::Weights::from_file(path)
-                    .map_err(|error| {
-                        mlx_gen::Error::Msg(format!("loading shard {}: {error}", path.display()))
-                    })?
-                    .into_tensors();
-                for (key, tensor) in shard {
-                    if tensors.insert(key.clone(), tensor).is_some() {
-                        return Err(mlx_gen::Error::Msg(format!(
-                            "duplicate tensor key `{key}` across the pinned shards (shard {} \
-                             repeats it; non-disjoint shard set)",
-                            path.display()
-                        )));
-                    }
-                }
-            }
-            mlx_gen::weights::Weights::from_map(tensors)
+            let paths: Vec<_> = self.loader_paths().map(Path::to_owned).collect();
+            let directory = paths
+                .first()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."));
+            mlx_gen::weights::Weights::from_paths(&paths, directory)?
         };
         self.ensure_unchanged()
             .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;

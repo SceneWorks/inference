@@ -1,30 +1,41 @@
-//! Native descriptor-driven ConvRot INT8 base (sc-26683), shared with adapter consumers.
+//! Native ConvRot projections from a media weight map.
 use crate::{CandleError, CandleWeightSource, Result};
 use candle_core::{DType, Device, Tensor};
 use gen_core::convrot_int8::{ConvRotInt8, MAX_DESCRIPTOR_BYTES};
 
-/// One compact signed INT8 projection. Non-CUDA builds refuse, never dequantize.
-pub struct ConvRotLinear {
-    pub(crate) descriptor: ConvRotInt8,
-    device: Device,
-    #[cfg(feature = "cuda")]
-    rotation: Tensor,
-    #[cfg(feature = "cuda")]
-    linear: crate::eight_bit_linear::Int8Linear,
-}
-impl std::fmt::Debug for ConvRotLinear {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConvRotLinear")
-            .field("descriptor", &self.descriptor)
-            .finish_non_exhaustive()
+#[derive(Debug)]
+pub struct ConvRotLinear(candle_quant_kernels::convrot_int8::ConvRotLinear);
+
+impl std::ops::Deref for ConvRotLinear {
+    type Target = candle_quant_kernels::convrot_int8::ConvRotLinear;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
+
 impl ConvRotLinear {
-    /// Immutable validated logical geometry.
-    pub fn descriptor(&self) -> ConvRotInt8 {
-        self.descriptor
+    pub fn from_native(base: candle_quant_kernels::convrot_int8::ConvRotLinear) -> Self {
+        Self(base)
     }
 
+    pub fn from_native_parts(
+        resources: &candle_quant_kernels::convrot_int8::ProjectionResources,
+        descriptor: ConvRotInt8,
+        codes: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        if !codes.device().is_cuda() {
+            return Err(CandleError::Unsupported(
+                "ConvRot INT8 requires native CUDA".into(),
+            ));
+        }
+        Ok(Self(
+            candle_quant_kernels::convrot_int8::ConvRotLinear::from_native_parts(
+                resources, descriptor, codes, scales, bias,
+            )?,
+        ))
+    }
     /// Missing descriptor is dense only when there are no native INT8 operands.
     pub fn from_weights<W: CandleWeightSource + ?Sized>(
         w: &W,
@@ -81,74 +92,13 @@ impl ConvRotLinear {
         } else {
             None
         };
-        if bias.as_ref().is_some_and(|b| {
-            b.dims() != [descriptor.out_features]
-                || !matches!(b.dtype(), DType::F32 | DType::F16 | DType::BF16)
-        }) {
-            return Err(CandleError::Msg(format!("{base}: invalid ConvRot bias")));
-        }
-        #[cfg(feature = "cuda")]
-        {
-            let ctx = w.int8_context(codes.device())?;
-            let lt = ctx.handle_for(codes.device())?;
-            if !lt.meets_fp8_floor()? {
-                return Err(CandleError::Unsupported(
-                    "ConvRot INT8 requires the shared sm_89 integer lane".into(),
-                ));
-            }
-            if !descriptor.out_features.is_multiple_of(16) {
-                return Err(CandleError::Msg(
-                    "ConvRot CUDA output width must be a multiple of16".into(),
-                ));
-            }
-            let linear = crate::eight_bit_linear::Int8Linear::from_native_bytes(
-                &codes,
-                scales,
-                bias,
-                lt.clone(),
-            )?;
-            let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
-            Ok(Some(Self {
-                descriptor,
-                device: codes.device().clone(),
-                rotation,
-                linear,
-            }))
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = (descriptor, bias);
-            Err(CandleError::Unsupported(
-                "ConvRot INT8 requires native CUDA; no floating fallback".into(),
-            ))
-        }
-    }
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-    pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            let d = self.descriptor;
-            if x.dims().last() != Some(&d.in_features)
-                || !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
-                || x.elem_count() == 0
-                || !self.device.same_device(x.device())
-            {
-                candle_core::bail!("ConvRot INT8 activation shape/dtype/device mismatch");
-            }
-            let rotated = crate::convrot::convrot_rotate(x, &self.rotation)?
-                .to_dtype(x.dtype())?
-                .reshape((x.elem_count() / d.in_features, d.in_features))?;
-            let out = self.linear.forward_kitchen(&rotated, x.dtype())?;
-            let mut shape = x.dims().to_vec();
-            *shape.last_mut().unwrap() = d.out_features;
-            out.reshape(shape)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = x;
-            candle_core::bail!("ConvRot INT8 requires native CUDA; no floating fallback")
-        }
+        Self::from_native_parts(
+            w.projection_resources(),
+            descriptor,
+            codes.clone(),
+            scales.clone(),
+            bias,
+        )
+        .map(Some)
     }
 }

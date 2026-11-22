@@ -55,6 +55,12 @@ impl Generator for ControlGenerator {
         })
     }
 
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.model
+            .borrow()
+            .as_ref()
+            .and_then(|(_, control)| control.checkpoint_weight_facts())
+    }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

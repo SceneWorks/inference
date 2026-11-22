@@ -12,11 +12,12 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{DenseLinear, QLinear};
 
 use crate::config::DitConfig;
 use crate::nn;
-use crate::weights::Weights;
+use crate::weights::ModelWeights;
 
 type CResult<T> = candle_gen::Result<T>;
 
@@ -38,12 +39,15 @@ type CResult<T> = candle_gen::Result<T>;
 /// flatten**, and the **cast-back** to the input dtype (the DiT flows bf16).
 struct Linear(QLinear);
 impl Linear {
-    fn load(w: &Weights, prefix: &str, bias: bool) -> CResult<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?; // [out, in]
+    fn load(w: &impl ModelWeights, prefix: &str, bias: bool) -> CResult<Self> {
+        if let Some(native) = w.native_projection(prefix, bias)? {
+            return Ok(Self(QLinear::from_dense(DenseLinear::Linear(native))));
+        }
+        let weight = w.tensor(&format!("{prefix}.weight"))?; // [out, in]
         Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
-            weight_t: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
+            weight_t: nn::transpose_weight(&weight)?, // [in, out], once at load (sc-8997/F-017)
             bias: if bias {
-                Some(w.require(&format!("{prefix}.bias"))?.clone())
+                Some(w.tensor(&format!("{prefix}.bias"))?.clone())
             } else {
                 None
             },
@@ -61,7 +65,14 @@ impl Linear {
     /// is promoted to f32 for the post-matmul add.
     fn quantize(&mut self, quant: Quant) -> CResult<()> {
         // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = true.
-        self.0.quantize_int8_fast(quant, true, true, true)?;
+        self.0.quantize_component(
+            quant,
+            ComponentFold::Int8Fast {
+                skip_indivisible: true,
+                flatten_leading: true,
+                cast_back: true,
+            },
+        )?;
         Ok(())
     }
 }
@@ -91,8 +102,8 @@ struct TimeEmbedding {
     dtype: DType,
 }
 impl TimeEmbedding {
-    fn load(w: &Weights, prefix: &str) -> CResult<Self> {
-        let dtype = w.require(&format!("{prefix}.proj_in.weight"))?.dtype();
+    fn load(w: &impl ModelWeights, prefix: &str) -> CResult<Self> {
+        let dtype = w.dtype(&format!("{prefix}.proj_in.weight"))?;
         Ok(Self {
             proj_in: Linear::load(w, &format!("{prefix}.proj_in"), true)?,
             proj_hid: Linear::load(w, &format!("{prefix}.proj_hid"), true)?,
@@ -133,7 +144,7 @@ struct PatchIn {
     pw: usize,
 }
 impl PatchIn {
-    fn load(w: &Weights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
         Ok(Self {
             proj: Linear::load(w, &format!("{prefix}.proj"), true)?,
             pt: cfg.patch_t,
@@ -166,7 +177,7 @@ struct PatchOut {
     pw: usize,
 }
 impl PatchOut {
-    fn load(w: &Weights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
         Ok(Self {
             proj: Linear::load(w, &format!("{prefix}.proj"), true)?,
             pt: cfg.patch_t,
@@ -439,8 +450,8 @@ struct AdaParams {
     mlp_gate: Tensor,
 }
 impl AdaParams {
-    fn load(w: &Weights, prefix: &str) -> CResult<Self> {
-        let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
+    fn load(w: &impl ModelWeights, prefix: &str) -> CResult<Self> {
+        let g = |n: &str| w.tensor(&format!("{prefix}.{n}"));
         Ok(Self {
             attn_shift: g("attn_shift")?,
             attn_scale: g("attn_scale")?,
@@ -496,7 +507,7 @@ enum Mlp {
     },
 }
 impl Mlp {
-    fn load(w: &Weights, prefix: &str, swiglu: bool) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, swiglu: bool) -> CResult<Self> {
         if swiglu {
             Ok(Mlp::SwiGlu {
                 proj_in: Linear::load(w, &format!("{prefix}.proj_in"), false)?,
@@ -616,17 +627,17 @@ struct MMAttention {
     rope_pixel: bool,
 }
 impl MMAttention {
-    fn load(w: &Weights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, prefix: &str, cfg: &DitConfig) -> CResult<Self> {
         Ok(Self {
             qkv_vid: Linear::load(w, &format!("{prefix}.proj_qkv_vid"), false)?,
             out_vid: Linear::load(w, &format!("{prefix}.proj_out_vid"), true)?,
-            nq_vid: w.require(&format!("{prefix}.norm_q_vid.weight"))?.clone(),
-            nk_vid: w.require(&format!("{prefix}.norm_k_vid.weight"))?.clone(),
+            nq_vid: w.tensor(&format!("{prefix}.norm_q_vid.weight"))?.clone(),
+            nk_vid: w.tensor(&format!("{prefix}.norm_k_vid.weight"))?.clone(),
             qkv_txt: Linear::load(w, &format!("{prefix}.proj_qkv_txt"), false)?,
             out_txt: Linear::load(w, &format!("{prefix}.proj_out_txt"), true)?,
-            nq_txt: w.require(&format!("{prefix}.norm_q_txt.weight"))?.clone(),
-            nk_txt: w.require(&format!("{prefix}.norm_k_txt.weight"))?.clone(),
-            freqs: w.require(&format!("{prefix}.rope.freqs"))?.clone(),
+            nq_txt: w.tensor(&format!("{prefix}.norm_q_txt.weight"))?.clone(),
+            nk_txt: w.tensor(&format!("{prefix}.norm_k_txt.weight"))?.clone(),
+            freqs: w.tensor(&format!("{prefix}.rope.freqs"))?.clone(),
             heads: cfg.heads,
             head_dim: cfg.head_dim,
             scale: (cfg.head_dim as f64).powf(-0.5),
@@ -740,15 +751,16 @@ struct Block {
     ones: Tensor,
 }
 impl Block {
-    fn load(w: &Weights, idx: usize, cfg: &DitConfig) -> CResult<Self> {
+    fn load(w: &impl ModelWeights, idx: usize, cfg: &DitConfig) -> CResult<Self> {
         let prefix = format!("blocks.{idx}");
         let shared = idx >= cfg.mm_layers;
         let is_last = cfg.last_layer_vid_only && idx == cfg.num_layers - 1;
         let device = w
-            .require(&format!("{prefix}.attn.norm_q_vid.weight"))?
-            .device();
+            .tensor(&format!("{prefix}.attn.norm_q_vid.weight"))?
+            .device()
+            .clone();
         // Unit weight for the parameter-free pre-norms (sc-9039); vid/txt both live in `vid_dim`.
-        let ones = Tensor::ones(cfg.vid_dim, DType::F32, device)?;
+        let ones = Tensor::ones(cfg.vid_dim, DType::F32, &device)?;
         let attn = MMAttention::load(w, &format!("{prefix}.attn"), cfg)?;
         let (mlp_vid, mlp_txt, mlp_all) = if shared {
             (
@@ -929,15 +941,15 @@ pub struct Seedvr2Transformer {
 }
 
 impl Seedvr2Transformer {
-    pub fn from_weights(w: &Weights, cfg: &DitConfig) -> CResult<Self> {
+    pub fn from_weights(w: &impl ModelWeights, cfg: &DitConfig) -> CResult<Self> {
         let blocks = (0..cfg.num_layers)
             .map(|i| Block::load(w, i, cfg))
             .collect::<CResult<Vec<_>>>()?;
         let (vid_out_norm, out_shift, out_scale) = if cfg.use_output_ada {
             (
-                Some(w.require("vid_out_norm.weight")?.clone()),
-                Some(w.require("out_shift")?.clone()),
-                Some(w.require("out_scale")?.clone()),
+                Some(w.tensor("vid_out_norm.weight")?.clone()),
+                Some(w.tensor("out_shift")?.clone()),
+                Some(w.tensor("out_scale")?.clone()),
             )
         } else {
             (None, None, None)

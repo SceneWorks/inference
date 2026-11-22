@@ -118,11 +118,13 @@ struct VisionEncoderLayer {
 impl VisionEncoderLayer {
     fn from_weights(w: &Weights, prefix: &str, cfg: &VisionConfig) -> Result<Self> {
         let g = |name: &str| w.require(&format!("{prefix}.{name}")).cloned();
-        let dense = |wn: &str, bn: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{wn}"))?.clone(),
-                Some(w.require(&format!("{prefix}.{bn}"))?.clone()),
-            ))
+        let linear = |name: &str| {
+            mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.{name}"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )
         };
         let head_dim = cfg.hidden / cfg.num_heads;
         Ok(Self {
@@ -130,12 +132,12 @@ impl VisionEncoderLayer {
             ln1_b: g("layer_norm1.bias")?,
             ln2_w: g("layer_norm2.weight")?,
             ln2_b: g("layer_norm2.bias")?,
-            q: dense("self_attn.q_proj.weight", "self_attn.q_proj.bias")?,
-            k: dense("self_attn.k_proj.weight", "self_attn.k_proj.bias")?,
-            v: dense("self_attn.v_proj.weight", "self_attn.v_proj.bias")?,
-            out: dense("self_attn.out_proj.weight", "self_attn.out_proj.bias")?,
-            fc1: dense("mlp.fc1.weight", "mlp.fc1.bias")?,
-            fc2: dense("mlp.fc2.weight", "mlp.fc2.bias")?,
+            q: linear("self_attn.q_proj")?,
+            k: linear("self_attn.k_proj")?,
+            v: linear("self_attn.v_proj")?,
+            out: linear("self_attn.out_proj")?,
+            fc1: linear("mlp.fc1")?,
+            fc2: linear("mlp.fc2")?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),

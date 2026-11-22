@@ -226,9 +226,24 @@ pub fn backbone_bytes(
         .filter(|header| header.shape.len() >= 2)
         .filter_map(|header| header.name.strip_suffix(".weight"))
         .collect();
+    let encoded = candle_gen::logical_weights::projection_prices(
+        file,
+        &headers,
+        |h| {
+            if h.shape.len() >= 2 && h.name.ends_with(".weight") {
+                compute_width
+            } else {
+                4
+            }
+        },
+        candle_gen::logical_weights::standard_linear_weight,
+    )?;
     checked_sum(
         "iris",
         headers.iter().map(|header| {
+            if let Some(&bytes) = encoded.get(&header.name) {
+                return Ok(bytes);
+            }
             if let ([out, input], Some(_)) =
                 (header.shape.as_slice(), header.name.strip_suffix(".weight"))
             {
@@ -278,15 +293,33 @@ pub fn text_encoder_bytes(
         .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: text encoder config: {e}")))?;
     let tied = config.tie_word_embeddings;
     let spec = crate::text_encoder::text_encoder_quant_spec(&config, quant)?;
-    let mut total = 0_u64;
-    for file in crate::text_encoder::shard_files(dir)? {
-        let headers = safetensors_path_tensor_headers(&file)?;
-        let part = checked_sum(
-            MODEL_ID,
-            headers
-                .iter()
-                .filter(|header| text_encoder_keeps(&header.name, tied))
-                .map(|header| match (spec, header.shape.as_slice()) {
+    let files = crate::text_encoder::shard_files(dir)?;
+    let mut headers = Vec::new();
+    for file in &files {
+        headers.extend(safetensors_path_tensor_headers(file)?);
+    }
+    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        &files,
+        &headers,
+        |_| tower_width,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+        candle_gen::logical_weights::standard_linear_weight,
+    )?;
+    checked_sum(
+        MODEL_ID,
+        headers
+            .iter()
+            .filter(|h| {
+                text_encoder_keeps(&h.name, tied)
+                    || (!tied
+                        && gen_core::checkpoint_codec::projection_companion_base(&h.name)
+                            == Some("lm_head"))
+            })
+            .map(|header| {
+                if let Some(&bytes) = encoded.get(&header.name) {
+                    return Ok(bytes);
+                }
+                match (spec, header.shape.as_slice()) {
                     (Some(spec), [out, input])
                         if header.name.starts_with(TEXT_ENCODER_LAYERS_PREFIX)
                             && header.name.ends_with(".weight") =>
@@ -302,13 +335,9 @@ pub fn text_encoder_bytes(
                         ))
                     }
                     _ => tensor_bytes(header, tower_width),
-                }),
-        )?;
-        total = total.checked_add(part).ok_or_else(|| {
-            gen_core::Error::Msg(format!("{MODEL_ID}: text encoder byte sum overflow"))
-        })?;
-    }
-    Ok(total)
+                }
+            }),
+    )
 }
 
 /// Device bytes of a downstream export's shipped empty-prompt conditioning: the `[1, T, L, D]`

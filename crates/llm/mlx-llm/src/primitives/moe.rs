@@ -24,10 +24,12 @@ use mlx_rs::ops::{
     add, argpartition_axis, argsort_axis, divide, floor_divide, gather_mm, gather_qmm, maximum,
     multiply, negative, quantize, sigmoid, softmax_axis, split_sections, stack_axis, sum_axis,
 };
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{ops::indexing::IndexOp, Array, Dtype};
 
 use crate::error::{Error, Result};
-use crate::primitives::nn::{linear, silu};
+#[cfg(test)]
+use crate::primitives::nn::linear;
+use crate::primitives::nn::silu;
 use crate::primitives::projection::{Projection, QuantSpec};
 
 /// Routed (token, slot) pairs at or above this count are sorted by expert before the gathered
@@ -43,6 +45,11 @@ pub enum SwitchLinear {
     Dense {
         /// The stacked weight.
         weight: Array,
+    },
+    /// Original per-expert source operators, indexed in the same order as the router.
+    Source {
+        parts: Vec<Projection>,
+        shape: [i32; 2],
     },
     /// Group-wise quantized weights (`[experts, out, packed]` plus per-group scales / biases),
     /// dispatched with `gather_qmm`.
@@ -79,6 +86,107 @@ impl SwitchLinear {
         }
     }
 
+    /// Retain the slices of a publisher's [experts, output, input] FP8 bank.
+    pub(crate) fn from_checkpoint(
+        w: &super::weights::Weights,
+        key: &str,
+        shape: [i32; 3],
+        dense: impl FnOnce() -> Result<Array>,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
+        if let Some(bank) = Self::from_scalar_source(w, key, shape, false, None)? {
+            return Ok(bank);
+        }
+        let weight = dense()?;
+        if weight.shape() != shape {
+            return Err(Error::Config(format!(
+                "{key}: expected {shape:?}, got {:?}",
+                weight.shape()
+            )));
+        }
+        Self::load(weight, quant)
+    }
+
+    /// Bind source scalar FP8 bank axes in declared architecture order. Some publishers
+    /// store each expert in input-major order and keep a separate per-expert bias.
+    pub fn from_scalar_source(
+        w: &impl mlx_layers::MlxWeightSource,
+        key: &str,
+        shape: [i32; 3],
+        input_major: bool,
+        bias: Option<&Array>,
+    ) -> Result<Option<Self>> {
+        use mlx_layers::ComfyQuantFormat;
+        if let Some(blob) = w.get(&format!("{key}.comfy_quant")) {
+            let desc = mlx_layers::convrot_int8::descriptor(blob, key)?;
+            if !matches!(
+                desc.format,
+                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+            ) || desc.full_precision_matrix_mult
+            {
+                return Err(Error::Config(format!(
+                    "{key}: stacked source requires a scalar FP8 scale for the entire expert bank"
+                )));
+            }
+            let codes = w.require(key)?;
+            let [e, n, k] = shape;
+            let (rows, cols) = if input_major { (k, n) } else { (n, k) };
+            if codes.shape() != [e, rows, cols]
+                || shape.iter().any(|n| *n <= 0)
+                || bias.is_some_and(|b| b.shape() != [e, n])
+            {
+                return Err(Error::Config(format!(
+                    "{key}: invalid expert bank geometry"
+                )));
+            }
+            let scales = w.get(&format!("{key}.weight_scale")).cloned();
+            let input = w.get(&format!("{key}.input_scale")).cloned();
+            let observation = w.observation(key);
+            let all_rows = e.checked_mul(rows).ok_or_else(|| {
+                Error::Config(format!("{key}: expert bank exceeds MLX row range"))
+            })?;
+            let matrix = mlx_layers::fp8::Fp8Linear::new(
+                desc.format,
+                codes.reshape(&[all_rows, cols])?,
+                scales,
+                input,
+                &[all_rows as usize, cols as usize],
+                None,
+            )?;
+            let mut parts = Vec::with_capacity(e as usize);
+            for i in 0..e {
+                let mut op = matrix.slice_rows(i * rows, (i + 1) * rows)?;
+                if input_major {
+                    op = op.transposed_scalar()?;
+                }
+                if let Some(bias) = bias {
+                    op.set_bias(bias.index(i))?;
+                }
+                if let Some(obs) = &observation {
+                    op.observe(obs.expert(i as usize, rows as usize, cols as usize)?)?;
+                }
+                parts.push(Projection::Native(mlx_layers::NativeProjection::Fp8(op)));
+            }
+            return Ok(Some(Self::Source {
+                parts,
+                shape: [n, k],
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Project ordered active token groups with a shared router boundary vector.
+    pub fn project_sorted(&self, x: &Array, idx: &Array, offsets: &[i32]) -> Result<Array> {
+        if offsets.len() != self.num_experts() + 1
+            || offsets.first() != Some(&0)
+            || offsets.last().copied() != x.shape().first().copied()
+            || offsets.windows(2).any(|s| s[1] < s[0])
+        {
+            return Err(Error::Config("invalid source expert boundaries".into()));
+        }
+        self.forward(x, idx, true, Some(offsets))
+    }
+
     /// Stack per-expert projections (a checkpoint that stores each expert under its own key).
     ///
     /// Every part must share one representation: all dense, or all quantized with one group size
@@ -90,6 +198,17 @@ impl SwitchLinear {
                 "an MoE expert bank needs at least one expert".into(),
             ));
         };
+        if parts.iter().any(|p| matches!(p, Projection::Native(_))) {
+            let shape = first.expert_shape()?;
+            for p in &parts {
+                if p.expert_shape()? != shape {
+                    return Err(Error::Config(
+                        "routed experts disagree on input/output geometry".into(),
+                    ));
+                }
+            }
+            return Ok(Self::Source { parts, shape });
+        }
         match first {
             Projection::Dense { .. } => {
                 let mut weights = Vec::with_capacity(parts.len());
@@ -126,6 +245,7 @@ impl SwitchLinear {
                     bits,
                 })
             }
+            Projection::Native(_) => unreachable!("source bank handled above"),
             Projection::Prism(_) => Err(Error::Unsupported(
                 "Prism packed MoE experts have no gathered matmul".into(),
             )),
@@ -134,8 +254,26 @@ impl SwitchLinear {
 
     /// `x @ weight[idx]ᵀ` for every index: `x` `[.., 1, in]` broadcast against `idx`'s shape,
     /// giving `[.., 1, out]` per index.
-    fn forward(&self, x: &Array, idx: &Array, sorted: bool) -> Result<Array> {
+    fn forward(
+        &self,
+        x: &Array,
+        idx: &Array,
+        sorted: bool,
+        offsets: Option<&[i32]>,
+    ) -> Result<Array> {
         Ok(match self {
+            Self::Source { parts, .. } => {
+                let offsets = offsets.ok_or_else(|| {
+                    Error::Config("source expert bank requires sorted router offsets".into())
+                })?;
+                let mut outputs = Vec::new();
+                for (p, span) in parts.iter().zip(offsets.windows(2)) {
+                    if span[0] < span[1] {
+                        outputs.push(p.forward(&x.index(span[0]..span[1]))?);
+                    }
+                }
+                mlx_rs::ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 0)?
+            }
             Self::Dense { weight } => gather_mm(x, weight.swap_axes(-1, -2)?, None, idx, sorted)?,
             Self::Quantized {
                 weight,
@@ -160,24 +298,37 @@ impl SwitchLinear {
 
     /// The experts stacked on the leading axis.
     pub fn num_experts(&self) -> usize {
-        let (Self::Dense { weight } | Self::Quantized { weight, .. }) = self;
-        weight.shape().first().copied().unwrap_or(0) as usize
+        match self {
+            Self::Source { parts, .. } => parts.len(),
+            Self::Dense { weight } | Self::Quantized { weight, .. } => {
+                weight.shape().first().copied().unwrap_or(0) as usize
+            }
+        }
     }
 
     /// Whether the bank is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized { .. })
+        matches!(self, Self::Quantized { .. } | Self::Source { .. })
     }
 
     /// Output rows per expert (`out` of `[experts, out, in]`).
     fn out_features(&self) -> i32 {
-        let (Self::Dense { weight } | Self::Quantized { weight, .. }) = self;
-        weight.shape().get(1).copied().unwrap_or(0)
+        match self {
+            Self::Source { shape, .. } => shape[0],
+            Self::Dense { weight } | Self::Quantized { weight, .. } => {
+                weight.shape().get(1).copied().unwrap_or(0)
+            }
+        }
     }
 
     /// The arrays the bank holds, for load-time materialization (sc-24446).
     pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
+            Self::Source { parts, .. } => {
+                for p in parts {
+                    p.push_arrays(out);
+                }
+            }
             Self::Dense { weight } => out.push(weight.clone()),
             Self::Quantized {
                 weight,
@@ -207,18 +358,25 @@ pub enum GateUp {
 
 impl GateUp {
     /// `(gate, up)` activations for `x` routed through `idx`.
-    fn forward(&self, x: &Array, idx: &Array, sorted: bool) -> Result<(Array, Array)> {
+    fn forward(
+        &self,
+        x: &Array,
+        idx: &Array,
+        sorted: bool,
+        offsets: Option<&[i32]>,
+    ) -> Result<(Array, Array)> {
         match self {
             Self::Fused(bank) => {
-                let gu = bank.forward(x, idx, sorted)?;
+                let gu = bank.forward(x, idx, sorted, offsets)?;
                 let mut halves = split_sections(&gu, &[bank.out_features() / 2], -1)?;
                 let up = halves.pop().expect("two halves");
                 let gate = halves.pop().expect("two halves");
                 Ok((gate, up))
             }
-            Self::Split { gate, up } => {
-                Ok((gate.forward(x, idx, sorted)?, up.forward(x, idx, sorted)?))
-            }
+            Self::Split { gate, up } => Ok((
+                gate.forward(x, idx, sorted, offsets)?,
+                up.forward(x, idx, sorted, offsets)?,
+            )),
         }
     }
 
@@ -284,13 +442,13 @@ pub struct MoeRouting {
 #[derive(Debug)]
 pub struct SparseMoe {
     /// Router weight `[experts, hidden]`.
-    router: Array,
+    router: Projection,
     gate_up: GateUp,
     down: SwitchLinear,
     num_experts: usize,
-    shared: SwiGlu,
+    shared: Box<SwiGlu>,
     /// Shared-expert sigmoid gate `[1, hidden]`; `None` ⇒ the shared expert is added ungated.
-    shared_gate: Option<Array>,
+    shared_gate: Option<Projection>,
     routing: MoeRouting,
 }
 
@@ -309,11 +467,11 @@ impl SparseMoe {
         routing: MoeRouting,
     ) -> Result<Self> {
         Self::with_gate_up(
-            router,
+            Projection::load(router, None)?,
             GateUp::Split { gate, up },
             down,
             shared,
-            shared_gate,
+            shared_gate.map(|w| Projection::load(w, None)).transpose()?,
             routing,
         )
     }
@@ -336,24 +494,30 @@ impl SparseMoe {
             )));
         }
         Self::with_gate_up(
-            router,
+            Projection::load(router, None)?,
             GateUp::Fused(gate_up),
             down,
             shared,
-            shared_gate,
+            shared_gate.map(|w| Projection::load(w, None)).transpose()?,
             routing,
         )
     }
 
-    fn with_gate_up(
-        router: Array,
+    pub(crate) fn with_gate_up(
+        router: Projection,
         gate_up: GateUp,
         down: SwitchLinear,
         shared: SwiGlu,
-        shared_gate: Option<Array>,
+        shared_gate: Option<Projection>,
         routing: MoeRouting,
     ) -> Result<Self> {
-        let num_experts = router.shape().first().copied().unwrap_or(0) as usize;
+        let num_experts = router.expert_shape()?[0] as usize;
+        if matches!(&gate_up, GateUp::Fused(bank) if bank.out_features()==0 || bank.out_features()%2!=0)
+        {
+            return Err(Error::Config(
+                "fused gate/up requires an even nonzero output width".into(),
+            ));
+        }
         if num_experts == 0 {
             return Err(Error::Config(
                 "an MoE router needs at least one expert".into(),
@@ -374,7 +538,7 @@ impl SparseMoe {
             gate_up,
             down,
             num_experts,
-            shared,
+            shared: Box::new(shared),
             shared_gate,
             routing,
         })
@@ -404,20 +568,22 @@ impl SparseMoe {
 
     /// Every array the block holds, for load-time materialization (sc-24446).
     pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
-        out.push(self.router.clone());
+        self.router.push_arrays(out);
         for (_, bank) in self.gate_up.banks() {
             bank.push_arrays(out);
         }
         self.down.push_arrays(out);
         self.shared.push_arrays(out);
-        out.extend(self.shared_gate.iter().cloned());
+        if let Some(g) = &self.shared_gate {
+            g.push_arrays(out);
+        }
     }
 
     /// Route every token on the device: the top-k expert indices `[t, k]` (uint32) and their
     /// weights `[t, k]` (f32), from `xf` `[t, hidden]`.
     pub fn route(&self, xf: &Array) -> Result<(Array, Array)> {
         let k = self.routing.experts_per_tok.clamp(1, self.num_experts) as i32;
-        let logits = linear(xf, &self.router, None)?; // [t, E]
+        let logits = self.router.forward(xf)?; // [t, E]
         let probs = softmax_axis(logits.as_dtype(Dtype::Float32)?, -1, true)?;
         // The k largest probabilities (unordered) sit in the first k positions of a partition.
         let part = argpartition_axis(negative(&probs)?, k - 1, -1)?;
@@ -443,11 +609,19 @@ impl SparseMoe {
         let sh = inds.shape();
         let (t, k) = (sh[0], sh[1]);
         let h = xf.shape()[1];
-        let swiglu = |x: &Array, idx: &Array, sorted: bool| -> Result<Array> {
-            let (g, up) = self.gate_up.forward(x, idx, sorted)?;
-            self.down.forward(&multiply(&silu(&g)?, &up)?, idx, sorted)
-        };
-        if t * k >= SORT_THRESHOLD {
+        let has_source = self
+            .gate_up
+            .banks()
+            .iter()
+            .any(|(_, bank)| matches!(bank, SwitchLinear::Source { .. }))
+            || matches!(self.down, SwitchLinear::Source { .. });
+        let swiglu =
+            |x: &Array, idx: &Array, sorted: bool, offsets: Option<&[i32]>| -> Result<Array> {
+                let (g, up) = self.gate_up.forward(x, idx, sorted, offsets)?;
+                self.down
+                    .forward(&multiply(&silu(&g)?, &up)?, idx, sorted, offsets)
+            };
+        if has_source || t * k >= SORT_THRESHOLD {
             // Sort the (token, slot) pairs by expert so each expert's rows are contiguous, run
             // the gathered matmuls on the sorted pairs, and put the rows back in (token, slot)
             // order.
@@ -457,11 +631,14 @@ impl SparseMoe {
             let rows = floor_divide(&order, Array::from_int(k).as_dtype(order.dtype())?)?;
             let xs = xf.reshape(&[t, 1, h])?.take_axis(&rows, 0)?; // [t*k, 1, h]
             let idx = flat.take_axis(&order, 0)?;
-            let y = swiglu(&xs, &idx, true)?; // [t*k, 1, h]
+            let boundaries = has_source
+                .then(|| routed_offsets(&idx, self.num_experts))
+                .transpose()?;
+            let y = swiglu(&xs, &idx, true, boundaries.as_deref())?; // [t*k, 1, h]
             Ok(y.take_axis(&inverse, 0)?.reshape(&[t, k, h])?)
         } else {
             let x = xf.reshape(&[t, 1, 1, h])?;
-            Ok(swiglu(&x, inds, false)?.reshape(&[t, k, h])?) // [t, k, 1, h] → [t, k, h]
+            Ok(swiglu(&x, inds, false, None)?.reshape(&[t, k, h])?) // [t, k, 1, h] → [t, k, h]
         }
     }
 
@@ -479,11 +656,61 @@ impl SparseMoe {
 
         let shared = self.shared.forward(&xf)?;
         let shared = match &self.shared_gate {
-            Some(g) => multiply(&shared, &sigmoid(&linear(&xf, g, None)?)?)?,
+            Some(g) => multiply(&shared, &sigmoid(&g.forward(&xf)?)?)?,
             None => shared,
         };
         Ok(add(&routed, &shared)?.reshape(&[b, s, h])?)
     }
+}
+
+// Read only E+1 boundaries for the three operators, regardless of prompt length. Token data,
+// sorted IDs, and expert operands stay on device. Each active expert receives a contiguous batch.
+pub fn routed_offsets(ids: &Array, experts: usize) -> Result<Vec<i32>> {
+    use mlx_rs::fast::MetalKernel;
+    thread_local! {static KERNEL:std::cell::RefCell<Option<MetalKernel>>=const{std::cell::RefCell::new(None)};}
+    const SOURCE: &str = r#"
+    uint e=thread_position_in_grid.x;
+    if(e<=uint(E)){
+        uint lo=0,hi=uint(P);
+        while(lo<hi){uint mid=lo+(hi-lo)/2u;if(uint(ids[mid])<e){lo=mid+1u;}else{hi=mid;}}
+        offsets[e]=int(lo);
+    }"#;
+    let count = i32::try_from(experts + 1)
+        .map_err(|_| Error::Config("expert count exceeds Metal indexing".into()))?;
+    let pairs = i32::try_from(ids.size())
+        .map_err(|_| Error::Config("token routes exceed Metal indexing".into()))?;
+    let offsets = KERNEL.with(|cell| -> Result<Array> {
+        let mut cache = cell.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(MetalKernel::with_options(
+                "sc_routed_offsets_v1",
+                &["ids"],
+                &["offsets"],
+                SOURCE,
+                "",
+                true,
+                false,
+            )?);
+        }
+        Ok(cache
+            .as_ref()
+            .unwrap()
+            .apply()
+            .inputs([ids])
+            .output_shape([count], Dtype::Int32)
+            .template_arg("E", count - 1)
+            .template_arg("P", pairs)
+            .grid(count, 1, 1)
+            .thread_group(32, 1, 1)
+            .run()?
+            .remove(0))
+    })?;
+    offsets.eval()?;
+    let offsets = offsets.as_slice::<i32>().to_vec();
+    if offsets.first() != Some(&0) || offsets.last() != Some(&pairs) {
+        return Err(Error::Config("routed expert ID outside bank".into()));
+    }
+    Ok(offsets)
 }
 
 #[cfg(test)]

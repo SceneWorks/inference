@@ -1,0 +1,23 @@
+[package]
+name = "candle-checkpoint"
+version = "0.0.0"
+edition = "2021"
+description = "Shared Candle checkpoint codec readers and projection construction for media, audio and language models."
+license = "Apache-2.0"
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-quant-kernels.workspace = true
+sceneworks-gen-core.workspace = true
+safetensors = "0.7"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal"]
+model-inference-proof = ["candle-quant-kernels/model-inference-proof", "sceneworks-gen-core/model-inference-proof"]

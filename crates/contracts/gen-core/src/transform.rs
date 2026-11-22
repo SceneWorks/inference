@@ -48,6 +48,14 @@ impl CompletedTransform {
 
 /// A non-prompt image→image transform (super-resolution / restoration).
 pub trait Transform {
+    /// Latest measured representation for the primary checkpoint.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+    /// Every source measured by this loaded model, including deferred components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
     fn descriptor(&self) -> &TransformDescriptor;
     fn validate(&self, req: &TransformRequest) -> Result<()>;
     fn apply(&self, req: &TransformRequest, on_progress: &mut dyn FnMut(Progress))

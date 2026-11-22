@@ -165,6 +165,9 @@ pub(crate) fn geglu_half_ranges(output_rows: i32) -> Result<[(i32, i32); 2]> {
 /// is per-row independent, so this is byte-identical to the dense path's split-then-quantize), else
 /// row-slice the dense weight + bias. `base` is `…transformer_blocks.{k}.ff.net.0.proj`.
 pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::NativeProjection::from_weights(w, base, true)? {
+        return Ok(AdaptableLinear::from_native(native.slice_rows(lo, hi)?));
+    }
     let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
     let row_slice = |a: &Array| -> Result<Array> { Ok(a.take_axis(&idx, 0)?) };
     let bias_full = w.require(&format!("{base}.bias"))?;
@@ -221,8 +224,8 @@ pub(crate) fn header_dtype(dtype: mlx_gen::gen_core::weightsmeta::Dtype) -> Resu
         Stored::BF16 => Dtype::Bfloat16,
         Stored::F32 => Dtype::Float32,
         // The actual pinned native safetensors decoder stores these as uint8, NOT decoded fp8.
-        Stored::F8_E4M3 | Stored::F8_E8M0 => Dtype::Uint8,
-        Stored::F64 | Stored::F8_E5M2 => {
+        Stored::F8_E4M3 | Stored::F8_E5M2 | Stored::F8_E8M0 => Dtype::Uint8,
+        Stored::F64 => {
             return Err(mlx_gen::Error::Unsupported(
                 "sdxl native safetensors loader does not accept this source dtype".into(),
             ))

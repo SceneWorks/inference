@@ -130,6 +130,11 @@ pub trait Generator {
         None
     }
 
+    /// Receipts for each measured source of a multi-component provider.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
+
     /// The loaded provider's memory-strategy contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {

@@ -68,6 +68,14 @@ IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
 )
 IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
 SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
+PROJECTION_PROOF_DEVICES = {
+    ('candle-gen', 'integration', 'cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16'): 'gpu0',
+    ('candle-gen-minimax-h3', 'integration', 'convrot_int8::native_projections_match_pinned_kitchen'): 'gpu1',
+    ('candle-gen-krea', 'candle_gen_krea', 'loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'quant::tests::convrot_int8_constructor_is_typed_error_not_panic'): 'gpu0',
+    ('candle-gen-krea', 'candle_gen_krea', 'train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk'): 'gpu0',
+}
 # A product-pinned Hub snapshot: `org/name@<40-hex revision>` plus an optional subfolder path.
 HUB_PIN = re.compile(r'^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@([0-9a-f]{40})((?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)$')
 HUB_SLOT_SOURCES = ('pin', 'choices', 'request_bound')
@@ -411,8 +419,14 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                                      and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
         shared_headroom = recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_PROFILE
         comparison_binding = comparison_metadata_binding(row, name, recipe) if comparison_recipe else None
+        expected_index = comparison_binding[1] if comparison_binding else 1
+        projection_device = PROJECTION_PROOF_DEVICES.get((row.get('package'), row.get('target'), row.get('fqn')))
+        if name == 'fixed_cuda' and projection_device is not None:
+            uuid, expected_index = training_comparison.DEVICES[projection_device]
+            if not shared_headroom or row.get('required_cuda_device_uuid') != uuid:
+                raise ValueError('projection correctness proof requires its fixed device UUID and headroom profile')
         if shared_headroom and (expected_activity_profile is not None or route != 'candle-cuda'
-                                or recipe.get('required_cuda_physical_index') != (comparison_binding[1] if comparison_binding else 1)
+                                or recipe.get('required_cuda_physical_index') != expected_index
                                 or type(recipe.get('required_cuda_physical_index')) is not int
                                 or not isinstance(recipe.get('required_cuda_device_uuid') if comparison_recipe else row.get('required_cuda_device_uuid'), str)
                                 or not re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',

@@ -24,7 +24,7 @@
 //! `vae/qwen_image_vae.safetensors` (epic 10451 Phase 2b, sc-10830): that file carries **native
 //! WAN-VAE key names** (`conv1`, `{enc,dec}oder.{middle,downsamples,upsamples,head}.*.residual.*`),
 //! remapped to the diffusers schema [`crate::vae::QwenVae`]/[`crate::vae::QwenVaeEncoder`] read by
-//! [`remap_vae_wan_to_diffusers`] — a pure key rename (values byte-identical bf16, upcast to f32 at
+//! [`candle_gen::comfyui_vae::wan_vae_var_builder`] — a pure key rename (values byte-identical bf16, upcast to f32 at
 //! `VarBuilder` build like the snapshot VAE). When the caller does **not** pass it, the VAE falls back
 //! to the resident snapshot's `vae/` (same weights, diffusers keys). The tree's Qwen2.5-VL **text
 //! encoder** is still snapshot-sourced (it is *scaled*-fp8, sc-10671 territory), as is the tiny
@@ -35,85 +35,48 @@
 //! upstream by SceneWorks (`sceneworks-core::base_weights`, sc-10662); this module is handed a file
 //! already identified as a Qwen-Image DiT.
 
-use std::collections::HashMap;
-
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::{CandleError, Result};
 
-/// The ComfyUI/BFL prefix every Qwen-Image DiT tensor carries; stripped to reach the diffusers keys
-/// [`crate::transformer::QwenTransformer`] reads.
-const COMFY_DIT_PREFIX: &str = "model.diffusion_model.";
-
-/// Remap + upcast a ComfyUI Qwen-Image DiT tensor map to the schema
-/// [`crate::transformer::QwenTransformer`] reads, ready for `VarBuilder::from_tensors`.
-///
-/// Two transforms per tensor, nothing synthesized or dropped:
-///
-/// 1. **Strip** the `model.diffusion_model.` prefix — the inner diffusers names already match candle,
-///    so this is the entire key transform (no per-leaf aliases).
-/// 2. **Upcast** each weight to `dtype` (the compute dtype, bf16). The plain-fp8 checkpoint is all
-///    `F8_E4M3`; the cast is a straight `to_dtype` with **no** scale companion (candle's CPU backend
-///    upcasts `F8_E4M3 → bf16` directly). Integer buffers (if any) pass through unchanged.
-///
-/// Every tensor must carry the `model.diffusion_model.` prefix and map one-to-one onto a non-empty
-/// destination key. Foreign/bare keys and destination collisions fail closed rather than relying on
-/// `VarBuilder` to ignore an incomplete or mixed-family surface.
-pub fn remap_and_cast_comfyui_dit(
-    src: HashMap<String, Tensor>,
+/// Physical namespace admission runs before binding the shared checkpoint-aware builder.
+pub(crate) fn transformer_builder(
+    path: &std::path::Path,
     dtype: DType,
-) -> Result<HashMap<String, Tensor>> {
-    let mut out = HashMap::with_capacity(src.len());
-    for (key, tensor) in src {
-        let Some(rest) = key.strip_prefix(COMFY_DIT_PREFIX) else {
-            return Err(CandleError::Msg(format!(
-                "qwen-image ComfyUI DiT remap: tensor {key:?} is outside the required {COMFY_DIT_PREFIX:?} namespace"
-            )));
-        };
-        if rest.is_empty() {
-            return Err(CandleError::Msg(
-                "qwen-image ComfyUI DiT remap: a source tensor maps to an empty key".into(),
-            ));
+    device: &Device,
+) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
+    let mut count = 0;
+    let vb = candle_gen::loader::remap_file_var_builder(path, dtype, device, |key, _| {
+        if key == "scaled_fp8" {
+            return Ok(Vec::new());
         }
-        let new_key = rest.to_string();
-        let tensor = cast_weight(&new_key, tensor, dtype)?;
-        if out.insert(new_key.clone(), tensor).is_some() {
-            return Err(CandleError::Msg(format!(
-                "qwen-image ComfyUI DiT remap: more than one source tensor maps to {new_key:?}"
-            )));
-        }
+        let name=key.strip_prefix("model.diffusion_model.").filter(|n|!n.is_empty()).ok_or_else(||CandleError::Msg(format!("qwen-image ComfyUI DiT: {key} outside the required model.diffusion_model namespace")))?;
+        count += 1;
+        Ok(vec![candle_gen::loader::SourceView::Whole(name.to_owned())])
+    })?;
+    if count == 0 {
+        return Err(CandleError::Msg(
+            "qwen-image ComfyUI DiT has no prefixed tensors".into(),
+        ));
     }
-    if out.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "qwen-image ComfyUI DiT remap: no {COMFY_DIT_PREFIX:?}-prefixed tensors found — not a \
-             ComfyUI Qwen-Image DiT (wrong file/family?)"
-        )));
-    }
-    Ok(out)
+    Ok(vb)
 }
-
-/// Upcast one DiT weight to the compute `dtype`. Floating tensors (fp8 / f32 / bf16) cast; integer
-/// buffers pass through unchanged (they are indices/caches, not weights, and must keep their dtype).
-fn cast_weight(key: &str, tensor: Tensor, dtype: DType) -> Result<Tensor> {
-    if tensor.dtype().is_int() {
-        return Ok(tensor);
-    }
-    tensor.to_dtype(dtype).map_err(|e| {
-        CandleError::Msg(format!(
-            "qwen-image ComfyUI DiT remap: upcast {key:?} ({:?} → {dtype:?}) failed: {e}",
-            tensor.dtype()
-        ))
-    })
-}
-
-// VAE: native WAN-VAE (`Wan2.1` z16 3D-causal-conv autoencoder) → diffusers `AutoencoderKLQwenImage`
-// keys read by `crate::vae::{QwenVae, QwenVaeEncoder}`. Qwen-Image ships the *same physical* Wan2.1
-// 16-channel VAE the Wan2.2 lane reads, so the native→diffusers key rename is shared from the
-// `candle-gen` core crate (sc-10909) rather than kept per-crate — re-exported here so this module's
-// `comfyui` seam and the sc-10830 call sites keep referring to `comfyui::remap_vae_wan_to_diffusers`.
-pub use candle_gen::comfyui_vae::remap_vae_wan_to_diffusers;
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    fn remap_and_cast_comfyui_dit(
+        src: HashMap<String, Tensor>,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        let dir = tempfile::tempdir().map_err(|e| CandleError::Msg(e.to_string()))?;
+        let path = dir.path().join("model.safetensors");
+        candle_gen::candle_core::safetensors::save(&src, &path)?;
+        let vb = transformer_builder(&path, dtype, &Device::Cpu)?;
+        src.keys()
+            .filter_map(|k| k.strip_prefix("model.diffusion_model."))
+            .map(|k| Ok((k.to_owned(), vb.get_unchecked(k)?)))
+            .collect()
+    }
+
     use super::*;
     use candle_gen::candle_core::{Device, Tensor};
 

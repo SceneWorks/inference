@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 
 use mlx_rs::ops::indexing::argmax_axis;
-use mlx_rs::ops::{matmul, split_sections};
+use mlx_rs::ops::split_sections;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::text_sample::{sample_token, SampleParams, SplitMix64};
@@ -51,10 +51,10 @@ pub const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
 /// The generating gpt-oss-20b model: the full decoder stack + final norm + LM head (the
 /// encoder-only [`crate::text_encoder::encoder::LensTextEncoder`] truncates the stack and drops these).
 pub struct LensReasonerModel {
-    embed_tokens: Array, // [vocab, hidden]
+    embed_tokens: mlx_gen::nn::TokenEmbedding, // [vocab, hidden]
     layers: Vec<GptOssDecoderLayer>,
-    final_norm: Array, // [hidden]
-    lm_head: Array,    // [vocab, hidden]
+    final_norm: Array,                           // [hidden]
+    lm_head: mlx_gen::adapters::AdaptableLinear, // [vocab, hidden]
     inv_freq: Array,
     attn_scaling: f32,
     sliding_window: i32,
@@ -70,7 +70,7 @@ impl LensReasonerModel {
         dtype: Dtype,
         quant: Option<Quant>,
     ) -> Result<Self> {
-        let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        let embed_tokens = mlx_gen::quant::embedding_compute(w, "model.embed_tokens", dtype)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(GptOssDecoderLayer::from_weights(
@@ -86,7 +86,13 @@ impl LensReasonerModel {
             embed_tokens,
             layers,
             final_norm: w.require("model.norm.weight")?.as_dtype(dtype)?,
-            lm_head: w.require("lm_head.weight")?.as_dtype(dtype)?,
+            lm_head: match mlx_gen::quant::native_lin(w, "lm_head", false)? {
+                Some(p) => p,
+                None => mlx_gen::adapters::AdaptableLinear::dense(
+                    w.require("lm_head.weight")?.as_dtype(dtype)?,
+                    None,
+                ),
+            },
             inv_freq: Array::from_slice(&inv_freq, &[inv_freq.len() as i32]),
             attn_scaling,
             sliding_window: cfg.sliding_window,
@@ -137,10 +143,10 @@ impl LensReasonerModel {
     pub fn next_token_argmax(&self, input_ids: &[i32]) -> Result<Vec<i32>> {
         let mut caches: Vec<KvCache> = (0..self.cfg.num_layers).map(|_| KvCache::new()).collect();
         let prompt = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
-        let hidden = self.embed_tokens.take_axis(&prompt, 0)?;
+        let hidden = self.embed_tokens.rows(&prompt)?;
         let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
         let normed = mlx_rs::fast::rms_norm(&hidden, &self.final_norm, self.cfg.rms_eps)?;
-        let logits = matmul(&normed, self.lm_head.t())?; // [1, L, vocab]
+        let logits = self.lm_head.forward(&normed)?; // [1, L, vocab]
         let pred = argmax_axis(&logits, 2, None)?.reshape(&[input_ids.len() as i32])?; // [L]
         Ok(pred.as_slice::<u32>().iter().map(|&i| i as i32).collect())
     }
@@ -282,7 +288,7 @@ struct ReasonerTarget<'a> {
 impl ReasonerTarget<'_> {
     fn step(&self, cache: &mut ReasonerCache, ids: &Array, position: i32) -> Result<Array> {
         let m = self.model;
-        let hidden = m.embed_tokens.take_axis(ids, 0)?; // [1, T, hidden]
+        let hidden = m.embed_tokens.rows(ids)?; // [1, T, hidden]
         let hidden = m.run_layers(hidden, &mut cache.layers, position, cache.len == 0)?;
         cache.len += ids.shape()[1];
         let t = hidden.shape()[1];
@@ -292,7 +298,7 @@ impl ReasonerTarget<'_> {
             hidden
         };
         let normed = mlx_rs::fast::rms_norm(&last, &m.final_norm, m.cfg.rms_eps)?;
-        Ok(matmul(&normed, m.lm_head.t())?) // [1, 1, vocab]
+        m.lm_head.forward(&normed) // [1, 1, vocab]
     }
 }
 
@@ -495,7 +501,11 @@ impl LensReasoner {
     ) -> Result<Self> {
         let root = snapshot_dir.as_ref();
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
-        let w = Weights::from_dir(root.join("text_encoder"))?;
+        let w = Weights::from_dir_with_layout(
+            root.join("text_encoder"),
+            crate::text_encoder::gpt_oss::stacked_expert_key,
+            |_, _| dtype,
+        )?;
         let model = LensReasonerModel::from_weights(&w, &GptOssConfig::lens(), dtype, quant)?;
         // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
         w.materialize_accessed()?;
@@ -665,7 +675,7 @@ mod tests {
             hidden.clone()
         };
         let normed = mlx_rs::fast::rms_norm(&last, &m.final_norm, m.cfg.rms_eps)?;
-        let logits = matmul(&normed, m.lm_head.t())?; // [1, 1, vocab]
+        let logits = m.lm_head.forward(&normed)?; // [1, 1, vocab]
         let vocab = logits.shape()[2];
         let idx = argmax(&logits.reshape(&[vocab])?, None)?;
         Ok(idx.item::<u32>() as i32)
@@ -681,7 +691,7 @@ mod tests {
             hidden.clone()
         };
         let normed = mlx_rs::fast::rms_norm(&last, &m.final_norm, m.cfg.rms_eps)?;
-        let logits = matmul(&normed, m.lm_head.t())?; // [1, 1, vocab]
+        let logits = m.lm_head.forward(&normed)?; // [1, 1, vocab]
         Ok(logits)
     }
 
@@ -696,7 +706,7 @@ mod tests {
     ) -> Result<Vec<i32>> {
         let mut caches: Vec<KvCache> = (0..m.cfg.num_layers).map(|_| KvCache::new()).collect();
         let prompt = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
-        let hidden = m.embed_tokens.take_axis(&prompt, 0)?;
+        let hidden = m.embed_tokens.rows(&prompt)?;
         let hidden = m.run_layers(hidden, &mut caches, 0, true)?;
         mlx_rs::transforms::eval([&hidden])?;
         let mut next = argmax_token(m, &hidden)?;
@@ -709,7 +719,7 @@ mod tests {
                 }
             }
             let tok = Array::from_slice(&[next], &[1, 1]);
-            let h = m.embed_tokens.take_axis(&tok, 0)?;
+            let h = m.embed_tokens.rows(&tok)?;
             let h = m.run_layers(h, &mut caches, position, false)?;
             position += 1;
             next = argmax_token(m, &h)?;
@@ -730,7 +740,7 @@ mod tests {
     ) -> Result<Vec<i32>> {
         let mut caches: Vec<KvCache> = (0..m.cfg.num_layers).map(|_| KvCache::new()).collect();
         let prompt = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
-        let hidden = m.embed_tokens.take_axis(&prompt, 0)?;
+        let hidden = m.embed_tokens.rows(&prompt)?;
         let hidden = m.run_layers(hidden, &mut caches, 0, true)?;
         let mut history: Vec<i32> = input_ids.to_vec();
         let mut rng = SplitMix64::new(seed);
@@ -746,7 +756,7 @@ mod tests {
                 }
             }
             let tok = Array::from_slice(&[next], &[1, 1]);
-            let h = m.embed_tokens.take_axis(&tok, 0)?;
+            let h = m.embed_tokens.rows(&tok)?;
             let h = m.run_layers(h, &mut caches, position, false)?;
             position += 1;
             let logits = last_logits(m, &h)?;

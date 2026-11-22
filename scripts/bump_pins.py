@@ -82,6 +82,7 @@ PIN_GROUPS = {
         # upstream's rank > 4 strided-reduce indexing fix (#3873).
         vendored=(
             "crates/media/candle-gen/vendor/candle-core",
+            "crates/media/candle-gen/vendor/candle-nn",
             "crates/media/candle-gen/vendor/candle-metal-kernels",
             "crates/media/candle-gen/vendor/candle-flash-attn",
         ),

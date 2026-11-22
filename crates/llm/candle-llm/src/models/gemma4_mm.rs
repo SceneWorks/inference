@@ -26,7 +26,7 @@ use candle_core::{DType, Device, Tensor};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::primitives::nn::{layer_norm, linear};
+use crate::primitives::nn::layer_norm;
 use crate::primitives::Weights;
 
 /// Which of the two shipped Gemma 4 tensor layouts a checkpoint uses.
@@ -281,15 +281,14 @@ impl Gemma4MmConfig {
 pub struct Gemma4VisionEmbedder {
     patch_ln1_w: Tensor,
     patch_ln1_b: Tensor,
-    patch_dense_w: Tensor,
-    patch_dense_b: Tensor,
+    patch_dense_w: crate::primitives::Projection,
     patch_ln2_w: Tensor,
     patch_ln2_b: Tensor,
     pos_row: Tensor,
     pos_col: Tensor,
     pos_norm_w: Tensor,
     pos_norm_b: Tensor,
-    proj_w: Tensor,
+    proj_w: crate::primitives::Projection,
     cfg: Gemma4VisionConfig,
     dtype: DType,
     device: Device,
@@ -314,7 +313,9 @@ impl Gemma4VisionEmbedder {
         dtype: DType,
     ) -> Result<Self> {
         let vp = layout.vision_prefix();
-        let get = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let get = |key: String| -> Result<Tensor> {
+            Ok(w.require(&key)?.to_dtype(w.parameter_dtype(&key, dtype))?)
+        };
 
         let pos = get(format!("{vp}.pos_embedding"))?;
         let shape = pos.dims().to_vec();
@@ -336,10 +337,14 @@ impl Gemma4VisionEmbedder {
         let pos_row = pos.i((.., 0, ..))?.contiguous()?;
         let pos_col = pos.i((.., 1, ..))?.contiguous()?;
 
-        let patch_dense_w = get(format!("{vp}.patch_dense.weight"))?;
-        let dense_shape = patch_dense_w.dims().to_vec();
+        let patch_dense_w = w.linear(
+            &format!("{vp}.patch_dense.weight"),
+            dtype,
+            Some(get(format!("{vp}.patch_dense.bias"))?),
+        )?;
+        let dense_shape = patch_dense_w.dims();
         let expected_in = cfg.patch_elems();
-        if dense_shape != [hidden, expected_in] {
+        if dense_shape != (hidden, expected_in) {
             return Err(Error::Config(format!(
                 "Gemma 4 vision: `{vp}.patch_dense.weight` is {dense_shape:?} but the config's \
                  {}x{} RGB patch flattens to {expected_in} and pos_embedding's hidden is {hidden}",
@@ -351,17 +356,20 @@ impl Gemma4VisionEmbedder {
             patch_ln1_w: get(format!("{vp}.patch_ln1.weight"))?,
             patch_ln1_b: get(format!("{vp}.patch_ln1.bias"))?,
             patch_dense_w,
-            patch_dense_b: get(format!("{vp}.patch_dense.bias"))?,
             patch_ln2_w: get(format!("{vp}.patch_ln2.weight"))?,
             patch_ln2_b: get(format!("{vp}.patch_ln2.bias"))?,
             pos_row,
             pos_col,
             pos_norm_w: get(format!("{vp}.pos_norm.weight"))?,
             pos_norm_b: get(format!("{vp}.pos_norm.bias"))?,
-            proj_w: get(format!(
-                "{}.embedding_projection.weight",
-                layout.vision_proj_prefix()
-            ))?,
+            proj_w: w.linear(
+                &format!(
+                    "{}.embedding_projection.weight",
+                    layout.vision_proj_prefix()
+                ),
+                dtype,
+                None,
+            )?,
             cfg,
             dtype,
             device: w.device().clone(),
@@ -391,7 +399,7 @@ impl Gemma4VisionEmbedder {
             &self.patch_ln1_b,
             eps
         ))?;
-        let x = __model_proof_output!(linear(&x, &self.patch_dense_w, Some(&self.patch_dense_b)))?;
+        let x = __model_proof_output!(self.patch_dense_w.forward(&x))?;
         let x = __model_proof_output!(layer_norm(&x, &self.patch_ln2_w, &self.patch_ln2_b, eps))?;
 
         let (row_idx, col_idx) = posemb_indices(gh, gw, self.cfg.posemb_size);
@@ -401,13 +409,13 @@ impl Gemma4VisionEmbedder {
             .add(&self.pos_col.index_select(&cols, 0)?)?;
         let x = x.add(&pos.to_dtype(self.dtype)?)?;
         let x = __model_proof_output!(layer_norm(&x, &self.pos_norm_w, &self.pos_norm_b, eps))?;
-        __model_proof_output!(linear(&x, &self.proj_w, None))
+        __model_proof_output!(self.proj_w.forward(&x))
     }
 }
 
 /// The audio projector: one dense map from a raw 640-sample frame to the decoder's hidden width.
 pub struct Gemma4AudioEmbedder {
-    proj_w: Tensor,
+    proj_w: crate::primitives::Projection,
     cfg: Gemma4AudioConfig,
 }
 
@@ -428,9 +436,9 @@ impl Gemma4AudioEmbedder {
         dtype: DType,
     ) -> Result<Self> {
         let key = format!("{}.embedding_projection.weight", layout.audio_proj_prefix());
-        let proj_w = w.require(&key)?.to_dtype(dtype)?;
-        let shape = proj_w.dims().to_vec();
-        if shape.len() != 2 || shape[1] != cfg.samples_per_token {
+        let proj_w = w.linear(&key, dtype, None)?;
+        let shape = proj_w.dims();
+        if shape.1 != cfg.samples_per_token {
             return Err(Error::Config(format!(
                 "Gemma 4 audio: `{key}` is {shape:?} but the config frames audio at {} samples per \
                  token, so the projection must take that many inputs",
@@ -454,7 +462,7 @@ impl Gemma4AudioEmbedder {
                 self.cfg.samples_per_token
             )));
         }
-        __model_proof_output!(linear(frames, &self.proj_w, None))
+        __model_proof_output!(self.proj_w.forward(frames))
     }
 }
 

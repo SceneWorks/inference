@@ -63,10 +63,7 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
 
 /// A biased `[out, in]` Linear (`nn.Linear`) → dense [`AdaptableLinear`].
 fn load_lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
-    Ok(AdaptableLinear::dense(
-        w.require(&format!("{prefix}.weight"))?.clone(),
-        Some(w.require(&format!("{prefix}.bias"))?.clone()),
-    ))
+    mlx_gen::quant::lin(w, prefix, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 /// Like [`load_lin`] but **pre-quantized-snapshot aware** (sc-5445), mirroring the Wan DiT

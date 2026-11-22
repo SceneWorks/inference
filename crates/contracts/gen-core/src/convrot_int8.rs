@@ -5,7 +5,7 @@
 //! Authority: Comfy Kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6 and
 //! comfy-model-tools d6797787e6bdb1a1fb0094d588a26f8e71a1c757.
 
-use serde::Deserialize;
+use crate::comfy_quant::{parse_comfy_quant_descriptor, ComfyQuantFormat};
 
 /// Stable source/storage and native execution identity of this validated operand format.
 ///
@@ -24,16 +24,10 @@ pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvRotInt8 {
     pub out_features: usize,
+    /// Source shape `[N]`, permitted only by the legacy descriptor convention.
+    pub flat_scales: bool,
     pub in_features: usize,
     pub rotation_group: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Descriptor {
-    format: String,
-    convrot: bool,
-    convrot_groupsize: usize,
 }
 
 impl ConvRotInt8 {
@@ -43,17 +37,41 @@ impl ConvRotInt8 {
         if payload.is_empty() || payload.len() > MAX_DESCRIPTOR_BYTES {
             return Err("ConvRot INT8 descriptor length is invalid".into());
         }
-        let d: Descriptor =
-            serde_json::from_slice(payload).map_err(|e| format!("ConvRot INT8 descriptor: {e}"))?;
-        if d.format != "int8_tensorwise" || !d.convrot {
-            return Err("expected int8_tensorwise with convrot:true".into());
+        let d = parse_comfy_quant_descriptor(payload)
+            .map_err(|e| format!("ConvRot INT8 descriptor: {e}"))?;
+        if d.format != ComfyQuantFormat::ConvRotInt8 {
+            return Err("expected int8_tensorwise with convrot: true".into());
         }
+        Self::from_geometry(
+            d.rotation_group.ok_or("missing convrot_groupsize")?,
+            weight,
+            scales,
+        )
+    }
+
+    /// Check original code and row-scale geometry, including the signed GEMM accumulator bound.
+    pub fn from_geometry(
+        rotation_group: usize,
+        weight: &[usize],
+        scales: &[usize],
+    ) -> Result<Self, String> {
+        Self::from_source_geometry(rotation_group, weight, scales, false)
+    }
+    pub fn from_source_geometry(
+        rotation_group: usize,
+        weight: &[usize],
+        scales: &[usize],
+        legacy: bool,
+    ) -> Result<Self, String> {
         if weight.len() != 2 || weight.contains(&0) {
             return Err("ConvRot INT8 weight must be nonempty [out, in]".into());
         }
         let (n, k) = (weight[0], weight[1]);
-        if !matches!(d.convrot_groupsize, 64 | 256)
-            || !k.is_multiple_of(d.convrot_groupsize)
+        if !(matches!(rotation_group, 64 | 256)
+            || legacy
+                && rotation_group.is_power_of_two()
+                && rotation_group.trailing_zeros().is_multiple_of(2))
+            || !k.is_multiple_of(rotation_group)
             || k > i32::MAX as usize / (128 * 128)
             || n > i32::MAX as usize
             || n.checked_mul(k).is_none()
@@ -62,13 +80,14 @@ impl ConvRotInt8 {
                 "ConvRot INT8 invalid rotation group, tail, or integer GEMM geometry".into(),
             );
         }
-        if scales != [n, 1] {
+        if scales != [n, 1] && !(legacy && scales == [n]) {
             return Err("ConvRot INT8 weight_scale must be F32 [out, 1] (not group scales)".into());
         }
         Ok(Self {
             out_features: n,
+            flat_scales: scales.len() == 1,
             in_features: k,
-            rotation_group: d.convrot_groupsize,
+            rotation_group,
         })
     }
 
@@ -125,7 +144,7 @@ mod tests {
             good.replace("64", "256"),
             good.replace("64", "32"),
             good.replace("int8_tensorwise", "asym_w4a8_int8"),
-            good.replace("true,", "true,\"per_row\":true,"),
+            good.replace("true,", "true,\"per_row\":false,"),
             "{}".into(),
             "[]".into(),
         ] {

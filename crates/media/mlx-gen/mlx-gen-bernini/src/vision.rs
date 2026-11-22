@@ -135,6 +135,9 @@ path,
 }
 
 fn linear(w: &Weights, prefix: &str, bias: bool) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::quant::native_lin(w, prefix, bias)? {
+        return Ok(native);
+    }
     let weight = w.require(&format!("{prefix}.weight"))?.clone();
     let b = if bias {
         Some(w.require(&format!("{prefix}.bias"))?.clone())

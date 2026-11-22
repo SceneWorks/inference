@@ -28,6 +28,52 @@ use crate::unet::{
 const ADDITION_TIME_EMBED_DIM: usize = 256;
 const PROJECTION_INPUT_DIM: usize = 2816;
 
+/// Build the stock flash-attention UNet against the same model geometry and checkpoint reader
+/// as the vendored math-attention path.
+pub(crate) fn load_flash_unet(
+    file: PathBuf,
+    device: &Device,
+    dtype: DType,
+) -> Result<candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel> {
+    use candle_transformers::models::stable_diffusion::unet_2d as stock;
+    let cfg = sdxl_unet_config();
+    let blocks = cfg
+        .blocks
+        .into_iter()
+        .map(|block| stock::BlockConfig {
+            out_channels: block.out_channels,
+            use_cross_attn: block.use_cross_attn,
+            attention_head_dim: block.attention_head_dim,
+        })
+        .collect();
+    let stock_cfg = stock::UNet2DConditionModelConfig {
+        blocks,
+        center_input_sample: cfg.center_input_sample,
+        flip_sin_to_cos: cfg.flip_sin_to_cos,
+        freq_shift: cfg.freq_shift,
+        layers_per_block: cfg.layers_per_block,
+        downsample_padding: cfg.downsample_padding,
+        mid_block_scale_factor: cfg.mid_block_scale_factor,
+        norm_num_groups: cfg.norm_num_groups,
+        norm_eps: cfg.norm_eps,
+        cross_attention_dim: cfg.cross_attention_dim,
+        use_linear_projection: cfg.use_linear_projection,
+        sliced_attention_size: None,
+    };
+    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
+    Ok(stock::UNet2DConditionModel::new(vb, 4, 4, true, stock_cfg)?)
+}
+
+pub(crate) fn load_stock_clip(
+    config: &candle_transformers::models::stable_diffusion::clip::Config,
+    file: PathBuf,
+    device: &Device,
+    dtype: DType,
+) -> Result<candle_transformers::models::stable_diffusion::clip::ClipTextTransformer> {
+    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
+    Ok(candle_transformers::models::stable_diffusion::clip::ClipTextTransformer::new(vb, config)?)
+}
+
 /// Load the **vendored** SDXL UNet with the `add_embedding` head loaded (so
 /// [`UNet2DConditionModel::forward_instantid`] runs). Math attention (`use_flash_attn = false`) — the
 /// vendored flash path is a stub; perf tuning is later. The caller installs the IP-Adapter K/V pairs.

@@ -6,6 +6,7 @@ fn custom_stack_is_fp32_scaled_and_keeps_dmd_separate() {
     let _device = crate::cpu_test_device();
     let weight = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2]);
     let mut p = Projection {
+        native_compute: None,
         lokr: Vec::new(),
         weight: weight.clone(),
         bias: None,

@@ -48,7 +48,7 @@ impl FluxIpImageEncoder {
             LN_EPS,
         );
         // `visual_projection` is bias-free in CLIP.
-        let visual_projection = Linear::new(w.require("visual_projection.weight")?, None);
+        let visual_projection = w.linear("visual_projection", false)?;
         Ok(Self {
             encoder,
             post_ln,
@@ -61,7 +61,7 @@ impl FluxIpImageEncoder {
     /// preprocess → full tower (`last_hidden_state`) → class token → `post_layernorm` →
     /// `visual_projection`.
     pub fn image_embeds(&self, image: &Image) -> GenResult<Tensor> {
-        let device = self.visual_projection.weight().device().clone();
+        let device = self.visual_projection.device().clone();
         let dtype = self.encoder.dtype();
         let px = preprocess_clip_image_sized(image, self.image_size, &device)?.to_dtype(dtype)?;
         let last = self.encoder.last_hidden(&px)?; // [1, num_positions, 1024]
@@ -153,7 +153,7 @@ mod tests {
             w.require("vision_model.post_layernorm.bias").unwrap(),
             LN_EPS,
         );
-        let visual_projection = Linear::new(w.require("visual_projection.weight").unwrap(), None);
+        let visual_projection = w.linear("visual_projection", false).unwrap();
         let enc = FluxIpImageEncoder {
             encoder,
             post_ln,

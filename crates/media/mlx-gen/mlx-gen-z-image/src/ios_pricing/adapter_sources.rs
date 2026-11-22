@@ -1252,6 +1252,7 @@ mod source_ledger_tests {
                 mlx_gen::adapters::LinearFacts {
                     base_shape: vec![8, 8],
                     is_quantized: false,
+                    source_packed: false,
                     has_live_adapters: false,
                     adapter_count: 0,
                     bias_shape: None,

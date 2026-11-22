@@ -21,6 +21,7 @@
 //! and return a [`LoraSet`] (the flat `Var` list for the optimizer + the per-target metadata for
 //! checkpoint save). This keeps the harness model-agnostic — SDXL, Z-Image, and Wan reuse it.
 
+use crate::quant::ComponentFold;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{
@@ -220,7 +221,11 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: SpineBase::Dense(base),
+            base: if base.is_native() {
+                SpineBase::Packed(QLinear::from_dense(crate::quant::DenseLinear::Linear(base)))
+            } else {
+                SpineBase::Dense(base)
+            },
             in_features,
             out_features,
             path,
@@ -386,7 +391,9 @@ impl LoraLinear {
     /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
     /// Already-packed bases are idempotent; non-dense/non-packed bases refuse re-quantization.
     pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
-        Ok(self.base.quantize(quant)?)
+        Ok(self
+            .base
+            .quantize_component(quant, ComponentFold::DequantDense)?)
     }
 
     /// Fold the frozen dense base from a CPU-staged model directly onto `device`, preserving every
@@ -404,7 +411,8 @@ impl LoraLinear {
                     .into(),
             ));
         }
-        self.base.quantize_dequant_onto(quant, device)?;
+        self.base
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         for residual in &mut self.additive {
             match residual {
                 AdditiveResidual::Lora { a, b, .. } => {

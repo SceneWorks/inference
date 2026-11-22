@@ -314,11 +314,24 @@ fn linear_b_initialized(
     if !zero_init {
         return linear_b(in_dim, out_dim, bias, vb);
     }
-    let weight = vb.get_with_hints((out_dim, in_dim), "weight", Init::Const(0.0))?;
+    let native = vb.native_linear_weight_with_shape("weight", Some((out_dim, in_dim)))?;
+    let dtype = native
+        .as_ref()
+        .and_then(|op| op.checkpoint_bias_dtype())
+        .unwrap_or(vb.dtype());
     let bias = bias
-        .then(|| vb.get_with_hints(out_dim, "bias", Init::Const(0.0)))
+        .then(|| vb.get_with_hints_dtype(out_dim, "bias", Init::Const(0.0), dtype))
         .transpose()?;
-    Ok(Linear::new(weight, bias))
+    match native {
+        Some(op) if op.dims() == (out_dim, in_dim) => Ok(Linear::from_native(op, bias)),
+        Some(op) => {
+            candle_audio::candle_core::bail!("expected [{out_dim},{in_dim}], got {:?}", op.dims())
+        }
+        None => Ok(Linear::new(
+            vb.get_with_hints((out_dim, in_dim), "weight", Init::Const(0.0))?,
+            bias,
+        )),
+    }
 }
 
 fn to_heads(x: &Tensor, heads: usize, dim_head: usize) -> Result<Tensor> {

@@ -69,6 +69,31 @@ pub fn remap_vae_wan_to_diffusers(src: HashMap<String, Tensor>) -> Result<HashMa
     Ok(out)
 }
 
+/// Bind an in-place WAN-VAE checkpoint without expanding its encoded projections into a tensor map.
+pub fn wan_vae_var_builder(
+    path: &std::path::Path,
+    dtype: candle_core::DType,
+    dev: &candle_core::Device,
+) -> Result<candle_nn::VarBuilder<'static>> {
+    let mut remapped = 0;
+    let vb = crate::loader::remap_file_var_builder(path, dtype, dev, |key, _| {
+        let name = match remap_vae_key(key)? {
+            Some(name) => {
+                remapped += 1;
+                name
+            }
+            None => key.to_owned(),
+        };
+        Ok(vec![crate::loader::SourceView::Whole(name)])
+    })?;
+    if remapped == 0 {
+        return Err(CandleError::Msg(
+            "ComfyUI WAN-VAE has no native WAN-VAE keys".into(),
+        ));
+    }
+    Ok(vb)
+}
+
 /// Remap the exact 194-tensor native WAN-VAE shipped in the shared MLX SCAIL tier and transpose its
 /// convolution kernels from MLX layout to Candle layout.
 ///

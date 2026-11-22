@@ -181,6 +181,7 @@ impl AdaptableHost for DitBlockStream {
         let slot = mlx_gen::adapters::LinearFacts::of(self.adapter_slot_mut(index, rest)?);
         (staged.base_shape == slot.base_shape).then_some(mlx_gen::adapters::LinearFacts {
             is_quantized: staged.is_quantized,
+            source_packed: staged.source_packed,
             ..slot
         })
     }
@@ -316,7 +317,7 @@ impl DitBlockStream {
     /// MLX maps per tensor and materializes on first read, so this is cheap regardless of how many
     /// shards the tier ships: the whole 14-shard 66 GB bf16 partition opens at kilobytes of handles.
     pub fn open(&self) -> Result<Weights> {
-        Weights::from_dir(&self.dir).map_err(|error| {
+        crate::dit::heads::open_dit_weights(&self.dir).map_err(|error| {
             Error::Msg(format!(
                 "minimax-h3 block stream: reopening {}: {error}",
                 self.dir.display()

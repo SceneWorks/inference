@@ -246,6 +246,7 @@ impl KolorsLoadSeal {
 struct ComponentReceipt {
     bytes: u64,
     runtime_bytes: u64,
+    encoded: bool,
     digest: Sha256,
 }
 
@@ -268,22 +269,19 @@ fn validate_float_tensor_inventory(path: &Path, label: &str) -> gen_core::Result
             "kolors: {label} has no safetensors tensor inventory"
         )));
     }
-    let mut tensor_count = 0_usize;
-    for file in files {
-        for header in gen_core::weightsmeta::safetensors_path_tensor_headers(&file)? {
-            tensor_count += 1;
-            if !header.is_float() {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "kolors: {label} tensor {} uses non-floating {:?} storage",
-                    header.name, header.dtype
-                )));
-            }
-        }
-    }
-    if tensor_count == 0 {
+    let (headers, encoded) = component_header_rows(&files, label)?;
+    if headers.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "kolors: {label} tensor inventory is empty"
         )));
+    }
+    for h in &headers {
+        if !h.is_float() && !encoded.contains_key(&h.name) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "kolors: {label} tensor {} uses non-floating {:?} storage",
+                h.name, h.dtype
+            )));
+        }
     }
     Ok(())
 }
@@ -299,6 +297,27 @@ fn receipt_for(label: &str, path: &Path) -> gen_core::Result<ComponentReceipt> {
     files.sort();
     let mut receipt = ComponentReceipt::default();
     update_framed(&mut receipt.digest, label.as_bytes());
+    let shards: Vec<_> = files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .cloned()
+        .collect();
+    let (headers, encoded) = component_header_rows(&shards, label)?;
+    receipt.encoded = !encoded.is_empty();
+    receipt.runtime_bytes = headers.iter().try_fold(0_u64, |sum, h| {
+        let width = if h.is_float() {
+            4
+        } else {
+            h.dtype.size() as u64
+        };
+        let bytes = match encoded.get(&h.name) {
+            Some(&bytes) => bytes,
+            None => h.materialized_bytes(width)?,
+        };
+        sum.checked_add(bytes).ok_or_else(|| {
+            gen_core::Error::Unsupported("kolors runtime tensor bytes overflow".into())
+        })
+    })?;
     for file in files {
         let relative = file.strip_prefix(path).unwrap_or(file.as_path());
         update_framed(&mut receipt.digest, relative.to_string_lossy().as_bytes());
@@ -318,91 +337,38 @@ fn receipt_for(label: &str, path: &Path) -> gen_core::Result<ComponentReceipt> {
             file_digest.update(&buffer[..count]);
         }
         update_framed(&mut receipt.digest, &file_digest.finalize());
-        if file.extension().and_then(|value| value.to_str()) == Some("safetensors") {
-            receipt.runtime_bytes = receipt
-                .runtime_bytes
-                .saturating_add(f32_runtime_tensor_bytes(&file)?);
-        }
     }
     Ok(receipt)
 }
 
-fn f32_runtime_tensor_bytes(path: &Path) -> gen_core::Result<u64> {
-    let mut reader = BufReader::new(File::open(path).map_err(|error| {
-        gen_core::Error::Msg(format!(
-            "kolors receipt opens header {}: {error}",
-            path.display()
-        ))
-    })?);
-    let mut length = [0_u8; 8];
-    reader.read_exact(&mut length).map_err(|error| {
-        gen_core::Error::Msg(format!(
-            "kolors receipt reads header {}: {error}",
-            path.display()
-        ))
-    })?;
-    let header_len = usize::try_from(u64::from_le_bytes(length)).map_err(|_| {
-        gen_core::Error::Unsupported(format!(
-            "kolors receipt header too large: {}",
-            path.display()
-        ))
-    })?;
-    let mut header = vec![0_u8; header_len];
-    reader.read_exact(&mut header).map_err(|error| {
-        gen_core::Error::Msg(format!(
-            "kolors receipt reads tensor index {}: {error}",
-            path.display()
-        ))
-    })?;
-    let index: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
-        .map_err(|error| {
-            gen_core::Error::Msg(format!("kolors receipt parses {}: {error}", path.display()))
-        })?;
-    index
-        .into_iter()
-        .filter(|(name, _)| name != "__metadata__")
-        .try_fold(0_u64, |total, (name, value)| {
-            let dtype = value
-                .get("dtype")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported(format!("kolors tensor {name} omits dtype"))
-                })?;
-            let width = match dtype {
-                "F64" | "I64" | "U64" => 8,
-                // Every floating tensor is materialized through this provider's F32 VarBuilder.
-                "F32" | "F16" | "BF16" | "I32" | "U32" => 4,
-                "I16" | "U16" => 2,
-                "I8" | "U8" | "BOOL" => 1,
-                other => {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "kolors tensor {name} uses unsupported dtype {other}"
-                    )))
-                }
-            };
-            let elements = value
-                .get("shape")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported(format!("kolors tensor {name} omits shape"))
-                })?
-                .iter()
-                .try_fold(1_u64, |product, dimension| {
-                    dimension
-                        .as_u64()
-                        .and_then(|dimension| product.checked_mul(dimension))
-                        .ok_or_else(|| {
-                            gen_core::Error::Unsupported(format!(
-                                "kolors tensor {name} shape overflows"
-                            ))
-                        })
-                })?;
-            total
-                .checked_add(elements.saturating_mul(width))
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported("kolors runtime tensor bytes overflow".into())
-                })
-        })
+type ComponentHeaderRows = (
+    Vec<gen_core::weightsmeta::SafetensorsTensorHeader>,
+    BTreeMap<String, u64>,
+);
+
+fn component_header_rows(files: &[PathBuf], label: &str) -> gen_core::Result<ComponentHeaderRows> {
+    let mut headers = Vec::new();
+    for path in files {
+        headers.extend(gen_core::weightsmeta::safetensors_path_tensor_headers(
+            path,
+        )?);
+    }
+    // ChatGLM word embeddings have an indexed lookup. LoRA/LoKr factors are
+    // coefficients for the additive operator. Neither is a base matrix GEMM.
+    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        files,
+        &headers,
+        |_| 4,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+        |name, shape| {
+            !matches!(label, "adapter" | "ordered-adapter")
+                && shape.len() == 2
+                && name.ends_with(".weight")
+                && !name.ends_with("embeddings.weight")
+                && !name.ends_with("embedding.weight")
+        },
+    )?;
+    Ok((headers, encoded))
 }
 
 fn source_path(source: &WeightsSource) -> &Path {
@@ -580,6 +546,7 @@ fn sealed_contract(
     let conditioning_text = receipt_for("kolors-chatglm", &root.join("text_encoder"))?;
     let transformer = receipt_for("kolors-unet", &root.join("unet"))?;
     let decoder = receipt_for("kolors-vae-f32", &root.join("vae"))?;
+    let mut encoded = conditioning_text.encoded || transformer.encoded || decoder.encoded;
     let conditioning_bytes = conditioning_text.runtime_bytes;
     if conditioning_bytes == 0 || transformer.runtime_bytes == 0 || decoder.runtime_bytes == 0 {
         return Err(gen_core::Error::Unsupported(
@@ -621,6 +588,7 @@ fn sealed_contract(
         let canonical =
             validate_immutable_component_source(path, repository, revision, cache_namespace)?;
         let receipt = receipt_for(prefix, &canonical)?;
+        encoded |= receipt.encoded;
         overlay_bytes = overlay_bytes.saturating_add(receipt.runtime_bytes);
         components.push(MemoryResidentComponent {
             id: format!("{prefix}{}", hex_lower(&receipt.digest.finalize())),
@@ -644,7 +612,7 @@ fn sealed_contract(
         provider_id,
         load_shape,
         // The published cells belong to the rehost, not an uncalibrated upstream snapshot.
-        if matches!(source, BaseSource::Rehost(_)) {
+        if matches!(source, BaseSource::Rehost(_)) && !encoded {
             production_calibration_identity(provider_id, tier.quant, adapters, pid, load_shape)
         } else {
             None
@@ -1118,14 +1086,13 @@ fn inspect_component_tier(root: &Path, component: &str) -> gen_core::Result<Opti
             "kolors: {component} has no safetensors inventory"
         )));
     }
+    let (rows, encoded) = component_header_rows(&files, component)?;
     let mut headers = BTreeMap::new();
-    for file in files {
-        for header in gen_core::weightsmeta::safetensors_path_tensor_headers(&file)? {
-            if headers.insert(header.name.clone(), header).is_some() {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "kolors: duplicate {component} tensor across shards"
-                )));
-            }
+    for header in rows {
+        if headers.insert(header.name.clone(), header).is_some() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "kolors: duplicate {component} tensor across shards"
+            )));
         }
     }
     let packed_bases = headers
@@ -1143,7 +1110,11 @@ fn inspect_component_tier(root: &Path, component: &str) -> gen_core::Result<Opti
         // as F16 (ChatGLM and UNet alike); the pipeline reads every dense tensor at F32 through
         // `mmap_var_builder`/`load_sorted_mmap`, so F16 and BF16 storage are the same load. Either
         // half-width storage resolves to the BF16 numeric identity below (sc-22738).
-        if headers.is_empty() || !headers.values().all(|header| is_dense_half(header.dtype)) {
+        if headers.is_empty()
+            || !headers
+                .values()
+                .all(|header| is_dense_half(header.dtype) || encoded.contains_key(&header.name))
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "kolors: dense {component} must contain F16/BF16 tensors only"
             )));
@@ -1218,7 +1189,7 @@ fn inspect_component_tier(root: &Path, component: &str) -> gen_core::Result<Opti
         }
         // Packed tiers keep the embeddings/norms un-packed in the source's own F16 (see the dense
         // arm above); only the packed `.scales`/`.biases` are pinned to BF16.
-        if !is_dense_half(header.dtype) {
+        if !is_dense_half(header.dtype) && !encoded.contains_key(name) {
             return Err(gen_core::Error::Unsupported(format!(
                 "kolors: non-packed {component} tensor {name} must be F16 or BF16"
             )));
@@ -2238,6 +2209,7 @@ mod tests {
         for (name, dtype, shape) in tensors {
             let width = match *dtype {
                 "BF16" | "F16" => 2,
+                "F8_E4M3" | "F8_E5M2" => 1,
                 _ => 4,
             };
             let bytes = shape.iter().product::<u64>() * width;
@@ -2295,6 +2267,32 @@ mod tests {
             .join(tier);
         write_base_inventory(&root, bits);
         root
+    }
+
+    #[test]
+    fn sealed_encoded_component_prices_its_operator_and_withholds_rehost_calibration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = canonical_base_tier(&temp, "bf16");
+        let file = root.join("unet/model.safetensors");
+        write_named_tensors(
+            &file,
+            &[
+                ("attention.to_q.weight", "F8_E5M2", &[2, 3]),
+                ("attention.to_q.weight_scale", "F32", &[]),
+            ],
+        );
+        let seal = KolorsLoadSeal::capture_load(
+            &root,
+            &[],
+            None,
+            gen_core::LoadShape::DeferredMaterialization,
+        )
+        .unwrap();
+        // The unaligned matrix executes in F32. The decoded operand has consumed its source scale.
+        assert_eq!(seal.contract().asset_facts.transformer_bytes, 2 * 3 * 4);
+        assert!(seal.contract().calibration.is_none());
+        write_named_tensors(&file, &[("attention.to_q.weight", "BF16", &[2, 3])]);
+        assert!(seal.ensure_unchanged().is_err());
     }
 
     // Serialized safetensors metadata/zero payload only: these fixtures are never loaded as

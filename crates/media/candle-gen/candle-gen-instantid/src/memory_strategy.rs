@@ -38,18 +38,7 @@ fn source_path(source: &WeightsSource) -> &Path {
 /// Bytes one resolved component occupies once loaded: float tensors at the compute width, integer
 /// tensors at their stored width. Header-only — no tensor data is materialized.
 fn component_bytes(path: &Path) -> gen_core::Result<u64> {
-    gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
-        .iter()
-        .try_fold(0_u64, |sum, header| {
-            let bytes = if header.is_float() {
-                header.materialized_bytes(FLOAT_WIDTH)?
-            } else {
-                header.data_bytes
-            };
-            sum.checked_add(bytes).ok_or_else(|| {
-                gen_core::Error::Msg("instantid: component byte sum overflow".into())
-            })
-        })
+    candle_gen::logical_weights::selected_component_bytes(path, FLOAT_WIDTH, |_| true)
 }
 
 /// Bytes the [`candle_gen_face`] SCRFD + ArcFace stack occupies once `candle_gen_face::load_on`
@@ -60,11 +49,14 @@ fn component_bytes(path: &Path) -> gen_core::Result<u64> {
 /// [`FLOAT_WIDTH`] — it is not part of the fp16 diffusion graph. Pricing the whole dir instead would
 /// also charge a `bisenet_parsing.safetensors` that shares the layout but that InstantID never loads.
 fn face_stack_bytes(dir: &Path) -> gen_core::Result<u64> {
-    const FACE_WIDTH: u64 = 4;
     candle_gen_face::ANALYSIS_STACK_FILES
         .iter()
         .try_fold(0_u64, |sum, file| {
-            let bytes = gen_core::weightsmeta::materialized_path_bytes(dir.join(file), FACE_WIDTH)?;
+            let bytes = candle_gen::logical_weights::component_f32_bytes(
+                &dir.join(file),
+                false,
+                candle_gen::logical_weights::standard_linear_weight,
+            )?;
             sum.checked_add(bytes).ok_or_else(|| {
                 gen_core::Error::Msg("instantid: face stack byte sum overflow".into())
             })

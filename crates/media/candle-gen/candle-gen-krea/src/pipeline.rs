@@ -625,8 +625,9 @@ pub(crate) fn load_text_quantized_for_request(
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
     let cpu = Device::Cpu;
-    let te_w =
-        source.read_unchanged(|weights| load_te_weights_cancelable(weights, &cpu, Some(cancel)))?;
+    let te_w = source
+        .read_unchanged(|weights| load_te_weights_cancelable(weights, device, Some(cancel)))?
+        .stage_dense_on(&cpu);
     let mut te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
     te.quantize_onto(quant, device)?;
     candle_gen::check_cancel(cancel)?;
@@ -1053,22 +1054,16 @@ fn load_native_dit_at_dtype(
 ) -> Result<Krea2Transformer> {
     native_dit.read_unchanged(|_| {
         let cfg = Krea2Config::from_snapshot(root)?;
-        // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
-        // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-        let source_device = if matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
-            &Device::Cpu
-        } else {
-            device
-        };
-        // sc-20651: the architecture config goes IN, so the compiled plan can unpad a block-padded
-        // (Kitchen NVFP4) layer to its true geometry. Without it a padded layer would plan at its
-        // stored grid and refuse to materialize rather than promote padding to weights.
         let mut dit_w = Weights::from_pinned_native_file_for(
             native_dit,
-            source_device,
+            device,
             dit_dtype,
             crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+            matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)),
         )?;
+        let fixed_source = dit_w
+            .logical_plan()
+            .is_some_and(|p| p.has_encoded_weights());
         let native_nvfp4 = dit_w.is_native_nvfp4();
         ensure_nvfp4_adapters_supported(native_nvfp4, adapters.specs)?;
         if native_nvfp4 && stream_blocks {
@@ -1084,6 +1079,7 @@ fn load_native_dit_at_dtype(
         #[cfg(test)]
         run_native_dit_load_test_hook(&dit_w, device)?;
         crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+        let quant = quant.filter(|_| !fixed_source);
         let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters.specs)?;
         if stream_blocks && (!adapters.specs.is_empty() || quant.is_some()) {
             return Err(CandleError::Msg(

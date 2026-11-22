@@ -6,7 +6,9 @@ use std::path::Path;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::multiply;
-use mlx_rs::{Array, Dtype};
+#[cfg(test)]
+use mlx_rs::Array;
+use mlx_rs::Dtype;
 
 const DIT_DIM: i32 = 3840;
 const VAE_LEVELS: usize = 4;
@@ -47,47 +49,25 @@ fn component_name(key: &str) -> Option<(Component, &str)> {
         .and_then(|key| key.strip_prefix('.').map(|key| (Component::Vae, key)))
 }
 
-fn component_for_key<'a, 'b>(
-    key: &'a str,
-    transformer: &'b mut HashMap<String, Array>,
-    text_encoder: &'b mut HashMap<String, Array>,
-    vae: &'b mut HashMap<String, Array>,
-) -> Option<(&'a str, &'b mut HashMap<String, Array>)> {
-    let (component, key) = component_name(key)?;
-    let map = match component {
-        Component::Transformer => transformer,
-        Component::TextEncoder => text_encoder,
-        Component::Vae => vae,
-    };
-    Some((key, map))
-}
-
 fn split_combined_checkpoint_selected(
     path: &Path,
     include_text: bool,
     include_heavy: bool,
 ) -> Result<ComponentWeights> {
-    let mut source = Weights::from_file_with_fp8_filter(path, |key| {
+    let source = Weights::from_file_with_fp8_filter(path, |key| {
         component_name(key).is_some_and(|(component, _)| match component {
             Component::TextEncoder => include_text,
             Component::Transformer | Component::Vae => include_heavy,
         })
     })?;
-    let keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    let mut transformer = HashMap::new();
-    let mut text_encoder = HashMap::new();
-    let mut vae = HashMap::new();
-    for source_key in keys {
-        let Some((target, map)) =
-            component_for_key(&source_key, &mut transformer, &mut text_encoder, &mut vae)
-        else {
-            continue;
-        };
-        let value = source
-            .remove(&source_key)
-            .ok_or_else(|| Error::MissingTensor(source_key.clone()))?;
-        map.insert(target.to_owned(), value);
-    }
+    let component = |which| {
+        source.select_renamed(|key| {
+            component_name(key).and_then(|(c, name)| (c == which).then(|| name.to_owned()))
+        })
+    };
+    let transformer = component(Component::Transformer);
+    let text_encoder = component(Component::TextEncoder);
+    let vae = component(Component::Vae);
     for (enabled, name, map) in [
         (include_heavy, "transformer", &transformer),
         (include_text, "text encoder", &text_encoder),
@@ -100,9 +80,9 @@ fn split_combined_checkpoint_selected(
         }
     }
     Ok(ComponentWeights {
-        transformer: Weights::from_map(transformer),
-        text_encoder: Weights::from_map(text_encoder),
-        vae: Weights::from_map(vae),
+        transformer,
+        text_encoder,
+        vae,
     })
 }
 
@@ -116,88 +96,107 @@ pub(crate) fn split_combined_heavy(path: &Path) -> Result<(Weights, Weights)> {
 }
 
 pub(crate) fn normalize_fp8(mut source: Weights, what: &str) -> Result<Weights> {
-    let keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    let mut out = HashMap::new();
+    // Encoded projections and any required float fallback were normalized from source dtypes by
+    // the shared reader. Older exporters also attach scalar multipliers to plain floating arrays.
+    let keys: Vec<String> = source
+        .keys()
+        .filter(|key| key.ends_with(".scale_weight") || key.ends_with(".weight_scale"))
+        .map(str::to_owned)
+        .collect();
     for key in keys {
-        if key == "scaled_fp8"
-            || key.ends_with(".scale_weight")
-            || key.ends_with(".weight_scale")
-            || key.ends_with(".scale_input")
-            || key.ends_with(".input_scale")
-        {
-            continue;
-        }
-        let value = source
-            .remove(&key)
-            .ok_or_else(|| Error::MissingTensor(key.clone()))?;
-        let base = key.strip_suffix(".weight").unwrap_or(&key);
-        let scale = source
-            .get(&format!("{base}.scale_weight"))
-            .or_else(|| source.get(&format!("{base}.weight_scale")));
-        let value = match scale {
-            Some(scale) => {
-                if scale.size() != 1 {
-                    return Err(Error::Msg(format!(
-                        "{what}: scale companion for `{key}` must contain one scalar"
-                    )));
-                }
-                let dense = multiply(
-                    &value.as_dtype(Dtype::Float32)?,
-                    &scale.as_dtype(Dtype::Float32)?,
-                )?
-                .as_dtype(Dtype::Bfloat16)?;
-                dense.eval()?;
-                dense
-            }
-            None => value,
+        let base = key
+            .trim_end_matches(".scale_weight")
+            .trim_end_matches(".weight_scale");
+        let ordinary = format!("{base}.weight");
+        let weight_key = if source.get(&ordinary).is_some() {
+            ordinary.as_str()
+        } else {
+            base
         };
-        out.insert(key, value);
-    }
-    Ok(Weights::from_map(out))
-}
-
-pub(crate) fn remap_dit(mut source: Weights) -> Result<Weights> {
-    let keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    let mut out = HashMap::new();
-    for key in keys {
-        let value = source
-            .remove(&key)
-            .ok_or_else(|| Error::MissingTensor(key.clone()))?;
-        if let Some(prefix) = key.strip_suffix(".attention.qkv.weight") {
-            if value.shape() != [3 * DIT_DIM, DIT_DIM] {
-                return Err(Error::Msg(format!(
-                    "z-image ComfyUI remap: fused `{key}` has shape {:?}, expected [{}, {DIT_DIM}]",
-                    value.shape(),
-                    3 * DIT_DIM
-                )));
-            }
-            let parts = mlx_rs::ops::split(&value, 3, 0)?;
-            for (leaf, part) in ["to_q", "to_k", "to_v"].into_iter().zip(parts) {
-                out.insert(format!("{prefix}.attention.{leaf}.weight"), part);
-            }
+        let Some(value) = source.get(weight_key) else {
+            continue;
+        };
+        if !matches!(
+            value.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64
+        ) {
             continue;
         }
-        if key.ends_with(".attention.qkv.bias") {
+        let scale = source.require(&key)?;
+        if scale.size() != 1 {
             return Err(Error::Msg(format!(
-                "z-image ComfyUI remap: unexpected fused attention bias `{key}`"
+                "{what}: scale companion for {weight_key} must contain one scalar"
             )));
         }
-        let target = if let Some(prefix) = key.strip_suffix(".attention.q_norm.weight") {
-            format!("{prefix}.attention.norm_q.weight")
-        } else if let Some(prefix) = key.strip_suffix(".attention.k_norm.weight") {
-            format!("{prefix}.attention.norm_k.weight")
-        } else if let Some((prefix, tail)) = key.split_once(".attention.out.") {
-            format!("{prefix}.attention.to_out.0.{tail}")
-        } else if let Some(tail) = key.strip_prefix("x_embedder.") {
-            format!("all_x_embedder.2-1.{tail}")
-        } else if let Some(tail) = key.strip_prefix("final_layer.") {
-            format!("all_final_layer.2-1.{tail}")
-        } else {
-            key
-        };
-        out.insert(target, value);
+        let dense = multiply(
+            &value.as_dtype(Dtype::Float32)?,
+            &scale.as_dtype(Dtype::Float32)?,
+        )?
+        .as_dtype(Dtype::Bfloat16)?;
+        dense.eval()?;
+        source.insert(weight_key, dense);
+        source.remove(&key);
     }
-    Ok(Weights::from_map(out))
+    Ok(source)
+}
+
+pub(crate) fn remap_dit(source: Weights) -> Result<Weights> {
+    remap_dit_width(source, DIT_DIM)
+}
+
+fn remap_dit_width(source: Weights, dim: i32) -> Result<Weights> {
+    let mut out = source.select_renamed(|key| {
+        if key.contains(".attention.qkv.") {
+            return None;
+        }
+        Some(
+            if let Some(prefix) = key.strip_suffix(".attention.q_norm.weight") {
+                format!("{prefix}.attention.norm_q.weight")
+            } else if let Some(prefix) = key.strip_suffix(".attention.k_norm.weight") {
+                format!("{prefix}.attention.norm_k.weight")
+            } else if let Some((prefix, tail)) = key.split_once(".attention.out.") {
+                format!("{prefix}.attention.to_out.0.{tail}")
+            } else if let Some(tail) = key.strip_prefix("x_embedder.") {
+                format!("all_x_embedder.2-1.{tail}")
+            } else if let Some(tail) = key.strip_prefix("final_layer.") {
+                format!("all_final_layer.2-1.{tail}")
+            } else {
+                key.to_owned()
+            },
+        )
+    });
+    for key in source.keys().filter(|k| k.contains(".attention.qkv.")) {
+        if key.ends_with(".attention.qkv.bias") {
+            return Err(Error::Msg(format!(
+                "z-image ComfyUI remap: unexpected fused attention bias {key}"
+            )));
+        }
+        let Some(prefix) = key.strip_suffix(".attention.qkv.weight") else {
+            continue;
+        };
+        let targets =
+            ["to_q", "to_k", "to_v"].map(|leaf| format!("{prefix}.attention.{leaf}.weight"));
+        let value = source.require(key)?;
+        let native = source.source_projection(key)?;
+        let shape = native
+            .as_ref()
+            .map(|p| p.shape().to_vec())
+            .unwrap_or_else(|| value.shape().to_vec());
+        if shape != [3 * dim, dim] {
+            return Err(Error::Msg(format!(
+                "z-image ComfyUI remap: fused {key} has shape {shape:?}, expected [{}, {dim}]",
+                3 * dim
+            )));
+        }
+        if let Some(native) = native {
+            out.insert_split_projection(key, native, &targets)?;
+        } else {
+            for (target, part) in targets.into_iter().zip(mlx_rs::ops::split(value, 3, 0)?) {
+                out.insert(target, part);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn vae_key(key: &str) -> Result<String> {
@@ -275,34 +274,36 @@ fn vae_key(key: &str) -> Result<String> {
     Ok(key.to_owned())
 }
 
-pub(crate) fn remap_vae(mut source: Weights) -> Result<Weights> {
-    let keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    let mut out = HashMap::new();
-    for key in keys {
-        let value = source
-            .remove(&key)
-            .ok_or_else(|| Error::MissingTensor(key.clone()))?;
-        let target = vae_key(&key)?;
-        let value = if target.contains(".attentions.0.")
-            && (target.ends_with(".to_q.weight")
-                || target.ends_with(".to_k.weight")
-                || target.ends_with(".to_v.weight")
-                || target.ends_with(".to_out.0.weight"))
-            && value.shape().len() == 4
+pub(crate) fn remap_vae(source: Weights) -> Result<Weights> {
+    let targets: HashMap<_, _> = source
+        .keys()
+        .map(|key| Ok((key, vae_key(key)?)))
+        .collect::<Result<_>>()?;
+    let mut out = source.select_renamed(|key| targets.get(key).cloned());
+    for (key, target) in targets {
+        if target.contains(".attentions.0.")
+            && [
+                ".to_q.weight",
+                ".to_k.weight",
+                ".to_v.weight",
+                ".to_out.0.weight",
+            ]
+            .iter()
+            .any(|leaf| target.ends_with(leaf))
         {
-            let [out_dim, in_dim, 1, 1] = value.shape() else {
-                return Err(Error::Msg(format!(
-                    "z-image VAE attention `{key}` must be [C,C,1,1], got {:?}",
-                    value.shape()
-                )));
-            };
-            value.reshape(&[*out_dim, *in_dim])?
-        } else {
-            value
-        };
-        out.insert(target, value);
+            let value = source.require(key)?;
+            if value.ndim() == 4 {
+                let [out_dim, in_dim, 1, 1] = value.shape() else {
+                    return Err(Error::Msg(format!(
+                        "z-image VAE attention {key} must be [C,C,1,1], got {:?}",
+                        value.shape()
+                    )));
+                };
+                out.insert(target, value.reshape(&[*out_dim, *in_dim])?);
+            }
+        }
     }
-    Ok(Weights::from_map(out))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -311,29 +312,14 @@ mod tests {
 
     #[test]
     fn component_prefixes_cover_diffusers_and_ldm_forms() {
-        let mut transformer = HashMap::new();
-        let mut text_encoder = HashMap::new();
-        let mut vae = HashMap::new();
-        assert_eq!(
-            component_for_key(
-                "text_encoders.qwen3_4b.transformer.model.layers.0.weight",
-                &mut transformer,
-                &mut text_encoder,
-                &mut vae
-            )
-            .map(|(key, _)| key),
-            Some("model.layers.0.weight")
-        );
-        assert_eq!(
-            component_for_key(
-                "first_stage_model.decoder.conv_in.weight",
-                &mut transformer,
-                &mut text_encoder,
-                &mut vae
-            )
-            .map(|(key, _)| key),
-            Some("decoder.conv_in.weight")
-        );
+        assert!(matches!(
+            component_name("text_encoders.qwen3_4b.transformer.model.layers.0.weight"),
+            Some((Component::TextEncoder, "model.layers.0.weight"))
+        ));
+        assert!(matches!(
+            component_name("first_stage_model.decoder.conv_in.weight"),
+            Some((Component::Vae, "decoder.conv_in.weight"))
+        ));
     }
 
     #[test]
@@ -350,6 +336,38 @@ mod tests {
             vae_key("decoder.mid.attn_1.proj_out.weight").unwrap(),
             "decoder.mid_block.attentions.0.to_out.0.weight"
         );
+    }
+
+    #[test]
+    fn combined_fp8_qkv_retains_code_order_and_output_row_scales() {
+        let mut checkpoint = Weights::empty();
+        let base = "model.diffusion_model.layers.0.attention.qkv";
+        let codes: Vec<u8> = (0..12).collect();
+        checkpoint.insert(format!("{base}.weight"), Array::from_slice(&codes, &[6, 2]));
+        checkpoint.insert(
+            format!("{base}.weight_scale"),
+            Array::from_slice(&[1f32, 2., 3., 4., 5., 6.], &[6]),
+        );
+        let desc = br#"{"format":"fp8r"}"#;
+        checkpoint.insert(
+            format!("{base}.comfy_quant"),
+            Array::from_slice(desc, &[desc.len() as i32]),
+        );
+        let component =
+            checkpoint.select_renamed(|key| component_name(key).map(|(_, name)| name.to_owned()));
+        let mapped = remap_dit_width(normalize_fp8(component, "transformer").unwrap(), 2).unwrap();
+        for (i, leaf) in ["to_q", "to_k", "to_v"].into_iter().enumerate() {
+            let key = format!("layers.0.attention.{leaf}.weight");
+            let Some(mlx_gen::NativeProjection::Fp8(op)) = mapped.source_projection(&key).unwrap()
+            else {
+                panic!("missing native {key}")
+            };
+            assert_eq!(op.codes().as_slice::<u8>(), &codes[i * 4..i * 4 + 4]);
+            assert_eq!(
+                op.scales().as_slice::<f32>(),
+                &[(i * 2 + 1) as f32, (i * 2 + 2) as f32]
+            );
+        }
     }
 
     #[test]

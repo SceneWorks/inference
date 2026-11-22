@@ -5,60 +5,42 @@
 //! OIHW `[out, in, kH, kW]` at load. The weight FILES are shared with MLX (the same antelopev2
 //! `tools/convert_*` output); only the in-memory layout differs.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
-use candle_gen::{CandleError, Result};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::Result;
 
 /// A loaded face-checkpoint weight map. The face sub-model files are small f32 safetensors; every
 /// tensor is coerced to f32 on load (the reference is f32 and cosine parity is comfortable there).
 pub(crate) struct Weights {
-    map: HashMap<String, Tensor>,
+    vb: candle_gen::candle_nn::VarBuilder<'static>,
 }
-
 impl Weights {
-    /// Load every tensor from a `.safetensors` file onto `device`, coercing to f32.
     pub fn from_file(path: &Path, device: &Device) -> Result<Self> {
-        let raw = safetensors::load(path, device)?;
-        let mut map = HashMap::with_capacity(raw.len());
-        for (k, v) in raw {
-            let v = if v.dtype() == DType::F32 {
-                v
-            } else {
-                v.to_dtype(DType::F32)?
-            };
-            map.insert(k, v);
-        }
-        Ok(Self { map })
+        Ok(Self {
+            vb: candle_gen::mmap_var_builder(&[path.to_owned()], DType::F32, device)?,
+        })
     }
-
-    /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
-        self.map
-            .get(key)
-            .cloned()
-            .ok_or_else(|| CandleError::Msg(format!("missing tensor: {key}")))
+        Ok(self.vb.get_unchecked(key)?)
     }
-
-    /// Whether the checkpoint carries `key`.
     pub fn contains(&self, key: &str) -> bool {
-        self.map.contains_key(key)
+        self.vb.contains_tensor(key)
     }
-
-    /// Build from an in-memory tensor map (coercing to f32, like [`Weights::from_file`]).
+    pub fn linear(&self, base: &str) -> Result<candle_gen::candle_nn::Linear> {
+        let vb = self.vb.pp(base);
+        Ok(candle_gen::candle_nn::Linear::from_var_builder(&vb, true)?)
+    }
     #[cfg(test)]
-    pub fn from_map(raw: HashMap<String, Tensor>) -> Result<Self> {
-        let mut map = HashMap::with_capacity(raw.len());
-        for (k, v) in raw {
-            let v = if v.dtype() == DType::F32 {
-                v
-            } else {
-                v.to_dtype(DType::F32)?
-            };
-            map.insert(k, v);
-        }
-        Ok(Self { map })
+    pub fn from_map(raw: std::collections::HashMap<String, Tensor>) -> Result<Self> {
+        let device = raw
+            .values()
+            .next()
+            .map(|t| t.device().clone())
+            .unwrap_or(Device::Cpu);
+        Ok(Self {
+            vb: candle_gen::candle_nn::VarBuilder::from_tensors(raw, DType::F32, &device),
+        })
     }
 
     /// A per-channel vector (`[C]`) reshaped to broadcast over an NCHW feature map: `[1, C, 1, 1]`.

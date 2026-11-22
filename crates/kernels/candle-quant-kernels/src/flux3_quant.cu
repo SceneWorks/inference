@@ -104,15 +104,17 @@ __global__ void flux3_fp8_rowwise_epilogue(
     const float* __restrict__ acc,   // [m, n] f32 GEMM accumulate (unit operand scales)
     const float* __restrict__ sa,    // [m] activation row scales
     const float* __restrict__ sw,    // [n] weight row scales
-    unsigned short* __restrict__ out,// [m, n] bf16 bits
-    int m, int n)
+    void* __restrict__ out,          // [m, n] BF16 bits or F32
+    unsigned int f32_output, int m, int n)
 {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)m * n;
     if (idx >= total) return;
     int r = (int)(idx / n);
     int c = (int)(idx % n);
-    out[idx] = f3_bf16_bits(acc[idx] * sa[r] * sw[c]);
+    float scaled = (acc[idx] * sa[r]) * sw[c];
+    if (f32_output) ((float*)out)[idx] = scaled;
+    else ((unsigned short*)out)[idx] = f3_bf16_bits(scaled);
 }
 
 // ---- NVFP4 static activation pack: one thread per (row, 16-block). `packed` and `scales` must be

@@ -541,20 +541,9 @@ pub struct SafetensorsTensorHeader {
 }
 
 impl SafetensorsTensorHeader {
-    /// Whether Candle's shared `Weights` loader casts this source dtype to its requested float
-    /// compute dtype. Integer and boolean tensors remain stored-width.
-    ///
-    /// `F8_E4M3` is deliberately **excluded**: `candle_gen::weights::coerce_float` only casts
-    /// `F16 | BF16 | F32 | F64`, so through the shared loader an fp8 payload stays at its stored
-    /// width and needs an explicit, route-owned dequantization contract (paired
-    /// `weight_scale`/`scales` companions) before it can be priced. Admission guards therefore fail
-    /// closed on fp8 through this predicate; a route that genuinely accepts fp8 declares it
-    /// explicitly, the way [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
-    ///
-    /// What the row occupies *after* such a route loads it is that route's fact, not this
-    /// predicate's: a planned single-file import (`candle_gen::logical_weights`) decodes an fp8 row
-    /// to dense bf16 wherever its residency policy masks the packed fp8 leg, so a pricing built on
-    /// `is_float()` alone under-declares those rows by half — see [`materialized_path_bytes`].
+    /// Ordinary floating storage cast directly to the consumer's compute dtype. FP8 and
+    /// packed integers have codec-specific projection and coefficient representations.
+    /// Use the checkpoint codec plan to price their source scales and materialized operands.
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
@@ -627,7 +616,8 @@ pub fn safetensors_path_tensor_headers(
     Ok(tensors.into_values().collect())
 }
 
-fn collect_safetensors_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// Enumerate the same non-hidden shard tree consumed by recursive source inventory.
+pub fn collect_safetensors_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();

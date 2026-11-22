@@ -36,7 +36,7 @@ impl OpenVoicePipeline {
     /// Build from a `converter/`-shaped snapshot dir (`config.json` + `checkpoint.pth`).
     pub fn from_snapshot(root: &Path, device: &Device) -> Result<Self> {
         validate_config(&root.join(CONFIG_FILE))?;
-        let pth = root.join(CHECKPOINT_FILE);
+        let pth = candle_audio::weights::checkpoint_file(root.join(CHECKPOINT_FILE));
         if !pth.is_file() {
             return Err(AudioError::Msg(format!(
                 "openvoice_v2: checkpoint {} missing from the snapshot",

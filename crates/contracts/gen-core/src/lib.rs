@@ -45,6 +45,10 @@ pub mod block_window;
 pub mod caption;
 pub mod checkpoint_codec;
 pub mod checkpoint_facts;
+mod read_accounting;
+mod receipt_scope;
+pub use read_accounting::CheckpointReadAccounting;
+pub use receipt_scope::CheckpointReceiptScope;
 pub mod comfy_quant;
 pub mod control;
 pub mod convrot_int8;
@@ -89,6 +93,7 @@ pub mod h3_image;
 pub mod h3_memory;
 pub mod h3_reference;
 pub mod hdr;
+mod headwise;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
@@ -102,6 +107,7 @@ pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
+pub use headwise::{HeadwiseProjection, HeadwiseWeights};
 pub mod numeric;
 pub mod phase;
 pub mod registry;
@@ -157,8 +163,8 @@ pub use checkpoint_codec::{
     LogicalWeightPlan, LogicalWeightPlanError, LogicalWeightReceipt, PlannedResidency,
     ResidencyMode, ResidentTensorHeadersError, ScalarScaleSource, StoredTensorFormat,
     TensorCodecSpec, WeightEncoding, COMFY_QUANT_CODECS, DENSE_BF16_CODEC, DENSE_CODECS,
-    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
-    GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
+    FP8_E5M2_SCALAR_CODEC, GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 pub use checkpoint_facts::{
     CheckpointFactsSink, CheckpointWeightFacts, CheckpointWeightFactsError,
@@ -171,10 +177,10 @@ pub use comfy_quant::{
     e8m0_to_f32, fp8_e4m3fn_to_f32, fp8_e5m2_to_f32, mxfp8_padded_shape, mxfp8_scale_shape,
     mxfp8_swizzled_scale_index, nvfp4_padded_shape, nvfp4_scale_shape, nvfp4_swizzled_scale_index,
     parse_comfy_quant_descriptor, parse_quantization_metadata, partial_descriptor_from_json,
-    validate_mxfp8_geometry, validate_nvfp4_block_scale_payload, validate_nvfp4_geometry,
-    ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
-    Nvfp4GeometryError, PartialComfyQuantDescriptor, QuantizationMetadataError, E2M1_LUT,
-    MXFP8_BLOCK, NVFP4_BLOCK, NVFP4_PAD,
+    remap_mxfp8_scales, validate_mxfp8_geometry, validate_nvfp4_block_scale_payload,
+    validate_nvfp4_geometry, ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat,
+    Mxfp8GeometryError, Nvfp4GeometryError, PartialComfyQuantDescriptor, QuantizationMetadataError,
+    E2M1_LUT, MXFP8_BLOCK, NVFP4_BLOCK, NVFP4_PAD,
 };
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,

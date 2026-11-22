@@ -221,6 +221,14 @@ impl Loader<'_> {
         bias: bool,
         resolved_width: Option<i32>,
     ) -> Result<Option<(AdaptableLinear, i32)>> {
+        if let Some(native) = mlx_gen::quant::native_lin(self.weights, prefix, bias)? {
+            if resolved_width.is_some_and(|k| k != native.base_shape()[1]) {
+                return Err(Error::Msg(format!(
+                    "iris: {prefix} native width does not match adapter"
+                )));
+            }
+            return Ok(Some((native, 0)));
+        }
         let scales_key = format!("{prefix}.scales");
         if !self.has(&scales_key) {
             crate::packed::check_loaded_projection(self.weights, prefix, None)?;

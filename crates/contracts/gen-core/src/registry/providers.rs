@@ -34,7 +34,7 @@ pub struct ProviderRegistry {
 macro_rules! explicit_registry_kind {
     (
         $iter:ident, $load:ident, $field:ident, $registration:ty,
-        $kind:literal, $trait:ty
+        $kind:literal, $trait:ty $(, $wrap:path)?
     ) => {
         pub fn $iter(&self) -> impl ExactSizeIterator<Item = &$registration> {
             self.$field.iter()
@@ -52,9 +52,24 @@ macro_rules! explicit_registry_kind {
                 })?;
             self.ensure_quant_supported(id, spec, $kind)?;
             let _activity = spec.load_activity_context().install();
-            spec.read_prepared_files_unchanged(|| (registration.load)(spec))
+            let load = || spec.read_prepared_files_unchanged(|| (registration.load)(spec));
+            explicit_registry_kind!(@load spec, load $(, $wrap)?)
         }
     };
+    (@load $spec:ident, $load:ident, $wrap:path) => { $wrap($spec, $load) };
+    (@load $spec:ident, $load:ident) => { $load() };
+}
+
+fn load_with_receipts(
+    spec: &LoadSpec,
+    load: impl FnOnce() -> Result<Box<dyn Generator>>,
+) -> Result<Box<dyn Generator>> {
+    let scope = crate::CheckpointReceiptScope::for_load(spec)?;
+    let inner = scope.with(load)?;
+    Ok(Box::new(crate::generator::ReceiptGenerator {
+        inner,
+        scope,
+    }))
 }
 
 impl ProviderRegistry {
@@ -760,7 +775,8 @@ impl ProviderRegistry {
         generators,
         ModelRegistration,
         "generator",
-        dyn Generator
+        dyn Generator,
+        load_with_receipts
     );
     explicit_registry_kind!(
         transforms,
@@ -768,7 +784,8 @@ impl ProviderRegistry {
         transforms,
         TransformRegistration,
         "transform",
-        dyn Transform
+        dyn Transform,
+        super::media_receipts::load_transform
     );
     explicit_registry_kind!(
         audio_transforms,
@@ -776,7 +793,8 @@ impl ProviderRegistry {
         audio_transforms,
         AudioTransformRegistration,
         "audio transform",
-        dyn AudioTransform
+        dyn AudioTransform,
+        super::media_receipts::load_audio_transform
     );
     explicit_registry_kind!(
         trainers,
@@ -792,7 +810,8 @@ impl ProviderRegistry {
         captioners,
         CaptionerRegistration,
         "captioner",
-        dyn Captioner
+        dyn Captioner,
+        super::media_receipts::load_captioner
     );
     explicit_registry_kind!(
         transcribers,
@@ -800,7 +819,8 @@ impl ProviderRegistry {
         transcribers,
         TranscriberRegistration,
         "transcriber",
-        dyn Transcriber
+        dyn Transcriber,
+        super::media_receipts::load_transcriber
     );
     explicit_registry_kind!(
         image_embedders,
@@ -808,7 +828,8 @@ impl ProviderRegistry {
         image_embedders,
         ImageEmbedderRegistration,
         "image embedder",
-        dyn ImageEmbedder
+        dyn ImageEmbedder,
+        super::media_receipts::load_image_embedder
     );
     explicit_registry_kind!(
         text_embedders,
@@ -816,7 +837,8 @@ impl ProviderRegistry {
         text_embedders,
         TextEmbedderRegistration,
         "text embedder",
-        dyn TextEmbedder
+        dyn TextEmbedder,
+        super::media_receipts::load_text_embedder
     );
     explicit_registry_kind!(
         voice_embedders,
@@ -824,7 +846,8 @@ impl ProviderRegistry {
         voice_embedders,
         VoiceEmbedderRegistration,
         "voice embedder",
-        dyn VoiceEmbedder
+        dyn VoiceEmbedder,
+        super::media_receipts::load_voice_embedder
     );
     explicit_registry_kind!(
         audio_embedders,
@@ -832,7 +855,8 @@ impl ProviderRegistry {
         audio_embedders,
         AudioEmbedderRegistration,
         "audio embedder",
-        dyn AudioEmbedder
+        dyn AudioEmbedder,
+        super::media_receipts::load_audio_embedder
     );
 
     /// Return the provider-owned on-disk component footprint for generator `id`, when declared.

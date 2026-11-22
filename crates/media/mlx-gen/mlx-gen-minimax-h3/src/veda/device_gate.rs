@@ -328,10 +328,12 @@ fn metal_scorer_logits_are_the_host_contract_bit_for_bit() {
         let shape = rt.plan.shapes[0];
         let layout = &rt.layouts[&shape];
         let all: Vec<i32> = (0..HEADS as i32).collect();
-        let batched = metal::scores(&rt.device[&shape], &nq, &nk, &pq, &pk, &all, 0, DIM).unwrap();
+        let batched =
+            metal::scores_with_weights(&rt.device[&shape], &nq, &nk, &pq, &pk, &all, 0, DIM)
+                .unwrap();
         let per = layout.video * layout.video;
         for head in [0usize, 13, 55] {
-            let alone = metal::scores(
+            let alone = metal::scores_with_weights(
                 &rt.device[&shape],
                 &nq,
                 &nk,

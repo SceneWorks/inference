@@ -7,8 +7,8 @@
 //! last_hidden_state[:, 0])`, `image_embeds = visual_projection(pooled)` (Linear 1280→1024, no bias) —
 //! diffusers `CLIPVisionTransformer` pooling + `CLIPVisionModelWithProjection`.
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::matmul;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -26,7 +26,7 @@ pub struct SvdImageEncoder {
     post_ln_w: Array,
     post_ln_b: Array,
     /// `visual_projection.weight` `[projection_dim, hidden]` (no bias).
-    visual_projection: Array,
+    visual_projection: AdaptableLinear,
     /// Compute dtype (the loaded weight dtype): fp16 on the dense fast path, f32 on `Precision::Fp32`.
     dtype: Dtype,
 }
@@ -40,12 +40,20 @@ impl SvdImageEncoder {
     /// architecture is not config-driven here. (`ImageEncoderConfig::default()` documents the shape.)
     pub fn from_weights(w: &Weights, _cfg: &ImageEncoderConfig) -> Result<Self> {
         let body = ClipVisionEncoder::from_weights(w, &VisionConfig::vit_h_14())?;
+        let visual_projection = mlx_gen::quant::lin(
+            w,
+            "visual_projection",
+            false,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         Ok(Self {
             body,
             post_ln_w: w.require("vision_model.post_layernorm.weight")?.clone(),
             post_ln_b: w.require("vision_model.post_layernorm.bias")?.clone(),
-            visual_projection: w.require("visual_projection.weight")?.clone(),
-            dtype: w.require("visual_projection.weight")?.dtype(),
+            dtype: visual_projection
+                .weight_dtype()
+                .unwrap_or(w.require("vision_model.post_layernorm.weight")?.dtype()),
+            visual_projection,
         })
     }
 
@@ -63,7 +71,7 @@ impl SvdImageEncoder {
         let cls = last.take_axis(Array::from_int(0), 1)?; // [B, hidden] (CLS token, axis dropped)
         let pooled = layer_norm(&cls, Some(&self.post_ln_w), Some(&self.post_ln_b), LN_EPS)?;
         // visual_projection is a bias-free Linear with weight [proj, hidden] → embeds = pooled · Wᵀ.
-        let embeds = matmul(&pooled, &self.visual_projection.transpose_axes(&[1, 0])?)?;
+        let embeds = self.visual_projection.forward(&pooled)?;
         Ok(embeds.as_dtype(Dtype::Float32)?)
     }
 }
