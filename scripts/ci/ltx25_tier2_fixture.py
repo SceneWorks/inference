@@ -48,6 +48,8 @@ DEV_LOADER_BASE_SHA256 = {
 DEV_LOADER_FILES = (*DEV_LOADER_BASE_SHA256, "adapters/refinement.rs")
 ORIGINAL_INSTALL = b"        adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
 REPAIRED_INSTALL = b"""        if self.transformer_variant.is_dev() {
+            // Resident blocks own their tensors. The streamed path retains its own builder.
+            drop(dit_vb);
             adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?;
         } else {
             adapters::install_ltx25_adapters(&mut avdit, adapters)?;
