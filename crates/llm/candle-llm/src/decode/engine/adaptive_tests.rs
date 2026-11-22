@@ -249,6 +249,7 @@ struct MockPrimaryProposer {
     sequence: Vec<i32>,
     clock: Rc<FakeClock>,
     propose_cost: Duration,
+    catch_up_cost: Duration,
     /// Steps where this proposer predicts `sequence` accurately; outside these ranges it emits
     /// wrong tokens so rejection / shrinking / demotion are exercised.
     accurate_ranges: Vec<std::ops::Range<usize>>,
@@ -275,6 +276,7 @@ impl MockPrimaryProposer {
             sequence,
             clock,
             propose_cost,
+            catch_up_cost: Duration::ZERO,
             accurate_ranges,
             emit_stochastic_dists: false,
             propose_depths: Vec::new(),
@@ -364,6 +366,7 @@ impl Proposer for MockPrimaryProposer {
                 );
             }
         }
+        self.clock.advance(self.catch_up_cost);
         self.catch_up_calls.push((tokens.to_vec(), rows, position));
         Ok(())
     }
@@ -1210,5 +1213,148 @@ fn adaptive_keeps_want_hidden_for_multitoken_lookup_after_mtp_retires() {
         shapes.iter().any(|&(n, want_hidden)| n == 1 && !want_hidden),
         "demoted plain steps must turn want_hidden off (priced by graph_demoted_step_admission_bytes): {:?}",
         *shapes
+    );
+}
+
+#[test]
+fn adaptive_charges_mtp_catch_up_to_switch_cost_and_summary() {
+    let vocab = 128;
+    let prompt: Vec<i32> = (10..26).collect();
+    let mut seq = Vec::new();
+    // Phase 1 (0..45): open-ended; MTP warms depth 2.
+    for i in 0..45 {
+        seq.push(30 + (i % 90));
+    }
+    // Phase 2 (45..125): repeated prompt spans; MTP misses while PromptLookup wins probe and
+    // buffers tokens for MTP catch-up.
+    for i in 0..80 {
+        seq.push(prompt[i % prompt.len()]);
+    }
+    // Phase 3 (125..195): open-ended; PromptLookup dries up and triggers MTP switch-back probe.
+    for i in 0..70 {
+        seq.push(30 + ((i * 7 + 13) % 90));
+    }
+    let config = greedy_config(seq.len());
+
+    #[derive(Clone, Copy)]
+    enum CatchUpTier {
+        Zero,
+        Small,
+        Expensive,
+    }
+
+    let run_tier = |tier: CatchUpTier| {
+        let clock = Rc::new(FakeClock::default());
+        let target = ScriptedTarget::new(vocab, prompt.len(), seq.clone(), clock.clone());
+        let mut proposer = MockPrimaryProposer::new(
+            ProposerKind::Mtp,
+            vocab,
+            prompt.len(),
+            seq.clone(),
+            clock.clone(),
+            Duration::from_millis(6),
+            vec![0..45, 125..195],
+        );
+        proposer.catch_up_cost = match tier {
+            CatchUpTier::Zero => Duration::ZERO,
+            CatchUpTier::Small => Duration::from_millis(5),
+            CatchUpTier::Expensive => Duration::from_millis(250),
+        };
+        let run = with_decode_clock(Some(clock), || {
+            generate_speculative_adaptive(
+                &target,
+                &mut proposer,
+                SpeculativePrompt::Tokens(&prompt),
+                &config,
+                2,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                Speculative::Auto,
+                0,
+                AdaptiveEngineConfig {
+                    adaptive_plan: Some(mtp_and_lookup_plan(2, 5)),
+                    provisioned_max_depth: Some(6),
+                    plain_reason: None,
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(run.output.tokens, seq);
+        (run, proposer.catch_up_calls.len() as u64)
+    };
+
+    let (zero_run, zero_catchups) = run_tier(CatchUpTier::Zero);
+    let (small_run, small_catchups) = run_tier(CatchUpTier::Small);
+    let (dear_run, dear_catchups) = run_tier(CatchUpTier::Expensive);
+
+    assert!(zero_catchups >= 2, "expected plain + switch-back catch-up");
+    assert_eq!(small_catchups, zero_catchups);
+    assert!(dear_catchups >= 2, "expected plain + switch-back catch-up");
+
+    let zero_report = zero_run.record.report(false);
+    let small_report = small_run.record.report(false);
+    let dear_report = dear_run.record.report(false);
+    let zero_adaptive = zero_report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+    let small_adaptive = small_report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+    let dear_adaptive = dear_report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+
+    // Cheap catch-up still switches back to MTP.
+    assert!(small_adaptive.events.iter().any(|e| {
+        e.kind == AdaptiveEventKind::ProposerSwitched && e.to_proposer == ProposerKind::Mtp
+    }));
+    // Exact nanosecond accounting: every 5 ms catch-up appears in both `proposal_ns` and
+    // `total_ns` (which feed `AdaptiveCostSummary::proposal_ms` and `total_ms`).
+    let zero_cost = zero_adaptive.cost.expect("zero cost summary");
+    let small_cost = small_adaptive.cost.expect("small cost summary");
+    assert_eq!(
+        small_cost.proposal_ns - zero_cost.proposal_ns,
+        small_catchups * 5_000_000
+    );
+    assert_eq!(
+        small_cost.total_ns - zero_cost.total_ns,
+        small_catchups * 5_000_000
+    );
+
+    // Expensive catch-up is charged into both AdaptiveCostSummary and the switch-back probe,
+    // causing the probe to revert rather than switching to MTP at a net loss.
+    let dear_cost = dear_adaptive.cost.expect("dear cost summary");
+    assert!(
+        dear_cost.proposal_ns >= dear_catchups * 250_000_000,
+        "catch-up work must be included in proposal_ns: {:?}",
+        dear_cost
+    );
+    assert!(
+        dear_cost.total_ns >= dear_cost.proposal_ns,
+        "catch-up work must be included in total_ns: {:?}",
+        dear_cost
+    );
+    assert!(
+        dear_adaptive.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProbeReverted
+                && e.from_proposer == ProposerKind::Mtp
+                && e.to_proposer == ProposerKind::PromptLookup
+                && e.reason.contains("catch-up")
+        }),
+        "expensive catch-up must revert the MTP switch-back probe: {:?}",
+        dear_adaptive.events
+    );
+    assert!(
+        !dear_adaptive.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProposerSwitched && e.to_proposer == ProposerKind::Mtp
+        }),
+        "expensive catch-up must not commit a switch back to MTP: {:?}",
+        dear_adaptive.events
     );
 }

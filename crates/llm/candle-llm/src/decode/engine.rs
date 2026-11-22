@@ -447,7 +447,7 @@ pub trait Proposer {
 
     /// Bring the proposer up to date with steps the target ran **without** a proposal — the
     /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
-    /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
+    /// [`core_llm::AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
     /// paired with its predecessor's target hidden row in `preceding_hidden`
     /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
     /// before the next [`propose`](Self::propose). Each probe step was also
@@ -1103,18 +1103,22 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             && kind != ProposerKind::PromptLookup;
         let use_primary =
             !demoted && !probing && step_plan.proposer == kind && kind != ProposerKind::None;
-        if use_primary && !probed.is_empty() {
-            catch_up(&mut *proposer, &mut probed, probe_position)?;
-        }
-        if use_primary {
-            inactive_draft_tokens = 0;
-        }
         let step_started = clock.as_ref().map(|c| c.now());
+        let step_syncs = host_sync_count();
+        let mut catchup_ns = 0u64;
         let mut proposal_ns = 0u64;
         let verify_ns;
         let sync_ns;
         let rollback_ns;
-        let step_syncs = host_sync_count();
+        if use_primary && !probed.is_empty() {
+            let cu_clock = clock.as_ref().map(|c| c.now());
+            catch_up(&mut *proposer, &mut probed, probe_position)?;
+            catchup_ns = elapsed_ns(cu_clock);
+            proposal_ns = proposal_ns.saturating_add(catchup_ns);
+        }
+        if use_primary {
+            inactive_draft_tokens = 0;
+        }
         let remaining = config.max_new_tokens - generated.len();
         let active_depth = (step_plan.depth as usize).min(provisioned_width);
         let k = if demoted || probing || step_plan.proposer == ProposerKind::None {
@@ -1225,7 +1229,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                         }
                     }
                 };
-            proposal_ns = elapsed_ns(prop_clock);
+            proposal_ns = proposal_ns.saturating_add(elapsed_ns(prop_clock));
             // A proposal left on the device was timed only up to its enqueue (SW-7200).
             let on_device = matches!(proposed.0.drafts, Some(Drafts::Device(_)));
             stats
@@ -1526,6 +1530,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 verify_ns,
                 rollback_ns,
                 sync_ns,
+                switch_overhead_ns: catchup_ns,
                 total_ns,
                 host_syncs: step_host_syncs,
             },

@@ -12,7 +12,7 @@
 //! * **Cost-aware decisions ([`StepCost`], [`AdaptiveSpeculativeController`])**: accounts for
 //!   proposal, verification, rollback, and synchronization costs (`total_ns / committed_tokens`),
 //!   skipping per-shape warm-up steps ([`SHAPE_WARMUP_STEPS`]) and filtering host stalls
-//!   ([`STALL_STEP_FACTOR`]), while keeping MLX's pipelined-plain guard ([`PlainDecode::MlxPipelined`]).
+//!   ([`STALL_STEP_FACTOR`](super::STALL_STEP_FACTOR)), while keeping MLX's pipelined-plain guard ([`PlainDecode::MlxPipelined`]).
 //! * **Bounded adaptation without oscillation**: resizes proposal depth within advertised and
 //!   provisioned bounds (`1..=max_depth`), switches proposers via bounded probing
 //!   ([`ADAPTIVE_PROBE_STEPS`]) with improvement hysteresis ([`ADAPTIVE_SWITCH_IMPROVEMENT_MARGIN`]),
@@ -351,7 +351,7 @@ pub fn resolve_auto_candidates(
 /// Measured cost components for one decode step (nanoseconds + host sync count).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepCost {
-    /// Time spent proposing drafts (nanoseconds).
+    /// Time spent proposing drafts (nanoseconds), including any proposer catch-up replay.
     pub proposal_ns: u64,
     /// Time spent running the target verify forward (nanoseconds).
     pub verify_ns: u64,
@@ -359,8 +359,14 @@ pub struct StepCost {
     pub rollback_ns: u64,
     /// Time spent in host synchronization and decision readback (nanoseconds).
     pub sync_ns: u64,
-    /// End-to-end step wall time (nanoseconds), encompassing proposal, verify, sync, rollback,
-    /// and proposer commit.
+    /// Portion of this step spent on one-time proposer catch-up / switching overhead
+    /// (nanoseconds, already included in `proposal_ns` and `total_ns`). Tracked separately from
+    /// steady-state per-step time so `Stretch::of` stall filtering never discards real switch-back
+    /// catch-up work when judging an alternate-proposer probe or post-switch window.
+    #[serde(default)]
+    pub switch_overhead_ns: u64,
+    /// End-to-end step wall time (nanoseconds), encompassing catch-up, proposal, verify, sync,
+    /// rollback, and proposer commit.
     pub total_ns: u64,
     /// Device->host synchronizations executed during this step.
     pub host_syncs: u64,
@@ -374,6 +380,7 @@ impl StepCost {
             verify_ns: 0,
             rollback_ns: 0,
             sync_ns: 0,
+            switch_overhead_ns: 0,
             total_ns,
             host_syncs: 0,
         }
@@ -686,6 +693,8 @@ struct ProbeState {
     accepted: u64,
     committed: u64,
     timed: Vec<TimedStep>,
+    /// One-time catch-up / switching overhead incurred during this probe (nanoseconds).
+    switch_overhead_ns: u64,
 }
 
 /// Backend-neutral adaptive speculative controller shared by MLX and Candle (SW-7237).
@@ -720,6 +729,7 @@ pub struct AdaptiveSpeculativeController {
     window_accepted: u64,
     window_committed: u64,
     window_timed: Vec<TimedStep>,
+    window_switch_overhead_ns: u64,
 
     clear_verifies: u32,
     clear_accepted: u64,
@@ -821,6 +831,7 @@ impl AdaptiveSpeculativeController {
                 window_accepted: 0,
                 window_committed: 0,
                 window_timed: Vec::new(),
+                window_switch_overhead_ns: 0,
                 clear_verifies: 0,
                 clear_accepted: 0,
                 clear_timed: Vec::new(),
@@ -899,6 +910,7 @@ impl AdaptiveSpeculativeController {
                 window_accepted: 0,
                 window_committed: 0,
                 window_timed: Vec::new(),
+                window_switch_overhead_ns: 0,
                 clear_verifies: 0,
                 clear_accepted: 0,
                 clear_timed: Vec::new(),
@@ -965,6 +977,7 @@ impl AdaptiveSpeculativeController {
             window_accepted: 0,
             window_committed: 0,
             window_timed: Vec::new(),
+            window_switch_overhead_ns: 0,
             clear_verifies: 0,
             clear_accepted: 0,
             clear_timed: Vec::new(),
@@ -1058,7 +1071,7 @@ impl AdaptiveSpeculativeController {
         self.demoted
     }
 
-    /// Build the final [`AdaptiveSpeculativeReport`] for [`DecodeReport`].
+    /// Build the final [`AdaptiveSpeculativeReport`] for [`DecodeReport`](crate::DecodeReport).
     pub fn report(&self) -> AdaptiveSpeculativeReport {
         AdaptiveSpeculativeReport {
             adaptive: self.adaptive,
@@ -1101,8 +1114,14 @@ impl AdaptiveSpeculativeController {
             self.active_proposer
         };
         let seen = self.bump_shape(shape_proposer, width);
+        let switch_overhead_ns = if self.timed {
+            input.cost.switch_overhead_ns.min(total_ns)
+        } else {
+            0
+        };
+        let step_work_ns = total_ns.saturating_sub(switch_overhead_ns);
         let elapsed_ns =
-            (self.timed && total_ns > 0 && seen >= SHAPE_WARMUP_STEPS).then_some(total_ns);
+            (self.timed && step_work_ns > 0 && seen >= SHAPE_WARMUP_STEPS).then_some(step_work_ns);
         if input.drafts == 0 {
             self.plain_ns.extend(elapsed_ns);
         }
@@ -1136,7 +1155,7 @@ impl AdaptiveSpeculativeController {
 
         // 1. If a bounded alternate-proposer probe is in flight, drive it to completion.
         if self.active_probe.is_some() {
-            return self.step_active_probe(input, timed_step);
+            return self.step_active_probe(input, timed_step, switch_overhead_ns);
         }
 
         // 2. Accumulate rolling window and clear-loss counters for the incumbent.
@@ -1144,6 +1163,11 @@ impl AdaptiveSpeculativeController {
         self.window_proposed += input.drafts as u64;
         self.window_accepted += input.accepted as u64;
         self.window_committed += input.committed.max(1) as u64;
+        if self.proposer_switches > 0 {
+            self.window_switch_overhead_ns = self
+                .window_switch_overhead_ns
+                .saturating_add(switch_overhead_ns);
+        }
         self.clear_verifies += 1;
         self.clear_accepted += input.accepted as u64;
         if let Some(ts) = timed_step {
@@ -1279,6 +1303,7 @@ impl AdaptiveSpeculativeController {
         self.window_accepted = 0;
         self.window_committed = 0;
         self.window_timed.clear();
+        self.window_switch_overhead_ns = 0;
     }
 
     fn reset_clear_loss(&mut self) {
@@ -1322,13 +1347,25 @@ impl AdaptiveSpeculativeController {
         self.windows += 1;
         let plain_step_ns = self.plain_step_ns();
         let stretch = Stretch::of(&self.window_timed);
+        let window_timed_ns = if stretch.steps >= MIN_TIMED_WINDOW_STEPS
+            && stretch.tokens > 0
+            && self.window_committed > 0
+            && self.window_switch_overhead_ns > 0
+        {
+            let overhead = ((self.window_switch_overhead_ns as f64)
+                * (stretch.tokens as f64 / self.window_committed as f64))
+                .round() as u64;
+            stretch.ns.saturating_add(overhead)
+        } else {
+            stretch.ns
+        };
         let mut decision = MonitorDecision {
             window: self.windows,
             verifies: self.window_verifies,
             accepted: self.window_accepted,
             timed_steps: stretch.steps,
             timed_tokens: stretch.tokens,
-            timed_ns: stretch.ns,
+            timed_ns: window_timed_ns,
             plain_step_ns,
             basis: DemotionBasis::Static,
             demoted: false,
@@ -1355,11 +1392,13 @@ impl AdaptiveSpeculativeController {
         &mut self,
         input: AdaptiveStepInput,
         timed_step: Option<TimedStep>,
+        switch_overhead_ns: u64,
     ) -> AdaptiveAction {
         let mut probe = self.active_probe.take().expect("checked is_some");
         probe.steps += 1;
         probe.accepted += input.accepted as u64;
         probe.committed += input.committed.max(1) as u64;
+        probe.switch_overhead_ns = probe.switch_overhead_ns.saturating_add(switch_overhead_ns);
         if let Some(ts) = timed_step {
             probe.timed.push(ts);
         }
@@ -1372,10 +1411,15 @@ impl AdaptiveSpeculativeController {
         }
 
         let stretch = Stretch::of(&probe.timed);
-        let probe_ns_per_tok = (stretch.steps >= ADAPTIVE_PROBE_MIN_TIMED_STEPS
+        let steady_ns_per_tok = (stretch.steps >= ADAPTIVE_PROBE_MIN_TIMED_STEPS
             && stretch.tokens > 0
             && stretch.ns > 0)
             .then(|| stretch.ns as f64 / stretch.tokens as f64);
+        // Amortize any one-time switch-back catch-up across the probe's committed tokens outside
+        // `Stretch::of` so host-stall filtering never drops legitimate switching overhead.
+        let probe_ns_per_tok = steady_ns_per_tok.map(|steady| {
+            steady + (probe.switch_overhead_ns as f64 / probe.committed.max(1) as f64)
+        });
         let probe_tok_per_verify = probe.committed as f64 / f64::from(probe.steps.max(1));
 
         let plain_ok = match (probe_ns_per_tok, self.plain_step_ns()) {
@@ -1399,10 +1443,18 @@ impl AdaptiveSpeculativeController {
         {
             let target_ns = inc_ns * (1.0 - ADAPTIVE_SWITCH_IMPROVEMENT_MARGIN);
             let beats = p_ns < target_ns && plain_ok;
+            let overhead_note = if probe.switch_overhead_ns > 0 {
+                format!(
+                    " (incl. {:.2} ms catch-up)",
+                    probe.switch_overhead_ns as f64 / 1e6
+                )
+            } else {
+                String::new()
+            };
             (
                 beats,
                 format!(
-                    "probe `{}` {:.2} ms/tok vs incumbent `{}` {:.2} ms/tok ({})",
+                    "probe `{}` {:.2} ms/tok{overhead_note} vs incumbent `{}` {:.2} ms/tok ({})",
                     probe.probe_proposer.label(),
                     p_ns / 1e6,
                     probe.incumbent_proposer.label(),
@@ -1436,8 +1488,8 @@ impl AdaptiveSpeculativeController {
             self.active_proposer = probe.probe_proposer;
             self.active_depth = probe.probe_depth;
             self.proposer_switches += 1;
-            if let Some(p_ns) = probe_ns_per_tok {
-                self.incumbent_ns_per_token = Some(p_ns);
+            if let Some(s_ns) = steady_ns_per_tok.or(probe_ns_per_tok) {
+                self.incumbent_ns_per_token = Some(s_ns);
             }
             self.incumbent_tokens_per_verify = probe_tok_per_verify;
             self.prev_depth_baseline = None;
@@ -1634,6 +1686,7 @@ impl AdaptiveSpeculativeController {
             accepted: 0,
             committed: 0,
             timed: Vec::new(),
+            switch_overhead_ns: 0,
         });
         self.active_proposer = probe_proposer;
         self.active_depth = probe_depth;
@@ -2048,6 +2101,7 @@ mod tests {
             verify_ns: ver,
             rollback_ns: rb,
             sync_ns: sync,
+            switch_overhead_ns: 0,
             total_ns: prop + ver + rb + sync,
             host_syncs,
         }
@@ -3232,5 +3286,191 @@ mod tests {
             );
             assert_eq!(ctrl.next_step().depth, expected_next_depth);
         }
+    }
+
+    #[test]
+    fn switch_back_probe_charges_catchup_overhead_without_stall_filtering() {
+        let caps = TextLlmCapabilities {
+            speculative: vec![
+                ProposerCapabilities {
+                    proposer: SpeculativeProposer::Mtp,
+                    max_depth: 5,
+                    recommended_depth: 3,
+                },
+                ProposerCapabilities {
+                    proposer: SpeculativeProposer::PromptLookup,
+                    max_depth: 6,
+                    recommended_depth: 4,
+                },
+            ],
+            ..Default::default()
+        };
+        let plan = resolve_auto_candidates(&caps, AutoCandidateContext::default());
+        let plain_ns = 10_000_000u64;
+
+        let drive_to_switch_back_probe =
+            |catchup_ns: u64| -> (AdaptiveSpeculativeController, AdaptiveAction) {
+                let mut ctrl = AdaptiveSpeculativeController::for_request(
+                    crate::Speculative::Auto,
+                    plan.clone(),
+                    vec![
+                        ProposerKind::Mtp,
+                        ProposerKind::PromptLookup,
+                        ProposerKind::None,
+                    ],
+                    PlainDecode::Candle,
+                    true,
+                    6,
+                    ProposerKind::Mtp,
+                    3,
+                    None,
+                );
+                let mut tokens = 0u64;
+                run_plain_probe(&mut ctrl, plain_ns, &mut tokens);
+
+                // Warm MTP at depth 3 and establish a lagging acceptance ratio (< 55%) with
+                // consecutive prompt_lookup peek matches to trigger a switch to PromptLookup.
+                for _ in 0..ADAPTIVE_LOOKUP_MIN_INCUMBENT_VERIFIES {
+                    let p = ctrl.next_step();
+                    assert_eq!(p.proposer, ProposerKind::Mtp);
+                    tokens += 2;
+                    let _ = ctrl.observe_step(AdaptiveStepInput {
+                        accepted: 1,
+                        drafts: p.depth as usize,
+                        committed: 2,
+                        generated_tokens: tokens,
+                        cost: step_cost(4_000_000, 12_000_000, 0, 1_000_000, 1),
+                        lookup_peek_len: 4,
+                    });
+                }
+                assert_eq!(ctrl.next_step().proposer, ProposerKind::PromptLookup);
+
+                // PromptLookup wins its bounded probe with high acceptance and low cost.
+                for _ in 0..ADAPTIVE_PROBE_STEPS {
+                    let p = ctrl.next_step();
+                    assert_eq!(p.proposer, ProposerKind::PromptLookup);
+                    tokens += 5;
+                    let _ = ctrl.observe_step(AdaptiveStepInput {
+                        accepted: 4,
+                        drafts: p.depth as usize,
+                        committed: 5,
+                        generated_tokens: tokens,
+                        cost: step_cost(0, 11_000_000, 0, 500_000, 1),
+                        lookup_peek_len: 0,
+                    });
+                }
+                assert_eq!(ctrl.next_step().proposer, ProposerKind::PromptLookup);
+
+                // Clear cooldown while PromptLookup still matches.
+                for _ in 0..ADAPTIVE_COOLDOWN_VERIFIES {
+                    tokens += 5;
+                    let _ = ctrl.observe_step(AdaptiveStepInput {
+                        accepted: 4,
+                        drafts: 4,
+                        committed: 5,
+                        generated_tokens: tokens,
+                        cost: step_cost(0, 11_000_000, 0, 500_000, 1),
+                        lookup_peek_len: 0,
+                    });
+                }
+
+                // PromptLookup goes dry for ADAPTIVE_LOOKUP_DRY_STEPS -> triggers MTP switch-back probe.
+                let mut probe_started = false;
+                for _ in 0..ADAPTIVE_LOOKUP_DRY_STEPS {
+                    tokens += 1;
+                    let action = ctrl.observe_step(AdaptiveStepInput {
+                        accepted: 0,
+                        drafts: 0,
+                        committed: 1,
+                        generated_tokens: tokens,
+                        cost: step_cost(0, 9_500_000, 0, 500_000, 1),
+                        lookup_peek_len: 0,
+                    });
+                    if matches!(
+                        action,
+                        AdaptiveAction::SwitchProposer {
+                            from: ProposerKind::PromptLookup,
+                            to: ProposerKind::Mtp,
+                            ..
+                        }
+                    ) {
+                        probe_started = true;
+                    }
+                }
+                assert!(
+                    probe_started,
+                    "expected dry PromptLookup to start MTP probe"
+                );
+
+                // Drive MTP switch-back probe: step 0 carries `catchup_ns` (which would exceed
+                // `STALL_STEP_FACTOR * median` when large), while steady-state MTP steps are fast
+                // (15ms for 4 tokens = 3.75 ms/tok vs dry incumbent 10 ms/tok).
+                let mut final_action = AdaptiveAction::Continue;
+                for step in 0..ADAPTIVE_PROBE_STEPS {
+                    let p = ctrl.next_step();
+                    assert_eq!(p.proposer, ProposerKind::Mtp);
+                    let overhead = if step == 0 { catchup_ns } else { 0 };
+                    let prop = 3_000_000 + overhead;
+                    let ver = 11_000_000;
+                    let sync = 1_000_000;
+                    tokens += 4;
+                    final_action = ctrl.observe_step(AdaptiveStepInput {
+                        accepted: 3,
+                        drafts: p.depth as usize,
+                        committed: 4,
+                        generated_tokens: tokens,
+                        cost: StepCost {
+                            proposal_ns: prop,
+                            verify_ns: ver,
+                            rollback_ns: 0,
+                            sync_ns: sync,
+                            switch_overhead_ns: overhead,
+                            total_ns: prop + ver + sync,
+                            host_syncs: 1,
+                        },
+                        lookup_peek_len: 0,
+                    });
+                }
+                (ctrl, final_action)
+            };
+
+        // 1) Small catch-up (10 ms): steady 3.75 ms/tok + 10/28 ms/tok = 4.11 ms/tok < 9.2 ms/tok
+        //    -> switch-back probe succeeds.
+        let (cheap_ctrl, cheap_action) = drive_to_switch_back_probe(10_000_000);
+        assert_eq!(cheap_action, AdaptiveAction::Continue);
+        assert_eq!(cheap_ctrl.next_step().proposer, ProposerKind::Mtp);
+        let cheap_report = cheap_ctrl.report();
+        assert!(cheap_report.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProposerSwitched && e.to_proposer == ProposerKind::Mtp
+        }));
+
+        // 2) Large catch-up (200 ms — >13x steady-state step, would be filtered as a host stall if
+        //    left inside `TimedStep::ns`): 3.75 + 200/28 = 10.89 ms/tok > 9.2 ms/tok -> probe MUST
+        //    revert back to PromptLookup and record the full catch-up cost in AdaptiveCostSummary.
+        let (dear_ctrl, dear_action) = drive_to_switch_back_probe(200_000_000);
+        assert_eq!(
+            dear_action,
+            AdaptiveAction::SwitchProposer {
+                from: ProposerKind::Mtp,
+                to: ProposerKind::PromptLookup,
+                depth: 4,
+            }
+        );
+        assert_eq!(dear_ctrl.next_step().proposer, ProposerKind::PromptLookup);
+        let dear_report = dear_ctrl.report();
+        assert!(
+            dear_report.events.iter().any(|e| {
+                e.kind == AdaptiveEventKind::ProbeReverted
+                    && e.from_proposer == ProposerKind::Mtp
+                    && e.to_proposer == ProposerKind::PromptLookup
+                    && e.reason.contains("catch-up")
+            }),
+            "expected ProbeReverted citing catch-up cost: {:?}",
+            dear_report.events
+        );
+        let cheap_cost = cheap_report.cost.expect("cheap cost summary");
+        let dear_cost = dear_report.cost.expect("dear cost summary");
+        assert_eq!(dear_cost.proposal_ns - cheap_cost.proposal_ns, 190_000_000);
+        assert_eq!(dear_cost.total_ns - cheap_cost.total_ns, 190_000_000);
     }
 }

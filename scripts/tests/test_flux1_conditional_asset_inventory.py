@@ -498,7 +498,7 @@ class ConditionalAssetInventory(unittest.TestCase):
 
     def test_fetch_pinned_falls_back_to_replace_when_hardlinks_unsupported(self):
         import errno
-        import io
+        import threading
 
         class FakeResponse(io.BytesIO):
             headers = {"Content-Length": "7"}
@@ -513,16 +513,180 @@ class ConditionalAssetInventory(unittest.TestCase):
             def open(self, request, timeout=None):
                 return FakeResponse(b"fetched")
 
+        class RacingResponse:
+            """Creates `destination` with `placed` once the stream finishes reading."""
+
+            def __init__(self, destination, body, placed):
+                self.destination, self.body, self.placed = destination, io.BytesIO(body), placed
+                self.headers = {"Content-Length": str(len(body))}
+
+            def read(self, size):
+                chunk = self.body.read(size)
+                if not chunk and not self.destination.exists():
+                    self.destination.write_bytes(self.placed)
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class RacingOpener:
+            def __init__(self, destination, body, placed):
+                self.destination, self.body, self.placed, self.linked_etag = destination, body, placed, None
+
+            def open(self, request, timeout=None):
+                return RacingResponse(self.destination, self.body, self.placed)
+
         with TemporaryDirectory() as tmp:
-            dest = Path(tmp).resolve() / "chat_template.jinja"
-            with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
-                size, sha, _, placed = assets.fetch_pinned(
-                    "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
-                    dest,
-                    opener=FakeOpener(),
-                )
-            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"fetched").hexdigest(), False))
-            self.assertEqual(dest.read_bytes(), b"fetched")
+            root = Path(tmp).resolve()
+            # Fresh placement succeeds on both the macOS `renamex_np` path and the lockfile fallback.
+            for mode, patch_renamex in (("renamex_or_lock", False), ("lock_fallback", True)):
+                with self.subTest(mode=mode):
+                    dest = root / mode / "chat_template.jinja"
+                    with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
+                        if patch_renamex:
+                            with patch.object(assets, "_renamex_excl", return_value=False):
+                                size, sha, _, placed = assets.fetch_pinned(
+                                    "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
+                                    dest,
+                                    opener=FakeOpener(),
+                                )
+                        else:
+                            size, sha, _, placed = assets.fetch_pinned(
+                                "https://huggingface.co/o/r/resolve/abc/chat_template.jinja",
+                                dest,
+                                opener=FakeOpener(),
+                            )
+                    self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"fetched").hexdigest(), False))
+                    self.assertEqual(dest.read_bytes(), b"fetched")
+                    self.assertEqual([p.name for p in dest.parent.iterdir()], ["chat_template.jinja"])
+
+            # Mid-download concurrent placement under ENOTSUP never overwrites `destination`.
+            for mode, patch_renamex in (("renamex_or_lock", False), ("lock_fallback", True)):
+                race_dir = root / f"race_{mode}"
+                race_dir.mkdir()
+                same_dest = race_dir / "same.safetensors"
+                diff_dest = race_dir / "diff.safetensors"
+                with patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")):
+                    ctx = patch.object(assets, "_renamex_excl", return_value=False) if patch_renamex else patch.object(
+                        assets, "_renamex_excl", wraps=assets._renamex_excl
+                    )
+                    with ctx:
+                        with self.subTest(mode=mode, case="matching_bytes"):
+                            size, sha, _, placed = assets.fetch_pinned(
+                                "https://example/same",
+                                same_dest,
+                                opener=RacingOpener(same_dest, b"weights", b"weights"),
+                            )
+                            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"weights").hexdigest(), True))
+                            self.assertEqual(same_dest.read_bytes(), b"weights")
+                        with self.subTest(mode=mode, case="differing_bytes"):
+                            with self.assertRaisesRegex(ValueError, "placed concurrently"):
+                                assets.fetch_pinned(
+                                    "https://example/diff",
+                                    diff_dest,
+                                    opener=RacingOpener(diff_dest, b"weights", b"OTHER!!"),
+                                )
+                            self.assertEqual(diff_dest.read_bytes(), b"OTHER!!")
+                self.assertEqual(sorted(p.name for p in race_dir.iterdir()), ["diff.safetensors", "same.safetensors"])
+
+            # Two concurrent lockfile-fallback publishers serialize cleanly: both pass the initial
+            # pre-download probe before either publishes; t1 acquires the sibling lockfile while t2
+            # contends on it; t1 places once, then t2 observes FileExistsError and verifies via
+            # `_same_bytes` without clobbering.
+            real_replace = os.replace
+            real_os_open = os.open
+
+            class PlainOpener:
+                def __init__(self, body, on_open=None):
+                    self.body, self.on_open, self.linked_etag = body, on_open, None
+
+                def open(self, request, timeout=None):
+                    if self.on_open is not None:
+                        self.on_open()
+                    body = self.body
+
+                    class _Resp(io.BytesIO):
+                        headers = {"Content-Length": str(len(body))}
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *_):
+                            return False
+
+                    return _Resp(body)
+
+            for case, body_b, expect_error in (("identical", b"weights", False), ("divergent", b"DIFFER!", True)):
+                with self.subTest(concurrent_lock=case):
+                    conc_dir = root / f"concurrent_{case}"
+                    conc_dir.mkdir()
+                    dest = conc_dir / "model.safetensors"
+                    both_started = threading.Barrier(2)
+                    t1_holding_lock = threading.Event()
+                    t2_hit_lock = threading.Event()
+                    results = []
+
+                    def synchronized_replace(src, dst):
+                        t1_holding_lock.set()
+                        t2_hit_lock.wait(timeout=5.0)
+                        return real_replace(src, dst)
+
+                    def tracking_os_open(path, flags, *args, **kwargs):
+                        try:
+                            return real_os_open(path, flags, *args, **kwargs)
+                        except FileExistsError:
+                            if str(path).endswith(".place.lock"):
+                                t2_hit_lock.set()
+                            raise
+
+                    def run_worker(body, is_first):
+                        try:
+                            def sync_start():
+                                both_started.wait(timeout=5.0)
+                                if not is_first:
+                                    t1_holding_lock.wait(timeout=5.0)
+
+                            res = assets.fetch_pinned(
+                                "https://example/model",
+                                dest,
+                                opener=PlainOpener(body, on_open=sync_start),
+                            )
+                            results.append(("ok", body, res))
+                        except Exception as exc:  # noqa: BLE001
+                            results.append(("err", body, exc))
+
+                    with (
+                        patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                        patch.object(assets, "_renamex_excl", return_value=False),
+                        patch.object(assets.os, "replace", side_effect=synchronized_replace),
+                        patch.object(assets.os, "open", side_effect=tracking_os_open),
+                    ):
+                        t1 = threading.Thread(target=run_worker, args=(b"weights", True))
+                        t2 = threading.Thread(target=run_worker, args=(body_b, False))
+                        t1.start()
+                        t2.start()
+                        t1.join(timeout=10.0)
+                        t2.join(timeout=10.0)
+
+                    self.assertTrue(t2_hit_lock.is_set(), "second publisher must contend on sibling lockfile")
+                    self.assertEqual(dest.read_bytes(), b"weights")
+                    self.assertEqual([p.name for p in conc_dir.iterdir()], ["model.safetensors"])
+                    if expect_error:
+                        ok = [r for r in results if r[0] == "ok"]
+                        err = [r for r in results if r[0] == "err"]
+                        self.assertEqual(len(ok), 1, results)
+                        self.assertFalse(ok[0][2][3])
+                        self.assertEqual(len(err), 1, results)
+                        self.assertIsInstance(err[0][2], ValueError)
+                        self.assertIn("placed concurrently", str(err[0][2]))
+                    else:
+                        self.assertEqual(len(results), 2, results)
+                        self.assertTrue(all(r[0] == "ok" for r in results), results)
+                        placed_flags = sorted(r[2][3] for r in results)
+                        self.assertEqual(placed_flags, [False, True])
 
 
 if __name__ == "__main__":

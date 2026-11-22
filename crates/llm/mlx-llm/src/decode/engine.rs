@@ -1383,7 +1383,7 @@ pub trait Proposer<T: SpeculativeTarget + ?Sized> {
 
     /// Bring the proposer up to date with steps the target ran **without** a proposal — the
     /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
-    /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
+    /// [`core_llm::AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
     /// paired with its predecessor's target hidden row in `preceding_hidden`
     /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
     /// before the next [`propose`](Self::propose). The default does nothing — right for a
@@ -1477,7 +1477,7 @@ pub struct EngineOptions<'a, 'c> {
     /// Whether the token-at-a-time loop may pipeline (see [`generate_speculative`]).
     pub pipelining: Pipelining,
     /// The request's speculative option (sc-24446). [`Speculative::Auto`] runs under `auto`'s
-    /// acceptance monitor ([`AcceptanceMonitor::for_request`], against the plain loop this run
+    /// acceptance monitor ([`core_llm::AcceptanceMonitor::for_request`], against the plain loop this run
     /// would fall back to — pipelined or not), which demotes a proposer that is not paying for
     /// itself to token-at-a-time decoding (see [`generate_speculative`]); any other option — an
     /// explicit proposer, `off`, the default — runs the proposer to the end.
@@ -1972,18 +1972,26 @@ where
             && kind != ProposerKind::PromptLookup;
         let use_primary =
             !demoted && !probing && step_plan.proposer == kind && kind != ProposerKind::None;
-        if use_primary && !probed.is_empty() {
-            catch_up(target, &mut *proposer, &mut probed, probe_position)?;
-        }
-        if use_primary {
-            inactive_draft_tokens = 0;
-        }
         let step_started = clock.as_ref().map(|c| c.now());
+        let mut catchup_ns = 0u64;
         let mut proposal_ns = 0u64;
         let verify_ns;
         let mut sync_ns = 0u64;
         let mut rollback_ns = 0u64;
         let mut step_host_syncs = 0u64;
+        if use_primary && !probed.is_empty() {
+            let cu_clock = clock.as_ref().map(|c| c.now());
+            catch_up(target, &mut *proposer, &mut probed, probe_position)?;
+            catchup_ns = elapsed_ns(cu_clock);
+            proposal_ns = proposal_ns.saturating_add(catchup_ns);
+            if kind == ProposerKind::Mtp {
+                // `MtpProposer::catch_up` runs a host-synchronized `eval([&seed])`.
+                step_host_syncs += 1;
+            }
+        }
+        if use_primary {
+            inactive_draft_tokens = 0;
+        }
 
         let remaining = config.max_new_tokens - generated.len();
         let active_depth = (step_plan.depth as usize).min(provisioned_width);
@@ -2082,7 +2090,7 @@ where
             } else {
                 (proposer.propose(target, &ctx, &mut draft_sampler)?, None)
             };
-            proposal_ns = elapsed_ns(prop_clock);
+            proposal_ns = proposal_ns.saturating_add(elapsed_ns(prop_clock));
             if !use_lookup && kind != ProposerKind::PromptLookup {
                 step_host_syncs += 1;
             }
@@ -2357,6 +2365,7 @@ where
                 verify_ns,
                 rollback_ns,
                 sync_ns,
+                switch_overhead_ns: catchup_ns,
                 total_ns,
                 host_syncs: step_host_syncs,
             },
