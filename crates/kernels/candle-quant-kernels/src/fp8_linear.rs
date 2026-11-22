@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub type ActivationQuantizer = fn(&Tensor) -> Result<(Tensor, f32)>;
 
 pub struct Fp8Linear {
+    weight_only: bool,
     dynamic_quantizer: Option<ActivationQuantizer>,
     w_fp8: crate::cublaslt::DevFp8,
     device: Device,
@@ -69,6 +70,19 @@ impl Fp8Linear {
         Self::from_codes(codes, scale_w, Some(input_scale.unwrap_or(1.0)), bias, lt)
     }
 
+    /// Bind original FP8 weight codes without imposing FP8 quantization on the activation.
+    /// The CUDA storage convention is F8E4M3 for E4M3FN and raw U8 for E5M2.
+    pub fn from_weight_only_codes(
+        codes: Tensor,
+        scale_w: f32,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        let mut layer = Self::from_codes(codes, scale_w, None, bias, lt)?;
+        layer.weight_only = true;
+        Ok(layer)
+    }
+
     fn from_codes(
         codes: Tensor,
         scale_w: f32,
@@ -89,6 +103,7 @@ impl Fp8Linear {
         }
         let device = codes.device().clone();
         Ok(Self {
+            weight_only: false,
             dynamic_quantizer: None,
             dims: codes.dims2()?,
             block_scales: None,
@@ -194,7 +209,7 @@ impl Fp8Linear {
         Self::new(weight, bias, Arc::new(CublasLt::new(dev)?))
     }
 
-    /// `x`: `(..., K)`; flattened to `(M, K)` for the GEMM, then reshaped back. Output bf16.
+    /// Flatten `x: (..., K)` for the GEMM, then restore its leading dimensions.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.forward_with_bias(x, self.bias.as_ref())
     }
@@ -203,8 +218,10 @@ impl Fp8Linear {
     /// The legacy dynamically quantized recipe returns BF16 as before.
     pub fn forward_with_bias(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         use candle_core::DType;
-        let source =
-            self.input_scale.is_some() || self.block_scales.is_some() || self.row_scales.is_some();
+        let source = self.weight_only
+            || self.input_scale.is_some()
+            || self.block_scales.is_some()
+            || self.row_scales.is_some();
         let output_dtype = if source { x.dtype() } else { DType::BF16 };
         if !matches!(output_dtype, DType::BF16 | DType::F16 | DType::F32) {
             candle_core::bail!("unsupported FP8 projection output {output_dtype:?}");
@@ -214,7 +231,10 @@ impl Fp8Linear {
         if flat.dim(1)? != self.dims.1 || !flat.device().same_device(self.device()) {
             candle_core::bail!("FP8 input width or device differs from weight");
         }
-        let y = if let Some(scales) = &self.row_scales {
+        let y = if self.weight_only {
+            self.lt
+                .weight_only_fp8_linear(&flat, &self.w_fp8, self.scale_w)?
+        } else if let Some(scales) = &self.row_scales {
             if f32_accumulator {
                 self.lt
                     .flux3_fp8_rowwise_linear_f32(&flat, &self.w_fp8, scales)?

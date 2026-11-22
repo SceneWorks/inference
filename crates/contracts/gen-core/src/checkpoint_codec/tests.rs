@@ -928,7 +928,7 @@ fn mixed_checkpoint_dispatches_per_layer_and_accounts_every_companion() {
         TensorCodecSpec::ScalarFp8 {
             scale: ScalarScaleSource::Unit,
             input_scale: None,
-            full_precision_matrix_mult: false,
+            full_precision_matrix_mult: true,
         }
     );
     // Dense residency prices every quantized layer at bf16 of its logical shape.
@@ -1056,7 +1056,7 @@ fn packed_mxfp8_counts_a_static_input_scale_only_in_source_bytes() {
 }
 
 /// A packed-selecting policy prices packed layers at stored + retained scales, EXCEPT layers
-/// flagged `full_precision_matrix_mult`, which stay dense by contract. Mutation partner:
+/// using scalar weight-only execution; other full-precision codecs stay dense. Mutation partner:
 /// `residency-pricing` — flipping packed pricing to dense bytes (or ignoring the fpmm flag)
 /// turns this red.
 #[test]
@@ -1108,8 +1108,7 @@ fn packed_policy_prices_stored_bytes_plus_scales_and_honors_full_precision_layer
             resident_bytes: 4
         }
     );
-    // e5m2 is not this policy's packed codec → dense; and even if it were, its
-    // full_precision_matrix_mult flag forces dense.
+    // E5M2 is not this policy's packed codec, so it stays dense.
     assert_eq!(by_logical["k.weight"].residency.mode, ResidencyMode::Dense);
     struct PackEverything;
     impl CodecResidencyPolicy for PackEverything {
@@ -1137,10 +1136,50 @@ fn packed_policy_prices_stored_bytes_plus_scales_and_honors_full_precision_layer
         .unwrap();
     assert_eq!(
         k.residency.mode,
-        ResidencyMode::Dense,
-        "a full_precision_matrix_mult layer never runs packed, whatever the policy answers"
+        ResidencyMode::Packed,
+        "a capable backend retains scalar FP8 while preserving activation precision"
     );
-    assert_eq!(k.residency.resident_bytes, 4 * 8 * 2);
+    assert_eq!(k.residency.resident_bytes, 4 * 8);
+}
+
+#[test]
+fn plain_fp8_preserves_activation_precision_with_backend_owned_residency() {
+    struct PackedScalar;
+    impl CodecResidencyPolicy for PackedScalar {
+        fn residency(
+            &self,
+            _codec: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            _shape: &[usize],
+        ) -> ResidencyMode {
+            assert!(matches!(
+                spec,
+                TensorCodecSpec::ScalarFp8 {
+                    scale: ScalarScaleSource::Unit,
+                    input_scale: None,
+                    full_precision_matrix_mult: true,
+                }
+            ));
+            ResidencyMode::Packed
+        }
+    }
+    for dtype in [Dtype::F8_E4M3, Dtype::F8_E5M2] {
+        let headers = [header("model.q.weight", dtype, &[16, 32])];
+        let packed = compile_logical_weight_plan(
+            &headers,
+            &no_descriptors(),
+            &StripPrefix,
+            &full(),
+            &PackedScalar,
+        )
+        .unwrap();
+        assert_eq!(packed.tensors[0].residency.mode, ResidencyMode::Packed);
+        assert_eq!(packed.tensors[0].residency.resident_bytes, 16 * 32);
+        let dense = compile(&headers, &no_descriptors(), &StripPrefix, &full()).unwrap();
+        assert!(dense.tensors[0].codec.full_precision_matrix_mult());
+        assert_eq!(dense.tensors[0].residency.mode, ResidencyMode::Dense);
+        assert_eq!(dense.tensors[0].residency.resident_bytes, 16 * 32 * 2);
+    }
 }
 
 #[test]
@@ -1576,7 +1615,9 @@ impl CodecResidencyPolicy for AlwaysPacked {
         spec: &TensorCodecSpec,
         _stored_shape: &[usize],
     ) -> ResidencyMode {
-        if spec.full_precision_matrix_mult() || matches!(spec, TensorCodecSpec::Dense) {
+        if (spec.full_precision_matrix_mult() && !matches!(spec, TensorCodecSpec::ScalarFp8 { .. }))
+            || matches!(spec, TensorCodecSpec::Dense)
+        {
             ResidencyMode::Dense
         } else {
             ResidencyMode::Packed

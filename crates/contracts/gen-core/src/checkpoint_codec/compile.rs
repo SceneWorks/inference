@@ -527,7 +527,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                 TensorCodecSpec::ScalarFp8 {
                     scale: ScalarScaleSource::Unit,
                     input_scale: None,
-                    full_precision_matrix_mult: false,
+                    full_precision_matrix_mult: true,
                 },
                 header.shape.clone(),
             ),
@@ -797,8 +797,11 @@ pub fn compile_logical_weight_plan_with_metadata(
         }
 
         // Residency: the backend's packed-vs-dense decision, priced per tensor. A layer flagged
-        // `full_precision_matrix_mult` never runs packed.
-        let mode = if codec_spec.full_precision_matrix_mult() {
+        // Scalar FP8 can retain its codes while preserving the compute dtype of activations.
+        // Other codecs still require dense execution for the full-precision contract.
+        let mode = if codec_spec.full_precision_matrix_mult()
+            && !matches!(codec_spec, TensorCodecSpec::ScalarFp8 { .. })
+        {
             ResidencyMode::Dense
         } else {
             residency.residency_for_key(&header.name, codec, &codec_spec, &header.shape)

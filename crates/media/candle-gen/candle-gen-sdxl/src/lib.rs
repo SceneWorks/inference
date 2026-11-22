@@ -335,9 +335,8 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// whether a flash-attn-capable build actually *uses* the fused kernels, so the SceneWorks UI can
 /// expose it (defaulted on) and the worker flips it from settings — without recompiling. Mirrors
 /// `mlx-gen-sdxl::set_compile_glue`. **sc-9032:** the `flash-attn` cargo feature it was ANDed with
-/// was a no-op alias (`= ["cuda"]`, no `candle-flash-attn` wired) and was removed; `components` now
-/// hard-codes the flash path off, so this toggle is retained as public worker API but is inert until
-/// the fused-kernel slice lands and re-gates the load on it. Default **on**.
+/// was a no-op alias (`= ["cuda"]`, no `candle-flash-attn` wired) and was removed. The toggle remains inert as part
+/// of the public worker API. Default **on**.
 static FLASH_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Enable/disable flash-attention for subsequently-loaded pipelines (sc-3674). Process-global; the
@@ -394,11 +393,9 @@ pub struct SdxlGenerator {
     /// the fp16-fix VAE, validated at [`load`] and threaded into the lazy tokenizer/UNet+VAE build in
     /// place of the deleted render-path self-fetch.
     component_paths: SdxlComponents,
-    /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
-    /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
-    /// cheap `Arc` clone or a one-time load), never across the denoise.
-    components: Mutex<Option<(bool, Components)>>,
-    text_models: Mutex<Option<Arc<(pipeline::CandleModule, pipeline::CandleModule)>>>,
+    /// Cached UNet and VAE. The lock is held for lookup or one-time load, never for denoising.
+    components: Mutex<Option<Components>>,
+    text_models: Mutex<Option<Arc<(conditioning::ClipTower, conditioning::ClipTower)>>>,
     /// Serialize cache transitions so a staged request cannot overlap a warm resident borrow.
     request: Mutex<()>,
     /// Cached dual CLIP tokenizers, loaded+parsed once and reused across `generate` calls (sc-8991 /
@@ -420,29 +417,18 @@ pub struct SdxlGenerator {
 }
 
 impl SdxlGenerator {
-    /// Get the cached UNet/VAE, loading (and caching) them on a miss. Keyed by the effective
-    /// flash-attn setting (`build_unet` bakes it in, sc-3674), so flipping [`set_flash_attn`] between
-    /// calls rebuilds rather than serving a stale UNet. The lock is held over the cache-miss load
-    /// (concurrent first-callers serialize on it) but released before the caller's denoise.
+    /// Get the cached UNet/VAE, loading them on a miss.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // sc-9032: the `flash-attn` cargo feature (a no-op alias for `cuda`) was removed. No fused
-        // candle-flash-attn kernel is wired, so the flash path is never taken — `false` here is
-        // byte-identical to the old `cfg!(feature = "flash-attn") && flash_attn_enabled()`, which
-        // always resolved false in every buildable config. The `set_flash_attn` runtime toggle stays
-        // (public worker API) but is inert until the fused-kernel slice lands and re-gates this.
-        let flash = false;
         // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
         // while locked must not turn every later `generate` into a panic).
         let mut guard = candle_gen::lock_recover(&self.components);
-        if let Some((cached_flash, comps)) = guard.as_ref() {
-            if *cached_flash == flash {
-                return Ok(comps.clone());
-            }
+        if let Some(comps) = guard.as_ref() {
+            return Ok(comps.clone());
         }
         let comps = self
             .file_pin_spec
-            .read_prepared_files_unchanged(|| pipe.load_components(flash))?;
-        *guard = Some((flash, comps.clone()));
+            .read_prepared_files_unchanged(|| pipe.load_components())?;
+        *guard = Some(comps.clone());
         Ok(comps)
     }
 
@@ -540,7 +526,7 @@ impl SdxlGenerator {
                         candle_gen::residency::check_cancel(&req.cancel)?;
                         verify_artifacts(&self.artifact_seal)?;
                         self.file_pin_spec
-                            .read_prepared_files_unchanged(|| pipe.load_unet(false))
+                            .read_prepared_files_unchanged(|| pipe.load_unet())
                     },
                     |unet, state| {
                         if let Some(ref run) = state.3 {

@@ -1,8 +1,6 @@
 //! SDXL dual-CLIP conditioning (sc-5491, epic 5480) — the candle twin of
-//! `mlx-gen-sdxl::pipeline::encode_conditioning`, the piece the txt2img `crate::pipeline` does NOT
-//! build (it uses only the final CLIP hidden state and no pooled text-embeds, relying on the stock
-//! candle UNet). The InstantID UNet ([`crate::UNet2DConditionModel::forward_instantid`]) needs the real
-//! SDXL micro-conditioning, so this assembles it exactly as diffusers does:
+//! `mlx-gen-sdxl::pipeline::encode_conditioning`. Plain SDXL and the edit/control conditioners
+//! share the window encoding and projection used for SDXL micro-conditioning:
 //!
 //! - **cross-attention conditioning** `[B, n·77, 2048]` = `cat(penultimate(CLIP-L)[768],
 //!   penultimate(CLIP-bigG)[1280])` — the *second-to-last* encoder-layer hidden state (`hidden_states[-2]`,
@@ -68,64 +66,148 @@ fn pool_eos(
     Ok(text_projection.forward(&eos_hidden)?)
 }
 
-/// A loaded SDXL dual-CLIP conditioner: both text encoders + the bigG `text_projection` + the two
-/// tokenizers. Built once per model; `encode` is called per request.
-pub struct SdxlConditioner {
-    tok_l: Tokenizer,
-    tok_g: Tokenizer,
-    clip_l: ClipTextTransformer,
-    clip_g: ClipTextTransformer,
-    /// bigG `CLIPTextModelWithProjection` head (`text_projection.weight`, `[1280, 1280]`, no bias) —
-    /// a packed-detecting [`QLinear`] (sc-9527): packed straight from the MLX triple, else dense.
-    text_projection: QLinear,
-    cfg_l: clip::Config,
-    cfg_g: clip::Config,
-    device: Device,
+/// Encode one tower for an already aligned batch of text rows. Only bigG owns the pooled head.
+/// Keeping this per tower lets the staged fused path release CLIP-L before loading bigG.
+fn encode_clip_windows(
+    tower: &ClipTextTransformer,
+    projection: Option<&QLinear>,
+    tokenizer: &Tokenizer,
+    plan: &ChunkPlan,
+    texts: &[&str],
+    chunks: usize,
+    device: &Device,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let mut hidden_rows = Vec::with_capacity(texts.len());
+    let mut pooled_rows = Vec::with_capacity(texts.len());
+    for text in texts {
+        let rows = plan.rows_aligned(tokenizer, text, chunks)?;
+        let mut hidden = Vec::with_capacity(rows.len());
+        // Use batch 1 for each window. CFG rows are stacked only after the causal CLIP forward.
+        for (index, row) in rows.iter().enumerate() {
+            let ids = Tensor::new(row.as_slice(), device)?.reshape((1, plan.window()))?;
+            let (final_hidden, penultimate) =
+                tower.forward_until_encoder_layer(&ids, usize::MAX, -2)?;
+            hidden.push(penultimate);
+            if index == 0 {
+                if let Some(projection) = projection {
+                    pooled_rows.push(pool_eos(
+                        &final_hidden,
+                        std::slice::from_ref(row),
+                        projection,
+                    )?);
+                }
+            }
+        }
+        hidden_rows.push(if hidden.len() == 1 {
+            hidden.remove(0)
+        } else {
+            Tensor::cat(&hidden, 1)?
+        });
+    }
+    let pooled = projection
+        .map(|_| Tensor::cat(&pooled_rows, 0))
+        .transpose()?;
+    Ok((Tensor::cat(&hidden_rows, 0)?, pooled))
 }
 
-/// Resolve one CLIP encoder's weight file + packed group size (sc-9527): the packed
-/// `text_encoder{,_2}/model.safetensors` + its config group size on a packed MLX tier, else the dense
-/// `.fp16` file at the default group 64. The vendored tower's `linear_detect_gs` takes the packed or
-/// dense path per the presence of `.scales` siblings; the returned group size only matters on the
-/// packed branch.
-fn clip_weight_file(
-    root: &Path,
-    which: &Clip,
-    dense_sub: &str,
-) -> Result<(std::path::PathBuf, usize)> {
-    match crate::pipeline::detect_packed_clip(root, which)? {
-        Some((packed_file, group_size)) => Ok((packed_file, group_size)),
-        None => Ok((
-            snapshot_file(root, dense_sub)?,
-            candle_gen::quant::MLX_GROUP_SIZE,
-        )),
+/// One SDXL CLIP tower and its pooled head, when the tower is bigG.
+pub(crate) struct ClipTower {
+    tower: ClipTextTransformer,
+    projection: Option<QLinear>,
+    pub(crate) representation: &'static str,
+}
+
+impl ClipTower {
+    pub(crate) fn load(
+        vb: candle_nn::VarBuilder<'_>,
+        which: Clip,
+        group_size: usize,
+        representation: &'static str,
+    ) -> Result<Self> {
+        let cfg = which.vendored_config();
+        let tower = ClipTextTransformer::new_gs(vb.clone(), &cfg, group_size)?;
+        let projection = if matches!(which, Clip::BigG) {
+            Some(clip::text_projection(&vb, cfg.projection_dim, group_size)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            tower,
+            projection,
+            representation,
+        })
+    }
+
+    pub(crate) fn load_snapshot(
+        root: &Path,
+        which: Clip,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let (_tok_repo, dense_sub) = which.sources();
+        let (file, group_size, representation) =
+            match crate::pipeline::detect_packed_clip(root, &which)? {
+                Some((file, group_size)) => (file, group_size, "packed_or_imported"),
+                None => (
+                    snapshot_file(root, dense_sub)?,
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                    "dense",
+                ),
+            };
+        let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
+        Self::load(vb, which, group_size, representation)
+    }
+
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        self.tower.quantize_onto(quant, device)?;
+        if let Some(projection) = &mut self.projection {
+            projection.quantize_onto(quant, device)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode(
+        &self,
+        tokenizer: &Tokenizer,
+        plan: &ChunkPlan,
+        texts: &[&str],
+        chunks: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        encode_clip_windows(
+            &self.tower,
+            self.projection.as_ref(),
+            tokenizer,
+            plan,
+            texts,
+            chunks,
+            device,
+        )
     }
 }
 
-/// Build one vendored, packed-detecting CLIP tower for `which` and return it alongside the VarBuilder
-/// it was built from (so a caller — the bigG `text_projection` — can reuse the same mmap) and the
-/// packed group size.
-fn load_clip_tower_with_vb(
-    root: &Path,
-    which: &Clip,
-    device: &Device,
-    dtype: DType,
-) -> Result<(ClipTextTransformer, candle_nn::VarBuilder<'static>, usize)> {
-    let (_tok_repo, dense_sub) = which.sources();
-    let (file, group_size) = clip_weight_file(root, which, dense_sub)?;
-    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
-    let tower = ClipTextTransformer::new_gs(vb.clone(), &which.vendored_config(), group_size)?;
-    Ok((tower, vb, group_size))
+pub(crate) fn combine_clip_embeddings(
+    l: (Tensor, Option<Tensor>),
+    g: (Tensor, Option<Tensor>),
+) -> Result<(Tensor, Tensor)> {
+    let pooled =
+        g.1.ok_or_else(|| CandleError::Msg("SDXL bigG pooled embedding missing".into()))?;
+    Ok((Tensor::cat(&[l.0, g.0], D::Minus1)?, pooled))
 }
 
-/// As [`load_clip_tower_with_vb`] but drops the VarBuilder (the CLIP-L encoder has no projection head).
-fn load_clip_tower(
-    root: &Path,
-    which: &Clip,
-    device: &Device,
-    dtype: DType,
-) -> Result<ClipTextTransformer> {
-    Ok(load_clip_tower_with_vb(root, which, device, dtype)?.0)
+/// A loaded SDXL dual-CLIP conditioner with two tokenizers. Built once per model.
+pub struct SdxlConditioner {
+    tok_l: Tokenizer,
+    tok_g: Tokenizer,
+    clip_l: ClipTower,
+    clip_g: ClipTower,
+    cfg_l: clip::Config,
+    cfg_g: clip::Config,
+    device: Device,
 }
 
 impl SdxlConditioner {
@@ -174,26 +256,14 @@ Tokenizer,
             ))
         })?;
 
-        // sc-9527: build each encoder through the vendored, packed-detecting tower. On a packed MLX
-        // tier the weights live under `text_encoder{,_2}/model.safetensors` (with `.scales` siblings);
-        // on a dense snapshot they live under the `.fp16` name and the vendored tower takes the dense
-        // path (byte-identical to the stock builder, pinned by `clip::tests::vendored_dense_matches_stock`).
-        let clip_l = load_clip_tower(root, &Clip::L, device, dtype)?;
-        let (clip_g, g_vb, g_group_size) =
-            load_clip_tower_with_vb(root, &Clip::BigG, device, dtype)?;
-
-        // The bigG `text_projection.weight` (`CLIPTextModelWithProjection` pooled head) lives at the bare
-        // top-level key of the SAME bigG checkpoint the tower just read. It packs on a packed tier, so
-        // load it packed-detecting from the same VarBuilder (no separate materialization) — dense
-        // (`text_projection.weight`) on a dense snapshot.
-        let text_projection = clip::text_projection(&g_vb, cfg_g.projection_dim, g_group_size)?;
+        let clip_l = ClipTower::load_snapshot(root, Clip::L, device, dtype)?;
+        let clip_g = ClipTower::load_snapshot(root, Clip::BigG, device, dtype)?;
 
         Ok(Self {
             tok_l,
             tok_g,
             clip_l,
             clip_g,
-            text_projection,
             cfg_l,
             cfg_g,
             device: device.clone(),
@@ -243,61 +313,13 @@ Tokenizer,
             &texts,
         )?;
 
-        // Encode **one row at a time** (batch 1) and stack along the batch dim afterwards — NOT a single
-        // batched-2 CLIP forward. candle-transformers' stock CLIP builds its causal attention mask as
-        // `[B, S, S]` and `broadcast_add`s it onto the per-head scores `[B, H, S, S]`; that only aligns
-        // when `B == 1` (the mask's batch dim broadcasts against the head dim). At `B >= 2` it panics
-        // (`shape mismatch in broadcast_add, lhs [2, H, 77, 77], rhs [2, 77, 77]`). The stock SD pipeline
-        // dodges this by running uncond/cond as separate passes, so do the same here. Each CLIP window
-        // is likewise its own batch-1 forward.
-        let mut penult_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
-        let mut pooled_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
-        for text in &texts {
-            let rows_l = plan_l.rows_aligned(&self.tok_l, text, chunks)?;
-            let rows_g = plan_g.rows_aligned(&self.tok_g, text, chunks)?;
-            let mut penult_chunks: Vec<Tensor> = Vec::with_capacity(rows_l.len());
-            let mut pooled: Option<Tensor> = None;
-            for (i, (row_l, row_g)) in rows_l.iter().zip(rows_g.iter()).enumerate() {
-                let ids_l =
-                    Tensor::new(row_l.as_slice(), &self.device)?.reshape((1, plan_l.window()))?;
-                let ids_g =
-                    Tensor::new(row_g.as_slice(), &self.device)?.reshape((1, plan_g.window()))?;
-
-                // Penultimate hidden (`hidden_states[-2]`, pre-final-norm) from each encoder; the bigG `.0`
-                // is its final-norm hidden (for the pooled head). `usize::MAX` = the plain causal mask (no
-                // padding truncation), matching the txt2img path.
-                let (_final_l, penult_l) =
-                    self.clip_l
-                        .forward_until_encoder_layer(&ids_l, usize::MAX, -2)?;
-                let (final_g, penult_g) =
-                    self.clip_g
-                        .forward_until_encoder_layer(&ids_g, usize::MAX, -2)?;
-                penult_chunks.push(Tensor::cat(&[&penult_l, &penult_g], D::Minus1)?); // [1, 77, 2048]
-                if i == 0 {
-                    // pool the FIRST window's bigG final hidden at its EOS, then project → [1, 1280].
-                    // Every later window carries its own EOS, so an arg-max over the concatenated ids
-                    // would be ambiguous; diffusers' pooled embed is defined on the first window and
-                    // that is what the add_embedding micro-conditioning expects.
-                    pooled = Some(pool_eos(
-                        &final_g,
-                        std::slice::from_ref(row_g),
-                        &self.text_projection,
-                    )?);
-                }
-            }
-            penult_rows.push(if penult_chunks.len() == 1 {
-                penult_chunks.remove(0)
-            } else {
-                Tensor::cat(&penult_chunks, 1)? // [1, n·77, 2048]
-            });
-            pooled_rows.push(pooled.ok_or_else(|| {
-                CandleError::Msg("sdxl conditioning: no CLIP window encoded".into())
-            })?);
-        }
-
-        let conditioning = Tensor::cat(&penult_rows, 0)?; // [B, n·77, 2048]
-        let pooled = Tensor::cat(&pooled_rows, 0)?; // [B, 1280]
-        Ok((conditioning, pooled))
+        let l = self
+            .clip_l
+            .encode(&self.tok_l, &plan_l, &texts, chunks, &self.device)?;
+        let g = self
+            .clip_g
+            .encode(&self.tok_g, &plan_g, &texts, chunks, &self.device)?;
+        combine_clip_embeddings(l, g)
     }
 }
 
