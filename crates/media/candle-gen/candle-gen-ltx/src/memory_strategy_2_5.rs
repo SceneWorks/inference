@@ -267,9 +267,10 @@ fn exact_load_receipt(
             vocoder_bytes,
         ],
     )?;
+    // The installer retains both LoRA factors in F32, including the shipped BF16 Dev adapter.
     let overlay_bytes = spec.adapters.iter().try_fold(0_u64, |total, adapter| {
         total
-            .checked_add(required_component_bytes(&adapter.path, 2, "adapter")?)
+            .checked_add(required_component_bytes(&adapter.path, 4, "adapter")?)
             .ok_or_else(|| {
                 gen_core::Error::Msg(format!(
                     "{LTX_2_5_DISTILLED_MODEL_ID}: adapter byte total overflows u64"
@@ -1280,7 +1281,7 @@ mod tests {
         assert_eq!(contract.asset_facts.transformer_bytes, 22 + 116 + 124);
         assert_eq!(contract.asset_facts.decoder_bytes, 68 + 76);
         assert_eq!(contract.asset_facts.base_bytes, 352 + 262 + 144);
-        assert_eq!(contract.asset_facts.overlay_bytes, 82);
+        assert_eq!(contract.asset_facts.overlay_bytes, 164);
         assert_eq!(
             weights_free_contract(&load).unwrap().asset_facts,
             MemoryAssetFacts::default()

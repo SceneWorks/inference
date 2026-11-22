@@ -546,7 +546,11 @@ impl Pipeline {
                 AvDiT::new(dit_vb.clone(), &self.av_cfg)
             })?
         };
-        adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        if self.transformer_variant.is_dev() {
+            adapters::install_ltx25_dev_adapters(&mut avdit, adapters)?;
+        } else {
+            adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        }
         if let Some(chunk) = execution.attention_chunk_size {
             avdit.set_attention_budget(chunk as usize);
         }

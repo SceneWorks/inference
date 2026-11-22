@@ -23,6 +23,8 @@ use candle_gen::{CandleError, Result};
 
 use crate::transformer::AvDiT;
 
+mod refinement;
+
 const PATH_PREFIXES: [&str; 6] = [
     "base_model.model.diffusion_model.",
     "base_model.model.",
@@ -81,6 +83,13 @@ enum AdapterFormat {
     Lora,
     Lokr,
     ThirdPartyLokr,
+}
+
+#[derive(Clone, Copy)]
+enum InstallPolicy {
+    Ltx23,
+    Ltx25,
+    Ltx25Dev,
 }
 
 fn classify_format(spec: &AdapterSpec, file: &AdapterFile) -> Result<AdapterFormat> {
@@ -292,24 +301,34 @@ fn ltx25_factor_rank(declared_rank: usize, in_features: usize, out_features: usi
 /// A resolved module outside the exact training surface is an error, as is an incomplete or
 /// shape-mismatched pair. Thus a non-empty adapter can never silently render as the base model.
 pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
-    install_ltx_adapters_with_policy(dit, specs, false)
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx23)
 }
 
 fn install_ltx_adapters_with_policy(
     dit: &mut AvDiT,
     specs: &[AdapterSpec],
-    strict_25: bool,
+    policy: InstallPolicy,
 ) -> Result<AdditiveReport> {
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
     let mut report = AdditiveReport::default();
+    let mut used_refinement = false;
 
     for (source, spec) in specs.iter().enumerate() {
-        ensure_no_diff_patch(spec)?;
         let pass_scales = effective_pass_scales(spec)?;
-        let file = read_adapter(&spec.path)?;
+        let refinement = match policy {
+            InstallPolicy::Ltx25Dev => refinement::read_over_cap(spec, &mut used_refinement)?,
+            _ => None,
+        };
+        let mut file = match refinement {
+            Some(file) => file,
+            None => {
+                ensure_no_diff_patch(spec)?;
+                read_adapter(&spec.path)?
+            }
+        };
         let format = classify_format(spec, &file)?;
-        let strict_scale = if strict_25 {
+        let strict_scale = if !matches!(policy, InstallPolicy::Ltx23) {
             if spec.kind != AdapterKind::Lora || format != AdapterFormat::Lora {
                 return Err(CandleError::Msg(format!(
                     "ltx_2_5 adapter {} must be a LoRA file; LoKr/third-party LyCORIS are not supported by this route",
@@ -385,20 +404,22 @@ fn install_ltx_adapters_with_policy(
 
         let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
         let mut lora_tensors = 0;
-        for (key, tensor) in &file.tensors {
-            match classify_lora_key(key) {
+        // Move the native factors into their pairs so the BF16 buffers are released
+        // as the installer replaces those factors with their F32 equivalents.
+        for (key, tensor) in std::mem::take(&mut file.tensors) {
+            match classify_lora_key(&key) {
                 Some((path, Role::Down)) => {
                     lora_tensors += 1;
-                    triples.entry(path).or_default().down = Some(tensor.clone())
+                    triples.entry(path).or_default().down = Some(tensor)
                 }
                 Some((path, Role::Up)) => {
                     lora_tensors += 1;
-                    triples.entry(path).or_default().up = Some(tensor.clone())
+                    triples.entry(path).or_default().up = Some(tensor)
                 }
                 Some((path, Role::Alpha)) => {
                     lora_tensors += 1;
                     triples.entry(path).or_default().alpha =
-                        Some(read_scalar(key, "alpha", tensor)?)
+                        Some(read_scalar(&key, "alpha", &tensor)?)
                 }
                 None => report.skipped_keys += 1,
             }
@@ -479,7 +500,7 @@ fn install_ltx_adapters_with_policy(
     let mut applied_by_spec = vec![0usize; specs.len()];
     dit.visit_adaptable_mut(&mut |loaded_path, linear| {
         let path = strip_path_prefix(loaded_path);
-        if let Some(residuals) = pending.get(path) {
+        if let Some(residuals) = pending.get_mut(path) {
             let (out_features, in_features) = linear.base_shape();
             for residual in residuals {
                 if residual.a.dims()[0] != in_features
@@ -492,9 +513,12 @@ fn install_ltx_adapters_with_policy(
                         residual.b.dims()
                     )));
                 }
+                // Release each CPU factor as its device copy becomes resident.
+                residual.a = residual.a.to_device(&device)?;
+                residual.b = residual.b.to_device(&device)?;
                 linear.push_additive_lora_per_pass(
-                    residual.a.to_device(&device)?,
-                    residual.b.to_device(&device)?,
+                    residual.a.clone(),
+                    residual.b.clone(),
                     residual.pass_scales.clone(),
                 )?;
                 report.applied += 1;
@@ -569,7 +593,14 @@ fn install_ltx_adapters_with_policy(
 /// its source-scale fallback is disabled and unmatched targets remain fatal, so a selected adapter
 /// can never be accepted without affecting the split-provider DiT.
 pub fn install_ltx25_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
-    install_ltx_adapters_with_policy(dit, specs, true)
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25)
+}
+
+pub(crate) fn install_ltx25_dev_adapters(
+    dit: &mut AvDiT,
+    specs: &[AdapterSpec],
+) -> Result<AdditiveReport> {
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25Dev)
 }
 
 #[cfg(test)]
