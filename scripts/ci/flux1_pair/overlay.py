@@ -10,6 +10,14 @@ CANDLE = "crates/media/candle-gen/"
 BASE = "2b09938e33370915d4f853389961709b8bbf8bf9"
 ENG4B_BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
 ENG4B_BASE_TREE = "88e1369f11fbc1be2d2fb9b0063db8725463db92"
+ENG4B_TERMINAL_BASE = "481a982db44b58937c15c2d3f0cbf918b116d04d"
+ENG4B_TERMINAL_BASE_TREE = "4672a53038a32e26ba169a62be5e8a19ded2b76d"
+
+
+def eng4b_baseline(tier):
+    if tier == ENG4B_REAL:
+        return ENG4B_TERMINAL_BASE, ENG4B_TERMINAL_BASE_TREE
+    return ENG4B_BASE, ENG4B_BASE_TREE
 
 
 def replace_once(root, path, old, new):
@@ -30,7 +38,8 @@ def install(root, backend, arm, tier):
             raise ValueError("ENG-4b overlay requires the Candle CUDA comparison arms")
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True,
                                        encoding="utf-8").strip()
-        if (head == ENG4B_BASE) != (arm == "base"):
+        baseline, _ = eng4b_baseline(tier)
+        if (head == baseline) != (arm == "base"):
             raise ValueError("ENG-4b overlay received the wrong source revision for its arm")
     mlx = backend == "mlx"
     planned = arm == "head" or eng4b

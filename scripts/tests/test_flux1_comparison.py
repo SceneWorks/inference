@@ -177,7 +177,10 @@ class FluxPairTests(unittest.TestCase):
                 comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
             policy["deadlineSeconds"] = 360
             contract = comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
-        self.assertEqual((contract["base"], contract["head"]), (overlay.ENG4B_BASE, head))
+        self.assertEqual((contract["base"], contract["head"]),
+                         ("481a982db44b58937c15c2d3f0cbf918b116d04d", head))
+        self.assertEqual(contract["base_tree"], "4672a53038a32e26ba169a62be5e8a19ded2b76d")
+        self.assertEqual(contract["asset_setup"], "flux1-eng4b-terminal-comparison")
         refs = contract["pinned_fixtures"]
         self.assertEqual(refs["dev"]["source_snapshot"]["snapshot"], "323fd12d79f78ad444e882e8d8e871914584f2b9")
         self.assertEqual(refs["schnell"]["source_snapshot"]["snapshot"], "bba3ae01dfd94089f173c05edd4e1a4c551f2599")
@@ -275,7 +278,8 @@ class FluxPairTests(unittest.TestCase):
                 eng4b = tier in fixture.ENG4B_TIERS
                 measured = tier == fixture.ENG4B_REAL
                 if eng4b:
-                    contract.update(base=overlay.ENG4B_BASE, base_tree=overlay.ENG4B_BASE_TREE,
+                    baseline, baseline_tree = overlay.eng4b_baseline(tier)
+                    contract.update(base=baseline, base_tree=baseline_tree,
                                     head="a" * 40, head_tree="b" * 40)
                 profiles = comparison.variants(tier)
                 shapes = {v: {} for v in profiles}

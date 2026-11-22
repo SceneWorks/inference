@@ -96,7 +96,7 @@ def measured_cases(tier):
 def plan(backend, value, head, tier):
     eng4b = tier in fixture.ENG4B_TIERS
     measured = tier == ENG4B_REAL
-    baseline = overlay.ENG4B_BASE if eng4b else BASE
+    baseline, baseline_tree = overlay.eng4b_baseline(tier) if eng4b else (BASE, None)
     if backend not in LANES or tier not in TIERS or head == baseline:
         raise ValueError("select distinct head and supported proof tier/backend")
     if eng4b and backend != "candle-cuda":
@@ -123,8 +123,10 @@ def plan(backend, value, head, tier):
         fixture.geometry(variant)
     settings = evidence.SETTINGS
     identity = {}
+    asset_setup = "flux1-comparison"
     if eng4b:
-        identity["base_tree"] = overlay.ENG4B_BASE_TREE
+        identity["base_tree"] = baseline_tree
+        asset_setup = "flux1-eng4b-terminal-comparison" if measured else "flux1-eng4b-comparison"
     if tier == ENG4B:
         settings = dict(settings, guidance={"dev": 3.5},
                         weights="synthetic MLX affine Q4 transformer, CLIP-L and T5; dense BF16 VAE",
@@ -137,8 +139,7 @@ def plan(backend, value, head, tier):
         settings = dict(settings, weights="complete provisioned Q4 snapshots from the pinned file hashes",
                         depth={"double": 19, "single": 38, "clip": 12, "t5": 24},
                         plans="compiled and used on both arms", scope="Candle CUDA resident plain T2I")
-    return {"runner": LANES[backend],
-            "asset_setup": "flux1-eng4b-comparison" if eng4b else "flux1-comparison",
+    return {"runner": LANES[backend], "asset_setup": asset_setup,
             "backend": backend, "base": baseline, "head": source["revision"], "head_tree": source["tree"],
             "tier": tier, "geometry_sha256": fixture.sha(fixture.HERE / "geometry.tsv"),
             "request": value, "settings": settings, **identity,

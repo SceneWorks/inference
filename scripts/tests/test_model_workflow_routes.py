@@ -78,6 +78,7 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertEqual(baselines, {
             "matrix.asset_setup == 'flux1-comparison'": "2b09938e33370915d4f853389961709b8bbf8bf9",
             "matrix.asset_setup == 'flux1-eng4b-comparison'": "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294",
+            "matrix.asset_setup == 'flux1-eng4b-terminal-comparison'": "481a982db44b58937c15c2d3f0cbf918b116d04d",
         })
         self.assertEqual(inputs['flux1_pair']['default'], 'none')
         # Opt-in asset setup for the inventory job only; never on by default.

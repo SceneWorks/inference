@@ -77,9 +77,10 @@ weights are private temporary job files.
 ## ENG-4b terminal real-weight comparison
 
 Select `eng4b-tier2` and request `flux1-eng4b-pair` on `candle-cuda`.
-Both arms use locked Cargo release builds and the planned route. The reference is the merged
-ENG-4a engine `e86b8d5fc493c16b2d9d852e0c9ecbdefee58294`. The head is the
-exact dispatched revision and tree. Both use the full Q4 Dev and Schnell
+Both arms use locked Cargo release builds and the planned route. The reference
+is inference main at `481a982db44b58937c15c2d3f0cbf918b116d04d`. Both arms
+include the shared loader changes merged in PR #1492. The head is the exact
+dispatched revision and tree. Both use the full Q4 Dev and Schnell
 snapshots and the request settings above. The controller verifies the
 published file hashes before and after the comparison. One instrumented
 pair per variant checks bit-exact states and RGB8 before the performance

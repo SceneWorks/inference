@@ -143,6 +143,13 @@ jobs:
           ref: e86b8d5fc493c16b2d9d852e0c9ecbdefee58294
           path: flux1-baseline
           persist-credentials: false
+      - name: Check out the merged main engine for terminal FLUX.1 comparison
+        if: matrix.asset_setup == 'flux1-eng4b-terminal-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 481a982db44b58937c15c2d3f0cbf918b116d04d
+          path: flux1-baseline
+          persist-credentials: false
       - name: Select Git Bash on Windows
         if: runner.os == 'Windows'
         shell: cmd
