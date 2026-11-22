@@ -64,6 +64,8 @@ def plan(backend, request, head):
         "runner": tier1.LANES[backend],
         "counts": [2, 3, 4, 5] if continuation else c.COUNTS[backend],
         **({"recovered_six": c.RECOVERED_SIX} if continuation else {}),
+        **({"cuda_completion": "supervisor-owned-windows-job"}
+           if not continuation and request["policy"].get("cudaDeviceUuid") == c.GPU0 else {}),
         "asset_setup": "hub-snapshots",
         "hub_snapshots": {c.SLOT: {"repository": c.REPO, "revision": c.REV, "subfolder": "q4"}},
         "fixture_module_sha256": hashlib.sha256(source(backend, request["policy"].get("cudaDeviceUuid")).encode()).hexdigest(),
@@ -195,13 +197,15 @@ def build(work, contract, policy):
     )
 
 
-def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved, head, *, completed_job=None):
+def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved, head, *, completed_job=None, fresh_cuda=False):
+    if fresh_cuda and (completed_job is None or completed_job[1] != "owned-job-completion"):
+        raise ValueError("fresh GPU 0 qualification requires the supervised Windows Job")
     if completed_job is not None:
         claim, basis = completed_job
         if backend != "candle-cuda" or approved.cuda_device_uuid != c.GPU0:
             raise ValueError("completed Job proof requires physical GPU 0")
         require_release(claim, backend, hw, approved)
-        if basis == "owned-job-completion" and count in (2, 3, 4, 5):
+        if basis == "owned-job-completion" and count in (c.COUNTS["candle-cuda"] if fresh_cuda else (2, 3, 4, 5)):
             validate_shared_release_record(claim, [{"supervision": guard}],
                 dict(backend=backend, **c.cuda_constraints(c.GPU0)))
             if claim["owned_execution_completion"]["waited_returncode"] != 0:
@@ -209,7 +213,7 @@ def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved,
         elif not (basis == "archived-supervisor-return" and count == 6 and head == c.RECOVERED_SIX["inference_revision"]):
             raise ValueError("unexpected completed Job evidence source")
     try:
-        candidate = c.measured_row(native, guard, pool, adapter, hw, backend, count, approved, head, completed_job=completed_job)
+        candidate = c.measured_row(native, guard, pool, adapter, hw, backend, count, approved, head, completed_job=completed_job, fresh_cuda=fresh_cuda)
     except c.IncompleteWddmSamples:
         return {"accepted": False, "telemetry_failure": "incomplete_wddm_samples"}
     return {"accepted": True, "candidate_row_pending_physical_review": candidate}
@@ -260,7 +264,8 @@ def execute(args, contract):
     proof.unlinked_path(work, temp)
     work.mkdir()
     phases = [f"count-{n}" for n in contract["counts"]]
-    continuation = contract["request"].get("continuation") == c.CONTINUATION
+    fresh_cuda = "cuda_completion" in contract
+    require_job = fresh_cuda or contract["request"].get("continuation") == c.CONTINUATION
     receipt = {
         "contract": contract,
         "request": contract["request"],
@@ -308,7 +313,7 @@ def execute(args, contract):
             deadline = time.monotonic() + 2520
             with execution_claim(
                 backend, claim_policy, claim_dir, build_env, original_deadline_monotonic=deadline,
-                require_owned_completion=continuation,
+                require_owned_completion=require_job,
                 constraints=c.cuda_constraints(approved.cuda_device_uuid) if backend == "candle-cuda" else None,
             ) as claim:
                 record["claim"] = claim
@@ -339,7 +344,7 @@ def execute(args, contract):
                     arguments=["--exact", c.FQN, "--ignored", "--nocapture", "--test-threads=1"],
                     capture_cuda_basis=backend == "candle-cuda",
                     dedicated_adapter=adapter,
-                    observer=Observer, completion_claim=claim if continuation else None,
+                    observer=Observer, completion_claim=claim if require_job else None,
                 )
                 native = json.loads(evidence.owned_file(out, "native.json", c.MIB).read_bytes())
                 record["native"] = native
@@ -355,7 +360,7 @@ def execute(args, contract):
             require_release(claim, backend, hw, approved)
             record.update(measured_outcome(
                 native, guard, pool, adapter, hw, backend, count, approved, contract["head"],
-                completed_job=(claim, "owned-job-completion") if continuation else None,
+                completed_job=(claim, "owned-job-completion") if require_job else None, fresh_cuda=fresh_cuda,
             ))
         receipt["accepted"] = all(record["accepted"] for record in receipt["counts"].values())
         if not receipt["accepted"]:
@@ -421,6 +426,8 @@ def verify(args, contract):
 
     with TemporaryDirectory() as d:
         approved = tier1.read_policy(Path(d), "policy.json", contract["request"]["policy"])
+    fresh_cuda = "cuda_completion" in contract
+    require_job = fresh_cuda or contract["request"].get("continuation") == c.CONTINUATION
     for count in attempted:
         record = records[str(count)]
         if type(record["accepted"]) is not bool:
@@ -446,7 +453,7 @@ def verify(args, contract):
         actual = measured_outcome(
             record["native"], guard, pool, receipt["adapter"], receipt["hardware"],
             backend, count, approved, contract["head"], completed_job=(record["claim"], "owned-job-completion")
-            if contract["request"].get("continuation") == c.CONTINUATION else None,
+            if require_job else None, fresh_cuda=fresh_cuda,
         )
         stored = {key: record[key] for key in (
             "accepted", "telemetry_failure", "candidate_row_pending_physical_review"

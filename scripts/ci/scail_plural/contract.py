@@ -204,7 +204,7 @@ class IncompleteWddmSamples(ValueError):
 
 
 def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision, *,
-                 completed_job=None, archived_owned_zero=False):
+                 completed_job=None, archived_owned_zero=False, fresh_cuda=False):
     if archived_owned_zero:
         from scripts.ci.scail_plural.completed_job import OWNED_ZERO_CAPTURE
         if (backend != "candle-cuda" or approved.cuda_device_uuid != GPU0 or count not in (3, 5)
@@ -311,16 +311,19 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             counters["peak_working_set_bytes"],
         )
         from scripts.ci.scail_plural.cuda_stage import render_scope, tenant_growth
-        if (raw.get("cuda_render_end") or {}).get("rejected_growth"):
+        if fresh_cuda or (raw.get("cuda_render_end") or {}).get("rejected_growth"):
             admission = guard["admission"]
             if (admission["cudaDeviceUuid"] != approved.cuda_device_uuid
                     or admission["gpuFreeReserveBytes"] != approved.gpu_free_reserve_bytes
                     or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes
                     or (completed_job is not None and admission["pollMillis"] != approved.poll_millis)):
                 raise ValueError("rejected CUDA attempt budget differs from the approved guard")
+        if fresh_cuda:
+            from scripts.ci.scail_plural.completed_job import validate_guard_samples
+            validate_guard_samples(guard, raw["cuda_render_end"], raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"])
         growth, growth_count = tenant_growth(guard, uuid)
         stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job,
-                             archived_owned_zero=archived_owned_zero)
+                             archived_owned_zero=archived_owned_zero, fresh_cuda=fresh_cuda)
         if stage is not None and (incomplete or "basis" in stage):
             scope = stage
             incomplete = False

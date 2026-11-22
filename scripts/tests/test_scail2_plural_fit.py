@@ -105,7 +105,7 @@ class PluralQualification(unittest.TestCase):
             previous = runner.plan("candle-cuda", request, "head")
             selected = dict(request, policy=c.policy("candle-cuda", cuda_uuid=c.GPU0))
             plan = runner.plan("candle-cuda", selected, "head")
-            self.assertEqual(plan, dict(previous, request=selected,
+            self.assertEqual(plan, dict(previous, request=selected, cuda_completion="supervisor-owned-windows-job",
                 fixture_module_sha256=hashlib.sha256(runner.source("candle-cuda", c.GPU0).encode()).hexdigest()))
             self.assertEqual(previous["fixture_module_sha256"], "ea14d6259e4c2bfc903c69bb34178f413585e91eeeec48649d78d6a67377a67c")
             self.assertEqual(selected["policy"], dict(request["policy"], cudaDeviceUuid=c.GPU0))

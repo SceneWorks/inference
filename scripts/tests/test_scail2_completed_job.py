@@ -110,6 +110,8 @@ class CompletedJob(unittest.TestCase):
             follow = runner.plan("candle-cuda", subset, "r")
             self.assertEqual(first["counts"], [6, 2, 3, 4, 5])
             self.assertNotIn("recovered_six", first)
+            self.assertEqual(first["cuda_completion"], "supervisor-owned-windows-job")
+            self.assertNotIn("cuda_completion", follow)
             self.assertEqual(follow["counts"], [2, 3, 4, 5])
             self.assertEqual(follow["recovered_six"], contract.RECOVERED_SIX)
             self.assertEqual(follow["fixture_module_sha256"], first["fixture_module_sha256"])

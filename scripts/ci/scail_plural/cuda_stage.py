@@ -322,7 +322,7 @@ def validate_rejected_growth(guard, end, native_pool, card, *, completed_job=Fal
         raise ValueError("CUDA usage resumed after the original Job exited")
 
 
-def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None, archived_owned_zero=False):
+def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None, archived_owned_zero=False, fresh_cuda=False):
     raw = guard["fit_observation"]
     end = raw.get("cuda_render_end")
     if end is None:
@@ -436,10 +436,22 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         "dedicated_missing_after_output": ded["missing_active_polls"],
         "shared_missing_after_output": shared["missing_active_polls"],
     }
-    if archived_owned_zero:
-        from scripts.ci.scail_plural.completed_job import ordered_owned_zero
+    # On Windows the source read and the first unavailable PDH reading can
+    # share a monotonic tick. Only the serialized final attempt and actual Job
+    # exit establish their order; the ordinary strict interval still applies otherwise.
+    tied = fresh_cuda and end.get("rejected_growth") and any(
+        not e["recovered"] and e["start_ns"] == last_used
+        for e in raw["wddm_retry"]["dedicated"]["events"]
+    )
+    if archived_owned_zero or tied:
+        from scripts.ci.scail_plural.completed_job import ordered_owned_zero, UnverifiedOrderedZero
         claim, _ = completed_job
-        scope.update(ordered_owned_zero(guard, end, card, claim, last_used))
+        try:
+            scope.update(ordered_owned_zero(guard, end, card, claim, last_used))
+        except UnverifiedOrderedZero:
+            if archived_owned_zero:
+                raise
+            return None
         return scope
     for key, series in (("dedicated", ded), ("shared", shared)):
         misses = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]

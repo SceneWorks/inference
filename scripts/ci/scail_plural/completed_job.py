@@ -79,6 +79,10 @@ def terminal_scope(guard, end, pool, card, claim, basis):
                 terminal_rejected_attempts=len(final), **counts)
 
 
+class UnverifiedOrderedZero(ValueError):
+    """The missed gauge cannot be located inside the final post-output attempt."""
+
+
 def ordered_owned_zero(guard, end, card, claim, last_used):
     """Locate the two absent gauges within one rejected read, before the actual owned zero."""
     from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
@@ -97,7 +101,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
         and all(e["next_card_index"] == zero["card_index"] for e in events)
         and all(a["child_growth_bytes"] >= b["child_growth_bytes"] for a, b in zip(events, events[1:]))
     ):
-        raise ValueError("unverified terminal CUDA attempt, Job, or physical release")
+        raise UnverifiedOrderedZero("unverified terminal CUDA attempt, Job, or physical release")
     validate_guard_samples(guard, end, card)
     final = events[-1]
     if not (
@@ -107,7 +111,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
         and mark["at_ns"] < events[-2]["at_ns"] < final["read_ns"] == last_used
         and final["at_ns"] < zero["at_ns"]
     ):
-        raise ValueError("last positive rejected reading cannot establish the owned-zero boundary")
+        raise UnverifiedOrderedZero("last positive rejected reading cannot establish the owned-zero boundary")
 
     raw = guard["fit_observation"]
     gaps = []
@@ -116,7 +120,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
         diagnostics = raw["wddm_retry"][key]
         if not (series["error"] is None and series["missing_active_polls"] == diagnostics["attempts"] == 1
                 and len(diagnostics["events"]) == 1):
-            raise ValueError("expected exactly one located terminal WDDM gap per gauge")
+            raise UnverifiedOrderedZero("expected exactly one located terminal WDDM gap per gauge")
         gap = diagnostics["events"][0]
         start, finish = gap["start_ns"], gap["end_ns"]
         lower, upper = gap["local_filetime_before"], gap["local_filetime_after"]
@@ -127,7 +131,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
             and gap["retried"] is True and gap["recovered"] is False and gap["retry_sample"] is None
             and series["samples"] and gap["previous"] == series["samples"][-1] and lower >= gap["previous"][0]
         ):
-            raise ValueError("WDDM retry does not fall inside its final rejected CUDA attempt")
+            raise UnverifiedOrderedZero("WDDM retry does not fall inside its final rejected CUDA attempt")
         gaps.append(gap)
     dedicated, shared = gaps
     # KeepSystemGrowth reads first. PairCudaProbe polls dedicated before it rejects
@@ -135,5 +139,5 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
     if not (dedicated["start_ns"] == final["read_ns"] and dedicated["end_ns"] <= shared["start_ns"]
             and dedicated["local_filetime_after"] <= shared["local_filetime_before"]
             and shared["end_ns"] == final["at_ns"]):
-        raise ValueError("terminal gauge timestamps contradict the original synchronous read order")
+        raise UnverifiedOrderedZero("terminal gauge timestamps contradict the original synchronous read order")
     return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])

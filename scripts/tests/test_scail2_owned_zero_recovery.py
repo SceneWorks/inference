@@ -30,13 +30,28 @@ def fixture():
     return guard, pool, claim
 
 
-def scope(guard, pool, claim, archived=True):
+def scope(guard, pool, claim, archived=True, fresh=False):
     _, primary = stage.tenant_growth(guard, pool["cudaDeviceUuid"])
     return stage.render_scope(guard, pool, pool["cudaDeviceUuid"], primary,
-                              completed_job=(claim, "owned-job-completion"), archived_owned_zero=archived)
+                              completed_job=(claim, "owned-job-completion"), archived_owned_zero=archived, fresh_cuda=fresh)
 
 
 class OwnedZeroRecovery(unittest.TestCase):
+    def test_fresh_gpu0_locates_only_the_verified_terminal_tie(self):
+        guard, pool, claim = fixture()
+        self.assertEqual(scope(guard, pool, claim, archived=False, fresh=True), scope(guard, pool, claim))
+        raw = guard["fit_observation"]
+        event = raw["wddm_retry"]["dedicated"]["events"][0]
+        event.update(start_ns=150, end_ns=160)
+        self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
+        guard, pool, claim = fixture()
+        guard["fit_observation"]["wddm_retry"]["shared"]["events"][0]["local_filetime_after"] = 0
+        self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
+        guard, pool, claim = fixture()
+        guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]["free_bytes"] = 1
+        with self.assertRaises(ValueError):
+            scope(guard, pool, claim, archived=False, fresh=True)
+
     def test_archived_tied_read_only_and_raw_record_preserved(self):
         guard, pool, claim = fixture()
         before = json.dumps(guard)
