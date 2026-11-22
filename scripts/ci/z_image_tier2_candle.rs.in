@@ -73,17 +73,27 @@ fn main() -> ProofResult<()> {
 
     let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing proof output")?);
     let mut progress = Vec::with_capacity(steps as usize);
+    let mut decode_started = None;
     let start = Instant::now();
     let generator = registry.load(provider, &spec)?;
+    let loaded = Instant::now();
     assert_eq!(generator.descriptor().id, provider);
-    let report = generator.generate_planned(&request, &plan, None, &mut |event| {
-        if let Progress::Step { current, total } = event {
+    let report = generator.generate_planned(&request, &plan, None, &mut |event| match event {
+        Progress::Step { current, total } => {
             assert_eq!(total, steps);
             progress.push(current);
         }
+        Progress::Decoding => {
+            assert!(decode_started.replace(Instant::now()).is_none());
+        }
+        _ => {}
     })?;
-    let e2e_ns = start.elapsed().as_nanos();
+    let ended = Instant::now();
     let sample = take_z_image_terminal_sample().ok_or("resident sampler did not run")?;
+    let decode_started = decode_started.ok_or("missing native Z-Image decode boundary")?;
+    if !(loaded <= sample.started && sample.ended <= decode_started && decode_started <= ended) {
+        return Err("invalid native Z-Image phase order".into());
+    }
     assert_eq!(sample.device.location(), DeviceLocation::Cuda { gpu_id: 0 });
     assert_eq!(sample.dtype, DType::BF16);
     assert_eq!(sample.sigmas, sigmas);
@@ -109,7 +119,15 @@ fn main() -> ProofResult<()> {
             "sigmas_bits": sample.sigmas,
             "latent_shape": sample.shape,
         },
-        "progress": progress, "e2e_ns": e2e_ns, "denoise_ns": sample.time,
+        "progress": progress,
+        "e2e_ns": (ended - start).as_nanos(),
+        "denoise_ns": (sample.ended - sample.started).as_nanos(),
+        "phase_ns": {
+            "provider_load": (loaded - start).as_nanos(),
+            "render_before_denoise": (sample.started - loaded).as_nanos(),
+            "after_denoise_before_decode": (decode_started - sample.ended).as_nanos(),
+            "decode_through_host_rgb": (ended - decode_started).as_nanos(),
+        },
     });
     serde_json::to_writer(fs::File::create_new(output.join("result.json"))?, &row)?;
     retain_cuda_pool(&output, &sample.device)?;

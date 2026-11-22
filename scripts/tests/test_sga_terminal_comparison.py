@@ -132,7 +132,9 @@ class TerminalTests(unittest.TestCase):
                     row = {"plan": dict(z_image.request(variant), sigmas_bits=sigmas),
                            "sample": {"dtype": "BF16", "device": "candle-cuda:0", "sigmas_bits": sigmas,
                                       "latent_shape": [1, 16, 1, size // 8, size // 8]},
-                           "progress": list(range(1, steps + 1)), "e2e_ns": 1000, "denoise_ns": 600}
+                           "progress": list(range(1, steps + 1)), "e2e_ns": 1000, "denoise_ns": 600,
+                           "phase_ns": {"provider_load": 100, "render_before_denoise": 150,
+                                        "after_denoise_before_decode": 10, "decode_through_host_rgb": 140}}
                     result = sample / "result.json"
                     result.write_text(json.dumps(row), encoding="utf-8")
                     log = "SGA_Z_IMAGE_TIER2_BODY " + variant
@@ -148,6 +150,10 @@ class TerminalTests(unittest.TestCase):
                     original = z_image.observe(log, result, UUID, variant)
                     replay = z_image.observe(log, archive / (variant + ".result.json"), UUID, variant)
                     self.assertEqual(original, replay)
+                    row["phase_ns"]["provider_load"] += 1
+                    result.write_text(json.dumps(row), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "render phases do not account"):
+                        z_image.observe(log, result, UUID, variant)
                     self.assertEqual(replay["identity"]["rgb_sha256"], hashlib.sha256(pixels).hexdigest())
 
     def test_z_image_refuses_corrupt_or_oversized_png_data(self):

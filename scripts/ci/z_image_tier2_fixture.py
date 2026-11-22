@@ -72,6 +72,7 @@ def contract(variant):
         "comparison": {"numerics": "AP13(a), identical native plan, sampler sigma bits, and nondegenerate RGB8",
                        "warmup": ["base", "head"], "cache": "fresh process with warmed OS file cache",
                        "pairs": PAIRS, "order": [["base", "head"], ["head", "base"]],
+                       "phase_breakdown": "diagnostic wall time at provider load, synchronized denoise and decode boundaries",
                        "time_ceiling": CEILING, "peak_ceiling": CEILING,
                        "median_interval": "min/max exact sign interval",
                        "interval_coverage": INTERVAL_COVERAGE, "child_deadline_seconds": CHILD_SECONDS},
@@ -94,9 +95,9 @@ def overlay(read, _arm, backend, binary):
         None,
     )?;
     out.device().synchronize()?;
-    let time = start.elapsed().as_nanos();
+    let ended = std::time::Instant::now();
     let sample = ZImageTerminalSample {
-        time, device, dtype: out.dtype(), shape: out.dims().to_vec(),
+        started: start, ended, device, dtype: out.dtype(), shape: out.dims().to_vec(),
         sigmas: sigmas.iter().map(|v| v.to_bits()).collect(),
     };
     Z_IMAGE_TERMINAL_SAMPLE.with(|slot| assert!(slot.replace(Some(sample)).is_none()));
@@ -107,7 +108,8 @@ def overlay(read, _arm, backend, binary):
 pub fn run_flow_sampler_with_phase_transition_spans(""")
     source += b"""
 pub struct ZImageTerminalSample {
-    pub time: u128,
+    pub started: std::time::Instant,
+    pub ended: std::time::Instant,
     pub device: candle_core::Device,
     pub dtype: candle_core::DType,
     pub shape: Vec<usize>,
@@ -253,7 +255,7 @@ def observe(stdout, result, _uuid, variant):
     if stdout.splitlines().count("SGA_Z_IMAGE_TIER2_BODY " + variant) != 1:
         raise ValueError("missing completed resident Z-Image generation")
     row = json.loads(result.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
-    if not isinstance(row, dict) or set(row) != {"plan", "sample", "progress", "e2e_ns", "denoise_ns"}:
+    if not isinstance(row, dict) or set(row) != {"plan", "sample", "progress", "e2e_ns", "denoise_ns", "phase_ns"}:
         raise ValueError("invalid Z-Image terminal receipt")
     plan = verify_plan(row["plan"], variant)
     sample = {"dtype": "BF16", "device": "candle-cuda:0", "sigmas_bits": plan["sigmas_bits"],
@@ -264,6 +266,12 @@ def observe(stdout, result, _uuid, variant):
     if (type(end_to_end) is not int or type(denoise) is not int
             or not STEPS[variant] <= denoise <= end_to_end <= CHILD_SECONDS * 10**9):
         raise ValueError("Z-Image native timing receipt is malformed or exceeds the child budget")
+    phases = row["phase_ns"]
+    if (not isinstance(phases, dict) or set(phases) != {"provider_load", "render_before_denoise",
+                                                       "after_denoise_before_decode", "decode_through_host_rgb"}
+            or any(type(value) is not int or value < 0 for value in phases.values())
+            or sum(phases.values()) + denoise != end_to_end):
+        raise ValueError("Z-Image render phases do not account for measured time")
     image_path = result.with_name(result.name.removesuffix("result.json") + "image.png")
     image = read_artifact_pixels(image_path, SIZE[variant])
     mean = sum(image) / len(image)
