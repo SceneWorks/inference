@@ -54,7 +54,8 @@ pub fn quantize_cached(src: &Tensor, dtype: GgmlDType, device: &Device) -> Resul
         return Ok(tensor);
     }
     let bytes = std::fs::read(artifact.path())?;
-    let storage = QStorage::from_data(Cow::Owned(bytes), device, dtype)?;
+    // Candle copies/uploads the borrowed payload during this call; retain its backing buffer.
+    let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, dtype)?;
     QTensor::new(storage, src.shape())
 }
 
