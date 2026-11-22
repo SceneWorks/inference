@@ -1,0 +1,109 @@
+use candle_core::cuda_backend::cudarc::driver::{
+    result::event, sys::CUevent_flags::CU_EVENT_DEFAULT, CudaEvent, CudaStream,
+};
+use std::{sync::Arc, time::Instant};
+
+struct ZImageTurboStepTiming {
+    stream: Arc<CudaStream>,
+    events: Vec<CudaEvent>,
+    host: Vec<Instant>,
+}
+
+fn z_image_timing_cuda_error(error: impl std::fmt::Display) -> CandleError {
+    CandleError::Msg(format!("Z-Image Turbo CUDA event: {error}"))
+}
+
+impl ZImageTurboStepTiming {
+    fn new(device: &candle_core::Device, sigmas: &[f32]) -> Result<Self> {
+        if sigmas.len() != 5 {
+            return Err(CandleError::Msg(
+                "Z-Image Turbo timing requires the four-step terminal schedule".into(),
+            ));
+        }
+        let stream = device.as_cuda_device()?.cuda_stream();
+        let events = (0..sigmas.len())
+            .map(|_| stream.context().new_event(Some(CU_EVENT_DEFAULT)))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(z_image_timing_cuda_error)?;
+        Ok(Self {
+            stream,
+            events,
+            host: Vec::with_capacity(sigmas.len()),
+        })
+    }
+
+    fn record(&mut self) -> Result<()> {
+        let index = self.host.len();
+        let now = Instant::now();
+        self.events[index]
+            .record(&self.stream)
+            .map_err(z_image_timing_cuda_error)?;
+        self.host.push(now);
+        Ok(())
+    }
+
+    fn record_step(&mut self, current: u32, total: u32) -> Result<()> {
+        if total != 4 || current as usize != self.host.len() + 1 || current > total {
+            return Err(CandleError::Msg(
+                "Z-Image Turbo timing saw unexpected Euler progress".into(),
+            ));
+        }
+        self.record()
+    }
+
+    fn record_tail(&mut self, device: &candle_core::Device) -> Result<()> {
+        if self.host.len() != 4
+            || !Arc::ptr_eq(&self.stream, &device.as_cuda_device()?.cuda_stream())
+        {
+            return Err(CandleError::Msg(
+                "Z-Image Turbo timing requires four steps on one CUDA stream".into(),
+            ));
+        }
+        self.record()
+    }
+
+    fn report(
+        &self,
+        start_barrier: Instant,
+        started: Instant,
+        finish_barrier: Instant,
+        ended: Instant,
+    ) -> Result<()> {
+        // The existing final barrier has drained this stream. Query to fail closed rather than
+        // using CudaEvent::elapsed_ms, which issues event synchronizations of its own.
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(z_image_timing_cuda_error)?;
+        if !self.events.iter().all(CudaEvent::is_complete) {
+            return Err(CandleError::Msg(
+                "Z-Image Turbo timing events are incomplete after the sampler barrier".into(),
+            ));
+        }
+        let mut steps = Vec::with_capacity(4);
+        for (events, host) in self.events.windows(2).zip(self.host.windows(2)) {
+            // SAFETY: both events are owned and live, have timing enabled, and completed on the
+            // same stream. This reads elapsed time without waiting on either event.
+            let elapsed = unsafe { event::elapsed(events[0].cu_event(), events[1].cu_event()) }
+                .map_err(z_image_timing_cuda_error)?;
+            if !elapsed.is_finite() || elapsed <= 0.0 {
+                return Err(CandleError::Msg(
+                    "Z-Image Turbo timing returned a nonpositive or nonfinite CUDA interval".into(),
+                ));
+            }
+            steps.push(serde_json::json!({
+                "stream_elapsed_ns": (f64::from(elapsed) * 1_000_000.0).round() as u64,
+                "host_enqueue_ns": (host[1] - host[0]).as_nanos(),
+            }));
+        }
+        let row = serde_json::json!({
+            "start_barrier_ns": (started - start_barrier).as_nanos(),
+            "before_first_step_ns": (self.host[0] - started).as_nanos(),
+            "tail_event_enqueue_ns": (finish_barrier - self.host[4]).as_nanos(),
+            "finish_barrier_ns": (ended - finish_barrier).as_nanos(),
+            "steps": steps,
+        });
+        println!("SGA_Z_IMAGE_TURBO_STEP_TIMING {row}");
+        Ok(())
+    }
+}

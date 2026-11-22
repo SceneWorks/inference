@@ -27,9 +27,62 @@ APPLE_DIAGNOSTIC = {"selection": comparison.SELECTION, "profile": "ltx25", "vari
                     "runner": "nax", "download_missing": True, "diagnostic": comparison.APPLE_DEV_DIAGNOSTIC}
 WAN_MEMORY_DIAGNOSTIC = dict(REQUEST, profile="wan", variant="a14b-t2v-candle",
                              cuda_device_uuid=comparison.WAN_MEMORY_GPU, diagnostic=comparison.WAN_MEMORY_DIAGNOSTIC)
+Z_TURBO_DIAGNOSTIC = dict(REQUEST, profile="z-image", variant="turbo",
+                          cuda_device_uuid=comparison.Z_TURBO_TIMING_GPU,
+                          diagnostic=comparison.Z_TURBO_TIMING_DIAGNOSTIC)
 
 
 class TerminalTests(unittest.TestCase):
+    def test_z_turbo_diagnostic_is_bound_and_requires_opposite_order(self):
+        self.assertIs(comparison.profile_for("candle-cuda", Z_TURBO_DIAGNOSTIC), z_image)
+        for overrides in ({"variant": "base"}, {"profile": "wan"}, {"cuda_device_uuid": UUID},
+                          {"download_missing": False}):
+            with self.assertRaises(ValueError):
+                comparison.profile_for("candle-cuda", {**Z_TURBO_DIAGNOSTIC, **overrides})
+        schedule = comparison.sample_schedule(Z_TURBO_DIAGNOSTIC)
+        self.assertEqual(schedule, [("warmup-base", "base"), ("warmup-head", "head"),
+                                    ("pair-1-base", "base"), ("pair-1-head", "head"),
+                                    ("pair-2-head", "head"), ("pair-2-base", "base")])
+        sample = {"identity": {"rgb_sha256": "same"}, "timing": {"e2e_ns": 1000},
+                  "peaks": {"host_process_bytes": 600}, "step_timings": {"steps": []}}
+        observations = {name: sample for name, _ in schedule}
+        summary = comparison.PAIRED_DIAGNOSTICS[comparison.Z_TURBO_TIMING_DIAGNOSTIC]
+        self.assertEqual(set(summary(observations, None)), {"fidelity", "samples"})
+        with self.assertRaisesRegex(ValueError, "opposite-order pairs"):
+            summary(dict(reversed(list(observations.items()))), None)
+
+    def test_z_turbo_overlay_keeps_the_two_original_sampler_barriers(self):
+        make_overlay, metadata = comparison.terminal_overlay(z_image, "candle-cuda", Z_TURBO_DIAGNOSTIC, "")
+        self.assertEqual(metadata, {})
+        def read(path):
+            return (comparison.ROOT / path).read_bytes()
+        plain = z_image.overlay(read, "base", "candle-cuda", "fixture")
+        diagnostic = make_overlay(read, "base", "candle-cuda", "fixture")
+        self.assertEqual(plain.keys(), diagnostic.keys())
+        for path in plain:
+            if not path.endswith("/sampler.rs"):
+                self.assertEqual(plain[path], diagnostic[path])
+                continue
+            self.assertNotIn(b"ZImageTurboStepTiming", plain[path])
+            self.assertEqual(diagnostic[path].count(b".synchronize()?"), plain[path].count(b".synchronize()?"))
+            self.assertIn(b"event::elapsed", diagnostic[path])
+            self.assertNotIn(b".elapsed_ms(", diagnostic[path])
+
+    def test_z_turbo_step_receipt_checks_completion_shape_and_clock_bounds(self):
+        row = {"start_barrier_ns": 10, "before_first_step_ns": 1, "tail_event_enqueue_ns": 2,
+               "finish_barrier_ns": 5,
+               "steps": [{"host_enqueue_ns": 20, "stream_elapsed_ns": 18}] * 4}
+        prefix = z_image.TURBO_STEP_TIMING_PREFIX
+        stdout = prefix + json.dumps(row)
+        self.assertEqual(z_image.read_turbo_step_timings(stdout, 88, 10), row)
+        for bad in ("", stdout + "\n" + stdout, prefix + json.dumps({**row, "steps": row["steps"][:-1]}),
+                    prefix + json.dumps({**row, "finish_barrier_ns": 9}),
+                    prefix + json.dumps({**row, "steps": [{**s, "stream_elapsed_ns": 30} for s in row["steps"]]})):
+            with self.assertRaisesRegex(ValueError, "step timing"):
+                z_image.read_turbo_step_timings(bad, 88, 10)
+        with self.assertRaisesRegex(ValueError, "step timing requires the unscored"):
+            z_image.observe("SGA_Z_IMAGE_TIER2_BODY turbo\n" + stdout, None, UUID, "turbo")
+
     def test_wan_memory_diagnostic_exact_route_and_adjacent_frozen_control(self):
         self.assertIs(comparison.profile_for("candle-cuda", WAN_MEMORY_DIAGNOSTIC), wan)
         for overrides in ({"cuda_device_uuid": comparison.WINDOWS_DEV_GPU}, {"variant": "a14b-t2v-mlx"},

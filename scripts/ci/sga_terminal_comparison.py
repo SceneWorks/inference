@@ -37,6 +37,8 @@ DIAGNOSTIC_SAMPLES = (("warmup-base", "base"),)
 APPLE_DEV_DIAGNOSTIC = "apple-dev-step-timing"
 WAN_MEMORY_DIAGNOSTIC = "windows-wan-memory"
 WAN_MEMORY_GPU = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+Z_TURBO_TIMING_DIAGNOSTIC = "windows-z-image-turbo-step-timing"
+Z_TURBO_TIMING_GPU = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
             ("mlx", "ltx25"): "ltx25_tier2_mlx",
             ("candle-cuda", "z-image"): "z_image_tier2_fixture",
@@ -48,7 +50,8 @@ ORDER = (ARMS, tuple(reversed(ARMS)))
 SAMPLES = [(f"warmup-{arm}", arm) for arm in ARMS] + [
     (f"pair-{index+1}-{arm}", arm) for index in range(PAIRS) for arm in ORDER[index % len(ORDER)]
 ]
-APPLE_DIAGNOSTIC_SAMPLES = SAMPLES[:len(ARMS) * (1 + len(ORDER))]
+OPPOSITE_ORDER_SAMPLES = SAMPLES[:len(ARMS) * (1 + len(ORDER))]
+APPLE_DIAGNOSTIC_SAMPLES = OPPOSITE_ORDER_SAMPLES
 WAN_MEMORY_SAMPLES = [*APPLE_DIAGNOSTIC_SAMPLES, ("control-base", "base")]
 PREFLIGHT_SECONDS = 180
 
@@ -75,6 +78,10 @@ def profile_for(backend, request):
         if (backend, request["profile"], request["variant"], request[binding]) != (
                 "candle-cuda", "wan", "a14b-t2v-candle", WAN_MEMORY_GPU):
             raise ValueError("Wan memory diagnostic requires the registered CUDA A14B T2V route on its exact GPU")
+    elif request.get("diagnostic") == Z_TURBO_TIMING_DIAGNOSTIC:
+        if (backend, request["profile"], request["variant"], request[binding]) != (
+                "candle-cuda", "z-image", "turbo", Z_TURBO_TIMING_GPU):
+            raise ValueError("Z-Image Turbo timing diagnostic requires its dense CUDA route on the exact GPU")
     elif diagnostic and (backend, request["profile"], request["variant"], request[binding], request["diagnostic"]) != (
             "candle-cuda", "ltx25", "dev", WINDOWS_DEV_GPU, WINDOWS_DEV_DIAGNOSTIC):
         raise ValueError("Windows Dev memory diagnostic requires the approved Candle LTX Dev CUDA device")
@@ -91,6 +98,8 @@ def terminal_overlay(profile, backend, request, head):
         return partial(profile.overlay, step_timing=True), {}
     if request.get("diagnostic") == WAN_MEMORY_DIAGNOSTIC:
         return partial(profile.overlay, phase_memory=True), {}
+    if request.get("diagnostic") == Z_TURBO_TIMING_DIAGNOSTIC:
+        return partial(profile.overlay, step_timing=True), {}
     if (backend, request["profile"], request["variant"]) != ("candle-cuda", "ltx25", "dev"):
         return profile.overlay, {}
     diagnostic = request.get("diagnostic") == WINDOWS_DEV_DIAGNOSTIC
@@ -116,7 +125,8 @@ def terminal_overlay(profile, backend, request, head):
 def sample_schedule(request):
     return {WINDOWS_DEV_DIAGNOSTIC: DIAGNOSTIC_SAMPLES,
             APPLE_DEV_DIAGNOSTIC: APPLE_DIAGNOSTIC_SAMPLES,
-            WAN_MEMORY_DIAGNOSTIC: WAN_MEMORY_SAMPLES}.get(request.get("diagnostic"), SAMPLES)
+            WAN_MEMORY_DIAGNOSTIC: WAN_MEMORY_SAMPLES,
+            Z_TURBO_TIMING_DIAGNOSTIC: OPPOSITE_ORDER_SAMPLES}.get(request.get("diagnostic"), SAMPLES)
 
 
 def plan(backend, request, head):
@@ -155,6 +165,12 @@ def plan(backend, request, head):
             "pool_high_water": "cumulative since child launch",
             "host": "existing supervisor Windows working set, private bytes and Job peak counters",
             "baseline_repeat": ["pair-2-base", "control-base"],
+        }
+    elif request.get("diagnostic") == Z_TURBO_TIMING_DIAGNOSTIC:
+        profile_contract["diagnostic_measurement"] = {
+            "steps": "each Euler prediction and update, delimited by consecutive progress callbacks",
+            "stream": "CUDA events on the latent stream, which can include idle time between enqueues",
+            "host": "wall intervals for enqueue and the existing synchronization calls",
         }
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,
@@ -200,7 +216,8 @@ def read_sample(name, directory, profile, contract, *, upload=False):
         peaks.update(cuda_process_bytes=guard["peak_gpu_bytes"], cuda_pool_used_bytes=pool["poolUsedHighBytes"],
                      cuda_pool_reserved_bytes=pool["poolReservedHighBytes"])
     req = contract["request"]
-    options = {"step_timing": True} if req.get("diagnostic") == APPLE_DEV_DIAGNOSTIC else {}
+    options = {"step_timing": True} if req.get("diagnostic") in (
+        APPLE_DEV_DIAGNOSTIC, Z_TURBO_TIMING_DIAGNOSTIC) else {}
     stdout = file("stdout.log").read_text(encoding="utf-8")
     readback = profile.observe(stdout, file("result.json"),
                                req[DEVICE_KEY[contract["backend"]]], req["variant"], **options)
@@ -256,8 +273,17 @@ def summarize_wan_memory(samples, preflight):
                         for name, row in samples.items()}}
 
 
+def summarize_z_turbo_timing(samples, preflight):
+    if list(samples) != [name for name, _ in OPPOSITE_ORDER_SAMPLES]:
+        raise ValueError("Z-Image Turbo timing diagnostic requires both warmups and both opposite-order pairs")
+    return {"fidelity": paired_reference(samples, preflight)["identity"],
+            "samples": {name: {"timing": row["timing"], "peaks": row["peaks"], "denoise": row["step_timings"]}
+                        for name, row in samples.items()}}
+
+
 PAIRED_DIAGNOSTICS = {APPLE_DEV_DIAGNOSTIC: summarize_apple_diagnostic,
-                      WAN_MEMORY_DIAGNOSTIC: summarize_wan_memory}
+                      WAN_MEMORY_DIAGNOSTIC: summarize_wan_memory,
+                      Z_TURBO_TIMING_DIAGNOSTIC: summarize_z_turbo_timing}
 
 
 def require_sm120(uuid):

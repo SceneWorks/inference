@@ -36,6 +36,7 @@ GIB = 2**30
 MIB = 2**20
 POOL_BYTES = 30 * GIB
 CHILD_SECONDS = 300
+TURBO_STEP_TIMING_PREFIX = "SGA_Z_IMAGE_TURBO_STEP_TIMING "
 
 
 def package(backend):
@@ -80,7 +81,7 @@ def contract(variant):
     }
 
 
-def overlay(read, _arm, backend, binary):
+def overlay(read, _arm, backend, binary, *, step_timing=False):
     family = f"crates/media/candle-gen/{package(backend)}/src"
     shared = "crates/media/candle-gen/candle-gen/src/sampler.rs"
     source = read(shared)
@@ -124,11 +125,52 @@ pub fn take_z_image_terminal_sample() -> Option<ZImageTerminalSample> {
     Z_IMAGE_TERMINAL_SAMPLE.with(|slot| slot.take())
 }
 """
+    if step_timing:
+        source = instrument_turbo_steps(source)
     probe = Path(__file__).with_name("z_image_tier2_candle.rs.in").read_bytes()
     receipt = replace_once(cuda_receipt(), b"(0, 10 * 2_u64.pow(30))",
                            f"(0, {POOL_BYTES})".encode())
     probe = replace_once(probe, b"// __SGA_CUDA_RECEIPT__", receipt)
     return {shared: source, f"{family}/bin/{binary}.rs": probe}
+
+
+def instrument_turbo_steps(source):
+    source = replace_once(
+        source,
+        b"    device.synchronize()?;\n    let start = std::time::Instant::now();\n",
+        b"""    let mut trace = ZImageTurboStepTiming::new(&device, sigmas)?;
+    let start_barrier = std::time::Instant::now();
+    device.synchronize()?;
+    let start = std::time::Instant::now();
+    let mut timing_error = None;
+    let mut timed_progress = |event| {
+        if let Progress::Step { current, total } = &event {
+            if timing_error.is_none() {
+                timing_error = trace.record_step(*current, *total).err();
+            }
+        }
+        on_progress(event);
+    };
+""")
+    source = replace_once(
+        source,
+        b"        on_progress,\n        preview,\n        predict,\n        None,\n    )?;\n"
+        b"    out.device().synchronize()?;\n    let ended = std::time::Instant::now();\n",
+        b"""        &mut timed_progress,
+        preview,
+        predict,
+        None,
+    )?;
+    if let Some(error) = timing_error {
+        return Err(error);
+    }
+    trace.record_tail(out.device())?;
+    let finish_barrier = std::time::Instant::now();
+    out.device().synchronize()?;
+    let ended = std::time::Instant::now();
+    trace.report(start_barrier, start, finish_barrier, ended)?;
+""")
+    return source + Path(__file__).with_name("z_image_turbo_step_timing.rs.in").read_bytes()
 
 
 def asset_inventory(variant, upstream):
@@ -246,9 +288,11 @@ def read_artifact_pixels(image, size):
     return b"".join(rows[offset + 1:offset + stride] for offset in range(0, len(rows), stride))
 
 
-def observe(stdout, result, _uuid, variant):
+def observe(stdout, result, _uuid, variant, *, step_timing=False):
     if stdout.splitlines().count("SGA_Z_IMAGE_TIER2_BODY " + variant) != 1:
         raise ValueError("missing completed resident Z-Image generation")
+    if not step_timing and any(line.startswith(TURBO_STEP_TIMING_PREFIX) for line in stdout.splitlines()):
+        raise ValueError("Z-Image Turbo step timing requires the unscored diagnostic")
     row = json.loads(result.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     if not isinstance(row, dict) or set(row) != {"plan", "sample", "progress", "e2e_ns", "denoise_ns", "phase_ns"}:
         raise ValueError("invalid Z-Image terminal receipt")
@@ -273,6 +317,34 @@ def observe(stdout, result, _uuid, variant):
     variance = sum(value * value for value in image) / len(image) - mean ** 2
     if not 8 < mean < 248 or variance <= 64 or image == image[:3] * (len(image) // 3):
         raise ValueError("Z-Image emitted a saturated or nearly flat RGB8 frame")
-    return {"identity": {"plan": plan, "sample": sample, "progress": row["progress"],
-                         "rgb_sha256": hashlib.sha256(image).hexdigest()},
-            "timing": {"e2e_ns": end_to_end, "denoise_per_step_ns": denoise // STEPS[variant]}}
+    observation = {"identity": {"plan": plan, "sample": sample, "progress": row["progress"],
+                                "rgb_sha256": hashlib.sha256(image).hexdigest()},
+                   "timing": {"e2e_ns": end_to_end, "denoise_per_step_ns": denoise // STEPS[variant]}}
+    if step_timing:
+        if variant != "turbo":
+            raise ValueError("step timing requires the frozen dense Z-Image Turbo route")
+        observation["step_timings"] = read_turbo_step_timings(stdout, denoise, phases["render_before_denoise"])
+    return observation
+
+
+def read_turbo_step_timings(stdout, denoise, before_denoise):
+    prefix = TURBO_STEP_TIMING_PREFIX
+    markers = [line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)]
+    if len(markers) != 1:
+        raise ValueError("missing or duplicate Z-Image Turbo step timing receipt")
+    row = json.loads(markers[0], object_pairs_hook=unique_object)
+    host_fields = {"start_barrier_ns", "before_first_step_ns", "tail_event_enqueue_ns", "finish_barrier_ns"}
+    if (not isinstance(row, dict) or set(row) != host_fields | {"steps"}
+            or any(type(row[key]) is not int or row[key] < 0 for key in host_fields)
+            or row["start_barrier_ns"] > before_denoise):
+        raise ValueError("invalid Z-Image Turbo step timing boundaries")
+    steps = row["steps"]
+    if (not isinstance(steps, list) or len(steps) != STEPS["turbo"]
+            or any(not isinstance(step, dict) or set(step) != {"host_enqueue_ns", "stream_elapsed_ns"}
+                   or any(type(value) is not int or value <= 0 for value in step.values()) for step in steps)):
+        raise ValueError("invalid Z-Image Turbo step timing samples")
+    host_total = sum(row[key] for key in host_fields - {"start_barrier_ns"})
+    if (host_total + sum(step["host_enqueue_ns"] for step in steps) != denoise
+            or sum(step["stream_elapsed_ns"] for step in steps) > denoise):
+        raise ValueError("Z-Image Turbo step timings do not match the synchronized sampler")
+    return row
