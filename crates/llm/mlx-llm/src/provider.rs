@@ -5199,7 +5199,11 @@ impl LlamaProvider {
                                     let _ = self
                                         .prefix
                                         .borrow_mut()
-                                        .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                        .promote_protected_counting_evictions(
+                                            &prompt_ids[..pb.position],
+                                            pb.kind,
+                                            &mut checkpoint_telemetry.evicted_entries,
+                                        );
                                 }
                             }
                             run
@@ -5332,7 +5336,11 @@ impl LlamaProvider {
                                         let _ = self
                                             .prefix
                                             .borrow_mut()
-                                            .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                            .promote_protected_counting_evictions(
+                                                &prompt_ids[..pb.position],
+                                                pb.kind,
+                                                &mut checkpoint_telemetry.evicted_entries,
+                                            );
                                     }
                                 }
                                 run
@@ -6084,7 +6092,11 @@ impl LlamaProvider {
                 let _ = self
                     .prefix
                     .borrow_mut()
-                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                    .promote_protected_counting_evictions(
+                        &prompt_ids[..pb.position],
+                        pb.kind,
+                        &mut checkpoint_telemetry.evicted_entries,
+                    );
             }
         }
         run.report.draft = Some(block.report.clone());

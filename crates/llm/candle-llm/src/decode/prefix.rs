@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 use candle_core::Tensor;
 
 use core_llm::{
-    PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixKind, PrefixPlannedContext,
-    PrefixReuse, PrefixStore, PREFIX_CANCELLED_NOT_STORED, PREFIX_PROTECTED_CAP_DEMOTED,
-    PREFIX_PROTECTED_PRESERVED,
+    CheckpointTelemetry, PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixKind,
+    PrefixPlannedContext, PrefixReuse, PrefixStore, PREFIX_CANCELLED_NOT_STORED,
+    PREFIX_PROTECTED_CAP_DEMOTED, PREFIX_PROTECTED_PRESERVED,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -344,6 +344,16 @@ impl PrefixCache {
         self.store.promote_protected(tokens, kind)
     }
 
+    pub(crate) fn promote_protected_counting_evictions(
+        &mut self,
+        tokens: &[i32],
+        kind: PrefixKind,
+        evicted_entries: &mut u32,
+    ) -> bool {
+        self.store
+            .promote_protected_counting_evictions(tokens, kind, evicted_entries)
+    }
+
     /// The held entries' token keys, least-recently-used first.
     pub fn keys(&self) -> Vec<Vec<i32>> {
         self.store.keys().into_iter().map(<[i32]>::to_vec).collect()
@@ -650,6 +660,27 @@ impl PrefixCache {
         Ok(outcome)
     }
 
+    /// Record a request's store outcome, including evictions committed before a snapshot failed.
+    pub(crate) fn record_checkpoint_store(
+        &mut self,
+        telemetry: &mut CheckpointTelemetry,
+        store: impl FnOnce(&mut Self) -> Result<PrefixStoreOutcome>,
+    ) -> Result<()> {
+        let evicted_before = self.stats().evicted;
+        match store(self) {
+            Ok(outcome) => {
+                telemetry.record_store(outcome);
+                Ok(())
+            }
+            Err(error) => {
+                let evicted =
+                    u32::try_from(self.stats().evicted - evicted_before).unwrap_or(u32::MAX);
+                telemetry.evicted_entries = telemetry.evicted_entries.saturating_add(evicted);
+                Err(error)
+            }
+        }
+    }
+
     fn record_checkpoint_entry(
         &mut self,
         tokens: Vec<i32>,
@@ -697,8 +728,11 @@ impl PrefixCache {
     ) {
         if pb.position > 0 && pb.position <= prompt.len() {
             let key = &prompt[..pb.position];
-            if !self.store.promote_protected(key, pb.kind)
-                && self.store.contains_exact(key)
+            if !self.promote_protected_counting_evictions(
+                key,
+                pb.kind,
+                &mut outcome.evicted_entries,
+            ) && self.store.contains_exact(key)
                 && !outcome
                     .fallbacks
                     .iter()
@@ -993,6 +1027,82 @@ mod tests {
         let mut cache = ContiguousKvCache::new(1);
         cache.update(0, &t, &t).unwrap();
         cache
+    }
+
+    #[test]
+    fn reused_checkpoint_promotion_reports_protected_evictions() {
+        let prompt = [10, 11, 12];
+        let boundary = PlannedBoundary {
+            position: 2,
+            kind: PrefixKind::Document,
+            protected: true,
+        };
+        let document = &prompt[..boundary.position];
+        for (during_storage, snapshot_fails) in [(false, false), (true, false), (true, true)] {
+            let mut cache = PrefixCache::with_budget(100);
+            // Synthetic byte sizes exercise the 75-byte document cap without tensor operations.
+            for (key, bytes, kind, protected) in [
+                (&[1, 2][..], 30, PrefixKind::SharedRoot, true),
+                (document, 60, PrefixKind::Conversation, false),
+            ] {
+                let entry = PrefixEntry::Kv(Vec::new());
+                assert!(
+                    cache
+                        .store
+                        .insert_with_meta(
+                            key.to_vec(),
+                            PrefixReuse::WholeEntry,
+                            bytes,
+                            entry,
+                            kind,
+                            protected,
+                        )
+                        .stored
+                );
+            }
+
+            let mut telemetry = CheckpointTelemetry {
+                evicted_entries: 2,
+                ..Default::default()
+            };
+            if during_storage {
+                let result = cache.record_checkpoint_store(&mut telemetry, |prefix| {
+                    let mut outcome = PrefixStoreOutcome::default();
+                    prefix.try_promote_reused(&prompt, boundary, &mut outcome);
+                    if snapshot_fails {
+                        return Err(Error::Msg("snapshot failed after promotion".into()));
+                    }
+                    Ok(outcome)
+                });
+                assert_eq!(result.is_err(), snapshot_fails);
+            } else {
+                assert!(cache.promote_protected_counting_evictions(
+                    document,
+                    boundary.kind,
+                    &mut telemetry.evicted_entries,
+                ));
+            }
+
+            assert_eq!(cache.keys(), vec![document.to_vec()]);
+            assert_eq!(cache.protected_bytes(), 60);
+            assert!(cache.promote_protected_counting_evictions(
+                document,
+                boundary.kind,
+                &mut telemetry.evicted_entries,
+            ));
+            let report = telemetry.into_report(
+                "document",
+                2,
+                1,
+                cache.resident_bytes(),
+                cache.protected_bytes(),
+            );
+            assert_eq!(
+                report.evicted_entries, 3,
+                "during storage: {during_storage}, snapshot fails: {snapshot_fails}"
+            );
+            assert_eq!(report.checkpoints_captured, 0);
+        }
     }
 
     /// Defence in depth (sc-12455): if an entry's key ever over-states its KV again (the pre-fix
