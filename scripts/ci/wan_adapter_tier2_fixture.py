@@ -256,8 +256,9 @@ def observe(stdout, path, binding, variant):
     device = {"kind": "candle-cuda" if cuda else "mlx-metal", "index": 0}
     if (row["device"] != device or set(experts) != {"high", "low"}
             or timesteps != sorted(timesteps, reverse=True) or row["progress"] != progress
-            or len(digests) != (17 if cuda else MLX_NATIVE_DECODED_FRAMES) or len(set(digests)) < 2
-            or any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests)):
+            or not isinstance(digests, list) or len(digests) != (17 if cuda else MLX_NATIVE_DECODED_FRAMES)
+            or any(not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests)
+            or len(set(digests)) < 2):
         raise ValueError("Wan output does not prove both expert branches and the frozen decoded clip")
     peaks = {}
     if cuda:

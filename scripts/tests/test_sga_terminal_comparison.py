@@ -379,6 +379,10 @@ class TerminalTests(unittest.TestCase):
                 with self.subTest(count=count), self.assertRaisesRegex(ValueError, "frozen decoded clip"):
                     wan.observe(log, result, "nax", variant)
 
+            result.write_text(json.dumps(dict(row, frame_rgb8_sha256=dict.fromkeys(digests))), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "frozen decoded clip"):
+                wan.observe(log, result, "nax", variant)
+
             altered = [*digests[:-1], "f" * 64]
             result.write_text(json.dumps(dict(row, frame_rgb8_sha256=altered)), encoding="utf-8")
             samples = {name: full for name, _ in comparison.SAMPLES}
