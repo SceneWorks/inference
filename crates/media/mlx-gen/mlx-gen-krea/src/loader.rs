@@ -1209,8 +1209,8 @@ mod tests {
     /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values (not 1.0),
     /// and 256 `.comfy_quant` descriptors — 160 `{"format": "float8_e4m3fn"}` plus 96
     /// `{"format": "float8_e4m3fn", "full_precision_matrix_mult": true}` — with the other 174
-    /// tensors left BF16. They exercise the companion-scale and forced-dense paths this test does
-    /// not; `kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm` covers them.
+    /// tensors left BF16. `kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm` covers the
+    /// companion-scale path and its per-layer activation policy.
     #[test]
     #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8 to a plain fp8_e4m3fn Krea 2 DiT"]
     fn kreamania_fp8_cast_plans_as_scalar_fp8_through_the_codec_seam() {
@@ -1255,16 +1255,17 @@ mod tests {
                 &tensor.codec,
                 mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
                     scale: mlx_gen::gen_core::ScalarScaleSource::Unit,
-                    ..
+                    input_scale: None,
+                    full_precision_matrix_mult: true,
                 }
             )),
-            "a plain cast carries no scale companion, so every layer plans at unit scale"
+            "a plain cast uses unit-scale weights with floating activations"
         );
-        // Residency: fp8 layers double (→ bf16), dense rows keep their stored bytes. Summing the
-        // two is the real relationship the blanket `2 * declared` was standing in for.
+        // Packed matrices use their stored bytes and coefficients cast to BF16.
+        let metal = mlx_gen::metal_available();
         let fp8_resident: u64 = fp8
             .iter()
-            .map(|t| t.source_bytes * if t.shape.len() == 2 { 1 } else { 2 })
+            .map(|t| t.source_bytes * if metal && t.shape.len() == 2 { 1 } else { 2 })
             .sum();
         let dense_source: u64 = plan
             .tensors
@@ -1455,13 +1456,14 @@ mod tests {
     /// `.comfy_quant` descriptors, of which **96 set `full_precision_matrix_mult`**, with the
     /// remaining 174 tensors left BF16.
     ///
-    /// So one file exercises three things the plain cast cannot: `ScalarScaleSource::Companion`
-    /// (never `Unit`), the `full_precision_matrix_mult` forced-dense rule, and mixed per-layer
-    /// dispatch against dense bf16 — on the real published artifact.
+    /// This file exercises companion-backed scales and mixed per-layer activation modes alongside
+    /// dense BF16 weights. On Metal, both scalar modes retain the original bytes.
     /// `KREA_NATIVE_DIT_FP8_SCALED` points at the file.
     #[test]
     #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8"]
     fn kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm() {
+        use mlx_gen::{gen_core::ResidencyMode, mlx_layers::NativeProjection};
+
         let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_FP8_SCALED") else {
             panic!("set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8 DiT");
         };
@@ -1501,13 +1503,6 @@ mod tests {
             .filter(|tensor| tensor.codec.full_precision_matrix_mult())
             .count();
         assert_eq!(fpmm, 96, "96 layers declare full_precision_matrix_mult");
-        // NOTE: asserting these layers plan *dense* would be vacuous here — MLX plans under
-        // `DenseResidencyPolicy`, so every layer is dense whether or not the flag is honored
-        // (verified: deleting the fpmm-forces-dense rule in the compiler leaves this test green).
-        // The flag's residency consequence is tested where a packed policy exists, in gen-core's
-        // `packed_policy_prices_stored_bytes_plus_scales_and_honors_full_precision_layers`. What
-        // this assertion is worth on the real artifact is that the descriptor parse recovered the
-        // flag from 96 of 256 real `.comfy_quant` payloads at all.
 
         // 256 weight_scale + 256 comfy_quant, every one consumed; every data byte accounted for.
         assert_eq!(plan.companions.len(), 256 * 2);
@@ -1515,13 +1510,7 @@ mod tests {
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
 
-        let group_source = |fpmm_wanted: bool| -> u64 {
-            fp8.iter()
-                .filter(|tensor| tensor.codec.full_precision_matrix_mult() == fpmm_wanted)
-                .map(|tensor| tensor.source_bytes)
-                .sum()
-        };
-        let (fpmm_source, plain_fp8_source) = (group_source(true), group_source(false));
+        let fp8_source: u64 = fp8.iter().map(|tensor| tensor.source_bytes).sum();
         let dense_source: u64 = plan
             .tensors
             .iter()
@@ -1533,23 +1522,23 @@ mod tests {
             .iter()
             .map(|companion| companion.resident_bytes)
             .sum();
+        let metal = mlx_gen::metal_available();
+        let (mode, bytes_per_code, scale_bytes) = if metal {
+            (ResidencyMode::Packed, 1, 4)
+        } else {
+            (ResidencyMode::Dense, 2, 0)
+        };
+        assert!(
+            fp8.iter().all(|tensor| {
+                tensor.residency.mode == mode
+                    && tensor.residency.resident_bytes == bytes_per_code * tensor.source_bytes
+            }),
+            "both scalar activation modes must follow the Metal projection residency policy"
+        );
+        assert_eq!(companion_resident, scale_bytes * fp8.len() as u64);
         assert_eq!(
             plan.resident_bytes(),
-            2 * fpmm_source + plain_fp8_source + dense_source + companion_resident,
-            "only full_precision_matrix_mult projections decode to BF16"
-        );
-        assert_eq!(companion_resident, 4 * (fp8.len() - fpmm) as u64);
-        // Per-layer, not just in aggregate: every fpmm layer's own residency is 2× its stored bytes.
-        assert!(
-            fp8.iter()
-                .filter(|tensor| tensor.codec.full_precision_matrix_mult())
-                .all(|tensor| tensor.residency.resident_bytes == 2 * tensor.source_bytes),
-            "each of the 96 fpmm layers doubles individually"
-        );
-        eprintln!(
-            "RESULT kreamania-scaled-fp8-residency fpmm_source={fpmm_source} \
-             plain_fp8_source={plain_fp8_source} dense_source={dense_source} total={}",
-            plan.resident_bytes()
+            bytes_per_code * fp8_source + dense_source + companion_resident
         );
 
         let (lazy, receipt) =
@@ -1558,8 +1547,22 @@ mod tests {
         assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
         assert_eq!(
             lazy.keys().filter(|k| k.ends_with(".weight_scale")).count(),
-            fp8.len() - fpmm
+            if metal { fp8.len() } else { 0 }
         );
+        if metal {
+            for tensor in &fp8 {
+                let Some(NativeProjection::Fp8(projection)) =
+                    lazy.source_projection(&tensor.logical_key).unwrap()
+                else {
+                    panic!("{} should bind original FP8 bytes", tensor.logical_key);
+                };
+                assert_eq!(projection.codes().nbytes() as u64, tensor.source_bytes);
+                assert_eq!(
+                    projection.full_precision_matrix_mult(),
+                    tensor.codec.full_precision_matrix_mult(),
+                );
+            }
+        }
         assert_eq!(
             receipt.materialization,
             mlx_gen::gen_core::LogicalReadMaterialization::Deferred

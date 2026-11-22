@@ -122,8 +122,7 @@ impl SwitchLinear {
             if !matches!(
                 desc.format,
                 ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
-            ) || desc.full_precision_matrix_mult
-            {
+            ) {
                 return Err(Error::Config(format!(
                     "{key}: stacked source requires a scalar FP8 scale for the entire expert bank"
                 )));
@@ -145,13 +144,14 @@ impl SwitchLinear {
             let all_rows = e.checked_mul(rows).ok_or_else(|| {
                 Error::Config(format!("{key}: expert bank exceeds MLX row range"))
             })?;
-            let matrix = mlx_layers::fp8::Fp8Linear::new(
+            let matrix = mlx_layers::fp8::Fp8Linear::from_source(
                 desc.format,
                 codes.reshape(&[all_rows, cols])?,
                 scales,
                 input,
                 &[all_rows as usize, cols as usize],
                 None,
+                desc.full_precision_matrix_mult,
             )?;
             let mut parts = Vec::with_capacity(e as usize);
             for i in 0..e {

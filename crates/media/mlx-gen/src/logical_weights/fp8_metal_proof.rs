@@ -44,6 +44,130 @@ fn ordered_bf16(v: f32) -> i32 {
         0x8000 + b
     }
 }
+
+fn check_weight_only_scalar_projection() {
+    use ComfyQuantFormat::*;
+
+    for (format, unit, non_fp8) in [
+        (Float8E4M3Fn, 0x38_u8, 1.0625_f32),
+        (Float8E5M2, 0x3c_u8, 1.125_f32),
+    ] {
+        // The exact midpoint is representable in every compute dtype, but FP8 rounds it
+        // down to one. A raw unit-scale source must preserve it through the projection.
+        let raw = Fp8Linear::from_source(
+            format,
+            Array::from_slice(&[unit], &[1, 1]),
+            None,
+            None,
+            &[1, 1],
+            None,
+            true,
+        )
+        .unwrap();
+        let calibrated =
+            Fp8Linear::new(format, raw.codes().clone(), None, None, &[1, 1], None).unwrap();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x = Array::from_slice(&[non_fp8], &[1, 1])
+                .as_dtype(dtype)
+                .unwrap();
+            let actual = raw.forward(&x).unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(
+                actual.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>(),
+                &[non_fp8]
+            );
+            let rounded = calibrated
+                .forward(&x)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            assert_eq!(rounded.as_slice::<f32>(), &[1.]);
+        }
+
+        // Multiple K tiles and partial M/N tiles with independent inputs, weight codes,
+        // and a bias. The dense oracle rounds the scaled coefficient to the compute dtype
+        // before matmul and adds bias only after the output cast.
+        const M: usize = 17;
+        const N: usize = 19;
+        const K: usize = 67;
+        let codes: Vec<_> = (0..N * K)
+            .map(|i| unit + ((i / K * 5 + i % K * 3) % 7) as u8)
+            .collect();
+        let values: Vec<_> = (0..M * K)
+            .map(|i| ((i * 7 + 5) % 17 + 1) as f32 / 16.)
+            .collect();
+        let biases: Vec<_> = (0..N).map(|i| (i % 5) as f32 / 16. - 0.125).collect();
+        let sw = 1. + 3. / 1024.;
+        let weight: Vec<_> = codes
+            .iter()
+            .map(|&byte| codebook(format, byte) * sw)
+            .collect();
+        let weight = Array::from_slice(&weight, &[N as i32, K as i32]);
+        let bias = Array::from_slice(&biases, &[N as i32]);
+        let op = Fp8Linear::from_source(
+            format,
+            Array::from_slice(&codes, &[N as i32, K as i32]),
+            Some(Array::from_f32(sw)),
+            Some(Array::from_f32(0.3)),
+            &[N, K],
+            Some(bias.clone()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(op.codes().dtype(), Dtype::Uint8);
+        assert_eq!(op.codes().nbytes(), N * K);
+        assert_eq!(op.scales().as_slice::<f32>(), &[sw]);
+        assert_eq!(op.input_scale().as_slice::<f32>(), &[0.3]);
+        for (dtype, relative) in [
+            (Dtype::Float32, 1e-6),
+            (Dtype::Float16, 1. / 1024.),
+            (Dtype::Bfloat16, 1. / 128.),
+        ] {
+            let input = Array::from_slice(&values, &[M as i32, K as i32])
+                .as_dtype(dtype)
+                .unwrap();
+            let rounded = weight.as_dtype(dtype).unwrap().transpose().unwrap();
+            let expected = mlx_rs::ops::matmul(&input, &rounded).unwrap();
+            let expected = mlx_rs::ops::add(&expected, bias.as_dtype(dtype).unwrap())
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            let actual = op.forward(&input).unwrap();
+            assert_eq!(actual.shape(), [M as i32, N as i32]);
+            assert_eq!(actual.dtype(), dtype);
+            let actual = actual.as_dtype(Dtype::Float32).unwrap();
+            for (&got, &want) in actual
+                .as_slice::<f32>()
+                .iter()
+                .zip(expected.as_slice::<f32>())
+            {
+                assert!(
+                    (got - want).abs() <= relative * want.abs().max(1.),
+                    "{format:?} {dtype:?}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    // The BF16-cast weight subnormal makes the exact accumulator a rounding midpoint.
+    // Applying the scale after matmul would push the output above that midpoint.
+    let op = Fp8Linear::from_source(
+        Float8E4M3Fn,
+        Array::from_slice(&[0x38_u8, 0x02], &[1, 2]),
+        Some(Array::from_f32(1. + 1. / 512.)),
+        None,
+        &[1, 2],
+        Some(Array::from_slice(&[-1.0_f32], &[1])),
+        true,
+    )
+    .unwrap();
+    let x = Array::from_slice(&[1.0_f32, 1.0], &[1, 2])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let y = op.forward(&x).unwrap().as_dtype(Dtype::Float32).unwrap();
+    assert_eq!(y.as_slice::<f32>(), &[0.]);
+}
+
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn metal_projection_matches_fixed_codebook_reference_and_dtype_rounding() {
@@ -238,6 +362,7 @@ fn metal_projection_matches_fixed_codebook_reference_and_dtype_rounding() {
         actual.eval().unwrap();
         assert_eq!(actual.as_slice::<f32>(), &[expected]);
     }
+    check_weight_only_scalar_projection();
     crate::model_inference_device::record_model_inference_device();
     println!("\nMODEL_INFERENCE_BODY_COMPLETED logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding");
 }

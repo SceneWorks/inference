@@ -434,7 +434,15 @@ fn bind_fp8(
     }
     let has_scale = sw.is_some();
     let has_input = sx.is_some();
-    let fp8 = mlx_layers::fp8::Fp8Linear::new(format, codes, sw, sx, &t.shape, None)?;
+    let fp8 = mlx_layers::fp8::Fp8Linear::from_source(
+        format,
+        codes,
+        sw,
+        sx,
+        &t.shape,
+        None,
+        t.codec.full_precision_matrix_mult(),
+    )?;
     Ok((fp8, has_scale, has_input))
 }
 
