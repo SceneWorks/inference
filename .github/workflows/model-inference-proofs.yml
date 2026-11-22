@@ -83,8 +83,9 @@ jobs:
           plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "model-proof-plan.json").read_text())
           setup = plan["asset_setup"]
           paired = setup in ("wan-curated-tier1", "mochi-svd-tier1", "scail2-tier1")
-          canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() if paired or plan.get("protocol") == "scail2-plural-fit-v1" else b""
-          row = {"runner": plan["runner"], "asset_setup": setup, "paired_source": paired,
+          fresh_source = paired or plan.get("protocol") == "scail2-plural-fit-v1"
+          canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() if fresh_source else b""
+          row = {"runner": plan["runner"], "asset_setup": setup, "paired_source": paired, "fresh_source": fresh_source,
                  "video_plan_sha256": hashlib.sha256(canonical).hexdigest() if canonical else ""}
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               print("matrix=" + json.dumps({"include": [row]}, separators=(",", ":")), file=output)
@@ -101,10 +102,10 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # Keep paired video history in a fresh repository. Reused listeners may have a
-      # shallow index with linked objects that Git cannot repack during an all-ref unshallow.
+      # A reused listener can lack blobs from earlier partial fetches. Use a fresh
+      # repository for the video proofs that clone a second isolated build tree.
       VIDEO_TIER1_PLAN_SHA256: ${{ matrix.video_plan_sha256 }}
-      MODEL_PROOF_CWD: ${{ matrix.paired_source && format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.' }}
+      MODEL_PROOF_CWD: ${{ matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.' }}
       FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
       MODEL_PROOF_BACKEND: ${{ inputs.backend }}
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
@@ -125,9 +126,9 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Create the fresh paired checkout directory
-        if: matrix.paired_source
-        id: paired_checkout
+      - name: Create the fresh proof checkout directory
+        if: matrix.fresh_source
+        id: fresh_checkout
         shell: bash
         run: mkdir -- "$MODEL_PROOF_CWD"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -270,6 +271,7 @@ jobs:
           set "PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
           "%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py
       - name: Stage and bind declared pinned Hub snapshots (Linux/macOS)
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: matrix.asset_setup == 'hub-snapshots' && runner.os != 'Windows'
         shell: bash
         env:
@@ -279,6 +281,7 @@ jobs:
           "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
           "$PYTHON" -I scripts/ci/stage_pinned_hub_snapshots.py --plan "$RUNNER_TEMP/model-proof-plan.json"
       - name: Stage and bind declared pinned Hub snapshots (Windows)
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: matrix.asset_setup == 'hub-snapshots' && runner.os == 'Windows'
         shell: cmd
         env:
@@ -312,7 +315,7 @@ jobs:
       - name: Validate owned evidence tree before any upload
         working-directory: ${{ env.MODEL_PROOF_CWD }}
         id: evidence
-        if: always() && (!matrix.paired_source || steps.source.outcome == 'success')
+        if: always() && (!matrix.fresh_source || steps.source.outcome == 'success')
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
@@ -326,8 +329,8 @@ jobs:
           name: model-proof-${{ github.sha }}-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MODEL_PROOF_EVIDENCE }}
           if-no-files-found: error
-      - name: Remove the owned paired checkout
-        if: always() && steps.paired_checkout.outcome == 'success'
+      - name: Remove the owned proof checkout
+        if: always() && steps.fresh_checkout.outcome == 'success'
         shell: bash
         run: |
           checkout="paired-src-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

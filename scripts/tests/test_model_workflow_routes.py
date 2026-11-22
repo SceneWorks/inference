@@ -106,42 +106,47 @@ class ModelWorkflowRoutes(unittest.TestCase):
         for selector in selectors:
             self.assertIn(selector, workflow["env"]["MODEL_PROOF_SCRIPT"])
             self.assertIn(selector, steps[0]["with"]["fetch-depth"])
-        for selector in (*selectors, "registered", "mochi-svd-tier1-other"):
+        for selector in (*selectors, "scail2-plural-fit", "hub-snapshots", "registered", "mochi-svd-tier1-other"):
             with self.subTest(selector=selector), tempfile.TemporaryDirectory() as location:
                 root = Path(location)
                 data = {"runner": ["expected"], "asset_setup": selector}
+                if selector == "scail2-plural-fit":
+                    data.update(protocol="scail2-plural-fit-v1", asset_setup="hub-snapshots")
                 (root / "model-proof-plan.json").write_text(json.dumps(data))
                 output = root / "output"
                 subprocess.run([sys.executable, "-I", "-"], input=python, text=True, check=True,
                                env=dict(os.environ, RUNNER_TEMP=location, GITHUB_OUTPUT=str(output)))
                 row, = json.loads(output.read_text().removeprefix("matrix="))["include"]
                 self.assertEqual(row["paired_source"], selector in selectors)
+                fresh = selector in (*selectors, "scail2-plural-fit")
+                self.assertEqual(row["fresh_source"], fresh)
                 digest = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                self.assertEqual(row["video_plan_sha256"], digest if selector in selectors else "")
+                self.assertEqual(row["video_plan_sha256"], digest if fresh else "")
         self.assertEqual(workflow["jobs"]["prove"]["env"]["VIDEO_TIER1_PLAN_SHA256"], "${{ matrix.video_plan_sha256 }}")
 
     @unittest.skipUnless(os.name == "posix", "uses local Git and Bash; does not contact Actions")
-    def test_paired_full_history_uses_fresh_attempt_and_leaves_reused_shallow_checkout(self):
+    def test_paired_and_scail_checkouts_survive_a_reused_promisor_repository(self):
         job = document("model-inference-proofs.yml")["jobs"]["prove"]
         steps = job["steps"]
-        create = next(s for s in steps if s.get("id") == "paired_checkout")
+        create = next(s for s in steps if s.get("id") == "fresh_checkout")
         source = next(s for s in steps if s.get("id") == "source")
-        cleanup = next(s for s in steps if s.get("name") == "Remove the owned paired checkout")
-        self.assertEqual(create["if"], "matrix.paired_source")
-        self.assertIn("format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
+        cleanup = next(s for s in steps if s.get("name") == "Remove the owned proof checkout")
+        self.assertEqual(create["if"], "matrix.fresh_source")
+        self.assertIn("matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
         self.assertEqual(source["with"]["path"], "${{ env.MODEL_PROOF_CWD }}")
         self.assertEqual(source["with"]["ref"], "${{ github.sha }}")
         self.assertEqual(source["with"]["fetch-depth"], "${{ matrix.paired_source && '0' || '1' }}")
         self.assertIs(source["with"]["persist-credentials"], False)
         self.assertLess(steps.index(create), steps.index(source))
-        self.assertEqual(cleanup["if"], "always() && steps.paired_checkout.outcome == 'success'")
+        self.assertEqual(cleanup["if"], "always() && steps.fresh_checkout.outcome == 'success'")
         for step in steps:
             if step.get("working-directory"):
                 self.assertEqual(step["working-directory"], source["with"]["path"])
             # All Wan-reachable script commands must resolve inside the selected source on both OSes.
             if (step.get("name") in {"Install reviewed CPython 3.12 on Windows", "Select Rustup proxies on Linux and macOS",
                     "Select real pinned Rust toolchain on Windows", "Report actual host and pinned toolchain (no model execution)",
-                    "Validate owned evidence tree before any upload"} or "Run exact registered model tests" in step.get("name", "")):
+                    "Validate owned evidence tree before any upload"} or "Run exact registered model tests" in step.get("name", "")
+                    or "Stage and bind declared pinned Hub snapshots" in step.get("name", "")):
                 self.assertEqual(step.get("working-directory"), source["with"]["path"])
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -152,6 +157,9 @@ class ModelWorkflowRoutes(unittest.TestCase):
                                                 "-C", str(path), *args], text=True).strip()
             origin.mkdir()
             git(origin, "init", "-q", "-b", "main")
+            git(origin, "config", "uploadpack.allowFilter", "true")
+            git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+            git(origin, "commit", "-q", "--allow-empty", "-m", "history")
             (origin / "source").write_text("before migration")
             git(origin, "add", "source")
             git(origin, "commit", "-qm", "trusted base")
@@ -159,7 +167,15 @@ class ModelWorkflowRoutes(unittest.TestCase):
             (origin / "source").write_text("after migration")
             git(origin, "commit", "-qam", "candidate")
             head = git(origin, "rev-parse", "HEAD")
-            git(origin, "clone", "-q", "--depth=1", origin.as_uri(), str(workspace))
+            git(origin, "clone", "-q", "--depth=2", "--filter=blob:none", "--no-checkout", origin.as_uri(), str(workspace))
+            git(workspace, "checkout", "-q", "--detach", head)
+            self.assertEqual(git(workspace, "config", "remote.origin.promisor"), "true")
+            git(workspace, "remote", "set-url", "origin", (origin.parent / "offline").as_uri())
+            legacy = subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(workspace),
+                                     str(origin.parent / "reused-clone")], capture_output=True, text=True)
+            self.assertNotEqual(legacy.returncode, 0)
+            self.assertIn("promisor", legacy.stderr)
+
             marker = workspace / "listener-owned"
             marker.write_text("preserve")
             env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="paired-src-42-3")
@@ -188,6 +204,23 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertFalse(owned.exists())
             self.assertEqual(git(workspace, "rev-parse", "--is-shallow-repository"), "true")
             self.assertEqual(git(workspace, "rev-parse", "HEAD"), head)
+            self.assertEqual(marker.read_text(), "preserve")
+
+            # SCAIL needs a complete tip tree for its fixture overlay, but no
+            # paired migration base. Reproduce checkout v5's SHA-only fetch.
+            run_step(create)
+            git(owned, "init", "-q")
+            git(owned, "fetch", "-q", "--no-tags", "--depth=1", origin.as_uri(), head)
+            git(owned, "checkout", "-q", "--detach", "FETCH_HEAD")
+            self.assertEqual(git(owned, "rev-parse", "--is-shallow-repository"), "true")
+            scratch = origin.parent / "scail-build"
+            git(owned, "clone", "--quiet", "--shared", "--no-checkout", str(owned), str(scratch))
+            git(scratch, "checkout", "--quiet", "--detach", head)
+            self.assertEqual(git(scratch, "rev-parse", "HEAD^{tree}"), git(origin, "rev-parse", head + "^{tree}"))
+            (scratch / "source").write_text("fixture overlay")
+            self.assertEqual((owned / "source").read_text(), "after migration")
+            run_step(cleanup)
+            self.assertFalse(owned.exists())
             self.assertEqual(marker.read_text(), "preserve")
 
     def test_owned_paths_and_runner_context_are_step_not_job_environment(self):
