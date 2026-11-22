@@ -160,6 +160,11 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
     // justification: off, MEASURED (mlx-final-compare.md, mlx-campaign-6): every proposer is
     // greedy-exact (E1), but `auto` vs `off` regresses decode beyond the noise band on Qwen3-8B
     // (chat -19.0%) and the Gemma 4 enhancer (chat -3.9%), so a request opts in per family.
+    // SW-F357 paired real-weight runs (MLX runs 45024221234 / 45038552790 vs baseline
+    // 45026043098): adaptive `Auto` improves Qwen3.8-27B Q4 (-11.1..-24.4% total wall vs `off`)
+    // and Qwen3-0.6B greedy (-1.2..-16.1%), but remains opt-in backend-wide because Qwen3-0.6B
+    // sampled (+2.1..+13.9% vs `off`) and MLX Qwen3.8-27B open-ended `chat`/`creative`
+    // (+6.1..+17.8% vs `off`) still regress relative to plain decode.
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths (MTP: the checkpoints' upstream recommendation;
     // prompt lookup / draft model: sc-24433 / sc-24436), clamped per model to the backend max.
@@ -222,7 +227,10 @@ pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
     backend: DecodeBackend::CandleCuda,
     // justification: off, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): greedy-exact, but
     // `auto` vs `off` regresses decode beyond the noise band on Bonsai (graphs on: -5.6..-18.3%),
-    // so a request opts in.
+    // so a request opts in. SW-F357 paired real-weight runs (Candle/CUDA run 45033639000 vs
+    // baseline 45027343772): adaptive `Auto` improves Qwen3.8-27B Q4 (-11.1..-24.4% total wall
+    // vs `off`) and Qwen3-0.6B greedy (-1.2..-16.1%), but remains opt-in backend-wide because
+    // Qwen3-0.6B sampled (+2.1..+13.9% vs `off`) still regresses relative to plain decode.
     speculative: Speculative::Off,
     // justification: proposer-intrinsic depths, clamped per model to the backend max.
     recommended_depths: RECOMMENDED_DEPTHS,

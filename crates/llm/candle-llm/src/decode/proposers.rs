@@ -441,6 +441,11 @@ pub struct DraftModelProposer<'a, D: StepModel> {
     budget: usize,
     max_drafts: usize,
     base: i32,
+    /// Committed tokens not yet fed into the draft cache (queued during plain probes or while an
+    /// alternate adaptive proposer ran).
+    pending: Vec<i32>,
+    /// Whether `propose` ran on the current step (`false` when committing an inactive step).
+    proposed_this_step: bool,
     /// Leading draft ids a draft may be drawn from (the tokenizer's tokens the draft scores).
     proposable: usize,
     /// The target's logits width, which the draft's logits are shaped to.
@@ -460,6 +465,8 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
             budget: capacity,
             max_drafts,
             base: 0,
+            pending: Vec::new(),
+            proposed_this_step: false,
             proposable: draft.vocab_size(),
             width: draft.vocab_size(),
             draft_forwards: 0,
@@ -519,6 +526,8 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
             .forward_step(&mut cache, StepRequest::last(prompt).as_prefill())?;
         self.draft_forwards += 1;
         self.cache = Some(cache);
+        self.pending.clear();
+        self.proposed_this_step = false;
         Ok(())
     }
 
@@ -530,13 +539,33 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         let k = ctx.max_drafts;
         let device = self.draft.device().clone();
         let mut cache = self.take_cache()?;
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            let catchup = self
+                .draft
+                .forward_step(&mut cache, StepRequest::last(&pending));
+            self.draft_forwards += 1;
+            if let Err(err) = catchup {
+                self.cache = Some(cache);
+                return Err(err);
+            }
+        }
         self.base = cache.len();
+        self.proposed_this_step = true;
         let result = self.propose_into(&mut cache, ctx, sampler, k, &device);
         self.cache = Some(cache);
         result
     }
 
     fn commit(&mut self, cur: i32, accepted: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        if !self.proposed_this_step {
+            // Inactive step (plain probe, budget clamp, or alternate adaptive proposer): queue
+            // `[cur, accepted…]` with zero draft forwards until this proposer runs again.
+            self.pending.push(cur);
+            self.pending.extend_from_slice(accepted);
+            return Ok(());
+        }
+        self.proposed_this_step = false;
         let base = self.base;
         let mut cache = self.take_cache()?;
         // A host-sampled run stops drafting at a stop token without feeding it, so an accepted
@@ -556,6 +585,24 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
             }),
             Err(e) => Err(e),
         };
+        self.cache = Some(cache);
+        result
+    }
+
+    fn catch_up(&mut self, tokens: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        let replay = if !self.pending.is_empty() {
+            std::mem::take(&mut self.pending)
+        } else if !tokens.is_empty() {
+            tokens.to_vec()
+        } else {
+            return Ok(());
+        };
+        let mut cache = self.take_cache()?;
+        let result = self
+            .draft
+            .forward_step(&mut cache, StepRequest::last(&replay))
+            .map(|_| ());
+        self.draft_forwards += 1;
         self.cache = Some(cache);
         result
     }

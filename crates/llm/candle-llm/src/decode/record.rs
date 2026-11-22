@@ -199,6 +199,8 @@ pub struct DecodeRecord {
     pub tree_fallback: Option<&'static str>,
     /// [`core_llm::DecodeReport::draft_time`] (SW-7200); `None` when no proposer call ran.
     pub draft_time: Option<core_llm::DraftTime>,
+    /// Adaptive speculative telemetry ([`core_llm::DecodeReport::adaptive_speculative`], SW-7237).
+    pub adaptive_speculative: Option<core_llm::AdaptiveSpeculativeReport>,
 }
 
 impl DecodeRecord {
@@ -238,7 +240,17 @@ impl DecodeRecord {
             tree_verify: None,
             tree_fallback: None,
             draft_time: None,
+            adaptive_speculative: None,
         }
+    }
+
+    /// The same record with its adaptive speculative telemetry set (SW-7237).
+    pub fn with_adaptive_speculative(
+        mut self,
+        adaptive_speculative: core_llm::AdaptiveSpeculativeReport,
+    ) -> Self {
+        self.adaptive_speculative = Some(adaptive_speculative);
+        self
     }
 
     /// The same record with its CUDA-graph tally filled in (from [`RequestSpan::cuda_graphs`]).
@@ -358,6 +370,7 @@ impl DecodeRecord {
             tree_verify: stats.tree,
             tree_fallback: stats.tree_fallback,
             draft_time: stats.draft_time,
+            adaptive_speculative: None,
         }
     }
 
@@ -451,6 +464,7 @@ impl DecodeRecord {
                 reason: self.prefix_cache_reason.map(str::to_string),
             },
             prefix_checkpoints: self.prefix_checkpoints.clone(),
+            adaptive_speculative: self.adaptive_speculative.clone(),
             fallbacks: self
                 .tree_fallback
                 .map(tree_fallback_reason)

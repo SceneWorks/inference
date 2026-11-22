@@ -264,8 +264,10 @@ where
         _: i32,
     ) -> Result<()> {
         let Some(fed) = self.fed.take() else {
-            // A step with no proposal (the budget clamped it to no drafts): `cur` was never fed.
+            // A step with no proposal from this proposer (budget clamp, plain probe, or another
+            // adaptive proposer ran): queue `cur` and any accepted drafts for the next proposal.
             self.pending.push(cur);
+            self.pending.extend_from_slice(accepted);
             return Ok(());
         };
         let draft = self.draft;
@@ -282,6 +284,19 @@ where
             // Back at the step start (just past `cur`): the whole accepted run is still to feed.
             Rollback::Restored => accepted.to_vec(),
         };
+        Ok(())
+    }
+
+    fn catch_up(&mut self, _: &T, tokens: &[i32], _: Option<&Array>, _: i32) -> Result<()> {
+        let replay = if !self.pending.is_empty() {
+            std::mem::take(&mut self.pending)
+        } else if !tokens.is_empty() {
+            tokens.to_vec()
+        } else {
+            return Ok(());
+        };
+        let logits = self.feed(&replay)?;
+        eval([&logits])?;
         Ok(())
     }
 }

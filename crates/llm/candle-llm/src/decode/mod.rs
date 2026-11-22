@@ -34,10 +34,10 @@ pub use block_draft::{BlockDraftProposer, TappedQwen35};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
-    generate_speculative, generate_speculative_monitored, generate_speculative_with,
-    generate_with_sampler, tree_extra_positions, DraftSample, DraftSampler, Drafts, NoProposer,
-    Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
-    SpeculativeRun, TokenSampler,
+    generate_speculative, generate_speculative_adaptive, generate_speculative_monitored,
+    generate_speculative_with, generate_with_sampler, tree_extra_positions, AdaptiveEngineConfig,
+    DraftSample, DraftSampler, Drafts, NoProposer, Proposal, ProposeContext, Proposer,
+    RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, TokenSampler,
 };
 pub use graph::{
     cuda_graphs_enabled, cuda_graphs_scope, graph_demoted_step_admission_bytes,

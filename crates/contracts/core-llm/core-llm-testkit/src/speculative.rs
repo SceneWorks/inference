@@ -1268,9 +1268,9 @@ impl BenchOption {
     }
 }
 
-/// The row keys the harness writes beyond the pre-epic schema (SW-7200/SW-F356 per-path telemetry):
-/// the baseline driver predates them, so a schema comparison leaves them out.
-pub const BENCH_PATH_ROW_KEYS: [&str; 9] = [
+/// The row keys the harness writes beyond the pre-epic schema (SW-7200/SW-F356/SW-F357 per-path
+/// telemetry): the baseline driver predates them, so a schema comparison leaves them out.
+pub const BENCH_PATH_ROW_KEYS: [&str; 10] = [
     "speculative",
     "verify",
     "wall_ms",
@@ -1280,6 +1280,7 @@ pub const BENCH_PATH_ROW_KEYS: [&str; 9] = [
     "tree_verify",
     "peak_memory_bytes",
     "prefix_checkpoints",
+    "adaptive_speculative",
 ];
 
 /// The document keys the harness writes beyond the pre-epic schema (SW-7200).
@@ -1572,7 +1573,10 @@ impl BenchRow {
                     "fallbacks": pc.fallbacks,
                 })
             });
-        // The SW-7200/SW-F356 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
+        let adaptive_speculative = report
+            .and_then(|r| r.adaptive_speculative.as_ref())
+            .map(core_llm::AdaptiveSpeculativeReport::to_wire_json);
+        // The SW-7200/SW-F356/SW-F357 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
         let path_keys = [
             ("speculative", json!(self.speculative)),
             ("verify", json!(self.verify)),
@@ -1585,6 +1589,10 @@ impl BenchRow {
             (
                 "prefix_checkpoints",
                 prefix_checkpoints.unwrap_or(Value::Null),
+            ),
+            (
+                "adaptive_speculative",
+                adaptive_speculative.unwrap_or(Value::Null),
             ),
         ];
         if let Some(object) = row.as_object_mut() {
@@ -3501,5 +3509,101 @@ mod tests {
         assert_eq!(multi_doc.rows[1].prompt_id, "short_turn1");
         assert_eq!(multi_doc.rows[1].requested, Speculative::Auto);
         assert_eq!(multi_doc.rows[0].samples.len(), 2);
+    }
+
+    #[test]
+    fn bench_row_serializes_adaptive_speculative_telemetry() {
+        use core_llm::{
+            AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent,
+            AdaptiveSpeculativeReport,
+        };
+        let report = DecodeReport {
+            proposer: ProposerKind::Mtp,
+            draft_tokens: Some(3),
+            proposed_tokens: 40,
+            accepted_tokens: 30,
+            verify_steps: 16,
+            adaptive_speculative: Some(AdaptiveSpeculativeReport {
+                adaptive: true,
+                candidates: vec![
+                    ProposerKind::Mtp,
+                    ProposerKind::PromptLookup,
+                    ProposerKind::None,
+                ],
+                initial_proposer: ProposerKind::Mtp,
+                initial_depth: 2,
+                final_proposer: ProposerKind::PromptLookup,
+                final_depth: 4,
+                depth_changes: 1,
+                proposer_switches: 1,
+                plain_reason: None,
+                events: vec![AdaptiveSpeculativeEvent {
+                    token_offset: 32,
+                    verify_step: 12,
+                    kind: AdaptiveEventKind::ProposerSwitched,
+                    from_proposer: ProposerKind::Mtp,
+                    from_depth: 3,
+                    to_proposer: ProposerKind::PromptLookup,
+                    to_depth: 4,
+                    reason: "probe beat incumbent".into(),
+                }],
+                cost: Some(AdaptiveCostSummary {
+                    proposal_ns: 2_000_000,
+                    verify_ns: 10_000_000,
+                    rollback_ns: 500_000,
+                    sync_ns: 500_000,
+                    total_ns: 13_000_000,
+                    host_syncs: 10,
+                    committed_tokens: 26,
+                }),
+            }),
+            ..Default::default()
+        };
+        let row = BenchRow {
+            prompt_id: "code_edit".into(),
+            class: PromptClass::Predictable,
+            requested: BenchOption::Plain(Speculative::Auto),
+            speculative: Speculative::Auto,
+            verify: SpeculativeVerify::Linear,
+            thinking: BenchThinking::Default,
+            prompt_tokens: 64,
+            generated_tokens: 26,
+            timing_source: "backend",
+            samples: vec![BenchSample {
+                ttft_ms: Some(12.0),
+                wall_ms: Some(42.0),
+                draft_ms: Some(2.0),
+                prefill_ms: 10.0,
+                decode_ms: 32.0,
+                decode_tok_s: Some(80.0),
+                generated_tokens: 26,
+                prefix_hit_tokens: Some(0),
+                memory_before_bytes: Some(1_000_000),
+                peak_memory_bytes: Some(1_100_000),
+            }],
+            report: Some(report),
+        };
+        let v = row.to_json();
+        let a = &v["adaptive_speculative"];
+        assert_eq!(a["adaptive"], true);
+        assert_eq!(a["initial_proposer"], "mtp");
+        assert_eq!(a["final_proposer"], "prompt_lookup");
+        assert_eq!(a["depth_changes"], 1);
+        assert_eq!(a["proposer_switches"], 1);
+        assert_eq!(a["events"][0]["kind"], "proposer_switched");
+        let cost = &a["cost"];
+        assert_eq!(cost["committed_tokens"], 26);
+        assert_eq!(cost["host_syncs"], 10);
+        let expected_cost = serde_json::json!({
+            "proposal_ms": 2.0,
+            "verify_ms": 10.0,
+            "rollback_ms": 0.5,
+            "sync_ms": 0.5,
+            "total_ms": 13.0,
+            "host_syncs": 10,
+            "committed_tokens": 26,
+            "ms_per_committed_token": 0.5,
+        });
+        assert_eq!(cost, &expected_cost);
     }
 }
