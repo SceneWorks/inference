@@ -1431,6 +1431,7 @@ fn check_reasoner_cancel(cancel: &CancelFlag) -> candle_gen::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::quantized::QTensor;
     use candle_gen::testkit::tensor_cosine;
 
     fn streamable_encoder_without_layer_files() -> GptOssTextEncoder {
@@ -2199,6 +2200,3 @@ mod tests {
         assert!(!cfg.is_sliding(23));
     }
 }
-
-#[cfg(test)]
-use candle_gen::candle_core::quantized::QTensor;
