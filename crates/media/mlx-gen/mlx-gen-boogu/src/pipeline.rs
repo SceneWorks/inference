@@ -1388,7 +1388,7 @@ impl BooguPipeline {
 
 /// Seeded initial/renoise latent noise `[1, 16, H/8, W/8]` (f32). `step` derives a distinct RNG key
 /// per renoise so successive renoise draws differ (mirroring the reference's advancing generator).
-fn init_noise(height: u32, width: u32, seed: u64, step: u64) -> Result<Array> {
+pub(crate) fn init_noise(height: u32, width: u32, seed: u64, step: u64) -> Result<Array> {
     let (hl, wl) = ((height / 8) as i32, (width / 8) as i32);
     let key = random::key(seed.wrapping_add(step))?;
     Ok(random::normal::<f32>(

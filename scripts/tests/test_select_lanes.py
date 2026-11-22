@@ -61,13 +61,27 @@ class SelectLanesTests(unittest.TestCase):
         self.assertFalse(lanes["contracts"])
 
     def test_shared_quant_kernels_are_candle_classified(self) -> None:
-        # candle-quant-kernels (sc-24135) serves both candle-gen and candle-llm: every Candle lane,
-        # and never the fail-safe-to-all an unclassified top-level path would take.
-        lanes = select_lanes(["crates/kernels/candle-quant-kernels/src/nvfp4.rs"])
+        # candle-quant-kernels (sc-24135) and candle-layers (SW-6955) serve both candle-gen and
+        # candle-llm: every Candle lane, and never the fail-safe-to-all an unclassified top-level
+        # path would take.
+        for path in (
+            "crates/kernels/candle-quant-kernels/src/nvfp4.rs",
+            "crates/layers/candle-layers/src/lib.rs",
+        ):
+            with self.subTest(path=path):
+                lanes = select_lanes([path])
+                selected = {lane for lane, enabled in lanes.items() if enabled}
+                self.assertEqual(
+                    selected,
+                    {"workspace", "candle_cpu", "macos_metal", "windows_cuda", "real_weights"},
+                )
+
+    def test_shared_mlx_layers_are_mlx_and_ios_classified(self) -> None:
+        lanes = select_lanes(["crates/layers/mlx-layers/src/lib.rs"])
         selected = {lane for lane, enabled in lanes.items() if enabled}
         self.assertEqual(
             selected,
-            {"workspace", "candle_cpu", "macos_metal", "windows_cuda", "real_weights"},
+            {"workspace", "macos_metal", "ios_build", "real_weights"},
         )
 
     def test_audio_family_is_candle_classified(self) -> None:

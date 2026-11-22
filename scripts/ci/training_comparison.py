@@ -419,6 +419,9 @@ def validate_shared_source_controls(sources: dict[str, str]) -> None:
     broadcast/scaling/composable-return branches bound to the reviewed selectors.
     Runtime receipts independently require their actual consuming witnesses.
     """
+    if 'adapt.rs' not in sources:
+        adapt_path = Path(__file__).resolve().parents[2] / 'crates/layers/candle-layers/src/adapt.rs'
+        sources = {**sources, 'adapt.rs': adapt_path.read_text(encoding='utf-8')}
     def body(file: str, name: str) -> str:
         source = sources[file]
         start = re.search(r'\bfn\s+' + re.escape(name) + r'\b', source)
@@ -434,9 +437,11 @@ def validate_shared_source_controls(sources: dict[str, str]) -> None:
             raise ValueError('truncated shared comparison source function')
         return re.sub(r'\s+', '', source[opening+1:end-1])
     required = (
-        ('projection.rs', 'apply_factor', 'ifsuper::profile::reference_math()||'),
-        ('projection.rs', 'apply_factor', 'returnx.broadcast_matmul(w);'),
-        ('projection.rs', 'scaled_lora', 'ifsuper::profile::reference_math(){returnapply_factor(&rank,up)?*scale;}'),
+        ('projection.rs', 'apply_factor', 'crate::ensure_reference_math_hook();candle_layers::adapt::apply_factor(x,w)'),
+        ('projection.rs', 'scaled_lora', 'crate::ensure_reference_math_hook();candle_layers::adapt::scaled_lora(x,down,up,scale)'),
+        ('adapt.rs', 'apply_factor', 'ifon_apply_factor_reference_math()||'),
+        ('adapt.rs', 'apply_factor', 'returnx.broadcast_matmul(w);'),
+        ('adapt.rs', 'scaled_lora', 'ifis_reference_math(){returnapply_factor(&rank,up)?*scale;}'),
         ('projection.rs', 'prepare_lora', 'if!super::policy::projection_enabled(){returnOk(None);}'),
         ('projection.rs', 'prepare_adapt', 'if!super::policy::projection_enabled(){returnOk(None);}'),
         ('norm.rs', 'rms_normalize_f32_impl', 'ifsuper::policy::legacy_e1()||'),

@@ -4,9 +4,9 @@
 //! Python-MLX trainer (blocks sc-3049 cutover → sc-3242 `mlx-video` drop).
 //!
 //! Built on the same functional-autograd mechanism the Z-Image spike proved (sc-3042) and the
-//! sc-3043 runtime glue, but LTX has its **own** adapter seam: its [`crate::transformer::Linear`]
-//! carries a per-pass [`LoraStack`](crate::transformer) (not the core `AdaptableLinear`), so this
-//! module uses the LTX-local `Linear::set_train_lora` training seam and its own target
+//! sc-3043 runtime glue: its [`crate::transformer::Linear`] wraps the shared
+//! `AdaptableLinear` (`mlx_layers::Linear`) spine (`SW-6956`), and this
+//! module uses `Linear::set_train_lora` and its own target
 //! enumeration / save, while reusing the core [`LoraParams`] + grad-accumulation helpers and the
 //! runtime (schedule / dataset / checkpoint).
 //!

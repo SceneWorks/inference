@@ -385,7 +385,7 @@ impl Generator for Boogu {
             self.generate_observed(req, Some(&run), on_progress)
         })?;
         let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
-        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        report.low_res_start = low_res_start_report(plan)?;
         Ok(report)
     }
 
@@ -439,12 +439,18 @@ impl Generator for Boogu {
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 let output = self.generate_observed(req, Some(&run), &mut progress)?;
                 let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
-                report.low_res_start =
-                    plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                report.low_res_start = low_res_start_report(plan)?;
                 Ok(report)
             },
         )
     }
+}
+
+fn low_res_start_report(
+    plan: &mlx_gen::gen_core::RenderPlan,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::LowResStartExecutionReport>> {
+    // The retained boundary estimate lives in the f32 sampler trajectory.
+    plan.low_res_start_execution_report("f32", 4, "base_dit")
 }
 
 impl Boogu {
@@ -2036,6 +2042,72 @@ mod tests {
         !msg.contains("single .safetensors file")
             && !msg.contains("precision override")
             && !msg.contains("not supported")
+    }
+
+    #[test]
+    fn previous_evaluation_reports_f32_retained_estimate_bytes() {
+        use mlx_gen::gen_core::sampling::{
+            FlowModelSampling, Solver, SolverRunState, TimestepConvention,
+        };
+        use mlx_gen::gen_core::{EstimateSource, EvaluationKind, LowResStartSpec};
+        use mlx_gen::sampler::MlxLatentOps;
+
+        let req = GenerationRequest {
+            prompt: "a fox in the forest".into(),
+            width: 512,
+            height: 512,
+            seed: Some(42),
+            steps: Some(4),
+            sampler: Some("euler".into()),
+            low_res_start: Some(
+                LowResStartSpec::new(2, Some(0.5))
+                    .with_estimate_source(EstimateSource::PreviousEvaluation),
+            ),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/boogu".into()));
+        let registry = crate::provider_registry().unwrap();
+        let plan = registry
+            .compile_render_plan(BOOGU_IMAGE_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let (width, height) = plan.phase_output_size(0);
+        let noise = crate::pipeline::init_noise(height, width, 42, 0).unwrap();
+        let sigmas = plan.denoise_sigmas();
+        let mut state = SolverRunState::new(Solver::Euler, sigmas);
+        state
+            .configure_low_res_start(plan.low_res_start().unwrap())
+            .unwrap();
+        let _ = Solver::Euler
+            .boxed::<MlxLatentOps>()
+            .sample_span(
+                &MlxLatentOps,
+                &FlowModelSampling::new(TimestepConvention::Sigma),
+                &mut |x, _| Ok(x.clone()),
+                noise,
+                sigmas,
+                42,
+                plan.denoise_spans()[0].clone(),
+                &mut state,
+            )
+            .unwrap();
+        let retained = state.take_captured_primary_estimate(1).unwrap().latent;
+        assert_eq!(
+            retained.shape(),
+            vec![1, 16, (height / 8) as i32, (width / 8) as i32]
+        );
+        assert_eq!(retained.dtype(), mlx_rs::Dtype::Float32);
+
+        let estimate = low_res_start_report(&plan)
+            .unwrap()
+            .unwrap()
+            .estimate_provenance;
+        assert_eq!(estimate.evaluation_kind, EvaluationKind::GuidedPrimaryX0);
+        assert_eq!(estimate.dtype, "f32");
+        assert_eq!(
+            estimate.retained_primary_estimate_bytes,
+            retained.nbytes() as u64
+        );
     }
 
     #[test]

@@ -8,10 +8,21 @@
 //!   * cached decode — `q_len < k_len`, where MLX aligns the queries to the *last* `q_len` key
 //!     positions (bottom-right), exactly reproducing the old `decode_mask(q_len, k_len, offset)`.
 
+#[cfg(feature = "test-support")]
 use mlx_gen::testing::max_abs_diff;
 use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::random::{normal, seed};
 use mlx_rs::Array;
+
+#[cfg(not(feature = "test-support"))]
+fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+    use mlx_rs::ops::{abs, max, subtract};
+    max(abs(subtract(a, b).unwrap()).unwrap(), None)
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .item::<f32>()
+}
 
 /// The additive `[1, 1, q_len, k_len]` causal mask the decoders used to build by hand: query `r`
 /// sits at absolute position `(k_len - q_len) + r` and may attend to keys `j <= pos`.

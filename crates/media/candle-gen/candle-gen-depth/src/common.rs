@@ -15,6 +15,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
+use candle_gen::quant::{DenseLinear, QLinear};
 use candle_gen::{CandleError, Result};
 
 /// A loaded Depth Anything V2 weight map. Tensors are coerced to f32 on load — the parity oracle is
@@ -117,39 +118,25 @@ pub(crate) fn join(prefix: &str, leaf: &str) -> String {
     }
 }
 
-/// A dense linear over the LAST dim (the loaded `[out, in]` weight + optional bias). Applies to any
+/// A dense linear over the LAST dim (the loaded `[out, in]` weight + bias), backed by the shared
+/// [`candle_gen::quant::QLinear`] pre-transposed layout (`SW-6956`, `BACK-1`). Applies to any
 /// `[.., in]` tensor by flattening the leading dims (robust for both the `[b, n, c]` token
 /// projections and the `[b, nh, seq, hd]` head tensors).
 #[derive(Clone)]
-pub(crate) struct Linear {
-    weight_t: Tensor, // pre-transposed [in, out], contiguous
-    bias: Tensor,     // [out]
-    out_features: usize,
-}
+pub(crate) struct Linear(QLinear);
 
 impl Linear {
     /// Load `{name}.weight` + `{name}.bias` (DINOv2's Q/K/V/dense/fc projections all carry a bias).
     pub fn load(w: &Weights, name: &str) -> Result<Self> {
         let weight = w.require(&format!("{name}.weight"))?; // [out, in]
-        let out_features = weight.dim(0)?;
-        Ok(Self {
+        Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
             weight_t: weight.t()?.contiguous()?,
-            bias: w.require(&format!("{name}.bias"))?,
-            out_features,
-        })
+            bias: Some(w.require(&format!("{name}.bias"))?),
+        })))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        let in_features = *dims.last().expect("linear input has rank >= 1");
-        let lead: usize = dims[..dims.len() - 1].iter().product();
-        let x2 = x.reshape((lead, in_features))?;
-        let y = __model_proof_output!(
-            __model_proof_output!(x2.matmul(&self.weight_t))?.broadcast_add(&self.bias)
-        )?;
-        let mut out_shape = dims;
-        *out_shape.last_mut().unwrap() = self.out_features;
-        Ok(y.reshape(out_shape)?)
+        Ok(__model_proof_output!(self.0.forward(x))?)
     }
 }
 

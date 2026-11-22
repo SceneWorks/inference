@@ -2317,5 +2317,194 @@ class ProviderTierEdgeTests(unittest.TestCase):
         self.assertEqual(self.gate.provider_tier_edge_errors(metadata), [])
 
 
+class LayerSpineEdgeTests(unittest.TestCase):
+    """SW-6958 (ENG-4a / R2-08 / BACK-1 / XL-3 / E4): layer-spine direction and acyclicity."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def base_edges(self) -> dict[str, list[str]]:
+        return {
+            "core-llm": [],
+            "sceneworks-gen-core": ["core-llm"],
+            "candle-quant-kernels": [],
+            "mlx-layers": ["sceneworks-gen-core", "core-llm", "pmetal-mlx-rs", "pmetal-mlx-sys"],
+            "candle-layers": [
+                "sceneworks-gen-core",
+                "core-llm",
+                "candle-core",
+                "candle-nn",
+                "candle-quant-kernels",
+            ],
+            "mlx-llm": ["mlx-layers", "core-llm"],
+            "mlx-gen": ["mlx-layers", "mlx-llm", "sceneworks-gen-core"],
+            "candle-llm": ["candle-layers", "candle-quant-kernels", "core-llm"],
+            "candle-gen": ["candle-layers", "candle-quant-kernels", "sceneworks-gen-core"],
+            "mlx-gen-sana": ["mlx-gen"],
+            "candle-gen-sana": ["candle-gen"],
+            "mlx-gen-ios-catalog": ["mlx-gen", "mlx-gen-sana"],
+            "candle-gen-catalog": ["candle-gen", "candle-gen-sana"],
+            "runtime-ios": ["mlx-llm", "mlx-gen-ios-catalog"],
+            "runtime-cpu": ["candle-llm", "candle-gen-catalog"],
+        }
+
+    def metadata(self, overrides: dict[str, list[str]] | None = None) -> dict:
+        edges = self.base_edges()
+        if overrides:
+            edges.update(overrides)
+        workspace_names = set(edges)
+        packages = [
+            {
+                "id": name,
+                "name": name,
+                "manifest_path": (
+                    f"/repo/crates/bundles/{name}/Cargo.toml"
+                    if name.startswith("runtime-")
+                    else f"/repo/crates/x/{name}/Cargo.toml"
+                ),
+                "dependencies": [{"name": target, "kind": None} for target in edges[name]],
+            }
+            for name in sorted(workspace_names)
+        ]
+        return {"packages": packages, "workspace_members": sorted(workspace_names)}
+
+    def test_valid_downward_layer_spine_passes(self) -> None:
+        self.assertEqual(self.gate.layer_spine_edge_errors(self.metadata()), [])
+
+    def test_upward_or_cross_backend_layer_spine_edges_fail(self) -> None:
+        for layer, bad_target in (
+            ("mlx-layers", "mlx-gen"),
+            ("mlx-layers", "mlx-llm"),
+            ("mlx-layers", "mlx-gen-sana"),
+            ("mlx-layers", "runtime-ios"),
+            ("mlx-layers", "candle-core"),
+            ("candle-layers", "candle-gen"),
+            ("candle-layers", "candle-llm"),
+            ("candle-layers", "candle-gen-sana"),
+            ("candle-layers", "runtime-cpu"),
+            ("candle-layers", "pmetal-mlx-rs"),
+        ):
+            with self.subTest(layer=layer, bad_target=bad_target):
+                base = self.base_edges()[layer]
+                errors = self.gate.layer_spine_edge_errors(
+                    self.metadata({layer: [*base, bad_target]})
+                )
+                self.assertTrue(errors)
+
+    def test_engine_missing_layer_spine_or_llm_to_media_cycle_fails(self) -> None:
+        self.assertTrue(
+            self.gate.layer_spine_edge_errors(
+                self.metadata({"mlx-gen": ["sceneworks-gen-core"]})
+            )
+        )
+        self.assertTrue(
+            self.gate.layer_spine_edge_errors(
+                self.metadata({"candle-llm": ["core-llm"]})
+            )
+        )
+        for llm, media in (
+            ("mlx-llm", "mlx-gen"),
+            ("mlx-llm", "mlx-gen-sana"),
+            ("candle-llm", "candle-gen"),
+            ("candle-llm", "candle-gen-sana"),
+        ):
+            with self.subTest(llm=llm, media=media):
+                base = self.base_edges()[llm]
+                errors = self.gate.layer_spine_edge_errors(
+                    self.metadata({llm: [*base, media]})
+                )
+                self.assertTrue(errors)
+
+
+class TargetBundlePartitionTests(unittest.TestCase):
+    """SW-6958 (ENG-4a / E4): iOS media vs LLM-only and desktop/server bundle partitions."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def ios_media_graph(self) -> dict[str, set[str]]:
+        return {
+            "runtime-ios": {"default", "media"},
+            "runtime-catalog": set(),
+            "mlx-layers": {"default"},
+            "mlx-llm": set(),
+            "mlx-gen": set(),
+            "mlx-gen-ios-catalog": set(),
+            "mlx-gen-sana": set(),
+            "sceneworks-gen-core": set(),
+            "core-llm": set(),
+        }
+
+    def ios_llm_only_graph(self) -> dict[str, set[str]]:
+        return {
+            "runtime-ios": set(),
+            "runtime-catalog": set(),
+            "mlx-layers": {"default"},
+            "mlx-llm": set(),
+            "sceneworks-gen-core": set(),
+            "core-llm": set(),
+        }
+
+    def test_distinct_ios_partitions_pass(self) -> None:
+        self.assertEqual(
+            self.gate.ios_partition_errors(self.ios_media_graph(), self.ios_llm_only_graph()),
+            [],
+        )
+
+    def test_ios_llm_only_leaking_media_or_cross_backend_fails(self) -> None:
+        for leaked in (
+            "mlx-gen",
+            "mlx-gen-ios-catalog",
+            "mlx-gen-sana",
+            "sceneworks-gen-core-train",
+            "image",
+            "candle-layers",
+        ):
+            with self.subTest(leaked=leaked):
+                llm = self.ios_llm_only_graph()
+                llm[leaked] = set()
+                self.assertTrue(self.gate.ios_partition_errors(self.ios_media_graph(), llm))
+
+    def test_ios_media_reaching_full_catalog_training_or_candle_fails(self) -> None:
+        for forbidden in ("mlx-gen-catalog", "mlx-gen-perceptual", "candle-core"):
+            with self.subTest(forbidden=forbidden):
+                media = self.ios_media_graph()
+                media[forbidden] = set()
+                self.assertTrue(self.gate.ios_partition_errors(media, self.ios_llm_only_graph()))
+        media_with_training = self.ios_media_graph()
+        media_with_training["mlx-gen-sana"] = {"training"}
+        self.assertTrue(
+            self.gate.ios_partition_errors(media_with_training, self.ios_llm_only_graph())
+        )
+
+    def test_desktop_and_server_llm_only_partitions_enforce_isolation(self) -> None:
+        macos = {
+            "runtime-macos": set(),
+            "runtime-catalog": set(),
+            "mlx-layers": set(),
+            "mlx-llm": set(),
+        }
+        self.assertEqual(self.gate.bundle_llm_only_partition_errors("runtime-macos", macos), [])
+        for bad in ("mlx-gen", "mlx-gen-catalog", "candle-audio-catalog", "candle-layers"):
+            self.assertTrue(
+                self.gate.bundle_llm_only_partition_errors(
+                    "runtime-macos", {**macos, bad: set()}
+                )
+            )
+        for bundle in ("runtime-cpu", "runtime-cuda"):
+            candle = {
+                bundle: set(),
+                "runtime-catalog": set(),
+                "candle-layers": set(),
+                "candle-quant-kernels": set(),
+                "candle-llm": set(),
+            }
+            self.assertEqual(self.gate.bundle_llm_only_partition_errors(bundle, candle), [])
+            for bad in ("candle-gen", "candle-gen-catalog", "candle-audio-catalog", "mlx-layers"):
+                self.assertTrue(
+                    self.gate.bundle_llm_only_partition_errors(bundle, {**candle, bad: set()})
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
