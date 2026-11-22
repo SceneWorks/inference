@@ -4751,17 +4751,21 @@ impl LlamaProvider {
             gemma4_mm_request,
             &mut fallbacks,
         );
+        let provisioned_width = if route == SpeculativeRoute::Plain {
+            0
+        } else {
+            adaptive_ceiling.max(route.width())
+        };
         if let Some(ap) = adaptive_plan.as_mut() {
             if route.proposer_kind() != ap.primary().proposer {
                 ap.candidates
                     .retain(|c| c.proposer != ProposerKind::DraftModel);
             }
-            *ap = ap.clone().clamped_to(adaptive_ceiling as u32);
+            *ap = ap.clone().clamped_to(provisioned_width as u32);
         }
         let plain_reason = (route == SpeculativeRoute::Plain)
             .then(|| fallbacks.first().cloned())
             .flatten();
-        let provisioned_width = adaptive_ceiling.max(route.width());
         let engine_adaptive_plan = adaptive_plan.clone();
 
         let mut kv_report = match &kv_plan {

@@ -75,6 +75,14 @@ pub const ADAPTIVE_LOOKUP_DRY_STEPS: u32 = 4;
 /// stays O(1) bounded even on long prompts.
 pub const NGRAM_PEEK_WINDOW_TOKENS: usize = 2048;
 
+/// Maximum tokens buffered while an inactive `mtp` proposer waits for a switch-back before the
+/// engine retires it to keep catch-up memory bounded.
+pub const MAX_MTP_CATCHUP_TOKENS: usize = 128;
+
+/// Maximum tokens committed while an inactive `draft_model` proposer shadows decode before the
+/// engine retires it to bound inactive draft forward work.
+pub const MAX_DRAFT_CATCHUP_TOKENS: usize = 256;
+
 /// Zero-cost-on-GPU CPU check: how many draft tokens `prompt_lookup` would propose at the end of
 /// `tokens`, scanning at most the trailing `max_window` tokens (0 = full history).
 pub fn ngram_peek_match_len(
@@ -206,8 +214,8 @@ impl AutoSpeculativePlan {
         }
     }
 
-    /// Return a copy of this plan keeping only `primary` (if non-plain), optional `PromptLookup`
-    /// (when present in the plan), and `Plain`, clamping every candidate's `max_depth` to `cap`.
+    /// Return a copy of this plan preserving all candidates and clamping every non-plain
+    /// candidate's `max_depth` (and `recommended_depth`) to `cap.max(1)`.
     pub fn clamped_to(mut self, cap: u32) -> Self {
         for c in &mut self.candidates {
             if c.proposer != ProposerKind::None {
@@ -1416,6 +1424,28 @@ impl AdaptiveSpeculativeController {
             if !self.ruled_out.contains(&probe.probe_proposer) {
                 self.ruled_out.push(probe.probe_proposer);
             }
+            if self.ruled_out.contains(&probe.incumbent_proposer) {
+                self.demoted = true;
+                self.active_proposer = ProposerKind::None;
+                self.active_depth = 0;
+                self.proposer_switches += 1;
+                let demote_reason = format!(
+                    "{reason}; incumbent `{}` retired while probe was active; falling back to plain decode",
+                    probe.incumbent_proposer.label()
+                );
+                self.plain_reason = Some(demote_reason.clone());
+                self.events.push(AdaptiveSpeculativeEvent {
+                    token_offset: input.generated_tokens,
+                    verify_step: self.total_verifies,
+                    kind: AdaptiveEventKind::FallbackToPlain,
+                    from_proposer: probe.probe_proposer,
+                    from_depth: probe.probe_depth,
+                    to_proposer: ProposerKind::None,
+                    to_depth: 0,
+                    reason: demote_reason,
+                });
+                return AdaptiveAction::DemoteToPlain;
+            }
             self.active_proposer = probe.incumbent_proposer;
             self.active_depth = probe.incumbent_depth;
             self.events.push(AdaptiveSpeculativeEvent {
@@ -2567,5 +2597,115 @@ mod tests {
         assert!(report.plain_reason.is_some());
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].kind, AdaptiveEventKind::StayedPlain);
+    }
+
+    #[test]
+    fn failed_probe_demotes_to_plain_when_incumbent_retired_during_probe() {
+        let plan = AutoSpeculativePlan {
+            candidates: vec![
+                AutoCandidate {
+                    proposer: ProposerKind::Mtp,
+                    recommended_depth: 2,
+                    max_depth: 4,
+                },
+                AutoCandidate {
+                    proposer: ProposerKind::PromptLookup,
+                    recommended_depth: 4,
+                    max_depth: 6,
+                },
+                AutoCandidate::plain(),
+            ],
+            fallbacks: Vec::new(),
+        };
+        let mut ctrl = AdaptiveSpeculativeController::for_request(
+            Speculative::Auto,
+            plan,
+            vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            PlainDecode::Candle,
+            true,
+            6,
+            ProposerKind::Mtp,
+            2,
+            None,
+        );
+        let mut tokens = 1u64;
+        run_plain_probe(&mut ctrl, 10_000_000, &mut tokens);
+
+        // Establish a fast MTP baseline and trigger a bounded probe to PromptLookup.
+        let mut started_probe = false;
+        for _ in 0..8 {
+            tokens += 3;
+            let action = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 2,
+                drafts: 2,
+                committed: 3,
+                generated_tokens: tokens,
+                cost: step_cost(1_000_000, 10_000_000, 100_000, 200_000, 1),
+                lookup_peek_len: 4,
+            });
+            if matches!(
+                action,
+                AdaptiveAction::SwitchProposer {
+                    from: ProposerKind::Mtp,
+                    to: ProposerKind::PromptLookup,
+                    ..
+                }
+            ) {
+                started_probe = true;
+                break;
+            }
+        }
+        assert!(started_probe, "expected bounded probe to PromptLookup");
+        assert_eq!(ctrl.next_step().proposer, ProposerKind::PromptLookup);
+
+        // Retire the incumbent MTP while the PromptLookup probe is in flight.
+        ctrl.retire_proposer(ProposerKind::Mtp);
+
+        // Run the probe with poor performance so the probe fails; it must demote cleanly to plain
+        // rather than reverting to the retired MTP proposer.
+        let mut final_action = AdaptiveAction::Continue;
+        for _ in 0..ADAPTIVE_PROBE_STEPS {
+            tokens += 1;
+            let action = ctrl.observe_step(AdaptiveStepInput {
+                accepted: 0,
+                drafts: 4,
+                committed: 1,
+                generated_tokens: tokens,
+                cost: step_cost(100_000, 14_000_000, 200_000, 200_000, 1),
+                lookup_peek_len: 0,
+            });
+            if action != AdaptiveAction::Continue {
+                final_action = action;
+                break;
+            }
+        }
+        assert_eq!(final_action, AdaptiveAction::DemoteToPlain);
+        assert!(ctrl.is_demoted());
+        assert_eq!(ctrl.next_step().proposer, ProposerKind::None);
+        assert_eq!(ctrl.next_step().depth, 0);
+        let report = ctrl.report();
+        assert_eq!(report.final_proposer, ProposerKind::None);
+        assert_eq!(report.final_depth, 0);
+        assert!(report.plain_reason.is_some());
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|e| e.kind == AdaptiveEventKind::FallbackToPlain),
+            "expected FallbackToPlain event: {:?}",
+            report.events
+        );
+        assert!(
+            !report
+                .events
+                .iter()
+                .any(|e| e.kind == AdaptiveEventKind::ProbeReverted),
+            "must not emit ProbeReverted to retired incumbent: {:?}",
+            report.events
+        );
     }
 }

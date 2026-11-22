@@ -41,6 +41,7 @@ impl DecodeClock for FakeClock {
 
 struct MockCache {
     len: i32,
+    capacity: usize,
     provisioned_overshoot: usize,
 }
 
@@ -82,6 +83,9 @@ struct ScriptedTarget {
     expensive_verify: Duration,
     cancel_on_forward: Option<(u64, CancelFlag)>,
     forwards: Cell<u64>,
+    supports_tree: bool,
+    tree_forwards: Cell<u64>,
+    step_shapes: RefCell<Vec<(usize, bool)>>,
 }
 
 impl ScriptedTarget {
@@ -97,6 +101,9 @@ impl ScriptedTarget {
             expensive_verify: Duration::from_millis(22),
             cancel_on_forward: None,
             forwards: Cell::new(0),
+            supports_tree: false,
+            tree_forwards: Cell::new(0),
+            step_shapes: RefCell::new(Vec::new()),
         }
     }
 
@@ -125,15 +132,36 @@ impl StepModel for ScriptedTarget {
     fn new_cache(&self) -> MockCache {
         MockCache {
             len: 0,
+            capacity: 0,
             provisioned_overshoot: 0,
         }
     }
 
-    fn new_cache_for(&self, _capacity: usize, overshoot: usize) -> Result<MockCache> {
+    fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<MockCache> {
         Ok(MockCache {
             len: 0,
+            capacity,
             provisioned_overshoot: overshoot,
         })
+    }
+
+    fn tree_unsupported(&self, _cache: &MockCache) -> Option<&'static str> {
+        if self.supports_tree {
+            None
+        } else {
+            Some(crate::decode::step::TREE_MODEL_UNSUPPORTED)
+        }
+    }
+
+    fn forward_tree(
+        &self,
+        _cache: &mut MockCache,
+        _tree: &TreeVerify<'_>,
+    ) -> Result<crate::decode::step::TreeOutput> {
+        self.tree_forwards.set(self.tree_forwards.get() + 1);
+        Err(Error::Msg(
+            "unexpected forward_tree on non-tree-building primary".into(),
+        ))
     }
 
     fn device(&self) -> &Device {
@@ -150,6 +178,21 @@ impl StepModel for ScriptedTarget {
         self.forwards.set(call);
         let n = request.len()?;
         let start = cache.len as usize;
+        if cache.capacity > 0 {
+            let max_len = cache.capacity + cache.provisioned_overshoot;
+            assert!(
+                start + n <= max_len,
+                "kv capacity exceeded: {} + {} > {} (cap={}, overshoot={})",
+                start,
+                n,
+                max_len,
+                cache.capacity,
+                cache.provisioned_overshoot
+            );
+        }
+        if !request.prefill {
+            self.step_shapes.borrow_mut().push((n, request.want_hidden));
+        }
         if !request.prefill && n > 1 {
             if cache.provisioned_overshoot > 0 {
                 assert!(
@@ -967,5 +1010,204 @@ fn explicit_off_and_explicit_proposer_are_authoritative_and_auto_stayed_plain_re
     assert_eq!(
         stayed_adaptive.plain_reason.as_deref(),
         Some("speculative: no eligible proposer advertised")
+    );
+}
+
+#[test]
+fn adaptive_switch_to_prompt_lookup_runs_linear_when_primary_does_not_build_trees_under_tree_rows()
+{
+    let vocab = 128;
+    // Prompt contains a repeated prefix (`10, 11, 12`) with two distinct continuations
+    // (`13, 14, 15` and `20, 21, 22`) so `NgramProposer::propose_tree` would build a branching
+    // tree if called, while linear `propose` stays within provisioned `k`.
+    let prompt: Vec<i32> = vec![
+        10, 11, 12, 13, 14, 15, 16, 17, 10, 11, 12, 20, 21, 22, 23, 24, 10, 11, 12, 13, 14, 15,
+    ];
+    let mut seq = Vec::new();
+    // Phase 1: open-ended non-repeating tokens under primary (`Mtp` / `DraftModel`).
+    for i in 0..32 {
+        seq.push(40 + (i % 70));
+    }
+    // Phase 2: repeated branching-prefix prompt spans so adaptive probes & switches to PromptLookup.
+    let repeated_branch = [
+        10, 11, 12, 13, 14, 15, 16, 17, 10, 11, 12, 20, 21, 22, 23, 24,
+    ];
+    for i in 0..96 {
+        seq.push(repeated_branch[i % repeated_branch.len()]);
+    }
+    let config = greedy_config(seq.len());
+
+    for primary_kind in [ProposerKind::Mtp, ProposerKind::DraftModel] {
+        let clock = Rc::new(FakeClock::default());
+        let mut target = ScriptedTarget::new(vocab, prompt.len(), seq.clone(), clock.clone());
+        target.supports_tree = true;
+        let mut proposer = MockPrimaryProposer::new(
+            primary_kind,
+            vocab,
+            prompt.len(),
+            seq.clone(),
+            clock.clone(),
+            Duration::from_millis(8),
+            std::iter::once(0..seq.len()).collect(),
+        );
+        let plan = AutoSpeculativePlan {
+            candidates: vec![
+                AutoCandidate {
+                    proposer: primary_kind,
+                    recommended_depth: 2,
+                    max_depth: 4,
+                },
+                AutoCandidate {
+                    proposer: ProposerKind::PromptLookup,
+                    recommended_depth: 4,
+                    max_depth: 6,
+                },
+                AutoCandidate::plain(),
+            ],
+            fallbacks: Vec::new(),
+        };
+
+        let run = with_decode_clock(Some(clock), || {
+            generate_speculative_adaptive(
+                &target,
+                &mut proposer,
+                SpeculativePrompt::Tokens(&prompt),
+                &config,
+                2,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                Speculative::Auto,
+                16,
+                AdaptiveEngineConfig {
+                    adaptive_plan: Some(plan),
+                    provisioned_max_depth: Some(6),
+                    plain_reason: None,
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            run.output.tokens, seq,
+            "exact token parity for primary {:?}",
+            primary_kind
+        );
+        assert_eq!(
+            target.tree_forwards.get(),
+            0,
+            "non-tree primary {:?} must never call forward_tree after switching to PromptLookup",
+            primary_kind
+        );
+        assert_eq!(
+            run.stats.tree.as_ref().map(|t| t.tree_passes),
+            Some(0),
+            "every verify pass must remain linear for {:?}",
+            primary_kind
+        );
+        let adaptive = run
+            .record
+            .report(false)
+            .adaptive_speculative
+            .expect("adaptive report present");
+        assert!(
+            adaptive.events.iter().any(|e| {
+                e.kind == AdaptiveEventKind::ProposerSwitched
+                    && e.to_proposer == ProposerKind::PromptLookup
+            }),
+            "expected switch from {:?} to PromptLookup: {:?}",
+            primary_kind,
+            adaptive.events
+        );
+    }
+}
+
+#[test]
+fn adaptive_keeps_want_hidden_for_multitoken_lookup_after_mtp_retires() {
+    let vocab = 256;
+    let prompt: Vec<i32> = (10..26).collect();
+    let mut seq = Vec::new();
+    // Phase 1: open-ended tokens under MTP.
+    for i in 0..24 {
+        seq.push(30 + (i % 60));
+    }
+    // Phase 2: long repeated prompt span (> MAX_MTP_CATCHUP_TOKENS) so adaptive switches to
+    // PromptLookup and MTP retires while PromptLookup continues running multi-token verifies.
+    for i in 0..(MAX_MTP_CATCHUP_TOKENS + 80) {
+        seq.push(prompt[i % prompt.len()]);
+    }
+    // Phase 3: each `10` matches prompt `10 -> 11, 12, 13, 14`, but the next token is a unique
+    // mismatch (`100 + i`), so PromptLookup gets 0 accepted drafts on expensive verifies and
+    // demotes cleanly to Plain.
+    let demote_start = seq.len();
+    for i in 0..60 {
+        seq.push(10);
+        seq.push(100 + i);
+    }
+
+    let config = greedy_config(seq.len());
+    let clock = Rc::new(FakeClock::default());
+    let mut target = ScriptedTarget::new(vocab, prompt.len(), seq.clone(), clock.clone());
+    target.expensive_after_step = Some(demote_start);
+    target.expensive_verify = Duration::from_millis(24);
+    let mut proposer = MockPrimaryProposer::new(
+        ProposerKind::Mtp,
+        vocab,
+        prompt.len(),
+        seq.clone(),
+        clock.clone(),
+        Duration::from_millis(8),
+        std::iter::once(0..demote_start).collect(),
+    );
+
+    let run = with_decode_clock(Some(clock), || {
+        generate_speculative_adaptive(
+            &target,
+            &mut proposer,
+            SpeculativePrompt::Tokens(&prompt),
+            &config,
+            2,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            None,
+            Speculative::Auto,
+            0,
+            AdaptiveEngineConfig {
+                adaptive_plan: Some(mtp_and_lookup_plan(2, 4)),
+                provisioned_max_depth: Some(6),
+                plain_reason: None,
+            },
+        )
+    })
+    .unwrap();
+
+    assert_eq!(run.output.tokens, seq);
+    let adaptive = run
+        .record
+        .report(false)
+        .adaptive_speculative
+        .expect("adaptive report present");
+    assert!(adaptive.events.iter().any(|e| {
+        e.kind == AdaptiveEventKind::ProposerSwitched && e.to_proposer == ProposerKind::PromptLookup
+    }));
+    assert!(adaptive
+        .events
+        .iter()
+        .any(|e| e.kind == AdaptiveEventKind::FallbackToPlain));
+
+    let shapes = target.step_shapes.borrow();
+    assert!(
+        shapes.iter().all(|&(n, want_hidden)| n == 1 || want_hidden),
+        "no multi-token verify step may drop want_hidden on an MTP primary route: {:?}",
+        *shapes
+    );
+    assert!(
+        shapes.iter().any(|&(n, want_hidden)| n == 1 && !want_hidden),
+        "demoted plain steps must turn want_hidden off (priced by graph_demoted_step_admission_bytes): {:?}",
+        *shapes
     );
 }

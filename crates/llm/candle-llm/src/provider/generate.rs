@@ -780,7 +780,11 @@ impl LlamaProvider {
                 }
             }
         }
-        let provisioned_drafts = (adaptive_ceiling as usize).max(route.drafts() as usize);
+        let provisioned_drafts = if route.drafts() == 0 {
+            0
+        } else {
+            (adaptive_ceiling as usize).max(route.drafts() as usize)
+        };
         if let Some(ap) = adaptive_plan.as_mut() {
             *ap = ap.clone().clamped_to(provisioned_drafts as u32);
         }
@@ -1396,8 +1400,21 @@ impl LlamaProvider {
                         // spans included) is only known here, so its static preallocation is
                         // admitted here, before anything is allocated.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let spliced_route = match route {
+                            DecodeRoute::Engine { proposer, drafts } if drafts > 0 => {
+                                DecodeRoute::Engine {
+                                    proposer,
+                                    drafts: u32::try_from(provisioned_drafts).unwrap_or(u32::MAX),
+                                }
+                            }
+                            other => other,
+                        };
                         let required = self
-                            .spliced_request_bytes(route, m.expanded_ids.len(), req.max_new_tokens)
+                            .spliced_request_bytes(
+                                spliced_route,
+                                m.expanded_ids.len(),
+                                req.max_new_tokens,
+                            )
                             .ok_or_else(|| {
                                 CoreError::InvalidRequest("request memory estimate overflow".into())
                             })?;

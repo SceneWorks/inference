@@ -2821,5 +2821,6 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
 
             md = campaign.markdown_report(report)
             self.assertIn("## Adaptive speculative — paired auto vs off (SW-7237)", md)
+            self.assertIn("### Adaptive speculative — candidate auto vs baseline auto", md)
             self.assertIn("140.0 vs 220.0", md)
             self.assertIn("mtp -> prompt_lookup", md)

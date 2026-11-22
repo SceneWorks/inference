@@ -72,7 +72,7 @@ use core_llm::{
     ngram_peek_match_len, AdaptiveAction, AdaptiveSpeculativeController, AdaptiveSpeculativeReport,
     AdaptiveStepInput, AutoSpeculativePlan, CudaGraphsReport, DecodeReport, HostSampleReason,
     PathReport, PlainDecode, ProposerKind, SamplerPath, Speculative, StepCost,
-    NGRAM_PEEK_WINDOW_TOKENS,
+    MAX_DRAFT_CATCHUP_TOKENS, MAX_MTP_CATCHUP_TOKENS, NGRAM_PEEK_WINDOW_TOKENS,
 };
 use core_llm::{DraftTree, TreeVerifyReport, TreeWalk};
 
@@ -1949,8 +1949,6 @@ where
     // proposer and zero-memory `prompt_lookup` via bounded probing, and demotes losing paths to
     // plain decoding (pipelined when eligible). Explicit `off` / `{proposer, depth}` run
     // authoritatively without resizing or switching.
-    const MAX_MTP_CATCHUP_TOKENS: usize = 128;
-    const MAX_DRAFT_CATCHUP_TOKENS: usize = 256;
     let mut lookup_proposer = crate::decode::proposers::NgramProposer::default();
     let mut probed: Vec<(i32, Option<Array>)> = Vec::new();
     let mut probe_position = 0i32;
@@ -2041,7 +2039,10 @@ where
             let prop_clock = clock.as_ref().map(|c| c.now());
             let draft_started = std::time::Instant::now();
             let proposed = if use_lookup {
-                if tree_rows > 0 {
+                // Only build a branching lookup tree when tree workspace was provisioned and
+                // admitted for the primary route (`kind.builds_trees()`); otherwise run linear
+                // lookup within `k <= provisioned_width`.
+                if tree_rows > 0 && kind.builds_trees() {
                     let tree = lookup_proposer
                         .propose_tree(target, &ctx, &mut draft_sampler)?
                         .pruned(k, tree_rows, |t| config.stop_tokens.contains(&t));
@@ -2052,6 +2053,15 @@ where
                     } else {
                         (Proposal::default(), Some(tree))
                     }
+                } else if tree_rows > 0 {
+                    let capped = ProposeContext {
+                        max_drafts: k.min(tree_rows),
+                        ..ctx
+                    };
+                    (
+                        lookup_proposer.propose(target, &capped, &mut draft_sampler)?,
+                        None,
+                    )
                 } else {
                     (
                         lookup_proposer.propose(target, &ctx, &mut draft_sampler)?,

@@ -89,6 +89,8 @@ struct ScriptedTarget {
     cancel_on_forward: Option<(u64, CancelFlag)>,
     forwards: Cell<u64>,
     last_provisioned_width: Cell<usize>,
+    supports_tree: bool,
+    tree_forwards: Cell<u64>,
 }
 
 impl ScriptedTarget {
@@ -105,6 +107,8 @@ impl ScriptedTarget {
             cancel_on_forward: None,
             forwards: Cell::new(0),
             last_provisioned_width: Cell::new(0),
+            supports_tree: false,
+            tree_forwards: Cell::new(0),
         }
     }
 
@@ -211,6 +215,26 @@ impl SpeculativeTarget for ScriptedTarget {
 
     fn attention_label(&self) -> &'static str {
         "mock"
+    }
+
+    fn tree_unsupported(&self, _cache: &MockCache) -> Option<String> {
+        if self.supports_tree {
+            None
+        } else {
+            Some("this target verifies only linear proposals".into())
+        }
+    }
+
+    fn forward_tree(
+        &self,
+        _cache: &mut MockCache,
+        _inputs: &TreeInputs,
+        _want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        self.tree_forwards.set(self.tree_forwards.get() + 1);
+        Err(Error::Msg(
+            "unexpected forward_tree on non-tree-building primary".into(),
+        ))
     }
 }
 
@@ -942,4 +966,110 @@ fn explicit_off_and_explicit_proposer_are_authoritative_and_auto_stayed_plain_re
         stayed_adaptive.plain_reason.as_deref(),
         Some("speculative: no eligible proposer advertised")
     );
+}
+
+#[test]
+fn adaptive_switch_to_prompt_lookup_runs_linear_when_primary_does_not_build_trees_under_tree_rows()
+{
+    let vocab = 128;
+    // Prompt contains a repeated prefix (`10, 11, 12`) with two distinct continuations
+    // (`13, 14, 15` and `20, 21, 22`) so `NgramProposer::propose_tree` would build a branching
+    // tree if called, while linear `propose` stays within provisioned `k`.
+    let prompt: Vec<i32> = vec![
+        10, 11, 12, 13, 14, 15, 16, 17, 10, 11, 12, 20, 21, 22, 23, 24, 10, 11, 12, 13, 14, 15,
+    ];
+    let mut seq = Vec::new();
+    for i in 0..32 {
+        seq.push(40 + (i % 70));
+    }
+    let repeated_branch = [
+        10, 11, 12, 13, 14, 15, 16, 17, 10, 11, 12, 20, 21, 22, 23, 24,
+    ];
+    for i in 0..96 {
+        seq.push(repeated_branch[i % repeated_branch.len()]);
+    }
+    let config = greedy_config(seq.len());
+
+    for primary_kind in [ProposerKind::Mtp, ProposerKind::DraftModel] {
+        let clock = Rc::new(FakeClock::default());
+        let mut target = ScriptedTarget::new(vocab, prompt.len(), seq.clone(), clock.clone());
+        target.supports_tree = true;
+        let mut proposer = MockPrimaryProposer::new(
+            primary_kind,
+            vocab,
+            prompt.len(),
+            seq.clone(),
+            clock.clone(),
+            Duration::from_millis(8),
+            std::iter::once(0..seq.len()).collect(),
+        );
+        let plan = AutoSpeculativePlan {
+            candidates: vec![
+                AutoCandidate {
+                    proposer: primary_kind,
+                    recommended_depth: 2,
+                    max_depth: 4,
+                },
+                AutoCandidate {
+                    proposer: ProposerKind::PromptLookup,
+                    recommended_depth: 4,
+                    max_depth: 6,
+                },
+                AutoCandidate::plain(),
+            ],
+            fallbacks: Vec::new(),
+        };
+
+        let run = with_decode_clock(Some(clock), || {
+            generate_speculative(
+                &target,
+                &mut proposer,
+                SpeculativePrompt::Tokens(&prompt),
+                &config,
+                2,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions {
+                    pipelining: Pipelining::Auto,
+                    speculative_mode: Speculative::Auto,
+                    tree_rows: 16,
+                    adaptive_plan: Some(plan),
+                    provisioned_max_depth: Some(6),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            run.output.tokens, seq,
+            "exact token parity for primary {:?}",
+            primary_kind
+        );
+        assert_eq!(
+            target.tree_forwards.get(),
+            0,
+            "non-tree primary {:?} must never call forward_tree after switching to PromptLookup",
+            primary_kind
+        );
+        assert_eq!(
+            run.stats.tree.as_ref().map(|t| t.tree_passes),
+            Some(0),
+            "every verify pass must remain linear for {:?}",
+            primary_kind
+        );
+        let adaptive = run
+            .report
+            .adaptive_speculative
+            .expect("adaptive report present");
+        assert!(
+            adaptive.events.iter().any(|e| {
+                e.kind == AdaptiveEventKind::ProposerSwitched
+                    && e.to_proposer == ProposerKind::PromptLookup
+            }),
+            "expected switch from {:?} to PromptLookup: {:?}",
+            primary_kind,
+            adaptive.events
+        );
+    }
 }

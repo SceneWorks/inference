@@ -53,7 +53,8 @@ use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
     ngram_peek_match_len, AdaptiveAction, AdaptiveSpeculativeController, AdaptiveSpeculativeReport,
     AdaptiveStepInput, AutoSpeculativePlan, DraftTree, PlainDecode, ProposerKind, SamplerPath,
-    Speculative, StepCost, TreeVerifyReport, TreeWalk, NGRAM_PEEK_WINDOW_TOKENS,
+    Speculative, StepCost, TreeVerifyReport, TreeWalk, MAX_DRAFT_CATCHUP_TOKENS,
+    MAX_MTP_CATCHUP_TOKENS, NGRAM_PEEK_WINDOW_TOKENS,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -1075,8 +1076,6 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     // baseline probe, adapts depth within provisioned bounds, switches between the primary GPU
     // proposer and zero-memory `prompt_lookup` via bounded probing, and demotes losing paths to
     // plain token-at-a-time steps. Explicit `off` / `{proposer, depth}` run authoritatively.
-    const MAX_MTP_CATCHUP_TOKENS: usize = 128;
-    const MAX_DRAFT_CATCHUP_TOKENS: usize = 256;
     let mut lookup_proposer = crate::decode::proposers::NgramProposer::default();
     let mut probed: Vec<(i32, Option<Tensor>)> = Vec::new();
     let mut probe_position = 0i32;
@@ -1125,6 +1124,12 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         };
         let keep_primary_hidden =
             wants_hidden && !demoted && (probing || use_primary || controller.can_switch_to(kind));
+        // On a hidden-row primary route (`Mtp` / `BlockDraft`), keep `want_hidden = true` on
+        // linear `forward_step` calls while not demoted (even if `PromptLookup` runs after the
+        // primary retired): CUDA graph admission prices `(1..=K+1, want_hidden=true)` plus the
+        // demoted plain step `(1, want_hidden=false)`, so keeping `want_hidden = true` reuses the
+        // priced graph shapes instead of capturing unpriced `(1+k, want_hidden=false)` shapes.
+        let step_want_hidden = wants_hidden && !demoted;
         let base = cache.len();
         let position = base + position_delta;
         let record_catchup = !demoted
@@ -1172,7 +1177,14 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             let draft_started = std::time::Instant::now();
             let tree = if tree_rows > 0 {
                 if use_lookup {
-                    lookup_proposer.propose_tree(&ctx, &mut sampler)?
+                    // Only build a branching lookup tree when tree workspace was provisioned and
+                    // admitted for the primary route (`kind.builds_trees()`); otherwise fall
+                    // through to linear `lookup_proposer.propose` within `k <= provisioned_width`.
+                    if kind.builds_trees() {
+                        lookup_proposer.propose_tree(&ctx, &mut sampler)?
+                    } else {
+                        None
+                    }
                 } else {
                     proposer.propose_tree(&ctx, &mut sampler)?
                 }
@@ -1334,7 +1346,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 StepRequest {
                     tokens: StepTokens::Device(&verify_ids),
                     scope: LogitsScope::All,
-                    want_hidden: keep_primary_hidden,
+                    want_hidden: step_want_hidden,
                     prefill: false,
                     snapshot_at: None,
                     snapshot_points: Vec::new(),
@@ -1412,7 +1424,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                         replay.extend_from_slice(&draft_ids[..accepted]);
                         let replayed = model.forward_step(
                             cache,
-                            StepRequest::last(&replay).with_hidden(keep_primary_hidden),
+                            StepRequest::last(&replay).with_hidden(step_want_hidden),
                         )?;
                         stats.forwards += 1;
                         stats.replays += 1;

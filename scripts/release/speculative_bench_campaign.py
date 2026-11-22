@@ -2665,6 +2665,24 @@ def markdown_report(report: dict[str, Any]) -> str:
                 f"{_fmt(item.get('tokens_per_pass'), 2)} | {peak_cell} | {init_p} -> {fin_p} | "
                 f"{transitions} |"
             )
+        baseline_auto_items = [
+            item for item in report["adaptive_speculative"] if item.get("vs_baseline_auto")
+        ]
+        if baseline_auto_items:
+            lines += [
+                "",
+                "### Adaptive speculative — candidate auto vs baseline auto",
+                "",
+                "| backend | family | row | prompt | wall ms (cand vs base, Δ %) | TTFT ms (cand vs base, Δ %) | decode tok/s (cand vs base, Δ %) |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for item in baseline_auto_items:
+                vba = item["vs_baseline_auto"]
+                lines.append(
+                    f"| {item['backend']} | {item['model']} | {item['row']} | {item['prompt_id']} | "
+                    f"{_cmp_adaptive(vba['wall_ms'], 1)} | {_cmp_adaptive(vba['ttft_ms'], 1)} | "
+                    f"{_cmp_adaptive(vba['decode_tok_s'], 2)} |"
+                )
     if report.get("incomplete"):
         lines += [
             "",
