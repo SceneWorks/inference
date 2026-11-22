@@ -3023,27 +3023,30 @@ fn turbo_schedule_window(
 
 pub(crate) fn compile_turbo_plan(
     descriptor: &gen_core::ModelDescriptor,
-    spec: &gen_core::LoadSpec,
     req: &GenerationRequest,
+    admitted_load: Option<&gen_core::LoadSpec>,
 ) -> gen_core::Result<gen_core::RenderPlan> {
     let reference = crate::img2img_reference(req).map(|(_, strength)| strength);
     let sigmas = turbo_schedule_window(req, reference)?;
     let executed_steps = sigmas.len().saturating_sub(1);
     let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
-    gen_core::RenderPlan::packed_image_trajectory_with_exact_load(
-        descriptor,
-        spec,
-        req,
-        gen_core::render::PackedImagePass {
-            pixel_stride: 16,
-            token_width: 64,
-            sampler: solver.name(),
-            guidance: req.guidance.unwrap_or(0.0),
-            sigmas,
-            executed_steps,
-            capture_sigma: 0.0,
-        },
-    )
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: 16,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance: req.guidance.unwrap_or(0.0),
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    // Immediate generation uses the sources already owned by the generator. A plan
+    // compiled before load instead binds the caller's prepared source identities.
+    match admitted_load {
+        Some(spec) => gen_core::RenderPlan::packed_image_trajectory_with_exact_load(
+            descriptor, spec, req, pass,
+        ),
+        None => gen_core::RenderPlan::packed_image_trajectory(descriptor, req, pass),
+    }
 }
 
 /// Executed step count for an ordinary Krea image request. Planned renders already carry
@@ -3786,7 +3789,7 @@ mod tests {
             ..Default::default()
         };
         let load = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir("/unused".into()));
-        let plan = compile_turbo_plan(&crate::descriptor(), &load, &request).unwrap();
+        let plan = compile_turbo_plan(&crate::descriptor(), &request, Some(&load)).unwrap();
         let events = RefCell::new(Vec::new());
         let mut scope = Scope(&events);
         let run = gen_core::RenderRun::new(&plan, &request.cancel, Some(&mut scope));

@@ -956,11 +956,7 @@ impl Generator for KreaGenerator {
                 req,
             )?)
         } else if self.descriptor.id == KREA_2_TURBO_ID {
-            Some(pipeline::compile_turbo_plan(
-                &self.descriptor,
-                &self.file_pin_spec,
-                req,
-            )?)
+            Some(pipeline::compile_turbo_plan(&self.descriptor, req, None)?)
         } else {
             None
         };
@@ -4151,7 +4147,7 @@ fn compile_turbo_render_plan(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     let descriptor = descriptor();
     validate_krea_request(&descriptor, req)?;
-    pipeline::compile_turbo_plan(&descriptor, spec, req).map(Some)
+    pipeline::compile_turbo_plan(&descriptor, req, Some(spec)).map(Some)
 }
 
 fn compile_raw_render_plan(
@@ -8735,6 +8731,75 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             hires_encoder_weights(&convrot),
             Err(gen_core::Error::Unsupported(message)) if message.contains("artifact seal mismatch")
         ));
+    }
+
+    #[test]
+    fn turbo_immediate_generation_accepts_compatibility_file_sources() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("overlay.safetensors");
+        let bytes = 1.0_f32.to_le_bytes();
+        let factor = || {
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1, 1], &bytes)
+                .unwrap()
+        };
+        safetensors::tensor::serialize_to_file(
+            [
+                ("img_in.lora_A.weight", factor()),
+                ("img_in.lora_B.weight", factor()),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let spec = valid_directory_spec(fixture.path());
+        let registry = crate::provider_registry().unwrap();
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        for spec in [
+            spec.clone().with_adapters(vec![gen_core::AdapterSpec::new(
+                path.clone(),
+                1.0,
+                gen_core::AdapterKind::Lora,
+            )]),
+            spec.with_pid(
+                WeightsSource::File(path),
+                WeightsSource::Dir(fixture.path().to_path_buf()),
+            ),
+        ] {
+            let req = GenerationRequest {
+                prompt: "a courtyard".into(),
+                width: 512,
+                height: 512,
+                use_pid: spec.pid.is_some(),
+                cancel: cancel.clone(),
+                ..Default::default()
+            };
+            let generator = registry.load(KREA_2_TURBO_ID, &spec).unwrap();
+            assert!(matches!(
+                generator.generate(&req, &mut |_| {}),
+                Err(gen_core::Error::Canceled)
+            ));
+            assert!(matches!(
+                registry.compile_render_plan(KREA_2_TURBO_ID, &spec, &req),
+                Err(gen_core::Error::Unsupported(message)) if message.contains("finalized file source pins")
+            ));
+
+            let mut prepared = spec.clone();
+            prepared.prepare_file_sources().unwrap();
+            let plan = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &prepared, &req)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                generator.generate_planned(&req, &plan, None, &mut |_| {}),
+                Err(gen_core::Error::Unsupported(message)) if message.contains("different model or adapter stack")
+            ));
+            let generator = registry.load(KREA_2_TURBO_ID, &prepared).unwrap();
+            assert!(matches!(
+                generator.generate_planned(&req, &plan, None, &mut |_| {}),
+                Err(gen_core::Error::Canceled)
+            ));
+        }
     }
 
     #[test]
