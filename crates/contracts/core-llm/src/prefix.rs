@@ -404,7 +404,7 @@ pub struct PrefixStoreOutcome {
     pub checkpoints_captured: u32,
     /// Sum of stored entry byte sizes.
     pub captured_bytes: u64,
-    /// Number of entries evicted during storage.
+    /// Number of entries evicted during checkpoint storage or promotion.
     pub evicted_entries: u32,
     /// Wall duration spent copying/slicing and storing checkpoint entries.
     pub capture_time: Duration,
@@ -426,7 +426,7 @@ pub struct CheckpointTelemetry {
     pub checkpoints_captured: u32,
     /// Total bytes captured/stored across checkpoints for this request.
     pub captured_bytes: u64,
-    /// Number of resident entries evicted while storing checkpoints for this request.
+    /// Number of resident entries evicted during admission, storage, or promotion.
     pub evicted_entries: u32,
     /// Deduplicated fallback/advisory diagnostics emitted during restore/capture/storage.
     pub fallbacks: Vec<String>,
@@ -1520,6 +1520,20 @@ impl<S> PrefixStore<S> {
         self.entries[new_pos].protected = true;
         self.protected_bytes += bytes;
         true
+    }
+
+    /// Promote an exact entry and add this operation's evictions to the request's count.
+    pub fn promote_protected_counting_evictions(
+        &mut self,
+        tokens: &[i32],
+        kind: PrefixKind,
+        evicted_entries: &mut u32,
+    ) -> bool {
+        let before = self.stats.evicted;
+        let promoted = self.promote_protected(tokens, kind);
+        let evicted = u32::try_from(self.stats.evicted - before).unwrap_or(u32::MAX);
+        *evicted_entries = evicted_entries.saturating_add(evicted);
+        promoted
     }
 
     /// Hold `state` for the prefix `tokens` (its `bytes` as the backend measured them). An entry

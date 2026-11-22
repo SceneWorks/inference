@@ -1077,31 +1077,35 @@ impl LlamaProvider {
                             .as_mut()
                             .map_or_else(Vec::new, MtpProposer::take_captured_all);
                         if keep_prefix {
-                            match self.prefix_cache().store_checkpoints(
-                                &prompt_ids,
-                                &[],
-                                run.output.finish_reason,
-                                &cache,
-                                &kept_boundaries,
-                                snapshots,
-                                &captured,
-                                boundary_plan.promote_reused,
+                            if let Err(e) = self.prefix_cache().record_checkpoint_store(
+                                &mut checkpoint_telemetry,
+                                |prefix| {
+                                    prefix.store_checkpoints(
+                                        &prompt_ids,
+                                        &[],
+                                        run.output.finish_reason,
+                                        &cache,
+                                        &kept_boundaries,
+                                        snapshots,
+                                        &captured,
+                                        boundary_plan.promote_reused,
+                                    )
+                                },
                             ) {
-                                Ok(out) => checkpoint_telemetry.record_store(out),
-                                Err(e) => {
-                                    let reason = prefix_store_reason(&e);
-                                    prefix_reason = Some(reason);
-                                    checkpoint_telemetry.push_fallback(reason);
-                                }
+                                let reason = prefix_store_reason(&e);
+                                prefix_reason = Some(reason);
+                                checkpoint_telemetry.push_fallback(reason);
                             }
                         } else if let Some(pb) = boundary_plan.promote_reused {
                             if prefix_store
                                 && run.output.finish_reason != FinishReason::Cancelled
                                 && pb.position <= prompt_ids.len()
                             {
-                                let _ = self
-                                    .prefix_cache()
-                                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                let _ = self.prefix_cache().promote_protected_counting_evictions(
+                                    &prompt_ids[..pb.position],
+                                    pb.kind,
+                                    &mut checkpoint_telemetry.evicted_entries,
+                                );
                             }
                         }
                         run
@@ -1387,31 +1391,35 @@ impl LlamaProvider {
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
                         if keep_prefix {
-                            match self.prefix_cache().store_checkpoints(
-                                &prompt_ids,
-                                &run.output.tokens,
-                                run.output.finish_reason,
-                                &cache,
-                                &kept_boundaries,
-                                Vec::new(),
-                                &[],
-                                boundary_plan.promote_reused,
+                            if let Err(e) = self.prefix_cache().record_checkpoint_store(
+                                &mut checkpoint_telemetry,
+                                |prefix| {
+                                    prefix.store_checkpoints(
+                                        &prompt_ids,
+                                        &run.output.tokens,
+                                        run.output.finish_reason,
+                                        &cache,
+                                        &kept_boundaries,
+                                        Vec::new(),
+                                        &[],
+                                        boundary_plan.promote_reused,
+                                    )
+                                },
                             ) {
-                                Ok(out) => checkpoint_telemetry.record_store(out),
-                                Err(e) => {
-                                    let reason = prefix_store_reason(&e);
-                                    prefix_reason = Some(reason);
-                                    checkpoint_telemetry.push_fallback(reason);
-                                }
+                                let reason = prefix_store_reason(&e);
+                                prefix_reason = Some(reason);
+                                checkpoint_telemetry.push_fallback(reason);
                             }
                         } else if let Some(pb) = boundary_plan.promote_reused {
                             if prefix_store
                                 && run.output.finish_reason != FinishReason::Cancelled
                                 && pb.position <= prompt_ids.len()
                             {
-                                let _ = self
-                                    .prefix_cache()
-                                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                let _ = self.prefix_cache().promote_protected_counting_evictions(
+                                    &prompt_ids[..pb.position],
+                                    pb.kind,
+                                    &mut checkpoint_telemetry.evicted_entries,
+                                );
                             }
                         }
                         run
