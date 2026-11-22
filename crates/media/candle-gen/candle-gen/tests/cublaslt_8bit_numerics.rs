@@ -318,7 +318,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     use candle_gen::candle_nn::Module;
     use candle_gen::quant::AdaptLinear;
     use float8::{F8E4M3, F8E5M2};
-    use half::bf16;
+    use half::{bf16, f16};
     use safetensors::{tensor::TensorView, Dtype};
     fn assert_windows(
         path: &std::path::Path,
@@ -536,6 +536,144 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
                 vec![expected; 16]
             );
+        }
+    }
+    // Raw and described weight-only FP8 retain the activation dtype. Exact dyadic values make
+    // the reference independent of reduction order while still exposing unintended FP8/TF32
+    // rounding, byte/fragment swaps, and premature weight-scale or bias rounding.
+    let (m, n, k) = (19usize, 48usize, 48usize);
+    for e5 in [false, true] {
+        let (format, dtype, codec, midpoint) = if e5 {
+            ("float8_e5m2", Dtype::F8_E5M2, "fp8-e5m2-scalar-v1", 1.125)
+        } else {
+            (
+                "float8_e4m3fn",
+                Dtype::F8_E4M3,
+                "fp8-e4m3-scalar-v1",
+                1.0625,
+            )
+        };
+        let mut codes = vec![0u8; n * k];
+        let mut coefficients = vec![vec![(0, 1.0)]; n];
+        for (row, terms) in coefficients.iter_mut().enumerate().skip(1) {
+            *terms = vec![
+                (row % 16, -1.5),
+                (16 + (row * 3) % 16, 0.75),
+                (32 + (row * 5) % 16, 0.25),
+            ];
+        }
+        for (row, terms) in coefficients.iter().enumerate() {
+            for &(col, value) in terms {
+                codes[row * k + col] = if e5 {
+                    F8E5M2::from_f32(value).to_bits()
+                } else {
+                    F8E4M3::from_f32(value).to_bits()
+                };
+            }
+        }
+        let bias: Vec<f32> = (0..n).map(|i| if i == 0 { 0.0 } else { -0.125 }).collect();
+        let bias_bytes: Vec<u8> = bias.iter().flat_map(|b| b.to_le_bytes()).collect();
+        for described in [false, true] {
+            let scale = if described { 1. + 1. / 256. } else { 1. };
+            let scale_bytes = f32::to_le_bytes(scale);
+            let input_scale = 0.5_f32.to_le_bytes();
+            let desc = format!(r#"{{"format":"{format}","full_precision_matrix_mult":true}}"#);
+            let mut tensors = vec![
+                ("linear.weight", TensorView::new(dtype, vec![n, k], &codes)?),
+                (
+                    "linear.bias",
+                    TensorView::new(Dtype::F32, vec![n], &bias_bytes)?,
+                ),
+            ];
+            if described {
+                tensors.extend([
+                    (
+                        "linear.comfy_quant",
+                        TensorView::new(Dtype::U8, vec![desc.len()], desc.as_bytes())?,
+                    ),
+                    (
+                        "linear.weight_scale",
+                        TensorView::new(Dtype::F32, vec![], &scale_bytes)?,
+                    ),
+                    (
+                        "linear.input_scale",
+                        TensorView::new(Dtype::F32, vec![], &input_scale)?,
+                    ),
+                ]);
+            }
+            let path = tmp
+                .path()
+                .join(format!("weight-only-{e5}-{described}.safetensors"));
+            safetensors::tensor::serialize_to_file(tensors, None, &path)?;
+            for output in [DType::BF16, DType::F16, DType::F32] {
+                let round = |value| match output {
+                    DType::BF16 => bf16::from_f32(value).to_f32(),
+                    DType::F16 => f16::from_f32(value).to_f32(),
+                    _ => value,
+                };
+                let mut input: Vec<f32> = (0..(m + 1) * k)
+                    .map(|i| (i % 29) as f32 / 16. - 0.5)
+                    .collect();
+                input[k] = midpoint;
+                input[2 * k] = 1. + 1. / 65536.; // Smaller than TF32's spacing at one.
+                let x = Tensor::from_vec(input.clone(), (m + 1, k), &dev)?
+                    .to_dtype(output)?
+                    .narrow(0, 1, m)?;
+                let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+                let lin = candle_gen::candle_nn::linear(k, n, vb.pp("linear"))?;
+                assert_eq!(lin.native_format_id(), Some(codec));
+                let packed_bytes = (n * k) as u64;
+                let bounds = if described {
+                    packed_bytes + 4..=packed_bytes + 8
+                } else {
+                    packed_bytes..=packed_bytes
+                };
+                assert!(bounds.contains(&lin.native_resident_bytes().expect("packed projection")));
+                let y = __model_proof_output!(lin.forward(&x))?;
+                assert_eq!(y.dtype(), output);
+                let mut expected = Vec::with_capacity(m * n);
+                for row in input[k..].chunks_exact(k) {
+                    for (terms, bias) in coefficients.iter().zip(&bias) {
+                        let acc = terms.iter().fold(0.0, |acc, &(col, value)| {
+                            round(row[col]).mul_add(round(value * scale), acc)
+                        });
+                        expected.push(round(round(acc) + bias));
+                    }
+                }
+                assert_eq!(
+                    y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                    expected,
+                    "{format} {output:?} described={described}"
+                );
+                if !described {
+                    assert_eq!(expected[0].to_bits(), midpoint.to_bits());
+                    assert_windows(&path, "linear", &lin, &x, &expected)?;
+                    let mut adapter = AdaptLinear::from_dense(lin, k, n);
+                    let mut a = vec![0.0_f32; k];
+                    a[0] = 0.5;
+                    adapter.push_lora_checked(
+                        Tensor::from_vec(a, (k, 1), &dev)?.to_dtype(output)?,
+                        Tensor::ones((1, n), output, &dev)?,
+                        1.0,
+                    )?;
+                    let adapted = __model_proof_output!(adapter.forward(&x))?;
+                    assert_eq!(adapted.dtype(), output);
+                    let mut adapted_expected = expected;
+                    for (row, values) in adapted_expected.chunks_exact_mut(n).enumerate() {
+                        let delta = round(input[(row + 1) * k]) * 0.5;
+                        for value in values {
+                            *value = round(*value + delta);
+                        }
+                    }
+                    assert_eq!(
+                        adapted
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        adapted_expected
+                    );
+                }
+            }
         }
     }
     let (m, n, k) = (17usize, 23usize, 61usize);

@@ -17953,7 +17953,7 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16; fixed generated E4M3/E5M2, calibrated scalar, rowwise and swizzled MXFP8 source matrices; identity, output dtype and additive rank-one adapter assertions",
+    "fixture_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16; fixed generated E4M3/E5M2 raw and weight-only described scalar, calibrated scalar, rowwise and swizzled MXFP8 source matrices; identity, output dtype and additive rank-one adapter assertions",
     "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
     "required_environment": [],
     "device_witness": "Successful source-backed Linear and adapted projection outputs observed on the selected CUDA device before exact independent coefficient comparisons",
@@ -17976,7 +17976,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference."
+          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference. Prove raw and described full-precision E4M3/E5M2 with exact 19x48 activations and 48x48 weights spanning three K tiles, partial M/N tiles and an input offset. Preserve BF16, F16 and F32 activation precision, scaled weight rounding, bias, packed residence and the additive rank-one residual."
         ]
       }
     },

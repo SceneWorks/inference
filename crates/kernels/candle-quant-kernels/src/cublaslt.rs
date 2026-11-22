@@ -233,7 +233,7 @@ mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
     use super::*;
     use candle_core::cuda_backend::cudarc;
-    use candle_core::cuda_backend::CudaStorageSlice;
+    use candle_core::cuda_backend::{CudaDType, CudaStorageSlice};
     use candle_core::op::BackpropOp;
     use candle_core::{CudaStorage, Storage};
     use cudarc::cublaslt::{result as lt, sys};
@@ -1166,6 +1166,94 @@ mod cuda_impl {
             scale_x: f32,
         ) -> Result<Tensor> {
             self.scalar_gemm::<f32>(w, scale_w, x, scale_x)
+        }
+
+        /// Matmul with FP8 weight storage and an unquantized activation in its own dtype.
+        /// Only the weight tile in use is decoded; no dense coefficient allocation is made.
+        pub(crate) fn weight_only_fp8_linear(
+            &self,
+            x: &Tensor,
+            w: &DevFp8,
+            scale: f32,
+        ) -> Result<Tensor> {
+            let (m, k) = x.dims2()?;
+            if k != w.cols || !x.device().same_device(&Device::Cuda(self.device.clone())) {
+                candle_core::bail!("weight-only FP8 input width or device differs from weight");
+            }
+            check_alignment(k, w.rows)?;
+            if m == 0 {
+                return Tensor::zeros((m, w.rows), x.dtype(), x.device());
+            }
+            let x = x.contiguous()?;
+            let x = if x.layout().start_offset() == 0 {
+                x
+            } else {
+                x.force_contiguous()?
+            };
+            let (storage, _) = x.storage_and_layout();
+            let Storage::Cuda(storage) = &*storage else {
+                candle_core::bail!("expected CUDA weight-only FP8 activation");
+            };
+            match &storage.slice {
+                CudaStorageSlice::F16(src) => {
+                    self.launch_weight_only_fp8(src, w, m, scale, "scalar_fp8_weight_only_f16")
+                }
+                CudaStorageSlice::BF16(src) => {
+                    self.launch_weight_only_fp8(src, w, m, scale, "scalar_fp8_weight_only_bf16")
+                }
+                CudaStorageSlice::F32(src) => {
+                    self.launch_weight_only_fp8(src, w, m, scale, "scalar_fp8_weight_only_f32")
+                }
+                _ => candle_core::bail!("weight-only FP8 expects F16, BF16 or F32 activation"),
+            }
+        }
+
+        fn launch_weight_only_fp8<T: CudaDType + cudarc::driver::DeviceRepr>(
+            &self,
+            x: &cudarc::driver::CudaSlice<T>,
+            w: &DevFp8,
+            m: usize,
+            scale: f32,
+            kernel: &str,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m32, n32, k32) = (
+                u32::try_from(m).map_err(candle_core::Error::wrap)?,
+                u32::try_from(w.rows).map_err(candle_core::Error::wrap)?,
+                u32::try_from(w.cols).map_err(candle_core::Error::wrap)?,
+            );
+            let module = super::SCALAR_FP8_SOURCE
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let kernel = module
+                .function(kernel)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let e5m2 = u32::from(w.is_e5m2());
+            let mut out = unsafe { self.stream.alloc::<T>(m * w.rows) }.map_err(drv_err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(x)
+                    .arg(&w.buf)
+                    .arg(&mut out)
+                    .arg(&m32)
+                    .arg(&n32)
+                    .arg(&k32)
+                    .arg(&scale)
+                    .arg(&e5m2)
+                    .launch(LaunchConfig {
+                        grid_dim: (n32.div_ceil(32), m32.div_ceil(16), 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            Ok(Tensor::from_storage(
+                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, self.device.clone())),
+                (m, w.rows),
+                BackpropOp::none(),
+                false,
+            ))
         }
 
         fn scalar_gemm<T: Fp8Output>(
