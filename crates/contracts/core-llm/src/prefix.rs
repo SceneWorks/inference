@@ -429,6 +429,30 @@ pub fn plan_prefix_boundaries(
     candidates: BoundaryCandidates,
     near_tail: NearTailConfig,
 ) -> BoundaryPlan {
+    plan_prefix_boundaries_with_exact(
+        prompt_len,
+        reused,
+        reuse,
+        policy,
+        candidates,
+        near_tail,
+        |_| true,
+    )
+}
+
+/// Plan which exact prefix checkpoints to capture and/or promote for a request, consulting
+/// `has_exact_key(pos)` so that on [`PrefixReuse::AnyPrefix`] only boundaries already backed by
+/// an exact stored key (`pos <= reused && has_exact_key(pos)`) go into `promote_reused` — any
+/// non-exact boundary stays in `captures` to be priced, admitted, and bounded by E7.
+pub fn plan_prefix_boundaries_with_exact(
+    prompt_len: usize,
+    reused: usize,
+    reuse: PrefixReuse,
+    policy: crate::request::PrefixCheckpointPolicy,
+    candidates: BoundaryCandidates,
+    near_tail: NearTailConfig,
+    mut has_exact_key: impl FnMut(usize) -> bool,
+) -> BoundaryPlan {
     if prompt_len <= 1 {
         return BoundaryPlan::default();
     }
@@ -452,14 +476,17 @@ pub fn plan_prefix_boundaries(
         };
     }
 
-    let valid_reused_promote = |pos: usize| {
+    let valid_reused_promote = |pos: usize, has_exact: bool| {
         pos > 0
             && pos < prompt_len
+            && has_exact
             && (pos == reused || (reuse == PrefixReuse::AnyPrefix && pos <= reused))
     };
+    let doc_exact = candidates.document.is_some_and(&mut has_exact_key);
+    let root_exact = candidates.shared_root.is_some_and(&mut has_exact_key);
     let promote_reused = candidates
         .document
-        .filter(|&p| valid_reused_promote(p))
+        .filter(|&p| valid_reused_promote(p, doc_exact))
         .map(|position| PlannedBoundary {
             position,
             kind: PrefixKind::Document,
@@ -468,7 +495,9 @@ pub fn plan_prefix_boundaries(
         .or_else(|| {
             candidates
                 .shared_root
-                .filter(|&p| valid_reused_promote(p) && Some(p) != candidates.conversation_end)
+                .filter(|&p| {
+                    valid_reused_promote(p, root_exact) && Some(p) != candidates.conversation_end
+                })
                 .map(|position| PlannedBoundary {
                     position,
                     kind: PrefixKind::SharedRoot,
@@ -481,7 +510,22 @@ pub fn plan_prefix_boundaries(
                          position: usize,
                          kind: PrefixKind,
                          protected: bool| {
-        if position <= reused || position >= prompt_len {
+        let already_exact = match reuse {
+            PrefixReuse::WholeEntry => position <= reused,
+            PrefixReuse::AnyPrefix => {
+                position <= reused
+                    && match kind {
+                        PrefixKind::Document => doc_exact,
+                        PrefixKind::SharedRoot => root_exact,
+                        _ => true,
+                    }
+            }
+        };
+        if position == 0
+            || position >= prompt_len
+            || promote_reused.is_some_and(|pb| pb.position == position)
+            || already_exact
+        {
             return;
         }
         if let Some(existing) = captures.iter_mut().find(|b| b.position == position) {
@@ -657,6 +701,24 @@ pub struct PrefixInsertOutcome {
     pub skipped_for_protected: bool,
 }
 
+/// Optional context passed to [`PrefixStore::admit_planned_with`] so admission can preserve an
+/// already-matched prefix entry, account for in-place protected promotion, and recognize when an
+/// [`PrefixReuse::AnyPrefix`] `Conversation` entry supersedes unprotected matching prefixes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefixPlannedContext<'a> {
+    /// Prompt token ids of the request being admitted.
+    pub prompt: Option<&'a [i32]>,
+    /// Index in the store returned by [`PrefixStore::peek_match`], kept across optional snapshot
+    /// admission so an entry about to be restored is evicted only as a last resort for bare
+    /// `required` memory.
+    pub keep_match: Option<usize>,
+    /// Boundary slated for in-place protected promotion on hit, pinned against optional eviction.
+    pub promote_reused: Option<PlannedBoundary>,
+    /// Reuse mode of the request's final `Conversation` snapshot, if one is stored (`AnyPrefix`
+    /// supersedes matching unprotected `AnyPrefix` entries at store time).
+    pub conversation_reuse: Option<PrefixReuse>,
+}
+
 /// Result of [`PrefixStore::admit_planned`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedAdmission {
@@ -766,6 +828,11 @@ impl<S> PrefixStore<S> {
         self.entries.iter().map(|e| e.tokens.as_slice()).collect()
     }
 
+    /// Whether an entry with exact token key `tokens` is currently held in the store.
+    pub fn contains_exact(&self, tokens: &[i32]) -> bool {
+        !tokens.is_empty() && self.entries.iter().any(|e| e.tokens == tokens)
+    }
+
     /// Compute how many leading prompt tokens an entry could reuse without mutating state.
     fn entry_match(
         entry: &StoredPrefix<S>,
@@ -796,19 +863,48 @@ impl<S> PrefixStore<S> {
         (reused, true)
     }
 
+    /// Shared best-match selector: prefers longest `reused` length, then `protected`, then
+    /// highest semantic `kind.priority()`, then most-recently-used (back of deque).
+    fn best_match_with_diag(
+        &self,
+        prompt: &[i32],
+        held: &impl Fn(&S) -> Option<usize>,
+    ) -> (Option<(usize, usize)>, usize) {
+        let limit = prompt.len().saturating_sub(1);
+        let mut best: Option<(usize, (usize, bool, u8))> = None;
+        let mut skipped_longest = 0usize;
+        for (i, e) in self.entries.iter().enumerate().rev() {
+            let (len, compatible) = Self::entry_match(e, prompt, limit, held);
+            if !compatible {
+                skipped_longest = skipped_longest.max(len);
+                continue;
+            }
+            if len > 0 {
+                let key = (len, e.protected, e.kind.priority());
+                if best.is_none_or(|(_, best_key)| key > best_key) {
+                    best = Some((i, key));
+                }
+            }
+        }
+        (best.map(|(i, (len, _, _))| (i, len)), skipped_longest)
+    }
+
+    /// Read-only inspection returning the index and reused token count of the entry
+    /// [`lookup_with_proposer_diagnostic`](Self::lookup_with_proposer_diagnostic) would select,
+    /// without mutating stats or recency.
+    pub fn peek_match(
+        &self,
+        prompt: &[i32],
+        held: impl Fn(&S) -> Option<usize>,
+    ) -> Option<(usize, usize)> {
+        self.best_match_with_diag(prompt, &held).0
+    }
+
     /// Read-only inspection returning how many leading tokens of `prompt` a cached entry would
     /// currently reuse without updating stats or recency (useful for upfront boundary planning
     /// and snapshot admission before lookup).
     pub fn peek_reused(&self, prompt: &[i32], held: impl Fn(&S) -> Option<usize>) -> usize {
-        let limit = prompt.len().saturating_sub(1);
-        let mut best = 0usize;
-        for e in self.entries.iter().rev() {
-            let (reused, compatible) = Self::entry_match(e, prompt, limit, &held);
-            if compatible && reused > best {
-                best = reused;
-            }
-        }
-        best
+        self.peek_match(prompt, held).map_or(0, |(_, len)| len)
     }
 
     /// Same as [`lookup`](Self::lookup), also reporting whether a longer stored entry matched more
@@ -820,19 +916,7 @@ impl<S> PrefixStore<S> {
         held: impl Fn(&S) -> Option<usize>,
     ) -> PrefixLookup<'_, S> {
         self.stats.lookups += 1;
-        let limit = prompt.len().saturating_sub(1);
-        let mut best: Option<(usize, usize)> = None; // (deque index, reused)
-        let mut skipped_longest = 0usize;
-        for (i, e) in self.entries.iter().enumerate().rev() {
-            let (len, compatible) = Self::entry_match(e, prompt, limit, &held);
-            if !compatible {
-                skipped_longest = skipped_longest.max(len);
-                continue;
-            }
-            if len > 0 && best.is_none_or(|(_, b)| len > b) {
-                best = Some((i, len));
-            }
-        }
+        let (best, skipped_longest) = self.best_match_with_diag(prompt, &held);
         let best_reused = best.map_or(0, |(_, r)| r);
         let proposer_skipped_longer = skipped_longest > best_reused;
         let Some((idx, reused)) = best else {
@@ -1004,9 +1088,9 @@ impl<S> PrefixStore<S> {
         }
         self.tick = self.tick.saturating_add(1);
 
-        // Preserve existing protection if an unprotected re-insert matches exact tokens.
+        // Preserve existing protection and highest semantic kind if an insert matches exact tokens.
         if let Some(existing) = self.entries.iter().find(|e| e.tokens == tokens) {
-            if existing.protected && !protected {
+            if existing.protected {
                 protected = true;
                 if existing.kind.priority() > kind.priority() {
                     kind = existing.kind;
@@ -1134,17 +1218,18 @@ impl<S> PrefixStore<S> {
         let Some(pos) = self.entries.iter().position(|e| e.tokens == tokens) else {
             return false;
         };
-        let target_kind = if kind.priority() > self.entries[pos].kind.priority() {
+        let existing_kind = self.entries[pos].kind;
+        let target_kind = if kind.priority() > existing_kind.priority() {
             kind
         } else {
-            self.entries[pos].kind
+            existing_kind
         };
         let bytes = self.entries[pos].bytes;
         let already_protected = self.entries[pos].protected;
         let cap = self.protected_cap_for(target_kind);
 
         if already_protected {
-            if self.protected_bytes <= cap {
+            if existing_kind.priority() >= kind.priority() || self.protected_bytes <= cap {
                 self.entries[pos].kind = target_kind;
                 return true;
             }
@@ -1252,9 +1337,27 @@ impl<S> PrefixStore<S> {
         planned: &[(PlannedBoundary, u64)],
         available: u64,
     ) -> PlannedAdmission {
+        self.admit_planned_with(
+            required,
+            planned,
+            available,
+            PrefixPlannedContext::default(),
+        )
+    }
+
+    /// Context-aware [`admit_planned`](Self::admit_planned) honoring match pinning (`keep_match`),
+    /// in-place promotion (`promote_reused`), and `AnyPrefix` `Conversation` supersession.
+    pub fn admit_planned_with(
+        &mut self,
+        required: u64,
+        planned: &[(PlannedBoundary, u64)],
+        available: u64,
+        ctx: PrefixPlannedContext<'_>,
+    ) -> PlannedAdmission {
+        let keep_idx = ctx.keep_match.filter(|&i| i < self.entries.len());
         if planned.is_empty() {
             let evicted_before = self.stats.evicted;
-            let avail = self.reclaim_for(required, available);
+            let avail = self.reclaim_for_keeping_idx(required, available, keep_idx);
             let evicted = (self.stats.evicted - evicted_before) as u32;
             return PlannedAdmission {
                 admission: PrefixAdmission {
@@ -1267,110 +1370,92 @@ impl<S> PrefixStore<S> {
             };
         }
 
-        let mut working = planned.to_vec();
-        let mut trimmed = false;
-        let mut blocked_only_by_protected = false;
-
-        while !working.is_empty() {
-            let snap_bytes: u64 = working
-                .iter()
-                .fold(0u64, |acc, &(_, b)| acc.saturating_add(b));
-            let any_protected = working.iter().any(|(b, _)| b.protected);
-            let max_protected_bytes = working
-                .iter()
-                .filter(|(b, _)| b.protected)
-                .fold(0u64, |acc, &(_, b)| acc.saturating_add(b));
-            let max_protected_kind = working
-                .iter()
-                .filter(|(b, _)| b.protected)
-                .map(|(b, _)| b.kind)
-                .max();
-            let protected_cap_ok = match max_protected_kind {
-                Some(kind) => {
-                    let cap = self.protected_cap_for(kind);
-                    let higher_existing: u64 = self
-                        .entries
-                        .iter()
-                        .filter(|e| e.protected && e.kind.priority() > kind.priority())
-                        .map(|e| e.bytes)
-                        .sum();
-                    max_protected_bytes <= cap
-                        && higher_existing.saturating_add(max_protected_bytes) <= cap
-                }
-                None => true,
-            };
-
-            let unprotected_resident = self.resident_bytes - self.protected_bytes;
-            let over_budget = self
-                .resident_bytes
-                .saturating_add(snap_bytes)
-                .saturating_sub(self.budget_bytes);
-            let short = required
-                .saturating_add(snap_bytes)
-                .saturating_sub(available);
-            let need = over_budget.max(short);
-
-            let max_evictable = if any_protected {
-                if let Some(kind) = max_protected_kind {
-                    let lower_eq_protected: u64 = self
-                        .entries
-                        .iter()
-                        .filter(|e| e.protected && e.kind.priority() <= kind.priority())
-                        .map(|e| e.bytes)
-                        .sum();
-                    unprotected_resident.saturating_add(lower_eq_protected)
-                } else {
-                    self.resident_bytes
-                }
+        // Identify an unprotected AnyPrefix Conversation boundary if present and itself feasible,
+        // so individually feasible protected boundaries that only fit when it supersedes an
+        // AnyPrefix hit are not mistakenly dropped during single-candidate filtering.
+        let conv_offset_candidate =
+            if ctx.conversation_reuse == Some(PrefixReuse::AnyPrefix) && ctx.prompt.is_some() {
+                planned
+                    .iter()
+                    .copied()
+                    .find(|(b, _)| !b.protected && b.kind == PrefixKind::Conversation)
+                    .filter(|&c| {
+                        self.simulate_evictions(&[c], required, available, ctx)
+                            .is_ok()
+                    })
             } else {
-                unprotected_resident
+                None
             };
 
-            if snap_bytes <= self.budget_bytes && protected_cap_ok && need <= max_evictable {
-                let evicted_before = self.stats.evicted;
-                let freed = if need > 0 {
-                    if any_protected {
-                        self.evict_at_least(need, false)
-                    } else {
-                        self.evict_unprotected_at_least(need)
+        // Step 1: filter out individually infeasible candidates first (before combined trimming can
+        // drop a feasible unprotected boundary ahead of an impossible protected candidate).
+        let mut working = Vec::with_capacity(planned.len());
+        let mut trimmed = false;
+        for &item in planned {
+            let feasible_alone = self
+                .simulate_evictions(&[item], required, available, ctx)
+                .is_ok();
+            let feasible_with_conv = conv_offset_candidate.is_some_and(|cc| {
+                cc.0 != item.0
+                    && self
+                        .simulate_evictions(&[item, cc], required, available, ctx)
+                        .is_ok()
+            });
+            if feasible_alone || feasible_with_conv {
+                working.push(item);
+            } else {
+                trimmed = true;
+            }
+        }
+
+        let mut blocked_only_by_protected = false;
+        while !working.is_empty() {
+            match self.simulate_evictions(&working, required, available, ctx) {
+                Ok(mut victim_indices) => {
+                    victim_indices.sort_unstable_by(|a, b| b.cmp(a));
+                    let evicted_before = self.stats.evicted;
+                    let mut freed = 0u64;
+                    for idx in victim_indices {
+                        freed = freed.saturating_add(self.remove_entry(idx));
                     }
-                } else {
-                    0
-                };
-                let evicted = (self.stats.evicted - evicted_before) as u32;
-                let kept: Vec<PlannedBoundary> = working.into_iter().map(|(b, _)| b).collect();
-                return PlannedAdmission {
-                    admission: PrefixAdmission {
-                        available: available.saturating_add(freed),
-                        snapshot: true,
-                    },
-                    kept,
-                    evicted_entries: evicted,
-                    fallback: trimmed.then_some(PREFIX_PARTIAL_ADMISSION_TRIMMED),
-                };
+                    let evicted = (self.stats.evicted - evicted_before) as u32;
+                    let kept: Vec<PlannedBoundary> = working.into_iter().map(|(b, _)| b).collect();
+                    return PlannedAdmission {
+                        admission: PrefixAdmission {
+                            available: available.saturating_add(freed),
+                            snapshot: true,
+                        },
+                        kept,
+                        evicted_entries: evicted,
+                        fallback: trimmed.then_some(PREFIX_PARTIAL_ADMISSION_TRIMMED),
+                    };
+                }
+                Err(blocked) => {
+                    if blocked {
+                        blocked_only_by_protected = true;
+                    }
+                    // If the remaining protected candidates exceed their combined protected cap,
+                    // drop the lowest-priority protected boundary before touching unprotected ones.
+                    let drop_prot = !self.combined_protected_cap_ok(&working);
+                    let drop_idx = working
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (b, _))| !drop_prot || b.protected)
+                        .min_by(|(ia, (a, _)), (ib, (b, _))| {
+                            (a.protected, a.kind.priority(), a.position)
+                                .cmp(&(b.protected, b.kind.priority(), b.position))
+                                .then_with(|| ia.cmp(ib))
+                        })
+                        .map(|(i, _)| i)
+                        .expect("non-empty working set");
+                    working.remove(drop_idx);
+                    trimmed = true;
+                }
             }
-
-            if !any_protected && snap_bytes <= self.budget_bytes && need <= self.resident_bytes {
-                blocked_only_by_protected = true;
-            }
-
-            // Drop the lowest-priority remaining boundary and retry.
-            let drop_idx = working
-                .iter()
-                .enumerate()
-                .min_by(|(ia, (a, _)), (ib, (b, _))| {
-                    (a.protected, a.kind.priority(), a.position)
-                        .cmp(&(b.protected, b.kind.priority(), b.position))
-                        .then_with(|| ia.cmp(ib))
-                })
-                .map(|(i, _)| i)
-                .expect("non-empty working set");
-            working.remove(drop_idx);
-            trimmed = true;
         }
 
         let evicted_before = self.stats.evicted;
-        let avail = self.reclaim_for(required, available);
+        let avail = self.reclaim_for_keeping_idx(required, available, keep_idx);
         let evicted = (self.stats.evicted - evicted_before) as u32;
         PlannedAdmission {
             admission: PrefixAdmission {
@@ -1387,15 +1472,393 @@ impl<S> PrefixStore<S> {
         }
     }
 
-    fn evict_unprotected_at_least(&mut self, bytes: u64) -> u64 {
-        let mut freed = 0u64;
-        while freed < bytes {
-            let idx = self
-                .pick_unprotected_victim(false)
-                .expect("caller checked unprotected bytes cover shortfall");
-            freed += self.remove_entry(idx);
+    fn combined_protected_cap_ok(&self, working: &[(PlannedBoundary, u64)]) -> bool {
+        let Some(max_kind) = working
+            .iter()
+            .filter(|(b, _)| b.protected)
+            .map(|(b, _)| b.kind)
+            .max()
+        else {
+            return true;
+        };
+        let w_prot_bytes = working
+            .iter()
+            .filter(|(b, _)| b.protected)
+            .fold(0u64, |acc, &(_, b)| acc.saturating_add(b));
+        if w_prot_bytes > self.protected_cap_for(max_kind) {
+            return false;
         }
-        freed
+        for (b, bytes) in working.iter().filter(|(b, _)| b.protected) {
+            if *bytes > self.protected_cap_for(b.kind) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn pick_unprotected_victim_excluding(
+        &self,
+        excluded: &[bool],
+        keep_pin: Option<usize>,
+        promo_pin: Option<usize>,
+    ) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if excluded[i] || Some(i) == keep_pin || Some(i) == promo_pin || e.protected {
+                continue;
+            }
+            if best
+                .is_none_or(|b| self.compare_unprotected_victim(i, b) == std::cmp::Ordering::Less)
+            {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    fn pick_protected_victim_excluding(
+        &self,
+        max_priority: Option<u8>,
+        excluded: &[bool],
+        keep_pin: Option<usize>,
+        promo_pin: Option<usize>,
+    ) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if excluded[i]
+                || Some(i) == keep_pin
+                || Some(i) == promo_pin
+                || !e.protected
+                || max_priority.is_some_and(|p| e.kind.priority() > p)
+            {
+                continue;
+            }
+            if best.is_none_or(|b| self.compare_protected_victim(i, b) == std::cmp::Ordering::Less)
+            {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    fn simulate_evictions(
+        &self,
+        working: &[(PlannedBoundary, u64)],
+        required: u64,
+        available: u64,
+        ctx: PrefixPlannedContext<'_>,
+    ) -> Result<Vec<usize>, bool> {
+        let w_prot_bytes = working
+            .iter()
+            .filter(|(b, _)| b.protected)
+            .fold(0u64, |acc, &(_, b)| acc.saturating_add(b));
+        let w_unprot_bytes = working
+            .iter()
+            .filter(|(b, _)| !b.protected)
+            .fold(0u64, |acc, &(_, b)| acc.saturating_add(b));
+        let total_snap = w_prot_bytes.saturating_add(w_unprot_bytes);
+        if total_snap > self.budget_bytes {
+            return Err(false);
+        }
+
+        let keep_pin = ctx.keep_match.filter(|&i| i < self.entries.len());
+        let promo_pin = match (ctx.promote_reused, ctx.prompt) {
+            (Some(pb), Some(prompt)) if pb.position > 0 && pb.position <= prompt.len() => {
+                let slice = &prompt[..pb.position];
+                self.entries.iter().position(|e| e.tokens == slice)
+            }
+            _ => None,
+        };
+        let has_any_prefix_conv = ctx.conversation_reuse == Some(PrefixReuse::AnyPrefix)
+            && ctx.prompt.is_some()
+            && working
+                .iter()
+                .any(|(b, _)| !b.protected && b.kind == PrefixKind::Conversation);
+
+        let mut excluded = vec![false; self.entries.len()];
+        let mut order = Vec::new();
+        let mut freed_avail = 0u64;
+        let mut sim_resident = self.resident_bytes;
+        let mut sim_protected = self.protected_bytes;
+
+        // Phase A: satisfy bare `required` memory shortfall before considering optional snapshots.
+        let short_req = required.saturating_sub(available);
+        while freed_avail < short_req {
+            let idx = self
+                .pick_unprotected_victim_excluding(&excluded, keep_pin, promo_pin)
+                .or_else(|| {
+                    self.pick_protected_victim_excluding(None, &excluded, keep_pin, promo_pin)
+                })
+                .ok_or(false)?;
+            excluded[idx] = true;
+            order.push(idx);
+            let e = &self.entries[idx];
+            freed_avail = freed_avail.saturating_add(e.bytes);
+            sim_resident -= e.bytes;
+            if e.protected {
+                sim_protected -= e.bytes;
+            }
+        }
+
+        let compute_superseded = |excluded: &[bool]| -> u64 {
+            if !has_any_prefix_conv {
+                return 0;
+            }
+            let Some(prompt) = ctx.prompt else {
+                return 0;
+            };
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    !excluded[*i]
+                        && Some(*i) != promo_pin
+                        && !e.protected
+                        && e.reuse == PrefixReuse::AnyPrefix
+                        && prompt.starts_with(&e.tokens)
+                })
+                .map(|(_, e)| e.bytes)
+                .sum()
+        };
+
+        let (promo_extra_prot, promo_target_kind) = match (promo_pin, ctx.promote_reused) {
+            (Some(pi), Some(pb)) if !excluded[pi] && !self.entries[pi].protected => {
+                let target_kind = if pb.kind.priority() > self.entries[pi].kind.priority() {
+                    pb.kind
+                } else {
+                    self.entries[pi].kind
+                };
+                let cap = self.protected_cap_for(target_kind);
+                let bytes = self.entries[pi].bytes;
+                let higher_existing: u64 = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        !excluded[*i] && e.protected && e.kind.priority() > target_kind.priority()
+                    })
+                    .map(|(_, e)| e.bytes)
+                    .sum();
+                if bytes <= cap && higher_existing.saturating_add(bytes) <= cap {
+                    (bytes, Some(target_kind))
+                } else {
+                    (0, None)
+                }
+            }
+            _ => (0, None),
+        };
+        sim_protected = sim_protected.saturating_add(promo_extra_prot);
+
+        // Phase B: satisfy protected caps, budget, and headroom for protected candidates ONLY.
+        if let Some(max_prot_kind) = working
+            .iter()
+            .filter(|(b, _)| b.protected)
+            .map(|(b, _)| b.kind)
+            .max()
+        {
+            let max_cap = self.protected_cap_for(max_prot_kind);
+            if w_prot_bytes > max_cap {
+                return Err(false);
+            }
+            let higher_surviving: u64 = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    !excluded[*i] && e.protected && e.kind.priority() > max_prot_kind.priority()
+                })
+                .map(|(_, e)| e.bytes)
+                .sum();
+            let promo_higher = promo_target_kind
+                .filter(|k| k.priority() > max_prot_kind.priority())
+                .map_or(0, |_| promo_extra_prot);
+            if higher_surviving
+                .saturating_add(promo_higher)
+                .saturating_add(w_prot_bytes)
+                > max_cap
+            {
+                return Err(false);
+            }
+            while sim_protected.saturating_add(w_prot_bytes) > max_cap {
+                let idx = self
+                    .pick_protected_victim_excluding(
+                        Some(max_prot_kind.priority()),
+                        &excluded,
+                        keep_pin,
+                        promo_pin,
+                    )
+                    .ok_or(false)?;
+                excluded[idx] = true;
+                order.push(idx);
+                let e = &self.entries[idx];
+                freed_avail = freed_avail.saturating_add(e.bytes);
+                sim_resident -= e.bytes;
+                sim_protected -= e.bytes;
+            }
+
+            // Ensure every lower-priority protected kind (e.g. `SharedRoot` inserted before
+            // `Document`) fits its own cap against surviving higher-priority protected entries.
+            for (b, bytes) in working.iter().filter(|(b, _)| b.protected) {
+                let cap_b = self.protected_cap_for(b.kind);
+                let higher_b: u64 = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        !excluded[*i] && e.protected && e.kind.priority() > b.kind.priority()
+                    })
+                    .map(|(_, e)| e.bytes)
+                    .sum();
+                let promo_higher_b = promo_target_kind
+                    .filter(|k| k.priority() > b.kind.priority())
+                    .map_or(0, |_| promo_extra_prot);
+                let same_or_lower_working: u64 = working
+                    .iter()
+                    .filter(|(wb, _)| wb.protected && wb.kind.priority() <= b.kind.priority())
+                    .fold(0u64, |acc, &(_, wbytes)| acc.saturating_add(wbytes));
+                if *bytes > cap_b
+                    || higher_b
+                        .saturating_add(promo_higher_b)
+                        .saturating_add(same_or_lower_working)
+                        > cap_b
+                {
+                    return Err(false);
+                }
+            }
+
+            loop {
+                let superseded = compute_superseded(&excluded);
+                let eff_resident = sim_resident.saturating_sub(superseded);
+                let prot_over_budget = eff_resident
+                    .saturating_add(w_prot_bytes)
+                    .saturating_sub(self.budget_bytes);
+                let prot_short = required
+                    .saturating_add(w_prot_bytes)
+                    .saturating_sub(available.saturating_add(freed_avail));
+                if prot_over_budget == 0 && prot_short == 0 {
+                    break;
+                }
+                let idx = self
+                    .pick_unprotected_victim_excluding(&excluded, keep_pin, promo_pin)
+                    .or_else(|| {
+                        self.pick_protected_victim_excluding(
+                            Some(max_prot_kind.priority()),
+                            &excluded,
+                            keep_pin,
+                            promo_pin,
+                        )
+                    })
+                    .ok_or(false)?;
+                excluded[idx] = true;
+                order.push(idx);
+                let e = &self.entries[idx];
+                freed_avail = freed_avail.saturating_add(e.bytes);
+                sim_resident -= e.bytes;
+            }
+        }
+
+        // Phase C: satisfy combined budget & headroom for unprotected candidates by evicting ONLY
+        // non-pinned unprotected victims. Never evict resident protected entries for unprotected
+        // snapshots.
+        if w_unprot_bytes > 0 || has_any_prefix_conv {
+            loop {
+                let superseded = compute_superseded(&excluded);
+                let eff_resident = sim_resident.saturating_sub(superseded);
+                let over_budget = eff_resident
+                    .saturating_add(total_snap)
+                    .saturating_sub(self.budget_bytes);
+                let short = required
+                    .saturating_add(total_snap)
+                    .saturating_sub(available.saturating_add(freed_avail));
+                let need = over_budget.max(short);
+                if need == 0 {
+                    break;
+                }
+                if let Some(idx) =
+                    self.pick_unprotected_victim_excluding(&excluded, keep_pin, promo_pin)
+                {
+                    excluded[idx] = true;
+                    order.push(idx);
+                    let e = &self.entries[idx];
+                    freed_avail = freed_avail.saturating_add(e.bytes);
+                    sim_resident -= e.bytes;
+                } else {
+                    let evictable_prot: u64 = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, e)| {
+                            !excluded[*i]
+                                && Some(*i) != keep_pin
+                                && Some(*i) != promo_pin
+                                && e.protected
+                        })
+                        .map(|(_, e)| e.bytes)
+                        .sum();
+                    let blocked_by_prot = w_prot_bytes == 0
+                        && total_snap <= self.budget_bytes
+                        && need <= evictable_prot;
+                    return Err(blocked_by_prot);
+                }
+            }
+        }
+
+        Ok(order)
+    }
+
+    fn reclaim_for_keeping_idx(
+        &mut self,
+        required: u64,
+        available: u64,
+        keep: Option<usize>,
+    ) -> u64 {
+        let shortfall = required.saturating_sub(available);
+        if shortfall == 0 || shortfall > self.resident_bytes {
+            return available;
+        }
+        let Some(mut keep_idx) = keep.filter(|&i| i < self.entries.len()) else {
+            return self.reclaim_for(required, available);
+        };
+        let mut freed = 0u64;
+        while freed < shortfall {
+            let mut best_unprot: Option<usize> = None;
+            for i in 0..self.entries.len() {
+                if i == keep_idx || self.entries[i].protected {
+                    continue;
+                }
+                if best_unprot.is_none_or(|b| {
+                    self.compare_unprotected_victim(i, b) == std::cmp::Ordering::Less
+                }) {
+                    best_unprot = Some(i);
+                }
+            }
+            let victim = best_unprot.or_else(|| {
+                let mut best_prot: Option<usize> = None;
+                for i in 0..self.entries.len() {
+                    if i == keep_idx || !self.entries[i].protected {
+                        continue;
+                    }
+                    if best_prot.is_none_or(|b| {
+                        self.compare_protected_victim(i, b) == std::cmp::Ordering::Less
+                    }) {
+                        best_prot = Some(i);
+                    }
+                }
+                best_prot
+            });
+            let idx = match victim {
+                Some(i) => i,
+                None => {
+                    freed = freed.saturating_add(self.remove_entry(keep_idx));
+                    return available.saturating_add(freed);
+                }
+            };
+            if idx < keep_idx {
+                keep_idx -= 1;
+            }
+            freed = freed.saturating_add(self.remove_entry(idx));
+        }
+        available.saturating_add(freed)
     }
 
     /// Evict entries until at least `bytes` are freed: unprotected entries first (NearTail first,
@@ -2145,5 +2608,327 @@ mod tests {
         assert_eq!(adm.kept.len(), 2);
         assert!(!adm.kept.iter().any(|b| b.kind == PrefixKind::NearTail));
         assert_eq!(adm.fallback, Some(PREFIX_PARTIAL_ADMISSION_TRIMMED));
+    }
+
+    #[test]
+    fn any_prefix_non_exact_document_inside_reused_turn_stays_priced_in_captures() {
+        let mut store = PrefixStore::new(500);
+        let turn1_prompt: Vec<i32> = (1..=100).collect();
+        store.insert_with_meta(
+            turn1_prompt.clone(),
+            PrefixReuse::AnyPrefix,
+            200,
+            "turn1",
+            PrefixKind::Conversation,
+            false,
+        );
+
+        let mut turn2_prompt = turn1_prompt;
+        turn2_prompt.extend(101..=150);
+        let (match_idx, reused) = store
+            .peek_match(&turn2_prompt, |_| Some(100))
+            .expect("turn1 reused");
+        assert_eq!(reused, 100);
+
+        let cands = BoundaryCandidates {
+            document: Some(60), // <= reused (100), but NOT an exact key in store!
+            shared_root: None,
+            prev_message: Some(100),
+            conversation_end: None,
+        };
+        let plan = plan_prefix_boundaries_with_exact(
+            turn2_prompt.len(),
+            reused,
+            PrefixReuse::AnyPrefix,
+            crate::request::PrefixCheckpointPolicy::with_document(
+                crate::request::PrefixDocumentSpan::Tokens { count: 60 },
+            ),
+            cands,
+            NearTailConfig::default(),
+            |pos| store.contains_exact(&turn2_prompt[..pos]),
+        );
+        assert_eq!(plan.promote_reused, None);
+        assert_eq!(
+            plan.captures,
+            vec![PlannedBoundary {
+                position: 60,
+                kind: PrefixKind::Document,
+                protected: true,
+            }]
+        );
+
+        let planned_with_costs = vec![
+            (plan.captures[0], 120),
+            (
+                PlannedBoundary {
+                    position: turn2_prompt.len(),
+                    kind: PrefixKind::Conversation,
+                    protected: false,
+                },
+                260,
+            ),
+        ];
+        let ctx = PrefixPlannedContext {
+            prompt: Some(&turn2_prompt),
+            keep_match: Some(match_idx),
+            promote_reused: plan.promote_reused,
+            conversation_reuse: Some(PrefixReuse::AnyPrefix),
+        };
+        // Full headroom keeps both Document@60 and superseded Conversation@150 without evicting
+        // Turn-1 before restore.
+        let adm = store.admit_planned_with(100, &planned_with_costs, 1_000, ctx);
+        assert!(adm.admission.snapshot);
+        assert_eq!(adm.evicted_entries, 0);
+        assert_eq!(adm.kept.len(), 2);
+        assert!(store.contains_exact(&turn2_prompt[..100]));
+
+        // Tight headroom (`available = 200`, `required = 100`, `Document` = 120 fails `100 + 120 > 200`,
+        // while `Conversation` if <= 100 or partial trims cleanly) drops Document rather than
+        // bypassing E7 headroom.
+        let tight_costs = vec![(plan.captures[0], 120), (planned_with_costs[1].0, 80)];
+        let tight = store.admit_planned_with(100, &tight_costs, 200, ctx);
+        assert!(tight.admission.snapshot);
+        assert!(!tight.kept.iter().any(|b| b.kind == PrefixKind::Document));
+        assert_eq!(tight.fallback, Some(PREFIX_PARTIAL_ADMISSION_TRIMMED));
+    }
+
+    #[test]
+    fn promote_protected_preserves_existing_protection_above_half_budget() {
+        let mut store = PrefixStore::new(100);
+        store.insert_with_meta(
+            vec![3, 4],
+            PrefixReuse::WholeEntry,
+            10,
+            "root",
+            PrefixKind::SharedRoot,
+            true,
+        );
+        store.insert_with_meta(
+            vec![1, 2],
+            PrefixReuse::AnyPrefix,
+            60,
+            "doc",
+            PrefixKind::Document,
+            true,
+        );
+        assert_eq!(store.protected_bytes(), 70);
+
+        // Re-promoting already-protected SharedRoot must still succeed even though D1 holds
+        // protected_bytes (70) > budget_bytes / 2 (50).
+        assert!(store.promote_protected(&[3, 4], PrefixKind::SharedRoot));
+        // Promoting existing Document with lower kind must succeed and never downgrade Document.
+        assert!(store.promote_protected(&[1, 2], PrefixKind::SharedRoot));
+        let doc_hit = store.lookup(&[1, 2, 9], |_| Some(2)).unwrap();
+        assert_eq!(doc_hit.kind, PrefixKind::Document);
+        assert!(doc_hit.protected);
+        // Upgrading SharedRoot to Document succeeds within 3/4 cap (70 <= 75).
+        assert!(store.promote_protected(&[3, 4], PrefixKind::Document));
+        let upgraded = store.lookup(&[3, 4, 9], |_| Some(2)).unwrap();
+        assert_eq!(upgraded.kind, PrefixKind::Document);
+    }
+
+    #[test]
+    fn admit_planned_with_pins_hit_and_handles_over_half_budget_self_supersede() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert_with_meta(
+            vec![1, 2, 3, 4],
+            PrefixReuse::AnyPrefix,
+            600,
+            "c1",
+            PrefixKind::Conversation,
+            false,
+        );
+        let prompt = [1, 2, 3, 4, 5, 6];
+        let (idx, reused) = store.peek_match(&prompt, |_| Some(4)).unwrap();
+        assert_eq!((idx, reused), (0, 4));
+        let conv_boundary = PlannedBoundary {
+            position: prompt.len(),
+            kind: PrefixKind::Conversation,
+            protected: false,
+        };
+        let adm = store.admit_planned_with(
+            300,
+            &[(conv_boundary, 650)],
+            2_000,
+            PrefixPlannedContext {
+                prompt: Some(&prompt),
+                keep_match: Some(idx),
+                promote_reused: None,
+                conversation_reuse: Some(PrefixReuse::AnyPrefix),
+            },
+        );
+        assert!(adm.admission.snapshot);
+        assert_eq!(
+            adm.evicted_entries, 0,
+            "hit entry must not be evicted before restore"
+        );
+        assert!(store.contains_exact(&[1, 2, 3, 4]));
+
+        // When optional snapshot cannot fit available memory alongside pinned C1, snapshot is
+        // refused while C1 remains intact; only bare `required` shortfall evicts C1.
+        let no_snap = store.admit_planned_with(
+            300,
+            &[(conv_boundary, 650)],
+            500,
+            PrefixPlannedContext {
+                prompt: Some(&prompt),
+                keep_match: Some(idx),
+                promote_reused: None,
+                conversation_reuse: Some(PrefixReuse::AnyPrefix),
+            },
+        );
+        assert!(!no_snap.admission.snapshot);
+        assert_eq!(no_snap.evicted_entries, 0);
+        assert!(store.contains_exact(&[1, 2, 3, 4]));
+
+        let bare_req = store.admit_planned_with(
+            800,
+            &[(conv_boundary, 650)],
+            500,
+            PrefixPlannedContext {
+                prompt: Some(&prompt),
+                keep_match: Some(idx),
+                promote_reused: None,
+                conversation_reuse: Some(PrefixReuse::AnyPrefix),
+            },
+        );
+        assert!(!bare_req.admission.snapshot);
+        assert_eq!(bare_req.evicted_entries, 1);
+        assert_eq!(bare_req.admission.available, 1_100);
+        assert!(!store.contains_exact(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn admit_planned_drops_infeasible_protected_before_feasible_conversation() {
+        // Case (a1): oversized Document (> 3/4 cap) dropped first; Conversation kept.
+        let mut store: PrefixStore<&str> = PrefixStore::new(100);
+        let doc_huge = PlannedBoundary {
+            position: 20,
+            kind: PrefixKind::Document,
+            protected: true,
+        };
+        let conv = PlannedBoundary {
+            position: 50,
+            kind: PrefixKind::Conversation,
+            protected: false,
+        };
+        let adm = store.admit_planned(10, &[(doc_huge, 80), (conv, 40)], 1_000);
+        assert!(adm.admission.snapshot);
+        assert_eq!(adm.kept, vec![conv]);
+        assert_eq!(adm.fallback, Some(PREFIX_PARTIAL_ADMISSION_TRIMMED));
+
+        // Case (a2): Document violates tight headroom (`required 70 + 50 > 100`), Conversation(20)
+        // still fits headroom -> drops Document, keeps Conversation.
+        let doc_ok_cap = PlannedBoundary {
+            position: 20,
+            kind: PrefixKind::Document,
+            protected: true,
+        };
+        let adm_tight = store.admit_planned(70, &[(doc_ok_cap, 50), (conv, 20)], 100);
+        assert!(adm_tight.admission.snapshot);
+        assert_eq!(adm_tight.kept, vec![conv]);
+        assert_eq!(adm_tight.fallback, Some(PREFIX_PARTIAL_ADMISSION_TRIMMED));
+
+        // Case (a3): SharedRoot(40) + Document(50) exceed Document cap (75) together -> drops
+        // excess protected SharedRoot before touching Conversation(20).
+        let root = PlannedBoundary {
+            position: 10,
+            kind: PrefixKind::SharedRoot,
+            protected: true,
+        };
+        let adm_multi_prot =
+            store.admit_planned(0, &[(root, 40), (doc_ok_cap, 50), (conv, 20)], 1_000);
+        assert!(adm_multi_prot.admission.snapshot);
+        assert_eq!(adm_multi_prot.kept, vec![doc_ok_cap, conv]);
+        assert_eq!(
+            adm_multi_prot.fallback,
+            Some(PREFIX_PARTIAL_ADMISSION_TRIMMED)
+        );
+    }
+
+    #[test]
+    fn admit_planned_never_evicts_resident_protected_for_unprotected_snapshot() {
+        let mut store = PrefixStore::new(100);
+        store.insert_with_meta(
+            vec![1, 2],
+            PrefixReuse::WholeEntry,
+            40,
+            "d_old",
+            PrefixKind::Document,
+            true,
+        );
+        store.insert_with_meta(
+            vec![3, 4],
+            PrefixReuse::WholeEntry,
+            20,
+            "u_old",
+            PrefixKind::Conversation,
+            false,
+        );
+
+        let doc_new = PlannedBoundary {
+            position: 20,
+            kind: PrefixKind::Document,
+            protected: true,
+        };
+        let conv_new = PlannedBoundary {
+            position: 80,
+            kind: PrefixKind::Conversation,
+            protected: false,
+        };
+        // D_new(20) fits cleanly alongside D_old(40) + U_old(20) (80 <= 100, 60 <= 75), whereas
+        // adding Conv_new(50) would push total to 130 > 100 and U_old(20) cannot cover over=30.
+        // Conv_new must be dropped without evicting resident protected D_old.
+        let adm = store.admit_planned(0, &[(doc_new, 20), (conv_new, 50)], 1_000);
+        assert!(adm.admission.snapshot);
+        assert_eq!(adm.kept, vec![doc_new]);
+        assert_eq!(adm.fallback, Some(PREFIX_PARTIAL_ADMISSION_TRIMMED));
+        assert!(store.contains_exact(&[1, 2]), "D_old must remain resident");
+        assert_eq!(store.protected_bytes(), 40);
+    }
+
+    #[test]
+    fn lookup_tie_prefers_protected_and_insert_never_downgrades_protected_kind() {
+        let mut store = PrefixStore::new(200);
+        store.insert_with_meta(
+            vec![1, 2, 3, 4],
+            PrefixReuse::WholeEntry,
+            20,
+            "doc",
+            PrefixKind::Document,
+            true,
+        );
+        // Newer MRU unprotected Conversation with same 4-token overlap on prompt `[1,2,3,4,5]`.
+        store.insert_with_meta(
+            vec![1, 2, 3, 4, 9],
+            PrefixReuse::AnyPrefix,
+            30,
+            "conv_mru",
+            PrefixKind::Conversation,
+            false,
+        );
+
+        let hit = store
+            .lookup_with_proposer_diagnostic(&[1, 2, 3, 4, 5], |_| Some(4))
+            .hit
+            .expect("tie hit");
+        assert_eq!(hit.reused, 4);
+        assert_eq!(hit.kind, PrefixKind::Document);
+        assert!(hit.protected);
+        assert_eq!(store.stats().hits, 1);
+
+        // Inserting protected SharedRoot over an existing exact protected Document keeps Document.
+        let out = store.insert_with_meta(
+            vec![1, 2, 3, 4],
+            PrefixReuse::WholeEntry,
+            20,
+            "doc2",
+            PrefixKind::SharedRoot,
+            true,
+        );
+        assert!(out.stored);
+        let hit2 = store.lookup(&[1, 2, 3, 4, 5], |_| Some(4)).unwrap();
+        assert_eq!(hit2.kind, PrefixKind::Document);
+        assert!(hit2.protected);
     }
 }

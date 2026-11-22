@@ -20,15 +20,15 @@ use core_llm::ThinkingMode;
 use core_llm::{
     AudioRef, BoundaryCandidates, Channel, ChatTemplate, Constraint, ConstraintDecodeTable,
     ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish, ImageRef,
-    IncrementalDetok, JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry,
-    LoadSpec, Message, ModelSamplingDefaults, NearTailConfig, PlannedBoundary,
+    IncrementalDetok, JinjaChatTemplate, JsonConstraint, KvCacheShape, Llama3Template,
+    LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, NearTailConfig, PlannedBoundary,
     PrefixCheckpointCapabilities, PrefixCheckpointMode, PrefixCheckpointPolicy,
-    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixReuse, ProposerCapabilities,
-    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
-    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef, MAX_CHECKPOINTS_PER_REQUEST,
-    PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixPlannedContext, PrefixReuse,
+    ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
+    MAX_CHECKPOINTS_PER_REQUEST, PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
 };
 
 use core_llm::DraftReport;
@@ -2412,6 +2412,11 @@ impl LlamaProvider {
         self.prefix.borrow().stats()
     }
 
+    /// Drop every entry from the cross-turn prefix cache.
+    pub fn clear_prefix_cache(&self) {
+        self.prefix.borrow_mut().clear();
+    }
+
     /// Settle the prefix cache budget the load admitted: an empty cache of `budget` bytes, and
     /// the load report naming it.
     fn with_prefix_budget(mut self, budget: u64) -> Self {
@@ -3328,6 +3333,10 @@ fn numeric_policy(
 impl TextLlm for LlamaProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
+    }
+
+    fn clear_prefix_cache(&self) {
+        self.clear_prefix_cache();
     }
 
     fn synchronize_before_release(&self) -> CoreResult<()> {
@@ -4302,34 +4311,23 @@ impl LlamaProvider {
             Decoder::Causal(_) => PrefixReuse::AnyPrefix,
             Decoder::Qwen35(_) => PrefixReuse::WholeEntry,
         };
-        let peeked_reused = if prefix_store {
-            let prefix = self.prefix.borrow();
-            match &self.model {
-                Decoder::Causal(_) => prefix.peek_reused::<ContiguousKvCache>(&prompt_ids, false),
-                Decoder::Qwen35(_) => {
-                    let check_mtp =
-                        route.is_mtp() && !matches!(route, SpeculativeRoute::BlockDraft { .. });
-                    prefix.peek_reused::<Qwen35Cache>(&prompt_ids, check_mtp)
-                }
-            }
-        } else {
-            0
+        let check_mtp = route.is_mtp() && !matches!(route, SpeculativeRoute::BlockDraft { .. });
+        let peek_hit = |prefix: &PrefixCache| match &self.model {
+            Decoder::Causal(_) => prefix.peek_match::<ContiguousKvCache>(&prompt_ids, false),
+            Decoder::Qwen35(_) => prefix.peek_match::<Qwen35Cache>(&prompt_ids, check_mtp),
         };
-        let boundary_plan = if prefix_store {
-            core_llm::plan_prefix_boundaries(
+        let build_plan = |prefix: &PrefixCache, reused: usize| {
+            let plan = core_llm::plan_prefix_boundaries_with_exact(
                 prompt_ids.len(),
-                peeked_reused,
+                reused,
                 reuse_mode,
                 checkpoint_policy,
                 boundary_candidates,
                 NearTailConfig::default(),
-            )
-        } else {
-            core_llm::BoundaryPlan::default()
-        };
-        let planned_with_costs: Vec<(PlannedBoundary, u64)> = if prefix_store {
-            let mut items = Vec::with_capacity(boundary_plan.captures.len() + 1);
-            for &b in &boundary_plan.captures {
+                |pos| pos <= prompt_ids.len() && prefix.contains_exact(&prompt_ids[..pos]),
+            );
+            let mut items = Vec::with_capacity(plan.captures.len() + 1);
+            for &b in &plan.captures {
                 let bytes = self
                     .boundary_snapshot_bytes(b, route.is_mtp())
                     .ok_or_else(|| {
@@ -4354,9 +4352,22 @@ impl LlamaProvider {
                     0,
                 ));
             }
-            items
+            Ok::<_, CoreError>((plan, items))
+        };
+        let mut prefix_match_idx = None;
+        let peeked_reused = if prefix_store {
+            let prefix = self.prefix.borrow();
+            let hit = peek_hit(&prefix);
+            prefix_match_idx = hit.map(|(idx, _)| idx);
+            hit.map_or(0, |(_, len)| len)
         } else {
-            Vec::new()
+            0
+        };
+        let (mut boundary_plan, mut planned_with_costs) = if prefix_store {
+            let prefix = self.prefix.borrow();
+            build_plan(&prefix, peeked_reused)?
+        } else {
+            (core_llm::BoundaryPlan::default(), Vec::new())
         };
         // The request's native-memory estimate: the K/V term at the compressed format's bytes
         // when the plan runs compressed (sc-20682), dense otherwise — plus what its speculative
@@ -4423,9 +4434,54 @@ impl LlamaProvider {
         // not fit evicts them least-recently-used first, and the planned snapshots are admitted
         // with it (trimmed lowest-priority first if tight, never forcing request refusal).
         let planned_admission = if prefix_store {
-            self.prefix
-                .borrow_mut()
-                .admit_planned(required, &planned_with_costs, available)
+            let mut prefix = self.prefix.borrow_mut();
+            let adm = prefix.admit_planned_for(
+                required,
+                &planned_with_costs,
+                available,
+                PrefixPlannedContext {
+                    prompt: Some(&prompt_ids),
+                    keep_match: prefix_match_idx,
+                    promote_reused: boundary_plan.promote_reused,
+                    conversation_reuse: Some(reuse_mode),
+                },
+            );
+            let after_hit = peek_hit(&prefix);
+            let reused_after = after_hit.map_or(0, |(_, len)| len);
+            if reused_after < peeked_reused {
+                let (new_plan, new_items) = build_plan(&prefix, reused_after)?;
+                boundary_plan = new_plan;
+                planned_with_costs = new_items;
+                if !adm.admission.snapshot {
+                    core_llm::PlannedAdmission {
+                        admission: core_llm::PrefixAdmission {
+                            available: adm.admission.available,
+                            snapshot: false,
+                        },
+                        kept: Vec::new(),
+                        evicted_entries: adm.evicted_entries,
+                        fallback: adm.fallback,
+                    }
+                } else {
+                    let second = prefix.admit_planned_for(
+                        required,
+                        &planned_with_costs,
+                        adm.admission.available,
+                        PrefixPlannedContext {
+                            prompt: Some(&prompt_ids),
+                            keep_match: after_hit.map(|(idx, _)| idx),
+                            promote_reused: boundary_plan.promote_reused,
+                            conversation_reuse: Some(reuse_mode),
+                        },
+                    );
+                    core_llm::PlannedAdmission {
+                        evicted_entries: adm.evicted_entries.saturating_add(second.evicted_entries),
+                        ..second
+                    }
+                }
+            } else {
+                adm
+            }
         } else {
             core_llm::PlannedAdmission {
                 admission: core_llm::PrefixAdmission {
@@ -5746,7 +5802,7 @@ impl LlamaProvider {
     fn boundary_snapshot_bytes(&self, boundary: PlannedBoundary, mtp: bool) -> Option<u64> {
         match &self.model {
             Decoder::Qwen35(m) => m.config().prefix_snapshot_bytes(boundary.position, mtp),
-            Decoder::Causal(_) => {
+            Decoder::Causal(m) => {
                 if !boundary.protected {
                     Some(0)
                 } else {
@@ -5755,7 +5811,15 @@ impl LlamaProvider {
                         .div_ceil(block)
                         .max(1)
                         .checked_mul(block)?;
-                    self.model.memory_geometry().kv_shape().dense_bytes(aligned)
+                    let c = m.config();
+                    let (kv_heads, head_dim) = causal_widest_kv_layer(c);
+                    KvCacheShape {
+                        layers: u64::try_from(c.num_layers).ok()?,
+                        kv_heads,
+                        head_dim,
+                        element_bytes: self.model.memory_geometry().element_bytes,
+                    }
+                    .dense_bytes(aligned)
                 }
             }
         }
@@ -6230,6 +6294,31 @@ impl LlamaProvider {
         run.report.draft = Some(block.report.clone());
         Ok(run)
     }
+}
+
+/// Widest per-layer `(kv_heads, head_dim)` upper bound for `CausalLm` KV snapshot pricing,
+/// matching `candle-llm`'s `KvLayout::widest_layer`: handles DeepSeek-V2 MLA and per-layer
+/// Gemma 4 geometry while skipping Gemma 4 KV-shared tail layers.
+pub(crate) fn causal_widest_kv_layer(c: &ModelConfig) -> (u64, u64) {
+    if let Some(mla) = c.mla.filter(|_| c.is_mla()) {
+        return (
+            c.num_heads.max(0) as u64,
+            mla.q_head_dim().max(mla.v_head_dim).max(0) as u64,
+        );
+    }
+    (0..c.num_layers)
+        .filter(|&i| !c.gemma4.as_deref().is_some_and(|g| g.is_kv_shared(i)))
+        .map(|i| {
+            let la = c.layer_attention(i);
+            (la.num_kv_heads.max(0) as u64, la.head_dim.max(0) as u64)
+        })
+        .fold((0u64, 0u64), |widest, layer| {
+            if layer.0.saturating_mul(layer.1) > widest.0.saturating_mul(widest.1) {
+                layer
+            } else {
+                widest
+            }
+        })
 }
 
 /// The resident quantization of a decoder whose projections are `quantized` with affine bit

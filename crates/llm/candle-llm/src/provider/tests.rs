@@ -6436,3 +6436,30 @@ fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
     assert!(tok_bad_cands.document.is_none());
     assert!(tok_bad_unaligned);
 }
+
+#[test]
+fn prefix_checkpoint_clear_prefix_cache_drops_entries() {
+    use crate::primitives::KvCache;
+    use core_llm::TextLlm;
+
+    let (cfg, weights) = tiny_llama_parts();
+    let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
+    let tok = core_llm::Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap();
+    let provider = super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tok, vec![]);
+    *provider.prefix_cache() = crate::decode::PrefixCache::with_budget(1 << 20);
+    let mut kv = crate::primitives::kv_cache::ContiguousKvCache::new(1);
+    let ones = candle_core::Tensor::ones(
+        (1, 1, 8, 2),
+        candle_core::DType::F32,
+        &candle_core::Device::Cpu,
+    )
+    .unwrap();
+    kv.update(0, &ones, &ones).unwrap();
+    provider
+        .prefix_cache()
+        .store(&[1, 2, 3, 4, 5, 6, 7, 8], &[], &kv, None, None)
+        .unwrap();
+    assert!(provider.prefix_cache_resident_bytes() > 0);
+    TextLlm::clear_prefix_cache(&provider);
+    assert_eq!(provider.prefix_cache_resident_bytes(), 0);
+}

@@ -1498,6 +1498,17 @@ enum Qwen35PrefixLayer {
 }
 
 impl Qwen35PrefixState {
+    /// Dummy prefix state covering `len` positions for non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(len: usize) -> Self {
+        let t = Tensor::ones((1, 1, len, 2), DType::F32, &Device::Cpu).unwrap();
+        Self {
+            owner: std::sync::Arc::new([0]),
+            layers: vec![Qwen35PrefixLayer::Attn(Some((t.clone(), t)))],
+            len,
+        }
+    }
+
     /// The positions the state covers.
     pub fn len(&self) -> usize {
         self.len
@@ -2098,6 +2109,12 @@ pub struct Qwen35MtpCache {
 }
 
 impl Qwen35MtpCache {
+    /// Empty MTP cache for non-inference prefix-checkpoint unit tests.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { layers: Vec::new() }
+    }
+
     /// Clear every MTP layer's speculative attention state.
     pub fn reset(&mut self) {
         for layer in &mut self.layers {

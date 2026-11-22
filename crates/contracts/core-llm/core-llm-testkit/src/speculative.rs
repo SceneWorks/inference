@@ -1757,41 +1757,103 @@ pub fn run_speculative_bench_with(
         req
     };
     let mut rows = Vec::with_capacity(prompts.len() * config.options.len());
-    for prompt in prompts {
-        for option in &config.options {
-            let req = request(prompt, option);
-            let tag = format!("[{}] {}", prompt.id, option.to_wire());
-            if config.warmup && config.prompt_set != BenchPromptSet::PrefixCheckpoints {
-                let warm = if isolated_warmup {
-                    request(&warmup_prompt, option)
-                } else {
-                    req.clone()
-                };
-                observe(provider, &warm).map_err(|e| format!("{tag} warm-up: {e}"))?;
+    if config.prompt_set == BenchPromptSet::PrefixCheckpoints {
+        struct Cell {
+            req: TextLlmRequest,
+            first: Option<(Observed, &'static str)>,
+            samples: Vec<BenchSample>,
+        }
+        let mut cells: Vec<Vec<Cell>> = prompts
+            .iter()
+            .map(|prompt| {
+                config
+                    .options
+                    .iter()
+                    .map(|option| Cell {
+                        req: request(prompt, option),
+                        first: None,
+                        samples: Vec::with_capacity(config.repeats as usize),
+                    })
+                    .collect()
+            })
+            .collect();
+        for (o_idx, option) in config.options.iter().enumerate() {
+            let opt_tag = option.to_wire();
+            if config.warmup {
+                let warm = request(&warmup_prompt, option);
+                observe(provider, &warm).map_err(|e| format!("{opt_tag} warm-up: {e}"))?;
             }
-            let mut first = None;
-            let mut samples = Vec::with_capacity(config.repeats as usize);
             for repeat in 0..config.repeats {
-                let run = observe_with(provider, &req, memory)
-                    .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
-                let (sample, timing_source) = bench_sample(&run);
-                samples.push(sample);
-                first.get_or_insert((run, timing_source));
+                // Start every repeat and option from a clean prefix cache so multi-turn sequences
+                // (`turn1 -> turn1_edited`, `doc_q1 -> doc_q2`) never contaminate later repeats.
+                provider.clear_prefix_cache();
+                for (p_idx, prompt) in prompts.iter().enumerate() {
+                    let cell = &mut cells[p_idx][o_idx];
+                    let tag = format!("[{}] {}", prompt.id, opt_tag);
+                    let run = observe_with(provider, &cell.req, memory)
+                        .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
+                    let (sample, timing_source) = bench_sample(&run);
+                    cell.samples.push(sample);
+                    cell.first.get_or_insert((run, timing_source));
+                }
             }
-            let (run, timing_source) = first.expect("at least one repeat ran");
-            rows.push(BenchRow {
-                prompt_id: prompt.id.clone(),
-                class: prompt.class,
-                requested: *option,
-                speculative: req.speculative_mode(),
-                verify: req.speculative_verify,
-                thinking: config.thinking,
-                prompt_tokens: run.prompt_tokens,
-                generated_tokens: run.generated,
-                timing_source,
-                report: run.report,
-                samples,
-            });
+        }
+        for (p_idx, prompt) in prompts.iter().enumerate() {
+            for (o_idx, option) in config.options.iter().enumerate() {
+                let cell = &mut cells[p_idx][o_idx];
+                let (run, timing_source) = cell.first.take().expect("at least one repeat ran");
+                rows.push(BenchRow {
+                    prompt_id: prompt.id.clone(),
+                    class: prompt.class,
+                    requested: *option,
+                    speculative: cell.req.speculative_mode(),
+                    verify: cell.req.speculative_verify,
+                    thinking: config.thinking,
+                    prompt_tokens: run.prompt_tokens,
+                    generated_tokens: run.generated,
+                    timing_source,
+                    report: run.report,
+                    samples: std::mem::take(&mut cell.samples),
+                });
+            }
+        }
+    } else {
+        for prompt in prompts {
+            for option in &config.options {
+                let req = request(prompt, option);
+                let tag = format!("[{}] {}", prompt.id, option.to_wire());
+                if config.warmup {
+                    let warm = if isolated_warmup {
+                        request(&warmup_prompt, option)
+                    } else {
+                        req.clone()
+                    };
+                    observe(provider, &warm).map_err(|e| format!("{tag} warm-up: {e}"))?;
+                }
+                let mut first = None;
+                let mut samples = Vec::with_capacity(config.repeats as usize);
+                for repeat in 0..config.repeats {
+                    let run = observe_with(provider, &req, memory)
+                        .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
+                    let (sample, timing_source) = bench_sample(&run);
+                    samples.push(sample);
+                    first.get_or_insert((run, timing_source));
+                }
+                let (run, timing_source) = first.expect("at least one repeat ran");
+                rows.push(BenchRow {
+                    prompt_id: prompt.id.clone(),
+                    class: prompt.class,
+                    requested: *option,
+                    speculative: req.speculative_mode(),
+                    verify: req.speculative_verify,
+                    thinking: config.thinking,
+                    prompt_tokens: run.prompt_tokens,
+                    generated_tokens: run.generated,
+                    timing_source,
+                    report: run.report,
+                    samples,
+                });
+            }
         }
     }
     Ok(BenchDocument {
@@ -1878,11 +1940,18 @@ pub fn bench_config(
             format!("{name}@{format}")
         }
     });
+    let prompt_set = match var("SPECULATIVE_BENCH_PROMPT_SET") {
+        Some(value) => BenchPromptSet::parse(&value)?,
+        None => BenchPromptSet::Default,
+    };
     let options = match var("SPECULATIVE_BENCH_OPTIONS") {
         Some(json) => serde_json::from_str::<Vec<Value>>(&json)
             .map_err(|e| e.to_string())
             .and_then(|list| list.iter().map(BenchOption::from_wire).collect())
             .map_err(|e| format!("SPECULATIVE_BENCH_OPTIONS is not a JSON option list: {e}"))?,
+        None if prompt_set == BenchPromptSet::PrefixCheckpoints => {
+            vec![Speculative::Off.into()]
+        }
         None => vec![Speculative::Off.into(), Speculative::Auto.into()],
     };
     let sampling = match var("SPECULATIVE_BENCH_SAMPLING") {
@@ -1891,9 +1960,10 @@ pub fn bench_config(
         }
         None => Sampling::greedy(),
     };
-    let prompt_set = match var("SPECULATIVE_BENCH_PROMPT_SET") {
-        Some(value) => BenchPromptSet::parse(&value)?,
-        None => BenchPromptSet::Default,
+    let default_repeats = if prompt_set == BenchPromptSet::PrefixCheckpoints {
+        1
+    } else {
+        BENCH_DEFAULT_REPEATS
     };
     let prefix_checkpoints = match var("SPECULATIVE_BENCH_PREFIX_CHECKPOINTS").as_deref() {
         None => None,
@@ -1912,7 +1982,7 @@ pub fn bench_config(
         sampling,
         options,
         warmup: var("SPECULATIVE_BENCH_WARMUP").as_deref() != Some("0"),
-        repeats: count("SPECULATIVE_BENCH_REPEATS", BENCH_DEFAULT_REPEATS)?,
+        repeats: count("SPECULATIVE_BENCH_REPEATS", default_repeats)?,
         thinking: bench_thinking(var)?,
         prompt_set,
         prefix_checkpoints,
@@ -2209,6 +2279,8 @@ mod tests {
         seen_speculative: RefCell<Vec<(Speculative, SpeculativeVerify)>>,
         /// Each request's prefix checkpoint policy, in request order.
         seen_prefix_checkpoints: RefCell<Vec<Option<PrefixCheckpointPolicy>>>,
+        /// Number of `clear_prefix_cache` resets requested by the harness.
+        prefix_clears: std::cell::Cell<usize>,
     }
 
     fn stub(diverge: bool, mislabel: bool) -> SpeculativeStub {
@@ -2239,12 +2311,17 @@ mod tests {
             seen_thinking: RefCell::default(),
             seen_speculative: RefCell::default(),
             seen_prefix_checkpoints: RefCell::default(),
+            prefix_clears: std::cell::Cell::new(0),
         }
     }
 
     impl TextLlm for SpeculativeStub {
         fn descriptor(&self) -> &TextLlmDescriptor {
             &self.descriptor
+        }
+
+        fn clear_prefix_cache(&self) {
+            self.prefix_clears.set(self.prefix_clears.get() + 1);
         }
 
         fn load_report(&self) -> Option<LoadReport> {
@@ -3325,12 +3402,14 @@ mod tests {
         let knobs = |name: &str| match name {
             "SPECULATIVE_BENCH_PROMPT_SET" => Some("prefix_checkpoints".to_string()),
             "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS" => Some("off".to_string()),
-            "SPECULATIVE_BENCH_REPEATS" => Some("1".to_string()),
             _ => None,
         };
         let off_cfg = bench_config("/snap/Model-7B", "mlx", &knobs).unwrap();
         assert_eq!(off_cfg.prompt_set, BenchPromptSet::PrefixCheckpoints);
         assert_eq!(off_cfg.prefix_checkpoints, Some(PrefixCheckpointMode::Off));
+        // Unset options/repeats default to ["off"] and 1 for paired checkpoint sequences.
+        assert_eq!(off_cfg.options, vec![BenchOption::Plain(Speculative::Off)]);
+        assert_eq!(off_cfg.repeats, 1);
         assert!(bench_config("/snap/Model-7B", "mlx", &|k| {
             (k == "SPECULATIVE_BENCH_PROMPT_SET").then(|| "unknown".to_string())
         })
@@ -3340,15 +3419,13 @@ mod tests {
         })
         .is_err());
 
-        // `off` override forces every request (even `short_doc_q1`) to `off`, and skips warmups
-        // when prompt_set is `PrefixCheckpoints`.
+        // `off` override forces every request (even `short_doc_q1`) to `off`, runs one isolated
+        // unrelated warmup before the timed sequence, and clears the prefix cache before repeat 0.
         let off_provider = stub(false, false);
-        let off_cfg = BenchConfig {
-            options: vec![Speculative::Off.into()],
-            ..off_cfg
-        };
         let off_doc = run_speculative_bench(&off_provider, &prompts, &off_cfg).unwrap();
-        assert_eq!(off_provider.seen_prefix_checkpoints.borrow().len(), 8);
+        assert_eq!(off_provider.prefix_clears.get(), 1);
+        assert_eq!(off_provider.seen_prefix_checkpoints.borrow().len(), 9);
+        assert_eq!(off_provider.seen.borrow()[0], BENCH_WARMUP_PROMPT);
         assert!(off_provider
             .seen_prefix_checkpoints
             .borrow()
@@ -3357,13 +3434,15 @@ mod tests {
         let off_json = off_doc.to_json();
         assert_eq!(off_json["rows"][2]["prefix_checkpoints"]["policy"], "off");
 
-        // `auto` override preserves `with_document` on document prompts and sets `auto` elsewhere.
+        // `auto` override with warmup off runs the 8-prompt sequence cleanly without a warmup.
         let auto_provider = stub(false, false);
         let auto_cfg = BenchConfig {
             prefix_checkpoints: Some(PrefixCheckpointMode::Auto),
-            ..off_cfg
+            warmup: false,
+            ..off_cfg.clone()
         };
         let auto_doc = run_speculative_bench(&auto_provider, &prompts, &auto_cfg).unwrap();
+        assert_eq!(auto_provider.prefix_clears.get(), 1);
         assert_eq!(auto_provider.seen_prefix_checkpoints.borrow().len(), 8);
         assert_eq!(
             auto_provider.seen_prefix_checkpoints.borrow()[0],
@@ -3389,5 +3468,38 @@ mod tests {
         for key in BENCH_PATH_ROW_KEYS {
             assert!(auto_json["rows"][2].get(key).is_some(), "lacks {key}");
         }
+
+        // Multiple options and repeats execute per-option -> per-repeat full sequences with
+        // prefix-cache resets in between, while returning rows in prompt-major order.
+        let multi_provider = stub(false, false);
+        let multi_cfg = BenchConfig {
+            options: vec![Speculative::Off.into(), Speculative::Auto.into()],
+            repeats: 2,
+            warmup: true,
+            ..off_cfg
+        };
+        let multi_doc = run_speculative_bench(&multi_provider, &prompts, &multi_cfg).unwrap();
+        assert_eq!(multi_provider.prefix_clears.get(), 4);
+        assert_eq!(multi_provider.seen.borrow().len(), 2 * (1 + 2 * 8));
+        assert_eq!(multi_provider.seen.borrow()[0], BENCH_WARMUP_PROMPT);
+        assert_eq!(multi_provider.seen.borrow()[1 + 2 * 8], BENCH_WARMUP_PROMPT);
+        assert_eq!(
+            multi_provider.seen.borrow()[1],
+            prompts[0].messages[0].text_content()
+        );
+        assert_eq!(
+            multi_provider.seen.borrow()[2],
+            prompts[1].messages[0].text_content()
+        );
+        assert_eq!(
+            multi_provider.seen.borrow()[9],
+            prompts[0].messages[0].text_content()
+        );
+        assert_eq!(multi_doc.rows.len(), 16);
+        assert_eq!(multi_doc.rows[0].prompt_id, "short_turn1");
+        assert_eq!(multi_doc.rows[0].requested, Speculative::Off);
+        assert_eq!(multi_doc.rows[1].prompt_id, "short_turn1");
+        assert_eq!(multi_doc.rows[1].requested, Speculative::Auto);
+        assert_eq!(multi_doc.rows[0].samples.len(), 2);
     }
 }

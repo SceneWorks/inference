@@ -33,8 +33,9 @@ use std::time::{Duration, Instant};
 use candle_core::Tensor;
 
 use core_llm::{
-    PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixKind, PrefixReuse, PrefixStore,
-    PREFIX_CANCELLED_NOT_STORED, PREFIX_PROTECTED_CAP_DEMOTED, PREFIX_PROTECTED_PRESERVED,
+    PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixKind, PrefixPlannedContext,
+    PrefixReuse, PrefixStore, PREFIX_CANCELLED_NOT_STORED, PREFIX_PROTECTED_CAP_DEMOTED,
+    PREFIX_PROTECTED_PRESERVED,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -327,6 +328,23 @@ impl PrefixCache {
         self.store.protected_bytes()
     }
 
+    /// Drop every cached prefix entry.
+    pub fn clear(&mut self) {
+        self.store.clear();
+    }
+
+    /// Whether an entry with exact token key `tokens` is currently held.
+    pub fn contains_exact(&self, tokens: &[i32]) -> bool {
+        self.store.contains_exact(tokens)
+    }
+
+    /// Read-only inspection returning the index and reused token count of the best matching
+    /// entry right now without updating lookup statistics or recency (SW-F356).
+    pub fn peek_match(&self, prompt: &[i32], mtp: bool) -> Option<(usize, usize)> {
+        self.store
+            .peek_match(prompt, |e| e.serves(mtp).then(|| e.positions()))
+    }
+
     /// Read-only inspection returning how many leading prompt tokens would be reused right now
     /// without updating lookup statistics or recency (SW-F356).
     pub fn peek_reused(&self, prompt: &[i32], mtp: bool) -> usize {
@@ -366,7 +384,25 @@ impl PrefixCache {
         planned: &[(PlannedBoundary, u64)],
         available: u64,
     ) -> PlannedAdmission {
-        self.store.admit_planned(required, planned, available)
+        self.admit_planned_for(
+            required,
+            planned,
+            available,
+            PrefixPlannedContext::default(),
+        )
+    }
+
+    /// Context-aware [`admit_planned`](Self::admit_planned) pinning the matched hit entry and
+    /// accounting for `promote_reused` and `AnyPrefix` `Conversation` supersession.
+    pub fn admit_planned_for(
+        &mut self,
+        required: u64,
+        planned: &[(PlannedBoundary, u64)],
+        available: u64,
+        ctx: PrefixPlannedContext<'_>,
+    ) -> PlannedAdmission {
+        self.store
+            .admit_planned_with(required, planned, available, ctx)
     }
 
     /// Restore the longest prefix of `prompt` this cache can serve into the **empty** `cache`,
@@ -494,71 +530,41 @@ impl PrefixCache {
         }
         let started = Instant::now();
         let mut outcome = PrefixStoreOutcome::default();
-        let mut record_entry = |this: &mut Self,
-                                tokens: Vec<i32>,
-                                entry: PrefixEntry,
-                                kind: PrefixKind,
-                                protected: bool| {
-            let bytes = entry.bytes();
-            let out = this.insert_entry(tokens, entry, kind, protected);
-            if out.stored {
-                outcome.checkpoints_captured = outcome.checkpoints_captured.saturating_add(1);
-                outcome.captured_bytes = outcome.captured_bytes.saturating_add(bytes);
-            }
-            if out.evicted > 0 {
-                outcome.evicted_entries =
-                    outcome.evicted_entries.saturating_add(out.evicted as u32);
-            }
-            if out.demoted_from_protected
-                && !outcome
-                    .fallbacks
-                    .iter()
-                    .any(|f| f == PREFIX_PROTECTED_CAP_DEMOTED)
-            {
-                outcome
-                    .fallbacks
-                    .push(PREFIX_PROTECTED_CAP_DEMOTED.to_string());
-            }
-            if out.skipped_for_protected
-                && !outcome
-                    .fallbacks
-                    .iter()
-                    .any(|f| f == PREFIX_PROTECTED_PRESERVED)
-            {
-                outcome
-                    .fallbacks
-                    .push(PREFIX_PROTECTED_PRESERVED.to_string());
-            }
-        };
-
+        let mut promoted = false;
         match C::REUSE {
             PrefixReuse::AnyPrefix => {
-                if let Some(pb) = promote_reused {
-                    if pb.position > 0
-                        && pb.position <= cache.positions()
-                        && pb.position <= prompt.len()
-                        && !self
-                            .store
-                            .promote_protected(&prompt[..pb.position], pb.kind)
-                    {
-                        let entry = cache.snapshot(pb.position)?;
-                        record_entry(
-                            self,
-                            prompt[..pb.position].to_vec(),
-                            entry,
-                            pb.kind,
-                            pb.protected,
-                        );
+                let mut protected_planned: Vec<PlannedBoundary> = planned
+                    .iter()
+                    .copied()
+                    .filter(|pb| {
+                        pb.protected
+                            && pb.position > 0
+                            && pb.position <= cache.positions()
+                            && pb.position <= prompt.len()
+                    })
+                    .collect();
+                protected_planned.sort_by_key(|pb| (pb.kind.priority(), pb.position));
+                for pb in protected_planned {
+                    if !promoted {
+                        if let Some(promo) = promote_reused {
+                            if promo.kind.priority() <= pb.kind.priority() {
+                                self.try_promote_reused(prompt, promo, &mut outcome);
+                                promoted = true;
+                            }
+                        }
                     }
+                    let entry = cache.snapshot(pb.position)?;
+                    self.record_checkpoint_entry(
+                        prompt[..pb.position].to_vec(),
+                        entry,
+                        pb.kind,
+                        true,
+                        &mut outcome,
+                    );
                 }
-                for pb in planned {
-                    if pb.protected
-                        && pb.position > 0
-                        && pb.position <= cache.positions()
-                        && pb.position <= prompt.len()
-                    {
-                        let entry = cache.snapshot(pb.position)?;
-                        record_entry(self, prompt[..pb.position].to_vec(), entry, pb.kind, true);
+                if !promoted {
+                    if let Some(promo) = promote_reused {
+                        self.try_promote_reused(prompt, promo, &mut outcome);
                     }
                 }
                 let store_conversation = planned.is_empty()
@@ -569,16 +575,64 @@ impl PrefixCache {
                     tokens.truncate(cache.positions());
                     if !tokens.is_empty() {
                         let entry = cache.snapshot(tokens.len())?;
-                        record_entry(self, tokens, entry, PrefixKind::Conversation, false);
+                        self.record_checkpoint_entry(
+                            tokens,
+                            entry,
+                            PrefixKind::Conversation,
+                            false,
+                            &mut outcome,
+                        );
                     }
                 }
             }
             PrefixReuse::WholeEntry => {
-                if let Some(pb) = promote_reused {
-                    if pb.position > 0 && pb.position <= prompt.len() {
-                        let _ = self
-                            .store
-                            .promote_protected(&prompt[..pb.position], pb.kind);
+                let mut protected_bounds = Vec::new();
+                let mut unprot_bounds = Vec::new();
+                for b in boundaries {
+                    if b.len > 0 && b.len <= prompt.len() {
+                        if b.protected {
+                            protected_bounds.push(b);
+                        } else {
+                            unprot_bounds.push(b);
+                        }
+                    }
+                }
+                protected_bounds.sort_by_key(|b| (b.kind.priority(), b.len));
+                unprot_bounds.sort_by_key(|b| (std::cmp::Reverse(b.kind.priority()), b.len));
+
+                for Boundary {
+                    len,
+                    entry,
+                    kind,
+                    protected,
+                } in protected_bounds
+                {
+                    if !promoted {
+                        if let Some(promo) = promote_reused {
+                            if promo.kind.priority() <= kind.priority() {
+                                self.try_promote_reused(prompt, promo, &mut outcome);
+                                promoted = true;
+                            }
+                        }
+                    }
+                    let entry = match entry {
+                        PrefixEntry::Hybrid { state, .. } => PrefixEntry::Hybrid {
+                            state,
+                            mtp: mtp_captured.iter().find(|m| m.len() == len).cloned(),
+                        },
+                        kv => kv,
+                    };
+                    self.record_checkpoint_entry(
+                        prompt[..len].to_vec(),
+                        entry,
+                        kind,
+                        protected,
+                        &mut outcome,
+                    );
+                }
+                if !promoted {
+                    if let Some(promo) = promote_reused {
+                        self.try_promote_reused(prompt, promo, &mut outcome);
                     }
                 }
                 for Boundary {
@@ -586,23 +640,88 @@ impl PrefixCache {
                     entry,
                     kind,
                     protected,
-                } in boundaries
+                } in unprot_bounds
                 {
-                    if len > 0 && len <= prompt.len() {
-                        let entry = match entry {
-                            PrefixEntry::Hybrid { state, .. } => PrefixEntry::Hybrid {
-                                state,
-                                mtp: mtp_captured.iter().find(|m| m.len() == len).cloned(),
-                            },
-                            kv => kv,
-                        };
-                        record_entry(self, prompt[..len].to_vec(), entry, kind, protected);
-                    }
+                    let entry = match entry {
+                        PrefixEntry::Hybrid { state, .. } => PrefixEntry::Hybrid {
+                            state,
+                            mtp: mtp_captured.iter().find(|m| m.len() == len).cloned(),
+                        },
+                        kv => kv,
+                    };
+                    self.record_checkpoint_entry(
+                        prompt[..len].to_vec(),
+                        entry,
+                        kind,
+                        protected,
+                        &mut outcome,
+                    );
                 }
             }
         }
         outcome.capture_time = started.elapsed();
         Ok(outcome)
+    }
+
+    fn record_checkpoint_entry(
+        &mut self,
+        tokens: Vec<i32>,
+        entry: PrefixEntry,
+        kind: PrefixKind,
+        protected: bool,
+        outcome: &mut PrefixStoreOutcome,
+    ) {
+        let bytes = entry.bytes();
+        let out = self.insert_entry(tokens, entry, kind, protected);
+        if out.stored {
+            outcome.checkpoints_captured = outcome.checkpoints_captured.saturating_add(1);
+            outcome.captured_bytes = outcome.captured_bytes.saturating_add(bytes);
+        }
+        if out.evicted > 0 {
+            outcome.evicted_entries = outcome.evicted_entries.saturating_add(out.evicted as u32);
+        }
+        if out.demoted_from_protected
+            && !outcome
+                .fallbacks
+                .iter()
+                .any(|f| f == PREFIX_PROTECTED_CAP_DEMOTED)
+        {
+            outcome
+                .fallbacks
+                .push(PREFIX_PROTECTED_CAP_DEMOTED.to_string());
+        }
+        if out.skipped_for_protected
+            && !outcome
+                .fallbacks
+                .iter()
+                .any(|f| f == PREFIX_PROTECTED_PRESERVED)
+        {
+            outcome
+                .fallbacks
+                .push(PREFIX_PROTECTED_PRESERVED.to_string());
+        }
+    }
+
+    fn try_promote_reused(
+        &mut self,
+        prompt: &[i32],
+        pb: PlannedBoundary,
+        outcome: &mut PrefixStoreOutcome,
+    ) {
+        if pb.position > 0 && pb.position <= prompt.len() {
+            let key = &prompt[..pb.position];
+            if !self.store.promote_protected(key, pb.kind)
+                && self.store.contains_exact(key)
+                && !outcome
+                    .fallbacks
+                    .iter()
+                    .any(|f| f == PREFIX_PROTECTED_CAP_DEMOTED)
+            {
+                outcome
+                    .fallbacks
+                    .push(PREFIX_PROTECTED_CAP_DEMOTED.to_string());
+            }
+        }
     }
 
     fn insert_entry(
@@ -1100,6 +1219,307 @@ mod tests {
         assert!(out_demote
             .fallbacks
             .contains(&PREFIX_PROTECTED_CAP_DEMOTED.to_string()));
+    }
+
+    #[test]
+    fn admit_planned_for_pins_hit_and_handles_over_half_budget_self_supersede() {
+        let prompt = vec![1, 2, 3, 4, 5, 6];
+        let turn1 = kv(6, 1.0);
+        let turn1_bytes = turn1.snapshot(6).unwrap().bytes();
+        let mut pc = PrefixCache::with_budget(turn1_bytes + turn1_bytes / 2);
+        pc.store_checkpoints(
+            &prompt[..6],
+            &[],
+            crate::decode::FinishReason::StopToken,
+            &turn1,
+            &[],
+            Vec::new(),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let mut ext = prompt.clone();
+        ext.extend_from_slice(&[7, 8]);
+        let (match_idx, reused) = pc.peek_match(&ext, false).expect("hit");
+        assert_eq!(reused, 6);
+
+        let ext_bytes = kv(8, 1.0).snapshot(8).unwrap().bytes();
+        let adm = pc.admit_planned_for(
+            128,
+            &[(
+                PlannedBoundary {
+                    position: ext.len(),
+                    kind: PrefixKind::Conversation,
+                    protected: false,
+                },
+                ext_bytes,
+            )],
+            1 << 20,
+            PrefixPlannedContext {
+                prompt: Some(&ext),
+                keep_match: Some(match_idx),
+                promote_reused: None,
+                conversation_reuse: Some(PrefixReuse::AnyPrefix),
+            },
+        );
+        assert!(adm.admission.snapshot);
+        assert_eq!(
+            adm.evicted_entries, 0,
+            "matched entry must survive admission"
+        );
+        let mut restored_cache = ContiguousKvCache::new(1);
+        let diag = pc
+            .restore_with_diagnostic(&mut restored_cache, &ext, false)
+            .unwrap();
+        assert_eq!(diag.restored.expect("hit").reused, 6);
+    }
+
+    #[test]
+    fn hybrid_multi_boundary_mtp_diagnostic_promotion_and_clear() {
+        let prompt: Vec<i32> = (10..22).collect();
+        let unit = Qwen35PrefixState::dummy_for_test(4).bytes() as u64;
+        let mut pc = PrefixCache::with_budget(unit * 16);
+        let boundaries = vec![
+            Boundary::new(
+                4,
+                PrefixEntry::Hybrid {
+                    state: Qwen35PrefixState::dummy_for_test(4),
+                    mtp: None,
+                },
+                PrefixKind::SharedRoot,
+                true,
+            ),
+            Boundary::new(
+                6,
+                PrefixEntry::Hybrid {
+                    state: Qwen35PrefixState::dummy_for_test(6),
+                    mtp: None,
+                },
+                PrefixKind::Document,
+                true,
+            ),
+            Boundary::new(
+                8,
+                PrefixEntry::Hybrid {
+                    state: Qwen35PrefixState::dummy_for_test(8),
+                    mtp: None,
+                },
+                PrefixKind::MessageBoundary,
+                false,
+            ),
+            Boundary::new(
+                10,
+                PrefixEntry::Hybrid {
+                    state: Qwen35PrefixState::dummy_for_test(10),
+                    mtp: None,
+                },
+                PrefixKind::Conversation,
+                false,
+            ),
+            Boundary::new(
+                11,
+                PrefixEntry::Hybrid {
+                    state: Qwen35PrefixState::dummy_for_test(11),
+                    mtp: None,
+                },
+                PrefixKind::NearTail,
+                false,
+            ),
+        ];
+        let mtp_captured = vec![
+            MtpBoundary::dummy_for_test(4),
+            MtpBoundary::dummy_for_test(8),
+        ];
+        struct DummyHybridTarget;
+        impl PrefixSnapshot for DummyHybridTarget {
+            const REUSE: PrefixReuse = PrefixReuse::WholeEntry;
+            fn snapshot(&self, _len: usize) -> Result<PrefixEntry> {
+                unreachable!()
+            }
+            fn restore(&mut self, entry: &PrefixEntry, len: usize) -> Result<()> {
+                assert_eq!(entry.positions(), len);
+                Ok(())
+            }
+            fn positions(&self) -> usize {
+                12
+            }
+        }
+        let mut target = DummyHybridTarget;
+        let out = pc
+            .store_checkpoints(
+                &prompt,
+                &[99],
+                crate::decode::FinishReason::StopToken,
+                &target,
+                &[],
+                boundaries,
+                &mtp_captured,
+                None,
+            )
+            .unwrap();
+        assert_eq!(out.checkpoints_captured, 5);
+        let mtp_ext = [&prompt[..10], &[30]][..].concat();
+        let diag = pc
+            .restore_with_diagnostic(&mut target, &mtp_ext, true)
+            .unwrap();
+        assert!(diag.proposer_skipped_longer);
+        let hit = diag.restored.expect("fallback mtp boundary");
+        assert_eq!(hit.reused, 8);
+        assert_eq!(hit.kind, PrefixKind::MessageBoundary);
+        assert_eq!(hit.mtp.expect("mtp state").len(), 8);
+
+        pc.clear();
+        assert!(pc.is_empty());
+        assert_eq!(pc.resident_bytes(), 0);
+        assert_eq!(pc.protected_bytes(), 0);
+    }
+
+    struct DummyKvModel;
+    impl StepModel for DummyKvModel {
+        type Cache = StepKvCache;
+        fn new_cache(&self) -> Self::Cache {
+            StepKvCache::growing(&crate::primitives::KvLayout {
+                layers: vec![Some(crate::primitives::LayerKvShape {
+                    kv_heads: 1,
+                    key_dim: 2,
+                    value_dim: 2,
+                    device: Device::Cpu,
+                })],
+                dtype: DType::F32,
+            })
+        }
+        fn device(&self) -> &Device {
+            &Device::Cpu
+        }
+        fn vocab_size(&self) -> usize {
+            4
+        }
+        fn forward_step(
+            &self,
+            cache: &mut Self::Cache,
+            request: StepRequest<'_>,
+        ) -> Result<crate::decode::step::StepOutput> {
+            let len = request.len()?;
+            let ones = Tensor::ones((1, 1, len, 2), DType::F32, &Device::Cpu)?;
+            cache.update(0, &ones, &ones)?;
+            Ok(crate::decode::step::StepOutput {
+                logits: Tensor::zeros((1, 4), DType::F32, &Device::Cpu)?,
+                hidden: None,
+            })
+        }
+    }
+
+    #[test]
+    fn mock_step_model_non_exact_document_edited_turn_and_cancel() {
+        let mut pc = PrefixCache::with_budget(1 << 20);
+        let turn1: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut c1 = DummyKvModel.new_cache();
+        let pre1 = prefill_restored_with_plan(
+            &DummyKvModel,
+            &mut c1,
+            PrefixRestoreOutcome {
+                restored: None,
+                proposer_skipped_longer: false,
+                restore_time: Duration::ZERO,
+            },
+            &turn1,
+            &[],
+            false,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(pre1.reused, 0);
+        pc.store_checkpoints(
+            &turn1,
+            &[9],
+            crate::decode::FinishReason::StopToken,
+            &c1,
+            &[PlannedBoundary {
+                position: 8,
+                kind: PrefixKind::Conversation,
+                protected: false,
+            }],
+            Vec::new(),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let turn2: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 11];
+        let reused2 = pc.peek_reused(&turn2, false);
+        assert_eq!(reused2, 8);
+        let plan2 = core_llm::plan_prefix_boundaries_with_exact(
+            turn2.len(),
+            reused2,
+            PrefixReuse::AnyPrefix,
+            core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+                count: 4,
+            }),
+            core_llm::BoundaryCandidates {
+                document: Some(4),
+                shared_root: None,
+                prev_message: Some(8),
+                conversation_end: None,
+            },
+            core_llm::NearTailConfig::default(),
+            |pos| pc.contains_exact(&turn2[..pos]),
+        );
+        assert_eq!(plan2.promote_reused, None);
+        assert_eq!(plan2.captures.len(), 1);
+        assert_eq!(plan2.captures[0].kind, PrefixKind::Document);
+
+        let mut c2 = DummyKvModel.new_cache();
+        let restore2 = pc.restore_with_diagnostic(&mut c2, &turn2, false).unwrap();
+        let pre2 = prefill_restored_with_plan(
+            &DummyKvModel,
+            &mut c2,
+            restore2,
+            &turn2,
+            &plan2.captures,
+            false,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(pre2.reused, 8);
+        pc.store_checkpoints(
+            &turn2,
+            &[12],
+            crate::decode::FinishReason::StopToken,
+            &c2,
+            &plan2.captures,
+            Vec::new(),
+            &[],
+            plan2.promote_reused,
+        )
+        .unwrap();
+        assert!(pc.contains_exact(&[1, 2, 3, 4]));
+
+        let mut c3 = DummyKvModel.new_cache();
+        let diag3 = pc
+            .restore_with_diagnostic(&mut c3, &[1, 2, 3, 4, 99, 98], false)
+            .unwrap();
+        let hit3 = diag3.restored.expect("edited turn hits document");
+        assert_eq!(hit3.reused, 4);
+        assert_eq!(hit3.kind, PrefixKind::Document);
+
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut c4 = DummyKvModel.new_cache();
+        let err = prefill_restored_with_plan(
+            &DummyKvModel,
+            &mut c4,
+            PrefixRestoreOutcome {
+                restored: None,
+                proposer_skipped_longer: false,
+                restore_time: Duration::ZERO,
+            },
+            &[40, 41, 42, 43],
+            &[],
+            false,
+            &cancel,
+        );
+        assert!(matches!(err, Err(Error::Canceled)));
     }
 }
 

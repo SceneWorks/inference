@@ -83,6 +83,10 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
+    fn clear_prefix_cache(&self) {
+        self.clear_prefix_cache();
+    }
+
     fn synchronize_before_release(&self) -> CoreResult<()> {
         // This is the decoder/VLM's OWN device, including an explicitly selected
         // non-blocking CUDA stream; an image generator's stream is not a fence for it.
@@ -422,26 +426,18 @@ impl LlamaProvider {
             Decoder::Causal(_) => PrefixReuse::AnyPrefix,
             Decoder::Qwen35(_) => PrefixReuse::WholeEntry,
         };
-        let peeked_reused = if prefix_store {
-            self.prefix_cache().peek_reused(&prompt_ids, prefix_mtp)
-        } else {
-            0
-        };
-        let boundary_plan = if prefix_store {
-            core_llm::plan_prefix_boundaries(
+        let build_plan = |prefix: &PrefixCache, reused: usize| {
+            let plan = core_llm::plan_prefix_boundaries_with_exact(
                 prompt_ids.len(),
-                peeked_reused,
+                reused,
                 reuse_mode,
                 checkpoint_policy,
                 boundary_candidates,
                 NearTailConfig::default(),
-            )
-        } else {
-            core_llm::BoundaryPlan::default()
-        };
-        let planned_with_costs: Vec<(PlannedBoundary, u64)> = if prefix_store {
-            let mut items = Vec::with_capacity(boundary_plan.captures.len() + 1);
-            for &b in &boundary_plan.captures {
+                |pos| pos <= prompt_ids.len() && prefix.contains_exact(&prompt_ids[..pos]),
+            );
+            let mut items = Vec::with_capacity(plan.captures.len() + 1);
+            for &b in &plan.captures {
                 let bytes = self.boundary_snapshot_bytes(b, prefix_mtp).ok_or_else(|| {
                     CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
                 })?;
@@ -466,27 +462,80 @@ impl LlamaProvider {
                     conv_bytes,
                 ));
             }
-            items
-        } else {
-            Vec::new()
+            Ok::<_, CoreError>((plan, items))
         };
         let available = request_available_memory(self.model.device())?;
-        // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
-        // evicts them least-recently-used first, and the planned snapshots are admitted with it
-        // (trimmed lowest-priority first if tight, never forcing request refusal).
-        let planned_admission = if prefix_store {
-            self.prefix_cache()
-                .admit_planned(required, &planned_with_costs, available)
-        } else {
-            PlannedAdmission {
-                admission: core_llm::PrefixAdmission {
-                    available: self.prefix_cache().reclaim_for(required, available),
-                    snapshot: false,
+        let (boundary_plan, planned_with_costs, planned_admission) = if prefix_store {
+            let mut prefix = self.prefix_cache();
+            let hit = prefix.peek_match(&prompt_ids, prefix_mtp);
+            let match_idx = hit.map(|(idx, _)| idx);
+            let peeked_reused = hit.map_or(0, |(_, len)| len);
+            let (mut plan, mut items) = build_plan(&prefix, peeked_reused)?;
+            // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
+            // evicts them least-recently-used first while pinning the matched hit entry against
+            // optional snapshot eviction.
+            let adm = prefix.admit_planned_for(
+                required,
+                &items,
+                available,
+                PrefixPlannedContext {
+                    prompt: Some(&prompt_ids),
+                    keep_match: match_idx,
+                    promote_reused: plan.promote_reused,
+                    conversation_reuse: Some(reuse_mode),
                 },
-                kept: Vec::new(),
-                evicted_entries: 0,
-                fallback: None,
-            }
+            );
+            let after_hit = prefix.peek_match(&prompt_ids, prefix_mtp);
+            let reused_after = after_hit.map_or(0, |(_, len)| len);
+            let final_adm = if reused_after < peeked_reused {
+                let (new_plan, new_items) = build_plan(&prefix, reused_after)?;
+                plan = new_plan;
+                items = new_items;
+                if !adm.admission.snapshot {
+                    PlannedAdmission {
+                        admission: core_llm::PrefixAdmission {
+                            available: adm.admission.available,
+                            snapshot: false,
+                        },
+                        kept: Vec::new(),
+                        evicted_entries: adm.evicted_entries,
+                        fallback: adm.fallback,
+                    }
+                } else {
+                    let second = prefix.admit_planned_for(
+                        required,
+                        &items,
+                        adm.admission.available,
+                        PrefixPlannedContext {
+                            prompt: Some(&prompt_ids),
+                            keep_match: after_hit.map(|(idx, _)| idx),
+                            promote_reused: plan.promote_reused,
+                            conversation_reuse: Some(reuse_mode),
+                        },
+                    );
+                    PlannedAdmission {
+                        evicted_entries: adm.evicted_entries.saturating_add(second.evicted_entries),
+                        ..second
+                    }
+                }
+            } else {
+                adm
+            };
+            (plan, items, final_adm)
+        } else {
+            (
+                core_llm::BoundaryPlan::default(),
+                Vec::new(),
+                PlannedAdmission {
+                    admission: core_llm::PrefixAdmission {
+                        available: self.prefix_cache().reclaim_for(required, available),
+                        snapshot: false,
+                    },
+                    kept: Vec::new(),
+                    evicted_entries: 0,
+                    fallback: None,
+                },
+            )
         };
         let keep_prefix = planned_admission.admission.snapshot;
         let kept_boundaries = planned_admission.kept;

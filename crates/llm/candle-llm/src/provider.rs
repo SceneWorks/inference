@@ -20,12 +20,12 @@ use core_llm::{
     ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint, Llama3Template,
     LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, MtpStats, NearTailConfig,
     PlannedAdmission, PlannedBoundary, PrefixCheckpointMode, PrefixCheckpointPolicy,
-    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixReuse, ProposerCapabilities,
-    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
-    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage, VideoRef, PREFIX_DOCUMENT_UNALIGNED,
-    PREFIX_PROPOSER_INCOMPATIBLE,
+    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixPlannedContext, PrefixReuse,
+    ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
 };
 use serde_json::Value;
 
@@ -1688,6 +1688,11 @@ impl LlamaProvider {
     /// The prefix cache's cumulative reuse accounting.
     pub fn prefix_cache_stats(&self) -> PrefixStats {
         self.prefix_cache().stats()
+    }
+
+    /// Drop every entry from the cross-turn prefix cache.
+    pub fn clear_prefix_cache(&self) {
+        self.prefix_cache().clear();
     }
 
     fn prefix_cache(&self) -> std::sync::MutexGuard<'_, PrefixCache> {

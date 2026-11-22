@@ -2096,7 +2096,13 @@ def decide_defaults(
                     splits: tuple[str | None, ...] = (None,)
                     if entry["kind"] == "prefix_cache" and _splits_by_hit(on, prompt_id, on_option):
                         splits = ("miss", "hit")
-                    cells = [(m, h, s) for m, h in METRICS.items() for s in splits]
+                    metrics_for_entry = list(METRICS.items())
+                    if entry["kind"] == "prefix_checkpoints" and (
+                        metric_values(on, prompt_id, on_option, "wall_ms")
+                        or metric_values(off, prompt_id, off_option, "wall_ms")
+                    ):
+                        metrics_for_entry.append(("wall_ms", False))
+                    cells = [(m, h, s) for m, h in metrics_for_entry for s in splits]
                     for metric, higher, samples in cells:
                         if plain:
                             result = {
@@ -2163,6 +2169,106 @@ def decide_defaults(
             }
         )
     return decisions
+
+
+_CHECKPOINT_NUMERIC_FIELDS = (
+    "reused_tokens",
+    "reread_tokens",
+    "checkpoints_captured",
+    "captured_bytes",
+    "restore_ms",
+    "capture_ms",
+    "resident_bytes",
+    "protected_bytes",
+    "evicted_entries",
+)
+
+
+def _checkpoint_telemetry(processes: list[Process], prompt_id: str, option: str) -> dict[str, Any] | None:
+    blocks = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        pc = (table.get((prompt_id, option)) or {}).get("prefix_checkpoints")
+        if isinstance(pc, dict):
+            blocks.append(pc)
+    if not blocks:
+        return None
+    out: dict[str, Any] = {
+        field: _mean([v for v in (_number(b.get(field)) for b in blocks) if v is not None])
+        for field in _CHECKPOINT_NUMERIC_FIELDS
+    }
+    out["policies"] = sorted({b["policy"] for b in blocks if isinstance(b.get("policy"), str)})
+    out["matched_kinds"] = sorted(
+        {b["matched_kind"] for b in blocks if isinstance(b.get("matched_kind"), str)}
+    )
+    out["fallbacks"] = sorted(
+        {f for b in blocks for f in (b.get("fallbacks") or []) if isinstance(f, str)}
+    )
+    return out
+
+
+def prefix_checkpoints_paired(
+    groups: dict[tuple[str, str], list[Process]], max_noise: float
+) -> list[dict[str, Any]]:
+    """Paired ``prefix_checkpoints`` on-vs-off summaries (wall latency, TTFT, decode rate,
+    snapshot capture/restore overhead, reuse counters, memory footprint, and peak RAM)."""
+    epic_rows = []
+    for processes in groups.values():
+        epic = sorted((p for p in processes if p.run == "epic"), key=lambda p: p.index)
+        if epic:
+            epic_rows.append(epic)
+    stub_entry = {"kind": "prefix_checkpoints", "switch": None}
+    out: list[dict[str, Any]] = []
+    by_backend: dict[str, list[list[Process]]] = {}
+    for processes in epic_rows:
+        backend = processes[0].document.get("backend")
+        if isinstance(backend, str):
+            by_backend.setdefault(backend, []).append(processes)
+    for backend, backend_rows in sorted(by_backend.items()):
+        pairs, _ = _pairs(stub_entry, backend_rows)
+        for on, off, option_pairs in pairs:
+            config = document_config(on[0])
+            for prompt_id, prompt_class in config["prompts"]:
+                for on_option, off_option in option_pairs:
+                    metrics: dict[str, Any] = {}
+                    for metric, higher in (
+                        ("wall_ms", False),
+                        ("ttft_ms", False),
+                        ("decode_tok_s", True),
+                    ):
+                        metrics[metric] = verdict(
+                            metric_values(on, prompt_id, on_option, metric),
+                            metric_values(off, prompt_id, off_option, metric),
+                            higher,
+                            max_noise,
+                        )
+                    on_peaks = metric_values(on, prompt_id, on_option, "peak_memory_bytes")
+                    off_peaks = metric_values(off, prompt_id, off_option, "peak_memory_bytes")
+                    out.append(
+                        {
+                            "backend": backend,
+                            "model": family_label(on[0]),
+                            "on_row": f"{on[0].campaign}/{on[0].row}",
+                            "off_row": f"{off[0].campaign}/{off[0].row}",
+                            "prompt_id": prompt_id,
+                            "class": prompt_class,
+                            "option": on_option if on_option == off_option else f"{on_option} vs {off_option}",
+                            "on_n": len(on),
+                            "off_n": len(off),
+                            "wall_ms": metrics["wall_ms"],
+                            "ttft_ms": metrics["ttft_ms"],
+                            "decode_tok_s": metrics["decode_tok_s"],
+                            "peak_memory_bytes": {
+                                "on": series(on_peaks),
+                                "off": series(off_peaks),
+                            },
+                            "prefix_checkpoints": {
+                                "on": _checkpoint_telemetry(on, prompt_id, on_option),
+                                "off": _checkpoint_telemetry(off, prompt_id, off_option),
+                            },
+                        }
+                    )
+    return out
 
 
 def _fmt(value: Any, digits: int = 1) -> str:
@@ -2294,6 +2400,48 @@ def markdown_report(report: dict[str, Any]) -> str:
                 f"{j['prompt_id']} | `{j['option']}`{_samples_label(j)} | {j['metric']} | "
                 f"{j['on_n']}/{j['off_n']} | "
                 f"{_fmt(j['delta_pct'])} | {_fmt(j['margin_pct'])} | {j['verdict']} | {j['reason']} |"
+            )
+    if report.get("prefix_checkpoints"):
+        gib = 1024**3
+        lines += [
+            "",
+            "## Prefix checkpoints — paired on vs off rows",
+            "",
+            "| backend | family | on / off | prompt | option | wall ms (on vs off, Δ %) | TTFT ms (on vs off, Δ %) | decode tok/s (on vs off, Δ %) | peak mem GiB (on / off) | reused / reread | capture ms | restore ms | captured / resident / protected bytes |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for item in report["prefix_checkpoints"]:
+            def _cmp_cell(m: dict[str, Any], digits: int = 1) -> str:
+                c = (m.get("candidate") or {}).get("mean")
+                r = (m.get("reference") or {}).get("mean")
+                d = m.get("delta_pct")
+                delta = "—" if d is None else f"{d:+.1f}%"
+                return f"{_fmt(c, digits)} vs {_fmt(r, digits)} ({delta})"
+
+            on_peak = ((item.get("peak_memory_bytes") or {}).get("on") or {}).get("mean")
+            off_peak = ((item.get("peak_memory_bytes") or {}).get("off") or {}).get("mean")
+            peak_cell = (
+                f"{'—' if on_peak is None else f'{on_peak / gib:.2f}'} / "
+                f"{'—' if off_peak is None else f'{off_peak / gib:.2f}'}"
+            )
+            on_pc = (item.get("prefix_checkpoints") or {}).get("on") or {}
+            reused = _fmt(on_pc.get("reused_tokens"), 0)
+            reread = _fmt(on_pc.get("reread_tokens"), 0)
+            kinds = ",".join(on_pc.get("matched_kinds") or [])
+            reuse_cell = f"{reused} / {reread}" + (f" ({kinds})" if kinds else "")
+            cap_ms = _fmt(on_pc.get("capture_ms"), 2)
+            res_ms = _fmt(on_pc.get("restore_ms"), 2)
+            bytes_cell = (
+                f"{_fmt(on_pc.get('captured_bytes'), 0)} / "
+                f"{_fmt(on_pc.get('resident_bytes'), 0)} / "
+                f"{_fmt(on_pc.get('protected_bytes'), 0)}"
+            )
+            lines.append(
+                f"| {item['backend']} | {item['model']} | {item['on_row']} / {item['off_row']} | "
+                f"{item['prompt_id']} | `{item['option']}` | "
+                f"{_cmp_cell(item['wall_ms'], 1)} | {_cmp_cell(item['ttft_ms'], 1)} | "
+                f"{_cmp_cell(item['decode_tok_s'], 2)} | {peak_cell} | {reuse_cell} | "
+                f"{cap_ms} | {res_ms} | {bytes_cell} |"
             )
     if report.get("incomplete"):
         lines += [
@@ -2467,6 +2615,7 @@ def compare_campaigns(
         "comparisons": comparisons,
         "not_comparable": not_comparable,
         "defaults": defaults,
+        "prefix_checkpoints": prefix_checkpoints_paired(groups, max_noise),
         "incomplete": incomplete,
         "notes": notes,
     }
@@ -2579,6 +2728,11 @@ def path_measurement(row: dict[str, Any], context: str) -> dict[str, Any] | None
         ),
         "peak_memory_bytes": max(values("peak_memory_bytes"), default=None),
         "memory_added_bytes": max(added, default=None),
+        "prefix_checkpoints": (
+            row.get("prefix_checkpoints")
+            if isinstance(row.get("prefix_checkpoints"), dict)
+            else None
+        ),
     }
 
 
@@ -2733,9 +2887,32 @@ def summarize_paths(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     (e["measurement"]["memory_added_bytes"] for e in bucket if e["measurement"]["memory_added_bytes"] is not None),
                     default=None,
                 ),
+                "prefix_checkpoints": _summarize_path_checkpoints(bucket),
                 "speedup_vs_off": ratios,
             }
         )
+    return out
+
+
+def _summarize_path_checkpoints(bucket: list[dict[str, Any]]) -> dict[str, Any] | None:
+    blocks = [
+        e["measurement"]["prefix_checkpoints"]
+        for e in bucket
+        if isinstance(e["measurement"].get("prefix_checkpoints"), dict)
+    ]
+    if not blocks:
+        return None
+    out: dict[str, Any] = {
+        field: _mean([v for v in (_number(b.get(field)) for b in blocks) if v is not None])
+        for field in _CHECKPOINT_NUMERIC_FIELDS
+    }
+    out["policies"] = sorted({b["policy"] for b in blocks if isinstance(b.get("policy"), str)})
+    out["matched_kinds"] = sorted(
+        {b["matched_kind"] for b in blocks if isinstance(b.get("matched_kind"), str)}
+    )
+    out["fallbacks"] = sorted(
+        {f for b in blocks for f in (b.get("fallbacks") or []) if isinstance(f, str)}
+    )
     return out
 
 
@@ -2849,6 +3026,25 @@ def paths_markdown(report: dict[str, Any]) -> str:
                 f"{_fmt(wall['all'], 2)} | {_fmt(row['ttft_ms'], 0)} | {accepted} | {draft} | "
                 f"{memory} | {fallbacks} |"
             )
+        if any(r.get("prefix_checkpoints") for r in rows):
+            lines += [
+                "",
+                "### Prefix checkpoints",
+                "",
+                "| path | policy | reused | reread | capture ms | restore ms | captured bytes | resident bytes | protected bytes | matched kind |",
+                "|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for row in rows:
+                pc = row.get("prefix_checkpoints")
+                if not pc:
+                    continue
+                lines.append(
+                    f"| {row['path']} | {','.join(pc.get('policies') or []) or '—'} | "
+                    f"{_fmt(pc.get('reused_tokens'), 0)} | {_fmt(pc.get('reread_tokens'), 0)} | "
+                    f"{_fmt(pc.get('capture_ms'), 2)} | {_fmt(pc.get('restore_ms'), 2)} | "
+                    f"{_fmt(pc.get('captured_bytes'), 0)} | {_fmt(pc.get('resident_bytes'), 0)} | "
+                    f"{_fmt(pc.get('protected_bytes'), 0)} | {','.join(pc.get('matched_kinds') or []) or '—'} |"
+                )
     if report["auto_inputs"]:
         lines += [
             "",

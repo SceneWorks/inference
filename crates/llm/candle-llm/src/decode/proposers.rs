@@ -59,6 +59,21 @@ pub struct MtpBoundary {
 }
 
 impl MtpBoundary {
+    /// Dummy boundary carrying `len` positions for non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(len: usize) -> Self {
+        Self {
+            cache: Qwen35MtpCache::empty_for_test(),
+            hidden: Tensor::zeros(
+                (1, 1, 2),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            len,
+        }
+    }
+
     /// The prompt positions the state covers.
     pub fn len(&self) -> usize {
         self.len

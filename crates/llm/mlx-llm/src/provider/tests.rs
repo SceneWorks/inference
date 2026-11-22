@@ -7605,3 +7605,108 @@ fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
     assert!(tok_bad_cands.document.is_none());
     assert!(tok_bad_unaligned);
 }
+
+#[test]
+fn prefix_checkpoint_clear_prefix_cache_and_widest_kv_boundary_pricing() {
+    use core_llm::{PlannedBoundary, PrefixKind, TextLlm};
+
+    let mut provider = causal_provider();
+    provider = provider.with_prefix_budget(1 << 20);
+    // Seed a raw ContiguousKvCache entry directly into provider.prefix (no learned forward).
+    let mut kv = crate::primitives::kv_cache::ContiguousKvCache::new(1);
+    let ones = mlx_rs::Array::ones::<f32>(&[1, 1, 8, 2]).unwrap();
+    kv.update(0, &ones, &ones).unwrap();
+    provider
+        .prefix
+        .borrow_mut()
+        .store(&[1, 2, 3, 4, 5, 6, 7, 8], &[], kv, None, None);
+    assert!(provider.prefix_cache_resident_bytes() > 0);
+    TextLlm::clear_prefix_cache(&provider);
+    assert_eq!(provider.prefix_cache_resident_bytes(), 0);
+
+    // Gemma 4 config where full_attention (`k_eq_v`: 1 x 512) has fewer heads than sliding
+    // (`8 x 256` = 2048 > 512), plus trailing KV-shared layers: widest_layer picks 8 x 256,
+    // without crossing sliding's 8 heads with full's 512 head_dim.
+    let gemma4_json = serde_json::json!({
+        "model_type": "gemma4_text",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "num_global_key_value_heads": 1,
+        "attention_k_eq_v": true,
+        "num_kv_shared_layers": 2,
+        "sliding_window": 512,
+        "vocab_size": 256,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+        ]
+    });
+    let gemma4_cfg = crate::config::ModelConfig::from_json(&gemma4_json).unwrap();
+    assert_eq!(super::causal_widest_kv_layer(&gemma4_cfg), (8, 256));
+
+    // Config where full_attention is genuinely wider than sliding (`2 x 512` = 1024 > `2 x 256`;
+    // scalar config still exposes 256 while widest_layer sees 512).
+    let wide_full_json = serde_json::json!({
+        "model_type": "gemma4_text",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "attention_k_eq_v": false,
+        "num_kv_shared_layers": 0,
+        "sliding_window": 512,
+        "vocab_size": 256,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+        ]
+    });
+    let wide_full_cfg = crate::config::ModelConfig::from_json(&wide_full_json).unwrap();
+    assert_eq!(wide_full_cfg.head_dim, 256);
+    assert_eq!(super::causal_widest_kv_layer(&wide_full_cfg), (2, 512));
+
+    // DeepSeek-V2 MLA config uses `(num_heads, max(q_head_dim, v_head_dim))`.
+    let mla_json = serde_json::json!({
+        "model_type": "deepseek_v2",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "kv_lora_rank": 128,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "vocab_size": 256
+    });
+    let mla_cfg = crate::config::ModelConfig::from_json(&mla_json).unwrap();
+    assert_eq!(super::causal_widest_kv_layer(&mla_cfg), (8, 192));
+
+    // Boundary pricing charges 0 for unprotected Causal Conversation and aligned non-zero bytes
+    // for protected Document/SharedRoot slices.
+    let unprot = PlannedBoundary {
+        position: 32,
+        kind: PrefixKind::Conversation,
+        protected: false,
+    };
+    let prot = PlannedBoundary {
+        position: 32,
+        kind: PrefixKind::Document,
+        protected: true,
+    };
+    assert_eq!(provider.boundary_snapshot_bytes(unprot, false), Some(0));
+    assert!(provider.boundary_snapshot_bytes(prot, false).unwrap() > 0);
+}
