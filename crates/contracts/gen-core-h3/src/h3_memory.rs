@@ -1253,7 +1253,9 @@ mod tests {
                 spec: &TensorCodecSpec,
                 _: &[usize],
             ) -> ResidencyMode {
-                if spec.full_precision_matrix_mult() {
+                if spec.full_precision_matrix_mult()
+                    && !matches!(spec, TensorCodecSpec::ScalarFp8 { .. })
+                {
                     ResidencyMode::Dense
                 } else {
                     ResidencyMode::Packed
