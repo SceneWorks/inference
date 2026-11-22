@@ -79,6 +79,38 @@ class TerminalTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ltx.observe(log, result, UUID, variant)
 
+    def test_ltx_dev_baseline_applies_only_the_bound_loader_sources(self):
+        source = ltx.SOURCE
+        shared = {f"{source}/{filename}": f"repaired {filename}".encode() for filename in ltx.DEV_LOADER_FILES}
+        originals = {f"{source}/{filename}": filename.encode() for filename in ltx.DEV_LOADER_BASE_SHA256}
+        frozen_sha = {Path(path).name: hashlib.sha256(data).hexdigest() for path, data in originals.items()}
+        lib = f"{source}/lib.rs"
+        other_markers = b"\n".join((
+            b"        let (vlat, alat) = if self.transformer_variant.is_dev() {",
+            b"        // The denoised half-resolution latent enters the learned upsampler",
+            b"        let stage2 = if stage2_keyframes.is_empty() {",
+            b"        let (vlat, alat) = (stage2.video, stage2.audio);",
+        ))
+        metadata = {f"{source}/quant_measurement.rs": b"\nfn terminal_generation_request("}
+        base = {**originals, **metadata, lib: ltx.ORIGINAL_INSTALL + b"\n" + other_markers + b"\n// frozen scales"}
+        head = {**shared, **metadata, lib: ltx.REPAIRED_INSTALL + b"\n" + other_markers + b"\n// request scopes"}
+        with patch.dict(ltx.DEV_LOADER_BASE_SHA256, frozen_sha, clear=True):
+            base_overlay = ltx.overlay(base.__getitem__, "base", "candle-cuda", "test", dev_loader=shared)
+            head_overlay = ltx.overlay(head.__getitem__, "head", "candle-cuda", "test", dev_loader=shared)
+            self.assertEqual({path: base_overlay[path] for path in shared}, shared)
+            self.assertTrue(head_overlay.keys().isdisjoint(shared))
+            for marker, instrumented in ((b"// frozen scales", base_overlay), (b"// request scopes", head_overlay)):
+                self.assertIn(marker, instrumented[lib])
+                self.assertEqual(instrumented[lib].count(b"SGA_LTX_ADAPTER"), 1)
+                self.assertIn(b"let sga_adapters = if self.transformer_variant.is_dev()", instrumented[lib])
+            drift_path = f"{source}/adapters.rs"
+            base[drift_path] = b"old source drift"
+            with self.assertRaisesRegex(ValueError, "unexpected original LTX Dev loader"):
+                ltx.overlay(base.__getitem__, "base", "candle-cuda", "test", dev_loader=shared)
+            head[drift_path] = b"candidate drift"
+            with self.assertRaisesRegex(ValueError, "candidate LTX Dev loader differs"):
+                ltx.overlay(head.__getitem__, "head", "candle-cuda", "test", dev_loader=shared)
+
     def test_wan_variant_and_packed_model_are_bound_to_backend(self):
         cuda = dict(REQUEST, profile="wan", variant="a14b-t2v-candle")
         mlx = {key: value for key, value in cuda.items() if key != "cuda_device_uuid"}

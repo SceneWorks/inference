@@ -97,15 +97,16 @@ def overlay_identity(overlay):
     return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(overlay.items())}
 
 
-def build(work, origin, arm, contract, profile, env, *, release=False, cuda_features="cuda"):
+def build(work, origin, arm, contract, profile, env, *, release=False, cuda_features="cuda", source_overlay=None):
     root = work / arm
     expected = contract[arm]
     observed = paired.add_source_worktree(origin, root, expected["revision"])
     if observed != expected:
         raise ValueError("comparison build checkout does not match its exact clean Git tree")
     backend = contract["backend"]
-    overlay = profile.overlay(lambda path: subprocess.check_output(["git", "show", f"HEAD:{path}"],
-                              cwd=root, timeout=30), arm, backend, PROOF_BIN)
+    make_overlay = source_overlay or profile.overlay
+    overlay = make_overlay(lambda path: subprocess.check_output(["git", "show", f"HEAD:{path}"],
+                           cwd=root, timeout=30), arm, backend, PROOF_BIN)
     if overlay_identity(overlay) != contract["overlay_sha256"][arm]:
         raise ValueError("adapter probe overlay differs from the hosted plan")
     for name, data in overlay.items():

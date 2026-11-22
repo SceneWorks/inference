@@ -34,6 +34,18 @@ GIB = 2**30
 POOL_BYTES = 80 * GIB
 CHILD_SECONDS = 900
 PAIR_ORDER = ("base", "head"), ("head", "base")
+SOURCE = "crates/media/candle-gen/candle-gen-ltx/src"
+DEV_LOADER_BASE_SHA256 = {
+    "adapters.rs": "e99430f2d3f9af40206ae02bb3339dde04b39cab5aa667ae4fda6f9c2def8253",
+    "memory_strategy_2_5.rs": "d410a3074ab93fa09cca95f9f2bd8a75ba04c484bcbabd747b994815b3fe2479",
+}
+DEV_LOADER_FILES = (*DEV_LOADER_BASE_SHA256, "adapters/refinement.rs")
+ORIGINAL_INSTALL = b"        adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
+REPAIRED_INSTALL = b"""        if self.transformer_variant.is_dev() {
+            adapters::install_ltx25_dev_adapters(&mut avdit, adapters)?;
+        } else {
+            adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        }"""
 
 
 def contract(variant):
@@ -74,17 +86,35 @@ def edit_once(source, marker, replacement):
     return source.replace(marker, replacement)
 
 
-def overlay(read, _arm, backend, binary):
+def dev_loader_sources(read):
+    return {f"{SOURCE}/{filename}": read(f"{SOURCE}/{filename}") for filename in DEV_LOADER_FILES}
+
+
+def overlay(read, arm, backend, binary, *, dev_loader=None):
     if backend != "candle-cuda":
         raise ValueError("LTX Tier 2 fixture requires the native Candle CUDA provider")
-    source = "crates/media/candle-gen/candle-gen-ltx/src"
+    source = SOURCE
     measurement = f"{source}/quant_measurement.rs"
     campaign = edit_once(read(measurement), b"\nfn terminal_generation_request(", b"\npub fn terminal_generation_request(")
     lib = f"{source}/lib.rs"
     data = read(lib)
-    adapter = b"        adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
-    data = edit_once(data, adapter, b"        let sga_adapters = adapters::install_ltx25_adapters(&mut avdit, adapters)?;\n"
-                     b"        println!(\"SGA_LTX_ADAPTER {} {}\", sga_adapters.applied, sga_adapters.skipped_keys);")
+    loader_overlay = {}
+    if dev_loader is not None:
+        if arm == "base":
+            for name, digest in DEV_LOADER_BASE_SHA256.items():
+                if hashlib.sha256(read(f"{source}/{name}")).hexdigest() != digest:
+                    raise ValueError(f"unexpected original LTX Dev loader source {name}")
+            loader_overlay = dev_loader
+            data = edit_once(data, ORIGINAL_INSTALL, REPAIRED_INSTALL)
+        elif dev_loader_sources(read) != dev_loader or REPAIRED_INSTALL not in data:
+            raise ValueError("candidate LTX Dev loader differs from the baseline repair")
+    report = b'\n        println!("SGA_LTX_ADAPTER {} {}", sga_adapters.applied, sga_adapters.skipped_keys);'
+    if REPAIRED_INSTALL in data:
+        observed = REPAIRED_INSTALL.replace(b"        if ", b"        let sga_adapters = if ", 1).replace(b"adapters)?;", b"adapters)?")
+        data = edit_once(data, REPAIRED_INSTALL, observed + b";" + report)
+    else:
+        observed = b"        let sga_adapters = adapters::install_ltx25_adapters(&mut avdit, adapters)?;"
+        data = edit_once(data, ORIGINAL_INSTALL, observed + report)
     # Mark the existing render's two compute spans. Other render routes are outside this fixture.
     for marker, event in (
         (b"        let (vlat, alat) = if self.transformer_variant.is_dev() {", b"        let sga_stage1 = sga_ltx25_timer_start(&self.device)?;\n"),
@@ -114,7 +144,7 @@ fn sga_ltx25_timer_end(device: &Device, start: std::time::Instant, phase: u32, s
 }
 '''
     probe = Path(__file__).with_name("ltx25_tier2_candle.rs.in").read_bytes()
-    return {lib: data, measurement: campaign, f"{source}/bin/{binary}.rs": probe}
+    return {**loader_overlay, lib: data, measurement: campaign, f"{source}/bin/{binary}.rs": probe}
 
 
 def projection_shape(transformer, canonical):

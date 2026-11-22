@@ -61,6 +61,23 @@ def profile_for(backend, request):
     return module
 
 
+def terminal_overlay(profile, backend, request, head):
+    if (backend, request["profile"], request["variant"]) != ("candle-cuda", "ltx25", "dev"):
+        return profile.overlay, {}
+    repair = profile.dev_loader_sources(lambda path: subprocess.check_output(
+        ["git", "show", f"{head}:{path}"], cwd=ROOT, timeout=30))
+    provenance = {"baseline_loader_repair": {
+        "scope": "Original Candle Dev baseline with the candidate's bounded refinement adapter loader and memory price",
+        "reason": "The unmodified baseline refuses the pinned adapter at its 8 GiB whole-file limit",
+        "shared_source_sha256": source_pair.overlay_identity(repair),
+    }}
+
+    def overlay(read, arm, backend, binary):
+        return profile.overlay(read, arm, backend, binary, dev_loader=repair)
+
+    return overlay, provenance
+
+
 def plan(backend, request, head):
     profile = profile_for(backend, request)
     candidate = proof.repository_identity(head)
@@ -74,16 +91,17 @@ def plan(backend, request, head):
         proof.write_json(checked_policy, policy)
         load_policy(checked_policy)
     overlays = {}
+    make_overlay, provenance = terminal_overlay(profile, backend, request, head)
     for arm, revision in zip(ARMS, (BASE, head), strict=True):
-        overlay = profile.overlay(lambda path: subprocess.check_output(["git", "show", f"{revision}:{path}"],
-                                  cwd=ROOT, timeout=30), arm, backend, source_pair.PROOF_BIN)
+        overlay = make_overlay(lambda path: subprocess.check_output(["git", "show", f"{revision}:{path}"],
+                               cwd=ROOT, timeout=30), arm, backend, source_pair.PROOF_BIN)
         overlays[arm] = source_pair.overlay_identity(overlay)
     runner = proof.NAX_ROUTES[binding]["labels"] if backend == "mlx" else proof.RUNNERS[backend]
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
             "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,
             "base": {"revision": BASE, "tree": paired.git(ROOT, "rev-parse", BASE + "^{tree}")},
             "head": candidate, "overlay_sha256": overlays, "expected_samples": [name for name, _ in SAMPLES],
-            **profile.contract(request["variant"])}
+            **profile.contract(request["variant"]), **provenance}
 
 
 def sample_limits(profile, policy):
@@ -209,10 +227,12 @@ def execute(args, contract, profile):
             child_env.update(CUDA_VISIBLE_DEVICES=binding, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUBLAS_WORKSPACE_CONFIG=":4096:8",
                              SCENEWORKS_CUDA_PROOF_POOL_BYTES=str(contract["settings"]["pool_cap_bytes"]))
         executables, preflight_rows = {}, []
+        make_overlay, _ = terminal_overlay(profile, args.backend, request, contract["head"]["revision"])
         for arm, origin in zip(ARMS, (baseline, ROOT), strict=True):
             arm_env = child_env.copy()
             binary, receipt["arms"][arm] = source_pair.build(work, origin, arm, contract, profile, arm_env,
-                                                              release=True, cuda_features=getattr(profile, "BUILD_FEATURES", "cuda"))
+                                                              release=True, cuda_features=getattr(profile, "BUILD_FEATURES", "cuda"),
+                                                              source_overlay=make_overlay)
             executables[arm] = (binary, arm_env)
             preflight = subprocess.run([str(binary), "--preflight"], cwd=work / arm, encoding="utf-8", check=True,
                                        env=dict(arm_env, CUDA_VISIBLE_DEVICES=""), capture_output=True,
