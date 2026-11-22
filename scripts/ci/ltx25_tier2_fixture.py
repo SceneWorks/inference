@@ -131,9 +131,49 @@ def dev_loader_sources(read):
     return {f"{SOURCE}/{filename}": read(f"{SOURCE}/{filename}") for filename in DEV_LOADER_FILES}
 
 
-def overlay(read, arm, backend, binary, *, dev_loader=None):
+def windows_dev_memory_overlay(data, report):
+    # The diagnostic overlays the repaired baseline only, and guards every source boundary.
+    def mark(phase, indent=8):
+        return b" " * indent + b'sga_ltx25_memory_phase("' + phase + b'");\n'
+
+    for marker, phase in (
+        (b"        let sga_adapters = if self.transformer_variant.is_dev() {", b"adapter-start"),
+        (b"        let te = Ltx25TextEncoder::from_bundle_av(", b"gemma-load-start"),
+        (b"        Ok(Components {\n            te: Arc::new(TextEncoder::Gemma4(Box::new(te))),", b"components-ready"),
+        (b"        let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;\n"
+         b"        let (video_ctx, audio_ctx, negative_context) = candle_gen::gen_core::with_prompt_encoding(",
+         b"prompt-encode-start"),
+        (b"        let mut predict = || -> gen_core::Result<f32> {", b"prompt-encode-end"),
+        (b"            let (state, audio) = pipeline::denoise_av_dev_conditioned(", b"stage1-entry"),
+    ):
+        indent = len(marker) - len(marker.lstrip(b" "))
+        data = edit_once(data, marker, mark(phase, indent) + marker)
+    data = edit_once(data, report, report + b"\n" + mark(b"adapter-completed").rstrip(b"\n"))
+    gemma_end = b"            &self.audio_conn_cfg,\n        )?;\n"
+    rest_start = b"        let video_vb =\n"
+    data = edit_once(data, gemma_end + rest_start, gemma_end + mark(b"gemma-load-end") + rest_start)
+    progress = b"""        let mut stage1_progress = |event: Progress| {
+            if let Some(event) = stage1_fold.fold(event) {
+"""
+    data = edit_once(data, progress, progress + b"""                if matches!(&event, Progress::Step { current: 1, .. }) {
+""" + mark(b"stage1-step1-reported", 20) + b"                }\n")
+    return data + b'''
+fn sga_ltx25_memory_phase(phase: &str) {
+    let unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("proof runner clock precedes the Unix epoch")
+        .as_micros();
+    println!("SGA_LTX_MEMORY_PHASE {phase} {unix_us}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+'''
+
+
+def overlay(read, arm, backend, binary, *, dev_loader=None, diagnostic=False):
     if backend != "candle-cuda":
         raise ValueError("LTX Tier 2 fixture requires the native Candle CUDA provider")
+    if diagnostic and (arm != "base" or dev_loader is None):
+        raise ValueError("Windows Dev diagnostic only instruments the repaired frozen baseline")
     source = SOURCE
     measurement = f"{source}/quant_measurement.rs"
     campaign = edit_once(read(measurement), b"\nfn terminal_generation_request(", b"\npub fn terminal_generation_request(")
@@ -167,6 +207,8 @@ def overlay(read, arm, backend, binary, *, dev_loader=None):
         (b"        let (vlat, alat) = (stage2.video, stage2.audio);", b"        sga_ltx25_timer_end(&self.device, sga_stage2, 1, &STAGE2_SIGMAS)?;\n"),
     ):
         data = edit_once(data, marker, event + marker)
+    if diagnostic:
+        data = windows_dev_memory_overlay(data, report)
     data += b'''
 fn sga_ltx25_timer_start(device: &Device) -> CResult<std::time::Instant> {
     device.synchronize()?;

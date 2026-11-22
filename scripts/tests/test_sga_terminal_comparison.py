@@ -1,5 +1,6 @@
 """No model compute: terminal pairing decisions and native receipt contracts."""
 
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -21,6 +22,7 @@ from scripts.ci.pinned_hub_source import file_inventory_seal
 UUID = "GPU-a123bcde-4321-abcd-abcd-0123456789ab"
 REQUEST = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
            "cuda_device_uuid": UUID, "download_missing": True}
+DIAGNOSTIC = dict(REQUEST, cuda_device_uuid=comparison.WINDOWS_DEV_GPU, diagnostic="windows-dev-memory")
 
 
 class TerminalTests(unittest.TestCase):
@@ -56,6 +58,127 @@ class TerminalTests(unittest.TestCase):
         del samples["pair-4-head"]
         with self.assertRaisesRegex(ValueError, "every frozen sample"):
             comparison.summarize(samples)
+
+    def test_windows_diagnostic_selector_and_plan_pin_only_the_repaired_base(self):
+        self.assertIs(comparison.profile_for("candle-cuda", DIAGNOSTIC), ltx)
+        for request in (dict(DIAGNOSTIC, cuda_device_uuid=UUID), dict(DIAGNOSTIC, variant="distilled"),
+                        dict(DIAGNOSTIC, profile="z-image"), dict(DIAGNOSTIC, diagnostic=True),
+                        dict(DIAGNOSTIC, diagnostic="unknown"), dict(DIAGNOSTIC, download_missing=False)):
+            with self.assertRaises(ValueError):
+                comparison.profile_for("candle-cuda", request)
+        mlx = {key: value for key, value in DIAGNOSTIC.items() if key != "cuda_device_uuid"}
+        with self.assertRaises(ValueError):
+            comparison.profile_for("mlx", dict(mlx, runner="nax"))
+
+        controller = {"revision": "1" * 40, "tree": "2" * 40}
+        repair = {"adapter.rs": b"repaired"}
+
+        def make_overlay(read, arm, backend, binary, *, dev_loader, diagnostic):
+            self.assertEqual((arm, backend, diagnostic), ("base", "candle-cuda", True))
+            self.assertEqual(dev_loader, repair)
+            return {"base.rs": read("base.rs")}
+
+        def git_show(command, **_kwargs):
+            self.assertEqual(command[:2], ["git", "show"])
+            revision, path = command[2].split(":")
+            expected = comparison.BASE if path == "base.rs" else comparison.WINDOWS_DEV_REPAIR
+            self.assertEqual(revision, expected)
+            return b"frozen base" if path == "base.rs" else repair[path]
+
+        with (patch.object(comparison.proof, "repository_identity", return_value=controller),
+              patch.object(comparison.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+              patch.object(comparison.subprocess, "check_output", side_effect=git_show),
+              patch.object(comparison.paired, "git", return_value="3" * 40),
+              patch.object(ltx, "dev_loader_sources", side_effect=lambda read: {"adapter.rs": read("adapter.rs")}),
+              patch.object(ltx, "overlay", side_effect=make_overlay)):
+            contract = comparison.plan("candle-cuda", DIAGNOSTIC, controller["revision"])
+        self.assertEqual(set(contract["overlay_sha256"]), {"base"})
+        self.assertEqual(contract["expected_samples"], ["warmup-base"])
+        self.assertEqual(contract["base"], {"revision": comparison.BASE, "tree": "3" * 40})
+        self.assertEqual(contract["diagnostic_source"], controller)
+        self.assertNotIn("head", contract)
+        self.assertNotIn("comparison", contract)
+        self.assertEqual(contract["baseline_loader_repair"]["source_revision"], comparison.WINDOWS_DEV_REPAIR)
+        self.assertEqual(contract["baseline_loader_repair"]["shared_source_sha256"],
+                         comparison.source_pair.overlay_identity(repair))
+        self.assertEqual(contract["model"], ltx.contract("dev")["model"])
+        self.assertEqual(contract["settings"], ltx.contract("dev")["settings"])
+        self.assertEqual(contract["policy"], ltx.policy("dev", DIAGNOSTIC["cuda_device_uuid"]))
+
+    def test_windows_diagnostic_runs_one_warmup_and_archives_bounded_failure_without_scoring(self):
+        policy = ltx.policy("dev", DIAGNOSTIC["cuda_device_uuid"])
+        base = {"revision": comparison.BASE, "tree": "3" * 40}
+        build = dict(base, overlay_sha256={"lib.rs": "4" * 64}, binary_sha256="5" * 64)
+        contract = {"backend": "candle-cuda", "request": DIAGNOSTIC, "base": base,
+                    "diagnostic_source": {"revision": "1" * 40, "tree": "2" * 40},
+                    "policy": policy, "expected_samples": ["warmup-base"],
+                    "overlay_sha256": {"base": build["overlay_sha256"]},
+                    "settings": ltx.contract("dev")["settings"]}
+        for fails in (False, True):
+            with self.subTest(fails=fails), TemporaryDirectory() as directory, ExitStack() as stack:
+                tmp = Path(directory).resolve()
+                args = SimpleNamespace(backend="candle-cuda", output=tmp / "artifact")
+                env = {"RUNNER_TEMP": str(tmp), "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+                       "MODEL_PROOF_RUNNER_ENVIRONMENT": "self-hosted"}
+                stack.enter_context(patch.dict(comparison.os.environ, env))
+
+                @contextmanager
+                def claim(*_args, **_kwargs):
+                    yield {"post_execution_verified": True}
+
+                def invoke(_binary, _arm_root, output, *_args, **_kwargs):
+                    output.mkdir()
+                    (output / "stdout.log").write_text("SGA_LTX_MEMORY_PHASE adapter-start 1000\n", encoding="utf-8")
+                    if fails:
+                        raise ValueError("child-footprint: owned tree exceeded child cap")
+
+                replacements = [
+                    (comparison.proof, "require_host", None),
+                    (comparison.source_pair, "attempt_work_root", tmp),
+                    (comparison.paired, "git", comparison.BASE),
+                    (comparison.paired, "hardware", {}),
+                    (comparison, "require_sm120", "sm_120"),
+                    (comparison, "terminal_hub_root", tmp),
+                    (ltx, "staged_assets", (tmp / "snapshot", {"fixture": True})),
+                    (comparison, "verify_assets", None),
+                    (comparison, "terminal_overlay", (None, {})),
+                    (comparison.source_pair, "build", (Path("base.exe"), build.copy())),
+                    (comparison.subprocess, "run", SimpleNamespace(stdout="preflight")),
+                    (ltx, "preflight", None),
+                    (comparison, "sample_limits", {"stdout.log": 1024}),
+                    (comparison, "read_sample", {}),
+                ]
+                mocks = {name: stack.enter_context(patch.object(owner, name, return_value=value))
+                         for owner, name, value in replacements}
+                stack.enter_context(patch.object(comparison, "execution_claim", claim))
+                warmup = stack.enter_context(patch.object(comparison.paired, "invoke", side_effect=invoke))
+                stack.enter_context(patch.object(comparison, "summarize", side_effect=AssertionError("must not score")))
+                if fails:
+                    with self.assertRaisesRegex(ValueError, "child-footprint"):
+                        comparison.execute(args, contract, ltx)
+                else:
+                    comparison.execute(args, contract, ltx)
+                mocks["build"].assert_called_once()
+                self.assertEqual(mocks["build"].call_args.args[2], "base")
+                mocks["run"].assert_called_once()
+                warmup.assert_called_once()
+                self.assertEqual(warmup.call_args.args[2].name, "warmup-base")
+                receipt_path = args.output / "receipt.json"
+                receipt = comparison.load_json(receipt_path)
+                self.assertFalse(receipt["accepted"])
+                self.assertEqual(receipt["diagnostic_completed"], not fails)
+                self.assertEqual(set(receipt["files"]), {"warmup-base.stdout.log"})
+                self.assertNotIn("comparison_result", receipt)
+                comparison.verify(args, contract, ltx)
+                for invalid in (dict(receipt, accepted=True), dict(receipt, comparison_result={}),
+                                dict(receipt, arms={"head": build})):
+                    receipt_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "unscored and baseline-only"):
+                        comparison.verify(args, contract, ltx)
+                wrong_base = dict(receipt, arms={"base": dict(build, revision="f" * 40)})
+                receipt_path.write_text(json.dumps(wrong_base), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "exact compiled source"):
+                    comparison.verify(args, contract, ltx)
 
     def test_accepted_uploads_replay_the_frozen_assets_but_failure_archives_may_omit_them(self):
         sample = {"identity": {"fixture": "same"}, "timing": {"e2e_ns": 1000}, "peaks": {"device": 1000}}
