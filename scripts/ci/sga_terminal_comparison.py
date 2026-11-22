@@ -26,6 +26,7 @@ from scripts.ci.wan_adapter_tier1_fixture import unique_object
 from scripts.media_campaign_supervisor import load_policy
 
 SELECTION = "sga-terminal-tier2"
+BASE = "481a982db44b58937c15c2d3f0cbf918b116d04d"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
             ("mlx", "ltx25"): "ltx25_tier2_mlx",
             ("candle-cuda", "z-image"): "z_image_tier2_fixture",
@@ -62,10 +63,9 @@ def profile_for(backend, request):
 def plan(backend, request, head):
     profile = profile_for(backend, request)
     candidate = proof.repository_identity(head)
-    base = source_pair.BASE
-    if head == base or subprocess.run(["git", "merge-base", "--is-ancestor", base, head],
+    if head == BASE or subprocess.run(["git", "merge-base", "--is-ancestor", BASE, head],
                                       cwd=ROOT, timeout=30).returncode != 0:
-        raise ValueError("terminal head must descend from the exact ENG-4a baseline")
+        raise ValueError("terminal head must descend from the pinned native-format main baseline")
     binding = request[DEVICE_KEY[backend]]
     policy = profile.policy(request["variant"], binding)
     with TemporaryDirectory(prefix="sga-terminal-policy-") as directory:
@@ -73,14 +73,14 @@ def plan(backend, request, head):
         proof.write_json(checked_policy, policy)
         load_policy(checked_policy)
     overlays = {}
-    for arm, revision in zip(ARMS, (base, head), strict=True):
+    for arm, revision in zip(ARMS, (BASE, head), strict=True):
         overlay = profile.overlay(lambda path: subprocess.check_output(["git", "show", f"{revision}:{path}"],
                                   cwd=ROOT, timeout=30), arm, backend, source_pair.PROOF_BIN)
         overlays[arm] = source_pair.overlay_identity(overlay)
     runner = proof.NAX_ROUTES[binding]["labels"] if backend == "mlx" else proof.RUNNERS[backend]
     return {"protocol": SELECTION, "schema": 1, "runner": runner, "backend": backend,
-            "asset_setup": "sga-adapter-comparison", "request": request, "policy": policy,
-            "base": {"revision": base, "tree": paired.git(ROOT, "rev-parse", base + "^{tree}")},
+            "asset_setup": "sga-terminal-comparison", "request": request, "policy": policy,
+            "base": {"revision": BASE, "tree": paired.git(ROOT, "rev-parse", BASE + "^{tree}")},
             "head": candidate, "overlay_sha256": overlays, "expected_samples": [name for name, _ in SAMPLES],
             **profile.contract(request["variant"])}
 
@@ -171,10 +171,12 @@ def execute(args, contract, profile):
     receipt = {**contract, **identity, "accepted": False, "arms": {}, "files": {}}
     proof.write_json(artifact / "receipt.json", receipt)
     work = tmp / f"sga-terminal-{identity['run_id']}-{identity['run_attempt']}"
-    baseline = ROOT / "sga-adapter-baseline"
+    baseline = ROOT / "sga-terminal-baseline"
     proof.unlinked_path(work, tmp)
     work.mkdir()
     try:
+        if paired.git(baseline, "rev-parse", "HEAD") != BASE:
+            raise ValueError("terminal baseline checkout does not match the workflow pin")
         request = contract["request"]
         policy_path = work / "policy.json"
         proof.write_json(policy_path, contract["policy"])

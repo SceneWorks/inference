@@ -129,6 +129,13 @@ jobs:
           ref: e86b8d5fc493c16b2d9d852e0c9ecbdefee58294
           path: sga-adapter-baseline
           persist-credentials: false
+      - name: Check out the exact terminal comparison baseline
+        if: matrix.asset_setup == 'sga-terminal-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 481a982db44b58937c15c2d3f0cbf918b116d04d
+          path: sga-terminal-baseline
+          persist-credentials: false
       - name: Check out the merged ENG-4a engine for the FLUX.1 ENG-4b proof
         if: matrix.asset_setup == 'flux1-eng4b-comparison'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
