@@ -168,9 +168,15 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
     // on any family (200 judged, 0 regression); a hit cuts TTFT 19.5–87.7%. An exact cross-turn
     // reuse, admission-clamped (E7), so it can never refuse or overrun a load.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
-    // justification: PROVISIONAL — off pending SW-F356 paired real-weight runs measuring
-    // full-request latency, TTFT, snapshot overhead, and peak memory.
-    prefix_checkpoints: PrefixCheckpointMode::Off,
+    // justification: on (auto), MEASURED (SW-F356 MLX campaign run 44973821653, Apple M5 Max,
+    // `prefix_checkpoints` prompt set, 2 process repeats): on hybrid DeltaNet (Qwen3.8-27B Q4),
+    // `auto` vs `off` cuts total wall 30.7% (18455.8 -> 12782.0 ms) and total TTFT 46.5%
+    // (11864.8 -> 6346.9 ms), including -83.6% wall / -94.3% TTFT on edited long turns (1765
+    // reused) and -66.4% wall / -94.3% TTFT on repeated long documents (1752 reused), with flat
+    // peak memory (22533 -> 22541 MB, +0.04%) and 0.01 ms restore overhead. On ordinary attention
+    // (Qwen3-0.6B), total wall stays flat (+0.6%, 834.9 -> 839.7 ms) and peak memory stays bounded
+    // (+135 MB). Callers may still opt out per request with `PrefixCheckpointMode::Off`.
+    prefix_checkpoints: PrefixCheckpointMode::Auto,
     // justification: n/a — MLX has no CUDA graphs.
     cuda_graphs: false,
     // justification: fixed — MLX decoders always read positions from device RoPE tables
@@ -226,9 +232,16 @@ pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
     // rests on two cells barely past their band (a +2.3% miss TTFT vs ±2.1%, a -7.3% hit decode
     // vs ±3.9%), outweighed by the hit's TTFT cut. Admission-clamped in the device domain (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
-    // justification: PROVISIONAL — off pending SW-F356 paired real-weight runs measuring
-    // full-request latency, TTFT, snapshot overhead, and peak memory.
-    prefix_checkpoints: PrefixCheckpointMode::Off,
+    // justification: on (auto), MEASURED (SW-F356 Candle/CUDA campaign run 44967836606, RTX PRO
+    // 6000, `prefix_checkpoints` prompt set, 2 process repeats): on hybrid DeltaNet (Qwen3.8-27B
+    // Q4), `auto` vs `off` cuts total wall 14.1% (9076.3 -> 7798.5 ms) and total TTFT 23.3%
+    // (5556.6 -> 4259.9 ms), including -58.3% wall / -70.2% TTFT on edited long turns (1765
+    // reused) and -35.2% wall / -50.8% TTFT on repeated long documents (1752 reused), with lower
+    // peak memory (23111 -> 22791 MB) and sub-2 ms capture/restore (0.3-1.0 ms / 0.8-1.6 ms). On
+    // ordinary attention (Qwen3-0.6B), total wall stays flat (+0.8%, 976.0 -> 984.0 ms) and peak
+    // memory stays bounded (+96 MB). Callers may still opt out per request with
+    // `PrefixCheckpointMode::Off`.
+    prefix_checkpoints: PrefixCheckpointMode::Auto,
     // justification: on, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): 40 of 40 on-vs-off cells
     // pass, decode +44–53% on Bonsai and +5% on Qwen3-8B (speculative `off`), TTFT unchanged.
     // Captured steps are token-identical to eager by construction (bit-exact self-check). A step
@@ -278,8 +291,9 @@ pub const CANDLE_METAL: DecodeDefaults = DecodeDefaults {
     // justification: on — follows CANDLE_CUDA's MEASURED value (Metal was not a campaign host);
     // admission-clamped (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
-    // justification: PROVISIONAL — follows CANDLE_CUDA pending SW-F356 paired real-weight runs.
-    prefix_checkpoints: PrefixCheckpointMode::Off,
+    // justification: on (auto) — follows CANDLE_CUDA's MEASURED SW-F356 value (Metal was not a
+    // campaign host); admission-clamped per model and opt-out via `PrefixCheckpointMode::Off`.
+    prefix_checkpoints: PrefixCheckpointMode::Auto,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
     // justification: off, a correctness limit — Metal has no `write_rows_at` / `decode_attention`
@@ -318,8 +332,9 @@ pub const CANDLE_CPU: DecodeDefaults = DecodeDefaults {
     // justification: on — follows CANDLE_CUDA's MEASURED value (the CPU was not a campaign host);
     // admission-clamped in host memory.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
-    // justification: PROVISIONAL — follows CANDLE_CUDA pending SW-F356 paired real-weight runs.
-    prefix_checkpoints: PrefixCheckpointMode::Off,
+    // justification: on (auto) — follows CANDLE_CUDA's MEASURED SW-F356 value (the CPU was not a
+    // campaign host); admission-clamped in host memory and opt-out via `PrefixCheckpointMode::Off`.
+    prefix_checkpoints: PrefixCheckpointMode::Auto,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
     // justification: off — no graph runner on the CPU, and the

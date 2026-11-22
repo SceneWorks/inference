@@ -2474,7 +2474,7 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(campaign.MatrixError):
                 plan({"rows": [bad]}, lane="mlx")
 
-    def test_defaults_table_reports_prefix_checkpoints_off_as_provisional_and_pairs_twins(self) -> None:
+    def test_defaults_table_reports_prefix_checkpoints_auto_as_measured_and_pairs_twins(self) -> None:
         entries = {e["entry"]: e for e in campaign.default_entries(LIVE_DEFAULTS)}
         for key in (
             "MLX.prefix_checkpoints",
@@ -2483,10 +2483,10 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             "CANDLE_CPU.prefix_checkpoints",
         ):
             self.assertIn(key, entries)
-            self.assertFalse(entries[key]["on"])
-            self.assertTrue(entries[key]["provisional"])
+            self.assertTrue(entries[key]["on"])
+            self.assertFalse(entries[key]["provisional"])
             self.assertEqual(entries[key]["kind"], "prefix_checkpoints")
-            self.assertEqual(entries[key]["value"], "PrefixCheckpointMode::Off")
+            self.assertEqual(entries[key]["value"], "PrefixCheckpointMode::Auto")
 
         with tempfile.TemporaryDirectory() as td:
             def ckpt_row(row_id, mode, ttft):
@@ -2515,7 +2515,7 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             }
             decision = decisions["CANDLE_CUDA.prefix_checkpoints"]
             self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
-            self.assertTrue(decision["flip"])
+            self.assertFalse(decision["flip"])
 
     def test_compare_and_paths_surface_wall_ttft_memory_and_checkpoint_overhead(self) -> None:
         with tempfile.TemporaryDirectory() as td:
