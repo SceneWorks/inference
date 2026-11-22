@@ -367,7 +367,7 @@ class WorkflowStaging(unittest.TestCase):
             expected = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
             self.assertEqual(staging.resolve_hub_root(env, platform="darwin"), expected)
             self.assertEqual(staging.resolve_hub_root(env, platform="linux"), Path(absent))
-            with patch.object(campaign.sys, "platform", "darwin"):
+            with patch.object(staging.sys, "platform", "darwin"):
                 resolved_path, pin = campaign.hub_pin(
                     f"hub:SceneWorks/qwen3.8-27b-abliterated-mlx@{REV}/q4", env, "row r"
                 )

@@ -28,7 +28,7 @@ from contextlib import contextmanager
 import errno
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import sys
@@ -120,8 +120,9 @@ def resolve_hub_root(env: dict[str, str], *, platform: str | None = None) -> Pat
     configured = env.get("MODEL_PROOF_HUB_ROOT", "").strip()
     if not configured:
         raise ValueError("MODEL_PROOF_HUB_ROOT (the runner model root variable) is unset")
-    root = Path(os.path.expanduser(configured))
-    if not root.is_absolute():
+    expanded = os.path.expanduser(configured)
+    root = Path(expanded)
+    if not (root.is_absolute() or PureWindowsPath(expanded).is_absolute()):
         raise ValueError("MODEL_PROOF_HUB_ROOT must be an absolute or ~ path")
     # On macOS, repo variables point at an external volume (for example /Volumes/Models/...).
     # When that external volume is not mounted on the runner, /Volumes is root-owned and mkdir

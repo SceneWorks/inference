@@ -2651,3 +2651,44 @@ class PrefixCheckpointsCampaignTests(unittest.TestCase):
             pmd = campaign.paths_markdown(pr)
             self.assertIn("### Prefix checkpoints", pmd)
             self.assertIn("| off | document | 96 | 12 | 2.75 | 1.25 | 4096 | 8192 | 4096 | document |", pmd)
+
+    def test_cross_revision_epic_with_checkpoints_compares_against_pre_epic_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            def make_doc(run, k):
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": "auto"}})
+                    if run == "epic"
+                    else None
+                )
+                return document(
+                    run,
+                    value=lambda p, o, m: (
+                        (55.0 if run == "epic" else 50.0) if m == "decode_tok_s" else 80.0
+                    ) + jitter(k),
+                    row_extra=extra,
+                )
+
+            directory = write_campaign(
+                Path(td) / "cross-rev",
+                [{"id": "paired", "runs": ["epic", "baseline"], "document": make_doc}],
+            )
+            report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
+            self.assertEqual(report["schema"], campaign.COMPARE_SCHEMA)
+            self.assertEqual(len(report["rows"]), 1)
+
+            # Within the same run (`epic`), conflicting checkpoint modes are still refused.
+            def mixed_epic(run, k):
+                policy = "auto" if k == 1 else "off"
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": policy}})
+                    if run == "epic"
+                    else None
+                )
+                return document(run, row_extra=extra)
+
+            bad_dir = write_campaign(
+                Path(td) / "mixed-epic",
+                [{"id": "mixed", "runs": ["epic", "baseline"], "document": mixed_epic}],
+            )
+            with self.assertRaisesRegex(campaign.Refused, "prefix_checkpoints"):
+                campaign.compare_campaigns([bad_dir], LIVE_DEFAULTS)

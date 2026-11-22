@@ -123,6 +123,11 @@ import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, NamedTuple
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from scripts.ci.stage_pinned_hub_snapshots import resolve_hub_root  # noqa: E402
+
 SCHEMA = "sceneworks.decode-speedups.baseline/4"
 CAMPAIGN_SCHEMA = "sceneworks.decode-speedups.campaign/1"
 COMPARE_SCHEMA = "sceneworks.decode-speedups.compare/1"
@@ -323,18 +328,10 @@ def hub_pin(value: str, environ: dict[str, str], what: str) -> tuple[str, dict[s
     if not root:
         raise MatrixError(f"{what}: a Hub pin needs ${HUB_ROOT_ENV} (the runner's Hub root)")
     repository, revision = match.group("repository"), match.group("revision")
-    expanded = os.path.expanduser(root)
-    if not _absolute(expanded):
-        raise MatrixError(f"{what}: ${HUB_ROOT_ENV} must be an absolute or ~ path, got {root!r}")
-    root_path = Path(expanded)
-    if (
-        sys.platform == "darwin"
-        and len(root_path.parts) >= 3
-        and root_path.parts[:2] == ("/", "Volumes")
-        and not Path("/", "Volumes", root_path.parts[2]).exists()
-    ):
-        home = Path(os.path.expanduser(environ.get("HOME") or "~"))
-        root_path = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+    try:
+        root_path = resolve_hub_root(environ)
+    except ValueError as error:
+        raise MatrixError(f"{what}: {error} (got {root!r})") from error
     base = Path(os.path.realpath(root_path))
     path = base / ("models--" + repository.replace("/", "--")) / "snapshots" / revision
     if subfolder:
@@ -1639,10 +1636,24 @@ def check_row_evidence(processes: list[Process]) -> list[str]:
     reference["prompts"] = sorted(
         {p for process in processes for p in document_config(process)["prompts"]}
     )
+    by_run_checkpoints: dict[str, tuple[str, str | None]] = {}
     for process in processes:
         name = f"{process.campaign}/{process.row} {process.run}-{process.index}"
         config = document_config(process)
         for key, value in config.items():
+            if key == "prefix_checkpoints":
+                # Pre-epic baseline documents do not emit checkpoint telemetry (`None`), whereas
+                # current epic documents emit their active policy (`auto`/`off`/`document`). Enforce
+                # equality within each run without rejecting cross-revision epic-vs-baseline pairs.
+                expected_run = by_run_checkpoints.get(process.run)
+                if expected_run is None:
+                    by_run_checkpoints[process.run] = (f"{process.run}-{process.index}", value)
+                elif value != expected_run[1]:
+                    refusals.append(
+                        f"{name}: {key} {value!r} differs from {expected_run[1]!r} "
+                        f"({expected_run[0]} / the row's prompt set)"
+                    )
+                continue
             if value != reference[key]:
                 refusals.append(
                     f"{name}: {key} {value!r} differs from {reference[key]!r} "
