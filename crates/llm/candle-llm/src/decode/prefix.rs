@@ -260,20 +260,7 @@ pub struct PrefixRestoreOutcome {
     pub restore_time: Duration,
 }
 
-/// Summary of storing a request's checkpoints into [`PrefixCache`] (SW-F356).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PrefixStoreOutcome {
-    /// Number of checkpoint entries stored.
-    pub checkpoints_captured: u32,
-    /// Sum of stored entry byte sizes.
-    pub captured_bytes: u64,
-    /// Number of entries evicted during storage.
-    pub evicted_entries: u32,
-    /// Wall duration spent copying and storing checkpoint entries.
-    pub capture_time: Duration,
-    /// Fallback diagnostics emitted during storage.
-    pub fallbacks: Vec<String>,
-}
+pub use core_llm::prefix::PrefixStoreOutcome;
 
 /// A bounded, value-aware cross-turn prefix cache for one loaded model (see the module
 /// docs). Resident bytes never exceed the budget; a request short of memory evicts entries first

@@ -18,17 +18,17 @@ use core_llm::Role;
 #[cfg(feature = "campaign")]
 use core_llm::ThinkingMode;
 use core_llm::{
-    AudioRef, BoundaryCandidates, Channel, ChatTemplate, Constraint, ConstraintDecodeTable,
-    ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish, ImageRef,
-    IncrementalDetok, JinjaChatTemplate, JsonConstraint, KvCacheShape, Llama3Template,
+    AudioRef, BoundaryCandidates, Channel, ChatTemplate, CheckpointTelemetry, Constraint,
+    ConstraintDecodeTable, ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish,
+    ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint, KvCacheShape, Llama3Template,
     LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, NearTailConfig, PlannedBoundary,
-    PrefixCheckpointCapabilities, PrefixCheckpointMode, PrefixCheckpointPolicy,
-    PrefixCheckpointReport, PrefixKind, PrefixPlannedContext, PrefixReuse, ProposerCapabilities,
-    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
-    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef, MAX_CHECKPOINTS_PER_REQUEST,
-    PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PrefixCheckpointCapabilities, PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixKind,
+    PrefixPlannedContext, PrefixReuse, ProposerCapabilities, ProposerKind, Quantize,
+    ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, SpeculativePlan,
+    SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCall,
+    ToolCallSegmenter, Usage, VideoRef, MAX_CHECKPOINTS_PER_REQUEST, PREFIX_DOCUMENT_UNALIGNED,
+    PREFIX_PROPOSER_INCOMPATIBLE,
 };
 
 use core_llm::DraftReport;
@@ -5031,8 +5031,8 @@ impl LlamaProvider {
                                     } else {
                                         prefix_reason =
                                             Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED);
-                                        checkpoint_telemetry.fallbacks.push(
-                                            core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED.to_string(),
+                                        checkpoint_telemetry.push_fallback(
+                                            core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED,
                                         );
                                     }
                                 }
@@ -5593,57 +5593,6 @@ impl SpeculativeRoute {
                 | SpeculativeRoute::BlockDraft { .. },
                 _,
             ) => Box::new(NoProposer),
-        }
-    }
-}
-
-#[derive(Default)]
-struct CheckpointTelemetry {
-    restore_time: Duration,
-    capture_time: Duration,
-    matched_kind: Option<String>,
-    checkpoints_captured: u32,
-    captured_bytes: u64,
-    evicted_entries: u32,
-    fallbacks: Vec<String>,
-}
-
-impl CheckpointTelemetry {
-    fn record_store(&mut self, outcome: crate::decode::PrefixStoreOutcome) {
-        self.checkpoints_captured = self
-            .checkpoints_captured
-            .saturating_add(outcome.checkpoints_captured);
-        self.captured_bytes = self.captured_bytes.saturating_add(outcome.captured_bytes);
-        self.evicted_entries = self.evicted_entries.saturating_add(outcome.evicted_entries);
-        self.capture_time = self.capture_time.saturating_add(outcome.capture_time);
-        for fb in outcome.fallbacks {
-            if !self.fallbacks.contains(&fb) {
-                self.fallbacks.push(fb);
-            }
-        }
-    }
-
-    fn into_report(
-        self,
-        policy: &str,
-        reused_tokens: u64,
-        reread_tokens: u64,
-        resident_bytes: u64,
-        protected_bytes: u64,
-    ) -> PrefixCheckpointReport {
-        PrefixCheckpointReport {
-            policy: policy.to_string(),
-            reused_tokens,
-            reread_tokens,
-            matched_kind: self.matched_kind,
-            checkpoints_captured: self.checkpoints_captured,
-            captured_bytes: self.captured_bytes,
-            restore_time: self.restore_time,
-            capture_time: self.capture_time,
-            resident_bytes,
-            protected_bytes,
-            evicted_entries: self.evicted_entries,
-            fallbacks: self.fallbacks,
         }
     }
 }

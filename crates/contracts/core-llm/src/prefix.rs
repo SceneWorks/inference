@@ -35,6 +35,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use crate::defaults::DecodeBackend;
 
@@ -392,6 +393,88 @@ impl Default for NearTailConfig {
             margin: 64,
             align: 64,
             window: 128,
+        }
+    }
+}
+
+/// Summary of storing a request's checkpoints into a backend prefix cache (SW-F356).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrefixStoreOutcome {
+    /// Number of checkpoint entries stored.
+    pub checkpoints_captured: u32,
+    /// Sum of stored entry byte sizes.
+    pub captured_bytes: u64,
+    /// Number of entries evicted during storage.
+    pub evicted_entries: u32,
+    /// Wall duration spent copying/slicing and storing checkpoint entries.
+    pub capture_time: Duration,
+    /// Fallback diagnostics emitted during storage.
+    pub fallbacks: Vec<String>,
+}
+
+/// Request-scoped accumulator for [`PrefixCheckpointReport`](crate::report::PrefixCheckpointReport)
+/// shared by MLX and Candle providers (SW-F356).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointTelemetry {
+    /// Wall duration spent looking up and restoring cached prefix state.
+    pub restore_time: Duration,
+    /// Cumulative wall duration spent capturing and storing checkpoints.
+    pub capture_time: Duration,
+    /// Semantic kind label of the matched checkpoint, when a prefix hit occurred.
+    pub matched_kind: Option<String>,
+    /// Number of checkpoints captured/stored for this request.
+    pub checkpoints_captured: u32,
+    /// Total bytes captured/stored across checkpoints for this request.
+    pub captured_bytes: u64,
+    /// Number of resident entries evicted while storing checkpoints for this request.
+    pub evicted_entries: u32,
+    /// Deduplicated fallback/advisory diagnostics emitted during restore/capture/storage.
+    pub fallbacks: Vec<String>,
+}
+
+impl CheckpointTelemetry {
+    /// Append a fallback diagnostic if not already recorded.
+    pub fn push_fallback(&mut self, fb: &str) {
+        if !self.fallbacks.iter().any(|existing| existing == fb) {
+            self.fallbacks.push(fb.to_string());
+        }
+    }
+
+    /// Fold a backend checkpoint-store outcome into the request accumulator.
+    pub fn record_store(&mut self, outcome: PrefixStoreOutcome) {
+        self.checkpoints_captured = self
+            .checkpoints_captured
+            .saturating_add(outcome.checkpoints_captured);
+        self.captured_bytes = self.captured_bytes.saturating_add(outcome.captured_bytes);
+        self.evicted_entries = self.evicted_entries.saturating_add(outcome.evicted_entries);
+        self.capture_time = self.capture_time.saturating_add(outcome.capture_time);
+        for fb in outcome.fallbacks {
+            self.push_fallback(&fb);
+        }
+    }
+
+    /// Convert the accumulated telemetry into the public [`PrefixCheckpointReport`](crate::report::PrefixCheckpointReport).
+    pub fn into_report(
+        self,
+        policy: &str,
+        reused_tokens: u64,
+        reread_tokens: u64,
+        resident_bytes: u64,
+        protected_bytes: u64,
+    ) -> crate::report::PrefixCheckpointReport {
+        crate::report::PrefixCheckpointReport {
+            policy: policy.to_string(),
+            reused_tokens,
+            reread_tokens,
+            matched_kind: self.matched_kind,
+            checkpoints_captured: self.checkpoints_captured,
+            captured_bytes: self.captured_bytes,
+            restore_time: self.restore_time,
+            capture_time: self.capture_time,
+            resident_bytes,
+            protected_bytes,
+            evicted_entries: self.evicted_entries,
+            fallbacks: self.fallbacks,
         }
     }
 }

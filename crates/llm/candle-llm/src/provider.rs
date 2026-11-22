@@ -15,12 +15,12 @@ use std::time::Duration;
 use candle_core::{DType, Device, Tensor};
 use core_llm::DraftReport;
 use core_llm::{
-    AudioRef, BoundaryCandidates, Channel, ChatTemplate, Constraint, ConstraintDecodeTable,
-    ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish, GenerationTimings,
-    ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint, Llama3Template,
-    LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, MtpStats, NearTailConfig,
-    PlannedAdmission, PlannedBoundary, PrefixCheckpointMode, PrefixCheckpointPolicy,
-    PrefixCheckpointReport, PrefixKind, PrefixPlannedContext, PrefixReuse, ProposerCapabilities,
+    AudioRef, BoundaryCandidates, Channel, ChatTemplate, CheckpointTelemetry, Constraint,
+    ConstraintDecodeTable, ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish,
+    GenerationTimings, ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint,
+    Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, MtpStats,
+    NearTailConfig, PlannedAdmission, PlannedBoundary, PrefixCheckpointMode,
+    PrefixCheckpointPolicy, PrefixKind, PrefixPlannedContext, PrefixReuse, ProposerCapabilities,
     ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
     SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
@@ -36,8 +36,8 @@ use crate::decode::{
     prefill_restored_with_plan, tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask,
     CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason,
     GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache,
-    PrefixRestoreOutcome, PrefixStats, PrefixStoreOutcome, Proposer, RequestSpan,
-    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
+    PrefixRestoreOutcome, PrefixStats, Proposer, RequestSpan, RewindableConstraintMask,
+    SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
 };
 use crate::device::select_device;
 use crate::error::to_core;

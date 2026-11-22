@@ -140,15 +140,16 @@ pub use output::{
 pub use paging::BlockAllocator;
 pub use prefix::{
     plan_prefix_boundaries, plan_prefix_boundaries_with_exact, prefix_cache_budget,
-    prefix_path_before_lookup, requested_prefix_cache_bytes, BoundaryCandidates, BoundaryPlan,
-    InsertOutcome, NearTailConfig, PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixHit,
-    PrefixId, PrefixIndex, PrefixInsert, PrefixInsertOutcome, PrefixKind, PrefixLookup,
-    PrefixMatch, PrefixPlannedContext, PrefixReuse, PrefixStats, PrefixStore,
-    MAX_CHECKPOINTS_PER_REQUEST, PREFIX_CANCELLED_NOT_STORED, PREFIX_COMPRESSED_IMPORT_DECLINED,
-    PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED, PREFIX_DOCUMENT_UNALIGNED,
-    PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED,
-    PREFIX_PARTIAL_ADMISSION_TRIMMED, PREFIX_PROPOSER_INCOMPATIBLE, PREFIX_PROTECTED_CAP_DEMOTED,
-    PREFIX_PROTECTED_PRESERVED,
+    prefix_path_before_lookup, render_prefix_boundary, requested_prefix_cache_bytes,
+    resolve_boundary_candidates, resolve_document_boundary, BoundaryCandidates, BoundaryPlan,
+    CheckpointTelemetry, InsertOutcome, NearTailConfig, PlannedAdmission, PlannedBoundary,
+    PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixInsertOutcome,
+    PrefixKind, PrefixLookup, PrefixMatch, PrefixPlannedContext, PrefixReuse, PrefixStats,
+    PrefixStore, PrefixStoreOutcome, MAX_CHECKPOINTS_PER_REQUEST, PREFIX_CANCELLED_NOT_STORED,
+    PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED,
+    PREFIX_DOCUMENT_UNALIGNED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
+    PREFIX_PAGED_NOT_SNAPSHOTTED, PREFIX_PARTIAL_ADMISSION_TRIMMED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PREFIX_PROTECTED_CAP_DEMOTED, PREFIX_PROTECTED_PRESERVED,
 };
 pub use prepare::{
     check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
