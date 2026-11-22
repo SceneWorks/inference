@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -1988,23 +1989,32 @@ class HubPinPlanTests(unittest.TestCase):
         sys.path.insert(0, str(REPOSITORY))
         try:
             from scripts.ci import stage_pinned_hub_snapshots as stage
+            from scripts.ci import pinned_hub_source
         finally:
             sys.path.remove(str(REPOSITORY))
-        with contextlib.redirect_stdout(io.StringIO()):
+        config = b"{}"
+        for directory in (target, draft):
+            directory.mkdir(parents=True)
+            (directory / "config.json").write_bytes(config)
+        metadata = {"size": len(config), "blobId": hashlib.sha1(b"blob 2\0" + config).hexdigest()}
+
+        def manifest(repository, revision):
+            relative = "q4/config.json" if revision == "7" * 40 else "config.json"
+            return "test-hub", b"test inventory", {relative: metadata}
+
+        fetch = mock.Mock(side_effect=AssertionError("cached fixture should not need a download"))
+        with mock.patch.object(pinned_hub_source, "pinned_manifest", manifest):
             receipt = stage.stage(
                 planned["hub_snapshots"],
                 root,
-                manifest=lambda repository, revision: (
-                    None, None, {"config.json": {"size": 1}, "q4/config.json": {"size": 1}}
-                ),
-                fetch=lambda url, path: (None, None, None, False),
-                verify=lambda repository, revision, base, files: {
-                    "status": "ok", "manifest_sha256": "0", "files": []
-                },
+                manifest=manifest,
+                fetch=fetch,
                 free_bytes=lambda path: 1 << 50,
             )
         self.assertEqual(receipt["DECODE_BENCH_HUB_1"]["path"], str(target))
         self.assertEqual(receipt["DECODE_BENCH_HUB_2"]["path"], str(draft))
+        self.assertEqual(receipt["DECODE_BENCH_HUB_1"]["kept_existing"], ["q4/config.json"])
+        self.assertEqual(receipt["DECODE_BENCH_HUB_2"]["kept_existing"], ["config.json"])
         # No pin, no staging keys.
         self.assertNotIn("hub_snapshots", plan({"rows": [{"id": "r", "snapshot": "qwen38"}]}))
 
