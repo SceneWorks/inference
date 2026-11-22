@@ -122,15 +122,39 @@ impl Generator for Mock {
     fn video_load_binding(&self) -> Option<&RenderLoadBinding> {
         Some(&self.load)
     }
+    fn video_plan_resident_weight_bytes(&self, _: &VideoRenderPlan) -> Option<u64> {
+        Some(64)
+    }
+    fn video_memory_evidence_tier(
+        &self,
+        _: &VideoRenderPlan,
+        _: &GenerationRequest,
+    ) -> Result<Option<crate::MemoryNumericTier>> {
+        Ok(Some(crate::MemoryNumericTier {
+            precision: crate::Precision::Bf16,
+            quant: None,
+            component_precision_floors: &[],
+        }))
+    }
+    fn project_video_memory_context(
+        &self,
+        _: &VideoRenderPlan,
+        _: &GenerationRequest,
+        context: &mut MemoryRunContext,
+    ) -> Result<bool> {
+        context.evidence_revision = "mock provider".into();
+        Ok(true)
+    }
     fn validate(&self, _: &GenerationRequest) -> Result<()> {
         Ok(())
     }
     fn generate(
         &self,
         _: &GenerationRequest,
-        _: &mut dyn FnMut(Progress),
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.forward_calls.set(self.forward_calls.get() + 1);
+        on_progress(Progress::Decoding);
         let mut frame = Image {
             width: 16,
             height: 8,
@@ -177,6 +201,54 @@ impl Generator for Mock {
         scope.leave_phase(MemoryPhase::Denoise)?;
         Ok(report)
     }
+}
+
+#[test]
+fn registry_video_provider_keeps_phase_scope_and_prepared_file_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture");
+    std::fs::write(&path, b"original").unwrap();
+    let mut spec = LoadSpec::new(WeightsSource::File(path.clone()));
+    spec.prepare_file_sources().unwrap();
+    let req = request();
+    let registry = registry();
+    let id = descriptor().id;
+    let plan = registry
+        .compile_video_plan(id, &spec, &req)
+        .unwrap()
+        .unwrap();
+    let plan = plan.bind_admission(&spec, None, &req).unwrap();
+    let provider = registry.load(id, &spec).unwrap();
+    assert_eq!(provider.video_plan_resident_weight_bytes(&plan), Some(64));
+    provider.validate_video_plan(&plan, &req).unwrap();
+
+    let mut scope = BorrowedScope::default();
+    let mut progress = 0;
+    provider
+        .generate_video_planned_with_execution_report(&req, &plan, Some(&mut scope), &mut |_| {
+            assert!(crate::CheckpointReceiptScope::current().is_some());
+            progress += 1;
+        })
+        .unwrap();
+    assert_eq!(progress, 1);
+    assert_eq!(scope.events, [true, false]);
+    assert!(crate::CheckpointReceiptScope::current().is_none());
+
+    let result =
+        provider.generate_with_scoped_execution_report(&req, Some(&mut scope), &mut |_| {
+            assert!(crate::CheckpointReceiptScope::current().is_some());
+            std::fs::write(&path, b"replaced during callback").unwrap();
+        });
+    assert!(result.is_err());
+    assert_eq!(scope.events, [true, false, true, false]);
+    assert!(provider.validate_video_plan(&plan, &req).is_err());
+    assert!(provider.video_memory_evidence_tier(&plan, &req).is_err());
+    assert!(provider
+        .generate_video_planned_with_execution_report(&req, &plan, Some(&mut scope), &mut |_| {
+            panic!("changed source reached provider")
+        })
+        .is_err());
+    assert_eq!(scope.events.len(), 4);
 }
 
 #[test]
@@ -335,6 +407,15 @@ fn resident_defaults_preserve_optional_scope_and_optimized_requires_one() {
         evidence_revision: "test".into(),
         low_res_start: None,
     };
+    let registered = registry().load(descriptor().id, &spec).unwrap();
+    assert_eq!(
+        registered.video_memory_evidence_tier(&plan, &req).unwrap(),
+        Some(context.selection.tier)
+    );
+    assert!(registered
+        .project_video_memory_context(&plan, &req, &mut context)
+        .unwrap());
+    assert_eq!(context.evidence_revision, "mock provider");
     let mock = Mock::new(&spec);
     let bound = plan.bind_admission(&spec, Some(&context), &req).unwrap();
     assert!(mock
