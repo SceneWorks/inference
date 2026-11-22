@@ -340,7 +340,7 @@ def _same_bytes(path, size, sha):
     return read == size and state.hexdigest() == sha
 
 
-def publish_download(temporary, destination, size, sha, *, guard=None, under_staging_lock=False):
+def publish_download(temporary, destination, size, sha, *, guard=None, without_hardlinks=None):
     """Publish a verified partial atomically and reconcile a concurrent same-byte placement."""
     if guard is not None:
         guard(destination)
@@ -351,14 +351,10 @@ def publish_download(temporary, destination, size, sha, *, guard=None, under_sta
             try:
                 os.link(temporary, destination)
             except OSError as error:
-                if (not under_staging_lock or guard is None
+                if (sys.platform != "darwin" or without_hardlinks is None or guard is None
                         or error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP)):
                     raise
-                # Some macOS SMB volumes allow same-directory rename but cannot make hard links.
-                # The common staging lock serializes publication by every participating stager.
-                if guard(destination):
-                    raise FileExistsError(destination) from error
-                os.replace(temporary, destination)
+                without_hardlinks(temporary, destination)
     except FileExistsError:
         if guard is not None:
             guard(destination)

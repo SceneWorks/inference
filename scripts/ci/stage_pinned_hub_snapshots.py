@@ -33,6 +33,7 @@ from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -87,12 +88,16 @@ def _guard_lock(path: Path, hub: Path) -> None:
         raise ValueError(f"staging lock must be a regular unshared file: {path}")
 
 
+def _guard_directory(path: Path, hub: Path) -> None:
+    unlinked_path(path, hub)
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"snapshot asset parent is not a directory: {path}")
+
+
 def _asset_present(path: Path, hub: Path) -> bool:
     # Hugging Face uses symlink leaves to in-hub blobs. Writes and directory
     # creation must always use real, unlinked ancestors inside the hub.
-    unlinked_path(path.parent, hub)
-    if path.parent.exists() and not path.parent.is_dir():
-        raise ValueError(f"snapshot asset parent is not a directory: {path.parent}")
+    _guard_directory(path.parent, hub)
     if not os.path.lexists(path):
         return False
     try:
@@ -102,6 +107,31 @@ def _asset_present(path: Path, hub: Path) -> bool:
     if not resolved.is_file():
         raise ValueError(f"snapshot asset is not a regular file: {path}")
     return True
+
+
+def _publish_verified_symlink(temporary: Path, destination: Path, *, hub: Path, blobs: Path) -> None:
+    """Place a verified payload in private Hub storage, then create a no-clobber snapshot leaf."""
+    _guard_directory(blobs, hub)
+    blobs.mkdir(parents=True, exist_ok=True)
+    _guard_directory(blobs, hub)
+    owned = Path(tempfile.mkdtemp(prefix=".model-proof-", dir=blobs))
+    blob = owned / destination.name
+    moved = False
+    try:
+        # This job exclusively created the private directory. The payload was already fsynced
+        # and authenticated before publication, and the move leaves its bytes untouched.
+        _guard_directory(owned, hub)
+        os.rename(temporary, blob)
+        moved = True
+        _guard_directory(owned, hub)
+        _asset_present(destination, hub)
+        # Creating a link fails if any writer has published this leaf, even after the guard.
+        os.symlink(os.path.relpath(blob, destination.parent), destination)
+    except (OSError, ValueError):
+        if moved:
+            blob.unlink(missing_ok=True)
+        owned.rmdir()
+        raise
 
 
 @contextmanager
@@ -223,7 +253,9 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
                 size = identity["bytes"]
                 print(f"staging {pin['repository']}@{pin['revision']}/{file} ({size / GIB:.2f} GiB)", flush=True)
                 digest_arg = "expected_sha256" if identity["kind"] == "lfs_sha256" else "expected_git_blob"
-                publish = partial(publish_download, guard=partial(_asset_present, hub=hub), under_staging_lock=True)
+                publish = partial(publish_download, guard=partial(_asset_present, hub=hub),
+                                  without_hardlinks=partial(_publish_verified_symlink, hub=hub,
+                                                            blobs=base.parent.parent / "blobs"))
                 try:
                     _, _, _, placed = fetch(url, destination, expected_bytes=size, publish=publish,
                                             **{digest_arg: identity["digest"]})
