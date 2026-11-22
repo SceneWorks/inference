@@ -88,6 +88,7 @@ impl Generator for ControlGenerator {
             reference_count: context.geometry.reference_count,
             use_pid: context.use_pid,
             has_phases: context.has_phases,
+            produced_reference: None,
             finished: false,
         })));
         #[cfg(not(feature = "cuda"))]
