@@ -805,6 +805,17 @@ pub struct AdaptableLinear {
 }
 
 impl AdaptableLinear {
+    fn from_base(base: LinearBase) -> Self {
+        Self {
+            base,
+            adapters: Vec::new(),
+            phase_bindings: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
+            training_residual: false,
+        }
+    }
+
     /// Build from a raw `[out, in]` weight (and optional bias) — the common path when
     /// loading dense (bf16/fp16/fp32) checkpoints via the `weights` module.
     pub fn dense(weight: Array, bias: Option<Array>) -> Self {
@@ -816,38 +827,18 @@ impl AdaptableLinear {
 
     /// Wrap an existing dense `nn::Linear`.
     pub fn from_linear(linear: MlxLinear) -> Self {
-        Self {
-            base: LinearBase::Dense(linear),
-            adapters: Vec::new(),
-            phase_bindings: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::Dense(linear))
     }
 
     /// Wrap an existing `nn::QuantizedLinear` (sc-2342 quantized weights).
     pub fn from_quantized(q: QuantizedLinear) -> Self {
-        Self {
-            base: LinearBase::Quantized(q),
-            adapters: Vec::new(),
-            phase_bindings: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::Quantized(q))
     }
-    /// Wrap a validated, native signed INT8 base without a floating weight copy.
+    /// Wrap a validated native projection without a floating weight copy.
     pub fn from_native(p: crate::NativeProjection) -> Self {
         match p {
             crate::NativeProjection::ConvRot(p) => Self::from_convrot(p),
-            crate::NativeProjection::Fp8(p) => Self {
-                base: LinearBase::Fp8(p),
-                adapters: Vec::new(),
-                pass_scales: Vec::new(),
-                active_pass: Default::default(),
-                training_residual: false,
-            },
+            crate::NativeProjection::Fp8(p) => Self::from_base(LinearBase::Fp8(p)),
         }
     }
 
@@ -860,26 +851,12 @@ impl AdaptableLinear {
     }
 
     pub fn from_convrot(q: crate::convrot_int8::ConvRotLinear) -> Self {
-        Self {
-            base: LinearBase::ConvRot(q),
-            adapters: Vec::new(),
-            phase_bindings: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::ConvRot(q))
     }
 
     /// Wrap a validated, native packed W4A8 base without a dense weight copy.
     pub fn from_w4a8(q: crate::w4a8_int8::W4A8Linear) -> Self {
-        Self {
-            base: LinearBase::W4A8(q),
-            adapters: Vec::new(),
-            phase_bindings: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::W4A8(q))
     }
 
     /// Native INT8 resident base facts; affine Q8 is intentionally not reported here.
