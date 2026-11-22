@@ -409,6 +409,183 @@ pub struct BoundaryCandidates {
     pub conversation_end: Option<usize>,
 }
 
+/// Render `prefix_messages` without a generation prompt and return its token length iff it is
+/// a strict token prefix of `prompt_ids`.
+pub fn render_prefix_boundary(
+    template: &dyn crate::template::ChatTemplate,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    prefix_messages: &[crate::message::Message],
+    req: &crate::request::TextLlmRequest,
+    prompt_ids: &[i32],
+    date_string: Option<&str>,
+) -> Option<usize> {
+    let rendered = template
+        .render_with(
+            prefix_messages,
+            &crate::template::RenderOptions {
+                add_generation_prompt: false,
+                enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+                date_string,
+            },
+        )
+        .ok()?;
+    let ids = tokenizer.encode(&rendered, false).ok()?;
+    let len = ids.len();
+    (len > 0 && len < prompt_ids.len() && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b))
+        .then_some(len)
+}
+
+/// Resolve an explicit [`PrefixDocumentSpan`](crate::request::PrefixDocumentSpan) into a strict
+/// token prefix length `< prompt_ids.len()`.
+///
+/// Uses dual PUA sentinels (`\u{E000}` / `\u{E001}`) for
+/// [`PrefixDocumentSpan::MessageChars`](crate::request::PrefixDocumentSpan::MessageChars) so BPE
+/// merges across the character boundary back off cleanly to the last identical token.
+pub fn resolve_document_boundary(
+    template: &dyn crate::template::ChatTemplate,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    span: crate::request::PrefixDocumentSpan,
+    messages: &[crate::message::Message],
+    req: &crate::request::TextLlmRequest,
+    prompt_ids: &[i32],
+    date_string: Option<&str>,
+) -> Option<usize> {
+    match span {
+        crate::request::PrefixDocumentSpan::Messages { count } => (count > 0
+            && count <= messages.len())
+        .then(|| {
+            render_prefix_boundary(
+                template,
+                tokenizer,
+                &messages[..count],
+                req,
+                prompt_ids,
+                date_string,
+            )
+        })
+        .flatten(),
+        crate::request::PrefixDocumentSpan::Tokens { count } => {
+            (count > 0 && count < prompt_ids.len()).then_some(count)
+        }
+        crate::request::PrefixDocumentSpan::MessageChars { message, chars } => {
+            if chars == 0 {
+                return None;
+            }
+            let target = messages.get(message)?;
+            let text = target.text_content();
+            let total_chars = text.chars().count();
+            if chars > total_chars {
+                return None;
+            }
+            let byte_split = text
+                .char_indices()
+                .nth(chars)
+                .map(|(idx, _)| idx)
+                .unwrap_or(text.len());
+            let (prefix_str, suffix_str) = (&text[..byte_split], &text[byte_split..]);
+            let tokenize_with_sentinel = |sentinel: char| -> Option<Vec<u32>> {
+                let mut modified = messages.to_vec();
+                modified[message].content = vec![crate::message::Content::Text(format!(
+                    "{prefix_str}{sentinel}{suffix_str}"
+                ))];
+                let rendered = template
+                    .render_with(
+                        &modified,
+                        &crate::template::RenderOptions {
+                            add_generation_prompt: true,
+                            enable_thinking: req.enable_thinking_kwarg(),
+                            reasoning_effort: req.reasoning_effort,
+                            preserve_thinking: req.preserve_thinking,
+                            tools: &req.tools,
+                            date_string,
+                        },
+                    )
+                    .ok()?;
+                tokenizer.encode(&rendered, false).ok()
+            };
+            let ids_a = tokenize_with_sentinel('\u{E000}')?;
+            let ids_b = tokenize_with_sentinel('\u{E001}')?;
+            let same_as_prompt = |ids: &[u32]| {
+                ids.len() == prompt_ids.len()
+                    && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b)
+            };
+            if same_as_prompt(&ids_a) && same_as_prompt(&ids_b) {
+                return None;
+            }
+            let aligned = ids_a
+                .iter()
+                .zip(&ids_b)
+                .zip(prompt_ids)
+                .take_while(|&((&a, &b), &p)| a as i32 == p && b as i32 == p)
+                .count();
+            (aligned > 0 && aligned < prompt_ids.len()).then_some(aligned)
+        }
+    }
+}
+
+/// Resolve all candidate prefix boundaries (`document`, `shared_root`, `prev_message`,
+/// `conversation_end`), plus whether an explicit document span failed to align.
+pub fn resolve_boundary_candidates(
+    template: &dyn crate::template::ChatTemplate,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    messages: &[crate::message::Message],
+    req: &crate::request::TextLlmRequest,
+    prompt_ids: &[i32],
+    policy: crate::request::PrefixCheckpointPolicy,
+    date_string: Option<&str>,
+) -> (BoundaryCandidates, bool) {
+    let document = policy.document.and_then(|span| {
+        resolve_document_boundary(
+            template,
+            tokenizer,
+            span,
+            messages,
+            req,
+            prompt_ids,
+            date_string,
+        )
+    });
+    let doc_unaligned = policy.document.is_some() && document.is_none();
+    let conversation_end =
+        render_prefix_boundary(template, tokenizer, messages, req, prompt_ids, date_string);
+    let shared_root = if policy.is_active() && messages.len() >= 2 {
+        render_prefix_boundary(
+            template,
+            tokenizer,
+            &messages[..1],
+            req,
+            prompt_ids,
+            date_string,
+        )
+    } else {
+        None
+    };
+    let prev_message = if policy.is_active() && messages.len() >= 2 {
+        render_prefix_boundary(
+            template,
+            tokenizer,
+            &messages[..messages.len() - 1],
+            req,
+            prompt_ids,
+            date_string,
+        )
+    } else {
+        None
+    };
+    (
+        BoundaryCandidates {
+            document,
+            shared_root,
+            prev_message,
+            conversation_end,
+        },
+        doc_unaligned,
+    )
+}
+
 /// Boundary capture and promotion plan returned by [`plan_prefix_boundaries`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoundaryPlan {

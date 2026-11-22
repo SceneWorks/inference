@@ -20,12 +20,12 @@ use core_llm::{
     ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint, Llama3Template,
     LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, MtpStats, NearTailConfig,
     PlannedAdmission, PlannedBoundary, PrefixCheckpointMode, PrefixCheckpointPolicy,
-    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixPlannedContext, PrefixReuse,
-    ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
-    Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
-    PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PrefixCheckpointReport, PrefixKind, PrefixPlannedContext, PrefixReuse, ProposerCapabilities,
+    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
+    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef, PREFIX_DOCUMENT_UNALIGNED,
+    PREFIX_PROPOSER_INCOMPATIBLE,
 };
 use serde_json::Value;
 
@@ -1701,120 +1701,6 @@ impl LlamaProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Render `prefix_messages` without a generation prompt and return its token length iff it is
-    /// a strict token prefix of `prompt_ids`.
-    fn render_prefix_boundary(
-        &self,
-        prefix_messages: &[Message],
-        req: &TextLlmRequest,
-        prompt_ids: &[i32],
-    ) -> Option<usize> {
-        let rendered = self
-            .template
-            .render_with(
-                prefix_messages,
-                &RenderOptions {
-                    add_generation_prompt: false,
-                    enable_thinking: req.enable_thinking_kwarg(),
-                    reasoning_effort: req.reasoning_effort,
-                    preserve_thinking: req.preserve_thinking,
-                    tools: &req.tools,
-                    date_string: None,
-                },
-            )
-            .ok()?;
-        let ids = self.tokenizer.encode(&rendered, false).ok()?;
-        let len = ids.len();
-        (len > 0
-            && len < prompt_ids.len()
-            && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b))
-        .then_some(len)
-    }
-
-    /// Where the rendered conversation ends and the generation prompt begins, when that is a
-    /// strict token prefix of `prompt_ids` (sc-24437).
-    fn conversation_boundary(
-        &self,
-        messages: &[Message],
-        req: &TextLlmRequest,
-        prompt_ids: &[i32],
-    ) -> Option<usize> {
-        self.render_prefix_boundary(messages, req, prompt_ids)
-    }
-
-    /// Resolve an explicit [`PrefixDocumentSpan`] into a strict token prefix length `< prompt_ids.len()`.
-    /// Uses dual PUA sentinels (`\u{E000}` / `\u{E001}`) for [`PrefixDocumentSpan::MessageChars`]
-    /// so BPE merges across the character boundary back off cleanly to the last identical token.
-    fn resolve_document_boundary(
-        &self,
-        span: PrefixDocumentSpan,
-        messages: &[Message],
-        req: &TextLlmRequest,
-        prompt_ids: &[i32],
-    ) -> Option<usize> {
-        match span {
-            PrefixDocumentSpan::Messages { count } => (count > 0 && count <= messages.len())
-                .then(|| self.render_prefix_boundary(&messages[..count], req, prompt_ids))
-                .flatten(),
-            PrefixDocumentSpan::Tokens { count } => {
-                (count > 0 && count < prompt_ids.len()).then_some(count)
-            }
-            PrefixDocumentSpan::MessageChars { message, chars } => {
-                if chars == 0 {
-                    return None;
-                }
-                let target = messages.get(message)?;
-                let text = target.text_content();
-                let total_chars = text.chars().count();
-                if chars > total_chars {
-                    return None;
-                }
-                let byte_split = text
-                    .char_indices()
-                    .nth(chars)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(text.len());
-                let (prefix_str, suffix_str) = (&text[..byte_split], &text[byte_split..]);
-                let tokenize_with_sentinel = |sentinel: char| -> Option<Vec<u32>> {
-                    let mut modified = messages.to_vec();
-                    modified[message].content =
-                        vec![Content::Text(format!("{prefix_str}{sentinel}{suffix_str}"))];
-                    let rendered = self
-                        .template
-                        .render_with(
-                            &modified,
-                            &RenderOptions {
-                                add_generation_prompt: true,
-                                enable_thinking: req.enable_thinking_kwarg(),
-                                reasoning_effort: req.reasoning_effort,
-                                preserve_thinking: req.preserve_thinking,
-                                tools: &req.tools,
-                                date_string: None,
-                            },
-                        )
-                        .ok()?;
-                    self.tokenizer.encode(&rendered, false).ok()
-                };
-                let ids_a = tokenize_with_sentinel('\u{E000}')?;
-                let ids_b = tokenize_with_sentinel('\u{E001}')?;
-                let same_as_prompt = |ids: &[u32]| {
-                    ids.len() == prompt_ids.len()
-                        && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b)
-                };
-                if same_as_prompt(&ids_a) && same_as_prompt(&ids_b) {
-                    return None;
-                }
-                let aligned = ids_a
-                    .iter()
-                    .zip(&ids_b)
-                    .zip(prompt_ids)
-                    .take_while(|&((&a, &b), &p)| a as i32 == p && b as i32 == p)
-                    .count();
-                (aligned > 0 && aligned < prompt_ids.len()).then_some(aligned)
-            }
-        }
-    }
-
     /// Resolve all candidate prefix boundaries (`document`, `shared_root`, `prev_message`,
     /// `conversation_end`), plus whether an explicit document span failed to align.
     fn resolve_boundary_candidates(
@@ -1824,29 +1710,14 @@ impl LlamaProvider {
         prompt_ids: &[i32],
         policy: PrefixCheckpointPolicy,
     ) -> (BoundaryCandidates, bool) {
-        let document = policy
-            .document
-            .and_then(|span| self.resolve_document_boundary(span, messages, req, prompt_ids));
-        let doc_unaligned = policy.document.is_some() && document.is_none();
-        let conversation_end = self.conversation_boundary(messages, req, prompt_ids);
-        let shared_root = if policy.is_active() && messages.len() >= 2 {
-            self.render_prefix_boundary(&messages[..1], req, prompt_ids)
-        } else {
-            None
-        };
-        let prev_message = if policy.is_active() && messages.len() >= 2 {
-            self.render_prefix_boundary(&messages[..messages.len() - 1], req, prompt_ids)
-        } else {
-            None
-        };
-        (
-            BoundaryCandidates {
-                document,
-                shared_root,
-                prev_message,
-                conversation_end,
-            },
-            doc_unaligned,
+        core_llm::prefix::resolve_boundary_candidates(
+            self.template.as_ref(),
+            &self.tokenizer,
+            messages,
+            req,
+            prompt_ids,
+            policy,
+            None,
         )
     }
 

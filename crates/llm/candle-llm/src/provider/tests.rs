@@ -6346,6 +6346,11 @@ fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
         super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tok, vec![]);
     assert_eq!(
         provider.prefix_checkpoints_default(),
+        core_llm::defaults::CANDLE_CPU.prefix_checkpoints
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Off);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
         core_llm::PrefixCheckpointMode::Off
     );
     provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Auto);

@@ -7491,6 +7491,11 @@ fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
     let mut provider = causal_provider();
     assert_eq!(
         provider.prefix_checkpoints_default(),
+        core_llm::defaults::MLX.prefix_checkpoints
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Off);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
         core_llm::PrefixCheckpointMode::Off
     );
     provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Auto);
