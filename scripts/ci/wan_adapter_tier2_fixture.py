@@ -22,6 +22,7 @@ HUB_ENV = "FLUX1_HUB"
 GIB = 2**30
 POOL_BYTES = 24 * GIB
 CHILD_SECONDS = {"mlx": 300, "candle-cuda": 240}
+MLX_NATIVE_DECODED_FRAMES = 12
 STAGE_TIMEOUT_SECONDS = 2700
 RECHECK_TIMEOUT_SECONDS = 600
 LIGHTNING_DIR = "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1"
@@ -125,7 +126,7 @@ def fixture_identity(backend):
 def contract(variant):
     backend = VARIANT_BACKENDS[variant]
     cuda = backend == "candle-cuda"
-    size, frames = (320, 17) if cuda else (256, 9)
+    size, requested_frames = (320, 17) if cuda else (256, 9)
     device = {"kind": "candle-cuda" if cuda else "mlx-metal", "index": 0}
     allocation = {"pool_cap_bytes": POOL_BYTES, "cublas_workspace": ":4096:8"} if cuda else {}
     return {
@@ -133,7 +134,8 @@ def contract(variant):
                      "residency": "sequential expert swap", "device": device, **allocation,
                      "sampler": "uni_pc" if cuda else "unipc", "scheduler_shift": 12.0,
                      "guidance": 1.0, "steps": 4, "boundary_timestep": 875.0, "seed": 42,
-                     "width": size, "height": size, "frames": frames, "fps": 16,
+                     "width": size, "height": size, "frames": requested_frames, "fps": 16,
+                     **({} if cuda else {"native_decoded_frames": MLX_NATIVE_DECODED_FRAMES}),
                      "lightning": ["high@1.0", "low@1.0"],
                      "prompt": "A red fox trots across a snowy meadow at sunrise, filmed at ground level.",
                      "negative_prompt": "native provider default"},
@@ -254,7 +256,7 @@ def observe(stdout, path, binding, variant):
     device = {"kind": "candle-cuda" if cuda else "mlx-metal", "index": 0}
     if (row["device"] != device or set(experts) != {"high", "low"}
             or timesteps != sorted(timesteps, reverse=True) or row["progress"] != progress
-            or len(digests) != (17 if cuda else 9) or len(set(digests)) < 2
+            or len(digests) != (17 if cuda else MLX_NATIVE_DECODED_FRAMES) or len(set(digests)) < 2
             or any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests)):
         raise ValueError("Wan output does not prove both expert branches and the frozen decoded clip")
     peaks = {}

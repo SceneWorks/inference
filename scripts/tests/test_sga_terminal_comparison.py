@@ -321,6 +321,10 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(wan.policy(cuda["variant"], UUID)["deadlineSeconds"], 240)
         self.assertNotEqual(wan.contract(cuda["variant"])["sources"]["model"],
                             wan.contract(mlx["variant"])["sources"]["model"])
+        self.assertEqual(wan.contract(cuda["variant"])["settings"]["frames"], 17)
+        self.assertNotIn("native_decoded_frames", wan.contract(cuda["variant"])["settings"])
+        self.assertEqual(wan.contract(mlx["variant"])["settings"]["frames"], 9)
+        self.assertEqual(wan.contract(mlx["variant"])["settings"]["native_decoded_frames"], 12)
         for request in (cuda, mlx):
             contract = wan.contract(request["variant"])
             comparison.verify_assets(contract, contract["expected_asset_identity"])
@@ -349,6 +353,38 @@ class TerminalTests(unittest.TestCase):
                           log.replace(trace[-1].split()[2], trace[0].split()[2])):
                 with self.assertRaises(ValueError):
                     wan.observe(wrong, result, UUID, variant)
+
+    def test_wan_mlx_receipt_compares_all_native_decoded_frames(self):
+        variant = "a14b-t2v-mlx"
+        # The native MLX warmup completed this exact four-step schedule before the old output check.
+        trace = [f"SGA_WAN_OUTER_STEP {i} {bits} 1000"
+                 for i, bits in enumerate((1148829696, 1148387328, 1147568128, 1145552896), 1)]
+        log = "\n".join([*trace, "SGA_WAN_REAL_COMPLETE " + wan.CASE[variant]])
+        digests = [f"{i:064x}" for i in range(12)]
+        row = {"device": {"kind": "mlx-metal", "index": 0}, "mlx_peak_bytes": 30000,
+               "end_to_end_ns": 12000, "frame_rgb8_sha256": digests,
+               "progress": ["renderer", "1/4", "2/4", "3/4", "renderer", "4/4", "decode"],
+               "adapters": [{"file": expert.lower() + "_noise_model.safetensors",
+                             "expert": f"Some({expert})", "scale": 1.0, "applied": 8, "skipped": []}
+                            for expert in ("High", "Low")]}
+        with TemporaryDirectory() as directory:
+            result = Path(directory) / "result.json"
+            result.write_text(json.dumps(row), encoding="utf-8")
+            full = wan.observe(log, result, "nax", variant)
+            self.assertEqual(full["identity"]["frame_rgb8_sha256"], digests)
+
+            for count in (9, 11, 13):
+                altered = (digests + ["f" * 64])[:count]
+                result.write_text(json.dumps(dict(row, frame_rgb8_sha256=altered)), encoding="utf-8")
+                with self.subTest(count=count), self.assertRaisesRegex(ValueError, "frozen decoded clip"):
+                    wan.observe(log, result, "nax", variant)
+
+            altered = [*digests[:-1], "f" * 64]
+            result.write_text(json.dumps(dict(row, frame_rgb8_sha256=altered)), encoding="utf-8")
+            samples = {name: full for name, _ in comparison.SAMPLES}
+            samples["pair-6-head"] = wan.observe(log, result, "nax", variant)
+            with self.assertRaisesRegex(ValueError, "terminal output"):
+                comparison.summarize(samples)
 
     def test_z_image_archives_only_verified_png_with_exact_rgb_pixels(self):
         with TemporaryDirectory() as directory:
