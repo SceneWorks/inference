@@ -115,13 +115,7 @@ fn load_expert(
         .cloned()
         .collect();
     let vb = candle_gen::component_vb(root, subdir, DType::BF16, device, provider_id)?;
-    let encoded = !specs.is_empty()
-        && candle_gen::gen_core::checkpoint_codec::classify_checkpoint_projection_sources(
-            &candle_gen::sorted_safetensors(&root.join(subdir), provider_id)?,
-            candle_gen::logical_weights::baseline_codec_registry(),
-        )?
-        .is_some();
-    if vb.contains_tensor("proj_out.scales") || encoded {
+    if candle_gen_wan::adapters::requires_additive(&vb, &root.join(subdir), provider_id, &specs)? {
         let mut dit = WanTransformer::new(config, vb)?;
         let applied = if specs.is_empty() {
             0

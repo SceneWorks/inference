@@ -200,11 +200,8 @@ impl Pipeline {
         if adapters.is_empty() {
             return Ok(WanVaceTransformer::new(&self.vace_cfg, vb)?);
         }
-        drop(vb);
-        let mut map = crate::text_encode::load_component_map(&self.root, sub, MODEL_ID_VACE_FUN)?;
-        // `merge_adapters` fails closed per selected file if it matches no compatible projection.
-        crate::adapters::merge_adapters(&mut map, &adapters)?;
-        let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
+        let files = candle_gen::sorted_safetensors(&self.root.join(sub), MODEL_ID_VACE_FUN)?;
+        let vb = crate::adapters::fold_checkpoint(vb, &files, &adapters)?;
         Ok(WanVaceTransformer::new(&self.vace_cfg, vb)?)
     }
 

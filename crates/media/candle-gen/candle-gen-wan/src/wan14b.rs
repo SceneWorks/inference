@@ -275,19 +275,20 @@ impl Pipeline {
         expert: MoeExpert,
     ) -> CResult<(WanTransformer, Option<usize>)> {
         let vb = self.component_vb(sub, DIT_DTYPE)?;
+        let specs: Vec<AdapterSpec> =
+            select_expert_adapters(&self.adapters, expert, ExpertAdapterOrder::Request)
+                .map(|(_, spec)| spec.clone())
+                .collect();
         // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`), so a
         // `proj_out.scales` sibling is present iff this is a pre-quantized q4/q8 tier.
-        let packed = vb.contains_tensor("proj_out.scales");
+        let packed =
+            crate::adapters::requires_additive(&vb, &self.root.join(sub), "wan-14b", &specs)?;
         if packed {
             let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
             // Additive install on the packed base — no dense weight materialized (sc-10094/10095).
             let report = crate::adapters::install_additive(&mut dit, &self.adapters, expert)?;
             return Ok((dit, Some(report.applied)));
         }
-        let specs: Vec<AdapterSpec> =
-            select_expert_adapters(&self.adapters, expert, ExpertAdapterOrder::Request)
-                .map(|(_, spec)| spec.clone())
-                .collect();
         if specs.is_empty() {
             return Ok((WanTransformer::new(&self.dit_cfg, vb)?, None));
         }

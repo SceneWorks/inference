@@ -44,6 +44,7 @@
 //! not done (only the pre-packed tier is a quantized path). Component caching across calls is handled by
 //! the generator's `components` cache.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -954,7 +955,7 @@ impl Pipeline {
     /// projections (`{encoder,decoder}.mid_block.attentions.0.{to_q,to_k,to_v,to_out.0}`) to dense and
     /// passing every other (already-dense) tensor through unchanged — so the stock `AutoEncoderKL` loads
     /// without seeing a `.weight` u32/`.scales`/`.biases` triple it can't read. The dequant is ~2 MB of
-    /// one-time work (the sc-9408 pragmatic VAE path — see [`crate::quant::dequant_packed_to_dense`]).
+    /// one-time work (the sc-9408 pragmatic VAE path — see [`candle_gen::quant::dequant_packed_to_dense`]).
     fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
         let files = self.component_files("vae")?;
         dequantized_vae_vb(&files, dtype, device)
@@ -2159,45 +2160,7 @@ impl Pipeline {
     }
 }
 
-/// Body of [`Pipeline::vae_vb_dequantized_on`] over an already-resolved VAE shard list (split out so
-/// the single-mapping path is unit-testable on a synthetic packed fixture).
-fn dequantized_vae_vb(
-    files: &[PathBuf],
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    // One mapping serves both the key enumeration and every load (sc-27386): the names are
-    // collected before the mapping is boxed into the `VarBuilder` backend.
-    let st = candle_gen::mmap_safetensors_multi(files)?;
-    let names: Vec<String> = st.tensors().into_iter().map(|(k, _)| k).collect();
-    let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
-
-    // Collect every tensor, dequantizing the packed attention triples and dropping their
-    // `.scales`/`.biases` siblings; pass all other tensors through at their native dtype.
-    let mut tensors: HashMap<String, Tensor> = HashMap::new();
-    let packed_bases: std::collections::HashSet<String> = names
-        .iter()
-        .filter_map(|k| k.strip_suffix(".scales").map(|b| b.to_string()))
-        .collect();
-    for key in names {
-        // Skip the packed-triple siblings — they're folded into the dequantized dense `.weight`.
-        if key.ends_with(".scales") || key.ends_with(".biases") {
-            continue;
-        }
-        if let Some(base) = key.strip_suffix(".weight") {
-            if packed_bases.contains(base) {
-                let dense = crate::quant::dequant_packed_to_dense(&src, base, device, dtype)?;
-                tensors.insert(key.clone(), dense);
-                continue;
-            }
-        }
-        // Dense tensor — the mmap backend's `get_unchecked` is `load(key, device)` at its
-        // stored dtype then `to_dtype(dtype)`, byte-identical to the former direct load.
-        let t = src.get_unchecked_dtype(&key, dtype)?;
-        tensors.insert(key, t);
-    }
-    Ok(VarBuilder::from_tensors(tensors, dtype, device))
-}
+use candle_gen::loader::dequantized_vae_vb;
 
 #[cfg(test)]
 mod tests {
@@ -2960,7 +2923,17 @@ mod tests {
         let dense = Tensor::randn(0f32, 1f32, (3, 2), &dev)?;
         let dense_shard = tmp.path().join("b.safetensors");
         candle_gen::candle_core::safetensors::save(
-            &HashMap::from([("decoder.conv_in.weight".to_string(), dense.clone())]),
+            &HashMap::from([
+                ("decoder.conv_in.weight".to_string(), dense.clone()),
+                (
+                    "decoder.mid_block.attentions.0.to_v.weight".to_string(),
+                    Tensor::from_slice(&[1f32, -2.], (1, 2), &dev)?.to_dtype(DType::F8E4M3)?,
+                ),
+                (
+                    "decoder.mid_block.attentions.0.to_v.weight_scale".to_string(),
+                    Tensor::new(3f32, &dev)?,
+                ),
+            ]),
             &dense_shard,
         )?;
         let files = vec![packed_shard.clone(), dense_shard];
@@ -2973,11 +2946,14 @@ mod tests {
             DType::F32,
             dev.clone(),
         );
-        let expected = crate::quant::dequant_packed_to_dense(&reference, base, &dev, DType::F32)?;
+        let expected =
+            candle_gen::quant::dequant_packed_to_dense(&reference, base, &dev, DType::F32)?;
         let got = vb.get_unchecked(&format!("{base}.weight"))?;
         assert_eq!(got.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
         let passed = vb.get_unchecked("decoder.conv_in.weight")?;
         assert_eq!(passed.to_vec2::<f32>()?, dense.to_vec2::<f32>()?);
+        let scaled = vb.get_unchecked("decoder.mid_block.attentions.0.to_v.weight")?;
+        assert_eq!(scaled.to_vec2::<f32>()?, [[3.0, -6.0]]);
         Ok(())
     }
 

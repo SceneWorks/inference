@@ -499,6 +499,7 @@ impl StackInventory {
         file_prefix: &str,
         cfg: &ModelConfig,
         policy: CastPolicy,
+        prices: &crate::stream::SourcePrices,
     ) -> Result<Self> {
         let mut grouped: [Vec<Vec<&mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>>; 4] =
             Stack::ALL.map(|stack| vec![Vec::new(); stack.depth(cfg)]);
@@ -519,7 +520,9 @@ impl StackInventory {
                 ))
             })?;
             slot.push(header);
-            keys[stack.index()][i].push((header.name.clone(), name.to_owned()));
+            if !prices.is_companion(&header.name) {
+                keys[stack.index()][i].push((header.name.clone(), name.to_owned()));
+            }
         }
         for stack in Stack::ALL {
             if let Some(i) = keys[stack.index()].iter().position(Vec::is_empty) {
@@ -534,12 +537,13 @@ impl StackInventory {
                 block.sort();
             }
         }
-        let reads = Stack::ALL.map(|stack| {
-            grouped[stack.index()]
+        let mut reads: [Vec<BlockRead>; 4] = Default::default();
+        for stack in Stack::ALL {
+            reads[stack.index()] = grouped[stack.index()]
                 .iter()
-                .map(|block| crate::stream::block_read(block, policy))
-                .collect()
-        });
+                .map(|block| prices.block_read(block, policy))
+                .collect::<Result<_>>()?;
+        }
         Ok(Self { keys, reads })
     }
 
@@ -570,11 +574,15 @@ impl BlockStream {
         default_window: Option<usize>,
     ) -> Result<Self> {
         let headers = crate::stream::headers(path)?;
+        let prices = crate::stream::SourcePrices::compile(&[path.to_owned()], &headers, |name| {
+            name.strip_prefix(file_prefix).and_then(Stack::of).is_some()
+        })?;
         let inventory = StackInventory::from_headers(
             &headers,
             file_prefix,
             cfg,
             CastPolicy::Backbone { compute },
+            &prices,
         )?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -2521,7 +2529,7 @@ impl IrisDiT {
             &windows,
             cancel,
             init,
-            || Weights::from_file(&stream.path),
+            || Ok(Weights::empty()),
             |mut state, view, range| {
                 #[cfg(test)]
                 WINDOW_HOOK.with(|hook| {
@@ -2550,6 +2558,10 @@ impl IrisDiT {
                 mlx_gen::ios_quantum::before(
                     quanta::BLOCK_READ,
                     crate::stream::window_read_bytes(reads),
+                )?;
+                *view = crate::stream::open_window(
+                    std::slice::from_ref(&stream.path),
+                    &stream.inventory.keys[stack.index()][range.clone()],
                 )?;
                 let mut built = Vec::with_capacity(range.len());
                 for i in range.clone() {

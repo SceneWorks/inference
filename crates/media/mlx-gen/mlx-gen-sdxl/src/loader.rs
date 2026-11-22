@@ -534,7 +534,7 @@ pub fn load_ip_adapter(
     dtype: Dtype,
 ) -> Result<(
     crate::ip_adapter::IpImageEncoder,
-    Vec<(mlx_rs::Array, mlx_rs::Array)>,
+    crate::ip_adapter::IpKvPairs,
 )> {
     load_ip_adapter_with(
         dir,
@@ -552,7 +552,7 @@ pub(crate) fn load_ip_adapter_with(
     resampler_cfg: &crate::ip_adapter::ResamplerConfig,
 ) -> Result<(
     crate::ip_adapter::IpImageEncoder,
-    Vec<(mlx_rs::Array, mlx_rs::Array)>,
+    crate::ip_adapter::IpKvPairs,
 )> {
     use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler};
     use crate::vision_encoder::ClipVisionEncoder;

@@ -63,16 +63,10 @@ impl ResnetBlock2D {
 
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
-        let shortcut = match w.get(&format!("{prefix}.conv_shortcut.weight")) {
-            Some(sw) => {
-                // [out, in, 1, 1] → [out, in] Linear over NHWC channels.
-                let sh = sw.shape();
-                let w2 = sw.reshape(&[sh[0], sh[1]])?;
-                let b = w.require(&format!("{prefix}.conv_shortcut.bias"))?.clone();
-                Some(AdaptableLinear::dense(w2, Some(b)))
-            }
-            None => None,
-        };
+        let shortcut = w
+            .get(&format!("{prefix}.conv_shortcut.weight"))
+            .map(|_| crate::quant::pointwise_linear(w, &format!("{prefix}.conv_shortcut")))
+            .transpose()?;
         // VAE resnets carry no time embedding (`temb_channels=None`). The U-Net's `time_emb_proj` is
         // quantized (packed-detect, sc-8746); the VAE resnets never reach this crate's quantize path.
         // Detect presence by the dense `.weight` OR a packed `.scales` (a pre-quantized snapshot has

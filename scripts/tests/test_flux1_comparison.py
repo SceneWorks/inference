@@ -178,8 +178,8 @@ class FluxPairTests(unittest.TestCase):
             policy["deadlineSeconds"] = 360
             contract = comparison.plan("candle-cuda", request, head, fixture.ENG4B_REAL)
         self.assertEqual((contract["base"], contract["head"]),
-                         ("481a982db44b58937c15c2d3f0cbf918b116d04d", head))
-        self.assertEqual(contract["base_tree"], "4672a53038a32e26ba169a62be5e8a19ded2b76d")
+                         ("be45bdf746c5d4a12d4db76f9653b8686e7f33f8", head))
+        self.assertEqual(contract["base_tree"], "4d6eb59e08edcd257fd907247acd5e8f0cc5c545")
         self.assertEqual(contract["asset_setup"], "flux1-eng4b-terminal-comparison")
         refs = contract["pinned_fixtures"]
         self.assertEqual(refs["dev"]["source_snapshot"]["snapshot"], "323fd12d79f78ad444e882e8d8e871914584f2b9")

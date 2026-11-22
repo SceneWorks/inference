@@ -467,16 +467,7 @@ impl Linear {
     /// All retained parameters: the dense/packed base AND the materialized adapter-owned
     /// payloads. Transpose views are listed once; reconstruction-only source factors are absent.
     pub fn arrays(&self) -> Vec<&Array> {
-        let mut arrays: Vec<&Array> = if let Some((weight, bias)) = self.inner.dense_weight() {
-            std::iter::once(weight).chain(bias).collect()
-        } else {
-            match self.inner.quantized_params() {
-                Some((codes, scales, biases, bias, _, _)) => {
-                    [codes, scales, biases].into_iter().chain(bias).collect()
-                }
-                None => Vec::new(),
-            }
-        };
+        let mut arrays = self.inner.base_arrays();
         arrays.extend(self.inner.adapters().iter().flat_map(|a| a.arrays()));
         arrays
     }

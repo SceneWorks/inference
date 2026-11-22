@@ -1924,6 +1924,7 @@ mod tests {
             other => panic!("a packed base must refuse the fold, got {other:?}"),
         }
 
+        crate::loader::adapter_projection::tests::assert_original_input_residual().unwrap();
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::fold_dense_delta_adds_on_dense_and_refuses_packed");
     }

@@ -28,7 +28,7 @@ use mlx_gen::quant::save_map;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::config::WanQuant;
-use mlx_gen_wan::convert::sanitize_wan_transformer;
+use mlx_gen_wan::convert::sanitize_wan_transformer_weights;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::KreaRealtimeConfig;
@@ -56,7 +56,7 @@ pub fn strip_model_prefix(name: &str) -> &str {
 
 /// Normalize either on-disk layout to the plain Wan native key names by stripping a leading `model.`
 /// from every key. The sharded `transformer/` layout has no prefix, so this is a no-op there; the
-/// single-file layout's `model.` prefix is removed so both feed [`sanitize_wan_transformer`]
+/// single-file layout's `model.` prefix is removed so both feed [`sanitize_wan_transformer_weights`]
 /// identically.
 pub fn normalize_krea_keys(raw: HashMap<String, Array>) -> HashMap<String, Array> {
     raw.into_iter()
@@ -64,7 +64,7 @@ pub fn normalize_krea_keys(raw: HashMap<String, Array>) -> HashMap<String, Array
         .collect()
 }
 
-/// Cast every **floating-point** tensor in `map` to `dtype` in place (skipping any already at `dtype`).
+/// Cast every unowned **floating-point** tensor to `dtype` in place (skipping any already at `dtype`).
 /// Mirrors the private `cast_map` the Wan converters use for their F16/F32→bf16 transformer cast.
 ///
 /// Integer tensors are left alone (sc-15203): on a pre-quantized Q4/Q8 tier the predicate Linears'
@@ -72,25 +72,35 @@ pub fn normalize_krea_keys(raw: HashMap<String, Array>) -> HashMap<String, Array
 /// (Q8) packed 4/8-bit weights as one float — silently destroying the tier rather than failing. The
 /// `.scales`/`.biases` companions are floats and are cast (a no-op: MLX packs them at the source
 /// weight's bf16).
-fn cast_floats(map: &mut HashMap<String, Array>, dtype: Dtype) -> Result<()> {
-    for (key, v) in map.iter_mut() {
-        if !key.ends_with(".weight_scale") && v.dtype().is_float() && v.dtype() != dtype {
-            *v = v.as_dtype(dtype)?;
-        }
-    }
-    Ok(())
+fn cast_floats(weights: &mut Weights, dtype: Dtype) -> Result<()> {
+    let floating: std::collections::HashSet<String> = weights
+        .keys()
+        .filter(|key| {
+            !key.ends_with(".weight_scale")
+                && !key.ends_with(".input_scale")
+                && weights
+                    .peek(key)
+                    .is_some_and(|array| array.dtype().is_float())
+        })
+        .map(str::to_owned)
+        .collect();
+    weights.cast_matching(dtype, |key| floating.contains(key))
 }
 
 /// Full Krea Realtime transformer sanitize: normalize either layout's keys ([`normalize_krea_keys`]),
-/// map them onto the internal Wan DiT layout ([`sanitize_wan_transformer`] — `patch_embedding` conv →
+/// map them onto the internal Wan DiT layout ([`sanitize_wan_transformer_weights`] — `patch_embedding` conv →
 /// Linear reshape, `text/time_embedding` Sequential rename, `ffn.0/2` → `fc1/fc2`, `freqs` dropped),
 /// and cast to [`TRANSFORMER_DTYPE`] (bf16). The result is exactly the key layout
 /// [`mlx_gen_wan::WanTransformer::from_weights`] consumes.
 pub fn sanitize_krea_realtime_transformer(
     raw: HashMap<String, Array>,
 ) -> Result<HashMap<String, Array>> {
-    let normalized = normalize_krea_keys(raw);
-    let mut sanitized = sanitize_wan_transformer(&normalized)?;
+    Ok(sanitize_transformer_weights(&Weights::from_map(raw))?.into_tensors())
+}
+
+pub(crate) fn sanitize_transformer_weights(raw: &Weights) -> Result<Weights> {
+    let normalized = raw.select_renamed(|key| Some(strip_model_prefix(key).to_owned()));
+    let mut sanitized = sanitize_wan_transformer_weights(&normalized)?;
     cast_floats(&mut sanitized, TRANSFORMER_DTYPE)?;
     Ok(sanitized)
 }
@@ -479,7 +489,7 @@ mod tests {
     #[test]
     fn cast_skips_the_u32_packed_codes_and_still_casts_the_float_companions() {
         let codes: Vec<u32> = vec![0xDEAD_BEEF, 0x0123_4567, 1, u32::MAX];
-        let mut map = HashMap::from([
+        let mut weights = Weights::from_map(HashMap::from([
             (
                 "blocks.0.self_attn.q.weight".to_string(),
                 Array::from_slice(&codes, &[2, 2]),
@@ -488,10 +498,10 @@ mod tests {
                 "blocks.0.self_attn.q.scales".to_string(),
                 Array::from_slice(&[0.5f32, 0.25, 0.125, 1.0], &[2, 2]),
             ),
-        ]);
-        cast_floats(&mut map, TRANSFORMER_DTYPE).unwrap();
+        ]));
+        cast_floats(&mut weights, TRANSFORMER_DTYPE).unwrap();
 
-        let w = &map["blocks.0.self_attn.q.weight"];
+        let w = weights.peek("blocks.0.self_attn.q.weight").unwrap();
         assert_eq!(w.dtype(), Dtype::Uint32, "packed codes must stay u32");
         assert_eq!(w.shape(), &[2, 2]);
         assert_eq!(
@@ -500,7 +510,7 @@ mod tests {
             "the packed code words must be preserved bit-for-bit"
         );
         assert_eq!(
-            map["blocks.0.self_attn.q.scales"].dtype(),
+            weights.peek("blocks.0.self_attn.q.scales").unwrap().dtype(),
             Dtype::Bfloat16,
             "float companions still cast to the transformer dtype"
         );

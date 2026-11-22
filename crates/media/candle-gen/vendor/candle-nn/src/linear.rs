@@ -74,6 +74,12 @@ impl std::fmt::Debug for Linear {
     }
 }
 
+impl From<Tensor> for Linear {
+    fn from(weight: Tensor) -> Self {
+        Self::new(weight, None)
+    }
+}
+
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         Self {

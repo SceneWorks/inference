@@ -17,6 +17,39 @@ pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
 pub use candle_layers::quant::*;
 pub use sidecar::PackedWeightSidecars;
 
+/// Decode the affine group-64 grid used by diffusers VAE attention projections.
+pub fn dequant_packed_to_dense(
+    vb: &candle_nn::VarBuilder,
+    base: &str,
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+) -> candle_core::Result<candle_core::Tensor> {
+    let vb = vb.pp(base);
+    let codes = vb.get_unchecked_dtype("weight", candle_core::DType::U32)?;
+    let scales = vb.get_unchecked_dtype("scales", candle_core::DType::F32)?;
+    let biases = vb.get_unchecked_dtype("biases", candle_core::DType::F32)?;
+    dequant_vae_grid(&codes, &scales, &biases)?
+        .to_device(device)?
+        .to_dtype(dtype)
+}
+
+pub(crate) fn dequant_vae_grid(
+    codes: &candle_core::Tensor,
+    scales: &candle_core::Tensor,
+    biases: &candle_core::Tensor,
+) -> candle_core::Result<candle_core::Tensor> {
+    let cols = scales.dims2()?.1;
+    if cols == 0 {
+        candle_core::bail!("VAE projection: affine scales must have a positive group count");
+    }
+    let bits = mlx_packed_bits(codes.dims2()?.1, cols);
+    match bits {
+        4 => dequant_mlx_q4_reference(codes, scales, biases),
+        8 => dequant_mlx_q8(codes, scales, biases),
+        _ => candle_core::bail!("VAE projection: unsupported affine bit-width {bits}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

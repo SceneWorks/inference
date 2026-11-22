@@ -28,6 +28,9 @@
 
 pub use candle_checkpoint::{MappedWeights, ProjectionSource, SourceView};
 
+pub(crate) mod adapter_projection;
+use adapter_projection::{AdapterProjection, DeltaView};
+
 /// Map checkpoint names and structural row/reshape views before tensor I/O.
 pub fn remap_file_var_builder(
     file: &Path,
@@ -72,11 +75,60 @@ use candle_nn::VarBuilder;
 
 use crate::{CandleError, Result};
 
+/// Adapt group-64 affine matrices to the stock diffusers VAE. All other projections keep the
+/// shared checkpoint backend, including descriptor-backed matrices in a mixed-format component.
+pub fn dequantized_vae_vb(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    let st = mmap_safetensors_multi(files)?;
+    let mut views = std::collections::BTreeMap::new();
+    let mut overrides = std::collections::HashMap::new();
+    for (key, _) in st.tensors() {
+        if key.ends_with(".scales") || key.ends_with(".biases") {
+            continue;
+        }
+        if let Some(base) = key.strip_suffix(".weight") {
+            let scales = format!("{base}.scales");
+            if st.get(&scales).is_ok() {
+                let codes = st.load(&key, &Device::Cpu)?;
+                if codes.dtype() != DType::U32 {
+                    return Err(CandleError::Msg(format!(
+                        "VAE {key}: affine scales require U32 codes"
+                    )));
+                }
+                let scales = st.load(&scales, &Device::Cpu)?.to_dtype(DType::F32)?;
+                let biases = st
+                    .load(&format!("{base}.biases"), &Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let weight =
+                    crate::quant::dequant_vae_grid(&codes, &scales, &biases)?.to_dtype(dtype)?;
+                overrides.insert(key, weight);
+                continue;
+            }
+        }
+        views.insert(key.clone(), vec![SourceView::Whole(key)]);
+    }
+    let source = candle_checkpoint::remapped_var_builder(st, files, dtype, device, views)?;
+    Ok(overlay_var_builder(source, overrides))
+}
+
 /// Replace only the dense operands that a coefficient-folding adapter actually changed.
 /// Every untouched key still resolves from the original checkpoint and native operand backend.
 pub fn overlay_var_builder(
     base: VarBuilder<'static>,
     overrides: std::collections::HashMap<String, candle_core::Tensor>,
+) -> VarBuilder<'static> {
+    adapter_var_builder(base, overrides, Default::default())
+}
+
+/// Bind logical adapter deltas at the consumer. A coefficient request folds on the host;
+/// a native projection request attaches the same deltas to the immutable source operation.
+pub(crate) fn adapter_var_builder(
+    base: VarBuilder<'static>,
+    overrides: std::collections::HashMap<String, candle_core::Tensor>,
+    deltas: std::collections::HashMap<String, Vec<candle_core::Tensor>>,
 ) -> VarBuilder<'static> {
     use candle_core::{Result as CoreResult, Shape, Tensor};
     use candle_nn::var_builder::SimpleBackend;
@@ -85,16 +137,53 @@ pub fn overlay_var_builder(
     struct Overlay {
         base: VarBuilder<'static>,
         overrides: std::collections::HashMap<String, Tensor>,
+        deltas: std::collections::HashMap<String, Vec<Tensor>>,
+    }
+    impl Overlay {
+        fn read(
+            &self,
+            key: &str,
+            dtype: DType,
+            dev: &Device,
+            read: impl FnOnce(&VarBuilder<'_>, DType) -> CoreResult<Tensor>,
+        ) -> CoreResult<Tensor> {
+            if let Some(deltas) = self.deltas.get(key) {
+                let host = self.base.clone().set_device(Device::Cpu);
+                let weight = read(&host, dtype)?;
+                let mut value = weight.to_dtype(DType::F32)?;
+                for delta in deltas {
+                    value = (value + delta)?;
+                }
+                return value.to_dtype(dtype)?.to_device(dev);
+            }
+            read(&self.base.clone().set_device(dev.clone()), dtype)
+        }
     }
     impl SimpleBackend for Overlay {
+        fn tensor_info(&self, key: &str) -> CoreResult<Option<candle_nn::var_builder::TensorInfo>> {
+            match self.overrides.get(key) {
+                Some(t) => Ok(Some(candle_nn::var_builder::TensorInfo::dense(
+                    t.shape().clone(),
+                ))),
+                None => self.base.tensor_info(key),
+            }
+        }
         fn get_unchecked(&self, key: &str, dtype: DType, dev: &Device) -> CoreResult<Tensor> {
             if let Some(t) = self.overrides.get(key) {
                 return t.to_dtype(dtype)?.to_device(dev);
             }
-            self.base
-                .clone()
-                .set_device(dev.clone())
-                .get_unchecked_dtype(key, dtype)
+            self.read(key, dtype, dev, |vb, stored| {
+                // An adapter supplies logical axes even when the producer records only padded storage.
+                match self.deltas.get(key).and_then(|deltas| deltas.first()) {
+                    Some(delta) => vb.get_with_hints_dtype(
+                        delta.shape().clone(),
+                        key,
+                        candle_nn::Init::Const(0.),
+                        stored,
+                    ),
+                    None => vb.get_unchecked_dtype(key, stored),
+                }
+            })
         }
         fn get(
             &self,
@@ -107,10 +196,9 @@ pub fn overlay_var_builder(
             if self.overrides.contains_key(key) {
                 return SimpleBackend::get(&self.overrides, shape, key, init, dtype, dev);
             }
-            self.base
-                .clone()
-                .set_device(dev.clone())
-                .get_with_hints_dtype(shape, key, init, dtype)
+            self.read(key, dtype, dev, |vb, stored| {
+                vb.get_with_hints_dtype(shape, key, init, stored)
+            })
         }
         fn contains_tensor(&self, key: &str) -> bool {
             self.overrides.contains_key(key) || self.base.contains_tensor(key)
@@ -125,11 +213,15 @@ pub fn overlay_var_builder(
             if self.overrides.contains_key(key) {
                 return Ok(None);
             }
-            self.base
+            let deltas = self.deltas.get(key).map(Vec::as_slice);
+            let shape = shape.or_else(|| deltas?.first()?.dims2().ok());
+            let op = self
+                .base
                 .clone()
                 .set_device(dev.clone())
                 .to_dtype(dtype)
-                .native_linear_weight_with_shape(key, shape)
+                .native_linear_weight_with_shape(key, shape)?;
+            AdapterProjection::bind(op, deltas, DeltaView::Matrix)
         }
         fn native_linear_weight_transposed(
             &self,
@@ -141,11 +233,17 @@ pub fn overlay_var_builder(
             if self.overrides.contains_key(key) {
                 return Ok(None);
             }
-            self.base
+            let op = self
+                .base
                 .clone()
                 .set_device(dev.clone())
                 .to_dtype(dtype)
-                .native_linear_weight_transposed(key, shape)
+                .native_linear_weight_transposed(key, shape)?;
+            AdapterProjection::bind(
+                op,
+                self.deltas.get(key).map(Vec::as_slice),
+                DeltaView::Transposed,
+            )
         }
         fn native_linear_weight_flattened(
             &self,
@@ -157,16 +255,30 @@ pub fn overlay_var_builder(
             if self.overrides.contains_key(key) {
                 return Ok(None);
             }
-            self.base
+            let op = self
+                .base
                 .clone()
                 .set_device(dev.clone())
                 .to_dtype(dtype)
-                .native_linear_weight_flattened(key, shape)
+                .native_linear_weight_flattened(key, shape)?;
+            AdapterProjection::bind(
+                op,
+                self.deltas.get(key).map(Vec::as_slice),
+                DeltaView::Flattened,
+            )
         }
     }
     let dev = base.device().clone();
     let dtype = base.dtype();
-    VarBuilder::from_backend(Box::new(Overlay { base, overrides }), dtype, dev)
+    VarBuilder::from_backend(
+        Box::new(Overlay {
+            base,
+            overrides,
+            deltas,
+        }),
+        dtype,
+        dev,
+    )
 }
 
 /// The deterministic, sorted list of every `*.safetensors` file directly under `dir`.

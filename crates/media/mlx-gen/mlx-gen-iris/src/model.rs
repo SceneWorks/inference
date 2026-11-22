@@ -211,7 +211,12 @@ pub fn load_backbone_quantized(
     // table stay as stored; the modules decide their own dtype.
     let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();
     keys.sort();
+    let native = weights.native_tensor_keys();
     for key in keys {
+        if native.contains(&key) {
+            crate::stream::read_native_tensor(weights.peek(&key).expect("native source tensor"))?;
+            continue;
+        }
         let Some(array) = weights.remove(&key) else {
             continue;
         };
@@ -308,19 +313,22 @@ pub fn load_backbone_streamed(
         skeleton,
     )?;
     crate::stream::before_backbone_targets(load_sources, "", compute, None)?;
-    let mut weights = Weights::from_file(&path)
-        .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
+    let mut weights =
+        Weights::from_selected_files(std::slice::from_ref(&path), |_, key| skeleton(key))
+            .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();
     keys.sort();
+    let native = weights.native_tensor_keys();
     for key in keys {
+        if native.contains(&key) {
+            crate::stream::read_native_tensor(weights.peek(&key).expect("native source tensor"))?;
+            continue;
+        }
         let Some(array) = weights.remove(&key) else {
             continue;
         };
-        // A stack tensor's lazy handle is dropped unread: its window reads it.
-        if skeleton(&key) {
-            let array = read_backbone_tensor(&key, array, compute)?;
-            weights.insert(key, array);
-        }
+        let array = read_backbone_tensor(&key, array, compute)?;
+        weights.insert(key, array);
     }
     let stream = crate::dit::BlockStream::open(&path, "", &config.model, compute, default_window)?;
     let dit = IrisDiT::from_weights_streamed(

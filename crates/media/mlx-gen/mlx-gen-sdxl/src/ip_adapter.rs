@@ -134,16 +134,15 @@ pub(crate) fn ip_kv_indices<'a>(keys: impl Iterator<Item = &'a str>) -> Result<V
     Ok(indices)
 }
 
-pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
+/// Source-backed decoupled K/V projections, in UNet cross-attention walk order.
+pub type IpKvPairs = Vec<(AdaptableLinear, AdaptableLinear)>;
+
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<IpKvPairs> {
     ip_kv_indices(w.keys())?
         .into_iter()
         .map(|n| {
-            let k = w
-                .require(&format!("ip_adapter.{n}.to_k_ip.weight"))?
-                .clone();
-            let v = w
-                .require(&format!("ip_adapter.{n}.to_v_ip.weight"))?
-                .clone();
+            let k = crate::quant::lin(w, &format!("ip_adapter.{n}.to_k_ip"), false)?;
+            let v = crate::quant::lin(w, &format!("ip_adapter.{n}.to_v_ip"), false)?;
             Ok((k, v))
         })
         .collect()
@@ -239,20 +238,15 @@ struct PerceiverAttention {
 impl PerceiverAttention {
     fn from_weights(w: &Weights, prefix: &str, cfg: &ResamplerConfig) -> Result<Self> {
         let g = |name: &str| w.require(&format!("{prefix}.{name}")).cloned();
-        let lin = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{name}"))?.clone(),
-                None,
-            ))
-        };
+        let lin = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), false);
         Ok(Self {
             norm1_w: g("norm1.weight")?,
             norm1_b: g("norm1.bias")?,
             norm2_w: g("norm2.weight")?,
             norm2_b: g("norm2.bias")?,
-            to_q: lin("to_q.weight")?,
-            to_kv: lin("to_kv.weight")?,
-            to_out: lin("to_out.weight")?,
+            to_q: lin("to_q")?,
+            to_kv: lin("to_kv")?,
+            to_out: lin("to_out")?,
             heads: cfg.heads,
             dim_head: cfg.dim_head,
             scale: (cfg.dim_head as f32).powf(-0.5),
@@ -656,6 +650,72 @@ impl ClipPreprocessGeometry {
     /// no output-sized schedule allocation, tensor factory, device/stream call or physical law.
     pub(crate) fn host_requested_upper(&self) -> Result<u64> {
         Ok(self.host_requested_work()?.peak_requested())
+    }
+}
+
+#[cfg(test)]
+mod projection_source_tests {
+    use super::*;
+
+    #[test]
+    fn resampler_and_decoupled_kv_keep_native_operands_and_logical_widths() {
+        let mut weights = Weights::empty();
+        for (base, rows) in [
+            ("attn.to_q", 2),
+            ("attn.to_kv", 4),
+            ("attn.to_out", 2),
+            ("ip_adapter.11.to_k_ip", 3),
+            ("ip_adapter.11.to_v_ip", 3),
+            ("ip_adapter.3.to_k_ip", 2),
+            ("ip_adapter.3.to_v_ip", 2),
+        ] {
+            weights.insert(
+                format!("{base}.weight"),
+                Array::from_slice(&vec![1i8; rows * 64], &[rows as i32, 64]),
+            );
+            weights.insert(
+                format!("{base}.weight_scale"),
+                Array::from_slice(&vec![0.5f32; rows], &[rows as i32, 1]),
+            );
+            weights.insert(
+                format!("{base}.comfy_quant"),
+                mlx_gen::mlx_layers::convrot_int8::descriptor_array(64),
+            );
+        }
+        for name in ["norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"] {
+            weights.insert(
+                format!("attn.{name}"),
+                Array::from_slice(&[0f32; 64], &[64]),
+            );
+        }
+        let attn =
+            PerceiverAttention::from_weights(&weights, "attn", &ResamplerConfig::plus_sdxl_vit_h())
+                .unwrap();
+        let pairs = load_ip_kv_pairs(&weights).unwrap();
+        let [(k0, v0), (k1, v1)] = pairs.as_slice() else {
+            panic!("expected two numeric slots")
+        };
+        for (layer, rows) in [
+            (&attn.to_q, 2),
+            (&attn.to_kv, 4),
+            (&attn.to_out, 2),
+            (k0, 2),
+            (v0, 2),
+            (k1, 3),
+            (v1, 3),
+        ] {
+            let op = layer
+                .convrot_base()
+                .expect("source-backed K/V or resampler matrix");
+            assert_eq!(op.codes().dtype(), Dtype::Int8);
+            assert_eq!(layer.base_shape(), [rows, 64]);
+            let work = crate::quantum::LinearWork::of(layer);
+            assert_eq!(work.weights.len(), 3);
+            assert_eq!(work.weights[1].shape, [rows, 1]);
+            assert_eq!(work.output_dtype(Dtype::Float16), Dtype::Float16);
+            assert_eq!(work.output_shape(&[1, 5, 64]).unwrap(), [1, 5, rows]);
+            assert!(work.operand_bytes(&[1, 5, 64], Dtype::Float16) >= 5 * 64 * 3);
+        }
     }
 }
 

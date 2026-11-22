@@ -33,6 +33,8 @@ use crate::dit::{Execution, Stack, TextBatch};
 use crate::packed::ConvertKind;
 use crate::test_metal_guard as metal_guard;
 
+mod native_formats;
+
 pub(crate) const AMPLE: u64 = 1 << 34;
 
 pub(crate) fn fixtures() -> PathBuf {

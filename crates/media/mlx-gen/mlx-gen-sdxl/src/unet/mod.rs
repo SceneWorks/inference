@@ -558,7 +558,10 @@ impl UNet2DConditionModel {
     /// the diffusers `attn_processors` walk order — **down_blocks → up_blocks → mid_block** (the
     /// empirical `ip_adapter.{1,3,…}` numeric order). `pairs` are the `to_k_ip/to_v_ip` weights, one
     /// per cross-attention layer (70 for SDXL), in that numeric order. Errors on a count mismatch.
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+    pub fn install_ip_adapter<P: Into<AdaptableLinear>>(
+        &mut self,
+        pairs: Vec<(P, P)>,
+    ) -> Result<()> {
         let expected = pairs.len();
         let mut it = pairs.into_iter();
         for b in &mut self.down_blocks {

@@ -287,7 +287,7 @@ fn resident_component_bytes(
 }
 
 /// Bytes of the dense [`ACTIVATION_DTYPE`] `[out, in]` matrix an MLX packed triple dequantizes to
-/// (`crate::quant::dequant_packed_to_dense`): `out` rows from the packed weight, `in` = scale
+/// (`candle_gen::quant::dequant_packed_to_dense`): `out` rows from the packed weight, `in` = scale
 /// columns x the MLX group size.
 fn dequantized_dense_bytes(
     weight: &gen_core::weightsmeta::SafetensorsTensorHeader,

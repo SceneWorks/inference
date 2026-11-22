@@ -63,6 +63,7 @@ pub struct StarVectorMlxMemory {
 /// A fully loaded StarVector-1B MLX model. Dropping it releases all MLX array handles; reload is
 /// an ordinary new registry load, so lifecycle ownership never escapes the provider instance.
 pub struct StarVector1bModel {
+    load_report: core_llm::LoadReport,
     vision: StarVectorClipVision,
     adapter: StarVectorAdapter,
     decoder: GptBigCode,
@@ -79,6 +80,7 @@ impl StarVector1bModel {
                 "model.svg_transformer.transformer",
                 GptBigCodeConfig::STARVECTOR_1B,
             )?,
+            load_report: weights.native_load_report(),
         })
     }
 
@@ -307,6 +309,10 @@ fn image_from_request(request: &TextLlmRequest) -> CoreResult<&core_llm::ImageRe
 }
 
 impl TextLlm for StarVector1bProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.model.load_report.clone())
+    }
+
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }
@@ -340,6 +346,10 @@ impl TextLlm for StarVector1bProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(crate::provider::numeric_policy(
+            &self.model.load_report,
+            false,
+        ));
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -390,6 +400,10 @@ impl StarVectorProvider for StarVector1bProvider {
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::CompletedStarVector> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(crate::provider::numeric_policy(
+            &self.model.load_report,
+            false,
+        ));
         let (output, record) = self.generate_svg_inner(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -733,6 +747,7 @@ mod tests {
             descriptor: descriptor(),
             starvector: starvector_descriptor(),
             model: StarVector1bModel {
+                load_report: weights.native_load_report(),
                 vision: StarVectorClipVision::from_weights_with_layers(
                     &weights,
                     "model.image_encoder",

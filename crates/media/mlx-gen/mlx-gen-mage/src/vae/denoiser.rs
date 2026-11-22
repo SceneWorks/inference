@@ -136,9 +136,11 @@ impl NerfEmbedder {
     }
 
     fn fold_zero_rgb_dct(&mut self, dct: &Array, dynamic_channels: i32) -> Result<()> {
-        let (weight, bias) = self.projection.dense_weight().ok_or_else(|| {
-            Error::Msg("mage-vae x_embedder must fold before quantization".into())
-        })?;
+        let Some((weight, bias)) = self.projection.dense_weight() else {
+            // The native activation quantizer sees the full RGB/DCT input. Keep that operator
+            // intact and let decode supply its literal zero RGB and DCT channels.
+            return Ok(());
+        };
         let bias = bias.expect("x_embedder is biased");
         let total = weight.shape()[1];
         let dct_weight = weight

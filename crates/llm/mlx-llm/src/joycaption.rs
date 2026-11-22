@@ -143,21 +143,22 @@ impl LlavaProjector {
         prefix: &str,
         activation: ProjectorActivation,
     ) -> Result<Self> {
-        let bf16 =
-            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
+        let load = |layer: &str| -> Result<Projection> {
+            let weight = format!("{prefix}.{layer}.weight");
+            if let Some(native) = Projection::native(w, &weight, true)? {
+                return Ok(native);
+            }
+            Ok(Projection::Dense {
+                weight: w.require(&weight)?.as_dtype(Dtype::Bfloat16)?,
+                bias: Some(
+                    w.require(&format!("{prefix}.{layer}.bias"))?
+                        .as_dtype(Dtype::Bfloat16)?,
+                ),
+            })
+        };
         let model = Self {
-            linear1: Projection::from_named(
-                w,
-                &format!("{prefix}.linear_1.weight"),
-                Some(bf16(format!("{prefix}.linear_1.bias"))?),
-                Some(Dtype::Bfloat16),
-            )?,
-            linear2: Projection::from_named(
-                w,
-                &format!("{prefix}.linear_2.weight"),
-                Some(bf16(format!("{prefix}.linear_2.bias"))?),
-                Some(Dtype::Bfloat16),
-            )?,
+            linear1: load("linear_1")?,
+            linear2: load("linear_2")?,
             activation,
         };
         w.verify_accessed_gpu_view()?;
@@ -251,6 +252,7 @@ pub struct JoyGeneration {
 
 /// The loaded JoyCaption VLM: vision tower, projector, language decoder, and image preprocessor.
 pub struct JoyCaptionModel {
+    load_report: core_llm::LoadReport,
     vision: SiglipVisionTower,
     projector: LlavaProjector,
     language: CausalLm,
@@ -291,6 +293,7 @@ impl JoyCaptionModel {
             projector,
             language,
             processor: SiglipImageProcessor::default(),
+            load_report: w.native_load_report(),
         })
     }
 
@@ -449,6 +452,10 @@ impl JoyCaptionProvider {
 }
 
 impl TextLlm for JoyCaptionProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.model.load_report.clone())
+    }
+
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }
@@ -476,6 +483,10 @@ impl TextLlm for JoyCaptionProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(crate::provider::numeric_policy(
+            &self.model.load_report,
+            self.model.language.is_quantized(),
+        ));
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -926,6 +937,7 @@ mod tests {
             )
             .unwrap(),
             language: tiny_llama(VOCAB),
+            load_report: weights.native_load_report(),
             processor: SiglipImageProcessor::default(),
         }
     }

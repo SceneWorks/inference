@@ -349,6 +349,15 @@ pub(crate) const ADAPTER_LOAD: &str = "SDXL adapter load";
 /// install of its forward-time residual).
 pub(crate) const ADAPTER_MERGE: &str = "SDXL adapter merge";
 
+/// Runtime geometry for an activation-quantizing projection. Its output uses the activation
+/// dtype, irrespective of the stored code and scale types.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativeLinearWork {
+    Fp8(mlx_gen::gen_core::comfy_quant::ComfyQuantFormat),
+    ConvRot,
+    W4A8 { rotation_group: usize },
+}
+
 /// Borrowed-operator metadata for one actual Linear. Header-selected installs update these
 /// existing checked facts; the native pricing model is never filled with invented adapter Arrays.
 /// Declared tensor extents are not allocation identities or a physical-release certificate.
@@ -360,41 +369,41 @@ pub(crate) struct LinearWork {
     pub residuals: Vec<mlx_gen::adapters::facts::AdapterFacts>,
     pub group_size: i32,
     pub bits: Option<i32>,
+    pub native: Option<NativeLinearWork>,
 }
 
 impl LinearWork {
     pub(crate) fn of(linear: &AdaptableLinear) -> Self {
         use mlx_gen::adapters::facts::{AdapterFacts, TensorFacts};
         let mut base = mlx_gen::adapters::LinearFacts::of(linear);
-        let (weights, bias, group_size, bits) =
-            if let Some((w, scales, offsets, bias, group, bits)) = linear.quantized_params() {
-                // Keep the actual packed operand geometry, including its logical input width.
+        let mut weights: Vec<_> = linear
+            .base_arrays()
+            .into_iter()
+            .map(TensorFacts::of)
+            .collect();
+        // base_arrays puts the actual output bias last for every base, including W4A8.
+        let bias = linear.bias().and_then(|_| weights.pop());
+        let mut group_size = crate::quant::GROUP_SIZE;
+        let bits = linear
+            .quantized_params()
+            .map(|(_, scales, _, _, group, bits)| {
                 let mut logical = scales.shape().to_vec();
                 if let Some(input) = logical.last_mut() {
                     *input = input.saturating_mul(group);
                 }
                 base.base_shape = logical;
-                (
-                    vec![
-                        TensorFacts::of(w),
-                        TensorFacts::of(scales),
-                        TensorFacts::of(offsets),
-                    ],
-                    bias.map(TensorFacts::of),
-                    group,
-                    Some(bits),
-                )
-            } else {
-                let (w, bias) = linear
-                    .dense_weight()
-                    .expect("LinearBase is dense or packed");
-                (
-                    vec![TensorFacts::of(w)],
-                    bias.map(TensorFacts::of),
-                    crate::quant::GROUP_SIZE,
-                    None,
-                )
-            };
+                group_size = group;
+                bits
+            });
+        let native = linear
+            .fp8_base()
+            .map(|p| NativeLinearWork::Fp8(p.format))
+            .or_else(|| linear.convrot_base().map(|_| NativeLinearWork::ConvRot))
+            .or_else(|| {
+                linear.w4a8_base().map(|p| NativeLinearWork::W4A8 {
+                    rotation_group: p.descriptor().rotation_group,
+                })
+            });
         Self {
             base,
             weights,
@@ -402,6 +411,7 @@ impl LinearWork {
             residuals: linear.adapters().iter().map(AdapterFacts::of).collect(),
             group_size,
             bits,
+            native,
         }
     }
 
@@ -414,13 +424,16 @@ impl LinearWork {
     }
 
     pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
+        if self.native.is_some() {
+            return input;
+        }
         if self.bits.is_some() {
             let compute = self.packed_compute_dtype(input);
             return self.bias.as_ref().map_or(compute, |bias| {
                 Dtype::from_promoting_types(compute, bias.dtype)
             });
         }
-        let weight = self.weights[usize::from(self.bits.is_some())].dtype;
+        let weight = self.weights[0].dtype;
         let out = Dtype::from_promoting_types(input, weight);
         self.bias
             .as_ref()
@@ -468,55 +481,136 @@ impl LinearWork {
     }
 
     pub(crate) fn operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
-        if self.bits.is_some() {
-            return self.packed_operand_bytes(shape, input);
-        }
         let output = self.output_dtype(input);
-        let width = dtype_bytes(output);
-        let activation = if input != output {
-            shape.iter().fold(width, |n, &d| n.saturating_mul(u(d)))
+        let casts = if let Some(native) = self.native {
+            self.native_operand_bytes(native, shape, input)
+        } else if self.bits.is_some() {
+            self.packed_operand_bytes(shape, input)
         } else {
-            0
-        };
-        let weight = if self.bits.is_none() && self.weights[0].dtype != output {
-            self.weights[0].elements().saturating_mul(width)
-        } else {
-            0
-        };
-        let bias = self.bias.as_ref().map_or(0, |bias| {
-            if bias.dtype != output {
-                bias.elements().saturating_mul(width)
+            let width = dtype_bytes(output);
+            let activation = if input != output {
+                shape.iter().fold(width, |n, &d| n.saturating_mul(u(d)))
             } else {
                 0
-            }
-        });
-        let mut accumulated = self.base_output_shape(shape).ok();
-        self.residuals.iter().fold(
-            activation.saturating_add(weight).saturating_add(bias),
-            |n, adapter| {
-                if adapter.disabled() {
-                    return n;
+            };
+            let weight = if self.weights[0].dtype != output {
+                self.weights[0].elements().saturating_mul(width)
+            } else {
+                0
+            };
+            let bias = self.bias.as_ref().map_or(0, |bias| {
+                if bias.dtype != output {
+                    bias.elements().saturating_mul(width)
+                } else {
+                    0
                 }
-                accumulated = accumulated.as_ref().and_then(|host| {
-                    crate::adapters::adapter_residual_shape(adapter, shape)
-                        .ok()
-                        .and_then(|residual| crate::adapters::broadcast_shape(host, &residual).ok())
-                });
-                let add_elements = accumulated
+            });
+            activation.saturating_add(weight).saturating_add(bias)
+        };
+        let mut accumulated = self.base_output_shape(shape).ok();
+        self.residuals.iter().fold(casts, |n, adapter| {
+            if adapter.disabled() {
+                return n;
+            }
+            accumulated = accumulated.as_ref().and_then(|host| {
+                crate::adapters::adapter_residual_shape(adapter, shape)
+                    .ok()
+                    .and_then(|residual| crate::adapters::broadcast_shape(host, &residual).ok())
+            });
+            let add_elements = accumulated
+                .as_ref()
+                .map_or(0, |s| s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
+            // Invalid native operands keep their original operator error priority; this numeric
+            // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
+            // host-add geometry, including earlier residuals, not an independent residual maximum.
+            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(
+                adapter,
+                shape,
+                input,
+                output,
+                add_elements,
+            ))
+        })
+    }
+
+    /// Logical temporary payload for the actual native operator, separate from its resident
+    /// operands and final output. Sum the unfused activation stages as a conservative bound.
+    fn native_operand_bytes(&self, native: NativeLinearWork, shape: &[i32], input: Dtype) -> u64 {
+        use mlx_gen::gen_core::comfy_quant::ComfyQuantFormat;
+        let Some((&k, leading)) = shape.split_last() else {
+            return 0;
+        };
+        let rows = leading.iter().fold(1u64, |n, &d| n.saturating_mul(u(d)));
+        let elems = rows.saturating_mul(u(k));
+        let width = dtype_bytes(input);
+        let outputs = self.output_width();
+        let bias_cast = |dtype| {
+            self.bias.as_ref().map_or(0, |bias| {
+                if bias.dtype == dtype {
+                    0
+                } else {
+                    bias.elements().saturating_mul(dtype_bytes(dtype))
+                }
+            })
+        };
+        match native {
+            NativeLinearWork::Fp8(format) => {
+                let activation = match format {
+                    ComfyQuantFormat::Mxfp8 => elems.saturating_mul(4),
+                    ComfyQuantFormat::Fp8Rowwise => {
+                        // BF16 input, F32 cast and abs, peak/divide/clamp per row, F16 codes.
+                        let bf = u64::from(input != Dtype::Bfloat16) * 2;
+                        elems
+                            .saturating_mul(bf + 8 + 2)
+                            .saturating_add(rows.saturating_mul(12))
+                            .saturating_add(8)
+                    }
+                    _ => elems.saturating_mul(2),
+                };
+                activation
+                    .saturating_add(bias_cast(input))
+                    .saturating_add(if self.bias.is_some() {
+                        rows.saturating_mul(outputs).saturating_mul(width)
+                    } else {
+                        0
+                    })
+            }
+            NativeLinearWork::ConvRot => {
+                let rotation = &self.weights[2];
+                let rotation_cast = if rotation.dtype == input {
+                    0
+                } else {
+                    rotation.elements().saturating_mul(width)
+                };
+                let f32_bias = if self.bias.is_none() || input != Dtype::Float32 {
+                    outputs.saturating_mul(4)
+                } else {
+                    0
+                };
+                // Rotated activation, INT8 activation, F32 row scales, and F32 epilogue.
+                elems
+                    .saturating_mul(width + 1)
+                    .saturating_add(rows.saturating_mul(4))
+                    .saturating_add(rotation_cast)
+                    .saturating_add(bias_cast(input))
+                    .saturating_add(f32_bias)
+            }
+            NativeLinearWork::W4A8 { rotation_group } => {
+                // Each radix-4 FHT stage builds 16 quarter-width arithmetic outputs
+                // (12 butterfly + 4 scaled) and one full-width F32 concatenation.
+                let stages = u64::from(rotation_group.trailing_zeros() / 2);
+                let f32_input = u64::from(input != Dtype::Float32) * 4;
+                let bias = self
+                    .bias
                     .as_ref()
-                    .map_or(0, |s| s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
-                // Invalid native operands keep their original operator error priority; this numeric
-                // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
-                // host-add geometry, including earlier residuals, not an independent residual maximum.
-                n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(
-                    adapter,
-                    shape,
-                    input,
-                    output,
-                    add_elements,
-                ))
-            },
-        )
+                    .map_or(outputs.saturating_mul(4), |_| bias_cast(Dtype::Float32));
+                elems
+                    .saturating_mul(f32_input + 20 * stages + 1)
+                    .saturating_add(rows.saturating_mul(4))
+                    .saturating_add(bias)
+                    .saturating_add(4)
+            }
+        }
     }
 
     fn packed_operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
@@ -566,44 +660,23 @@ impl LinearWork {
         } else {
             0
         };
-        let base_casts = activation
+        activation
             .saturating_add(affine)
             .saturating_add(bias)
-            .saturating_add(post_bias);
-        let mut accumulated = self.base_output_shape(shape).ok();
-        self.residuals.iter().fold(base_casts, |n, adapter| {
-            if adapter.disabled() {
-                return n;
-            }
-            accumulated = accumulated.as_ref().and_then(|host| {
-                crate::adapters::adapter_residual_shape(adapter, shape)
-                    .ok()
-                    .and_then(|residual| crate::adapters::broadcast_shape(host, &residual).ok())
-            });
-            let add_elements = accumulated
-                .as_ref()
-                .map_or(0, |s| s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
-            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(
-                adapter,
-                shape,
-                input,
-                output,
-                add_elements,
-            ))
-        })
+            .saturating_add(post_bias)
     }
 
     pub(crate) fn install(&mut self, work: &crate::adapters::AdapterInstallWork) -> Result<()> {
         use crate::adapters::AdapterInstallStorage as S;
         match work.storage {
-            S::DenseLinear if self.bits.is_none() => {
+            S::DenseLinear if !self.base.is_quantized => {
                 let weight = work.installed.first().ok_or_else(|| {
                     mlx_gen::Error::Msg("sdxl selected dense install has no declared output".into())
                 })?;
                 self.base.base_shape = weight.shape.clone();
                 self.weights = vec![weight.clone()];
             }
-            S::PackedLora | S::PackedDelta | S::StructuredLokr if self.bits.is_some() => {
+            S::PackedLora | S::PackedDelta | S::StructuredLokr if self.base.is_quantized => {
                 self.residuals.push(work.residual().ok_or_else(|| {
                     mlx_gen::Error::Msg(
                         "sdxl selected packed install has incomplete declared operands".into(),
@@ -636,7 +709,7 @@ impl LinearWork {
 
     pub(crate) fn pack(&mut self, bits: i32) -> Result<u64> {
         use mlx_gen::adapters::facts::TensorFacts;
-        if self.bits.is_some() {
+        if self.base.is_quantized {
             return Ok(0);
         }
         let shape = &self.base.base_shape;
@@ -1455,6 +1528,7 @@ impl LinearWork {
             residuals: Vec::new(),
             group_size: crate::quant::GROUP_SIZE,
             bits: None,
+            native: None,
         }
     }
 }
@@ -1611,6 +1685,7 @@ mod linear_dtype_cast_tests {
                     residuals: Vec::new(),
                     group_size: 64,
                     bits: Some(bits),
+                    native: None,
                 };
                 assert_eq!(work.packed_compute_dtype(input), compute);
                 assert_eq!(work.output_dtype(input), output);
@@ -1638,6 +1713,7 @@ mod linear_dtype_cast_tests {
                 residuals: Vec::new(),
                 group_size: 64,
                 bits: Some(bits),
+                native: None,
             };
             assert_eq!(work.output_shape(&[1, 64]).unwrap(), vec![3, 2]);
             assert_eq!(

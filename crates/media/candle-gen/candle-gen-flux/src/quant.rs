@@ -1,77 +1,14 @@
-//! FLUX.1 [schnell] packed-load seam (sc-9407, sc-9089 umbrella) — the candle twin of the flux2-dev
-//! conversion (sc-9087) and the z-image conversion (sc-9408), built on the shared
-//! [`candle_gen::quant`] packed-load module (sc-9086).
-//!
-//! FLUX.1 [schnell] ships a **pre-quantized** MLX tier (`SceneWorks/flux1-schnell-mlx`, epic 8506)
-//! whose q4/q8 snapshots store each quantized `Linear` / token embedding as the MLX packed triple
-//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. [`QLinear::linear_detect`] /
-//! [`candle_gen::quant::embedding`] packed-**detect** the `.scales` sibling and build the quantized weight
-//! **straight from the packed parts** on the target device via the shared [`candle_gen::quant::lin`] /
-//! `embedding` loaders (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0` requant). **No dense bf16 weight is
-//! ever materialized** on the packed path — the q4 DiT lands ~6.3 GB directly rather than staging a
-//! ~24 GB dense DiT in RAM first.
-//!
-//! Absent `.scales` (a dense bf16 tier — the stock black-forest-labs `FLUX.1-schnell` BFL snapshot)
-//! the loader falls back to the **stock** BFL-layout `candle-transformers` path unchanged (see
-//! [`crate::pipeline`]), so one crate serves both a dense BFL snapshot and a packed diffusers snapshot.
-//!
-//! **The packed forward dequantizes the weight into a dense matmul (sc-7702)** — it does *not* take
-//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. The whole
-//! `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005): FLUX.1's packed
-//! projections load through the shared [`candle_gen::quant::QLinear`]'s
-//! [`MatmulStrategy::DequantDense`](candle_gen::quant::MatmulStrategy::DequantDense) arm, which owns
-//! that behavior. This module re-exports that shared `QLinear` under the crate-local name every vendored
-//! diffusers DiT builds its projections from, and keeps the [`dequant_packed_to_dense`] VAE helper.
-//!
-//! FLUX.1 has no *dense-tier on-the-fly* quant path (the only quantized tier is the pre-packed MLX
-//! one), so — like the z-image seam and unlike the flux2 seam — this crate never folds a dense weight;
-//! it only packed-detects. The [`QLinear::quantize`] / `quantize_onto` folds on the shared type are
-//! simply never called here.
+//! FLUX.1 projections use the shared additive Linear for dense, native and packed weights.
 
-use candle_gen::candle_core::{Device, Result, Tensor};
-use candle_gen::candle_nn::VarBuilder;
-use candle_gen::quant as shared;
-
-// The `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005). FLUX.1's packed
-// projections take the shared [`MatmulStrategy::DequantDense`] arm (sc-7702-safe, no int8 activation
-// quant), built by `QLinear::linear_detect` on an MLX tier. Re-export the shared type under the
-// crate-local `QLinear` name the DiT references.
 pub use candle_gen::quant::AdaptLinear as QLinear;
-
-/// Dequantize an MLX-packed triple (`{base}.weight` u32 + `{base}.scales` + `{base}.biases`) to a
-/// **dense** `[out, in]` tensor on `device` at `out_dtype` (Q4 via the exact affine grid, Q8 via the
-/// exact-grid dequant — [`candle_gen::quant::repack`]). Used only by the VAE loader
-/// ([`crate::pipeline`]): the FLUX packed tier quantizes just the 8 tiny (512×64) mid-block attention
-/// projections, so — rather than vendor a whole diffusers VAE for negligible weights — the packed VAE
-/// weights are dequantized to dense here and handed to a **stock** diffusers `AutoencoderKL` through a
-/// `VarBuilder::from_tensors` overlay (the same pragmatic path z-image took, sc-9408). This still loads
-/// *from the packed parts* (no dense bf16 tier downloaded); the ~2 MB one-time dequant is trivial next to
-/// the DiT/TE the packed path serves natively.
-pub fn dequant_packed_to_dense(
-    vb: &VarBuilder,
-    base: &str,
-    device: &Device,
-    out_dtype: candle_gen::candle_core::DType,
-) -> Result<Tensor> {
-    use candle_gen::candle_core::DType;
-    let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-    let scales = vb.get_unchecked_dtype(&format!("{base}.scales"), DType::F32)?;
-    let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
-    let (wq_cols, s_cols) = (wq.dims2()?.1, scales.dims2()?.1);
-    let grid = match shared::mlx_packed_bits(wq_cols, s_cols) {
-        4 => shared::dequant_mlx_q4_reference(&wq, &scales, &biases)?,
-        8 => shared::dequant_mlx_q8(&wq, &scales, &biases)?,
-        b => candle_gen::candle_core::bail!("flux vae: unsupported MLX packed bit-width {b}"),
-    };
-    grid.to_device(device)?.to_dtype(out_dtype)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
-    use candle_gen::candle_core::{DType, Device};
-    use candle_gen::candle_nn::Linear;
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::{Linear, VarBuilder};
+    use candle_gen::quant as shared;
     use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 

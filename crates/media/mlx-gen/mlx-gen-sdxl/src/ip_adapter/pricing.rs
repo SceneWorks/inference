@@ -82,24 +82,20 @@ fn conv_call(shape: &[i32], act: u64, weight: &Tensor, stride: i32, pad: i32) ->
 impl VisionLayerFacts {
     fn from_weights(w: &HeaderWeights, prefix: &str, cfg: &VisionConfig) -> Result<Self> {
         let g = |name: &str| w.require(&format!("{prefix}.{name}")).cloned();
-        let dense = |wn: &str, bn: &str| -> Result<q::LinearWork> {
-            Ok(q::LinearWork::dense(
-                w.require(&format!("{prefix}.{wn}"))?.clone(),
-                Some(w.require(&format!("{prefix}.{bn}"))?.clone()),
-            ))
-        };
+        let lin =
+            |name: &str| crate::unet::pricing::header_linear(w, &format!("{prefix}.{name}"), true);
         let head_dim = cfg.hidden / cfg.num_heads;
         Ok(Self {
             ln1_w: g("layer_norm1.weight")?,
             _ln1_b: g("layer_norm1.bias")?,
             _ln2_w: g("layer_norm2.weight")?,
             _ln2_b: g("layer_norm2.bias")?,
-            q: dense("self_attn.q_proj.weight", "self_attn.q_proj.bias")?,
-            _k: dense("self_attn.k_proj.weight", "self_attn.k_proj.bias")?,
-            _v: dense("self_attn.v_proj.weight", "self_attn.v_proj.bias")?,
-            out: dense("self_attn.out_proj.weight", "self_attn.out_proj.bias")?,
-            fc1: dense("mlp.fc1.weight", "mlp.fc1.bias")?,
-            fc2: dense("mlp.fc2.weight", "mlp.fc2.bias")?,
+            q: lin("self_attn.q_proj")?,
+            _k: lin("self_attn.k_proj")?,
+            _v: lin("self_attn.v_proj")?,
+            out: lin("self_attn.out_proj")?,
+            fc1: lin("mlp.fc1")?,
+            fc2: lin("mlp.fc2")?,
             num_heads: cfg.num_heads,
             head_dim,
         })
@@ -190,20 +186,16 @@ impl VisionFacts {
 impl PerceiverFacts {
     fn from_weights(w: &HeaderWeights, prefix: &str, cfg: &ResamplerConfig) -> Result<Self> {
         let g = |name: &str| w.require(&format!("{prefix}.{name}")).cloned();
-        let lin = |name: &str| -> Result<q::LinearWork> {
-            Ok(q::LinearWork::dense(
-                w.require(&format!("{prefix}.{name}"))?.clone(),
-                None,
-            ))
-        };
+        let lin =
+            |name: &str| crate::unet::pricing::header_linear(w, &format!("{prefix}.{name}"), false);
         Ok(Self {
             _norm1_w: g("norm1.weight")?,
             _norm1_b: g("norm1.bias")?,
             _norm2_w: g("norm2.weight")?,
             _norm2_b: g("norm2.bias")?,
-            to_q: lin("to_q.weight")?,
-            _to_kv: lin("to_kv.weight")?,
-            _to_out: lin("to_out.weight")?,
+            to_q: lin("to_q")?,
+            _to_kv: lin("to_kv")?,
+            _to_out: lin("to_out")?,
             heads: cfg.heads,
             dim_head: cfg.dim_head,
         })
@@ -215,8 +207,8 @@ impl FeedForwardFacts {
         Ok(Self {
             _ln_w: w.require(&format!("{prefix}.0.weight"))?.clone(),
             _ln_b: w.require(&format!("{prefix}.0.bias"))?.clone(),
-            fc1: q::LinearWork::dense(w.require(&format!("{prefix}.1.weight"))?.clone(), None),
-            _fc2: q::LinearWork::dense(w.require(&format!("{prefix}.3.weight"))?.clone(), None),
+            fc1: crate::unet::pricing::header_linear(w, &format!("{prefix}.1"), false)?,
+            _fc2: crate::unet::pricing::header_linear(w, &format!("{prefix}.3"), false)?,
         })
     }
 }
@@ -232,14 +224,8 @@ impl ResamplerFacts {
 
     pub fn from_weights(w: &HeaderWeights, prefix: &str, cfg: &ResamplerConfig) -> Result<Self> {
         let latents = w.require(&format!("{prefix}.latents"))?.clone();
-        let proj_in = q::LinearWork::dense(
-            w.require(&format!("{prefix}.proj_in.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.proj_in.bias"))?.clone()),
-        );
-        let proj_out = q::LinearWork::dense(
-            w.require(&format!("{prefix}.proj_out.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.proj_out.bias"))?.clone()),
-        );
+        let proj_in = crate::unet::pricing::header_linear(w, &format!("{prefix}.proj_in"), true)?;
+        let proj_out = crate::unet::pricing::header_linear(w, &format!("{prefix}.proj_out"), true)?;
         let layers = (0..cfg.depth)
             .map(|i| -> Result<_> {
                 let attn = PerceiverFacts::from_weights(w, &format!("{prefix}.layers.{i}.0"), cfg)?;

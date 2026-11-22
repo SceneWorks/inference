@@ -98,7 +98,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1200
+              "line": 1205
             }
           ],
           "creation": [
@@ -141,7 +141,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1193
+              "line": 1194
             }
           ],
           "creation": [
@@ -184,7 +184,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1193
+              "line": 1194
             }
           ],
           "creation": [
@@ -270,7 +270,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 608
+              "line": 605
             }
           ],
           "creation": [
@@ -599,14 +599,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 206
+              "line": 209
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 212
+              "line": 215
             }
           ],
           "release": [
@@ -648,14 +648,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 206
+              "line": 209
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 212
+              "line": 215
             }
           ],
           "release": [

@@ -147,7 +147,7 @@ jobs:
         if: matrix.asset_setup == 'flux1-eng4b-terminal-comparison'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: 481a982db44b58937c15c2d3f0cbf918b116d04d
+          ref: be45bdf746c5d4a12d4db76f9653b8686e7f33f8
           path: flux1-baseline
           persist-credentials: false
       - name: Select Git Bash on Windows

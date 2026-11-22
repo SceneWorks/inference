@@ -328,7 +328,7 @@ pub(super) fn install_one_loha_thirdparty_additive(
 }
 
 /// Reconstruct a third-party `[out,in]` delta at the host target's base shape and stack it as an
-/// [`Adapter::Lokr`] residual at `strength` — the additive analog of [`merge_wan_thirdparty_delta`].
+/// [`Adapter::Lokr`] residual at `strength` — the additive analog of [`merge_wan_delta`].
 /// A path outside the adaptable surface is surfaced (skipped), never fatal.
 pub(super) fn install_thirdparty_delta(
     host: &mut impl AdaptableHost,

@@ -1106,6 +1106,7 @@ fn load_backbone_set(
     select: impl Fn(&str) -> bool,
     quantize_dense: Option<BackboneQuant>,
 ) -> Result<()> {
+    require_operator_facts(needs_codec_facts(headers.values()))?;
     let compute = if cw == 4 {
         mlx_rs::Dtype::Float32
     } else {
@@ -1249,6 +1250,7 @@ impl TowerFacts {
                 crate::text_encoder::is_text_tower_tensor(&h.name, !cfg.tie_word_embeddings)
             }));
         }
+        require_operator_facts(needs_codec_facts(real.iter()))?;
         if streamed
             && real
                 .iter()
@@ -1262,7 +1264,7 @@ impl TowerFacts {
         }
         let built = if !packed {
             if let Some(q) = requested {
-                emulate_packed_tower(&real, &cfg, q)?
+                emulate_packed_tower(&real, &cfg, q, &SourcePrices::default())?
             } else {
                 real.clone()
             }
@@ -3531,6 +3533,13 @@ impl IrisMetadataFacts {
         )?;
         Ok(())
     }
+}
+
+pub(super) fn codec_facts_refusal(req: &IosPricingRequest<'_>) -> Result<Error> {
+    let mut analysis = IrisHostAnalysis::inventory_only(req)?;
+    analysis.missing[3] = Some(IrisHostGap::SourceMetadataCapacity);
+    analysis.source_guard_gap = Some("codec descriptor and native operator allocation facts");
+    Ok(analysis.refusal())
 }
 
 pub(super) fn source_guard_refusal(req: &IosPricingRequest<'_>, error: Error) -> Result<Error> {
