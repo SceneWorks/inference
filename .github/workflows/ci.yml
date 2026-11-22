@@ -1341,10 +1341,14 @@ jobs:
     if: >-
       (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, windows, cuda]
+    # All CUDA listeners share the Windows build volume. Queue across refs so the
+    # previous job's Cargo target cleanup finishes before the next restore.
+    concurrency:
+      group: inference-windows-cuda-build-storage
+      queue: max
     env:
-      # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
-      # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
-      # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
+      # Other CUDA workloads share this host. Limit Cargo's compiler processes to leave
+      # headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
       # This lane compiles every CUDA test target without executing model code. Full test
       # debug/PDB output exceeded 100 GB and exhausted the shared runner disk while linking.
@@ -1430,6 +1434,11 @@ jobs:
         with:
           toolchain: 1.96.0
           components: clippy
+      - name: Wait for Windows CUDA build space
+        id: cuda_build_space
+        shell: powershell
+        timeout-minutes: 11
+        run: ./scripts/ci/windows-cuda-build-space.ps1 -WaitForSpace
       - name: Cache Cargo and CUDA objects
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -1510,6 +1519,10 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv
+      - name: Report Windows CUDA build space before cleanup
+        if: ${{ !cancelled() && steps.cuda_build_space.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/ci/windows-cuda-build-space.ps1
 
   windows-cuda:
     timeout-minutes: 180
@@ -1518,6 +1531,10 @@ jobs:
     if: >-
       (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true')
     runs-on: [self-hosted, windows, cuda]
+    # Manual CUDA builds share the same Windows volume as the automatic lane.
+    concurrency:
+      group: inference-windows-cuda-build-storage
+      queue: max
     env:
       # Keep manual runs inside the same per-listener budget as the automatic compile check.
       CARGO_BUILD_JOBS: "12"
@@ -1549,6 +1566,11 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Wait for Windows CUDA build space
+        id: cuda_build_space
+        shell: powershell
+        timeout-minutes: 11
+        run: ./scripts/ci/windows-cuda-build-space.ps1 -WaitForSpace
       # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
       # cache step). This lane is manual — `windows-cuda` runs only on `workflow_dispatch` — so its
       # runs are operator iterations on whatever ref they dispatch, where a ref-scoped cache is the
@@ -1720,6 +1742,10 @@ jobs:
         run: |
           call "%VCVARS%"
           python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
+      - name: Report Windows CUDA build space before cleanup
+        if: ${{ !cancelled() && steps.cuda_build_space.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/ci/windows-cuda-build-space.ps1
 
   supply-chain:
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
