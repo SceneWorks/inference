@@ -44989,7 +44989,7 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base; Synthetic 16x64 G64 stored-code CUDA projection; original-basis rank-one LoRA (0.75) and structured 4x8 by 4x8 LoKr (0.5); additive differences against explicit residuals (max absolute error < 1e-5)",
+    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base; Synthetic 16x64 G64 stored-code CUDA projection; original-basis rank-one LoRA (0.75) and structured 4x8 by 4x8 LoKr (0.5); default and scoped additive differences against explicit residuals (max absolute error < 1e-5), zero LoKr and unchanged default output",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
@@ -45010,7 +45010,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+          "Entire source-selected body, original numerical assertions, scoped LoRA (-0.25) with zero LoKr, rebaked LoKr (-0.125), exact bare zero-only output, and unchanged defaults"
         ],
         "required_cuda_physical_index": 0,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
