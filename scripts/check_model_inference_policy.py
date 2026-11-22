@@ -607,7 +607,7 @@ def cargo_test_compilation(command):
 def is_file(path):
     """`Path.is_file` that reports any `OSError` as not-a-file, as Python 3.14 does.
 
-    An unexpanded `${{ … }}` expression substituted into a script path can exceed the
+    An unexpanded `${{ Ã¢â‚¬Â¦ }}` expression substituted into a script path can exceed the
     filesystem's name limit; Python 3.12's `is_file` raises ENAMETOOLONG for it instead of
     returning False, so the tracer would crash rather than report an unresolved script.
     """
@@ -862,8 +862,9 @@ class RunGraph:
             # Exact bare-parameter declarations remain attached under component selection.
             # The adapter file installer uses a CPU metadata-native base whose forward
             # and dense-materialization methods panic; only installation/routing is exercised.
-            # iOS admission wrappers forward mock checkpoint receipts; these controls use fake providers only.
-            controls_sha = 'a6190ec5e0b6557fe36105e001d619954961eb5047cb1a99e637a3d9fbd439e0'
+            # MLX source format reporting and load-admission controls use only JSON and measured metadata.
+            # Includes iOS fake-provider receipt forwarding and source-aware window metadata controls.
+            controls_sha = 'd796dda5ab7a39f0c6b33c04b4cabed8e2262cd10037e6c212cebe2b605692ef'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

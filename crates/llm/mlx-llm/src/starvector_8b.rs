@@ -25,9 +25,9 @@ use crate::decode::{
 use crate::error::{Error, Result};
 use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::{SiglipVisionConfig, SiglipVisionTower, StarCoder2, StarCoder2Config};
-use crate::primitives::nn::{layer_norm, linear, silu};
+use crate::primitives::nn::{layer_norm, silu};
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::{input_ids, Projection, Weights};
 
 /// Explicit provider id used by the ordinary MLX text registry.
 pub const PROVIDER_ID: &str = "mlx-starvector-8b";
@@ -44,6 +44,7 @@ const DECODER_HIDDEN: i32 = core_llm::starvector::starvector_8b::DECODER_HIDDEN 
 /// A fully loaded StarVector-8B MLX model. Dropping it releases all MLX array handles; reload is
 /// an ordinary new explicit-registry load.
 pub struct StarVector8bModel {
+    load_report: core_llm::LoadReport,
     vision: SiglipVisionTower,
     adapter: StarVector8bAdapter,
     decoder: StarCoder2,
@@ -64,6 +65,7 @@ impl StarVector8bModel {
                 "model.svg_transformer.transformer",
                 StarCoder2Config::STARVECTOR_8B,
             )?,
+            load_report: weights.native_load_report(),
         })
     }
 
@@ -97,10 +99,8 @@ struct StarVector8bAdapter {
     vision_hidden: i32,
     /// Decoder row width ([`DECODER_HIDDEN`] for the published snapshot).
     decoder_hidden: i32,
-    fc_weight: Array,
-    fc_bias: Array,
-    proj_weight: Array,
-    proj_bias: Array,
+    fc: Projection,
+    proj: Projection,
     norm_weight: Array,
     norm_bias: Array,
 }
@@ -111,10 +111,18 @@ impl StarVector8bAdapter {
         let model = Self {
             vision_hidden: VISION_HIDDEN,
             decoder_hidden: DECODER_HIDDEN,
-            fc_weight: w.require(&key("c_fc.weight"))?.clone(),
-            fc_bias: w.require(&key("c_fc.bias"))?.clone(),
-            proj_weight: w.require(&key("c_proj.weight"))?.clone(),
-            proj_bias: w.require(&key("c_proj.bias"))?.clone(),
+            fc: Projection::from_named(
+                w,
+                &key("c_fc.weight"),
+                Some(w.require(&key("c_fc.bias"))?.clone()),
+                None,
+            )?,
+            proj: Projection::from_named(
+                w,
+                &key("c_proj.weight"),
+                Some(w.require(&key("c_proj.bias"))?.clone()),
+                None,
+            )?,
             norm_weight: w.require(&key("norm.weight"))?.clone(),
             norm_bias: w.require(&key("norm.bias"))?.clone(),
         };
@@ -130,12 +138,8 @@ impl StarVector8bAdapter {
                 "StarVector-8B SigLIP features must be [batch,{IMAGE_TOKENS},{vision_hidden}], got {shape:?}"
             )));
         }
-        let hidden = silu(&linear(
-            image_features,
-            &self.fc_weight,
-            Some(&self.fc_bias),
-        )?)?;
-        let hidden = linear(&hidden, &self.proj_weight, Some(&self.proj_bias))?;
+        let hidden = silu(&self.fc.forward(image_features)?)?;
+        let hidden = self.proj.forward(&hidden)?;
         let flat_width = IMAGE_TOKENS * decoder_hidden;
         let flat = hidden.reshape(&[shape[0], flat_width])?;
         let weight = self.norm_weight.reshape(&[flat_width])?;
@@ -349,6 +353,10 @@ fn image_from_request(request: &TextLlmRequest) -> CoreResult<&core_llm::ImageRe
 }
 
 impl TextLlm for StarVector8bProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.model.load_report.clone())
+    }
+
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }
@@ -382,6 +390,10 @@ impl TextLlm for StarVector8bProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(crate::provider::numeric_policy(
+            &self.model.load_report,
+            false,
+        ));
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -435,6 +447,10 @@ impl StarVectorProvider for StarVector8bProvider {
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::CompletedStarVector> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(crate::provider::numeric_policy(
+            &self.model.load_report,
+            false,
+        ));
         let (output, record) = self.generate_svg_inner(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -746,6 +762,7 @@ mod tests {
             descriptor: descriptor(),
             starvector: starvector_descriptor(),
             model: StarVector8bModel {
+                load_report: weights.native_load_report(),
                 vision: SiglipVisionTower::from_weights(&weights, v, vision_cfg).unwrap(),
                 adapter,
                 decoder: StarCoder2::from_weights(

@@ -52,6 +52,9 @@ pub trait MlxWeightSource {
     fn peek(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }
+    /// A constructor successfully bound a native operator, including for in-memory sources
+    /// without a file plan. Materialization and resident bytes are accounted separately.
+    fn native_bound(&self) {}
     fn observation(&self, _key: &str) -> Option<crate::source::Observation> {
         None
     }
@@ -152,6 +155,9 @@ impl NativeProjection {
                 Self::Fp8(p) => p.observe(observation)?,
                 Self::ConvRot(p) => p.observe(observation)?,
             }
+        }
+        if native.is_some() {
+            w.native_bound();
         }
         Ok(native)
     }

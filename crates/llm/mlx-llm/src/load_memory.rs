@@ -51,6 +51,8 @@ pub(crate) struct SnapshotFacts {
     pub(crate) payload: u64,
     /// `tokenizer.json` bytes (0 when absent).
     pub(crate) tokenizer_bytes: u64,
+    /// Additional buffers produced by the source codec, beyond the original payload.
+    source_load_extra: u64,
 }
 
 impl SnapshotFacts {
@@ -65,30 +67,27 @@ impl SnapshotFacts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(Error::Load(e.to_string())),
         };
-        let (headers, payload) = if let Some(shards) =
-            crate::sensenova_snapshot::release_shards(dir, &config)
-                .map_err(crate::error::to_core)?
+        let shards = match crate::sensenova_snapshot::release_shards(dir, &config)
+            .map_err(crate::error::to_core)?
         {
-            let mut headers = Vec::with_capacity(shards.len());
-            let mut payload = 0u64;
-            for path in shards {
-                payload = payload
-                    .checked_add(path.metadata()?.len())
-                    .ok_or_else(overflow)?;
-                headers.push(read_safetensors_header(&path)?);
-            }
-            (headers, payload)
-        } else {
-            (
-                safetensors_headers(dir)?,
-                core_llm::checkpoint_payload_bytes(dir)?,
-            )
+            Some(shards) => shards,
+            None => safetensors_shards(dir)?,
         };
+        let mut payload = 0u64;
+        let mut headers = Vec::with_capacity(shards.len());
+        for path in &shards {
+            payload = payload
+                .checked_add(path.metadata()?.len())
+                .ok_or_else(overflow)?;
+            headers.push(read_safetensors_header(path)?);
+        }
+        let source_load_extra = source_load_extra(&shards, &headers)?;
         Ok(Self {
             config,
             headers,
             payload,
             tokenizer_bytes,
+            source_load_extra,
         })
     }
 
@@ -109,7 +108,11 @@ impl SnapshotFacts {
                 derived.max(self.payload.checked_mul(2).ok_or_else(overflow)?)
             }
         };
-        arrays.checked_add(self.host()?).ok_or_else(overflow)
+        let host = self.host()?;
+        arrays
+            .checked_add(self.source_load_extra)
+            .and_then(|v| v.checked_add(host))
+            .ok_or_else(overflow)
     }
 
     /// The arrays a cell `main` verified is charged exactly as `main` charged them
@@ -201,7 +204,11 @@ impl LoadCell {
                 .filter_map(Value::as_object)
                 .flat_map(|h| h.iter())
         };
+        // A source format with its own projection/scale or decode allocations has never
+        // qualified for the measured dense/affine bounds, even beside BF16 layers.
+        let encoded = has_source_encoding(headers);
         let conversion = match quant.map(|q| q.bits) {
+            _ if encoded => None,
             Some(4) => Some(Conversion::LoadQ4),
             Some(8) => Some(Conversion::LoadQ8),
             Some(_) => None,
@@ -419,16 +426,71 @@ fn host_bytes(tokenizer_bytes: u64) -> Result<u64> {
 }
 
 /// Every `*.safetensors` header in `dir`, read header-only.
+#[cfg(test)]
 pub(crate) fn safetensors_headers(dir: &Path) -> Result<Vec<Value>> {
-    let mut headers = Vec::new();
+    safetensors_shards(dir)?
+        .iter()
+        .map(|p| read_safetensors_header(p))
+        .collect()
+}
+
+fn safetensors_shards(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut shards = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| Error::Load(e.to_string()))? {
         let path = entry.map_err(|e| Error::Load(e.to_string()))?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
             continue;
         }
-        headers.push(read_safetensors_header(&path)?);
+        shards.push(path);
     }
-    Ok(headers)
+    shards.sort();
+    Ok(shards)
+}
+
+fn has_source_encoding(headers: &[Value]) -> bool {
+    headers
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|header| header.iter())
+        .any(|(key, info)| {
+            matches!(info["dtype"].as_str(), Some("F8_E4M3" | "F8_E5M2"))
+                || (info["dtype"] == "I8" && key.ends_with(".weight"))
+                || key.ends_with(".comfy_quant")
+                || (key == "__metadata__" && info.get("_quantization_metadata").is_some())
+        })
+}
+
+/// Upper bound for buffers created by the codec in addition to the stored payload. The same
+/// layout used by the loader settles native vs. dense and the actual expert/rotation geometry.
+fn source_load_extra(shards: &[std::path::PathBuf], headers: &[Value]) -> Result<u64> {
+    if !has_source_encoding(headers) {
+        return Ok(0);
+    }
+    let tables = headers
+        .iter()
+        .filter_map(|h| {
+            h["__metadata__"]["_quantization_metadata"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let plan = mlx_layers::source::projection_plan(
+        shards,
+        |_| true,
+        &tables,
+        crate::models::qwen35::stacked_expert_key,
+        crate::primitives::weights::coefficient_key,
+    )
+    .map_err(|e| crate::error::to_core(e.into()))?;
+    match plan {
+        Some(plan) => mlx_layers::source::load_auxiliary_bytes(
+            &plan,
+            |_| true,
+            |n| n.checked_add(ALLOCATION_ROUNDING),
+        )
+        .ok_or_else(overflow),
+        None => Ok(0),
+    }
 }
 
 fn read_safetensors_header(path: &Path) -> Result<Value> {
@@ -453,7 +515,14 @@ fn read_safetensors_header(path: &Path) -> Result<Value> {
 /// The conversion intermediates every `*.safetensors` header in `dir` implies with no load-time
 /// quantization ([`derived_bytes`]), read header-only.
 fn safetensors_dir_extra(dir: &Path) -> Result<u64> {
-    derived_bytes(&safetensors_headers(dir)?, None)
+    let shards = safetensors_shards(dir)?;
+    let headers = shards
+        .iter()
+        .map(|p| read_safetensors_header(p))
+        .collect::<Result<Vec<_>>>()?;
+    derived_bytes(&headers, None)?
+        .checked_add(source_load_extra(&shards, &headers)?)
+        .ok_or_else(overflow)
 }
 
 /// Resident bytes a companion MTP head adds to a load (epic sc-24432 E7, story sc-24444): its
@@ -1114,6 +1183,7 @@ mod tests {
             headers: vec![Value::Object(header)],
             payload,
             tokenizer_bytes: 11_000_000,
+            source_load_extra: 0,
         }
     }
 
@@ -1280,6 +1350,27 @@ mod tests {
         let mut spec = LoadSpec::dense(dir.path().display().to_string());
         spec.quantize = Some(core_llm::Quantize::Nvfp4);
         assert!(required_bytes(&spec).is_err());
+    }
+
+    #[test]
+    fn native_sources_do_not_use_verified_affine_or_dense_bounds() {
+        // The same family, floating sibling, and even requested Q4 cannot certify a checkpoint
+        // with a separate projection representation under a measured dense/affine row.
+        for dtype in ["F8_E4M3", "F8_E5M2", "I8"] {
+            let header = json!({
+                "model.layers.0.mlp.up_proj.weight": {"dtype": dtype, "shape":[64,64]},
+                "model.layers.0.mlp.down_proj.weight": {"dtype":"BF16", "shape":[64,64]},
+            });
+            for quant in [None, Some(QuantSpec::q4())] {
+                let cell = LoadCell::of(
+                    &json!({"model_type":"llama"}),
+                    std::slice::from_ref(&header),
+                    quant,
+                );
+                assert_eq!(cell.conversion, None);
+                assert!(!cell.is_main_verified() && !cell.is_in(MATERIALIZED_VERIFIED));
+            }
+        }
     }
 
     /// Unverified (architecture × conversion) keeps the two-copy bound: MoE checkpoints,
@@ -1674,6 +1765,7 @@ mod tests {
         )
         .unwrap();
         SnapshotFacts {
+            source_load_extra: 0,
             config: v["config"].clone(),
             headers: vec![v["tensors"].clone()],
             payload: v["payload"].as_u64().unwrap(),

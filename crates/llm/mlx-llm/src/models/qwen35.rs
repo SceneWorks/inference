@@ -1418,6 +1418,7 @@ pub struct Qwen35Model {
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
+    pub(crate) native_projections: bool,
     /// The affine spec the quantized projections hold: the snapshot's stored spec when its
     /// quantized triples were loaded, else the load-time spec; `None` for dense or Prism.
     resident_quant: Option<QuantSpec>,
@@ -1536,9 +1537,9 @@ impl Qwen35Model {
         &self.cfg
     }
 
-    /// Whether the large projections were quantized on load.
+    /// Whether the decoder holds native, affine or Prism quantized projections.
     pub fn is_quantized(&self) -> bool {
-        self.quantized
+        self.native_projections || self.quantized
     }
 
     /// The affine spec the quantized projections hold (stored in the snapshot or applied at
@@ -2420,6 +2421,7 @@ impl Qwen35Model {
             let t = req(key)?;
             precision.norm_weight(t, prism.is_some())
         };
+        let bindings_before = w.native_bindings();
         let stored_quant = cfg.quantization;
         if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
             return Err(Error::Config(
@@ -2643,6 +2645,7 @@ impl Qwen35Model {
             eps,
             cfg,
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
+            native_projections: w.native_bindings() != bindings_before,
             resident_quant: match prism {
                 Some(_) => None,
                 None if saw_stored.get() => stored_quant,
@@ -2955,6 +2958,13 @@ impl Qwen35Model {
     /// Qwen3.8 checkpoint convention (`1 + w`) of the official lineage the published heads are
     /// derived from. Every tensor in the head must be consumed.
     pub fn attach_companion_mtp(&mut self, dir: &std::path::Path) -> Result<()> {
+        self.attach_companion_mtp_report(dir).map(|_| ())
+    }
+
+    pub(crate) fn attach_companion_mtp_report(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Result<core_llm::LoadReport> {
         if self.mtp.is_some() {
             return Err(Error::Config(core_llm::COMPANION_MTP_ALREADY_NATIVE.into()));
         }
@@ -3010,7 +3020,7 @@ impl Qwen35Model {
         // The target now carries one predictor layer: what its config prices the head's state by
         // (the prefix-cache snapshot's head KV, sc-24437).
         self.cfg.mtp_num_hidden_layers = 1;
-        Ok(())
+        Ok(w.native_load_report())
     }
 }
 

@@ -238,6 +238,29 @@ impl Weights {
         )
     }
 
+    /// Read ordinary operands on the host at their compute width before placing them one at a time.
+    /// Encoded projections keep the source plan for the final execution device.
+    pub fn from_files_filtered_staged(
+        files: &[std::path::PathBuf],
+        device: &Device,
+        dtype: DType,
+        prefixes: &[&str],
+        place: impl Fn(Tensor) -> Result<Tensor>,
+    ) -> Result<Self> {
+        let st = crate::loader::mmap_safetensors_multi(files)?;
+        Self::from_selected_source(
+            st,
+            files,
+            device,
+            dtype,
+            prefixes,
+            false,
+            "candle-gen::Weights::from_files_filtered_staged",
+            || Ok(()),
+            Some(&place),
+        )
+    }
+
     fn load_selected(
         files: &[impl AsRef<Path>],
         device: &Device,
@@ -257,6 +280,7 @@ impl Weights {
             host_packed,
             proof_site,
             || Ok(()),
+            None,
         )
     }
 
@@ -280,6 +304,7 @@ impl Weights {
             false,
             "candle-gen::Weights::from_authenticated_buffers",
             check,
+            None,
         )
     }
 
@@ -293,6 +318,7 @@ impl Weights {
         host_packed: bool,
         proof_site: &'static str,
         mut check: impl FnMut() -> Result<()>,
+        place_staged: Option<&dyn Fn(Tensor) -> Result<Tensor>>,
     ) -> Result<Self> {
         let mut names = std::collections::BTreeSet::new();
         let mut packed_bases = std::collections::HashSet::new();
@@ -354,7 +380,11 @@ impl Weights {
                         .projection_bias_dtype(&format!("{base}.weight"))
                 })
                 .unwrap_or(dtype);
-            let t = load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?;
+            let t = if let Some(place) = place_staged {
+                place(load_map_tensor(mmap, &key, &Device::Cpu, dtype)?)?
+            } else {
+                load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?
+            };
             weights.map.insert(key, t);
         }
         weights.source = source.ok().map(|src| (src, device.clone(), dtype));

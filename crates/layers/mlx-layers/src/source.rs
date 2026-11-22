@@ -300,6 +300,12 @@ impl SourceReads {
         }
         Ok(())
     }
+    pub fn native_projection_report(&self) -> Vec<core_llm::ProjectionReport> {
+        self.accounting
+            .as_ref()
+            .map(|a| a.native_projection_report())
+            .unwrap_or_default()
+    }
     pub fn receipt(&self) -> Option<LogicalWeightReceipt> {
         self.accounting.as_ref().map(|a| a.receipt())
     }
@@ -322,17 +328,19 @@ pub fn prepare_sources_with_experts(
     prepare_sources_with_layout(tensors, paths, tables, expert_key, |_, _| Dtype::Bfloat16)
 }
 
-/// Determine dense consumer precision from the original storage handles, before decoding either
-/// operand of a mixed-precision module. Encoded matrices selected for native execution stay packed.
-pub fn prepare_sources_with_layout(
-    tensors: &mut HashMap<String, Array>,
+/// Compile the same file-backed operator layout for load admission and materialization.
+pub fn projection_plan(
     paths: &[PathBuf],
+    selected: impl Fn(&str) -> bool,
     tables: &[String],
     expert_key: impl Fn(&str) -> bool,
-    dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
-) -> Result<SourceReads> {
-    struct Layout<F>(F);
-    impl<F: Fn(&str) -> bool> CodecResidencyPolicy for Layout<F> {
+    coefficient_key: impl Fn(&str) -> bool,
+) -> Result<Option<LogicalWeightPlan>> {
+    struct Layout<E, C> {
+        expert: E,
+        coefficient: C,
+    }
+    impl<E: Fn(&str) -> bool, C: Fn(&str) -> bool> CodecResidencyPolicy for Layout<E, C> {
         fn residency(
             &self,
             c: &CheckpointCodecRegistration,
@@ -348,8 +356,11 @@ pub fn prepare_sources_with_layout(
             spec: &TensorCodecSpec,
             shape: &[usize],
         ) -> ResidencyMode {
+            if (self.coefficient)(key) {
+                return ResidencyMode::Dense;
+            }
             if shape.len() == 3
-                && (self.0)(key)
+                && (self.expert)(key)
                 && metal_available()
                 && matches!(
                     spec,
@@ -360,15 +371,115 @@ pub fn prepare_sources_with_layout(
                 )
             {
                 ResidencyMode::Packed
+            } else if (self.expert)(key) {
+                self.residency(c, spec, shape)
             } else {
-                if (self.0)(key) {
-                    self.residency(c, spec, shape)
-                } else {
-                    MlxCodecResidency.residency_for_key(key, c, spec, shape)
-                }
+                MlxCodecResidency.residency_for_key(key, c, spec, shape)
             }
         }
     }
+    plan_projection_sources(
+        paths,
+        selected,
+        tables,
+        registry(),
+        &Layout {
+            expert: expert_key,
+            coefficient: coefficient_key,
+        },
+    )
+    .map_err(|e| Error::Msg(e.to_string()))
+}
+
+/// Conservative additional load buffers of the selected encoded source operands. Physical
+/// codes, scales and biases are priced by the checkpoint plan. A device's allocator supplies
+/// the footprint of one allocation, including rounding. Counts are derived from the shared
+/// constructors and coefficient decode, without evaluating a tensor.
+pub fn load_auxiliary_bytes(
+    plan: &LogicalWeightPlan,
+    selected: impl Fn(&str) -> bool,
+    allocation: impl Fn(u64) -> Option<u64>,
+) -> Option<u64> {
+    let mut extra = 0u64;
+    let mut rotations = std::collections::BTreeSet::new();
+    let scales: HashMap<_, _> = plan
+        .companions
+        .iter()
+        .map(|c| (c.physical_key.as_str(), c.source_bytes))
+        .collect();
+    let mut add = |bytes: u64, allocations: u64| -> Option<()> {
+        extra = extra.checked_add(allocation(bytes)?.checked_mul(allocations)?)?;
+        Some(())
+    };
+    for row in plan.tensors.iter().filter(|r| selected(&r.physical_key)) {
+        // Only these codecs construct auxiliary buffers in bind_layout_with_dtypes.
+        if !matches!(
+            row.codec,
+            TensorCodecSpec::ConvRotInt8 { .. }
+                | TensorCodecSpec::ScalarFp8 { .. }
+                | TensorCodecSpec::RowwiseFp8 { .. }
+                | TensorCodecSpec::Mxfp8 { .. }
+        ) {
+            continue;
+        }
+        if row.residency.mode == ResidencyMode::Packed {
+            // Source normalization creates a small descriptor, and scalar FP8 can bind
+            // one default unit scale and two F32-converted weight/input scale operands.
+            add(gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64, 1)?;
+            match &row.codec {
+                TensorCodecSpec::ConvRotInt8 { geometry, .. }
+                    if rotations.insert(geometry.rotation_group) =>
+                {
+                    // from_slice copies the host rotation into its one shared MLX array.
+                    let group = geometry.rotation_group as u64;
+                    add(group.checked_mul(group).and_then(|n| n.checked_mul(4))?, 2)?;
+                }
+                TensorCodecSpec::ScalarFp8 { .. }
+                | TensorCodecSpec::RowwiseFp8 { .. }
+                | TensorCodecSpec::Mxfp8 { .. } => add(4, 3)?,
+                _ => {}
+            }
+        } else {
+            // E4M3 decode can create three byte masks, two decoded F32 buffers and one
+            // scaled F32 result before the BF16 coefficient buffer. E5M2's two U16
+            // shifts also fit this bound. Price the padded source extent for MXFP8.
+            let elements = row.source_bytes;
+            // Scalar constants for the decode predicates, NaN replacement and scales.
+            add(4, 8)?;
+            add(elements, 3)?;
+            add(elements.checked_mul(4)?, 3)?;
+            add(elements.checked_mul(2)?, 1)?;
+            if let TensorCodecSpec::Mxfp8 { scale, .. } = &row.codec {
+                // Unswizzle, exponent conversion, subtraction, power, NaN selection.
+                add(scales.get(scale.as_str())?.checked_mul(4)?, 6)?;
+            }
+        }
+    }
+    Some(extra)
+}
+
+/// Determine dense consumer precision from the original storage handles, before decoding either
+/// operand of a mixed-precision module. Encoded matrices selected for native execution stay packed.
+pub fn prepare_sources_with_layout(
+    tensors: &mut HashMap<String, Array>,
+    paths: &[PathBuf],
+    tables: &[String],
+    expert_key: impl Fn(&str) -> bool,
+    dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
+) -> Result<SourceReads> {
+    prepare_sources_for_consumers(tensors, paths, tables, expert_key, |_| false, dense_dtype)
+}
+
+/// Retain operator operands according to their declared use. A matrix-shaped coefficient table
+/// (for example multidimensional LayerNorm weights) must be decoded before elementwise use.
+pub fn prepare_sources_for_consumers(
+    tensors: &mut HashMap<String, Array>,
+    paths: &[PathBuf],
+    tables: &[String],
+    expert_key: impl Fn(&str) -> bool,
+    coefficient_key: impl Fn(&str) -> bool,
+    dense_dtype: impl Fn(&str, &HashMap<String, Array>) -> Dtype,
+) -> Result<SourceReads> {
     if tables.is_empty()
         && !tensors
             .values()
@@ -376,14 +487,13 @@ pub fn prepare_sources_with_layout(
     {
         return Ok(SourceReads::default());
     }
-    let Some(plan) = plan_projection_sources(
+    let Some(plan) = projection_plan(
         paths,
         |k| tensors.contains_key(k),
         tables,
-        registry(),
-        &Layout(&expert_key),
-    )
-    .map_err(|e| Error::Msg(e.to_string()))?
+        &expert_key,
+        coefficient_key,
+    )?
     else {
         return Ok(SourceReads::default());
     };
@@ -513,4 +623,60 @@ fn bind_layout_with_dtypes(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn selected_native_rotations_charge_one_shared_allocation_pair() {
+        let row = |base: &str| {
+            let shape = vec![32, 64];
+            LogicalTensorPlan {
+                logical_key: format!("{base}.weight"),
+                physical_key: format!("{base}.weight"),
+                encoding: WeightEncoding::Int8,
+                codec_id: gen_core::convrot_int8::CODEC_ID,
+                resident_encoding: WeightEncoding::DenseBf16,
+                codec: TensorCodecSpec::ConvRotInt8 {
+                    scale: format!("{base}.weight_scale"),
+                    geometry: gen_core::convrot_int8::ConvRotInt8::from_geometry(
+                        64,
+                        &shape,
+                        &[32, 1],
+                    )
+                    .unwrap(),
+                },
+                shape,
+                source_bytes: 32 * 64,
+                residency: PlannedResidency {
+                    mode: ResidencyMode::Packed,
+                    resident_bytes: 32 * 64,
+                },
+                transform: None,
+            }
+        };
+        let plan = LogicalWeightPlan {
+            mapping_id: "test",
+            tensors: vec![row("a"), row("b")],
+            companions: vec![],
+            source_bytes: 2 * 32 * 64,
+        };
+        let descriptor = gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES as u64;
+        let rotation = 64 * 64 * 4 * 2;
+        assert_eq!(
+            load_auxiliary_bytes(&plan, |_| true, Some),
+            Some(2 * descriptor + rotation)
+        );
+        assert_eq!(
+            load_auxiliary_bytes(&plan, |key| key == "b.weight", Some),
+            Some(descriptor + rotation)
+        );
+        assert_eq!(load_auxiliary_bytes(&plan, |_| false, Some), Some(0));
+        assert_eq!(
+            load_auxiliary_bytes(&plan, |_| true, |_| Some(u64::MAX)),
+            None
+        );
+    }
 }

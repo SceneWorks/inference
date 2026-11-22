@@ -1617,6 +1617,54 @@
         "darwin"
       ],
       "reason": "Checks admission metadata, request guards and exact receipt forwarding through a bound transform with fake delegates. The transform clones image bytes and the depth fake returns a typed error. No model load or compute executes."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_memory::tests::native_sources_do_not_use_verified_affine_or_dense_bounds",
+      "source": "crates/llm/mlx-llm/src/load_memory.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only synthetic JSON tensor headers, cell classification and verified-table comparisons are evaluated."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::numeric_policy_tests::dense_and_quantized_loads_both_observe_resident_numeric_policy",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only backend-neutral LoadReport values and JSON execution identity fields are constructed and compared."
+    },
+    {
+      "package": "mlx-layers",
+      "kind": "lib",
+      "target": "mlx_layers",
+      "test": "source::admission_tests::selected_native_rotations_charge_one_shared_allocation_pair",
+      "source": "crates/layers/mlx-layers/src/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Exercises checked byte arithmetic, tensor selection and rotation deduplication on two synthetic plan rows. No arrays, devices or operators are constructed."
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "weights::tests::native_component_windows_keep_companions_observations_and_constructor_reads",
+      "source": "crates/media/mlx-gen/src/weights.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Array-handle and source-layout metadata only: validates companion remapping, alias observations, atomic refusal and constructor-read tracking without tensor evaluation, projection construction, forward or kernel execution."
     }
   ]
 }

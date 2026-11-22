@@ -746,7 +746,7 @@ pub(crate) fn backbone_bytes_from_headers(
     Ok(total)
 }
 
-use crate::text_encoder::{LANGUAGE_HEAD_KEY, LANGUAGE_TOWER_PREFIX};
+use crate::text_encoder::{is_text_tower_tensor, LANGUAGE_TOWER_PREFIX};
 
 /// Resident bytes of the text encoder as [`crate::text_encoder::IrisTextEncoder::load_quantized`]
 /// builds it at `quant`.
@@ -793,7 +793,7 @@ pub(crate) fn text_encoder_bytes(dir: &Path, quant: Option<gen_core::Quant>) -> 
                 }
                 _ => ResidentProjection::Bfloat16,
             }
-        } else if untied_head && header.name == LANGUAGE_HEAD_KEY {
+        } else if is_text_tower_tensor(&header.name, untied_head) {
             ResidentProjection::Bfloat16
         } else {
             ResidentProjection::Omit
