@@ -138,8 +138,10 @@ class MaterializeTests(unittest.TestCase):
         plan = self.root / "plan.json"
         plan.write_text(json.dumps({"backend": "candle-cuda", "selected": 1, "bindings": [case],
                                     "configurations": {case: {"name": "fixed_cuda"}}}), encoding="utf-8")
+        work = self.root / 't' / '1234abcd'; work.mkdir(parents=True)
+        (work / '.actions-owner.json').write_text(json.dumps(dict(repository='SceneWorks/inference', run='1', attempt='1', job='prove', runner='unit')), encoding='utf-8')
         with patch.object(bespoke, "materialize", fake), patch("sys.argv", ["x", "--plan", str(plan)]), \
-                patch.dict(os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}):
+                patch.dict(os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_REPOSITORY": "SceneWorks/inference", "GITHUB_JOB": "prove", "RUNNER_NAME": "unit", "DEV_HOST_ROOT": str(self.root), "DEV_HOST_JOB_ROOT": str(work), "HF_HOME": "E:/huggingface", "HF_HUB_CACHE": "E:/huggingface/hub", "HUGGINGFACE_HUB_CACHE": "E:/huggingface/hub"}):
             with self.assertRaisesRegex(RuntimeError, "download refused"):
                 bespoke.main()
         self.assertEqual(calls, [bespoke.BESPOKE_TRAINING_PROOFS[case]])

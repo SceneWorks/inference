@@ -518,10 +518,10 @@ def automatic_jobs(workflow: dict, event: str, extra_context: dict | None = None
 # the pure test uses fake storage/process/API inputs. Bind the complete local action/test closure
 # rather than treating arbitrary Node programs or JavaScript actions as ordinary CI commands.
 REVIEWED_STORAGE_CLEANUP = {
-    '.github/actions/cleanup-runner-storage/action.yml': 'af221193e9b1d5a2cadecd048a9922f9d783cd278583e7320ec5d03f9d1143b1',
-    '.github/actions/cleanup-runner-storage/index.mjs': '49ac6fc7b0f679a3c07a31a788b9e7858db83b118736e6679692ba0aae639f1b',
-    '.github/actions/cleanup-runner-storage/storage.ps1': 'ce0adc2af81eb99e158c7758c6dbab3a3c817dc845be9337a1726534b26ed269',
-    'scripts/runner-storage-cleanup.test.mjs': '7d2e2101535e13a095dea5e5e8937e02776f415b7ee901130876e593d2b8e2a8',
+    '.github/actions/cleanup-runner-storage/action.yml': '38d80621d810fb9ec426f585045182316bf44a801069310da97eca06e87d8eb3',
+    '.github/actions/cleanup-runner-storage/index.mjs': '0fd73ef24c05a96b16559955633f2b619bf58ca8796121dfa9a868d1eac028c9',
+    '.github/actions/cleanup-runner-storage/storage.ps1': '8b45b76fc66dc0966c4f65dfa443caa66a06a12a1588a61c7d945227a9a3794e',
+    'scripts/runner-storage-cleanup.test.mjs': 'c6412777106959b25a08f38e9803b6031aae74f52dbd82b73d123f15185061aa',
 }
 
 # These exact sources package and fetch a static CUDA archive. The fetcher's CLI can

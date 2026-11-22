@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.ci.proof_asset_snapshots import Input, manifest_bindings, manifest_keys, materialize  # noqa: E402
@@ -81,6 +81,25 @@ def validate_paths(bindings: dict[str, Path]) -> None:
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError(f"missing/empty pinned installed asset {name}: {path}")
 
+
+def owned_runtime_root(identity: str, environ: dict | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    run = env["GITHUB_RUN_ID"] + "-" + env["GITHUB_RUN_ATTEMPT"]
+    if not re.fullmatch(r"[0-9]+-[0-9]+", run): raise ValueError("invalid runner run identity")
+    work = Path(env["DEV_HOST_JOB_ROOT"])
+    parent = Path(env["DEV_HOST_ROOT"]) / "t"
+    if work.is_symlink() or work.resolve().parent != parent.resolve() or not re.fullmatch(r"[a-f0-9]{8}", work.name):
+        raise ValueError("bespoke runtime must be in a dev-host t/ entry")
+    owner = json.loads((work / ".actions-owner.json").read_text(encoding="utf-8"))
+    for field, key in (("repository", "GITHUB_REPOSITORY"), ("run", "GITHUB_RUN_ID"), ("attempt", "GITHUB_RUN_ATTEMPT"), ("job", "GITHUB_JOB"), ("runner", "RUNNER_NAME")):
+        if owner.get(field) != env[key]: raise ValueError("bespoke runtime requires this exact job's managed temp directory")
+    if PureWindowsPath(env.get("HF_HOME", "")).as_posix().lower() != "e:/huggingface":
+        raise ValueError("Windows proof model downloads must use E:/huggingface")
+    for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if env.get(key) and PureWindowsPath(env[key]).as_posix().lower() != "e:/huggingface/hub":
+            raise ValueError("Windows proof model downloads must use E:/huggingface/hub")
+    return work / "model-proofs" / run / identity.split("::")[-1]
+
 def main() -> int:
     from scripts.ci.training_comparison import is_recipe
     parser = argparse.ArgumentParser(description=__doc__)
@@ -93,14 +112,12 @@ def main() -> int:
             or len(identities) != 1 or identities[0] not in BESPOKE_TRAINING_PROOFS
             or (configs.get(identities[0], {}).get("name") != "fixed_cuda" and not is_recipe(configs.get(identities[0], {}).get("name")))):
         raise ValueError("bespoke asset setup requires one exact reviewed fixed_cuda case")
-    # Downloads any missing pinned input into the runner's hub cache before the metadata checks.
-    bindings = materialize(BESPOKE_TRAINING_PROOFS[identities[0]])
-    validate_paths(bindings)
     # This directory is deliberately OUTSIDE artifact publication and the checkout.
     # Full Iris exports/recovery states and ControlNet weights are not LoRA files.
-    run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-    if not re.fullmatch(r"[0-9]+-[0-9]+", run): raise ValueError("invalid runner run identity")
-    runtime = Path("D:/sceneworks-runtime/model-proofs/sc-26850") / run / identities[0].split("::")[-1]
+    runtime = owned_runtime_root(identities[0])
+    # Downloads stay in E:\huggingface; only generated proof state belongs in job storage.
+    bindings = materialize(BESPOKE_TRAINING_PROOFS[identities[0]])
+    validate_paths(bindings)
     runtime.mkdir(parents=True, exist_ok=False)
     (runtime / ".sc-26850-owned-runtime").write_text(identities[0] + "\n", encoding="utf-8")
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
