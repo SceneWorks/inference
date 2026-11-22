@@ -21,6 +21,18 @@ enum WeightStorage {
     DetectPacked,
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn combined_fp8_qwen3_q_projection(vb: &VarBuilder) -> Result<QLinear> {
+    let cfg = TextEncoderConfig::z_image();
+    WeightStorage::Dense.linear(
+        vb,
+        "q_proj",
+        cfg.hidden_size,
+        cfg.num_attention_heads * cfg.head_dim,
+        cfg.attention_bias,
+    )
+}
+
 impl WeightStorage {
     fn linear(
         self,

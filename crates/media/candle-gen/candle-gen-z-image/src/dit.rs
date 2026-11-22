@@ -105,6 +105,27 @@ enum Projection {
     Inference(AdaptLinear),
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn combined_fp8_attention_projection(
+    vb: &VarBuilder,
+    name: &str,
+) -> Result<AdaptLinear> {
+    let cfg = Config::z_image_turbo();
+    let projection = Projection::load(
+        cfg.dim,
+        cfg.n_heads * cfg.head_dim(),
+        vb,
+        name,
+        false,
+        Execution::Inference,
+        None,
+    )?;
+    let Projection::Inference(linear) = projection else {
+        unreachable!("imported attention uses the inference projection");
+    };
+    Ok(linear)
+}
+
 impl Projection {
     fn load(
         in_dim: usize,

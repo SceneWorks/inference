@@ -105100,6 +105100,62 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
+    "fqn": "comfyui::tests::combined_fp8_native_projection_owners",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/comfyui.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_z_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Deterministic source-generated combined Z-Image E4M3 bytes at shipping projection widths. Physical layout from SeeSee21/Z-Image-Turbo-AIO@c9cab2ab0d2403d3795e8f23a36c3510e312ae72/z-image-turbo-fp8-aio.safetensors header SHA-256 203c881eeb7b4493049abf3f65092b6f331317c54d68b9f5d931bab8de9a508e. One fused DiT QKV projection, one Qwen3 query projection, one BF16 VAE namespace sentinel, standalone scalar controls.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/comfyui.rs::comfyui::tests::combined_fp8_native_projection_owners",
+    "required_environment": [],
+    "device_witness": "The test observes all eight BF16 projection outputs on the selected CUDA device after verifying their actual stored E4M3 operand types and native device ownership.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Compare all fused QKV row products and the Qwen3 query products to the independently specified one-hot coefficient oracle.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/comfyui.rs::comfyui::tests::combined_fp8_native_projection_owners/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Open the sealed combined checkpoint through the production component reader for plain and scalar E4M3. Assert disjoint component ownership, native CUDA projection residency, exact fused QKV row selection and Qwen3 query products in BF16 without a full model load."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/comfyui.rs::comfyui::tests::combined_fp8_native_projection_owners",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-z-image",
+    "target": "candle_gen_z_image",
+    "target_kind": "lib",
     "fqn": "adapters::tests::resolve_lora_matches_fold_on_dense",
     "source": "crates/media/candle-gen/candle-gen-z-image/src/adapters.rs",
     "cargo_target_metadata": {
