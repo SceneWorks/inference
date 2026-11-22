@@ -13,6 +13,8 @@ test-support = []
 model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "core-llm/model-inference-proof"]
 
 [dependencies]
+bytemuck = "1"
+half = { version = "2", features = ["bytemuck"] }
 sceneworks-gen-core = { workspace = true }
 core-llm = { workspace = true }
 mlx-rs = { workspace = true }

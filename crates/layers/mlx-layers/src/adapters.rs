@@ -1439,7 +1439,7 @@ impl AdaptableLinear {
                 weight: Param::new(weight),
                 bias: Param::new(bias),
             };
-            let q = QuantizedLinear::try_from_linear(
+            let q = crate::quantization_cache::quantize_linear_cached(
                 linear,
                 group_size.unwrap_or(crate::quant::DEFAULT_GROUP_SIZE),
                 bits,

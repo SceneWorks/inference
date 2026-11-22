@@ -1000,3 +1000,5 @@ mod tests {
         Ok(())
     }
 }
+
+pub use candle_layers::quantization_cache::{quantize_cached, quantize_on_source_device_cached};

@@ -122,21 +122,7 @@ fn is_row_major(x: &Array) -> bool {
 
 /// MLX's `contiguous` op (not wrapped by mlx-rs): a row-major copy unless already row-contiguous.
 fn mlx_contiguous(x: &Array) -> Result<Array> {
-    let stream = mlx_rs::StreamOrDevice::default();
-    // SAFETY: on success `mlx_contiguous` writes a new owned handle into `result`, which
-    // `Array::from_ptr` takes ownership of; on failure the empty handle is freed here.
-    unsafe {
-        let mut result = mlx_sys::mlx_array_new();
-        let status =
-            mlx_sys::mlx_contiguous(&mut result, x.as_ptr(), false, stream.as_ref().as_ptr());
-        if status != 0 {
-            mlx_sys::mlx_array_free(result);
-            return Err(Error::Msg(
-                "mlx_contiguous failed while making a row-major copy".into(),
-            ));
-        }
-        Ok(Array::from_ptr(result))
-    }
+    Ok(mlx_layers::contiguous_weight(x)?)
 }
 
 /// Split `shape` into two contiguous dimension groups `[a, b]` (`a·b == Π shape`) with each factor

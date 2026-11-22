@@ -21,7 +21,7 @@ use std::path::Path;
 
 use candle_gen::attention::repeat_kv;
 use candle_gen::attention::AttentionPlan;
-use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
+use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
@@ -625,7 +625,7 @@ impl Loader<'_> {
         // Candle's quantizer reads the source's backing storage from its start, so hand it owned,
         // zero-offset storage.
         let host = host.force_contiguous()?;
-        let packed = QTensor::quantize_onto(&host, dtype, &self.weights.device)?;
+        let packed = candle_gen::quant::quantize_cached(&host, dtype, &self.weights.device)?;
         drop(host);
         self.weights.hold(packed.storage_size_in_bytes() as u64);
         let bias = if bias {

@@ -617,7 +617,7 @@ impl QuantizedLinear {
             DType::F32 => weight.force_contiguous()?,
             _ => weight.to_dtype(DType::F32)?,
         };
-        let qt = QTensor::quantize(&source, dtype)?;
+        let qt = crate::quantization_cache::quantize_on_source_device_cached(&source, dtype)?;
         Ok(Self {
             inner: QuantizedWeight::Matmul(QMatMul::from_qtensor(qt)?),
             bias,
@@ -639,7 +639,7 @@ impl QuantizedLinear {
             DType::F32 => source.force_contiguous()?,
             _ => source.to_dtype(DType::F32)?,
         };
-        let qt = QTensor::quantize_onto(&source, dtype, weight.device())?;
+        let qt = crate::quantization_cache::quantize_cached(&source, dtype, weight.device())?;
         Ok(Self {
             inner: QuantizedWeight::Dequant(std::sync::Arc::new(qt)),
             bias,
@@ -718,7 +718,7 @@ impl QuantizedLinear {
             }
         }
         let dense = Tensor::from_vec(grid, (out_dim, in_dim), &cpu)?;
-        let qt = QTensor::quantize_onto(&dense, GgmlDType::Q8_0, device)?;
+        let qt = crate::quantization_cache::quantize_cached(&dense, GgmlDType::Q8_0, device)?;
         Ok(Self {
             inner: QuantizedWeight::Dequant(std::sync::Arc::new(qt)),
             bias,
