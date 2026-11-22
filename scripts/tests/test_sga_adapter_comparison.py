@@ -18,6 +18,25 @@ REQUEST = {"selection": "sga-adapter-tier1", "profile": wan.PROFILE,
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_windows_comparison_uses_its_own_registered_dev_host_directory(self):
+        with tempfile.TemporaryDirectory() as stage:
+            dev_host = Path(stage).resolve()
+            work = dev_host / "t" / "ab123456"
+            work.mkdir(parents=True)
+            env = {"RUNNER_TEMP": str(dev_host / "artifacts"), "DEV_HOST_ROOT": str(dev_host),
+                   "DEV_HOST_JOB_ROOT": str(work), "GITHUB_REPOSITORY": "SceneWorks/inference",
+                   "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "explicit",
+                   "RUNNER_NAME": "cuda-windows"}
+            owner = {"repository": "SceneWorks/inference", "run": "123", "attempt": "1",
+                     "job": "explicit", "runner": "cuda-windows"}
+            (work / ".actions-owner.json").write_text(json.dumps(owner), encoding="utf-8")
+            self.assertEqual(compare.attempt_work_root(env, "candle-cuda"), work)
+            self.assertEqual(compare.attempt_work_root(env, "mlx"), dev_host / "artifacts")
+            with self.assertRaisesRegex(ValueError, "owned by a different Actions job"):
+                compare.attempt_work_root(dict(env, GITHUB_RUN_ATTEMPT="2"), "candle-cuda")
+            with self.assertRaisesRegex(ValueError, "requires the registered dev-host"):
+                compare.attempt_work_root(dict(env, DEV_HOST_JOB_ROOT=stage), "candle-cuda")
+
     def test_only_source_owned_profile_and_secondary_runner(self):
         self.assertIs(compare.request_value("mlx", REQUEST), wan)
         for backend, supplied in (

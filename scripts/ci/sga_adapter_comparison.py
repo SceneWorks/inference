@@ -172,6 +172,23 @@ def attempt_identity(env):
     return {"run_id": run, "run_attempt": attempt}
 
 
+def attempt_work_root(env, backend):
+    if backend != "candle-cuda":
+        return Path(env["RUNNER_TEMP"])
+    parent = Path(env["DEV_HOST_ROOT"]) / "t"
+    root = Path(env["DEV_HOST_JOB_ROOT"])
+    if not parent.is_absolute() or root.parent != parent or not re.fullmatch(r"[0-9a-f]{8}", root.name):
+        raise ValueError("Windows SGA proof requires the registered dev-host job directory")
+    proof.unlinked_path(root, parent)
+    owner_path = bounded_owned_file(root / ".actions-owner.json", root, 4096)
+    owner = json.loads(owner_path.read_text(encoding="utf-8"), object_pairs_hook=wan.unique_object)
+    expected = dict(repository=env["GITHUB_REPOSITORY"], run=env["GITHUB_RUN_ID"],
+                    attempt=env["GITHUB_RUN_ATTEMPT"], job=env["GITHUB_JOB"], runner=env["RUNNER_NAME"])
+    if not isinstance(owner, dict) or any(owner.get(key) != value for key, value in expected.items()):
+        raise ValueError("Windows dev-host directory is owned by a different Actions job")
+    return root
+
+
 def validate_guard(row, policy=POLICY):
     if (type(row.get("returncode")) is not int or row["returncode"] != 0
             or type(row.get("pid")) is not int or row["pid"] <= 0
@@ -206,13 +223,14 @@ def execute(args, contract):
         raise ValueError("adapter comparison requires the registered self-hosted proof lane")
     identity = attempt_identity(env)
     tmp = Path(env["RUNNER_TEMP"])
+    work_root = attempt_work_root(env, backend)
     artifact = proof.owned_output(args.output, tmp)
     profile = PROFILES[backend, contract["request"]["profile"]]
     receipt = {**contract, **identity, "accepted": False, "arms": {}, "files": {}}
     proof.write_json(artifact / "receipt.json", receipt)
     baseline = ROOT / "sga-adapter-baseline"
-    work = tmp / f"sga-adapter-{receipt['run_id']}-{receipt['run_attempt']}"
-    proof.unlinked_path(work, tmp)
+    work = work_root / f"sga-adapter-{receipt['run_id']}-{receipt['run_attempt']}"
+    proof.unlinked_path(work, work_root)
     work.mkdir()
     try:
         if paired.git(baseline, "rev-parse", "HEAD") != BASE:
@@ -275,7 +293,8 @@ def execute(args, contract):
     finally:
         try:
             paired.remove_source_worktrees(work, {"base": baseline, "head": ROOT})
-            paired.remove_work(work, tmp)
+            if backend != "candle-cuda":
+                paired.remove_work(work, work_root)
         except (OSError, ValueError, subprocess.SubprocessError):
             receipt["accepted"] = False
             receipt["cleanup_failed"] = True

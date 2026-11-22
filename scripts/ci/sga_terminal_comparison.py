@@ -213,12 +213,13 @@ def execute(args, contract, profile):
         raise ValueError("terminal comparisons require the self-hosted real-weights lane")
     identity = source_pair.attempt_identity(env)
     tmp = Path(env["RUNNER_TEMP"])
+    work_root = source_pair.attempt_work_root(env, args.backend)
     artifact = proof.owned_output(args.output, tmp)
     receipt = {**contract, **identity, "accepted": False, "arms": {}, "files": {}}
     proof.write_json(artifact / "receipt.json", receipt)
-    work = tmp / f"sga-terminal-{identity['run_id']}-{identity['run_attempt']}"
+    work = work_root / f"sga-terminal-{identity['run_id']}-{identity['run_attempt']}"
     baseline = ROOT / "sga-terminal-baseline"
-    proof.unlinked_path(work, tmp)
+    proof.unlinked_path(work, work_root)
     work.mkdir()
     try:
         if paired.git(baseline, "rev-parse", "HEAD") != BASE:
@@ -305,7 +306,8 @@ def execute(args, contract, profile):
     finally:
         try:
             paired.remove_source_worktrees(work, {"base": baseline, "head": ROOT})
-            paired.remove_work(work, tmp)
+            if not cuda:
+                paired.remove_work(work, work_root)
         except (OSError, ValueError, subprocess.SubprocessError):
             receipt["accepted"] = False
             receipt["cleanup_failed"] = True
