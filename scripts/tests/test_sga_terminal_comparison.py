@@ -57,13 +57,13 @@ class TerminalTests(unittest.TestCase):
                         [*lines[:-1], lines[-1].replace(" 74", " 81")]):
             with self.assertRaisesRegex(ValueError, "Wan diagnostic"):
                 wan.observe_memory("\n".join(invalid), pool)
-        host = {"pid": 201, "sample_count": 1, "working_set": {"bytes": 600, "at_unix_ns": start},
+        host = {"pid": 201, "sample_count": 1, "pid_sample_count": 1, "working_set": {"bytes": 600, "at_unix_ns": start},
                 "private_usage": {"bytes": 250, "at_unix_ns": start}, "job_peak": {"bytes": 500, "at_unix_ns": start}}
         guard = {"pid": 201, "peak_host_bytes": 600, "samples": [{"sample_kind": "process"}],
                  "windows_host_peaks": host}
         self.assertEqual(wan.observe_windows_host(guard), host)
-        for invalid in (dict(host, pid=202), dict(host, sample_count=2), dict(host, job_peak={"bytes": 700,
-                                                                                            "at_unix_ns": start})):
+        for invalid in (dict(host, pid=202), dict(host, sample_count=2), dict(host, pid_sample_count=0),
+                        dict(host, pid_sample_count=2), dict(host, job_peak={"bytes": 700, "at_unix_ns": start})):
             with self.assertRaisesRegex(ValueError, "exact single-child"):
                 wan.observe_windows_host(dict(guard, windows_host_peaks=invalid))
 

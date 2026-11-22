@@ -5,10 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from scripts import media_campaign_windows as windows
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
-from scripts.media_campaign_supervisor import SupervisionError
+from scripts.ci.wan_adapter_tier2_fixture import observe_windows_host
+from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
 
 UUID = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
@@ -66,12 +68,47 @@ class PairCudaProbeTests(unittest.TestCase):
             with patch("scripts.ci.flux1_pair.cuda_probe.time.time_ns", return_value=at):
                 self.assertEqual(self.probe.tree_footprint(self.owner), max(working, private, job))
         self.assertEqual(self.probe.windows_footprint_peaks, {
-            "pid": 123, "sample_count": 3, "working_set": {"bytes": 500, "at_unix_ns": 1},
+            "pid": 123, "sample_count": 3, "pid_sample_count": 3, "working_set": {"bytes": 500, "at_unix_ns": 1},
             "private_usage": {"bytes": 600, "at_unix_ns": 2}, "job_peak": {"bytes": 700, "at_unix_ns": 3},
         })
         self.probe.windows_footprint_peaks = None
         self.assertEqual(self.probe.tree_footprint(self.owner), 700)
         self.assertIsNone(self.probe.windows_footprint_peaks)
+
+    def test_exiting_pid_leaves_authentic_job_peak_for_guard_and_diagnostic_replay(self):
+        job_peaks = iter((450, 800))
+
+        def query_job(_handle, _info_class, output, _size, _returned):
+            output._obj.PeakJobMemoryUsed = next(job_peaks)
+            return True
+
+        def memory_info(_process, output, _size):
+            output._obj.WorkingSetSize = 500
+            output._obj.PrivateUsage = 300
+            return True
+
+        job = windows.WindowsJob.__new__(windows.WindowsJob)
+        job.handle = 1
+        job.members = Mock(side_effect=({123}, {123}, set()))
+        job.kernel = SimpleNamespace(OpenProcess=Mock(side_effect=(1, None)), CloseHandle=Mock(),
+                                     QueryInformationJobObject=query_job)
+        job.psapi = SimpleNamespace(GetProcessMemoryInfo=memory_info)
+        self.probe.system = SystemProbe.__new__(SystemProbe)
+        self.probe.system.policy = SimpleNamespace(backend="windows-cuda")
+        self.probe.windows_footprint_peaks = {}
+        samples = []
+        for at in (1, 2):
+            with patch("scripts.ci.flux1_pair.cuda_probe.time.time_ns", return_value=at):
+                samples.append({"sample_kind": "process", "peak_bytes": self.probe.tree_footprint(job)})
+        host = self.probe.windows_footprint_peaks
+        self.assertEqual(job.last_footprint_details["processes"], [])
+        self.assertEqual([sample["peak_bytes"] for sample in samples], [500, 800])
+        self.assertEqual(host, {"pid": 123, "sample_count": 2, "pid_sample_count": 1,
+                                "working_set": {"bytes": 500, "at_unix_ns": 1},
+                                "private_usage": {"bytes": 300, "at_unix_ns": 1},
+                                "job_peak": {"bytes": 800, "at_unix_ns": 2}})
+        self.assertEqual(observe_windows_host({"pid": 123, "peak_host_bytes": 800, "samples": samples,
+                                               "windows_host_peaks": host}), host)
 
     def test_rejects_wrong_or_absent_owner_uuid_and_zero_or_unknown_counters(self):
         for change in ({"pid": 456}, {"cudaDeviceUuid": "GPU-00000000-0000-0000-0000-000000000000"},

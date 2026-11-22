@@ -289,8 +289,9 @@ def observe_windows_host(guard):
     row = guard.get("windows_host_peaks")
     kinds = ("working_set", "private_usage", "job_peak")
     samples = [sample for sample in guard["samples"] if sample.get("sample_kind") == "process"]
-    if (not isinstance(row, dict) or set(row) != {"pid", "sample_count", *kinds}
+    if (not isinstance(row, dict) or set(row) != {"pid", "sample_count", "pid_sample_count", *kinds}
             or row["pid"] != guard["pid"] or type(row["sample_count"]) is not int
+            or type(row["pid_sample_count"]) is not int or not 0 < row["pid_sample_count"] <= row["sample_count"]
             or not 0 < row["sample_count"] == len(samples)
             or any(not isinstance(item := row[kind], dict) or set(item) != {"bytes", "at_unix_ns"}
                    or type(item["bytes"]) is not int or item["bytes"] <= 0
