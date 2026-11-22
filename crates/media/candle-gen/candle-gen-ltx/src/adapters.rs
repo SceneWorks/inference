@@ -11,9 +11,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::{weightsmeta, AdapterKind, AdapterSpec};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::{weightsmeta, AdapterKind, AdapterSpec, CancelFlag};
 use candle_gen::quant::LokrFactors;
+use candle_gen::residency::check_cancel;
 use candle_gen::train::lora::{parse_lokr_metadata, LoraAdapterMeta};
 use candle_gen::train::merge::{
     has_diff_patch_keys, parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, LoraTriple,
@@ -86,10 +87,10 @@ enum AdapterFormat {
 }
 
 #[derive(Clone, Copy)]
-enum InstallPolicy {
+enum InstallPolicy<'a> {
     Ltx23,
     Ltx25,
-    Ltx25Dev,
+    Ltx25Dev(&'a CancelFlag),
 }
 
 fn classify_format(spec: &AdapterSpec, file: &AdapterFile) -> Result<AdapterFormat> {
@@ -296,6 +297,29 @@ fn ltx25_factor_rank(declared_rank: usize, in_features: usize, out_features: usi
     declared_rank.min(in_features).min(out_features)
 }
 
+fn prepare_lora_pair(
+    down: Tensor,
+    up: Tensor,
+    scale: f64,
+    device: &Device,
+    refinement_cancel: Option<&CancelFlag>,
+) -> Result<(Tensor, Tensor)> {
+    if let Some(cancel) = refinement_cancel {
+        check_cancel(cancel)?;
+    }
+    let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+    let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * scale)?;
+    // The authenticated Dev factors use the existing CPU conversion one pair at a time.
+    // Stage each pair on the destination to avoid a second full adapter copy on the host.
+    if let Some(cancel) = refinement_cancel {
+        check_cancel(cancel)?;
+        let a = a.to_device(device)?;
+        check_cancel(cancel)?;
+        return Ok((a, b.to_device(device)?));
+    }
+    Ok((a, b))
+}
+
 /// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
 ///
 /// A resolved module outside the exact training surface is an error, as is an incomplete or
@@ -307,7 +331,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
 fn install_ltx_adapters_with_policy(
     dit: &mut AvDiT,
     specs: &[AdapterSpec],
-    policy: InstallPolicy,
+    policy: InstallPolicy<'_>,
 ) -> Result<AdditiveReport> {
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
@@ -317,11 +341,14 @@ fn install_ltx_adapters_with_policy(
 
     for (source, spec) in specs.iter().enumerate() {
         let pass_scales = effective_pass_scales(spec)?;
-        let refinement = match policy {
-            InstallPolicy::Ltx25Dev => refinement::read_shipped(spec, &mut used_refinement)?,
-            _ => None,
+        let (refinement, refinement_cancel) = match policy {
+            InstallPolicy::Ltx25Dev(cancel) => (
+                refinement::read_shipped(spec, &mut used_refinement, cancel)?,
+                Some(cancel),
+            ),
+            _ => (None, None),
         };
-        let pinned_refinement = refinement.is_some();
+        let refinement_cancel = refinement.as_ref().and(refinement_cancel);
         let mut file = match refinement {
             Some(file) => file,
             None => {
@@ -480,17 +507,13 @@ fn install_ltx_adapters_with_policy(
                     "ltx: LoRA target `{path}` has non-finite alpha"
                 )));
             }
-            let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
-            let b =
-                (up.to_dtype(DType::F32)?.t()?.contiguous()? * (alpha as f64 / scale_rank as f64))?;
-            // The authenticated Dev factors use the existing CPU conversion
-            // one pair at a time, then wait on the destination for installation.
-            // Do not accumulate a second complete copy of the adapter on the host.
-            let (a, b) = if pinned_refinement {
-                (a.to_device(&device)?, b.to_device(&device)?)
-            } else {
-                (a, b)
-            };
+            let (a, b) = prepare_lora_pair(
+                down,
+                up,
+                alpha as f64 / scale_rank as f64,
+                &device,
+                refinement_cancel,
+            )?;
             debug_assert_eq!(a.dims(), &[in_features, rank]);
             debug_assert_eq!(b.dims(), &[rank, out_features]);
             pending.entry(path).or_default().push(PendingLora {
@@ -608,8 +631,9 @@ pub fn install_ltx25_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<
 pub(crate) fn install_ltx25_dev_adapters(
     dit: &mut AvDiT,
     specs: &[AdapterSpec],
+    cancel: &CancelFlag,
 ) -> Result<AdditiveReport> {
-    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25Dev)
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25Dev(cancel))
 }
 
 #[cfg(test)]
@@ -617,7 +641,6 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
-    use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, Module};
     use candle_gen::train::lora::LoraLinear;
 
@@ -627,6 +650,17 @@ mod tests {
         assert_eq!(ltx25_factor_rank(450, 2048, 32), 32);
         assert_eq!(ltx25_factor_rank(450, 256, 2048), 256);
         assert_eq!(ltx25_factor_rank(450, 128, 4096), 128);
+    }
+
+    #[test]
+    fn canceled_refinement_pair_stops_before_factor_conversion() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let scalar = Tensor::new(1f32, &Device::Cpu).unwrap();
+        assert!(matches!(
+            prepare_lora_pair(scalar.clone(), scalar, 1.0, &Device::Cpu, Some(&cancel)),
+            Err(CandleError::Canceled)
+        ));
     }
 
     #[test]

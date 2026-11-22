@@ -9,7 +9,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 #[cfg(feature = "model-inference-proof")]
 use candle_gen::gen_core::model_input_proof::{record_inputs, InputIdentity, InputRole};
 use candle_gen::gen_core::weightsmeta::{self, Dtype};
-use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, CancelFlag};
+use candle_gen::residency::check_cancel;
 use candle_gen::train::merge::{AdapterFile, MAX_ADAPTER_BYTES};
 use candle_gen::{CandleError, Result};
 use sha2::{Digest, Sha256};
@@ -62,6 +63,7 @@ fn read_error(path: &Path, error: io::Error) -> CandleError {
 pub(super) fn read_shipped(
     spec: &AdapterSpec,
     used_refinement: &mut bool,
+    cancel: &CancelFlag,
 ) -> Result<Option<AdapterFile>> {
     let path = &spec.path;
     let shipped_name = path
@@ -71,6 +73,7 @@ pub(super) fn read_shipped(
     if !shipped_name && metadata.len() <= MAX_ADAPTER_BYTES {
         return Ok(None);
     }
+    check_cancel(cancel)?;
     if *used_refinement {
         return Err(refuse(
             path,
@@ -96,7 +99,7 @@ pub(super) fn read_shipped(
             "opened file differs from the shipped Dev refinement LoRA",
         ));
     }
-    let adapter = read_pinned(file, path, pin)?;
+    let adapter = read_pinned(file, path, pin, cancel)?;
     #[cfg(feature = "model-inference-proof")]
     record_inputs(
         "candle-gen-ltx::adapters::refinement::read_shipped/verified-weights",
@@ -134,10 +137,12 @@ fn authenticate_payload(
     pin: &RefinementPin,
     data_start: u64,
     mut hash: Sha256,
+    cancel: &CancelFlag,
 ) -> Result<()> {
     let mut scratch = [0u8; 64 * 1024];
     let mut remaining = pin.file_bytes - data_start;
     while remaining != 0 {
+        check_cancel(cancel)?;
         let n = remaining.min(scratch.len() as u64) as usize;
         let chunk = &mut scratch[..n];
         file.read_exact(chunk)
@@ -145,6 +150,7 @@ fn authenticate_payload(
         hash.update(&*chunk);
         remaining -= n as u64;
     }
+    check_cancel(cancel)?;
     finish_hash(file, path, pin, hash)
 }
 
@@ -152,7 +158,9 @@ fn read_pinned(
     mut file: impl Read + Seek,
     path: &Path,
     pin: &RefinementPin,
+    cancel: &CancelFlag,
 ) -> Result<AdapterFile> {
+    check_cancel(cancel)?;
     let mut prefix = [0u8; 8];
     file.read_exact(&mut prefix)
         .map_err(|error| read_error(path, error))?;
@@ -196,10 +204,11 @@ fn read_pinned(
     let mut hash = Sha256::new();
     hash.update(prefix);
     hash.update(&layout.header_json);
-    authenticate_payload(&mut file, path, pin, layout.data_start, hash)?;
+    authenticate_payload(&mut file, path, pin, layout.data_start, hash, cancel)?;
 
     // Rewind the same handle and hash exactly what this second pass consumes.
     // This also refuses in-place changes between authentication and decoding.
+    check_cancel(cancel)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| read_error(path, error))?;
     file.read_exact(&mut prefix)
@@ -229,15 +238,19 @@ fn read_pinned(
         .unwrap_or_default();
     let mut scratch = vec![0; scratch_bytes as usize];
     for location in layout.tensors {
+        check_cancel(cancel)?;
         let factor = location.header;
         let bytes = &mut scratch[..factor.data_bytes as usize];
         file.read_exact(bytes)
             .map_err(|error| read_error(path, error))?;
         hash.update(&*bytes);
+        check_cancel(cancel)?;
         let tensor = Tensor::from_raw_buffer(bytes, DType::BF16, &factor.shape, &Device::Cpu)?;
         tensors.insert(factor.name, tensor);
     }
+    check_cancel(cancel)?;
     finish_hash(&mut file, path, pin, hash)?;
+    check_cancel(cancel)?;
     Ok(AdapterFile { tensors, meta })
 }
 
@@ -276,10 +289,15 @@ mod tests {
     }
 
     fn failure(bytes: &[u8], pin: &RefinementPin) -> String {
-        read_pinned(Cursor::new(bytes), Path::new("adapter.safetensors"), pin)
-            .err()
-            .expect("reader must refuse the altered input")
-            .to_string()
+        read_pinned(
+            Cursor::new(bytes),
+            Path::new("adapter.safetensors"),
+            pin,
+            &CancelFlag::new(),
+        )
+        .err()
+        .expect("reader must refuse the altered input")
+        .to_string()
     }
 
     #[test]
@@ -291,6 +309,7 @@ mod tests {
             File::open(file.path()).unwrap(),
             Path::new("display-only.safetensors"),
             &pin,
+            &CancelFlag::new(),
         )
         .unwrap();
         assert_eq!(adapter.meta["lora_rank"], "1");
@@ -356,7 +375,7 @@ mod tests {
             file: Cursor::new(bytes.clone()),
             rewound: false,
         };
-        assert!(read_pinned(&mut source, path, &pin).is_err());
+        assert!(read_pinned(&mut source, path, &pin, &CancelFlag::new()).is_err());
         assert!(source.rewound);
 
         *bytes.last_mut().unwrap() ^= 1;
@@ -364,8 +383,61 @@ mod tests {
             file: Cursor::new(bytes),
             rewound: false,
         };
-        assert!(read_pinned(&mut already_changed, path, &pin).is_err());
+        assert!(read_pinned(&mut already_changed, path, &pin, &CancelFlag::new()).is_err());
         assert!(!already_changed.rewound);
+    }
+
+    #[test]
+    fn cancels_in_both_payload_passes_before_another_read() {
+        struct CancelOnPayload<'a> {
+            file: Cursor<Vec<u8>>,
+            cancel: &'a CancelFlag,
+            data_start: u64,
+            cancel_after_rewind: bool,
+            rewound: bool,
+        }
+
+        impl Read for CancelOnPayload<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    !self.cancel.is_cancelled(),
+                    "reader continued after cancellation"
+                );
+                let offset = self.file.position();
+                let read = self.file.read(bytes)?;
+                if offset >= self.data_start && self.rewound == self.cancel_after_rewind {
+                    self.cancel.cancel();
+                }
+                Ok(read)
+            }
+        }
+
+        impl Seek for CancelOnPayload<'_> {
+            fn seek(&mut self, offset: SeekFrom) -> io::Result<u64> {
+                assert!(
+                    !self.cancel.is_cancelled(),
+                    "reader rewound after cancellation"
+                );
+                assert_eq!(offset, SeekFrom::Start(0));
+                self.rewound = true;
+                self.file.seek(offset)
+            }
+        }
+
+        let (bytes, pin) = fixture();
+        for cancel_after_rewind in [false, true] {
+            let cancel = CancelFlag::new();
+            let mut source = CancelOnPayload {
+                file: Cursor::new(bytes.clone()),
+                cancel: &cancel,
+                data_start: 8 + pin.header_bytes,
+                cancel_after_rewind,
+                rewound: false,
+            };
+            let result = read_pinned(&mut source, Path::new("adapter.safetensors"), &pin, &cancel);
+            assert!(matches!(result, Err(CandleError::Canceled)));
+            assert_eq!(source.rewound, cancel_after_rewind);
+        }
     }
 
     #[test]
@@ -394,12 +466,13 @@ mod tests {
         std::fs::write(&ordinary, &bytes).unwrap();
 
         let mut used = false;
+        let cancel = CancelFlag::new();
         let spec = AdapterSpec::new(shipped, 1.0, AdapterKind::Lora);
-        let error = read_shipped(&spec, &mut used).err().unwrap();
+        let error = read_shipped(&spec, &mut used, &cancel).err().unwrap();
         assert!(error.to_string().contains("expected a regular LoRA file"));
         assert!(!used);
         let spec = AdapterSpec::new(ordinary, 1.0, AdapterKind::Lora);
-        assert!(read_shipped(&spec, &mut used).unwrap().is_none());
+        assert!(read_shipped(&spec, &mut used, &cancel).unwrap().is_none());
         assert_eq!(
             candle_gen::train::merge::read_adapter(&spec.path)
                 .unwrap()

@@ -381,6 +381,7 @@ impl Pipeline {
                 adapters,
                 with_vae_encoder,
                 memory_strategy_2_5::TransformerExecution::default(),
+                &gen_core::CancelFlag::new(),
             );
         }
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
@@ -468,6 +469,7 @@ impl Pipeline {
         adapters: &[AdapterSpec],
         with_vae_encoder: bool,
         execution: memory_strategy_2_5::TransformerExecution,
+        cancel: &gen_core::CancelFlag,
     ) -> CResult<Components> {
         let bundle = self.split_bundle.as_ref().expect("split route has bundle");
         let transformer = bundle
@@ -547,7 +549,7 @@ impl Pipeline {
             })?
         };
         if self.transformer_variant.is_dev() {
-            adapters::install_ltx25_dev_adapters(&mut avdit, adapters)?;
+            adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?;
         } else {
             adapters::install_ltx25_adapters(&mut avdit, adapters)?;
         }
@@ -2594,11 +2596,20 @@ impl Generator for Ltx25Generator {
             .as_ref()
             .is_none_or(|(cached_key, _)| *cached_key != key)
         {
+            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
             *slot = None;
-            *slot = Some((
-                key,
-                pipe.load_components_split(&self.adapters, key.with_vae_encoder, execution)?,
-            ));
+            let components = pipe.load_components_split(
+                &self.adapters,
+                key.with_vae_encoder,
+                execution,
+                &req.cancel,
+            )?;
+            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
+            *slot = Some((key, components));
         }
         let components = slot.as_ref().expect("split components populated").1.clone();
         drop(slot);
