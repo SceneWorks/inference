@@ -185,6 +185,13 @@ pub fn prepare_load_spec(spec: &mut LoadSpec) -> gen_core::Result<()> {
     spec.prepare_with_file_pins(pins)
 }
 
+fn component_bytes(path: &Path) -> gen_core::Result<u64> {
+    // CLIP's position embeddings are indexed. Rank-two UNet and VAE projections use Linear.
+    candle_gen::logical_weights::component_f32_bytes(path, true, |name, shape| {
+        shape.len() == 2 && name.ends_with(".weight") && !name.ends_with("embedding.weight")
+    })
+}
+
 impl PreparedSvdMemory {
     pub fn prepare(spec: &LoadSpec) -> gen_core::Result<Self> {
         let root = validate_load_spec(spec)?;
@@ -222,19 +229,7 @@ impl PreparedSvdMemory {
                     ))
                 })?;
             pin.ensure_unchanged()?;
-            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&path)?;
-            if headers.is_empty() || headers.iter().any(|header| !header.is_float()) {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: {relative} is empty or contains a non-float tensor",
-                    crate::MODEL_ID
-                )));
-            }
-            let resident_bytes = headers.iter().try_fold(0_u64, |sum, header| {
-                sum.checked_add(header.materialized_bytes(4)?)
-                    .ok_or_else(|| {
-                        gen_core::Error::Msg(format!("{}: resident byte overflow", crate::MODEL_ID))
-                    })
-            })?;
+            let resident_bytes = component_bytes(&path)?;
             if resident_bytes == 0 {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: {relative} has zero resident bytes",
@@ -318,13 +313,7 @@ impl PreparedSvdMemory {
                     file.relative
                 )));
             }
-            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
-            let resident = headers.iter().try_fold(0_u64, |sum, header| {
-                sum.checked_add(header.materialized_bytes(4)?)
-                    .ok_or_else(|| {
-                        gen_core::Error::Msg(format!("{}: resident byte overflow", crate::MODEL_ID))
-                    })
-            })?;
+            let resident = component_bytes(&path)?;
             if resident != file.resident_bytes {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: {} tensor geometry changed after admission",

@@ -249,16 +249,19 @@ fn a_layer_declared_twice_must_agree() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E4M3Fn,
                 full_precision_matrix_mult: None,
                 per_row: None,
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["format"],
         }
     );
@@ -276,16 +279,19 @@ fn a_layer_declared_twice_must_agree() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: Some(true),
                 per_row: None,
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["full_precision_matrix_mult"],
         }
     );
@@ -364,16 +370,19 @@ fn a_file_level_entry_that_is_a_subset_of_its_tensor_blob_corroborates_it() {
         LogicalWeightPlanError::DescriptorConflict {
             physical_key: "model.q.weight".to_owned(),
             tensor: ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: Some(false),
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["per_row"],
         }
     );
@@ -648,9 +657,19 @@ fn codec_registry_rejects_duplicate_ids_and_double_claimed_formats() {
 }
 
 #[test]
-fn comfy_codec_table_separates_the_two_fp8_e4m3_rows_by_descriptor() {
+fn comfy_codec_table_separates_scalar_rowwise_and_block_fp8_e4m3_descriptors() {
     let registry = full();
-    assert_eq!(registry.len(), 8);
+    assert_eq!(registry.len(), 10);
+    assert_eq!(
+        registry
+            .for_format(StoredTensorFormat::described(
+                WeightEncoding::Fp8E4M3,
+                ComfyQuantFormat::Fp8Rowwise
+            ))
+            .unwrap()
+            .codec_id,
+        "fp8-e4m3-rowwise-v1"
+    );
     // NVFP4 is the one `U8`-stored codec, separated from an undescribed `U8` tensor (which has
     // no codec at all) by its descriptor half.
     assert_eq!(
@@ -944,16 +963,10 @@ fn mixed_checkpoint_dispatches_per_layer_and_accounts_every_companion() {
     assert_eq!(all, file);
 }
 
-/// sc-20385 review: the shared MXFP8 / int8-per-row companion arm recorded `input_scale` at
-/// **zero** resident bytes unconditionally, while the ScalarFp8 arm branched on the residency
-/// mode, so a packed MXFP8 row under-priced its retained activation scale. Both arms now use
-/// the same `match mode` rule.
-///
-/// Only the MXFP8 half of that arm can actually carry an `input_scale`: the companion-surface
-/// check refuses one on an `int8_tensorwise` layer by format (asserted below), so the int8 row
-/// here contributes its `weight_scale` only.
+/// Some MX sources carry a scalar input-scale sidecar, but MX computes its activation
+/// scales per group of 32 at runtime. Record the file's bytes and the actual retained operands.
 #[test]
-fn packed_mxfp8_rows_retain_their_input_scale_companion() {
+fn packed_mxfp8_counts_a_static_input_scale_only_in_source_bytes() {
     struct PackEverything;
     impl CodecResidencyPolicy for PackEverything {
         fn residency(
@@ -1007,14 +1020,19 @@ fn packed_mxfp8_rows_retain_their_input_scale_companion() {
             .unwrap()
             .resident_bytes
     };
-    // Retained at its stored width — 4 bytes, not zero.
-    assert_eq!(companion(&packed, "model.v.input_scale"), 4);
+    let input = packed
+        .companions
+        .iter()
+        .find(|c| c.physical_key == "model.v.input_scale")
+        .unwrap();
+    assert_eq!(input.source_bytes, 4);
+    assert_eq!(input.resident_bytes, 0);
     // And the weight scales alongside it, so the input-scale row is the only thing this
     // fixture could be getting wrong.
     assert_eq!(companion(&packed, "model.o.weight_scale"), 16);
     assert_eq!(companion(&packed, "model.v.weight_scale"), 512);
     // The plan total accounts for every retained byte.
-    assert_eq!(packed.resident_bytes(), 32 + 16 + 32 * 64 + 512 + 4);
+    assert_eq!(packed.resident_bytes(), 32 + 16 + 32 * 64 + 512);
 
     // Under the dense policy the same companion is consumed, so the assertion above is about
     // the packed branch, not about the fixture always pricing scales.
@@ -1945,4 +1963,58 @@ fn a_packed_block_scaled_slice_must_respect_the_scale_row_tile() {
         ),
         other => panic!("expected a packed half-swap refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn convrot_descriptor_sources_preserve_basis_group_and_native_residency() {
+    let blob =
+        br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256,"per_row":true}"#;
+    let headers = [
+        header("q.weight", Dtype::I8, &[16, 256]),
+        header("q.weight_scale", Dtype::F32, &[16, 1]),
+        header("q.comfy_quant", Dtype::U8, &[blob.len()]),
+    ];
+    let payloads = BTreeMap::from([("q.comfy_quant".into(), blob.to_vec())]);
+    let registry = full();
+    let plan = |group, policy: &dyn CodecResidencyPolicy| {
+        let metadata = format!(
+            r#"{{"layers":{{"q":{{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":{group}}}}}}}"#
+        );
+        compile_logical_weight_plan_with_metadata(
+            &headers,
+            &payloads,
+            Some(&metadata),
+            &IdentityKeyMapping,
+            &registry,
+            policy,
+        )
+    };
+    let actual = plan(256, &SourceCodecResidency).unwrap();
+    let t = &actual.tensors[0];
+    assert_eq!(t.codec_id, crate::convrot_int8::CODEC_ID);
+    assert_eq!(
+        t.residency,
+        PlannedResidency {
+            mode: ResidencyMode::Packed,
+            resident_bytes: 16 * 256
+        }
+    );
+    assert!(
+        matches!(&t.codec, TensorCodecSpec::ConvRotInt8 { geometry, .. } if geometry.rotation_group == 256)
+    );
+    assert_eq!(
+        actual
+            .companions
+            .iter()
+            .map(|p| p.resident_bytes)
+            .sum::<u64>(),
+        64
+    );
+    assert!(
+        matches!(plan(64, &SourceCodecResidency), Err(LogicalWeightPlanError::DescriptorConflict { disagreement, .. }) if disagreement == ["convrot_groupsize"])
+    );
+    assert!(matches!(
+        plan(256, &DenseResidencyPolicy),
+        Err(LogicalWeightPlanError::UnsupportedFormat { .. })
+    ));
 }

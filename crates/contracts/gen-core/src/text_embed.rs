@@ -12,6 +12,14 @@ use crate::Result;
 /// No `Send`/`Sync` bound — matches [`ImageEmbedder`](crate::image_embed::ImageEmbedder) and the
 /// MLX/candle provider pattern. The worker loads and runs the provider inside one blocking task.
 pub trait TextEmbedder {
+    /// Latest measured representation for the primary checkpoint.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+    /// Every source measured by this loaded model, including deferred components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
     /// Stable identity + advertised shape, constructible without loading weights.
     fn descriptor(&self) -> &TextEmbedderDescriptor;
 

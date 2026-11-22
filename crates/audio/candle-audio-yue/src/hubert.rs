@@ -39,26 +39,14 @@ pub const EPS: f64 = 1e-5;
 /// clips ([`Hubert::with_query_chunk`]).
 pub const DEFAULT_QUERY_CHUNK: usize = 256;
 
-struct Weights<'a> {
-    map: &'a HashMap<String, Tensor>,
-    prefix: &'a str,
-}
-
+struct Weights<'a>(candle_nn::VarBuilder<'a>);
 impl Weights<'_> {
     fn get(&self, name: &str) -> Result<Tensor> {
-        let full = format!("{}{name}", self.prefix);
-        self.map.get(&full).cloned().ok_or_else(|| {
-            candle_audio::candle_core::Error::Msg(format!("HuBERT: missing {full:?}"))
-        })
+        self.0.get_unchecked(name)
     }
-
     fn linear(&self, name: &str) -> Result<Linear> {
-        Ok(Linear::new(
-            self.get(&format!("{name}.weight"))?,
-            Some(self.get(&format!("{name}.bias"))?),
-        ))
+        candle_audio::weights::checkpoint_linear(&self.0.pp(name), true)
     }
-
     fn layer_norm(&self, name: &str) -> Result<LayerNorm> {
         Ok(LayerNorm::new(
             self.get(&format!("{name}.weight"))?,
@@ -132,7 +120,25 @@ impl Hubert {
     /// Load from a tensor map whose HuBERT tensors sit under `prefix` (e.g. `"semantic_model."`
     /// inside the xcodec checkpoint). Layers are counted from the map.
     pub fn load(map: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
-        let w = Weights { map, prefix };
+        let device = map
+            .values()
+            .next()
+            .ok_or_else(|| candle_audio::candle_core::Error::Msg("HuBERT: empty weights".into()))?
+            .device();
+        let vb = candle_nn::VarBuilder::from_tensors(
+            map.clone(),
+            candle_audio::candle_core::DType::F32,
+            device,
+        );
+        Self::from_builder(if prefix.is_empty() {
+            vb
+        } else {
+            vb.pp(prefix.trim_end_matches('.'))
+        })
+    }
+
+    pub(crate) fn from_builder(vb: candle_nn::VarBuilder) -> Result<Self> {
+        let w = Weights(vb);
         let mut convs = Vec::with_capacity(CONV_STRIDES.len());
         for (i, (&stride, &kernel)) in CONV_STRIDES.iter().zip(&CONV_KERNELS).enumerate() {
             let weight = w.get(&format!("feature_extractor.conv_layers.{i}.conv.weight"))?;
@@ -180,8 +186,8 @@ impl Hubert {
         );
 
         let mut layers = Vec::new();
-        while map.contains_key(&format!(
-            "{prefix}encoder.layers.{}.attention.q_proj.weight",
+        while w.0.contains_tensor(&format!(
+            "encoder.layers.{}.attention.q_proj.weight",
             layers.len()
         )) {
             let l = format!("encoder.layers.{}", layers.len());
@@ -197,13 +203,13 @@ impl Hubert {
             });
         }
         if layers.is_empty() {
-            candle_audio::candle_core::bail!("HuBERT: no encoder layers under {prefix:?}");
+            candle_audio::candle_core::bail!("HuBERT: no encoder layers under {:?}", w.0.prefix());
         }
         let proj = w.linear("feature_projection.projection")?;
-        if proj.weight().dim(0)? != hidden {
+        if proj.weight_dims()?.0 != hidden {
             candle_audio::candle_core::bail!(
                 "HuBERT: projection emits {} but the encoder is {hidden} wide",
-                proj.weight().dim(0)?
+                proj.weight_dims()?.0
             );
         }
         Ok(Self {

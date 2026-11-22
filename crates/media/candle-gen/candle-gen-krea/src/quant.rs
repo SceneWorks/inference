@@ -33,6 +33,7 @@ use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
 
 /// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
@@ -57,152 +58,10 @@ pub enum QLinear {
     /// ([`crate::loader::linear_detect_planned`]); the shipping `linear_detect` path never produces one.
     Nvfp4(crate::nvfp4_dit::Nvfp4Proj),
     /// A **probe-wrapped** baseline projection (sc-12110): records its input activation's outlier
-    /// sparsity, then delegates to the wrapped [`Self::Adapt`] / [`Self::ConvRotInt8`] leg. This is how
+    /// sparsity, then delegates to the wrapped [`Self::Adapt`] leg. This is how
     /// the partition gate measures the trunk's *unperturbed* real activations. Instrumentation only —
     /// never on a timed or shipping path.
     Probed(crate::nvfp4_dit::ProbedProj),
-    /// A community **INT8-ConvRot** projection (sc-9300 loader + sc-9601 online rotation): the checkpoint
-    /// ships `(N, K)` int8 codes for the **rotated** weight `RHT(W) = W·R` + a `[N]` per-output-row
-    /// `weight_scale`, where `R` is the regular-Hadamard transform applied block-diagonally in groups of
-    /// `group_size` (256) along `K`. The forward applies the matching **online activation rotation**
-    /// `RHT(x) = x·R` ([`candle_gen::quant::convrot_rotate`]) *before* the int8 GEMM, so
-    /// `RHT(x)·RHT(W)ᵀ = x·Wᵀ` (`R` orthogonal). On CUDA that GEMM is a cuBLASLt IGEMM + per-row dequant
-    /// (`Int8Linear`); off-CUDA (CPU tests / Metal) it dequantizes the stored rotated
-    /// weight to a dense matmul.
-    ///
-    /// **The rotation is the sc-9300 → sc-9601 fix.** Without `RHT(x)` the GEMM reconstructs
-    /// `x·(W·R)ᵀ` — noise (dequantized `blocks.0.attn.wq` has cosine ≈ 0.07 with the canonical `to_q`;
-    /// the A/B render was PSNR ≈ 8 dB vs bf16). With it the render is coherent (verified cosine 0.99991
-    /// vs the f32 reference linear). See [`candle_gen::quant::convrot`] for the recovered transform.
-    ConvRotInt8(ConvRotInt8),
-}
-
-/// The stored parts of an INT8-ConvRot projection (sc-9300 loader + sc-9601 rotation): the `(N, K)` int8
-/// codes of the **rotated** weight `W·R` (on the CPU as `I64`, staged to the resident **compute** device
-/// `i8` inside `Int8Linear`), the `[N]` per-output-row dequant scale, the ConvRot `group_size` (the
-/// regular-Hadamard order, 256), and the optional dense bias (ConvRot Krea projections are bias-free, but
-/// the field keeps the type general). When the model's compute device is CUDA, a per-channel `Int8Linear`
-/// is built **eagerly at construction** on that device (F-121 / sc-11208) — the loader materializes the
-/// int8 codes on the CPU to avoid 8× VRAM, so the leg is built on the compute device the activations live
-/// on, **not** the CPU-resident codes' device, and `Int8Linear::from_per_channel_parts` stages the CPU
-/// codes onto it. The CPU / non-CUDA fallback dequantizes the rotated `w[o, :] = q[o, :] · scale[o]`. Both
-/// paths first apply the online activation rotation `RHT(x)` (built once, cached in `rot`) so the GEMM
-/// reconstructs `x·Wᵀ`.
-pub struct ConvRotInt8 {
-    w_i8: Tensor,
-    scale: Vec<f32>,
-    /// The regular-Hadamard order `R` was folded into the stored weight at (`convrot_groupsize`, 256).
-    group_size: usize,
-    bias: Option<Tensor>,
-    /// The `[group_size, group_size]` rotation `R = H/√group_size`, built lazily on the activation's
-    /// device on first forward and cached (tiny — 256² f32 — but shouldn't rebuild per projection/step).
-    rot: std::sync::OnceLock<Tensor>,
-    /// The cuBLASLt IGEMM leg, built eagerly at construction on the model's resident **compute** device
-    /// when that device is CUDA (F-121 / sc-11208): a cublasLt init failure surfaces as the crate's typed
-    /// error from [`QLinear::convrot_int8`] (where `?` is available) instead of aborting the sampler
-    /// thread via `.expect()` mid-render. Built on the compute device, **not** the CPU-resident codes'
-    /// device (the loader keeps the int8 codes on the CPU to save VRAM), so a normal CUDA render always
-    /// takes this int8 IGEMM leg. `None` when the compute device isn't CUDA (CPU / Metal fallback in
-    /// [`Self::forward`]).
-    #[cfg(feature = "cuda")]
-    lt: Option<std::sync::Arc<candle_gen::quant::Int8Linear>>,
-    /// User-selected residuals applied over the frozen INT8-ConvRot base. Keeping these separate from
-    /// the base preserves the int8 GEMM/online-rotation path and avoids materializing a dense weight.
-    adapters: Vec<ConvRotAdapter>,
-}
-
-enum ConvRotAdapter {
-    Lora {
-        a: Tensor,
-        b: Tensor,
-        scale: f64,
-    },
-    Lokr {
-        factors: candle_gen::quant::LokrFactors,
-    },
-}
-
-fn apply_adapter_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    let dims = x.dims();
-    if w.rank() != 2 || dims.len() <= 2 {
-        return x.broadcast_matmul(w);
-    }
-    let (lead, k) = dims.split_at(dims.len() - 1);
-    let m: usize = lead.iter().product();
-    let mut out_dims = lead.to_vec();
-    out_dims.push(w.dim(1)?);
-    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
-}
-
-impl ConvRotAdapter {
-    fn residual(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Lora { a, b, scale } => {
-                let dtype = x.dtype();
-                let a = a.to_dtype(dtype)?;
-                let b = b.to_dtype(dtype)?;
-                apply_adapter_factor(&apply_adapter_factor(x, &a)?, &b)? * *scale
-            }
-            Self::Lokr { factors } => factors.residual(x),
-        }
-    }
-}
-
-impl ConvRotInt8 {
-    /// The dense `(N, K)` f32 *rotated* weight the int8 codes + per-row scale represent
-    /// (`w[o,:] = q[o,:]·s[o]` = `RHT(W)[o,:]`). Paired with the online `RHT(x)` this yields `x·Wᵀ`.
-    fn dequant_dense(&self) -> Result<Tensor> {
-        let n = self.w_i8.dims2()?.0;
-        let scale_col = Tensor::from_vec(self.scale.clone(), (n, 1), self.w_i8.device())?;
-        self.w_i8.to_dtype(DType::F32)?.broadcast_mul(&scale_col)
-    }
-
-    /// The cached regular-Hadamard rotation `R` on `x`'s device (built once).
-    fn rotation(&self, x: &Tensor) -> Result<&Tensor> {
-        if let Some(r) = self.rot.get() {
-            return Ok(r);
-        }
-        let r = candle_gen::quant::regular_hadamard(self.group_size, x.device())?;
-        Ok(self.rot.get_or_init(|| r))
-    }
-
-    fn forward_base(&self, x: &Tensor) -> Result<Tensor> {
-        // Online ConvRot leg (sc-9601): rotate the activation by the same regular Hadamard folded into
-        // the stored weight, so `RHT(x)·RHT(W)ᵀ = x·Wᵀ`. Runs on both the CUDA and CPU paths.
-        let r = self.rotation(x)?.clone();
-        let xr = candle_gen::quant::convrot_rotate(x, &r)?;
-
-        #[cfg(feature = "cuda")]
-        if x.device().is_cuda() {
-            // Eagerly built in `convrot_int8` (F-121 / sc-11208) on the compute device; present whenever
-            // the model's compute device is CUDA — which is the case on every real CUDA render, even
-            // though the int8 codes themselves are CPU-materialized. If it's absent (CPU/Metal compute),
-            // fall through to the dequant-dense path.
-            if let Some(lin) = &self.lt {
-                return lin.forward(&xr);
-            }
-        }
-        // CPU / non-CUDA fallback: dequant-to-dense matmul (sc-7702-style; keeps activations full-precision).
-        let in_dtype = x.dtype();
-        let w = self.dequant_dense()?.to_dtype(in_dtype)?;
-        let bias = match &self.bias {
-            Some(b) => Some(b.to_dtype(in_dtype)?),
-            None => None,
-        };
-        __model_proof_output!(Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?))
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut y = self.forward_base(x)?;
-        for adapter in &self.adapters {
-            if matches!(adapter, ConvRotAdapter::Lora { scale, .. } if *scale == 0.0) {
-                continue;
-            }
-            let residual = adapter.residual(x)?.to_dtype(y.dtype())?;
-            y = (y + residual)?;
-        }
-        Ok(y)
-    }
 }
 
 impl QLinear {
@@ -211,10 +70,7 @@ impl QLinear {
     /// are recovered from the weight shape (`[out, in]`).
     pub fn dense(linear: Linear) -> Self {
         // `weight()` is `[out, in]`; read the dims before moving `linear` into the adapter.
-        let (out_dim, in_dim) = {
-            let d = linear.weight().dims();
-            (d[0], d[1])
-        };
+        let (out_dim, in_dim) = linear.weight_dims().expect("a projection has rank two");
         Self::Adapt(AdaptLinear::from_dense(linear, in_dim, out_dim))
     }
 
@@ -255,115 +111,102 @@ impl QLinear {
         Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
     }
 
-    /// Build an **INT8-ConvRot** projection (sc-9300 loader + sc-9601 rotation) straight from the
-    /// checkpoint's stored parts: the `(N, K)` int8 codes `w_i8` of the **rotated** weight `W·R` (any
-    /// dtype; narrowed at the int8 stage), the `[N]` per-output-row `weight_scale`, the ConvRot
-    /// `group_size` (the regular-Hadamard order the export folded into the weight — `convrot_groupsize`,
-    /// 256), the optional dense `bias`, and `device` — the model's resident **compute** device (where the
-    /// activations live). No re-quantization. `group_size` must be a power of four and divide `K`; the
-    /// forward applies the online `RHT(x)` so `RHT(x)·(W·R)ᵀ = x·Wᵀ`.
-    ///
-    /// **`device` is the compute device, not `w_i8.device()` (F-121 / sc-11208).** The loader
-    /// materializes the int8 codes on the CPU to avoid holding them at 8× the size on the GPU
-    /// (`Weights::get_int8_codes`), so `w_i8` is CPU-resident on a real CUDA render.
-    /// The cuBLASLt IGEMM leg must therefore be built on the passed-in CUDA compute device — not gated on
-    /// the CPU-resident codes' device — so a normal CUDA render takes the int8 IGEMM path (byte-identical
-    /// to the pre-eager lazy build, which staged onto the activation's device);
-    /// `Int8Linear::from_per_channel_parts` stages the CPU codes onto that device.
-    ///
-    /// **Builds a private cuBLASLt handle for this one projection** — and its eager 32 MiB workspace.
-    /// Correct for a one-off projection or a test; **a trunk loader must use [`Self::convrot_int8_in`]**
-    /// with one shared [`Int8Context`], or it pays 32 MiB *per projection* — the sc-12301 defect
-    /// (~224 int8 projections on a ConvRot DiT ⇒ ~7 GiB of duplicated scratch, none of it weight bytes).
+    /// Bind native ConvRot parts using a private workspace for a standalone projection.
+    /// Normal checkpoint loads share their reader's workspace and rotation cache.
     pub fn convrot_int8(
-        w_i8: Tensor,
-        scale: Vec<f32>,
-        group_size: usize,
+        codes: Tensor,
+        scales: Vec<f32>,
+        group: usize,
         bias: Option<Tensor>,
         device: &Device,
     ) -> Result<Self> {
-        // A private context for this one projection: `Int8Context::new` is `none()` off CUDA and
-        // propagates a handle failure as the F-121 typed error on it — exactly what the bare
-        // `CublasLt::new(device)?` here used to do.
-        let ctx = Int8Context::new(device)?;
-        Self::convrot_int8_in(w_i8, scale, group_size, bias, device, &ctx)
+        Self::convrot_int8_in(
+            codes,
+            scales,
+            group,
+            bias,
+            device,
+            &Int8Context::new(device)?,
+        )
     }
 
-    /// [`Self::convrot_int8`] sharing an existing per-device [`Int8Context`] — **the constructor a trunk
-    /// loader wants** (sc-12301). Every projection built against one context shares its single cuBLASLt
-    /// handle, so the eager 32 MiB workspace is paid once per device instead of once per projection.
-    ///
-    /// `ctx` must be bound to `device` (guarded by `Int8Context::handle_for` — a hazard new to sharing,
-    /// since a per-layer handle could never be bound to the wrong device), and must be non-empty when
-    /// `device` is CUDA. Both violations are typed errors at load, preserving F-121 / sc-11208: the int8
-    /// lane has no fallback worth taking silently.
+    /// Compatibility constructor for callers that supply signed code values as integer tensors.
+    /// The checkpoint reader binds the stored byte view directly and bypasses this conversion.
     pub fn convrot_int8_in(
-        w_i8: Tensor,
-        scale: Vec<f32>,
-        group_size: usize,
+        codes: Tensor,
+        scales: Vec<f32>,
+        group: usize,
         bias: Option<Tensor>,
         device: &Device,
-        ctx: &Int8Context,
+        context: &Int8Context,
     ) -> Result<Self> {
-        let (n, k) = w_i8.dims2()?;
-        if scale.len() != n {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea convrot: weight_scale len {} != weight rows {n}",
-                scale.len()
-            )));
-        }
-        if !candle_gen::quant::is_power_of_four(group_size) || !k.is_multiple_of(group_size) {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea convrot: group_size {group_size} must be a power of four dividing K ({k})"
-            )));
-        }
-        // Build the cuBLASLt IGEMM leg eagerly on the model's resident COMPUTE device (F-121 /
-        // sc-11208) so a cublasLt init failure is this typed error (where `?` is available), not an
-        // `.expect()` panic on the first sampler forward. Eagerness is deliberate and preserved; what
-        // sc-12301 removed is the *per-projection* handle this used to build here (`CublasLt::new`, an
-        // eager 32 MiB workspace × ~224 projections). The handle now arrives from the caller's shared
-        // `Int8Context` — bound to one device, resolved once per trunk.
-        //
-        // Gated on `device.is_cuda()`, NOT `w_i8.device().is_cuda()`: the loader keeps the int8 codes on
-        // the CPU (VRAM), so gating on the codes' device would leave `lt` None on every real CUDA render
-        // and drop into a cross-device dequant-dense matmul. `from_per_channel_parts` stages the CPU
-        // codes onto `device`.
-        #[cfg(feature = "cuda")]
-        let lt = if device.is_cuda() {
-            Some(std::sync::Arc::new(
-                candle_gen::quant::Int8Linear::from_per_channel_parts(
-                    w_i8.clone(),
-                    scale.clone(),
-                    bias.clone(),
-                    ctx.handle_for(device)?.clone(),
-                )?,
-            ))
-        } else {
-            None
+        let (rows, cols) = codes.dims2()?;
+        let descriptor = candle_gen::gen_core::convrot_int8::ConvRotInt8::from_geometry(
+            group,
+            &[rows, cols],
+            &[scales.len(), 1],
+        )
+        .map_err(candle_gen::candle_core::Error::Msg)?;
+        descriptor
+            .validate_scales(&scales)
+            .map_err(candle_gen::candle_core::Error::Msg)?;
+        let codes = match codes.dtype() {
+            DType::U8 => codes.to_device(device)?,
+            DType::F32 => {
+                let values = codes
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                if values
+                    .iter()
+                    .any(|v| !v.is_finite() || v.fract() != 0. || !(-128.0..=127.0).contains(v))
+                {
+                    candle_gen::candle_core::bail!("ConvRot requires exact signed integer codes");
+                }
+                let bytes = values
+                    .into_iter()
+                    .map(|v| v as i8 as u8)
+                    .collect::<Vec<_>>();
+                Tensor::from_vec(bytes, (rows, cols), device)?
+            }
+            DType::I64 => {
+                let values = codes
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<i64>()?;
+                let bytes = values
+                    .into_iter()
+                    .map(|v| {
+                        i8::try_from(v).map(|n| n as u8).map_err(|_| {
+                            candle_gen::candle_core::Error::Msg(
+                                "ConvRot code exceeds signed I8".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::from_vec(bytes, (rows, cols), device)?
+            }
+            _ => candle_gen::candle_core::bail!("ConvRot requires exact signed integer codes"),
         };
-        // Off cuda there is no IGEMM leg to build, so neither the compute device nor the (always empty)
-        // shared context is read — the forward takes its dequant-dense fallback.
-        #[cfg(not(feature = "cuda"))]
-        let (_, _) = (device, ctx);
-        Ok(Self::ConvRotInt8(ConvRotInt8 {
-            w_i8,
-            scale,
-            group_size,
+        let resources = candle_gen::weights::ProjectionResources::default();
+        resources.set_int8_context(context.clone());
+        let packed = candle_gen::quant::convrot_int8::ConvRotLinear::from_native_parts(
+            &resources,
+            descriptor,
+            codes,
+            Tensor::from_vec(scales, (rows, 1), device)?,
             bias,
-            rot: std::sync::OnceLock::new(),
-            #[cfg(feature = "cuda")]
-            lt,
-            adapters: Vec::new(),
-        }))
+        )
+        .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        Ok(Self::Adapt(AdaptLinear::from_convrot(packed)))
     }
 
     /// `x·Wᵀ + b` (+ any additive residual). The `Adapt` arm delegates to the shared [`AdaptLinear`]
     /// (dense `candle_nn::Linear`, or the packed dequant-on-forward `QLinear` — sc-7702 — plus its
-    /// residuals); int8-ConvRot to the cuBLASLt IGEMM (CUDA) or a dequant-dense matmul (CPU).
+    /// residuals); native ConvRot uses its shared cuBLASLt integer GEMM.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Adapt(l) => __model_proof_output!(l.forward(x)),
-            Self::ConvRotInt8(l) => __model_proof_output!(l.forward(x)),
             Self::Nvfp4(l) => __model_proof_output!(l.forward(x)),
             Self::Probed(l) => __model_proof_output!(l.forward(x)),
         }
@@ -378,7 +221,7 @@ impl QLinear {
     pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Adapt(l) => l.forward_upcast(x),
-            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => self.forward(x),
+            Self::Nvfp4(_) | Self::Probed(_) => self.forward(x),
         }
     }
 
@@ -388,9 +231,6 @@ impl QLinear {
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
         match self {
             Self::Adapt(linear) => linear.quantize(quant),
-            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
-                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
-            ),
             Self::Nvfp4(_) => candle_gen::candle_core::bail!(
                 "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
             ),
@@ -405,12 +245,9 @@ impl QLinear {
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         match self {
             Self::Adapt(linear) => {
-                linear.quantize_dequant_onto(quant, device)?;
+                linear.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
                 linear.to_device(device)
             }
-            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
-                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
-            ),
             Self::Nvfp4(_) => candle_gen::candle_core::bail!(
                 "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
             ),
@@ -428,7 +265,7 @@ impl QLinear {
             // dropped (the packed weight is staged at construction and cannot be re-staged). A move
             // onto the device it already occupies stays the no-op it has always been.
             Self::Nvfp4(p) => p.adapt_mut().to_device(device),
-            Self::ConvRotInt8(_) | Self::Probed(_) => Ok(()),
+            Self::Probed(_) => Ok(()),
         }
     }
 
@@ -454,16 +291,15 @@ impl QLinear {
     /// Public, not `#[cfg(test)]`: the CUDA integration test `tests/convrot_int8_gpu.rs` links the
     /// library built without `cfg(test)` and asserts on it.
     pub fn is_convrot_int8(&self) -> bool {
-        matches!(self, Self::ConvRotInt8(_))
+        matches!(self, Self::Adapt(linear) if linear.is_convrot_int8())
     }
 
-    /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its
-    /// own additive stack through `as_additive_mut`; the probe leg is instrumentation-only.
+    /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. The shared host also owns additive stacks for native ConvRot bases.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
             Self::Nvfp4(p) => Some(p.adapt_mut()),
-            Self::ConvRotInt8(_) | Self::Probed(_) => None,
+            Self::Probed(_) => None,
         }
     }
 
@@ -472,7 +308,7 @@ impl QLinear {
     /// probe leg is excluded, because it is measurement instrumentation and never on a shipping path.
     pub(crate) fn as_additive_mut(&mut self) -> Option<&mut Self> {
         match self {
-            Self::Adapt(_) | Self::ConvRotInt8(_) | Self::Nvfp4(_) => Some(self),
+            Self::Adapt(_) | Self::Nvfp4(_) => Some(self),
             Self::Probed(_) => None,
         }
     }
@@ -493,17 +329,13 @@ impl QLinear {
     /// intended, and the same rule `AdditiveProj for AdaptLinear::strict_admission`
     /// (`crate::adapters`) applies, so the two hosts of one projection never disagree.
     pub(crate) fn strict_adapter_admission(&self) -> bool {
-        matches!(self, Self::Nvfp4(_))
+        matches!(self, Self::Nvfp4(_)) || self.is_convrot_int8()
     }
 
     pub(crate) fn additive_shape(&self) -> (usize, usize) {
         match self {
             Self::Adapt(a) => a.base_shape(),
             Self::Nvfp4(p) => p.adapt().base_shape(),
-            Self::ConvRotInt8(c) => {
-                let (out, input) = c.w_i8.dims2().expect("validated ConvRot rank-2 weight");
-                (out, input)
-            }
             Self::Probed(_) => {
                 unreachable!("probe projections are not exposed to adapter installation")
             }
@@ -512,26 +344,17 @@ impl QLinear {
 
     pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         match self {
-            Self::Adapt(host) => {
-                return host
-                    .push_lora(a, b, scale)
-                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
-            }
+            Self::Adapt(host) if host.is_convrot_int8() => host.push_lora_checked(a, b, scale),
+            Self::Adapt(host) => host.push_lora(a, b, scale),
             // NVFP4 admits through the shared CHECKED push: a shape/dtype/device mismatch is a typed
             // error here — at install, before the first sampler step — and the packed base is never
             // converted to another regime to make the factor fit.
-            Self::Nvfp4(host) => {
-                return host
-                    .adapt_mut()
-                    .push_lora_checked(a, b, scale)
-                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
-            }
-            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lora { a, b, scale }),
+            Self::Nvfp4(host) => host.adapt_mut().push_lora_checked(a, b, scale),
             Self::Probed(_) => {
                 unreachable!("probe projections are not exposed to adapter installation")
             }
         }
-        Ok(())
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
     }
 
     pub(crate) fn push_additive_lokr(
@@ -539,30 +362,22 @@ impl QLinear {
         factors: candle_gen::quant::LokrFactors,
     ) -> Result<()> {
         match self {
-            Self::Adapt(host) => {
-                return host
-                    .push_lokr_structured(factors)
-                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            Self::Adapt(host) if host.is_convrot_int8() => {
+                host.push_lokr_structured_checked(factors)
             }
-            Self::Nvfp4(host) => {
-                return host
-                    .adapt_mut()
-                    .push_lokr_structured_checked(factors)
-                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
-            }
-            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lokr { factors }),
+            Self::Adapt(host) => host.push_lokr_structured(factors),
+            Self::Nvfp4(host) => host.adapt_mut().push_lokr_structured_checked(factors),
             Self::Probed(_) => {
                 unreachable!("probe projections are not exposed to adapter installation")
             }
         }
-        Ok(())
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
     }
 
     pub(crate) fn clear_adapters(&mut self) {
         match self {
             Self::Adapt(host) => host.clear_adapters(),
             Self::Nvfp4(host) => host.adapt_mut().clear_adapters(),
-            Self::ConvRotInt8(host) => host.adapters.clear(),
             Self::Probed(_) => {}
         }
     }
@@ -748,7 +563,7 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_constructor_is_typed_error_not_panic() -> Result<()> {
-        let dev = Device::Cpu;
+        let dev = Device::new_cuda(0)?;
         let (out_dim, in_dim) = (64usize, 128usize);
         let mut wv = vec![0f32; out_dim * in_dim];
         for o in 0..out_dim {
@@ -762,7 +577,7 @@ mod tests {
         let rw = candle_gen::quant::convrot_rotate(&w, &r)?;
         let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw)?;
 
-        // Valid build + forward (CPU compute → dequant-dense leg): must not panic.
+        // The native constructor must fail early on malformed operands and run valid ones.
         let lin = QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G, None, &dev)?;
         assert!(lin.is_convrot_int8());
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
@@ -788,31 +603,19 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_applies_lora_and_lokr_without_replacing_int8_base() -> Result<()> {
-        let dev = Device::Cpu;
-        let (out_dim, in_dim, group) = (4usize, 4usize, 4usize);
-        let canonical = Tensor::from_vec(
-            vec![
-                0.5, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
-                -0.1,
-            ],
-            (out_dim, in_dim),
-            &dev,
-        )?;
+        let dev = Device::new_cuda(0)?;
+        let (out_dim, in_dim, group) = (16usize, 64usize, 64usize);
+        let canonical = Tensor::ones((out_dim, in_dim), DType::F32, &dev)?;
         let rotation = candle_gen::quant::regular_hadamard(group, &dev)?;
         let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation)?;
         let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated)?;
         let build =
             || QLinear::convrot_int8(parts.q.clone(), parts.scale.clone(), group, None, &dev);
-        let x = Tensor::from_vec(
-            vec![0.2f32, -0.4, 0.6, 0.8, -0.3, 0.5, 0.7, -0.9],
-            (2, in_dim),
-            &dev,
-        )?;
-
+        let x = Tensor::ones((2, in_dim), DType::F32, &dev)?;
         let bare = build()?;
         let mut lora = build()?;
-        let a = Tensor::from_vec(vec![0.4f32, -0.2, 0.7, 0.3], (in_dim, 1), &dev)?;
-        let b = Tensor::from_vec(vec![0.5f32, -0.6, 0.2, 0.9], (1, out_dim), &dev)?;
+        let a = Tensor::ones((in_dim, 1), DType::F32, &dev)?;
+        let b = Tensor::ones((1, out_dim), DType::F32, &dev)?;
         lora.push_additive_lora(a.clone(), b.clone(), 0.75)?;
         let lora_actual = (lora.forward(&x)? - bare.forward(&x)?)?;
         let lora_expected = (x.matmul(&a)?.matmul(&b)? * 0.75)?;
@@ -825,8 +628,8 @@ mod tests {
             "ConvRot LoRA residual drifted ({lora_max})"
         );
 
-        let w1 = Tensor::from_vec(vec![0.8f32, -0.3, 0.2, 0.6], (2, 2), &dev)?;
-        let w2 = Tensor::from_vec(vec![0.4f32, 0.7, -0.5, 0.9], (2, 2), &dev)?;
+        let w1 = Tensor::ones((4, 8), DType::F32, &dev)?;
+        let w2 = Tensor::ones((4, 8), DType::F32, &dev)?;
         let factors = candle_gen::quant::LokrFactors::build(
             0.5,
             (out_dim, in_dim),
@@ -839,7 +642,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .expect("2x2 kron factors fit a 4x4 projection");
+        .expect("4x8 Kronecker factors fit a 16x64 projection");
         let expected = factors.residual(&x)?;
         let mut lokr = build()?;
         lokr.push_additive_lokr(factors)?;
@@ -913,8 +716,10 @@ mod tests {
 
         // Reference: the SAME parts on a CPU compute device (dequant-dense leg), full-precision
         // activation — the int8-tolerance yardstick for the IGEMM path.
-        let lin_cpu = QLinear::convrot_int8(w_i8_cpu, pc.scale.clone(), G, None, &cpu)?;
-        let y_ref = lin_cpu.forward(&x.to_device(&cpu)?)?.to_dtype(DType::F32)?;
+        let rotated = candle_gen::quant::convrot_rotate(&x.to_device(&cpu)?, &r)?;
+        let row_scales = Tensor::from_vec(pc.scale, (out_dim, 1), &cpu)?;
+        let reference = w_i8_cpu.to_dtype(DType::F32)?.broadcast_mul(&row_scales)?;
+        let y_ref = rotated.matmul(&reference.t()?)?;
 
         let cos = tensor_cosine(&y_cuda, &y_ref) as f32;
         let num = (y_cuda.sub(&y_ref)?)

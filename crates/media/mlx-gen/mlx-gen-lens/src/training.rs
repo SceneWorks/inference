@@ -214,7 +214,11 @@ fn load_weights(spec: &LoadSpec) -> Result<LensTrainer> {
     };
     let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
     let enc_cfg = GptOssConfig::lens();
-    let enc_w = Weights::from_dir(root.join("text_encoder"))?;
+    let enc_w = Weights::from_dir_with_layout(
+        root.join("text_encoder"),
+        crate::text_encoder::gpt_oss::stacked_expert_key,
+        |_, _| dtype,
+    )?;
     let encoder =
         LensTextEncoder::from_weights_quant(enc_w, &enc_cfg, dtype, TRAINER_ENCODER_QUANT)?;
     let dit_cfg = LensDitConfig::lens();

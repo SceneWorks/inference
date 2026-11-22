@@ -120,6 +120,9 @@ pub(crate) fn loads_quantized(cfg: &Qwen35Config, prefix: &str, key: &str) -> bo
 /// The dense tensor `key` in the compute `dtype`, refusing a stored GGML block tensor (sc-19375)
 /// in a slot the loader reads dense — its bytes are block codes, not weights.
 fn dense_weight(w: &Weights, key: &str, dtype: DType) -> Result<Tensor> {
+    if let Some(dense) = w.encoded_dense(key, dtype, None)? {
+        return Ok(dense);
+    }
     let t = w.require(key)?;
     if is_ggml_block_tensor(t) {
         return Err(Error::Config(format!(
@@ -160,6 +163,9 @@ fn keyed_projection(
     modelopt: bool,
     device: &Device,
 ) -> Result<Projection> {
+    if let Some(p) = w.checkpoint_projection(key, dtype, device, None)? {
+        return Ok(p);
+    }
     if let Some(p) = crate::modelopt::modelopt_projection(w, key, format, device)? {
         return Ok(p);
     }
@@ -301,6 +307,11 @@ impl Qwen35Config {
 
         let hidden_size = req("hidden_size")?;
         let num_heads = req("num_attention_heads")?;
+        if num_heads <= 0 || hidden_size <= 0 {
+            return Err(Error::Config(
+                "qwen3_5 hidden_size and num_attention_heads must be positive".into(),
+            ));
+        }
         // The MoE variant (`qwen3_5_moe`) has no dense `intermediate_size` — every layer is MoE — so
         // fall back to the per-expert width (unused on the MoE path, but keeps the field valid).
         let intermediate_size = int("intermediate_size")
@@ -1987,7 +1998,6 @@ fn build_ffn(
     proj_q: &dyn Fn(String) -> Result<Projection>,
 ) -> Result<Ffn> {
     let lp = |s: &str| format!("{lp}{s}");
-    let req = |key: String| -> Result<Tensor> { dense_weight(w, &key, dtype) };
     let Some(moe) = &cfg.moe else {
         return Ok(Ffn::Dense(Mlp {
             gate: proj_q(lp("mlp.gate_proj.weight"))?,
@@ -2006,53 +2016,115 @@ fn build_ffn(
             });
         }
     } else {
+        let ne = moe.num_experts as usize;
         let mi = moe.moe_intermediate_size as usize;
-        debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
-        debug_assert_priced(&lp("mlp.experts.down_proj"), format);
-        // A prepared tier stores each stacked tensor as GGML blocks
-        // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole blocks, so it is
-        // sliced out exactly like the dense `[E, rows, cols]`.
-        let stacked = |key: String| -> Result<(Tensor, bool)> {
-            let t = w.require(&key)?;
-            match is_ggml_block_tensor(t) {
-                true => Ok((t.clone(), true)),
-                false => Ok((req(key)?, false)),
-            }
-        };
-        let (gate_up_key, down_key) = (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
-        let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
-        let (down, down_stored) = stacked(down_key.clone())?;
-        let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
-            match stored {
-                true => Projection::load_stored_blocks(key, &slice, None, format, device),
-                false => Projection::load_as(slice.contiguous()?, None, format),
-            }
-        };
-        for e in 0..moe.num_experts as usize {
-            let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
-            let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
+        let hidden = cfg.hidden_size as usize;
+        let gate_up = stacked_expert_projections(
+            w,
+            &lp("mlp.experts.gate_up_proj"),
+            dtype,
+            device,
+            format,
+            [ne, 2 * mi, hidden],
+            2,
+        )?;
+        let down = stacked_expert_projections(
+            w,
+            &lp("mlp.experts.down_proj"),
+            dtype,
+            device,
+            format,
+            [ne, hidden, mi],
+            1,
+        )?;
+        let mut gate_up = gate_up.into_iter();
+        for down in down {
             experts.push(SwiGlu {
-                gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
-                up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
-                down: expert(&down_key, dn, down_stored)?,
+                gate: gate_up.next().expect("two projections per expert"),
+                up: gate_up.next().expect("two projections per expert"),
+                down,
             });
         }
     }
-    Ok(Ffn::Moe(SparseMoe::new(
-        req(lp("mlp.gate.weight"))?,
+    Ok(Ffn::Moe(SparseMoe::from_projections(
+        w.linear(&lp("mlp.gate.weight"), dtype, None)?,
+        dtype,
         experts,
         SwiGlu {
             gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
             up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
             down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
         },
-        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        Some(w.linear(&lp("mlp.shared_expert_gate.weight"), dtype, None)?),
         MoeRouting {
             experts_per_tok: moe.experts_per_tok,
             norm_topk_prob: true,
             routed_scaling_factor: 1.0,
         },
     )?))
+}
+
+/// Slice each expert's contiguous [out,in] rows before materializing its matrix. A scalar FP8
+/// stack carries the same publisher scales for every expert. Stored GGML blocks retain their
+/// additional trailing block dimensions and the original per-expert reconstruction path.
+fn stacked_expert_projections(
+    w: &Weights,
+    key: &str,
+    dtype: DType,
+    device: &Device,
+    format: Option<&ProjectionFormat>,
+    shape: [usize; 3],
+    parts: usize,
+) -> Result<Vec<Projection>> {
+    debug_assert_priced(key, format);
+    let [experts, full_rows, cols] = shape;
+    let rows = full_rows / parts;
+    let mut projections = Vec::with_capacity(experts * parts);
+    let encoded = w.encoded_device(key).is_some();
+    if encoded {
+        if w.shape(key) != Some(shape.as_slice()) {
+            return Err(Error::Config(format!(
+                "expert stack `{key}` has shape {:?}, expected {shape:?}",
+                w.shape(key)
+            )));
+        }
+        if let Some(first) = w.native_projection_slice(key, dtype, device, 0, rows, cols)? {
+            projections.push(first);
+            for index in 1..experts * parts {
+                let projection = w
+                    .native_projection_slice(key, dtype, device, index * rows, rows, cols)?
+                    .ok_or_else(|| {
+                        Error::Config(format!("inconsistent native slice in expert stack {key}"))
+                    })?;
+                projections.push(projection);
+            }
+            return Ok(projections);
+        }
+    }
+    let raw = if let Some(t) = w.encoded_dense(key, dtype, Some(device))? {
+        t
+    } else {
+        w.require(key)?.clone()
+    };
+    let stored = is_ggml_block_tensor(&raw);
+    let stack = if stored { raw } else { raw.to_dtype(dtype)? };
+    for expert in 0..experts {
+        let block = stack.narrow(0, expert, 1)?.squeeze(0)?;
+        for part in 0..parts {
+            let slice = block.narrow(0, part * rows, rows)?;
+            let projection = if stored {
+                Projection::load_stored_blocks(key, &slice, None, format, device)?
+            } else {
+                Projection::load_as(
+                    slice.contiguous()?,
+                    None,
+                    if encoded { None } else { format },
+                )?
+            };
+            projections.push(projection);
+        }
+    }
+    Ok(projections)
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -2371,12 +2443,17 @@ impl Qwen35Mtp {
                 }
             })
             .transpose()?;
-        let raw = Weights::from_dir(dir, &target.device)?;
+        let mut raw = Weights::from_dir(dir, &target.device)?;
         let prefix = core_llm::companion_mtp_prefix(|key| raw.contains(key))
             .map_err(|e| Error::Config(e.to_string()))?;
 
+        for (name, shape) in geometry.matrices() {
+            raw.bind_matrix_shape(&format!("{prefix}{name}.weight"), shape)?;
+        }
         let logical = |key: &str| -> Option<[usize; 2]> {
-            let (rows, cols) = raw.get(key)?.dims2().ok()?;
+            let &[rows, cols] = raw.shape(key)? else {
+                return None;
+            };
             match quant {
                 Some((_, group)) => {
                     let stem = key.strip_suffix(".weight").unwrap_or(key);
@@ -2388,9 +2465,7 @@ impl Qwen35Mtp {
         };
         // The shared stored-tensor check (E8: MLX refuses exactly the same heads).
         geometry
-            .check_tensors(prefix, logical, |key| {
-                raw.get(key).map(|t| t.dims().to_vec())
-            })
+            .check_tensors(prefix, logical, |key| raw.shape(key).map(<[usize]>::to_vec))
             .map_err(Error::Config)?;
         let mut expected_keys = std::collections::BTreeSet::new();
         for (name, _) in geometry.matrices() {
@@ -2412,17 +2487,10 @@ impl Qwen35Mtp {
         .map_err(Error::Config)?;
 
         // The predictor reads the native `mtp.` layout.
-        let device = raw.device().clone();
-        let w = Weights::from_map(
-            raw.into_map()
-                .into_iter()
-                .map(|(key, t)| match key.strip_prefix(prefix) {
-                    Some(bare) if prefix.is_empty() => (format!("mtp.{bare}"), t),
-                    _ => (key, t),
-                })
-                .collect(),
-            device,
-        );
+        let mut w = raw;
+        if prefix.is_empty() {
+            w.add_key_prefix("mtp.");
+        }
         let proj_q = |key: &str| -> Result<Projection> {
             match quant {
                 Some((bits, group)) => {
@@ -3974,7 +4042,7 @@ impl Qwen35Model {
         // embedding) is read as stored GGML blocks when a fully quantized tier (SW-7201) stores it
         // so, in its per-tensor format.
         let stored = |key: &str| -> Option<&Tensor> {
-            w.get(key)
+            w.plain(key)
                 .filter(|t| prism.is_none() && is_ggml_block_tensor(t))
         };
         let load_stored = |key: &str, t: &Tensor| -> Result<Projection> {
@@ -3987,7 +4055,7 @@ impl Qwen35Model {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
                 None => match stored(&key) {
                     Some(t) => load_stored(&key, t),
-                    None => Projection::load(req(key)?, None),
+                    None => w.linear(&key, dtype, None),
                 },
             }
         };
@@ -4029,41 +4097,49 @@ impl Qwen35Model {
         } else {
             "lm_head.weight".to_string()
         };
-        let lm_head =
-            if !with_lm_head {
-                None
-            } else {
-                Some(std::sync::Arc::new(
-                    if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
-                        Projection::load_prism(weight.clone())
-                    } else if cfg.tie_word_embeddings {
-                        match &embed_tokens {
-                            QwenEmbedding::Dense(weight) => {
-                                Projection::load_as(weight.clone(), None, dense_format)?
+        let lm_head = if !with_lm_head {
+            None
+        } else {
+            Some(std::sync::Arc::new(
+                if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+                    Projection::load_prism(weight.clone())
+                } else if cfg.tie_word_embeddings {
+                    match &embed_tokens {
+                        QwenEmbedding::Dense(weight) => {
+                            match w.native_projection(&embed_key, dtype, &device, None)? {
+                                Some(head) => head,
+                                None => Projection::load_as(weight.clone(), None, dense_format)?,
                             }
-                            // A tied stored table is the head's own blocks, as stored.
-                            QwenEmbedding::Q8(_) => load_stored(
-                                &embed_key,
-                                stored(&embed_key).expect("a Q8 table is stored"),
-                            )?,
-                            QwenEmbedding::Prism(_) => return Err(Error::Config(
+                        }
+                        // A tied stored table is the head's own blocks, as stored.
+                        QwenEmbedding::Q8(_) => load_stored(
+                            &embed_key,
+                            stored(&embed_key).expect("a Q8 table is stored"),
+                        )?,
+                        QwenEmbedding::Prism(_) => {
+                            return Err(Error::Config(
                                 "Prism tied embeddings require an explicit lm_head packed tensor"
                                     .into(),
-                            )),
+                            ))
                         }
-                    } else if cfg.sensenova_loop.is_some() {
-                        keyed_projection(w, &head_key, dtype, format, false, &device)?
-                    } else if let Some(t) = stored(&head_key) {
-                        load_stored(&head_key, t)?
-                    } else if let Some(head) =
-                        crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
-                    {
-                        head
-                    } else {
-                        Projection::load_as(req(head_key)?, None, dense_format)?
-                    },
-                ))
-            };
+                    }
+                } else if cfg.sensenova_loop.is_some() {
+                    keyed_projection(w, &head_key, dtype, format, false, &device)?
+                } else if let Some(t) = stored(&head_key) {
+                    load_stored(&head_key, t)?
+                } else if let Some(head) =
+                    w.checkpoint_projection(&head_key, dtype, &device, None)?
+                {
+                    head
+                } else if let Some(head) =
+                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                {
+                    head
+                } else {
+                    Projection::load_as(req(head_key)?, None, dense_format)?
+                },
+            ))
+        };
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -4481,6 +4557,33 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn stacked_checkpoint_experts_keep_row_boundaries_without_a_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let key = "model.layers.0.mlp.experts.gate_up_proj";
+        let codes =
+            Tensor::from_raw_buffer(&[0x38; 32], DType::F8E4M3, &[2, 4, 4], &device).unwrap();
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(key, codes)]),
+            dir.path().join("experts.safetensors"),
+        )
+        .unwrap();
+        let weights = Weights::from_dir(dir.path(), &device).unwrap();
+        let ops =
+            stacked_expert_projections(&weights, key, DType::F32, &device, None, [2, 4, 4], 2)
+                .unwrap();
+        assert_eq!(ops.len(), 4);
+        for op in ops {
+            assert_eq!(op.dims(), (2, 4));
+            assert_eq!(op.resident_bytes(), Some(8 * 4));
+        }
+        assert!(
+            stacked_expert_projections(&weights, key, DType::F32, &device, None, [4, 2, 4], 2)
+                .is_err()
+        );
+    }
 
     /// The fused GDN input preparation (conv + SiLU, q/k L2 norms, gates) is bit-identical to the
     /// op chains `GatedDeltaNet::forward_at` runs without it, over decode, verify and prefill

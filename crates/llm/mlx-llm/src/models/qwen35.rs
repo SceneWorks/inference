@@ -1427,6 +1427,7 @@ pub struct Qwen35Model {
 #[derive(Debug)]
 enum TokenEmbedding {
     Dense(Array),
+    Native(mlx_layers::NativeProjection),
     /// A fully quantized tier's stored affine table (SW-7201), gathered then dequantized per row.
     Quantized(QuantizedEmbedding),
     Prism(PrismEmbedding),
@@ -1436,6 +1437,7 @@ impl TokenEmbedding {
     fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Self::Dense(weight) => out.push(weight.clone()),
+            Self::Native(p) => p.push_arrays(out),
             Self::Quantized(q) => {
                 out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
             }
@@ -1446,6 +1448,7 @@ impl TokenEmbedding {
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
+            Self::Native(p) => Ok(p.rows(input_ids)?),
             Self::Quantized(embedding) => embedding.forward(input_ids),
             Self::Prism(embedding) => embedding.forward(input_ids),
         }
@@ -1455,6 +1458,7 @@ impl TokenEmbedding {
     /// (never materialized twice). Prism refuses a tied head before reaching here.
     fn tied_projection(&self) -> Projection {
         match self {
+            Self::Native(p) => Projection::Native(p.clone()),
             Self::Dense(weight) => Projection::Dense {
                 weight: weight.clone(),
                 bias: None,
@@ -2446,6 +2450,9 @@ impl Qwen35Model {
             (prism.is_none() && w.contains(&format!("{stem}.scales"))).then(|| stem.to_string())
         };
         let proj_dense = |key: String| -> Result<Projection> {
+            if let Some(native) = Projection::native(w, &key, false)? {
+                return Ok(native);
+            }
             match stored_part(&key) {
                 Some(stem) => load_projection(w, &key, stored_spec(&stem), None, &saw_stored),
                 None => Projection::load(w.require(&key)?.as_dtype(compute())?, None),
@@ -2462,6 +2469,8 @@ impl Qwen35Model {
         let embed_key = dp("embed_tokens.weight");
         let embed_tokens = if let Some(pack) = prism {
             TokenEmbedding::Prism(pack.embedding(w, &embed_key)?)
+        } else if let Some(Projection::Native(p)) = Projection::native(w, &embed_key, false)? {
+            TokenEmbedding::Native(p)
         } else if let Some(stem) = stored_part(&embed_key) {
             let spec = stored_spec(&stem).ok_or_else(|| {
                 Error::Config(format!(
@@ -2679,6 +2688,12 @@ fn build_ffn(
     let per_expert = ["weight", "scales", "biases"]
         .iter()
         .any(|part| w.contains(&format!("{expert0}.{part}")));
+    let gate_projection = |key: String| -> Result<Projection> {
+        if let Some(p) = Projection::native(w, &key, false)? {
+            return Ok(p);
+        }
+        Projection::load(req(key)?, None)
+    };
     let (gate, up, down) = if cfg.quantization.is_some() || per_expert {
         let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
         for e in 0..moe.num_experts {
@@ -2696,33 +2711,43 @@ fn build_ffn(
         // The fused bank stays fused (sc-24446): one gathered matmul over gate‖up rows, its
         // output split per token. Splitting the weights here held a second, gathered copy of
         // the whole bank (~44 GB on Qwen3.6-35B-A3B).
-        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
-        if gate_up.shape() != [e, 2 * mi, h] {
-            return Err(Error::Config(format!(
-                "qwen3_5_moe: `{}` is {:?}; expected [{e}, {}, {h}] from config",
-                lp("mlp.experts.gate_up_proj"),
-                gate_up.shape(),
-                2 * mi
-            )));
-        }
-        return Ok(Ffn::Moe(SparseMoe::fused(
-            req(lp("mlp.gate.weight"))?,
-            SwitchLinear::load(gate_up, quant)?,
-            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
+        let gate_key = lp("mlp.experts.gate_up_proj");
+        let down_key = lp("mlp.experts.down_proj");
+        let gate_up = SwitchLinear::from_checkpoint(
+            w,
+            &gate_key,
+            [e, 2 * mi, h],
+            || req(gate_key.clone()),
+            quant,
+        )?;
+        let down = SwitchLinear::from_checkpoint(
+            w,
+            &down_key,
+            [e, h, mi],
+            || req(down_key.clone()),
+            quant,
+        )?;
+        return Ok(Ffn::Moe(SparseMoe::with_gate_up(
+            gate_projection(lp("mlp.gate.weight"))?,
+            crate::primitives::moe::GateUp::Fused(gate_up),
+            down,
             shared_expert(&proj_q, &lp)?,
-            Some(req(lp("mlp.shared_expert_gate.weight"))?),
+            Some(gate_projection(lp("mlp.shared_expert_gate.weight"))?),
             routing(moe),
         )?));
     };
-    Ok(Ffn::Moe(SparseMoe::new(
-        req(lp("mlp.gate.weight"))?,
-        gate,
-        up,
+    Ok(Ffn::Moe(SparseMoe::with_gate_up(
+        gate_projection(lp("mlp.gate.weight"))?,
+        crate::primitives::moe::GateUp::Split { gate, up },
         down,
         shared_expert(&proj_q, &lp)?,
-        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        Some(gate_projection(lp("mlp.shared_expert_gate.weight"))?),
         routing(moe),
     )?))
+}
+
+pub(crate) fn stacked_expert_key(key: &str) -> bool {
+    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
 }
 
 /// The always-on shared expert of the MoE layer under `lp`.
@@ -2756,6 +2781,9 @@ fn load_projection(
     quant: Option<QuantSpec>,
     saw_stored: &Cell<bool>,
 ) -> Result<Projection> {
+    if let Some(native) = Projection::native(w, key, false)? {
+        return Ok(native);
+    }
     let base = key.strip_suffix(".weight").unwrap_or(key);
     let scales_key = format!("{base}.scales");
     let biases_key = format!("{base}.biases");

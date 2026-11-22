@@ -38,23 +38,7 @@ use crate::text_encoder::mxfp4::dequantize_mxfp4;
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight and `[out]` bias (the gpt-oss attention
 /// projections all have biases — `attention_bias: true`).
-struct LinearBias {
-    w: Array, // [out, in]
-    b: Array, // [out]
-}
-
-impl LinearBias {
-    fn load(w: &Weights, key: &str, dtype: Dtype) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{key}.weight"))?.as_dtype(dtype)?,
-            b: w.require(&format!("{key}.bias"))?.as_dtype(dtype)?,
-        })
-    }
-
-    fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(add(&matmul(x, self.w.t())?, &self.b)?)
-    }
-}
+type LinearBias = crate::dit::Linear;
 
 /// One gpt-oss decoder layer's attention (`self_attn`). Consumes the RMSNorm'd hidden state and
 /// returns the attention output *before* the residual add (matching `GptOssAttention.forward`).
@@ -82,10 +66,10 @@ impl GptOssAttention {
         dtype: Dtype,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: LinearBias::load(w, &format!("{prefix}.q_proj"), dtype)?,
-            k_proj: LinearBias::load(w, &format!("{prefix}.k_proj"), dtype)?,
-            v_proj: LinearBias::load(w, &format!("{prefix}.v_proj"), dtype)?,
-            o_proj: LinearBias::load(w, &format!("{prefix}.o_proj"), dtype)?,
+            q_proj: LinearBias::load(w, &format!("{prefix}.q_proj"), true, dtype)?,
+            k_proj: LinearBias::load(w, &format!("{prefix}.k_proj"), true, dtype)?,
+            v_proj: LinearBias::load(w, &format!("{prefix}.v_proj"), true, dtype)?,
+            o_proj: LinearBias::load(w, &format!("{prefix}.o_proj"), true, dtype)?,
             sinks: w.require(&format!("{prefix}.sinks"))?.as_dtype(dtype)?,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
@@ -537,33 +521,99 @@ impl StackedQuant {
 /// The MoE expert bank, stored **stacked** `[E, …]` for grouped-GEMM routing (F-021) — dense bf16
 /// (the dequantized-MXFP4 encoder path) or MLX group-wise affine Q4/Q8 (the ~12 GB path, sc-3172).
 /// Replaces the former per-expert `Vec<Expert>` + all-32-dense-then-mask loop.
-enum ExpertBank {
-    /// `gu_w [E, hidden, 2·inter]`, `gu_b [E, 2·inter]`, `dn_w [E, inter, hidden]`, `dn_b [E, hidden]`
-    /// — the `GptOssExperts` `[E, in, out]` layout, forward `x·w` via `gather_mm`.
-    Dense {
-        gu_w: Array,
-        gu_b: Array,
-        dn_w: Array,
-        dn_b: Array,
-    },
-    /// Stacked Q4/Q8 packs for `gate_up` / `down`.
-    Quant { gu: StackedQuant, dn: StackedQuant },
+struct ExpertBank {
+    gu: ExpertProjection,
+    dn: ExpertProjection,
 }
 
-impl ExpertBank {
-    /// gate_up projection: `x [.., 1, hidden]` → `[.., 1, 2·inter]`.
-    fn gate_up(&self, x: &Array, idx: &Array, sorted: bool) -> Result<Array> {
-        match self {
-            ExpertBank::Dense { gu_w, gu_b, .. } => dense_gather(x, gu_w, gu_b, idx, sorted),
-            ExpertBank::Quant { gu, .. } => gu.forward(x, idx, sorted),
+enum ExpertProjection {
+    Source(mlx_llm::primitives::moe::SwitchLinear),
+    Dense { weight: Array, bias: Array },
+    Quant(StackedQuant),
+}
+
+pub(crate) fn stacked_expert_key(key: &str) -> bool {
+    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
+}
+
+impl ExpertProjection {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        name: &str,
+        shape: [i32; 3],
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        let key = format!("{prefix}.experts.{name}_proj");
+        let [experts, out, input] = shape;
+        if let Some(weight) = w.get(&key) {
+            let bias = w.require(&format!("{key}_bias"))?.as_dtype(dtype)?;
+            if let Some(native) = mlx_llm::primitives::moe::SwitchLinear::from_scalar_source(
+                w,
+                &key,
+                shape,
+                true,
+                Some(&bias),
+            )
+            .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?
+            {
+                return Ok(Self::Source(native));
+            }
+            if weight.shape() != [experts, input, out]
+                || bias.shape() != [experts, out]
+                || !matches!(
+                    weight.dtype(),
+                    Dtype::Float32 | Dtype::Bfloat16 | Dtype::Float16
+                )
+            {
+                return Err(mlx_gen::Error::Msg(format!(
+                    "{key}: invalid decoded expert bank or bias"
+                )));
+            }
+            return Ok(Self::Dense {
+                weight: weight.as_dtype(dtype)?,
+                bias,
+            });
         }
+        if crate::quant::has_packed_experts(w, prefix, name) {
+            return Ok(Self::Quant(stacked_quant_from_pack(
+                crate::quant::load_packed_stack(w, prefix, name)?,
+            )));
+        }
+        let blocks = w.require(&format!("{key}_blocks"))?;
+        let scales = w.require(&format!("{key}_scales"))?;
+        let bias = w.require(&format!("{key}_bias"))?;
+        if let Some(q) = quant {
+            let (bits, group_size) = (q.bits(), mlx_gen::quant::DEFAULT_GROUP_SIZE);
+            Weights::materialize_named(&mut [
+                ("blocks", blocks),
+                ("scales", scales),
+                ("bias", bias),
+            ])?;
+            let p = prequantize_expert_proj(blocks, scales, bias, bits, group_size)?;
+            return Ok(Self::Quant(StackedQuant {
+                wq: p.weight,
+                scales: p.scales,
+                biases: p.biases,
+                b: p.bias,
+                group_size,
+                bits,
+            }));
+        }
+        Ok(Self::Dense {
+            weight: dequantize_mxfp4(blocks, scales, dtype)?,
+            bias: bias.as_dtype(dtype)?,
+        })
     }
 
-    /// down projection: `gated [.., 1, inter]` → `[.., 1, hidden]`.
-    fn down(&self, gated: &Array, idx: &Array, sorted: bool) -> Result<Array> {
+    fn forward(&self, x: &Array, idx: &Array, sorted: bool, offsets: &[i32]) -> Result<Array> {
         match self {
-            ExpertBank::Dense { dn_w, dn_b, .. } => dense_gather(gated, dn_w, dn_b, idx, sorted),
-            ExpertBank::Quant { dn, .. } => dn.forward(gated, idx, sorted),
+            Self::Source(p) => p
+                .project_sorted(x, idx, offsets)
+                .map_err(|e| mlx_gen::Error::Msg(e.to_string())),
+            Self::Dense { weight, bias } => dense_gather(x, weight, bias, idx, sorted),
+            Self::Quant(p) => p.forward(x, idx, sorted),
         }
     }
 }
@@ -595,6 +645,7 @@ fn dense_gather(x: &Array, w: &Array, b: &Array, idx: &Array, sorted: bool) -> R
 pub struct GptOssMoe {
     router_w: Array, // [E, hidden]
     router_b: Array, // [E]
+    router_source: Option<mlx_gen::NativeProjection>,
     bank: ExpertBank,
     top_k: i32,
     inter: i32,
@@ -612,7 +663,7 @@ impl GptOssMoe {
     ///   dequantized then re-quantized to MLX Q4/Q8 via `prequantize_expert_proj`, which `eval`s the
     ///   pack and frees the per-layer bf16 transient before the next layer loads (the full `~38 GB`
     ///   bf16 expert stack across 24 layers never co-resides).
-    /// * **MXFP4 dense** (`quant = None`) — dequantized to a stacked bf16 `ExpertBank::Dense`.
+    /// * **MXFP4 dense** (`quant = None`) — dequantized to a stacked bf16 coefficients.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -622,68 +673,30 @@ impl GptOssMoe {
     ) -> Result<Self> {
         let req = |k: &str| -> Result<Array> { Ok(w.require(k)?.as_dtype(dtype)?) };
 
-        // Packed-detect (sc-8763): a **pre-quantized turnkey** stores the experts as the stacked packed
-        // triple `experts.{gate_up,down}_proj.{weight,scales,biases}` (`crate::convert`), which loads
-        // directly with NO MXFP4 dequant + re-quant transient — the memory win realized on disk. A
-        // dense (MXFP4) source has no `experts.gate_up_proj.scales`, so it falls through to the
-        // dequant-then-(optionally)-quantize paths below.
-        let bank = if crate::quant::has_packed_experts(w, prefix, "gate_up") {
-            ExpertBank::Quant {
-                gu: stacked_quant_from_pack(crate::quant::load_packed_stack(w, prefix, "gate_up")?),
-                dn: stacked_quant_from_pack(crate::quant::load_packed_stack(w, prefix, "down")?),
-            }
-        } else if let Some(q) = quant {
-            // MXFP4 source + load-time quant: reuse the exact per-expert prequantize (returns the
-            // stacked pack, byte-identical to the packed turnkey, and `eval`s it so the bf16 dequant
-            // transient frees before the next layer loads).
-            let (bits, gs) = (q.bits(), mlx_gen::quant::DEFAULT_GROUP_SIZE);
-            let pack = |name: &str| -> Result<StackedQuant> {
-                let blocks = w.require(&format!("{prefix}.experts.{name}_proj_blocks"))?;
-                let scales = w.require(&format!("{prefix}.experts.{name}_proj_scales"))?;
-                let bias = w.require(&format!("{prefix}.experts.{name}_proj_bias"))?;
-                // Materialize the MXFP4 source before the GPU dequant+quantize `eval` below, so it
-                // never waits on an unread `Load` (sc-24245).
-                Weights::materialize_named(&mut [
-                    ("blocks", blocks),
-                    ("scales", scales),
-                    ("bias", bias),
-                ])?;
-                let p = prequantize_expert_proj(blocks, scales, bias, bits, gs)?;
-                Ok(StackedQuant {
-                    wq: p.weight,
-                    scales: p.scales,
-                    biases: p.biases,
-                    b: p.bias,
-                    group_size: gs,
-                    bits,
-                })
-            };
-            ExpertBank::Quant {
-                gu: pack("gate_up")?,
-                dn: pack("down")?,
-            }
-        } else {
-            // MXFP4 dense (bf16): dequantize to the stacked `[E, in, out]` layout; no per-expert split.
-            let gu_w = dequantize_mxfp4(
-                w.require(&format!("{prefix}.experts.gate_up_proj_blocks"))?,
-                w.require(&format!("{prefix}.experts.gate_up_proj_scales"))?,
+        // Each declared bank has independent storage and bias. Only sources without direct
+        // coefficients or an affine pack use the classic MXFP4 blocks/scales pair.
+        let bank = ExpertBank {
+            gu: ExpertProjection::load(
+                w,
+                prefix,
+                "gate_up",
+                [cfg.num_experts, 2 * cfg.intermediate, cfg.hidden_size],
                 dtype,
-            )?; // [E, hidden, 2*inter]
-            let dn_w = dequantize_mxfp4(
-                w.require(&format!("{prefix}.experts.down_proj_blocks"))?,
-                w.require(&format!("{prefix}.experts.down_proj_scales"))?,
+                quant,
+            )?,
+            dn: ExpertProjection::load(
+                w,
+                prefix,
+                "down",
+                [cfg.num_experts, cfg.hidden_size, cfg.intermediate],
                 dtype,
-            )?; // [E, inter, hidden]
-            ExpertBank::Dense {
-                gu_w,
-                gu_b: req(&format!("{prefix}.experts.gate_up_proj_bias"))?, // [E, 2*inter]
-                dn_w,
-                dn_b: req(&format!("{prefix}.experts.down_proj_bias"))?, // [E, hidden]
-            }
+                quant,
+            )?,
         };
 
         Ok(Self {
-            router_w: req(&format!("{prefix}.router.weight"))?,
+            router_source: w.source_projection(&format!("{prefix}.router.weight"))?,
+            router_w: w.require(&format!("{prefix}.router.weight"))?.clone(),
             router_b: req(&format!("{prefix}.router.bias"))?,
             bank,
             top_k: cfg.experts_per_tok,
@@ -701,7 +714,14 @@ impl GptOssMoe {
         let xf = x.reshape(&[n, hidden])?;
 
         // Router logits [n, E] → on-device top-`k` routing (selected indices + softmax weights).
-        let logits = add(&matmul(&xf, self.router_w.t())?, &self.router_b)?;
+        let logits = if let Some(p) = &self.router_source {
+            p.forward_with_bias(&xf, Some(&self.router_b))?
+        } else {
+            add(
+                &matmul(&xf, self.router_w.as_dtype(x.dtype())?.t())?,
+                &self.router_b,
+            )?
+        };
         let (idx, weights) = self.route(&logits)?; // idx [n, k], weights [n, k]
         let k = self.top_k;
 
@@ -722,7 +742,13 @@ impl GptOssMoe {
         k: i32,
         hidden: i32,
     ) -> Result<Array> {
-        if (n as i64) * (k as i64) >= GATHER_SORT_THRESHOLD {
+        let source_experts = [&self.bank.gu, &self.bank.dn]
+            .into_iter()
+            .find_map(|p| match p {
+                ExpertProjection::Source(bank) => Some(bank.num_experts()),
+                _ => None,
+            });
+        if source_experts.is_some() || (n as i64) * (k as i64) >= GATHER_SORT_THRESHOLD {
             // mlx-lm `_gather_sort`: sort the `n·k` (token, expert) pairs by expert so `gather_qmm`'s
             // `sorted_indices` fast path does contiguous per-expert GEMM, then scatter-unsort. Each
             // pair's math is x[token]·W[expert] — identical values, so this is numerically equivalent
@@ -733,21 +759,27 @@ impl GptOssMoe {
             let sorted_idx = idx_flat.take(&order)?; // [n*k] ascending expert
             let token = floor_divide(&order, Array::from_slice(&[k], &[1]))?; // [n*k] token per pair
             let x_rows = xf.take_axis(&token, 0)?.reshape(&[n * k, 1, hidden])?; // [n*k, 1, hidden]
-            let out = self.expert_mlp(&x_rows, &sorted_idx, true)?; // [n*k, 1, hidden]
+            let offsets = if let Some(experts) = source_experts {
+                mlx_llm::primitives::moe::routed_offsets(&sorted_idx, experts)
+                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?
+            } else {
+                vec![]
+            };
+            let out = self.expert_mlp(&x_rows, &sorted_idx, true, &offsets)?; // [n*k, 1, hidden]
             let out = out.reshape(&[n * k, hidden])?.take_axis(&inv_order, 0)?; // unsort
             Ok(out.reshape(&[n, k, hidden])?)
         } else {
             // Direct broadcast: `x [n, 1, 1, hidden]` against `idx [n, k]` → `[n, k, 1, hidden]`.
             let x4 = xf.reshape(&[n, 1, 1, hidden])?;
-            Ok(self.expert_mlp(&x4, idx, false)?.squeeze_axes(&[2])?) // [n, k, hidden]
+            Ok(self.expert_mlp(&x4, idx, false, &[])?.squeeze_axes(&[2])?) // [n, k, hidden]
         }
     }
 
     /// The clamped-SwiGLU expert body over gathered rows: `gate_up` (fused, one gather) →
     /// de-interleave → clamp → SwiGLU → `down`. Shape-agnostic in the batch dims: `x` is `[.., 1,
     /// hidden]` (broadcasting against `idx`) and the result is `[.., 1, hidden]`.
-    fn expert_mlp(&self, x: &Array, idx: &Array, sorted: bool) -> Result<Array> {
-        let gate_up = self.bank.gate_up(x, idx, sorted)?; // [.., 1, 2*inter]
+    fn expert_mlp(&self, x: &Array, idx: &Array, sorted: bool, offsets: &[i32]) -> Result<Array> {
+        let gate_up = self.bank.gu.forward(x, idx, sorted, offsets)?; // [.., 1, 2*inter]
 
         // De-interleave gate/up: reshape the last axis `2*inter` → `(inter, 2)`, split (gate = `[..,
         // 0]`, up = `[.., 1]`), matching the dense `GptOssExperts` layout.
@@ -771,7 +803,7 @@ impl GptOssMoe {
         let glu = multiply(&gate, &sigmoid(&multiply(&gate, &alpha)?)?)?;
         let gated = multiply(&add(&up, &one)?, &glu)?; // [.., 1, inter]
 
-        self.bank.down(&gated, idx, sorted) // [.., 1, hidden]
+        self.bank.dn.forward(&gated, idx, sorted, offsets) // [.., 1, hidden]
     }
 
     /// On-device top-`k` routing. Returns `(idx, weights)`: `idx [n, k]` the selected expert indices
@@ -1001,6 +1033,61 @@ mod moe_grouped_tests {
     use mlx_gen::testing::peak_rel_f32;
     use mlx_rs::ops::quantized_matmul;
 
+    #[test]
+    fn full_precision_scalar_experts_bind_decoded_input_major_coefficients() {
+        // A scalar FP8 bank with an explicit full-precision matrix multiply uses the loader's
+        // chosen float width, then the normal GptOss expert constructor consumes those rows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("experts.safetensors");
+        let key = "model.layers.0.mlp.experts.gate_up_proj";
+        let desc = br#"{"format":"float8_e4m3fn","full_precision_matrix_mult":true}"#;
+        let scale = 1.0 + 2.0f32.powi(-9);
+        let mut data = vec![0x38_u8; 12];
+        data.extend(scale.to_le_bytes());
+        data.extend(desc);
+        let header = serde_json::json!({
+            (key): {"dtype":"F8_E4M3","shape":[2,3,2],"data_offsets":[0,12]},
+            (format!("{key}.weight_scale")): {"dtype":"F32","shape":[],"data_offsets":[12,16]},
+            (format!("{key}.comfy_quant")): {"dtype":"U8","shape":[desc.len()],"data_offsets":[16,16+desc.len()]}
+        });
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(data);
+        std::fs::write(&path, bytes).unwrap();
+        let mut w =
+            Weights::from_file_with_layout(&path, stacked_expert_key, |_, _| Dtype::Float32)
+                .unwrap();
+        assert!(w.get(&format!("{key}.comfy_quant")).is_none());
+        w.insert(format!("{key}_bias"), Array::zeros::<f32>(&[2, 2]).unwrap());
+        let bound = ExpertProjection::load(
+            &w,
+            "model.layers.0.mlp",
+            "gate_up",
+            [2, 2, 3],
+            Dtype::Float32,
+            None,
+        )
+        .unwrap();
+        let ExpertProjection::Dense { weight, bias } = bound else {
+            panic!("expected decoded FP8 bank")
+        };
+        assert_eq!(weight.shape(), &[2, 3, 2]);
+        assert_eq!(bias.shape(), &[2, 2]);
+        weight.eval().unwrap();
+        assert_eq!(weight.as_slice::<f32>(), &[scale; 12]);
+        assert!(ExpertProjection::load(
+            &w,
+            "model.layers.0.mlp",
+            "gate_up",
+            [2, 3, 2],
+            Dtype::Float32,
+            None
+        )
+        .is_err());
+    }
+
     fn rn(shape: &[i32], scale: f32, dtype: Dtype) -> Array {
         let a = mlx_rs::random::normal::<f32>(shape, None, None, None).unwrap();
         multiply(&a, scalar(scale))
@@ -1018,13 +1105,18 @@ mod moe_grouped_tests {
     fn build_dense(e: i32, k: i32, hidden: i32, inter: i32, dtype: Dtype) -> GptOssMoe {
         let s_in = 1.0 / (hidden as f32).sqrt();
         GptOssMoe {
+            router_source: None,
             router_w: rn(&[e, hidden], s_in, dtype),
             router_b: rn(&[e], 0.1, dtype),
-            bank: ExpertBank::Dense {
-                gu_w: rn(&[e, hidden, 2 * inter], s_in, dtype),
-                gu_b: rn(&[e, 2 * inter], 0.1, dtype),
-                dn_w: rn(&[e, inter, hidden], 1.0 / (inter as f32).sqrt(), dtype),
-                dn_b: rn(&[e, hidden], 0.1, dtype),
+            bank: ExpertBank {
+                gu: ExpertProjection::Dense {
+                    weight: rn(&[e, hidden, 2 * inter], s_in, dtype),
+                    bias: rn(&[e, 2 * inter], 0.1, dtype),
+                },
+                dn: ExpertProjection::Dense {
+                    weight: rn(&[e, inter, hidden], 1.0 / (inter as f32).sqrt(), dtype),
+                    bias: rn(&[e, hidden], 0.1, dtype),
+                },
             },
             top_k: k,
             inter,
@@ -1036,34 +1128,32 @@ mod moe_grouped_tests {
     /// Quantize a dense bank's stacked weights to Q`bits` (the same transpose→bf16→`quantize` seam as
     /// `Proj::into_quantized`, applied to the whole `[E, out, in]` stack — affine quant is per-row).
     fn quantize_bank(dense: &ExpertBank, bits: i32) -> ExpertBank {
-        let ExpertBank::Dense {
-            gu_w,
-            gu_b,
-            dn_w,
-            dn_b,
-        } = dense
-        else {
-            unreachable!("build_dense yields Dense")
-        };
-        let pack = |w_in_out: &Array, b: &Array| -> StackedQuant {
+        let pack = |p: &ExpertProjection| -> ExpertProjection {
+            let ExpertProjection::Dense {
+                weight: w_in_out,
+                bias: b,
+            } = p
+            else {
+                unreachable!("build_dense yields Dense")
+            };
             let w_oi = w_in_out
                 .swap_axes(-1, -2)
                 .unwrap()
                 .as_dtype(Dtype::Bfloat16)
                 .unwrap();
             let (wq, scales, biases) = quantize(&w_oi, 64, bits).unwrap();
-            StackedQuant {
+            ExpertProjection::Quant(StackedQuant {
                 wq,
                 scales,
                 biases,
                 b: b.as_dtype(Dtype::Bfloat16).unwrap(),
                 group_size: 64,
                 bits,
-            }
+            })
         };
-        ExpertBank::Quant {
-            gu: pack(gu_w, gu_b),
-            dn: pack(dn_w, dn_b),
+        ExpertBank {
+            gu: pack(&dense.gu),
+            dn: pack(&dense.dn),
         }
     }
 
@@ -1139,18 +1229,12 @@ mod moe_grouped_tests {
 
     /// Reference single-expert projection: `x·w + b` (dense) or per-expert `quantized_matmul` (quant).
     fn proj_ref(bank: &ExpertBank, gate_up: bool, e: usize, x: &Array) -> Array {
-        match bank {
-            ExpertBank::Dense {
-                gu_w,
-                gu_b,
-                dn_w,
-                dn_b,
-            } => {
-                let (w, b) = if gate_up { (gu_w, gu_b) } else { (dn_w, dn_b) };
+        match if gate_up { &bank.gu } else { &bank.dn } {
+            ExpertProjection::Source(_) => panic!("dense/affine reference helper"),
+            ExpertProjection::Dense { weight: w, bias: b } => {
                 add(matmul(x, slice_e(w, e)).unwrap(), slice_e(b, e)).unwrap()
             }
-            ExpertBank::Quant { gu, dn } => {
-                let sq = if gate_up { gu } else { dn };
+            ExpertProjection::Quant(sq) => {
                 let y = quantized_matmul(
                     x,
                     slice_e(&sq.wq, e),
@@ -1241,6 +1325,7 @@ mod moe_grouped_tests {
             let (e, k, hidden, inter) = (8, 2, 64, 128);
             let dense = build_dense(e, k, hidden, inter, Dtype::Float32);
             let moe = GptOssMoe {
+                router_source: dense.router_source.clone(),
                 router_w: dense.router_w.clone(),
                 router_b: dense.router_b.clone(),
                 bank: quantize_bank(&dense.bank, bits),
@@ -1369,7 +1454,8 @@ mod moe_grouped_tests {
                     )
                     .unwrap();
                     assert!(
-                        matches!(moe.bank, ExpertBank::Quant { .. }),
+                        matches!(moe.bank.gu, ExpertProjection::Quant(_))
+                            && matches!(moe.bank.dn, ExpertProjection::Quant(_)),
                         "layer {layer} expected the packed Q4 path"
                     );
                     let got = moe.forward(&x).unwrap();

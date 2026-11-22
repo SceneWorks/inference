@@ -132,7 +132,7 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     // still present, so drop the two quant-only artifacts before the coverage diff.
     let actual: BTreeSet<String> = w
         .keys()
-        .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases"))
+        .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases") && !w.is_native_companion(k))
         .map(str::to_string)
         .collect();
 

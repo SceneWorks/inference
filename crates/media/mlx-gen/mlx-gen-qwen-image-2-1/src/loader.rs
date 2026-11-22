@@ -30,7 +30,6 @@
 //! `materialize`) so the untied `lm_head` and, on the text-only route, `model.visual.*` are never
 //! read.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
@@ -163,19 +162,13 @@ pub fn load_text_encoder_from(
     };
     // The ViT tower reads its own disjoint `model.visual.*` slice of the same shards. `mlx-llm`
     // carries the shared Qwen3-VL tower, so the weights are handed across on its own `Weights`.
-    let visual: HashMap<String, mlx_rs::Array> = w
-        .keys()
-        .filter(|key| key.starts_with(VISION_TOWER_PREFIX))
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .filter_map(|key| w.get(&key).cloned().map(|array| (key, array)))
-        .collect();
+    let visual =
+        w.select_renamed(|key| key.starts_with(VISION_TOWER_PREFIX).then(|| key.to_owned()));
     if visual.is_empty() {
         return Err(Error::MissingTensor(format!("{VISION_TOWER_PREFIX}.*")));
     }
     let tower = mlx_llm::models::Qwen3VLVisionModel::from_weights(
-        &mlx_llm::primitives::Weights::from_map(visual),
+        &visual.into_language_weights(),
         VISION_TOWER_PREFIX,
         vision.tower.clone(),
     )
@@ -208,19 +201,13 @@ pub(crate) fn diagnostic_language_with_fixed_vision(
     let vision =
         load_vision_config(vision_root)?.ok_or_else(crate::pipeline::missing_vision_tower)?;
     let weights = Weights::from_dir(vision_root.join("text_encoder"))?;
-    let visual = weights
-        .keys()
-        .filter(|key| key.starts_with(VISION_TOWER_PREFIX))
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|key| weights.require(&key).map(|array| (key, array.clone())))
-        .collect::<Result<HashMap<_, _>>>()?;
+    let visual =
+        weights.select_renamed(|key| key.starts_with(VISION_TOWER_PREFIX).then(|| key.to_owned()));
     if visual.is_empty() {
         return Err("diagnostic fixed vision source is empty".into());
     }
     let tower = mlx_llm::models::Qwen3VLVisionModel::from_weights(
-        &mlx_llm::primitives::Weights::from_map(visual),
+        &visual.into_language_weights(),
         VISION_TOWER_PREFIX,
         vision.tower.clone(),
     )

@@ -55,6 +55,8 @@ class DecodeQualityImplementationFingerprintTests(unittest.TestCase):
 
     def test_required_production_paths_are_bound_and_mutation_sensitive(self) -> None:
         required = (
+            "crates/layers/mlx-layers/src/quant.rs",
+            "crates/layers/mlx-layers/src/fp8.rs",
             "crates/media/mlx-gen/src/array.rs",
             "crates/media/mlx-gen/src/attention.rs",
             "crates/media/mlx-gen/src/decoder.rs",

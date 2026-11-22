@@ -99,7 +99,7 @@ pub fn split_at(x: &Tensor, axis: usize, at: usize) -> Result<(Tensor, Tensor)> 
 /// Where a [`Checkpoint`] reads its tensors from.
 enum Source {
     /// A `'static` mmap [`VarBuilder`] over one `model.safetensors` (tensors read at f32).
-    Mmap(VarBuilder<'static>),
+    Mmap(candle_gen::loader::MappedWeights),
     /// In-memory tensors handed out **as stored** (dtype and autograd identity preserved) — the
     /// training backbone (sc-25686): f32 `Var` masters of a full run, or a frozen base already at
     /// the provider's load dtypes under an adapter run.
@@ -167,9 +167,18 @@ impl Checkpoint {
             .into_iter()
             .filter_map(|(k, shape)| k.strip_prefix(prefix).map(|k| (k.to_owned(), shape)))
             .collect();
-        let keys = shapes.keys().cloned().collect();
-        let files = [file.to_path_buf()];
-        let vb = candle_gen::mmap_var_builder(&files, DType::F32, device)?;
+        let files = [file.to_owned()];
+        let mapped = candle_gen::mmap_safetensors(file)?;
+        let vb = candle_gen::loader::MappedWeights::new(mapped, &files, device)?;
+        let mut keys: BTreeSet<_> = shapes.keys().cloned().collect();
+        if let candle_gen::loader::MappedWeights::Checkpoint(src) = &vb {
+            for c in &src.reader().plan().companions {
+                if let Some(key) = c.physical_key.strip_prefix(prefix) {
+                    keys.remove(key);
+                }
+            }
+            keys.remove("scaled_fp8");
+        }
         let host = if device.is_cpu() {
             None
         } else {
@@ -237,7 +246,9 @@ impl Checkpoint {
     pub fn take(&self, key: &str) -> Result<Tensor> {
         self.consume(key)?;
         Ok(match &self.source {
-            Source::Mmap(vb) => vb.get_unchecked(&format!("{}{key}", self.prefix))?,
+            Source::Mmap(src) => {
+                src.read(&format!("{}{key}", self.prefix), DType::F32, &self.device)?
+            }
             Source::Map(map) => map[key].clone(),
         })
     }
@@ -253,6 +264,54 @@ impl Checkpoint {
             }
             None => self.take(key),
         }
+    }
+
+    /// The exported depth head is a 1×1 convolution evaluated by a matrix projection.
+    pub(crate) fn pointwise_linear(&self, channels: usize, dtype: DType) -> Result<Linear> {
+        use candle_gen::candle_nn::var_builder::SimpleBackend;
+        let key = format!("{}weight", self.prefix);
+        let bias_dtype = match &self.source {
+            Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) => {
+                src.reader().projection_bias_dtype(&key).unwrap_or(dtype)
+            }
+            _ => dtype,
+        };
+        let bias = self.take_as("bias", bias_dtype)?;
+        expect_shape("depth_reducer.bias", &bias, &[1])?;
+        let physical = [1, channels, 1, 1];
+        if let Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) = &self.source {
+            if let Some(op) =
+                src.native_linear_weight_flattened(&key, &physical, dtype, &self.device)?
+            {
+                self.consume("weight")?;
+                self.hold(op.resident_bytes());
+                return Ok(Linear {
+                    base: Base::Native(candle_gen::candle_nn::Linear::from_native(op, Some(bias))),
+                    residuals: Vec::new(),
+                });
+            }
+            if src
+                .reader()
+                .planned(&key)
+                .is_some_and(|r| r.shape.len() == 2)
+            {
+                self.consume("weight")?;
+                let weight = src.reader().read_dense_with_shape(
+                    &key,
+                    Some((1, channels)),
+                    dtype,
+                    &self.device,
+                )?;
+                self.hold((weight.elem_count() * dtype.size_in_bytes()) as u64);
+                return Ok(Linear::from_parts(weight, Some(bias)));
+            }
+        }
+        let weight = self.take_as("weight", dtype)?;
+        expect_shape("depth_reducer.weight", &weight, &physical)?;
+        Ok(Linear::from_parts(
+            weight.reshape((1, channels))?,
+            Some(bias),
+        ))
     }
 
     /// The stored shape of `key`, read without touching its bytes.
@@ -484,6 +543,29 @@ impl Loader<'_> {
             .last()
             .copied()
             .unwrap_or(0);
+        if let Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) =
+            &self.weights.source
+        {
+            let physical = format!("{}{weight_key}", self.weights.prefix);
+            if let Some(linear) =
+                src.native_linear(&physical, self.compute, &self.weights.device, None)?
+            {
+                self.weights.consume(&weight_key)?;
+                self.weights
+                    .hold(linear.native_resident_bytes().expect("native construction"));
+                let bias = if bias {
+                    let key = format!("{prefix}.bias");
+                    self.weights.record_stored(&key, self.compute);
+                    Some(self.weights.take_as(&key, self.compute)?)
+                } else {
+                    None
+                };
+                return Ok(Linear {
+                    base: Base::Native(linear.with_bias(bias)),
+                    residuals: self.prepare(residuals)?,
+                });
+            }
+        }
         // An adapted projection packs like any other; its residuals stay forward-time terms over
         // the packed base, reading the checkpoint-width input ([`Linear::forward`]).
         if let ProjectionLayout::Quantized { dtype, padded_in } =
@@ -678,6 +760,7 @@ pub struct Linear {
 
 /// The base projection of a [`Linear`].
 enum Base {
+    Native(candle_gen::candle_nn::Linear),
     /// `[out, in]` weight and optional `[out]` bias in the compute dtype.
     Dense {
         weight: Tensor,
@@ -710,6 +793,7 @@ impl Linear {
         // bf16 GEMM is — bf16 operands, f32 accumulation, one rounding of the result.
         let gemm = kernel_dtype(x.device(), dtype);
         let y = match &self.base {
+            Base::Native(layer) => candle_gen::candle_nn::Module::forward(layer, &flat)?,
             Base::Dense { weight, bias } => {
                 let mut y =
                     __model_proof_output!(to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?))?;
@@ -784,6 +868,7 @@ impl Linear {
     /// The dtype the projection returns (its compute dtype).
     fn compute_dtype(&self) -> DType {
         match &self.base {
+            Base::Native(layer) => layer.weight_dtype(),
             Base::Dense { weight, .. } => weight.dtype(),
             Base::Quantized { compute, .. } => *compute,
         }
@@ -792,6 +877,7 @@ impl Linear {
     /// The checkpoint's `[out, in]`, whatever the projection is held as.
     pub fn logical_shape(&self) -> Result<(usize, usize)> {
         match &self.base {
+            Base::Native(layer) => Ok(layer.weight_dims()?),
             Base::Dense { weight, .. } => Ok(weight.dims2()?),
             Base::Quantized {
                 out, in_features, ..
@@ -803,14 +889,14 @@ impl Linear {
     pub fn dense_weight(&self) -> Option<&Tensor> {
         match &self.base {
             Base::Dense { weight, .. } => Some(weight),
-            Base::Quantized { .. } => None,
+            Base::Native(_) | Base::Quantized { .. } => None,
         }
     }
 
     /// The GGML block type of a packed projection (`None` when dense).
     pub fn quant_dtype(&self) -> Option<GgmlDType> {
         match &self.base {
-            Base::Dense { .. } => None,
+            Base::Native(_) | Base::Dense { .. } => None,
             Base::Quantized { weight, .. } => weight.quant_dtype(),
         }
     }

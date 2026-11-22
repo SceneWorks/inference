@@ -770,6 +770,7 @@ pub enum LinearBase {
     Quantized(QuantizedLinear),
     /// Descriptor-driven symmetric INT8, distinct from affine Q4/Q8.
     ConvRot(crate::convrot_int8::ConvRotLinear),
+    Fp8(crate::fp8::Fp8Linear),
     /// Descriptor-driven packed W4A8 (asym_w4a8_int8), distinct from both ConvRot INT8 and affine
     /// Q4/Q8: two int4 codes per stored byte, a codebook and per-group F8 scales (sc-26685).
     W4A8(crate::w4a8_int8::W4A8Linear),
@@ -813,6 +814,7 @@ impl LinearBase {
                     q.bits,
                 )?
             }
+            LinearBase::Fp8(q) => q.forward(x)?,
             LinearBase::ConvRot(q) => q.forward(x)?,
             LinearBase::W4A8(q) => q.forward(x)?,
         })
@@ -871,6 +873,27 @@ impl AdaptableLinear {
         }
     }
     /// Wrap a validated, native signed INT8 base without a floating weight copy.
+    pub fn from_native(p: crate::NativeProjection) -> Self {
+        match p {
+            crate::NativeProjection::ConvRot(p) => Self::from_convrot(p),
+            crate::NativeProjection::Fp8(p) => Self {
+                base: LinearBase::Fp8(p),
+                adapters: Vec::new(),
+                pass_scales: Vec::new(),
+                active_pass: Default::default(),
+                training_residual: false,
+            },
+        }
+    }
+
+    pub fn fp8_base(&self) -> Option<&crate::fp8::Fp8Linear> {
+        if let LinearBase::Fp8(p) = &self.base {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
     pub fn from_convrot(q: crate::convrot_int8::ConvRotLinear) -> Self {
         Self {
             base: LinearBase::ConvRot(q),
@@ -1071,6 +1094,7 @@ impl AdaptableLinear {
                     .chain(quantized.inner.bias.value.iter()),
                 )?;
             }
+            LinearBase::Fp8(q) => q.materialize()?,
             LinearBase::ConvRot(q) => q.materialize()?,
             LinearBase::W4A8(q) => q.materialize()?,
         }
@@ -1092,7 +1116,24 @@ impl AdaptableLinear {
                 l.weight = Param::new(merged);
                 Ok(())
             }
-            LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => Err(
+            LinearBase::Fp8(_) | LinearBase::ConvRot(_) => {
+                if delta.shape() != self.base_shape()
+                    || !matches!(
+                        delta.dtype(),
+                        Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+                    )
+                {
+                    return Err(
+                        "native projection adapter delta must match the floating base shape".into(),
+                    );
+                }
+                self.push(Adapter::Lokr {
+                    delta: delta.clone(),
+                    scale: 1.0,
+                });
+                Ok(())
+            }
+            LinearBase::Quantized(_) | LinearBase::W4A8(_) => Err(
                 "merge_dense_delta: base is quantized; a LoRA must be merged before quantization"
                     .into(),
             ),
@@ -1122,12 +1163,16 @@ impl AdaptableLinear {
         let bias = match &mut self.base {
             LinearBase::Dense(l) => &mut l.bias,
             LinearBase::Quantized(q) => &mut q.inner.bias,
+            LinearBase::Fp8(q) => {
+                let b = q.bias().ok_or("FP8 base has no bias")?;
+                q.set_bias(add(b, &delta.as_dtype(b.dtype())?)?)?;
+                return Ok(());
+            }
             LinearBase::ConvRot(q) => {
                 let b = q
-                    .bias
-                    .as_ref()
+                    .bias()
                     .ok_or("merge_bias_delta: ConvRot base has no bias")?;
-                q.bias = Some(add(b, &delta.as_dtype(b.dtype())?)?);
+                q.set_bias(add(b, &delta.as_dtype(b.dtype())?)?)?;
                 return Ok(());
             }
             // W4A8 packs only its WEIGHT: the bias stays a dense float vector that the
@@ -1162,7 +1207,8 @@ impl AdaptableLinear {
         match &self.base {
             LinearBase::Dense(l) => l.bias.value.as_ref(),
             LinearBase::Quantized(q) => q.inner.bias.value.as_ref(),
-            LinearBase::ConvRot(q) => q.bias.as_ref(),
+            LinearBase::Fp8(q) => q.bias(),
+            LinearBase::ConvRot(q) => q.bias(),
             LinearBase::W4A8(q) => q.bias.as_ref(),
         }
     }
@@ -1190,7 +1236,10 @@ impl AdaptableLinear {
     pub fn weight_dtype(&self) -> Option<Dtype> {
         match &self.base {
             LinearBase::Dense(l) => Some(l.weight.value.dtype()),
-            LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
+            LinearBase::Quantized(_)
+            | LinearBase::Fp8(_)
+            | LinearBase::ConvRot(_)
+            | LinearBase::W4A8(_) => None,
         }
     }
 
@@ -1200,7 +1249,7 @@ impl AdaptableLinear {
         match &self.base {
             LinearBase::Dense(l) => Some(l.weight.value.dtype()),
             LinearBase::Quantized(q) => Some(q.scales.value.dtype()),
-            LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
+            LinearBase::Fp8(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
         }
     }
 
@@ -1232,7 +1281,7 @@ impl AdaptableLinear {
                     }
                 }
             }
-            LinearBase::ConvRot(_) | LinearBase::W4A8(_) => {}
+            LinearBase::Fp8(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => {}
         }
         Ok(())
     }
@@ -1251,7 +1300,10 @@ impl AdaptableLinear {
     pub fn is_quantized(&self) -> bool {
         matches!(
             self.base,
-            LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_)
+            LinearBase::Quantized(_)
+                | LinearBase::Fp8(_)
+                | LinearBase::ConvRot(_)
+                | LinearBase::W4A8(_)
         )
     }
 
@@ -1260,7 +1312,10 @@ impl AdaptableLinear {
     pub fn dense_weight(&self) -> Option<(&Array, Option<&Array>)> {
         match &self.base {
             LinearBase::Dense(l) => Some((&l.weight.value, l.bias.value.as_ref())),
-            LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
+            LinearBase::Quantized(_)
+            | LinearBase::Fp8(_)
+            | LinearBase::ConvRot(_)
+            | LinearBase::W4A8(_) => None,
         }
     }
 
@@ -1279,7 +1334,32 @@ impl AdaptableLinear {
                 q.group_size,
                 q.bits,
             )),
-            LinearBase::Dense(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
+            LinearBase::Dense(_)
+            | LinearBase::Fp8(_)
+            | LinearBase::ConvRot(_)
+            | LinearBase::W4A8(_) => None,
+        }
+    }
+
+    /// Physical operands held by the base for staging or resident-byte enumeration.
+    pub fn base_arrays(&self) -> Vec<&Array> {
+        match &self.base {
+            LinearBase::Dense(l) => std::iter::once(&l.weight.value)
+                .chain(l.bias.value.iter())
+                .collect(),
+            LinearBase::Quantized(q) => [&q.inner.weight.value, &q.scales.value, &q.biases.value]
+                .into_iter()
+                .chain(q.inner.bias.value.iter())
+                .collect(),
+            LinearBase::Fp8(p) => [p.codes(), p.scales(), p.input_scale()]
+                .into_iter()
+                .chain(p.bias())
+                .collect(),
+            LinearBase::ConvRot(p) => [p.codes(), p.scales(), p.rotation()]
+                .into_iter()
+                .chain(p.bias())
+                .collect(),
+            LinearBase::W4A8(p) => p.base_arrays(),
         }
     }
 
@@ -1296,9 +1376,10 @@ impl AdaptableLinear {
                 let s = q.scales.value.shape();
                 vec![s[0], s[1] * q.group_size]
             }
+            LinearBase::Fp8(q) => q.shape().to_vec(),
             LinearBase::ConvRot(q) => vec![
-                q.descriptor.out_features as i32,
-                q.descriptor.in_features as i32,
+                q.descriptor().out_features as i32,
+                q.descriptor().in_features as i32,
             ],
             LinearBase::W4A8(q) => vec![
                 q.descriptor.out_features as i32,
@@ -1312,9 +1393,9 @@ impl AdaptableLinear {
     /// forward-time residuals over the (now quantized) base, so they are unaffected — this is
     /// why the base is never fused: fusing would force re-quantization on every adapter swap.
     pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
-        if matches!(self.base, LinearBase::ConvRot(_)) {
+        if matches!(self.base, LinearBase::ConvRot(_) | LinearBase::Fp8(_)) {
             return Err(
-                "ConvRot INT8 refuses reinterpretation or re-quantization as affine Q4/Q8".into(),
+                "native checkpoint projection refuses reinterpretation or re-quantization as affine Q4/Q8".into(),
             );
         }
         if matches!(self.base, LinearBase::W4A8(_)) {
@@ -1568,9 +1649,10 @@ impl AdaptableLinear {
                     None => matmul(x, weight.t())?,
                 }
             }
-            LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => {
-                self.base.forward(x)?
-            }
+            LinearBase::Quantized(_)
+            | LinearBase::Fp8(_)
+            | LinearBase::ConvRot(_)
+            | LinearBase::W4A8(_) => self.base.forward(x)?,
         };
         self.apply_adapters_with_scales(x, out, scales)
     }
@@ -1669,6 +1751,8 @@ pub struct LinearFacts {
     pub base_shape: Vec<i32>,
     /// Whether the base is group-quantized (packed) rather than dense.
     pub is_quantized: bool,
+    /// A source-encoded base can retain a checked full delta as an additive projection.
+    pub source_packed: bool,
     /// Whether **any** installed adapter is live (`scale != 0`). A disabled adapter reads `false`,
     /// matching `apply_adapters` rule 1 and `FusedQkvProjection`'s
     /// pack predicate, which both treat "installed at scale 0" as "never installed".
@@ -1688,6 +1772,7 @@ impl LinearFacts {
         Self {
             base_shape: lin.base_shape(),
             is_quantized: lin.is_quantized(),
+            source_packed: lin.fp8_base().is_some() || lin.convrot_base().is_some(),
             has_live_adapters: lin.has_live_adapters(),
             adapter_count: lin.adapters().len(),
             bias_shape: lin.bias().map(|b| b.shape().to_vec()),

@@ -834,16 +834,16 @@ pub(crate) fn read_weights<'a>(
     cancel: &CancelFlag,
 ) -> Result<Weights> {
     let mut tensors = HashMap::new();
-    #[cfg(feature = "model-inference-proof")]
+    let mut declarations = Vec::new();
     let mut read_paths = Vec::new();
     for asset in assets {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
         let bytes = asset.weight_bytes()?;
-        #[cfg(feature = "model-inference-proof")]
         read_paths.push(asset.pin.canonical_target_path().to_path_buf());
         let meta = CheckpointMeta::from_bytes(bytes)?;
+        declarations.extend(meta.metadata("_quantization_metadata").map(str::to_owned));
         let expected = match asset.role {
             MossImageAssetRole::DmdLora => Some(dmd_lora_shapes()),
             MossImageAssetRole::DmdTime => Some(dmd_replacement_shapes()),
@@ -870,16 +870,27 @@ pub(crate) fn read_weights<'a>(
                 .collect::<Result<BTreeMap<_, _>>>()?;
             validate_dmd_tensors(&views, &expected)?;
         }
-        for key in meta.keys().filter(|k| include(k)) {
+        for key in meta.keys().filter(|k| {
+            include(k)
+                || mlx_gen::gen_core::checkpoint_codec::projection_companion_base(k)
+                    .is_some_and(|b| include(&format!("{b}.weight")))
+        }) {
             let t = meta
                 .tensor(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?;
             let dtype = match t.dtype {
                 mlx_gen::gen_core::weightsmeta::Dtype::BF16 => Dtype::Bfloat16,
                 mlx_gen::gen_core::weightsmeta::Dtype::F32 => Dtype::Float32,
+                mlx_gen::gen_core::weightsmeta::Dtype::F16 => Dtype::Float16,
+                mlx_gen::gen_core::weightsmeta::Dtype::I8 => Dtype::Int8,
+                mlx_gen::gen_core::weightsmeta::Dtype::U8
+                | mlx_gen::gen_core::weightsmeta::Dtype::F8_E4M3
+                | mlx_gen::gen_core::weightsmeta::Dtype::F8_E5M2
+                | mlx_gen::gen_core::weightsmeta::Dtype::F8_E8M0 => Dtype::Uint8,
                 _ => {
                     return Err(Error::Unsupported(format!(
-                        "MOSS tensor {key} source must be BF16 or FP32"
+                        "unsupported MOSS tensor {key} storage {:?}",
+                        t.dtype
                     )))
                 }
             };
@@ -905,7 +916,7 @@ pub(crate) fn read_weights<'a>(
         mlx_gen::gen_core::model_input_proof::InputRole::ModelWeights,
         &read_paths,
     );
-    Ok(Weights::from_map(tensors))
+    Weights::from_source_map(tensors, &read_paths, &declarations)
 }
 pub(crate) fn fp32_map(w: &Weights) -> Result<BTreeMap<String, Vec<f32>>> {
     let mut result = BTreeMap::new();

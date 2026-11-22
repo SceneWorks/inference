@@ -12,11 +12,11 @@
 //! `convert_vae_key` → `remap_vae_keys`; candle needs no `remap_vae_keys` because its `QwenVae` speaks
 //! the diffusers naming + native conv layout directly.)
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::loader::{remap_file_var_builder, SourceView};
 use candle_gen::Result;
 
 pub use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -110,38 +110,33 @@ pub fn is_decoder_key(key: &str) -> bool {
 /// Load the **decode half** of the Qwen-Image VAE from Anima's single-file
 /// `qwen_image_vae.safetensors` on `device` at [`LOAD_DTYPE`].
 ///
-/// Only [`DECODER_KEY_PREFIXES`] are read (a header-only mmap, `Weights::from_file_filtered`):
+/// Only [`DECODER_KEY_PREFIXES`] are read (a header-only component mapping):
 /// `QwenVae` is decode-only, so materializing the encoder tower too — as the whole-file
 /// `Weights::from_file` did — put a transient it never read on the device and made the priced
 /// decoder disagree with the resident one.
 pub fn load_vae(path: impl AsRef<Path>, device: &Device) -> Result<QwenVae> {
-    // Load + cast the decoder tensors to f32 (candle_gen::Weights coerces floats on load), then
-    // rename keys.
-    let src = candle_gen::Weights::from_file_filtered(
-        path.as_ref(),
-        device,
-        LOAD_DTYPE,
-        DECODER_KEY_PREFIXES,
-    )?;
-    let keys: Vec<String> = src.keys().cloned().collect();
-    let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
-    for k in &keys {
-        map.insert(convert_vae_key(k), src.require(k)?);
-    }
-    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
+    let vb = original_vae_builder(path.as_ref(), device, is_decoder_key)?;
     QwenVae::new(vb).map_err(Into::into)
 }
 
 /// Load only Anima's Qwen-Image VAE encoder for training-time image caching, at [`LOAD_DTYPE`].
 pub fn load_vae_encoder(path: impl AsRef<Path>, device: &Device) -> Result<QwenVaeEncoder> {
-    let src = candle_gen::Weights::from_file(path.as_ref(), device, LOAD_DTYPE)?;
-    let keys: Vec<String> = src.keys().cloned().collect();
-    let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
-    for k in &keys {
-        map.insert(convert_vae_key(k), src.require(k)?);
-    }
-    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
+    let vb = original_vae_builder(path.as_ref(), device, |_| true)?;
     QwenVaeEncoder::new(vb).map_err(Into::into)
+}
+
+fn original_vae_builder(
+    path: &Path,
+    device: &Device,
+    select: impl Fn(&str) -> bool,
+) -> Result<VarBuilder<'static>> {
+    remap_file_var_builder(path, LOAD_DTYPE, device, |key, _| {
+        Ok(if select(key) {
+            vec![SourceView::Whole(convert_vae_key(key))]
+        } else {
+            Vec::new()
+        })
+    })
 }
 
 #[cfg(test)]

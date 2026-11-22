@@ -93,7 +93,7 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
     match spec.quantize {
-        None | Some(Quant::Q4 | Quant::Q8) => Ok(()),
+        None | Some(Quant::Q4 | Quant::Q8 | Quant::Fp8Rowwise) => Ok(()),
         Some(other) => Err(CoreError::Unsupported(format!(
             "{MODEL_ID}: {} has no MLX FLUX3 kernel; the native MLX tiers are affine q4/q8 \
              converted from the original dense package",
@@ -107,6 +107,7 @@ fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
 pub fn tier_fingerprint(base: &str, quant: Option<Quant>, group: Option<u32>) -> String {
     match (quant, group) {
         (None, _) => base.to_owned(),
+        (Some(Quant::Fp8Rowwise), _) => format!("{base}-mlx-fp8r"),
         (Some(q), None) => format!("{base}-mlx-affine-{}", q.key()),
         (Some(q), Some(g)) => format!("{base}-mlx-affine-{}-g{g}", q.key()),
     }
@@ -294,15 +295,20 @@ pub(crate) fn generation_contract(
     }
 
     let storage = NativeDitStorage::from_package(&resources.package_dir)?;
-    storage.validate_selection(spec.quantize, precision)?;
+    let selection = storage.source_selection(spec.quantize);
+    storage.validate_selection(selection, precision)?;
     if let Some(calibration) = &mut contract.calibration {
         let group = match storage {
             NativeDitStorage::MlxAffine { group_size, .. } => Some(group_size),
             _ => None,
         };
-        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, group);
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, selection, group);
     }
-    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
+    let (transformer, encoded) =
+        native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
+    if encoded && storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        contract.calibration = None;
+    }
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
     let decoder = autoencoder_bytes(&resources.autoencoder_file)?;
     let base_bytes = conditioning
@@ -437,6 +443,7 @@ fn account_upsampler(
 
 /// Resident bytes of the DiT as [`crate::model::load_dit`] holds it, priced from the file's
 /// headers by [`dense_dit_projection`].
+#[cfg(test)]
 fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
     projected_safetensors_bytes(weights, dense_dit_projection(precision))
 }
@@ -487,12 +494,12 @@ fn native_dit_bytes(
     precision: Precision,
     storage: NativeDitStorage,
     cfg: &gen_core_flux3::DitConfig,
-) -> CoreResult<u64> {
-    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
-        return dit_bytes(weights, precision);
-    }
+) -> CoreResult<(u64, bool)> {
     let targets = storage.packed_targets(cfg)?;
-    projected_safetensors_bytes(weights, native_dit_projection(precision, &targets))
+    mlx_gen::asset_facts::projected_source_bytes(
+        weights,
+        native_dit_projection(precision, &targets),
+    )
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
@@ -513,22 +520,16 @@ fn text_encoder_bytes(dir: &Path) -> CoreResult<u64> {
     let untied_head = !mlx_llm::ModelConfig::from_dir(dir)
         .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: reading the text encoder config: {e}")))?
         .tie_word_embeddings;
-    let mut total = 0_u64;
-    for shard in crate::text_encoder::weight_shards(dir)? {
-        let bytes = projected_safetensors_bytes(&shard, |header| {
-            if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
-                || (untied_head && header.name == LANGUAGE_HEAD_KEY)
-            {
-                ResidentProjection::Bfloat16
-            } else {
-                ResidentProjection::Omit
-            }
-        })?;
-        total = total
-            .checked_add(bytes)
-            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: text encoder byte sum overflow")))?;
-    }
-    Ok(total)
+    let shards = crate::text_encoder::weight_shards(dir)?;
+    mlx_gen::asset_facts::projected_shards_bytes(&shards, |header| {
+        if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
+            || (untied_head && header.name == LANGUAGE_HEAD_KEY)
+        {
+            ResidentProjection::Bfloat16
+        } else {
+            ResidentProjection::Omit
+        }
+    })
 }
 
 /// The provider safety check: the shared handshake (calibration identity, loaded tier,
@@ -544,7 +545,28 @@ pub fn safety_check(
 
 /// The FLUX 3 MLX memory profile (sc-27307): the requested tier, the still-image reference-route
 /// gate, and one staged text-to-image fixture per implemented optimized rung.
+fn resolved_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let quant = match &spec.weights {
+        gen_core::WeightsSource::Dir(path) if path.join(gen_core_flux3::CONFIG_FILE).is_file() => {
+            let storage = NativeDitStorage::from_package(path)?;
+            let selected = storage.source_selection(spec.quantize);
+            storage.validate_selection(selected, spec.precision)?;
+            selected
+        }
+        _ => spec.quantize,
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
 const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(resolved_tier),
     gates: MemoryProfileGates::within(route_gate),
     fixtures: MemoryProfileFixtures::routes(&[
         MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::Always)
@@ -1094,7 +1116,8 @@ mod tests {
                         NativeDitStorage::Publisher(DitFormat::Dense),
                         &cfg
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .0,
                     dit_bytes(&weights, precision).unwrap()
                 );
             }
@@ -1308,7 +1331,6 @@ mod tests {
     fn a_spec_no_loader_opens_has_no_contract() {
         for spec in [
             sentinel().with_quant(Quant::Nvfp4),
-            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             match weights_free_memory_strategy_contract(MODEL_ID, &spec) {

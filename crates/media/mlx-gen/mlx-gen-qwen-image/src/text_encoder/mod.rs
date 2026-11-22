@@ -23,15 +23,5 @@ pub use vision_language::QwenVisionLanguageEncoder;
 // The HF half-split text RoPE is identical across families and now lives in core (F-006).
 pub use mlx_gen::nn::TextRope;
 
-use mlx_rs::ops::matmul;
-use mlx_rs::Array;
-
-use mlx_gen::Result;
-
-/// `y = x · Wᵀ` for a stored `[out, in]` weight (bias-less Linear, e.g. `o_proj` / MLP).
-pub(crate) fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, w.t())?)
-}
-
 // The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
 pub(crate) use mlx_gen::weights::join;

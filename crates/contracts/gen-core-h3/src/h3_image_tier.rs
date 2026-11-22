@@ -131,6 +131,20 @@ impl ImageTier {
 /// Group size the tiers pack at, the codebase-wide MLX affine default.
 pub const GROUP_SIZE: usize = 64;
 
+/// H3's published float32 I/O and timestep projection roles. A scalar-coded weight and bias
+/// have no stored compute dtype, so both backends recover it from this module contract.
+pub fn h3_projection_keeps_fp32(base: &str) -> bool {
+    matches!(
+        base,
+        "proj_in"
+            | "proj_out"
+            | "audio_proj_in"
+            | "audio_proj_out"
+            | "time_embedder.linear_1"
+            | "time_embedder.linear_2"
+    ) || base.starts_with("pdd_proj_out.")
+}
+
 /// Which bit width, if any, MiniMax-H3's policy packs a DiT linear at, from its `base` (the tensor
 /// key minus `.weight`). `None` means dense **in every tier**.
 ///
@@ -146,16 +160,6 @@ pub const GROUP_SIZE: usize = 64;
 ///
 /// The caller still applies the shape guard (2-D, input width a multiple of [`GROUP_SIZE`]).
 pub fn dit_pack_bits(base: &str, tier_bits: i32, adaln_bits: i32) -> Option<i32> {
-    const DENSE: &[&str] = &[
-        "proj_in",
-        "proj_out",
-        "audio_proj_in",
-        "audio_proj_out",
-        "time_embedder.linear_1",
-        "time_embedder.linear_2",
-        "context_embedder",
-        "norm_out.linear",
-    ];
     const DENSE_NORM_SUFFIXES: &[&str] = &[
         ".norm1",
         ".norm2",
@@ -164,8 +168,8 @@ pub fn dit_pack_bits(base: &str, tier_bits: i32, adaln_bits: i32) -> Option<i32>
         ".norm",
         ".final_norm",
     ];
-    if DENSE.contains(&base)
-        || base.starts_with("pdd_proj_out.")
+    if h3_projection_keeps_fp32(base)
+        || matches!(base, "context_embedder" | "norm_out.linear")
         || DENSE_NORM_SUFFIXES.iter().any(|s| base.ends_with(s))
     {
         None

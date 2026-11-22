@@ -24,6 +24,7 @@
 //! sibling `candle-gen-iris` applies ([`gemm_dtype`]).
 
 use candle_gen::candle_core::quantized::QMatMul;
+use candle_gen::candle_core::Module as _;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
@@ -107,6 +108,7 @@ pub fn kernel_dtype(device: &Device, dtype: DType) -> DType {
 /// Builds modules from the package's `model.safetensors` (an mmap, tensors read one at a time at
 /// the compute dtype) on one device.
 pub struct Loader<'a> {
+    pub expected: &'a std::collections::BTreeMap<String, gen_core_flux3::quantization::TensorSpec>,
     pub vb: &'a VarBuilder<'static>,
     pub compute: DType,
     pub device: &'a Device,
@@ -245,7 +247,7 @@ impl PublisherSource {
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-    fn linear(&self, key: &str) -> Result<Linear> {
+    fn linear(&self, key: &str, vb: &VarBuilder<'_>) -> Result<Linear> {
         let stem = key
             .strip_suffix(".weight")
             .ok_or_else(|| Error::Unsupported(format!("flux3: {key} is not a weight")))?;
@@ -271,16 +273,20 @@ impl PublisherSource {
             use gen_core_flux3::quantization::DitFormat;
             let kernel = match self.storage {
                 NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) => {
-                    let scales: Vec<f32> = self
-                        .raw(&format!("{stem}.weight_scale"))?
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    PublisherKernel::Fp8 {
-                        weight: self.lt.stage_fp8_bytes(&self.raw(key)?, out, input)?,
-                        scales: self.lt.stage_f32(&scales)?,
-                        lt: self.lt.clone(),
+                    let source = vb
+                        .native_linear_weight_with_shape(key, Some((out, input)))?
+                        .ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "flux3: {key} needs the native FP8R projection"
+                            ))
+                        })?;
+                    if source.format_id() != candle_gen::gen_core::FP8_E4M3_ROWWISE_CODEC.codec_id {
+                        return Err(Error::Unsupported(format!(
+                            "flux3: {key} resolved to {} instead of FP8R",
+                            source.format_id()
+                        )));
                     }
+                    PublisherKernel::Fp8(candle_gen::candle_nn::Linear::from_native(source, None))
                 }
                 NativeDitStorage::Publisher(DitFormat::Nvfp4) => PublisherKernel::Nvfp4 {
                     weight: self.lt.flux3_stage_nvfp4_weight(
@@ -328,11 +334,7 @@ struct PublisherBase {
 
 #[cfg(feature = "cuda")]
 enum PublisherKernel {
-    Fp8 {
-        lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
-        weight: candle_quant_kernels::cublaslt::DevFp8,
-        scales: candle_gen::candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>,
-    },
+    Fp8(candle_gen::candle_nn::Linear),
     Nvfp4 {
         lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
         weight: candle_quant_kernels::cublaslt::DevNvfp4,
@@ -348,9 +350,7 @@ impl PublisherBase {
     fn forward_chunk(&self, chunk: &Tensor) -> Result<Tensor> {
         match &self.kernel {
             #[cfg(feature = "cuda")]
-            PublisherKernel::Fp8 { lt, weight, scales } => {
-                Ok(lt.flux3_fp8_rowwise_linear(chunk, weight, scales)?)
-            }
+            PublisherKernel::Fp8(layer) => Ok(layer.forward(chunk)?),
             #[cfg(feature = "cuda")]
             PublisherKernel::Nvfp4 {
                 lt,
@@ -384,7 +384,7 @@ impl Loader<'_> {
 
     /// A tensor kept in f32 (the q/k RMSNorm scales).
     pub fn f32(&self, key: &str) -> Result<Tensor> {
-        to(&self.take(key)?, DType::F32)
+        Ok(self.vb.get_unchecked_dtype(key, DType::F32)?)
     }
 
     /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`). Dense packages store it in the
@@ -395,9 +395,29 @@ impl Loader<'_> {
             return Linear::from_ggml_rows(packed, &key, self.compute, self.device);
         }
         if let Some(publisher) = self.publisher.filter(|p| p.targets.contains(&key)) {
-            return publisher.linear(&key);
+            return publisher.linear(&key, self.vb);
         }
-        let weight = to(&self.take(&key)?, self.compute)?;
+        let expected = self
+            .expected
+            .get(&key)
+            .and_then(|spec| match spec.shape.as_slice() {
+                [n, k] => Some((*n, *k)),
+                _ => None,
+            });
+        if let Some(native) = self.vb.native_linear_weight_with_shape(&key, expected)? {
+            return Ok(Linear {
+                base: Base::Checkpoint(
+                    candle_gen::candle_nn::Linear::from_native(native, None),
+                    self.compute,
+                ),
+                adapted: None,
+            });
+        }
+        let weight = match expected {
+            Some(shape) => self.vb.get(shape, &key)?,
+            None => self.take(&key)?,
+        };
+        let weight = to(&weight, self.compute)?;
         if weight.rank() != 2 {
             return Err(Error::Msg(format!(
                 "flux3: {prefix}.weight is rank {}, a Linear needs [out, in]",
@@ -413,6 +433,7 @@ impl Loader<'_> {
 
 enum Base {
     Dense(Tensor),
+    Checkpoint(candle_gen::candle_nn::Linear, DType),
     /// A native GGML projection. The `QMatMul` is constructed DIRECTLY as its `QTensor` arm:
     /// `QMatMul::from_arc` would honour `CANDLE_DEQUANTIZE_ALL[_F16]` and silently swap in a
     /// dense weight. Activations stay row-independent, so row chunking is exact.
@@ -511,6 +532,7 @@ impl Linear {
         let flat = x.reshape((rows, *last))?;
         let gemm = kernel_dtype(flat.device(), dtype);
         let y = match &self.base {
+            Base::Checkpoint(layer, _) => layer.forward(&flat)?,
             Base::Dense(weight) => {
                 let y = to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?)?;
                 to(&y, dtype)?
@@ -606,6 +628,14 @@ impl Linear {
         if self.adapted.is_none() {
             let (output, input) = self.out_in()?;
             self.adapted = Some(match &self.base {
+                Base::Checkpoint(layer, compute) => {
+                    candle_gen::quant::AdaptLinear::for_external_base(
+                        input,
+                        output,
+                        *compute,
+                        layer.device(),
+                    )?
+                }
                 Base::Dense(weight) => candle_gen::quant::AdaptLinear::from_dense(
                     candle_gen::candle_nn::Linear::new(weight.clone(), None),
                     input,
@@ -664,6 +694,7 @@ impl Linear {
     pub fn out_in(&self) -> Result<(usize, usize)> {
         match &self.base {
             Base::Dense(weight) => Ok(weight.dims2()?),
+            Base::Checkpoint(layer, _) => Ok(layer.weight_dims()?),
             Base::Ggml { out, input, .. } => Ok((*out, *input)),
             Base::Publisher(publisher) => Ok((publisher.out, publisher.input)),
         }
@@ -673,6 +704,9 @@ impl Linear {
     pub fn weight(&self) -> Result<&Tensor> {
         match &self.base {
             Base::Dense(weight) => Ok(weight),
+            Base::Checkpoint(_, _) => Err(Error::Unsupported(
+                "flux3: native projection has no dense coefficient plane".into(),
+            )),
             Base::Ggml { storage, .. } | Base::Publisher(PublisherBase { storage, .. }) => {
                 Err(Error::Unsupported(format!(
                     "flux3: {} projection has no dense weight; dequantizing it is refused",
@@ -686,13 +720,17 @@ impl Linear {
 
     /// Whether the base is held in a packed native format.
     pub fn is_quantized(&self) -> bool {
-        matches!(self.base, Base::Ggml { .. } | Base::Publisher(_))
+        matches!(
+            self.base,
+            Base::Checkpoint(_, _) | Base::Ggml { .. } | Base::Publisher(_)
+        )
     }
 
     /// The compute (input and output) dtype.
     pub fn dtype(&self) -> DType {
         match &self.base {
             Base::Dense(weight) => weight.dtype(),
+            Base::Checkpoint(_, compute) => *compute,
             Base::Ggml { compute, .. } => *compute,
             Base::Publisher(_) => DType::BF16,
         }

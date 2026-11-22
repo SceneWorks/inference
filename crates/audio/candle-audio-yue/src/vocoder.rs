@@ -36,7 +36,6 @@ use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{self, CancelFlag};
 use candle_audio::vocos::{Vocos, VocosConfig};
 use candle_audio::AudioError;
-use candle_nn::VarBuilder;
 
 use crate::codec::DECODE_CHUNK_FRAMES;
 use crate::config::Assets;
@@ -176,21 +175,21 @@ impl VocosUpsampler {
 /// widths read from the tensors and the hop fixed at [`SAMPLES_PER_FRAME`].
 pub fn load_decoder(checkpoint: &Path, device: &Device) -> Result<Vocos, AudioError> {
     let err = |m: String| AudioError::Msg(format!("vocos {}: {m}", checkpoint.display()));
-    let st = candle_audio::weights::mmap_safetensors(checkpoint)
-        .map_err(|e| err(format!("open: {e}")))?;
-    let tensors = candle_audio::weights::load_f32_map(&st, device, |_| true)
+    let source = candle_audio::weights::AudioCheckpoint::open(checkpoint, device)
         .map_err(|e| err(e.to_string()))?;
-    let get = |name: &str| {
-        tensors
-            .get(name)
-            .ok_or_else(|| err(format!("missing tensor {name:?}")))
-    };
-    let (dim, input_channels, _) = get("backbone.embed.weight")?.dims3()?;
-    let (intermediate_dim, _) = get("backbone.convnext.0.pwconv1.weight")?.dims2()?;
+    let [dim, input_channels, _]: [usize; 3] = source
+        .shape("backbone.embed.weight")?
+        .try_into()
+        .map_err(|_| err("backbone.embed.weight must be rank three".into()))?;
+    let [intermediate_dim, _]: [usize; 2] = source
+        .shape("backbone.convnext.0.pwconv1.weight")?
+        .try_into()
+        .map_err(|_| err("backbone.convnext.0.pwconv1.weight must be a matrix".into()))?;
+    let vb = source.builder(DType::F32, device);
     let num_layers = (0..)
-        .take_while(|i| tensors.contains_key(&format!("backbone.convnext.{i}.gamma")))
+        .take_while(|i| vb.contains_tensor(&format!("backbone.convnext.{i}.gamma")))
         .count();
-    let window = get("head.istft.window")?.to_vec1::<f32>()?;
+    let window = vb.get_unchecked("head.istft.window")?.to_vec1::<f32>()?;
     let cfg = VocosConfig {
         input_channels,
         dim,
@@ -200,7 +199,6 @@ pub fn load_decoder(checkpoint: &Path, device: &Device) -> Result<Vocos, AudioEr
         hop: SAMPLES_PER_FRAME,
         ln_eps: LN_EPS,
     };
-    let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
     Vocos::load(&vb, cfg, window, device).map_err(|e| err(e.to_string()))
 }
 

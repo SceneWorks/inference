@@ -49,7 +49,8 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
         num_tensors += component_tensor_count(&source.join("text_encoder"), "model")?;
 
         // The VAE torch checkpoint (state_dict section, metadata only).
-        let vae = source.join("vae").join(crate::vae::VAE_FILE);
+        let vae =
+            candle_audio::weights::checkpoint_file(source.join("vae").join(crate::vae::VAE_FILE));
         if !vae.is_file() {
             return Err(CoreError::Msg(format!(
                 "prepare: {} is missing the VAE checkpoint {}",

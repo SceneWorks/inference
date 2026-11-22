@@ -403,8 +403,8 @@ fn convrot_int8_in_rejects_a_context_that_is_not_bound_to_the_compute_device() {
          empty context is fatal here; got: {msg}"
     );
 
-    // The same context IS correct for a CPU projection — there the dequant-dense fallback is the path.
-    let cpu_lin = QLinear::convrot_int8_in(w_i8, scale, 256, None, &Device::Cpu, &cpu_ctx)
-        .expect("an empty context is the honest state for a CPU projection");
-    assert!(cpu_lin.is_convrot_int8());
+    assert!(
+        QLinear::convrot_int8_in(w_i8, scale, 256, None, &Device::Cpu, &cpu_ctx).is_err(),
+        "CPU cannot execute a native ConvRot projection"
+    );
 }

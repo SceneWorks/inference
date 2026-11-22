@@ -33,7 +33,7 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::attention::{sdpa, AttnMask};
-use crate::primitives::nn::{gelu, gelu_erf, layer_norm, linear};
+use crate::primitives::nn::{gelu, gelu_erf, layer_norm};
 use crate::primitives::projection::Projection;
 use crate::primitives::rope::apply_rope;
 use crate::primitives::Weights;
@@ -128,15 +128,12 @@ impl Qwen35VisionConfig {
 
 /// The `Conv3d` patch embedding, loaded as a reshaped `[hidden, C·T·P·P]` linear (kernel == stride ==
 /// patch ⇒ each patch is an independent dot product over its flattened pixels).
-struct PatchEmbed {
-    weight: Tensor,
-    bias: Option<Tensor>,
-}
+struct PatchEmbed(Projection);
 
 impl PatchEmbed {
     /// `pixel_values` `[num_patches, C·T·P·P]` → `[num_patches, hidden]`.
     fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        __model_proof_output!(linear(pixel_values, &self.weight, self.bias.as_ref()))
+        __model_proof_output!(self.0.forward(pixel_values))
     }
 }
 
@@ -335,8 +332,8 @@ impl Qwen35VisionModel {
         let p = |leaf: &str| join(prefix, leaf);
         let req = |k: String| -> Result<Tensor> { Ok(w.require(&k)?.to_dtype(dtype)?) };
         let opt = |k: String| -> Result<Option<Tensor>> {
-            match w.get(&k) {
-                Some(t) => Ok(Some(t.to_dtype(dtype)?)),
+            match w.optional(&k)? {
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&k, dtype))?)),
                 None => Ok(None),
             }
         };
@@ -345,20 +342,43 @@ impl Qwen35VisionModel {
             if let Some(qtensor) = packed.as_deref_mut().and_then(|p| p.remove(&weight_name)) {
                 Projection::load_qtensor(qtensor, bias)
             } else {
-                Projection::load_with_bias(req(weight_name)?, bias, None)
+                w.linear(&weight_name, dtype, bias)
             }
         };
 
         // Conv3d weight `[hidden, C, T, P, P]` → reshaped `[hidden, C·T·P·P]` linear.
-        let patch_weight = req(p("patch_embed.proj.weight"))?;
-        let patch_weight = match patch_layout {
-            PatchWeightLayout::ChannelsFirst => patch_weight,
-            PatchWeightLayout::MlxChannelsLast => patch_weight.permute((0, 4, 1, 2, 3))?,
+        let key = p("patch_embed.proj.weight");
+        let bias = opt(p("patch_embed.proj.bias"))?;
+        let rows = cfg.hidden_size as usize;
+        let cols = cfg.patch_in() as usize;
+        let patch = cfg.patch_size as usize;
+        let patch_shape = [
+            rows,
+            cfg.in_channels as usize,
+            cfg.temporal_patch_size as usize,
+            patch,
+            patch,
+        ];
+        let native = match patch_layout {
+            PatchWeightLayout::ChannelsFirst if w.shape(&key) == Some(&[rows, cols][..]) => {
+                w.checkpoint_projection(&key, dtype, w.tensor_device(&key)?, bias.clone())?
+            }
+            PatchWeightLayout::ChannelsFirst => {
+                w.native_flattened_projection(&key, &patch_shape, dtype, bias.clone())?
+            }
+            PatchWeightLayout::MlxChannelsLast => None,
         };
-        let patch_embed = PatchEmbed {
-            weight: patch_weight.reshape((cfg.hidden_size as usize, cfg.patch_in() as usize))?,
-            bias: opt(p("patch_embed.proj.bias"))?,
-        };
+        let patch_embed = PatchEmbed(match native {
+            Some(op) => op,
+            None => {
+                let weight = req(key)?;
+                let weight = match patch_layout {
+                    PatchWeightLayout::ChannelsFirst => weight,
+                    PatchWeightLayout::MlxChannelsLast => weight.permute((0, 4, 1, 2, 3))?,
+                };
+                Projection::load_with_bias(weight.reshape((rows, cols))?, bias, None)?
+            }
+        });
         let pos_embed = req(p("pos_embed.weight"))?;
 
         let blocks = (0..cfg.depth)
@@ -454,7 +474,7 @@ impl Qwen35VisionModel {
         // Patch embed + bilinearly-resampled learned position embedding.
         let mut hs = self
             .patch_embed
-            .forward(&pixel_values.to_dtype(self.patch_embed.weight.dtype())?)?;
+            .forward(&pixel_values.to_dtype(self.pos_embed.dtype())?)?;
         let pos = self.position_embeds(grid_thw, n)?.to_dtype(hs.dtype())?;
         hs = hs.broadcast_add(&pos)?;
 

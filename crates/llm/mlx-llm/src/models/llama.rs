@@ -96,6 +96,7 @@ enum Stack {
 #[derive(Debug)]
 enum TokenEmbedding {
     Dense(Array),
+    Native(mlx_layers::NativeProjection),
     Quantized(QuantizedEmbedding),
 }
 
@@ -103,6 +104,7 @@ impl TokenEmbedding {
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
+            Self::Native(p) => Ok(p.rows(input_ids)?),
             Self::Quantized(weight) => weight.forward(input_ids),
         }
     }
@@ -111,6 +113,7 @@ impl TokenEmbedding {
     fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Self::Dense(weight) => out.push(weight.clone()),
+            Self::Native(p) => p.push_arrays(out),
             Self::Quantized(q) => {
                 out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
             }
@@ -119,6 +122,7 @@ impl TokenEmbedding {
 
     fn tied_projection(&self) -> Projection {
         match self {
+            Self::Native(p) => Projection::Native(p.clone()),
             Self::Dense(weight) => Projection::Dense {
                 weight: weight.clone(),
                 bias: None,
@@ -473,7 +477,11 @@ impl CausalLm {
             .strip_suffix(".weight")
             .expect("embedding weight key has the required suffix");
         let embed_scales_key = format!("{embed_base}.scales");
-        let embed_tokens = if w.contains(&embed_scales_key) {
+        let embed_tokens = if let Some(Projection::Native(p)) =
+            Projection::native(w, &embed_key, false)?
+        {
+            TokenEmbedding::Native(p)
+        } else if w.contains(&embed_scales_key) {
             let spec = cfg.quantization.ok_or_else(|| {
                 Error::Config(format!(
                     "snapshot stores quantized tensor `{embed_scales_key}` but config.json has no `quantization` block"
@@ -498,7 +506,9 @@ impl CausalLm {
                 .strip_suffix(".weight")
                 .expect("LM head key has the required suffix");
             let head_scales_key = format!("{head_base}.scales");
-            if w.contains(&head_scales_key) {
+            if let Some(native) = Projection::native(w, &head_key, false)? {
+                native
+            } else if w.contains(&head_scales_key) {
                 let spec = cfg.quantization.ok_or_else(|| {
                     Error::Config(format!(
                         "snapshot stores quantized tensor `{head_scales_key}` but config.json has no `quantization` block"
@@ -2295,6 +2305,9 @@ impl LayerPlan {
         // (and quantized on the fly if a load-time `quant` was requested). `bias` is applied dense in
         // both cases (Qwen2 / GLM-4 attention bias).
         let load_proj = |key: &str, bias: Option<Array>| -> Result<Projection> {
+            if let Some(native) = Projection::native(w, key, bias.is_some())? {
+                return Ok(native);
+            }
             let base = key.strip_suffix(".weight").unwrap_or(key);
             let scales_key = format!("{base}.scales");
             if w.contains(&scales_key) {
@@ -2392,15 +2405,12 @@ impl LayerPlan {
             // separate q/k/v projections are loaded (with q/k/v bias for Qwen2 / GLM-4).
             let packed = lp("self_attn.qkv_proj.weight");
             let (q, kv) = if w.contains(&packed) {
-                let qkv = req_compute(packed)?; // [qd + 2*kvd, hidden]
-                let parts = split_sections(&qkv, &[qd, qd + kvd], 0)?;
-                (
-                    Projection::load(parts[0].clone(), quant)?,
-                    Some(KvProjection::separate(
-                        Projection::load(parts[1].clone(), quant)?,
-                        Projection::load(parts[2].clone(), quant)?,
-                    )),
-                )
+                let parts =
+                    Projection::load_split(w, &packed, &[qd, qd + kvd], compute_dtype, quant)?;
+                let [q, k, v]: [Projection; 3] = parts
+                    .try_into()
+                    .map_err(|_| Error::Config("expected three QKV projections".into()))?;
+                (q, Some(KvProjection::separate(k, v)))
             } else {
                 let q = proj_b(lp("self_attn.q_proj.weight"))?;
                 let kv = if kv_shared {
@@ -2483,12 +2493,11 @@ impl LayerPlan {
             let (gate, up) = {
                 let packed = lp("mlp.gate_up_proj.weight");
                 if w.contains(&packed) {
-                    let gu = req_compute(packed)?; // [2*inter, hidden]
-                    let parts = split_sections(&gu, &[inter], 0)?;
-                    (
-                        Projection::load(parts[0].clone(), quant)?,
-                        Projection::load(parts[1].clone(), quant)?,
-                    )
+                    let parts = Projection::load_split(w, &packed, &[inter], compute_dtype, quant)?;
+                    let [gate, up]: [Projection; 2] = parts
+                        .try_into()
+                        .map_err(|_| Error::Config("expected two gate/up projections".into()))?;
+                    (gate, up)
                 } else {
                     (
                         proj(lp("mlp.gate_proj.weight"))?,

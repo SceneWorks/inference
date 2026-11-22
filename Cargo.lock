@@ -183,6 +183,7 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 name = "candle-audio"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-nn",
  "libc",
@@ -448,6 +449,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-checkpoint"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-quant-kernels",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
 dependencies = [
@@ -493,6 +507,7 @@ dependencies = [
 name = "candle-gen"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-flash-attn",
  "candle-layers",
@@ -1269,6 +1284,7 @@ dependencies = [
 name = "candle-llm"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-flash-attn",
  "candle-layers",
@@ -1302,7 +1318,6 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -1324,6 +1339,7 @@ dependencies = [
  "candle-nn",
  "float8",
  "half",
+ "sceneworks-gen-core",
 ]
 
 [[package]]
@@ -2559,7 +2575,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
- "safetensors 0.4.5",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-checkpoint",
  "sceneworks-gen-core-iris",

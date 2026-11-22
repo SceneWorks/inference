@@ -34,6 +34,18 @@ pub struct LogicalTensorPlan {
 }
 
 impl LogicalTensorPlan {
+    /// Native ConvRot keeps its floating bias at source precision across activation dtypes.
+    pub fn retained_convrot_bias_key(&self) -> Option<String> {
+        if self.residency.mode != ResidencyMode::Packed
+            || !matches!(self.codec, TensorCodecSpec::ConvRotInt8 { .. })
+        {
+            return None;
+        }
+        self.physical_key
+            .strip_suffix(".weight")
+            .map(|base| format!("{base}.bias"))
+    }
+
     /// The logical shape the codec decodes **before** this entry's transform: the physical tensor's
     /// own geometry. Equal to [`Self::shape`] for an untransformed entry.
     ///
@@ -128,8 +140,10 @@ impl LogicalTensorPlan {
     pub fn matrix_rank_refusal(&self) -> Option<String> {
         const MATRIX_RANK: usize = 2;
         match &self.codec {
-            TensorCodecSpec::Mxfp8 { .. }
+            TensorCodecSpec::RowwiseFp8 { .. }
+            | TensorCodecSpec::Mxfp8 { .. }
             | TensorCodecSpec::Nvfp4 { .. }
+            | TensorCodecSpec::ConvRotInt8 { .. }
             | TensorCodecSpec::Int8PerRow { .. } => {}
             TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => return None,
         }
@@ -204,6 +218,13 @@ pub struct LogicalWeightPlan {
 }
 
 impl LogicalWeightPlan {
+    /// True when the source already specifies a codec other than a dense numeric cast.
+    pub fn has_encoded_weights(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|row| !matches!(row.codec, TensorCodecSpec::Dense))
+    }
+
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }
@@ -512,7 +533,7 @@ pub enum LogicalWeightPlanError {
         /// The authoritative per-tensor `.comfy_quant` declaration.
         tensor: ComfyQuantDescriptor,
         /// The corroborating file-level entry, as declared (absent fields stay absent).
-        metadata: PartialComfyQuantDescriptor,
+        metadata: Box<PartialComfyQuantDescriptor>,
         /// The descriptor field names that disagree, in declaration order.
         disagreement: Vec<&'static str>,
     },

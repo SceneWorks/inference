@@ -2305,7 +2305,10 @@ fn native_dit_resident_bytes(
             .strip_suffix(".weight")
             .unwrap_or(&tensor.logical_key);
         let bytes = match tensor.residency.mode {
-            ResidencyMode::Packed if dit_plan.execution_role_for_layer(base).is_packed_w4a4() => {
+            ResidencyMode::Packed
+                if tensor.codec_id != gen_core::checkpoint_codec::NVFP4_CODEC.codec_id
+                    || dit_plan.execution_role_for_layer(base).is_packed_w4a4() =>
+            {
                 packed_owner.insert(tensor.physical_key.as_str());
                 tensor.residency.resident_bytes
             }
@@ -4908,15 +4911,15 @@ mod tests {
             256 * DIT_WIDTH,
             "the plan's dense decode of an fp8 row lands bf16"
         );
-        let masked = CandleCodecResidency {
+        let native = CandleCodecResidency {
             fp8_e4m3_native: true,
             nvfp4_native: false,
-        }
-        .with_dense_fp8();
+            mxfp8_native: false,
+        };
         assert_eq!(
-            native_dit_resident_bytes(&fp8, None, &masked).unwrap(),
-            256 * DIT_WIDTH,
-            "the fp8 leg is masked for this import on every host"
+            native_dit_resident_bytes(&fp8, None, &native).unwrap(),
+            256,
+            "the native projection keeps its stored codes"
         );
 
         // ---- NVFP4: dense fallback below the floor, role-table demotion above it ------------
@@ -4937,6 +4940,7 @@ mod tests {
         let packed = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let prefix = crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
         let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::for_config(prefix, &cfg);

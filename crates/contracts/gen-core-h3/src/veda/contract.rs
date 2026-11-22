@@ -117,8 +117,8 @@ pub struct Bundle {
     pub heads: usize,
     pub dim: usize,
     pub plans: Vec<Plan>,
-    pub q: Vec<Vec<u16>>,
-    pub k: Vec<Vec<u16>>,
+    pub q: Vec<gen_core::HeadwiseWeights>,
+    pub k: Vec<gen_core::HeadwiseWeights>,
 }
 /// Round-to-nearest-even BF16, AFTER FP8 decode and per-head FP32 scaling. A NaN stays NaN (the
 /// shared [`gen_core::numeric::bf16_bits`] guard, sc-27419); every non-NaN input is unchanged.
@@ -126,16 +126,7 @@ pub fn bf16(x: f32) -> u16 {
     gen_core::numeric::bf16_bits(x)
 }
 pub fn fp8(b: u8) -> f32 {
-    let e = (b >> 3) & 15;
-    let m = b & 7;
-    let sign = if b & 128 == 0 { 1.0 } else { -1.0 };
-    if e == 15 && m == 7 {
-        f32::NAN
-    } else if e == 0 {
-        sign * (m as f32) * 2.0f32.powi(-9)
-    } else {
-        sign * (1.0 + m as f32 / 8.0) * 2.0f32.powi(e as i32 - 7)
-    }
+    gen_core::fp8_e4m3fn_to_f32(b)
 }
 fn floats(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(match dtype {
@@ -290,6 +281,13 @@ impl Bundle {
                 if scale.iter().any(|v| !v.is_finite() || *v <= 0.0) {
                     return Err(bad("invalid scale"));
                 }
+                if storage == Dtype::F8_E4M3 {
+                    out.push(
+                        gen_core::HeadwiseWeights::from_fp8(t.data, scale, 3 * dim * dim)
+                            .map_err(|e| bad(e.to_string()))?,
+                    );
+                    continue;
+                }
                 let values = floats(t.dtype, t.data)?;
                 let mut rounded = Vec::with_capacity(values.len());
                 for (i, v) in values.into_iter().enumerate() {
@@ -303,7 +301,7 @@ impl Bundle {
                     }
                     rounded.push(rounded_value);
                 }
-                out.push(rounded);
+                out.push(rounded.into());
             }
         }
         if meta.keys().map(str::to_owned).collect::<BTreeSet<_>>() != expected {
@@ -338,28 +336,28 @@ impl Bundle {
             .min_by_key(cost)
             .unwrap()
     }
-    pub fn projection(&self, layer: usize, heads: &[i32], query: bool) -> Vec<f32> {
-        let data = if query {
+    pub fn selected_projection<'a>(
+        &'a self,
+        layer: usize,
+        heads: &'a [i32],
+        query: bool,
+    ) -> gen_core::HeadwiseProjection<'a> {
+        let columns = if query {
             &self.q[layer]
         } else {
             &self.k[layer]
         };
-        let n = 3 * self.dim * self.dim;
-        heads
-            .iter()
-            .flat_map(|&h| {
-                data[h as usize * n..(h as usize + 1) * n]
-                    .iter()
-                    .map(|&v| f32::from_bits((v as u32) << 16))
-            })
-            .collect()
+        columns.heads(heads, 3 * self.dim * self.dim)
+    }
+    pub fn projection(&self, layer: usize, heads: &[i32], query: bool) -> Vec<f32> {
+        self.selected_projection(layer, heads, query).dense()
     }
     pub fn host_bytes(&self) -> u64 {
         (self
             .q
             .iter()
             .chain(&self.k)
-            .map(|v| v.len() * 2)
+            .map(|v| v.resident_bytes())
             .sum::<usize>()) as u64
     }
 }
@@ -1309,8 +1307,11 @@ mod tests {
     fn strict_bundle_metadata_projection_and_scales() {
         let m = meta_fixture(|_, _| {});
         let b = Bundle::from_meta(&m, 1, 2, 2).unwrap();
-        assert_eq!(b.q[0].len(), 24);
-        assert_ne!(b.q[0][0], b.q[0][12]);
+        assert_eq!(b.q[0].resident_bytes(), 24 + 2 * 4);
+        assert_ne!(
+            b.projection(0, &[0], true)[0],
+            b.projection(0, &[1], true)[0]
+        );
         for key in [
             "format",
             "num_layers",

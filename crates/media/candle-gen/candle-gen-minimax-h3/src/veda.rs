@@ -460,20 +460,35 @@ fn scores(
         return Err("Veda invalid scorer layer/heads".into());
     }
     let ids: Vec<i32> = heads.iter().map(|&h| h as i32).collect();
-    let (pq, pk) = (
-        p.bundle.projection(layer, &ids, true),
-        p.bundle.projection(layer, &ids, false),
-    );
+    let pq = p.bundle.selected_projection(layer, &ids, true);
+    let pk = p.bundle.selected_projection(layer, &ids, false);
     if matches!(qt.device(), Device::Cuda(_)) {
+        if let (Some((qc, qs)), Some((kc, ks))) = (pq.packed(), pk.packed()) {
+            return Ok(veda_score::tile_logits_weights(
+                qt,
+                kt,
+                &layout.valid,
+                layout.video,
+                veda_score::Projection::Fp8 {
+                    codes: &qc,
+                    scales: &qs,
+                },
+                veda_score::Projection::Fp8 {
+                    codes: &kc,
+                    scales: &ks,
+                },
+            )?);
+        }
         return Ok(veda_score::tile_logits(
             qt,
             kt,
             &layout.valid,
             layout.video,
-            &pq,
-            &pk,
+            &pq.dense(),
+            &pk.dense(),
         )?);
     }
+    let (pq, pk) = (pq.dense(), pk.dense());
     let pool = |x: &Tensor| -> Result<Vec<f32>> {
         let x = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         Ok(contract::pool_video_tiles(

@@ -1,5 +1,5 @@
 //! Weight loading for the Boogu DiT + Qwen3-VL condition encoder — a thin shape-inferring wrapper
-//! over candle's [`MmapedSafetensors`], mirroring `mlx-gen-boogu`'s `Weights`/`lin` interface (and
+//! over the shared [`MappedWeights`] reader, mirroring `mlx-gen-boogu`'s `Weights`/`lin` interface (and
 //! `candle-gen-ideogram`'s `loader::Weights`) so the port stays a near-1:1 translation. [`linear`]
 //! builds a [`Linear`] from the actual `{base}.weight` (+ optional `{base}.bias`) tensor shapes, so
 //! dims that aren't in the public config (the FFN inner width, the embedder MLP hidden) need no
@@ -26,9 +26,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, Var, D};
 use candle_gen::candle_nn::{Embedding, Linear};
+use candle_gen::loader::MappedWeights;
 use candle_gen::quant::PackedConfig;
 
 use crate::quant::{QEmbedding, QLinear};
@@ -47,7 +47,7 @@ pub struct Weights {
 }
 
 enum WeightStorage {
-    Mmap(MmapedSafetensors),
+    Mmap(MappedWeights),
     /// Training-only live tensors. Each value is the tensor handle owned by the corresponding
     /// returned [`Var`], so rebuilding a model from this map preserves the backward edge.
     Owned(HashMap<String, Tensor>),
@@ -61,7 +61,7 @@ impl Weights {
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
         let st = candle_gen::mmap_safetensors_multi(&files)?;
         Ok(Self {
-            storage: WeightStorage::Mmap(st),
+            storage: WeightStorage::Mmap(MappedWeights::new(st, &files, device)?),
             device: device.clone(),
             dtype,
             packed: read_packed_config(dir)?,
@@ -73,7 +73,7 @@ impl Weights {
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let st = candle_gen::mmap_safetensors_multi(&[path])?;
         Ok(Self {
-            storage: WeightStorage::Mmap(st),
+            storage: WeightStorage::Mmap(MappedWeights::new(st, &[path.to_owned()], device)?),
             device: device.clone(),
             dtype,
             packed: read_packed_config(path.parent().unwrap_or_else(|| Path::new(".")))?,
@@ -131,7 +131,10 @@ impl Weights {
 
     /// Load `name` at the component dtype.
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        self.load_native(name)?.to_dtype(self.dtype)
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.read(name, self.dtype, &self.device),
+            WeightStorage::Owned(_) => self.load_native(name)?.to_dtype(self.dtype),
+        }
     }
 
     /// Load `name` at its **native** stored dtype (no cast) on the component device — used for the
@@ -142,12 +145,59 @@ impl Weights {
 
     /// Load `name` forcing f32 (norm weights and other precision-sensitive scalars).
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
-        self.load_native(name)?.to_dtype(DType::F32)
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.read(name, DType::F32, &self.device),
+            WeightStorage::Owned(_) => self.load_native(name)?.to_dtype(DType::F32),
+        }
+    }
+
+    pub(crate) fn vector_len(&self, name: &str) -> Result<usize> {
+        let shape = match &self.storage {
+            WeightStorage::Mmap(st) => st.mmap().get(name)?.shape().to_vec(),
+            WeightStorage::Owned(tensors) => tensors
+                .get(name)
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!("missing tensor {name}"))
+                })?
+                .dims()
+                .to_vec(),
+        };
+        match shape.as_slice() {
+            [n] => Ok(*n),
+            _ => candle_gen::candle_core::bail!("{name}: expected a vector, got {shape:?}"),
+        }
+    }
+
+    /// Native or dense projection at the vision tower's F32 precision, independent
+    /// of the language model's store dtype. Owned training tensors retain their graph.
+    pub(crate) fn vision_projection(
+        &self,
+        base: &str,
+        bias: bool,
+        shape: Option<&[usize]>,
+    ) -> Result<Linear> {
+        if let WeightStorage::Mmap(st) = &self.storage {
+            return st.linear_shaped(base, bias, DType::F32, self.device(), shape);
+        }
+        let mut weight = self.get_f32(&format!("{base}.weight"))?;
+        if let Some(shape) = shape {
+            if weight.dims() != shape {
+                candle_gen::candle_core::bail!(
+                    "{base}: expected {shape:?}, got {:?}",
+                    weight.dims()
+                );
+            }
+            weight = weight.flatten_from(1)?;
+        }
+        let bias = bias
+            .then(|| self.get_f32(&format!("{base}.bias")))
+            .transpose()?;
+        Ok(Linear::new(weight, bias))
     }
 
     pub fn contains(&self, name: &str) -> bool {
         match &self.storage {
-            WeightStorage::Mmap(st) => st.get(name).is_ok(),
+            WeightStorage::Mmap(st) => st.mmap().get(name).is_ok(),
             WeightStorage::Owned(tensors) => tensors.contains_key(name),
         }
     }
@@ -167,7 +217,7 @@ impl Weights {
 
     fn load_native(&self, name: &str) -> Result<Tensor> {
         match &self.storage {
-            WeightStorage::Mmap(st) => st.load(name, &self.device),
+            WeightStorage::Mmap(st) => st.mmap().load(name, &self.device),
             WeightStorage::Owned(tensors) => tensors.get(name).cloned().ok_or_else(|| {
                 candle_gen::candle_core::Error::Msg(format!("missing tensor `{name}`"))
             }),
@@ -214,6 +264,9 @@ ArtifactInput,
 /// Build a [`Linear`] from `{base}.weight` (+ `{base}.bias` when `bias`), inferring in/out dims from
 /// the stored tensor shape (`[out, in]`, PyTorch/HF convention).
 pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if let WeightStorage::Mmap(st) = &w.storage {
+        return st.linear(base, bias, w.dtype(), w.device());
+    }
     let weight = w.get(&format!("{base}.weight"))?;
     let bias = if bias {
         Some(w.get(&format!("{base}.bias"))?)

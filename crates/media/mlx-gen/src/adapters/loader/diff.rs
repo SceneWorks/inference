@@ -231,7 +231,9 @@ pub(super) fn fold_one_diff_module(
         // A weight `.diff` is the one genuinely tier-dependent channel: a dense delta cannot fold into
         // a packed weight, and unpacking to make it fit would defeat the tier the user chose. Skip the
         // whole module (coupled bias with it) and surface it.
-        if facts.is_quantized || diff.shape() != facts.base_shape.as_slice() {
+        if (facts.is_quantized && !facts.source_packed)
+            || diff.shape() != facts.base_shape.as_slice()
+        {
             skip_whole_module(stem, parts, report);
             return Ok(());
         }

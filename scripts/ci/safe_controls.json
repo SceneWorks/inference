@@ -1443,6 +1443,156 @@
         "win32"
       ],
       "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::bare_fp8_expert_declarations_bind_the_actual_owner_for_blob_and_metadata",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::named_projection_parameters_bind_original_file_owners_and_reject_ambiguity",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::named_fp8_parameters_keep_layer_and_parameter_scale_conventions_distinct",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::source_classification_keeps_mixed_dtypes_and_refuses_unmapped_sidecars",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::selected_shards_resolve_all_names_before_filtering_and_validate_original_codes",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
+    },
+    {
+      "package": "mlx-gen-sdxl",
+      "kind": "lib",
+      "target": "mlx_gen_sdxl",
+      "test": "ldm::tests::fused_openclip_maps_original_convrot_rows_and_scales_to_each_qkv_projection",
+      "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Writes and reads a tiny safetensors file through production source planning and key remapping; constructs typed packed-source views and reads original I8 codes/F32 scales only. No projection forward, activation, learned matmul or inference kernel executes."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::delegated_w4a8_operands_remain_outside_the_fp8_projection_plan",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary file headers and bounded descriptor metadata only. Verifies shared planning leaves W4A8 operands to their existing owner while planning neighboring FP8; invalid metadata envelopes and unknown tags still refuse. No backend arrays or learned computation."
+    },
+    {
+      "package": "candle-checkpoint",
+      "kind": "lib",
+      "target": "candle_checkpoint",
+      "test": "var_builder::tests::file_builder_recognizes_metadata_only_convrot_on_underscore_projection",
+      "source": "crates/layers/candle-checkpoint/src/var_builder.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "File-backed CPU VarBuilder construction and typed pre-load refusal for an encoded underscore owner, followed by a dense-peer read. No layer forward, activation or inference kernel executes."
+    },
+    {
+      "package": "mlx-gen-minimax-h3",
+      "kind": "lib",
+      "target": "mlx_gen_minimax_h3",
+      "test": "dit::heads::tests::mixed_w4a8_and_fp8_block_projections_retain_original_operands",
+      "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Loads one tiny file and constructs H3 projection wrappers only. Reads original W4A8 codes, relative/channel scales and codebook plus native FP8 code/scale storage; verifies owner-specific missing-codebook refusal. No forward, activation or learned kernel executes."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "checkpoint_codec::source::tests::bare_owner_selection_never_discards_its_descriptor",
+      "source": "crates/contracts/gen-core/src/checkpoint_codec/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Temporary safetensors header and bounded descriptor read only. Exact bare-parameter selection must retain its declaration and reject malformed/unknown descriptors; no backend tensors, model forward or inference computation."
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "adapters::tests::install_additive_applies_selected_lora_to_convrot_host",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/adapters.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Loads a tiny real adapter file into a metadata-only CPU NativeLinearWeight through the production additive installer. Preserves apply/skip/base-kind assertions; explicit panic guards prohibit base forward and dense materialization. No learned or GPU execution."
     }
   ]
 }

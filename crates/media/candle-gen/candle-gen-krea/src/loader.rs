@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use candle_gen::gen_core::checkpoint_codec::{
     LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, MXFP8_CODEC, NVFP4_CODEC,
@@ -58,7 +57,7 @@ use crate::quant::{QEmbedding, QLinear};
 /// touching the untargeted bulk of the model. Overlay tensors are stored CPU-side (where the merge runs)
 /// and moved to `device` / cast to the requested dtype on read, exactly like the mmap path.
 pub struct Weights {
-    st: MmapedSafetensors,
+    st: std::sync::Arc<MmapedSafetensors>,
     /// Present for a single-file source. The mmap keeps reads lazy; this lstat/target fingerprint adds
     /// the mutation guard required when the same mapping is revisited for successive block windows.
     pinned_source: Option<candle_gen::gen_core::PinnedWeightsFile>,
@@ -88,7 +87,7 @@ pub struct Weights {
     /// True **only** for a community **INT8-ConvRot** checkpoint (sc-9300): its quantized projections carry
     /// a `{native_base}.weight_scale` + int8 `.weight` whose stored weight is the *rotated* `W·R`, so
     /// [`linear_detect`] engages the int8 IGEMM + the online group-256 Hadamard **rotation** legs
-    /// ([`crate::quant::ConvRotInt8`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
+    /// ([`candle_gen::quant::convrot_int8::ConvRotLinear`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
     /// dense-bf16 native file is `native_keys: true, convrot: false` — remap ON, rotation/int8 OFF.
     convrot: bool,
     /// True only for a native-keyed, non-rotated ComfyUI
@@ -109,27 +108,9 @@ pub struct Weights {
     /// scale values, geometry) is enforced by the shared reader's codec decode. This is distinct
     /// from the MLX affine [`packed`](Self::packed) tier and inline FP8.
     native_nvfp4: bool,
-    /// The shared logical-weight reader over the compiled mapped-read plan, for a **single-file
-    /// native** checkpoint (`None` for the directory/packed-tier path, which is diffusers-keyed
-    /// and has its own tier machinery).
-    ///
-    /// The plan it holds is the descriptor authority the import reads: which layers are NVFP4,
-    /// which companion tensors carry their two scale levels, what stored/logical geometry each
-    /// has, and — priced per layer by [`CandleCodecResidency`] — whether each row materializes
-    /// packed-native or as the declared dense fallback. Materialization itself goes through
-    /// [`LogicalWeightReader::read`] (sc-21482): the provider owns **mapping and construction**,
-    /// the codec owns classification and decode, and the reader measures the receipt.
+    /// The source codec plan for encoded directory shards and component files, or the family-mapped
+    /// plan for a native single-file DiT. Plain snapshots can use the mmap directly.
     logical: Option<LogicalWeightReader>,
-    /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
-    /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
-    /// and the handle must be built at most once for the whole trunk, on first int8 projection.
-    ///
-    /// This weight set is the right owner and the right *lifetime*: the handle is a per-device compute
-    /// resource for exactly these weights, so it dies when they do — no process-global outliving an
-    /// unloaded model. `pipeline::load_components_convrot` seeds it up front via
-    /// [`with_int8_context`](Weights::with_int8_context) so the sm_89 floor probe's handle *becomes* the
-    /// trunk's shared handle instead of being built and thrown away.
-    int8: OnceLock<Int8Context>,
 }
 
 impl Weights {
@@ -203,6 +184,7 @@ impl Weights {
             }
             None => (candle_gen::mmap_safetensors_multi(&files)?, None),
         };
+        let (st, logical) = LogicalWeightReader::from_snapshot(st, &files, device)?;
         Ok(Self {
             st,
             pinned_source: None,
@@ -216,18 +198,21 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
-            logical: None,
-            int8: OnceLock::new(),
+            logical,
         })
     }
 
-    /// mmap a single `.safetensors` file (used by the committed parity fixtures). Dense-only (no
-    /// packed config), so the packed path is never taken for a single-file fixture. Diffusers-keyed —
-    /// for a **native-mmdit-keyed** dense single file use [`from_native_file`](Self::from_native_file).
+    /// Open a diffusers-keyed component file, including its encoded projections. Native-mmdit
+    /// single-file DiTs use the family mapping in [`Self::from_native_file`].
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
         let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
+        let (st, logical) = LogicalWeightReader::from_snapshot(
+            st,
+            &[pinned_source.loader_path().to_owned()],
+            device,
+        )?;
         Ok(Self {
             st,
             pinned_source: Some(pinned_source),
@@ -241,8 +226,7 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
-            logical: None,
-            int8: OnceLock::new(),
+            logical,
         })
     }
 
@@ -252,27 +236,13 @@ impl Weights {
     /// projections are int8 (per-output-row `.weight_scale`). Dense bf16 tensors (`first`/`last`/`tmlp`
     /// /`tproj`/`txtfusion`/`txtmlp` + norms) load unchanged through the remap.
     pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
-            .map_err(|error| Error::Msg(error.to_string()))?;
-        let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
-        validate_convrot_descriptors(&st)?;
-        let native_prefix = detect_native_prefix(&st);
-        Ok(Self {
-            st,
-            pinned_source: Some(pinned_source),
-            device: device.clone(),
-            dtype,
-            overlay: HashMap::new(),
-            packed: None,
-            sidecars: None,
-            native_keys: true,
-            native_prefix,
-            convrot: true,
-            plain_int8: false,
-            native_nvfp4: false,
-            logical: None,
-            int8: OnceLock::new(),
-        })
+        let weights = Self::from_native_file(path, device, dtype)?;
+        if !weights.is_convrot() {
+            return Err(Error::Msg(
+                "expected a native INT8 checkpoint declaring convrot: true".into(),
+            ));
+        }
+        Ok(weights)
     }
 
     /// mmap a **single-file native-mmdit-keyed checkpoint** (sc-14022/sc-14023) — either a dense-bf16
@@ -307,7 +277,7 @@ impl Weights {
     ) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes)
+        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes, false)
     }
 
     /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
@@ -334,6 +304,7 @@ impl Weights {
         device: &Device,
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         let residency = native_import_residency(device);
         Self::from_pinned_native_file_with_residency(
@@ -342,6 +313,7 @@ impl Weights {
             dtype,
             shapes,
             residency,
+            stage_dense_on_cpu,
         )
     }
 
@@ -367,7 +339,9 @@ impl Weights {
             CandleCodecResidency {
                 fp8_e4m3_native: false,
                 nvfp4_native: true,
+                mxfp8_native: false,
             },
+            false,
         )
     }
 
@@ -377,6 +351,7 @@ impl Weights {
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
         residency: CandleCodecResidency,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         pinned_source
             .ensure_unchanged()
@@ -386,7 +361,20 @@ impl Weights {
         let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
         let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        let plain_int8 = validate_plain_int8_tensorwise(&st)?;
+        // Only dense masters need CPU staging for an explicitly requested GGML conversion.
+        // Codec-declared checkpoints retain their source representation on the compute device.
+        let device = if stage_dense_on_cpu && !logical_plan.has_encoded_weights() {
+            &Device::Cpu
+        } else {
+            device
+        };
+        let plain_int8 = logical_plan.tensors.iter().any(|t| {
+            t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
+        });
+        let convrot = logical_plan
+            .tensors
+            .iter()
+            .any(|t| t.codec_id == candle_gen::gen_core::convrot_int8::CODEC_ID);
         // A BLOCK-PADDED checkpoint (NVFP4, MXFP8) whose architecture's logical shape was never
         // declared is NOT refused here: the plan stays legal, because a plan is also a *pricing*
         // artifact (gen-core's rule — `nvfp4_read_refuses_an_undeclared_logical_shape` pins it),
@@ -419,7 +407,7 @@ impl Weights {
         )
         .map_err(|error| Error::Msg(error.to_string()))?;
         let result = Self {
-            st,
+            st: st.into(),
             pinned_source: Some(pinned_source.clone()),
             device: device.clone(),
             dtype,
@@ -428,11 +416,10 @@ impl Weights {
             sidecars: None,
             native_keys: true,
             native_prefix,
-            convrot: false,
+            convrot,
             plain_int8,
             native_nvfp4,
             logical: Some(logical),
-            int8: OnceLock::new(),
         };
         pinned_source
             .ensure_unchanged()
@@ -443,7 +430,7 @@ impl Weights {
     /// The compiled mapped-read plan for a single-file native checkpoint — the descriptor authority
     /// the NVFP4 import consults. `None` for the directory/packed-tier path.
     pub fn logical_plan(&self) -> Option<&LogicalWeightPlan> {
-        self.logical.as_ref().map(LogicalWeightReader::plan)
+        self.logical.as_ref().map(|reader| reader.plan())
     }
 
     /// The planned entry for one **diffusers** (logical) key, or `None` when the file has no plan or
@@ -599,7 +586,7 @@ impl Weights {
     ///
     /// This is the surface the SceneWorks half consumes to distinguish a source stored `nvfp4-v1`
     /// from a run that executed it as packed W4A4 or as dense BF16. `Ok(None)` when the source has
-    /// no plan (the directory/packed-tier path); `Err` when the pinned file changed under the load,
+    /// no encoded rows or family plan; `Err` when the pinned file changed under the load,
     /// so facts are never reported about bytes that are gone.
     pub fn checkpoint_weight_facts(&self) -> Result<Option<CheckpointWeightFacts>> {
         let Some(logical) = self.logical.as_ref() else {
@@ -617,20 +604,11 @@ impl Weights {
         Ok(Some(facts))
     }
 
-    /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
-    ///
-    /// The seam for scope 5 of the story: `pipeline::ensure_int8_floor` must build a cuBLASLt handle
-    /// anyway to read the device's compute capability against the sm_89 floor, so it hands that handle
-    /// here instead of dropping it — the probe *becomes* the trunk's shared handle. Absent this call,
-    /// [`int8_context`](Self::int8_context) simply builds one lazily on the first int8 projection.
-    ///
-    /// Takes `self` by value (called at construction, before any projection reads the cell), so seeding
-    /// a fresh `OnceLock` cannot lose a race with a lazy build.
-    pub fn with_int8_context(mut self, ctx: Int8Context) -> Self {
-        let cell = OnceLock::new();
-        // Infallible: the cell was created one line above and nothing else holds it.
-        let _ = cell.set(ctx);
-        self.int8 = cell;
+    /// Reuse the floor probe's cuBLASLt handle in the checkpoint reader.
+    pub fn with_int8_context(mut self, context: Int8Context) -> Self {
+        if let Some(reader) = self.logical.as_mut() {
+            reader.set_int8_context(context);
+        }
         self
     }
 
@@ -661,28 +639,6 @@ impl Weights {
         result
     }
 
-    /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),
-    /// built on first use if [`with_int8_context`](Self::with_int8_context) did not seed it.
-    ///
-    /// This is the fix for the defect the story names: `QLinear::convrot_int8` built a fresh cuBLASLt
-    /// handle — and its eager 32 MiB workspace — for *every* int8 projection, so a ConvRot DiT's ~224 of
-    /// them carried ~7 GiB of duplicated scratch that a weights-only footprint sum cannot see.
-    ///
-    /// Errors (rather than caching a failure) if the handle cannot be built on a CUDA device, so the
-    /// F-121 / sc-11208 typed-error-at-load property survives the move to a shared handle: the error
-    /// surfaces from the first `linear_detect` that reaches an int8 projection, still inside load, where
-    /// `?` is available.
-    pub fn int8_context(&self) -> Result<&Int8Context> {
-        if let Some(ctx) = self.int8.get() {
-            return Ok(ctx);
-        }
-        // Built OUTSIDE the cell so a failure propagates instead of being cached as a poisoned context
-        // (`OnceLock` has no stable `get_or_try_init`). A lost race here just drops the loser's handle;
-        // the winner's is the one every projection then shares.
-        let ctx = Int8Context::new(&self.device)?;
-        Ok(self.int8.get_or_init(|| ctx))
-    }
-
     /// Whether this checkpoint applies the **int8 + online-rotation** legs, i.e. it is a genuine
     /// **INT8-ConvRot** export (sc-9300). This is the narrow ConvRot flag (sc-14022): it is **false** for
     /// a dense-bf16 native single file, which is native-keyed but never rotated/int8. Gate the int8
@@ -697,7 +653,22 @@ impl Weights {
         self.plain_int8
     }
 
+    /// Keep native operators on their plan device while ordinary parameters stage for a component fold.
+    pub(crate) fn stage_dense_on(mut self, device: &Device) -> Self {
+        self.device = device.clone();
+        self
+    }
+
     /// Whether this native checkpoint carries prepacked ComfyUI Kitchen NVFP4 projection triplets.
+    pub(crate) fn is_native_projection(&self, base: &str) -> bool {
+        let key = format!("{base}.weight");
+        !self.overlay_has(&key)
+            && self
+                .logical
+                .as_ref()
+                .is_some_and(|reader| reader.has_native_projection(&key))
+    }
+
     pub fn is_native_nvfp4(&self) -> bool {
         self.native_nvfp4
     }
@@ -778,20 +749,21 @@ impl Weights {
     ///   returned the stored `U8` nibble buffer at shape `[rows, cols / 2]`, cast to the component
     ///   dtype — silently wrong weights, not a dense decode. Refusing is strictly better.
     ///
-    /// Production reachability was audited: the only non-`linear_detect_planned` reads of a
-    /// projection `.weight` on a native file are `KreaTrainDit::load_inference`'s `lora_proj`
-    /// (reached from [`crate::control_provider`]'s `ControlDitSource::Native`, which does not yet
-    /// support an NVFP4 control DiT) and [`crate::control`]'s `ControlBranch::from_base` — whose
-    /// every production caller sources `Weights::from_dir`, the directory/packed-tier path, which
-    /// compiles no plan at all and so cannot reach this arm. The refusal names the escape hatch
-    /// for anything new: re-open the checkpoint under a `CandleCodecResidency` whose
-    /// `nvfp4_native` is `false`, so the plan prices — and the receipt reports — the dense
-    /// fallback the caller wants.
+    /// Directory components use the generic projection reader for coefficient accesses. The
+    /// native single-file DiT uses its family-mapped plan and the packed-read contract above.
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
         }
-        if self.plain_int8 {
+        if !self.native_keys {
+            if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
+                return self
+                    .read_source_unchanged(|| reader.read_dense(name, self.dtype, &self.device));
+            }
+        }
+        if self.planned(name).is_some_and(|t| {
+            t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
+        }) {
             let resolved = self.resolve(name);
             if self
                 .st
@@ -804,15 +776,17 @@ impl Weights {
         if self.planned(name).is_some() {
             return match self.read_planned(name)? {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype),
-                LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
-                    Err(Error::Msg(format!(
-                        "krea: `{name}` was planned packed-native; construct it through \
+                LogicalTensor::PackedNvfp4 { .. }
+                | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedRowwiseFp8 { .. }
+                | LogicalTensor::PackedMxFp8 { .. }
+                | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
+                    "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
                          under a residency whose `nvfp4_native` is false, so the plan prices this \
                          row `CandleCodecResidency::DENSE` and the receipt reports what a dense \
                          read costs"
-                    )))
-                }
+                ))),
             };
         }
         self.st
@@ -841,7 +815,15 @@ impl Weights {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(DType::F32);
         }
-        if self.plain_int8 {
+        if !self.native_keys {
+            if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
+                return self
+                    .read_source_unchanged(|| reader.read_dense(name, DType::F32, &self.device));
+            }
+        }
+        if self.planned(name).is_some_and(|t| {
+            t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
+        }) {
             let resolved = self.resolve(name);
             if self
                 .st
@@ -854,15 +836,17 @@ impl Weights {
         if self.planned(name).is_some() {
             return match self.read_planned(name)? {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(DType::F32),
-                LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
-                    Err(Error::Msg(format!(
-                        "krea: `{name}` was planned packed-native; construct it through \
+                LogicalTensor::PackedNvfp4 { .. }
+                | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedRowwiseFp8 { .. }
+                | LogicalTensor::PackedMxFp8 { .. }
+                | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
+                    "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
                          under a residency whose `nvfp4_native` is false, so the plan prices this \
                          row `CandleCodecResidency::DENSE` and the receipt reports what a dense \
                          read costs"
-                    )))
-                }
+                ))),
             };
         }
         self.st
@@ -885,46 +869,6 @@ impl Weights {
 
     pub fn contains(&self, name: &str) -> bool {
         self.overlay.contains_key(name) || self.st.get(&self.resolve(name)).is_ok()
-    }
-
-    /// Whether a **raw** (already-native) key is present on-disk, bypassing the ConvRot diffusers→native
-    /// remap — used to detect a ConvRot int8 projection's `{native_base}.weight_scale` sibling (sc-9300),
-    /// which is a native-only key with no diffusers counterpart in the remap.
-    fn contains_native(&self, name: &str) -> bool {
-        self.st.get(name).is_ok()
-    }
-
-    /// Load a **raw** (already-native) key forcing f32, bypassing the diffusers→native remap — the
-    /// ConvRot per-output-row `weight_scale` (sc-9300).
-    fn get_native_f32(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)?.to_dtype(DType::F32)
-    }
-
-    /// Load an INT8-ConvRot weight's int8 codes as an `I64` `[out, in]` tensor (sc-9300). `diffusers_key`
-    /// is the diffusers `{base}.weight`, resolved to its native key. candle's `DType` at our pin has **no
-    /// I8 variant** (only U8/U32/I16/I32/I64), so `st.load` can't decode an `I8` tensor — this reads the
-    /// raw `TensorView` bytes and reinterprets them as signed `i8 → i64` codes (the dtype the int8 stage
-    /// narrows back down). A test fixture may store the codes as `I64` directly (safetensors save has no
-    /// I8); that path loads through `st.load` unchanged.
-    fn get_int8_codes(&self, diffusers_key: &str) -> Result<Tensor> {
-        let native = self.resolve(diffusers_key);
-        let view = self.st.get(&native)?;
-        // Build the codes on the **CPU**: the caller (Int8Linear::from_per_channel_parts) stages them
-        // to a resident native-`i8` device buffer (1 byte/elem), so materializing the wider I64 form on
-        // the GPU first would 8× the VRAM (a 12B DiT's 224 projections OOM). The CPU I64 is transient.
-        match view.dtype() {
-            // Real ComfyUI export: raw I8 bytes reinterpreted as signed codes (candle can't decode I8).
-            ::safetensors::Dtype::I8 => {
-                let shape = view.shape().to_vec();
-                let codes: Vec<i64> =
-                    candle_gen::candle_core::safetensors::read_tensor_bytes(&view, |bytes| {
-                        bytes.iter().map(|&b| b as i8 as i64).collect()
-                    });
-                Tensor::from_vec(codes, shape, &Device::Cpu)
-            }
-            // Test / any-int fixture: load whatever integer dtype it is, then widen to I64.
-            _ => self.st.load(&native, &Device::Cpu)?.to_dtype(DType::I64),
-        }
     }
 
     /// Dequantize one already-validated plain-int8 projection as
@@ -961,21 +905,6 @@ impl Weights {
             }
         };
         codes.broadcast_mul(&scale)?.to_dtype(dtype)
-    }
-
-    /// Read the ConvRot `convrot_groupsize` (the regular-Hadamard order `R` was folded at) from a
-    /// projection's native `{native_base}.comfy_quant` descriptor — a small U8 JSON blob
-    /// (`{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256}`) the ComfyUI export writes
-    /// alongside each quantized weight (sc-9601). `None` when the blob is absent or lacks the field (an
-    /// older/plain int8 export); the caller then falls back to the checkpoint default (256).
-    fn get_convrot_groupsize(&self, native_base: &str) -> Option<usize> {
-        let view = self.st.get(&format!("{native_base}.comfy_quant")).ok()?;
-        let j: serde_json::Value =
-            candle_gen::candle_core::safetensors::read_tensor_bytes(&view, |bytes| {
-                serde_json::from_slice(bytes)
-            })
-            .ok()?;
-        j.get("convrot_groupsize")?.as_u64().map(|g| g as usize)
     }
 
     /// All tensor keys in the component (for architecture validation). For a ConvRot checkpoint these
@@ -1121,224 +1050,6 @@ fn is_block_padded_codec(codec_id: &str) -> bool {
     codec_id == NVFP4_CODEC.codec_id || codec_id == MXFP8_CODEC.codec_id
 }
 
-/// Validate the real data-section contract for a non-rotated ComfyUI int8-tensorwise checkpoint.
-///
-/// The app-side detector can only see header dtypes and key names. That is enough to put a file in
-/// the int8-per-row bucket, but not enough to prove that its U8 descriptor actually says
-/// `int8_tensorwise`, that `per_row` is true, or that the scale is one F32 value per output row.
-/// Perform those checks here, before any projection is dequantized. A `convrot` field at all selects
-/// the distinct rotated convention and is rejected from this constructor rather than falling back to
-/// the old implicit group-size-256 ConvRot path.
-///
-/// A file whose descriptors declare a DIFFERENT convention (ComfyUI's scalar fp8) is not this
-/// constructor's file at all: it returns `Ok(false)` rather than claiming int8 for it.
-fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
-    let tensors = st.tensors();
-    let int8_weights: Vec<String> = tensors
-        .iter()
-        .filter(|(_, view)| view.dtype() == ::safetensors::Dtype::I8)
-        .map(|(name, _)| name.clone())
-        .collect();
-    let descriptors: Vec<String> = tensors
-        .iter()
-        .filter(|(name, _)| name.ends_with(".comfy_quant"))
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    if int8_weights.is_empty() {
-        if descriptors.is_empty() {
-            return Ok(false);
-        }
-        // A `.comfy_quant` descriptor does NOT by itself mean int8. The same marker rides ComfyUI's
-        // scalar fp8 exports (`float8_e4m3fn`), whose weights are `F8_E4M3` and whose companion is
-        // an `F32` per-tensor scale — a convention this loader does not own but the codec seam
-        // does. Claiming plain int8 for a file that declares another format is what made every
-        // fp8 Krea 2 export fail here with "found 256 `.comfy_quant` descriptor(s) but no I8
-        // weight tensors" (sc-27092). Read what the descriptors actually declare: only an
-        // `int8_tensorwise` descriptor makes this file an int8 file, and an int8 file with no `I8`
-        // weights is genuinely broken.
-        if descriptors_declare_int8_tensorwise(st, &descriptors)? {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: found {} `.comfy_quant` descriptor(s) but no I8 weight tensors",
-                descriptors.len()
-            )));
-        }
-        // Not an int8 file: another descriptor-gated convention owns these bytes. The compiled plan
-        // is the authority on which one.
-        return Ok(false);
-    }
-
-    for weight_key in &int8_weights {
-        let Some(base) = weight_key.strip_suffix(".weight") else {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: I8 tensor `{weight_key}` is not a projection `.weight`"
-            )));
-        };
-        let weight = st.get(weight_key)?;
-        let [rows, _cols] = weight.shape() else {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{weight_key}` must be rank-2 [out,in], got {:?}",
-                weight.shape()
-            )));
-        };
-
-        let descriptor_key = format!("{base}.comfy_quant");
-        let descriptor = st.get(&descriptor_key).map_err(|_| {
-            candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{weight_key}` is missing `{descriptor_key}`"
-            ))
-        })?;
-        if descriptor.dtype() != ::safetensors::Dtype::U8 || descriptor.shape().len() != 1 {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must be a rank-1 U8 JSON blob"
-            )));
-        }
-        let json: serde_json::Value =
-            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
-                serde_json::from_slice(bytes)
-            })
-            .map_err(|error| {
-                candle_gen::candle_core::Error::Msg(format!(
-                    "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
-                ))
-            })?;
-        if json.get("format").and_then(serde_json::Value::as_str) != Some("int8_tensorwise") {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must declare format `int8_tensorwise`"
-            )));
-        }
-        if json.get("per_row").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must declare `per_row: true`"
-            )));
-        }
-        if json.get("convrot").is_some() {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` contains `convrot`; route rotated checkpoints \
-                 through the ConvRot loader"
-            )));
-        }
-
-        let scale_key = format!("{base}.weight_scale");
-        let scale = st.get(&scale_key).map_err(|_| {
-            candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{weight_key}` is missing `{scale_key}`"
-            ))
-        })?;
-        if scale.dtype() != ::safetensors::Dtype::F32 {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be F32, got {:?}",
-                scale.dtype()
-            )));
-        }
-        let scalar_single_row = *rows == 1 && scale.shape().is_empty();
-        if !scalar_single_row && scale.shape() != [*rows] && scale.shape() != [*rows, 1] {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1]{}; got {:?}",
-                if *rows == 1 { " or scalar" } else { "" },
-                scale.shape()
-            )));
-        }
-    }
-
-    for descriptor_key in descriptors {
-        let base = descriptor_key
-            .strip_suffix(".comfy_quant")
-            .expect("filtered suffix");
-        let weight_key = format!("{base}.weight");
-        if !matches!(
-            st.get(&weight_key),
-            Ok(view) if view.dtype() == ::safetensors::Dtype::I8
-        ) {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` does not describe an I8 `{weight_key}`"
-            )));
-        }
-    }
-
-    Ok(true)
-}
-
-/// Whether any `.comfy_quant` descriptor in the file declares the `int8_tensorwise` format.
-///
-/// The descriptor's `format` string is tensor *data*, invisible to the header-only app-side
-/// detector, so this is where the int8 convention is actually proven — and where a file that
-/// declares a *different* convention is recognised as not-int8 rather than refused as a broken
-/// int8 file (sc-27092).
-///
-/// An unreadable or malformed descriptor is a **refusal**, never a silent "not int8": the file
-/// claims a quantized convention this loader cannot verify, and treating it as something else
-/// would hand the codec seam bytes it may not own.
-fn descriptors_declare_int8_tensorwise(
-    st: &MmapedSafetensors,
-    descriptors: &[String],
-) -> Result<bool> {
-    let mut declares_int8 = false;
-    for descriptor_key in descriptors {
-        let descriptor = st.get(descriptor_key).map_err(|_| {
-            candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` could not be read"
-            ))
-        })?;
-        let json: serde_json::Value =
-            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
-                serde_json::from_slice(bytes)
-            })
-            .map_err(|error| {
-                candle_gen::candle_core::Error::Msg(format!(
-                    "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
-                ))
-            })?;
-        if json.get("format").and_then(serde_json::Value::as_str) == Some("int8_tensorwise") {
-            declares_int8 = true;
-        }
-    }
-    Ok(declares_int8)
-}
-
-/// Validate the other side of the descriptor gate: the existing ConvRot constructor may only accept
-/// descriptors that explicitly opt into `convrot: true`. This closes the historical fallback where a
-/// plain int8 file handed to the rotated entrypoint could inherit group size 256 and silently corrupt
-/// its weights.
-fn validate_convrot_descriptors(st: &MmapedSafetensors) -> Result<()> {
-    let descriptors: Vec<(String, ::safetensors::tensor::TensorView<'_>)> = st
-        .tensors()
-        .into_iter()
-        .filter(|(name, _)| name.ends_with(".comfy_quant"))
-        .collect();
-    if descriptors.is_empty() {
-        return Err(candle_gen::candle_core::Error::Msg(
-            "krea convrot: checkpoint has no `.comfy_quant` descriptor with `convrot: true`"
-                .to_owned(),
-        ));
-    }
-    for (descriptor_key, descriptor) in descriptors {
-        if descriptor.dtype() != ::safetensors::Dtype::U8 || descriptor.shape().len() != 1 {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea convrot: `{descriptor_key}` must be a rank-1 U8 JSON blob"
-            )));
-        }
-        let json: serde_json::Value =
-            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
-                serde_json::from_slice(bytes)
-            })
-            .map_err(|error| {
-                candle_gen::candle_core::Error::Msg(format!(
-                    "krea convrot: `{descriptor_key}` is not valid JSON: {error}"
-                ))
-            })?;
-        if json.get("format").and_then(serde_json::Value::as_str) != Some("int8_tensorwise")
-            || json.get("convrot").and_then(serde_json::Value::as_bool) != Some(true)
-        {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea convrot: `{descriptor_key}` must declare `format: int8_tensorwise` and \
-                 `convrot: true`"
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ===================================================================================================
 // INT8-ConvRot native-key remap (sc-9300)
 // ===================================================================================================
@@ -1361,7 +1072,7 @@ fn validate_convrot_descriptors(st: &MmapedSafetensors) -> Result<()> {
 // the canonical `to_q`), so reconstructing `X·Wᵀ` needs the matching **online activation rotation**
 // `RHT(x)` — the regular-Hadamard (group 256) leg from arXiv 2512.03673 (clean-room from the paper +
 // the `comfy_quant` descriptor). The ConvRot projection now applies it before the int8 IGEMM
-// ([`crate::quant::ConvRotInt8`]), lifting the render from the sc-9300 NO-GO's noise (PSNR ≈ 8 dB) to
+// ([`candle_gen::quant::convrot_int8::ConvRotLinear`]), lifting the render from the sc-9300 NO-GO's noise (PSNR ≈ 8 dB) to
 // coherent (verified cosine 0.99991 vs the f32 reference linear).
 
 /// Translate a **diffusers** tensor key to the **native-mmdit** key the INT8-ConvRot checkpoint stores.
@@ -1460,24 +1171,9 @@ pub(crate) fn detect_native_prefix_from_keys<'a>(
     }
 }
 
-/// The residency policy every planned single-file Krea import — the loader AND the memory
-/// contract that prices it — plans under (sc-20651; SC-22667 review).
-///
-/// The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the packed
-/// rows packed, everything else prices the dense fallback. Passing the real device (rather than a
-/// fixed policy) keeps the plan's pricing the pricing of *this* load.
-///
-/// The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
-/// `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal — so
-/// pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a plan this
-/// loader itself priced. Masked, an fp8 row takes the exact dense decode (`weight_scale` applied)
-/// through the shared reader on every host — which is why a memory contract must price an fp8 row
-/// at the DiT's dense width, never at its stored byte.
-///
-/// One definition for both callers is the point: pricing and loading cannot disagree about which
-/// rows stay packed, because that disagreement *is* the fit gate falsely admitting or rejecting.
+/// Device policy shared by native import pricing and projection construction.
 pub(crate) fn native_import_residency(device: &Device) -> CandleCodecResidency {
-    CandleCodecResidency::probe(device).with_dense_fp8()
+    CandleCodecResidency::probe(device)
 }
 
 /// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for
@@ -1573,49 +1269,34 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
     }
-    // (1.5) INT8-ConvRot (sc-9300 loader + sc-9601 rotation): a ConvRot checkpoint whose native
-    // `{base}.weight_scale` sibling is present → build a per-output-channel int8 projection from the
-    // stored int8 codes + row scale + the `convrot_groupsize` in the `comfy_quant` descriptor. Detect on
-    // the *native* base derived from the diffusers `{base}.weight` remap. The stored codes are the
-    // *rotated* weight `W·R`; the projection's forward applies the matching online `RHT(x)` so the GEMM
-    // reconstructs `X·Wᵀ` (the sc-9601 fix that makes this consume path render coherently).
-    if w.is_convrot() {
-        if let Some(native_weight) = convrot_diffusers_to_native(&weight_key) {
-            if let Some(native_base) = native_weight.strip_suffix(".weight") {
-                let scale_key = format!("{native_base}.weight_scale");
-                if w.contains_native(&scale_key) {
-                    let w_i8 = w.get_int8_codes(&weight_key)?; // raw I8 → I64 codes
-                    let scale = w
-                        .get_native_f32(&scale_key)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?;
-                    // The regular-Hadamard order the export rotated at (default 256 per the arXiv
-                    // 2512.03673 ConvRot default / this checkpoint) when the descriptor is absent.
-                    let group_size = w.get_convrot_groupsize(native_base).unwrap_or(256);
-                    let dense_bias = if bias {
-                        Some(w.get(&format!("{base}.bias"))?)
-                    } else {
-                        None
-                    };
-                    // Pass the model's resident COMPUTE device (where activations live), NOT
-                    // `w_i8.device()` — the codes are CPU-materialized here to save VRAM, but the int8
-                    // IGEMM leg must be built on the CUDA compute device (F-121 / sc-11208).
-                    //
-                    // `convrot_int8_in`, NOT `convrot_int8` (sc-12301): this runs once per int8
-                    // projection (~224 on a ConvRot DiT), and the private-handle constructor would give
-                    // each its own eager 32 MiB cuBLASLt workspace — ~7 GiB of duplicated scratch. The
-                    // weight set owns one shared handle for the whole trunk.
-                    return QLinear::convrot_int8_in(
-                        w_i8,
-                        scale,
-                        group_size,
-                        dense_bias,
-                        w.device(),
-                        w.int8_context()?,
-                    );
-                }
-            }
-        }
+    if w.logical
+        .as_ref()
+        .is_some_and(|r| r.has_native_projection(&weight_key))
+    {
+        let reader = w.logical.as_ref().expect("planned weight has a reader");
+        let projection = w
+            .read_source_unchanged(|| {
+                let bias = bias
+                    .then(|| {
+                        let key = format!("{base}.bias");
+                        if let Some(t) = w.overlay.get(&key) {
+                            let dtype = reader
+                                .projection_bias_dtype(&weight_key)
+                                .unwrap_or(w.dtype());
+                            return t.to_dtype(dtype)?.to_device(reader.device());
+                        }
+                        match reader.retained_projection_bias(&weight_key, &key, reader.device())? {
+                            Some(t) => Ok(t),
+                            None => w.get(&key)?.to_device(reader.device()),
+                        }
+                    })
+                    .transpose()?;
+                reader
+                    .native_projection(&weight_key, bias)
+                    .map_err(|e| Error::Msg(e.to_string()))
+            })?
+            .ok_or_else(|| Error::Msg(format!("{weight_key}: missing native projection")))?;
+        return Ok(QLinear::Adapt(projection));
     }
     // (2) A packed tier with a `.scales` sibling → transfer the prepared device-format artifact.
     if let (Some(_cfg), true) = (w.packed(), w.contains(&scales_key)) {
@@ -1660,6 +1341,12 @@ pub fn linear_detect_planned(
     bias: bool,
     plan: &DitPlan,
 ) -> Result<QLinear> {
+    if w.logical
+        .as_ref()
+        .is_some_and(|reader| reader.has_native_projection(&format!("{base}.weight")))
+    {
+        return linear_detect(w, base, bias);
+    }
     if !plan.is_nvfp4() {
         let inner = linear_detect(w, base, bias)?;
         return Ok(match plan.probe() {
@@ -1743,7 +1430,10 @@ pub fn linear_detect_planned(
                 let weight = weight.to_dtype(w.dtype())?;
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
-            LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedRowwiseFp8 { .. }
+            | LogicalTensor::PackedMxFp8 { .. }
+            | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "krea NVFP4: `{weight_key}` is planned as `{}` but the reader returned a \
                      packed fp8 container; the plan and reader disagree about this row's codec",
@@ -1900,6 +1590,47 @@ mod tests {
     const G: usize = 64;
 
     /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
+    #[test]
+    fn snapshot_directory_and_component_file_share_scaled_fp8_precision() -> Result<()> {
+        use ::safetensors::tensor::{serialize_to_file, Dtype as Stored, TensorView};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model.safetensors");
+        let codes = [0x38_u8; 16 * 16];
+        let scale = (1.0_f32 + 2.0_f32.powi(-9)).to_le_bytes();
+        serialize_to_file(
+            [
+                (
+                    "proj.weight",
+                    TensorView::new(Stored::F8_E4M3, vec![16, 16], &codes).unwrap(),
+                ),
+                (
+                    "proj.weight_scale",
+                    TensorView::new(Stored::F32, vec![], &scale).unwrap(),
+                ),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        for source in [
+            Weights::from_file(&path, &Device::Cpu, DType::F32)?,
+            Weights::from_dir(tmp.path(), &Device::Cpu, DType::F32)?,
+        ] {
+            assert_eq!(
+                source.planned("proj.weight").unwrap().codec_id,
+                candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id
+            );
+            assert_eq!(
+                source.get("proj.weight")?.flatten_all()?.to_vec1::<f32>()?,
+                vec![f32::from_le_bytes(scale); 256]
+            );
+            assert_eq!(source.get_f32("proj.weight")?.dtype(), DType::F32);
+            assert!(source.checkpoint_weight_facts()?.is_some());
+        }
+        Ok(())
+    }
+
     /// `planned(key)` is `None` for every key.
     fn unplanned_weights(tmp: &tempfile::TempDir, key: &str) -> Weights {
         let dev = Device::Cpu;
@@ -2603,7 +2334,15 @@ mod tests {
         let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw).unwrap();
         let scale_col = Tensor::from_vec(pc.scale.clone(), (out_dim, 1), &dev).unwrap();
         // On disk: I8 codes of W·R, F32 [out,1] weight_scale, U8 comfy_quant JSON descriptor.
-        let codes_i8 = pc.q.to_dtype(DType::I64).unwrap(); // safetensors save has no I8; I64 codes round-trip identically at the int8 stage
+        let signed =
+            pc.q.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v as i8 as u8)
+                .collect::<Vec<_>>();
+        let codes_i8 = Tensor::from_vec(signed, (out_dim, in_dim), &dev).unwrap();
         let cq = format!(
             "{{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": {CONVROT_G}}}"
         );
@@ -2628,6 +2367,50 @@ mod tests {
         safetensors::save(&tensors, path).unwrap();
     }
 
+    fn write_convrot_file(path: &Path, tensors: HashMap<String, Tensor>) {
+        // Candle has no I8 tensor type. Serialize the original byte patterns using the equal-width
+        // U8 carrier, then mark exactly the weight as I8 in the safetensors header.
+        write_single_file(path, tensors);
+        let mut bytes = std::fs::read(path).unwrap();
+        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header = &mut bytes[8..8 + n];
+        let mut data: serde_json::Value = serde_json::from_slice(header).unwrap();
+        let dtype = &mut data["blocks.0.attn.wq.weight"]["dtype"];
+        assert_eq!(dtype.as_str(), Some("U8"));
+        *dtype = serde_json::Value::String("I8".into());
+        let json = serde_json::to_vec(&data).unwrap();
+        header.fill(b' ');
+        header[..json.len()].copy_from_slice(&json);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    // The CPU test inspects a mixed plan and binds only its dense sibling. The actual CPU
+    // capability must refuse native ConvRot before materialization.
+    fn inspect_convrot_plan(path: &Path) -> Result<Weights> {
+        let error = Weights::from_convrot_file(path, &Device::Cpu, DType::F32)
+            .err()
+            .expect("CPU must refuse native ConvRot");
+        assert!(
+            error
+                .to_string()
+                .contains("requires native integer execution"),
+            "{error}"
+        );
+        let pinned = candle_gen::gen_core::PinnedWeightsFile::pin(path)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        Weights::from_pinned_native_file_with_residency(
+            &pinned,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::NotInScope,
+            CandleCodecResidency {
+                fp8_e4m3_native: true,
+                ..CandleCodecResidency::DENSE
+            },
+            false,
+        )
+    }
+
     /// **ConvRot detect fires on the native int8 layout and the online rotation reconstructs the
     /// canonical weight (sc-9300 loader + sc-9601 rotation).** `linear_detect(w, "…attn.to_q", …)` on a
     /// ConvRot checkpoint must resolve to the native `blocks.0.attn.wq`, see its `weight_scale` sibling,
@@ -2637,13 +2420,13 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_detect_fires_and_reconstructs_canonical_weight() -> Result<()> {
-        let dev = Device::Cpu;
+        let dev = Device::new_cuda(0)?;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (map, ref_w) = convrot_int8_weight(out_dim, in_dim);
 
         let path_tmp = tempfile::tempdir().unwrap();
         let path = path_tmp.path().join("krea2_int8_convrot.safetensors");
-        write_single_file(&path, map);
+        write_convrot_file(&path, map);
 
         let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
         assert!(w.is_convrot(), "from_convrot_file ⇒ convrot mode");
@@ -2659,7 +2442,7 @@ mod tests {
         // Without the rotation this would be ~0.1 (the sc-9300 NO-GO); the sc-9601 leg lifts it to ~1.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let got = lin.forward(&x)?.to_dtype(DType::F32)?;
-        let want = __model_proof_output!(Linear::new(ref_w, None).forward(&x))?;
+        let want = __model_proof_output!(Linear::new(ref_w.to_device(&dev)?, None).forward(&x))?;
         let cos = tensor_cosine(&got, &want);
         assert!(
             cos > 0.99,
@@ -2704,8 +2487,8 @@ mod tests {
         );
         let path_tmp = tempfile::tempdir().unwrap();
         let path = path_tmp.path().join("m.safetensors");
-        write_single_file(&path, map);
-        let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
+        write_convrot_file(&path, map);
+        let w = inspect_convrot_plan(&path)?;
 
         // The dense native norm resolves through the diffusers key `norm1.weight` → `prenorm.scale`.
         let normw = w.get("transformer_blocks.0.norm1.weight")?;
@@ -4032,6 +3815,7 @@ mod tests {
         let sm120 = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
 
         let cases: [(
@@ -4351,8 +4135,8 @@ mod tests {
         let (cmap, _ref) = convrot_int8_weight(out_dim, in_dim);
         let cpath_tmp = tempfile::tempdir().unwrap();
         let cpath = cpath_tmp.path().join("convrot.safetensors");
-        write_single_file(&cpath, cmap);
-        let convrot = Weights::from_convrot_file(&cpath, &dev, DType::F32)?;
+        write_convrot_file(&cpath, cmap);
+        let convrot = inspect_convrot_plan(&cpath)?;
         assert!(convrot.uses_native_keys());
         assert!(convrot.is_convrot(), "INT8-ConvRot ⇒ rotation ON");
 

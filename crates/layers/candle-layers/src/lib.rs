@@ -63,6 +63,12 @@ pub trait CandleWeightSource {
     /// Load or fetch a required tensor by exact key.
     fn require(&self, key: &str) -> Result<Tensor>;
 
+    /// Construct an immutable source-backed matrix before considering raw or affine weights.
+    fn native_linear(&self, base: &str, bias: bool) -> Result<Option<candle_nn::Linear>>;
+
+    /// Model-local resources shared across native projection constructors.
+    fn projection_resources(&self) -> &candle_quant_kernels::convrot_int8::ProjectionResources;
+
     /// Optional final execution device for host-staged packed weights.
     fn host_packed_target(&self) -> Option<&Device>;
 

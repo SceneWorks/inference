@@ -212,3 +212,27 @@ mod explicit_registry_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod checkpoint_registry {
+    #[test]
+    fn every_registered_text_provider_has_a_checkpoint_constructor() {
+        let actual = super::local_text_registry()
+            .unwrap()
+            .registrations()
+            .map(|r| (r.descriptor)().id)
+            .collect::<std::collections::BTreeSet<_>>();
+        // CausalLm and Qwen35, LLaVA/SigLIP, GPTBigCode/CLIP and StarCoder2 each build their
+        // decoder and multimodal matrices through source-aware Weights.
+        let covered = [
+            super::provider::PROVIDER_ID,
+            super::llava::PROVIDER_ID,
+            super::starvector::PROVIDER_ID,
+            super::starvector_8b::PROVIDER_ID,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(actual, covered);
+    }
+}

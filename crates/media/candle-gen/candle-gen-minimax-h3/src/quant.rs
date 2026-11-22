@@ -192,9 +192,33 @@ pub fn lin(
     bias: bool,
     dtype: DType,
 ) -> Result<TieredLinear> {
+    lin_shaped(w, component, base, bias, dtype, None)
+}
+
+pub(crate) fn lin_shaped(
+    w: &Weights,
+    component: &str,
+    base: &str,
+    bias: bool,
+    dtype: DType,
+    shape: Option<(usize, usize)>,
+) -> Result<TieredLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
+
+    if let Some(layer) = w.native_linear_shaped(base, bias, shape, dtype)? {
+        let (out, inp) = layer.weight_dims()?;
+        let bytes = match layer.native_resident_bytes() {
+            Some(bytes) => bytes as usize,
+            None => dense_bytes(layer.try_weight()?),
+        };
+        let base_bytes = bytes + layer.bias().map(dense_bytes).unwrap_or(0);
+        return Ok(TieredLinear {
+            linear: AdaptLinear::from_dense(layer, inp, out),
+            base_bytes,
+        });
+    }
 
     if let Some(native) = candle_gen::quant::W4A8Linear::from_weights(w, base, bias)? {
         let base_bytes = native.resident_bytes()
@@ -310,6 +334,15 @@ pub struct TieredEmbedding {
 /// host row source and has no long-lived device table; its transient work is bounded by distinct
 /// prompt tokens, and conditioning runs **once per render**, not once per step.
 pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
+    embed_shaped(w, base, dtype, None)
+}
+
+pub(crate) fn embed_shaped(
+    w: &Weights,
+    base: &str,
+    dtype: DType,
+    shape: Option<(usize, usize)>,
+) -> Result<TieredEmbedding> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
 
@@ -348,7 +381,7 @@ pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
         });
     }
 
-    let weight = w.require(&weight_key)?.to_dtype(dtype)?;
+    let weight = w.read_dense_with_shape(&weight_key, shape, dtype)?;
     let (_vocab, hidden) = weight.dims2()?;
     let base_bytes = dense_bytes(&weight);
     Ok(TieredEmbedding {

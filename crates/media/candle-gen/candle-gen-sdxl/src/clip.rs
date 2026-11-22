@@ -26,6 +26,7 @@
 //! today, but the seam repacks at whatever the component `config.json` declares.
 
 use candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::quant::ComponentFold;
 use candle_nn as nn;
 use candle_nn::{Module, VarBuilder};
 
@@ -251,7 +252,7 @@ impl ClipAttention {
             &mut self.v_proj,
             &mut self.out_proj,
         ] {
-            projection.quantize_dequant_onto(quant, device)?;
+            projection.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         }
         Ok(())
     }
@@ -305,8 +306,10 @@ impl ClipMlp {
     }
 
     fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
-        self.fc1.quantize_dequant_onto(quant, device)?;
-        self.fc2.quantize_dequant_onto(quant, device)
+        self.fc1
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.fc2
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))
     }
 
     #[cfg(test)]

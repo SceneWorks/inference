@@ -128,7 +128,7 @@ impl MiniMaxH3ImageDit {
         cfg.validate()?;
         let stream = DitBlockStream::new(dir, dtype, cfg.base.clone())?;
         let (projections, refiner, unverified) = {
-            let mut w = Weights::from_dir(dir)?;
+            let mut w = crate::dit::heads::open_dit_weights(dir)?;
             let projections = ImageDitProjections::from_weights(&mut w, &cfg)?;
             let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg.base, dtype)?;
             // Only the head tensors were read, so only the `head` group is populated.
@@ -193,7 +193,7 @@ impl MiniMaxH3ImageDit {
     pub fn load_dir(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
         let dir = dir.as_ref();
         let cfg = Self::read_config(dir)?;
-        let mut w = Weights::from_dir(dir)?;
+        let mut w = crate::dit::heads::open_dit_weights(dir)?;
         Self::from_weights(&mut w, &cfg, dtype)
     }
 
@@ -204,7 +204,7 @@ impl MiniMaxH3ImageDit {
     pub(crate) fn load_dir_materialized(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
         let dir = dir.as_ref();
         let cfg = Self::read_config(dir)?;
-        let mut w = Weights::from_dir(dir)?;
+        let mut w = crate::dit::heads::open_dit_weights(dir)?;
         let dit = Self::from_weights(&mut w, &cfg, dtype)?;
         w.materialize_accessed()?;
         Ok(dit)

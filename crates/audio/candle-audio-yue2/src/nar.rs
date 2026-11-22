@@ -290,7 +290,7 @@ impl Yue2Nar {
     pub(crate) fn from_var_builder(
         config: Yue2Config,
         nar: NarConfig,
-        vb: VarBuilder,
+        vb: VarBuilder<'static>,
         weights_sha256: String,
     ) -> gen_core::Result<Self> {
         Self::from_loader(

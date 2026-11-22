@@ -80,10 +80,14 @@ pub const NVFP4_PAD: usize = 16;
 pub enum ComfyQuantFormat {
     /// `int8_tensorwise` with `per_row: true` — int8 codes + per-output-row f32 scale.
     Int8TensorwisePerRow,
+    /// Rotated I8 codes with online input rotation and dynamic activation quantization.
+    ConvRotInt8,
     /// `float8_e4m3fn` — fp8 E4M3FN values + one per-tensor f32 scale.
     Float8E4M3Fn,
     /// `float8_e5m2` — fp8 E5M2 values + one per-tensor f32 scale.
     Float8E5M2,
+    /// Publisher E4M3 rows calibrated by one F32 scale per output.
+    Fp8Rowwise,
     /// `mxfp8` — fp8 E4M3FN values + E8M0 shared exponents per 32-element block along the last axis.
     Mxfp8,
     /// `nvfp4` — E2M1 nibbles (two per `U8` byte) + one FP8 E4M3 micro-scale per 16-element block
@@ -95,8 +99,9 @@ impl ComfyQuantFormat {
     /// The exact `format` string ComfyUI writes.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Int8TensorwisePerRow => "int8_tensorwise",
+            Self::Int8TensorwisePerRow | Self::ConvRotInt8 => "int8_tensorwise",
             Self::Float8E4M3Fn => "float8_e4m3fn",
+            Self::Fp8Rowwise => "fp8r",
             Self::Float8E5M2 => "float8_e5m2",
             Self::Mxfp8 => "mxfp8",
             Self::Nvfp4 => "nvfp4",
@@ -107,6 +112,7 @@ impl ComfyQuantFormat {
         Some(match name {
             "int8_tensorwise" => Self::Int8TensorwisePerRow,
             "float8_e4m3fn" => Self::Float8E4M3Fn,
+            "fp8r" => Self::Fp8Rowwise,
             "float8_e5m2" => Self::Float8E5M2,
             "mxfp8" => Self::Mxfp8,
             "nvfp4" => Self::Nvfp4,
@@ -124,6 +130,8 @@ impl fmt::Display for ComfyQuantFormat {
 /// A validated `.comfy_quant` descriptor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComfyQuantDescriptor {
+    /// Hadamard group width for a rotated INT8 projection.
+    pub rotation_group: Option<usize>,
     pub format: ComfyQuantFormat,
     /// ComfyUI's per-layer "dequantize and multiply in full precision" flag: the layer keeps its
     /// packed storage but never takes a quantized matmul. A codec plan treats it as "dense fallback
@@ -153,8 +161,7 @@ pub enum ComfyQuantDescriptorError {
     UnsupportedFormat {
         format: String,
     },
-    /// `convrot` present: the rotated INT8 convention belongs to the Candle ConvRot loader, not the
-    /// plain per-row arm, and must not be dequantized as if unrotated.
+    /// Malformed or contradictory rotation metadata.
     ConvRot,
     /// `int8_tensorwise` without `per_row: true` (the only int8 layout either backend decodes).
     Int8NotPerRow,
@@ -199,11 +206,7 @@ impl fmt::Display for ComfyQuantDescriptorError {
                 "descriptor format {format:?} has no registered codec on this workspace (known: \
                  int8_tensorwise, float8_e4m3fn, float8_e5m2, mxfp8, nvfp4)"
             ),
-            Self::ConvRot => write!(
-                f,
-                "descriptor carries `convrot`; rotated int8 checkpoints are not the plain per-row \
-                 format"
-            ),
+            Self::ConvRot => write!(f, "INT8 ConvRot requires convrot: true, convrot_groupsize 64 or 256, per_row omitted or true, and native matrix multiplication"),
             Self::Int8NotPerRow => write!(
                 f,
                 "descriptor format `int8_tensorwise` must declare `per_row: true`"
@@ -247,12 +250,18 @@ impl std::error::Error for ComfyQuantDescriptorError {}
 pub fn parse_comfy_quant_descriptor(
     bytes: &[u8],
 ) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
+    parse_descriptor_with_geometry(bytes, false)
+}
+pub(crate) fn parse_descriptor_with_geometry(
+    bytes: &[u8],
+    legacy: bool,
+) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ComfyQuantDescriptorError::NotUtf8)?;
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|error| ComfyQuantDescriptorError::NotJson {
             detail: error.to_string(),
         })?;
-    descriptor_from_json(&json)
+    parse_partial_geometry(&json, legacy)?.into_complete()
 }
 
 /// One layer descriptor as *declared*, before the completeness rules that only a standalone
@@ -280,6 +289,8 @@ pub fn parse_comfy_quant_descriptor(
 ///   (the ComfyUI Kitchen NVFP4 converters' form, sc-20641).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialComfyQuantDescriptor {
+    pub convrot: Option<bool>,
+    pub rotation_group: Option<usize>,
     pub format: ComfyQuantFormat,
     pub full_precision_matrix_mult: Option<bool>,
     /// Only meaningful for `int8_tensorwise`; `None` everywhere else (the key is refused as an
@@ -296,11 +307,26 @@ impl PartialComfyQuantDescriptor {
     /// descriptor: today that is int8's `per_row: true`, the only int8 layout either backend
     /// decodes. Absent optional fields take their ComfyUI defaults.
     pub fn into_complete(self) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
-        if self.format == ComfyQuantFormat::Int8TensorwisePerRow && self.per_row != Some(true) {
-            return Err(ComfyQuantDescriptorError::Int8NotPerRow);
-        }
+        let format = if self.convrot == Some(true) {
+            if self.rotation_group.is_none()
+                || self.per_row == Some(false)
+                || self.full_precision_matrix_mult == Some(true)
+            {
+                return Err(ComfyQuantDescriptorError::ConvRot);
+            }
+            ComfyQuantFormat::ConvRotInt8
+        } else {
+            if self.rotation_group.is_some() {
+                return Err(ComfyQuantDescriptorError::ConvRot);
+            }
+            if self.format == ComfyQuantFormat::Int8TensorwisePerRow && self.per_row != Some(true) {
+                return Err(ComfyQuantDescriptorError::Int8NotPerRow);
+            }
+            self.format
+        };
         Ok(ComfyQuantDescriptor {
-            format: self.format,
+            format,
+            rotation_group: self.rotation_group,
             full_precision_matrix_mult: self.full_precision_matrix_mult.unwrap_or(false),
             orig_shape: self.orig_shape,
         })
@@ -312,8 +338,17 @@ impl PartialComfyQuantDescriptor {
     /// are consistent and the authoritative one stands.
     pub fn disagreement_with(&self, tensor: &ComfyQuantDescriptor) -> Vec<&'static str> {
         let mut disagreement = Vec::new();
-        if self.format != tensor.format {
+        if self.format.as_str() != tensor.format.as_str() {
             disagreement.push("format");
+        }
+        if self
+            .convrot
+            .is_some_and(|flag| flag != (tensor.format == ComfyQuantFormat::ConvRotInt8))
+        {
+            disagreement.push("convrot");
+        }
+        if self.rotation_group.is_some() && self.rotation_group != tensor.rotation_group {
+            disagreement.push("convrot_groupsize");
         }
         if self
             .full_precision_matrix_mult
@@ -324,7 +359,12 @@ impl PartialComfyQuantDescriptor {
         // `per_row` does not survive into `ComfyQuantDescriptor` — the int8 format variant *is* the
         // per-row layout — so a declared `per_row: false` on an int8 layer contradicts the
         // authoritative blob just as surely as a format mismatch would.
-        if self.per_row == Some(false) && tensor.format == ComfyQuantFormat::Int8TensorwisePerRow {
+        if self.per_row == Some(false)
+            && matches!(
+                tensor.format,
+                ComfyQuantFormat::Int8TensorwisePerRow | ComfyQuantFormat::ConvRotInt8
+            )
+        {
             disagreement.push("per_row");
         }
         // Two block-scaled declarations of the same layer that name different pre-quantization
@@ -349,6 +389,12 @@ impl fmt::Display for PartialComfyQuantDescriptor {
         let mut declared = Vec::new();
         if let Some(flag) = self.full_precision_matrix_mult {
             declared.push(format!("full_precision_matrix_mult={flag}"));
+        }
+        if let Some(flag) = self.convrot {
+            declared.push(format!("convrot={flag}"));
+        }
+        if let Some(group) = self.rotation_group {
+            declared.push(format!("convrot_groupsize={group}"));
         }
         if let Some(flag) = self.per_row {
             declared.push(format!("per_row={flag}"));
@@ -382,6 +428,12 @@ pub fn descriptor_from_json(
 pub fn partial_descriptor_from_json(
     json: &serde_json::Value,
 ) -> Result<PartialComfyQuantDescriptor, ComfyQuantDescriptorError> {
+    parse_partial_geometry(json, false)
+}
+fn parse_partial_geometry(
+    json: &serde_json::Value,
+    legacy: bool,
+) -> Result<PartialComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let object = json
         .as_object()
         .ok_or(ComfyQuantDescriptorError::NotAnObject)?;
@@ -389,14 +441,36 @@ pub fn partial_descriptor_from_json(
         .get("format")
         .and_then(serde_json::Value::as_str)
         .ok_or(ComfyQuantDescriptorError::MissingFormat)?;
-    if object.contains_key("convrot") || object.contains_key("convrot_groupsize") {
-        return Err(ComfyQuantDescriptorError::ConvRot);
-    }
     let format = ComfyQuantFormat::parse(format).ok_or_else(|| {
         ComfyQuantDescriptorError::UnsupportedFormat {
             format: format.to_owned(),
         }
     })?;
+    let int8 = format == ComfyQuantFormat::Int8TensorwisePerRow;
+    let convrot = object
+        .get("convrot")
+        .map(|v| {
+            v.as_bool()
+                .ok_or(ComfyQuantDescriptorError::NonBooleanField { field: "convrot" })
+        })
+        .transpose()?;
+    let rotation_group = object
+        .get("convrot_groupsize")
+        .map(|v| match v.as_u64() {
+            Some(group)
+                if matches!(group, 64 | 256)
+                    || legacy
+                        && group.is_power_of_two()
+                        && group.trailing_zeros().is_multiple_of(2) =>
+            {
+                usize::try_from(group).map_err(|_| ComfyQuantDescriptorError::ConvRot)
+            }
+            _ => Err(ComfyQuantDescriptorError::ConvRot),
+        })
+        .transpose()?;
+    if !int8 && (convrot.is_some() || rotation_group.is_some()) {
+        return Err(ComfyQuantDescriptorError::ConvRot);
+    }
     let full_precision_matrix_mult = match object.get("full_precision_matrix_mult") {
         None => None,
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
@@ -407,6 +481,7 @@ pub fn partial_descriptor_from_json(
         }
     };
     let per_row = match object.get("per_row") {
+        None if legacy && convrot == Some(true) => Some(true),
         None => None,
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => return Err(ComfyQuantDescriptorError::NonBooleanField { field: "per_row" }),
@@ -467,7 +542,7 @@ pub fn partial_descriptor_from_json(
     };
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
-            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow)
+            || (matches!(key.as_str(), "per_row" | "convrot" | "convrot_groupsize") && int8)
             || key == "group_size"
             || (matches!(key.as_str(), "orig_dtype" | "orig_shape") && block_scaled);
         if !known {
@@ -475,6 +550,8 @@ pub fn partial_descriptor_from_json(
         }
     }
     Ok(PartialComfyQuantDescriptor {
+        convrot,
+        rotation_group,
         format,
         full_precision_matrix_mult,
         per_row,
@@ -561,6 +638,24 @@ impl std::error::Error for QuantizationMetadataError {}
 pub fn parse_quantization_metadata(
     payload: &str,
 ) -> Result<BTreeMap<String, PartialComfyQuantDescriptor>, QuantizationMetadataError> {
+    let layers = quantization_metadata_layers(payload)?;
+    let mut table = BTreeMap::new();
+    for (layer, value) in layers {
+        let descriptor = partial_descriptor_from_json(&value).map_err(|defect| {
+            QuantizationMetadataError::Layer {
+                layer: layer.clone(),
+                defect,
+            }
+        })?;
+        table.insert(layer, descriptor);
+    }
+    Ok(table)
+}
+
+/// Validate the complete table namespace before a component selects its codec-owned entries.
+pub(crate) fn quantization_metadata_layers(
+    payload: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, QuantizationMetadataError> {
     let json: serde_json::Value =
         serde_json::from_str(payload).map_err(|error| QuantizationMetadataError::NotJson {
             detail: error.to_string(),
@@ -593,17 +688,7 @@ pub fn parse_quantization_metadata(
     if layers.is_empty() {
         return Err(QuantizationMetadataError::NoLayers);
     }
-    let mut table = BTreeMap::new();
-    for (layer, value) in layers {
-        let descriptor = partial_descriptor_from_json(value).map_err(|defect| {
-            QuantizationMetadataError::Layer {
-                layer: layer.clone(),
-                defect,
-            }
-        })?;
-        table.insert(layer.clone(), descriptor);
-    }
-    Ok(table)
+    Ok(layers.clone())
 }
 
 // =================================================================================================
@@ -741,6 +826,46 @@ pub fn mxfp8_scale_shape(stored: [usize; 2]) -> [usize; 2] {
 /// stored_cols / 32`).
 pub fn mxfp8_swizzled_scale_index(stored: [usize; 2], row: usize, block: usize) -> usize {
     blocked_scale_index(stored[0], stored[1] / MXFP8_BLOCK, row, block)
+}
+
+/// Reorder complete output rows of an MXFP8 scale plane. Both planes use the producer's
+/// 128-by-4 scale swizzle; unused cells in the new plane receive E8M0 unit scale (127).
+pub fn remap_mxfp8_scales(
+    source: &[u8],
+    stored: [usize; 2],
+    source_rows: &[usize],
+) -> Result<Vec<u8>, String> {
+    if stored.contains(&0)
+        || !stored.iter().all(|n| n.is_multiple_of(MXFP8_PAD))
+        || source_rows.is_empty()
+    {
+        return Err("MXFP8 row remap requires a nonempty 32-aligned stored matrix".into());
+    }
+    let blocks = stored[1] / MXFP8_BLOCK;
+    let plane_bytes = |rows: usize| -> Option<usize> {
+        let rows = rows
+            .div_ceil(MXFP8_SCALE_ROW_TILE)
+            .checked_mul(MXFP8_SCALE_ROW_TILE)?;
+        let cols = blocks
+            .div_ceil(MXFP8_SCALE_COL_TILE)
+            .checked_mul(MXFP8_SCALE_COL_TILE)?;
+        rows.checked_mul(cols)
+    };
+    if plane_bytes(stored[0]) != Some(source.len()) || source_rows.iter().any(|&r| r >= stored[0]) {
+        return Err("MXFP8 row remap scale size or source row outside stored geometry".into());
+    }
+    let bytes = plane_bytes(source_rows.len()).ok_or("MXFP8 destination plane size overflow")?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes)
+        .map_err(|e| format!("MXFP8 scale plane: {e}"))?;
+    out.resize(bytes, 127);
+    for (dest, &src) in source_rows.iter().enumerate() {
+        for block in 0..blocks {
+            out[blocked_scale_index(source_rows.len(), blocks, dest, block)] =
+                source[blocked_scale_index(stored[0], blocks, src, block)];
+        }
+    }
+    Ok(out)
 }
 
 /// Why an MXFP8 layer's geometry is not decodable.
@@ -1305,6 +1430,30 @@ mod tests {
     }
 
     #[test]
+    fn mx_remap_copies_swizzled_scale_bytes_across_both_tile_axes() {
+        let stored = [160, 192];
+        let mut source = vec![255; mxfp8_scale_shape(stored).iter().product()];
+        for r in 0..160 {
+            for b in 0..6 {
+                source[mxfp8_swizzled_scale_index(stored, r, b)] = (r + 13 * b) as u8;
+            }
+        }
+        let rows = [155, 1, 129, 0, 64, 128, 63, 32, 31, 159, 0];
+        let out = remap_mxfp8_scales(&source, stored, &rows).unwrap();
+        for (r, &s) in rows.iter().enumerate() {
+            for b in 0..6 {
+                assert_eq!(
+                    out[mxfp8_swizzled_scale_index([32, 192], r, b)],
+                    (s + 13 * b) as u8
+                );
+            }
+        }
+        assert_eq!(out[mxfp8_swizzled_scale_index([32, 192], 20, 5)], 127);
+        assert!(remap_mxfp8_scales(&source[1..], stored, &rows).is_err());
+        assert!(remap_mxfp8_scales(&source, stored, &[160]).is_err());
+        assert!(remap_mxfp8_scales(&source, [160, 191], &rows).is_err());
+    }
+    #[test]
     fn e4m3fn_decoder_matches_the_spec_for_all_256_codes_and_the_canonical_table() {
         for code in 0..=255_u8 {
             assert!(
@@ -1395,6 +1544,7 @@ mod tests {
         assert_eq!(
             parse_comfy_quant_descriptor(br#"{"format": "float8_e4m3fn"}"#),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E4M3Fn,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
@@ -1405,6 +1555,7 @@ mod tests {
                 br#"{"format": "float8_e5m2", "full_precision_matrix_mult": true}"#
             ),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Float8E5M2,
                 full_precision_matrix_mult: true,
                 orig_shape: None,
@@ -1825,6 +1976,8 @@ mod tests {
             // Declared fields only (sc-20651): an entry that says nothing about
             // `full_precision_matrix_mult` must stay distinguishable from one that declares `false`.
             PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: None,
                 per_row: None,
@@ -1839,6 +1992,7 @@ mod tests {
         assert_eq!(
             table["blocks.0.attn.wq"].clone().into_complete(),
             Ok(ComfyQuantDescriptor {
+                rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: false,
                 orig_shape: None,
@@ -1853,6 +2007,8 @@ mod tests {
         assert_eq!(
             int8["q"],
             PartialComfyQuantDescriptor {
+                convrot: None,
+                rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: None,

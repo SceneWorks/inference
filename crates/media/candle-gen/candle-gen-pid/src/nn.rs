@@ -17,14 +17,7 @@ use candle_gen::{Result, Weights};
 /// checkpoints store torch `[out, in]` weights, which candle's `Linear` consumes directly (it applies
 /// `x · Wᵀ`) — no transpose, unlike the MLX port's NHWC conv weights.
 pub fn linear(w: &Weights, prefix: &str) -> Result<Linear> {
-    let weight = w.require(&format!("{prefix}.weight"))?;
-    let bias_key = format!("{prefix}.bias");
-    let bias = if w.contains(&bias_key) {
-        Some(w.require(&bias_key)?)
-    } else {
-        None
-    };
-    Ok(Linear::new(weight, bias))
+    w.linear(prefix, w.contains(&format!("{prefix}.bias")))
 }
 
 /// `x · rsqrt(mean(x²)+eps) · weight` over the last axis (all in f32). Mirrors the MLX `rms`

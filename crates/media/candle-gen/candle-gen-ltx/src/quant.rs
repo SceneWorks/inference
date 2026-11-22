@@ -57,13 +57,9 @@
 //! with **synthetic** packed fixtures built on the **real** AvDiT block-0 key layout the hf-header audit
 //! captured — they prove the packed-detect seam fires on that layout, not that a real tier was ingested.
 
-use std::sync::OnceLock;
-
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
 use candle_gen::quant as shared;
-#[cfg(feature = "cuda")]
-use candle_gen::quant::Int8Linear;
 use candle_gen::quant::{ActPrecision, LokrFactors, Nvfp4Linear, Nvfp4Regime};
 use candle_gen::train::lora::LoraLinear;
 
@@ -81,7 +77,7 @@ pub const GROUP_SIZE: usize = shared::MLX_GROUP_SIZE; // 64
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 enum QLinearBase {
     Adapt(LoraLinear),
-    ConvRot(ConvRotLinear),
+    ConvRot(Linear),
     Nvfp4(Nvfp4Linear),
 }
 
@@ -94,37 +90,6 @@ pub struct QLinear {
     out_features: usize,
     attestation: String,
     bounded_packed_training: bool,
-}
-
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-struct ConvRotLinear {
-    group_size: usize,
-    rotation: OnceLock<Tensor>,
-    #[cfg(feature = "cuda")]
-    linear: Int8Linear,
-}
-
-impl ConvRotLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            let rotation = if let Some(rotation) = self.rotation.get() {
-                rotation
-            } else {
-                let rotation = shared::regular_hadamard(self.group_size, x.device())?;
-                self.rotation.get_or_init(|| rotation)
-            };
-            let rotated = shared::convrot_rotate(x, rotation)?;
-            __model_proof_output!(self.linear.forward(&rotated))
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = x;
-            candle_gen::candle_core::bail!(
-                "LTX INT8-ConvRot has no dense CPU fallback; build with cuda and run its IGEMM operator"
-            )
-        }
-    }
 }
 
 impl QLinear {
@@ -156,6 +121,29 @@ impl QLinear {
 
     pub fn operator_kind(&self) -> AdvancedOperatorKind {
         match &self.base {
+            QLinearBase::Adapt(_)
+                if self.attestation == candle_gen::gen_core::convrot_int8::CODEC_ID =>
+            {
+                AdvancedOperatorKind::Int8ConvRotIgemm
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::Fp8E4M3
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::Fp8E5M2
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::MXFP8_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::MxFp8
+            }
             QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
             QLinearBase::Adapt(_) => AdvancedOperatorKind::Dense,
             QLinearBase::ConvRot(_) => AdvancedOperatorKind::Int8ConvRotIgemm,
@@ -279,56 +267,33 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
     let path = vb.pp(key).prefix();
     if let Some(source) = active_source() {
         if source.is_advanced_projection(&path) {
-            let bias_tensor = if bias {
-                Some(
-                    vb.get_unchecked(&format!("{key}.bias"))?
-                        .to_dtype(vb.dtype())?,
-                )
-            } else {
-                None
+            let load_bias = |dtype| {
+                bias.then(|| vb.get_unchecked_dtype(&format!("{key}.bias"), dtype))
+                    .transpose()
             };
             let loaded = source.load_projection(&path, vb.device())?;
             let (base, in_features, out_features, attestation) = match loaded {
-                crate::advanced_quant::LoadedAdvancedProjection::Int8ConvRot {
-                    codes,
-                    scale,
-                    group_size,
-                    context,
-                    attestation,
-                } => {
-                    if !vb.device().is_cuda() || !context.is_int8() {
+                crate::advanced_quant::LoadedAdvancedProjection::Int8ConvRot { attestation } => {
+                    let operand = vb
+                        .native_linear_weight(&format!("{key}.weight"))?
+                        .ok_or_else(|| {
+                            candle_gen::candle_core::Error::Msg(format!(
+                                "LTX ConvRot {path} requires a native IGEMM weight"
+                            ))
+                        })?;
+                    if operand.format_id() != candle_gen::gen_core::convrot_int8::CODEC_ID {
                         candle_gen::candle_core::bail!(
-                            "LTX INT8-ConvRot projection `{path}` requires a live CUDA cuBLASLt IGEMM context; dense fallback is forbidden"
+                            "LTX {path}: incompatible native projection"
                         );
                     }
-                    let (out_features, in_features) = codes.dims2()?;
-                    #[cfg(feature = "cuda")]
-                    let linear = Int8Linear::from_per_channel_parts(
-                        codes,
-                        scale,
-                        bias_tensor,
-                        context.handle_for(vb.device())?.clone(),
-                    )?;
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        let _ = (codes, scale, bias_tensor, context);
-                        candle_gen::candle_core::bail!(
-                            "LTX INT8-ConvRot requires a cuda-enabled executable"
-                        );
-                    }
-                    #[cfg(feature = "cuda")]
-                    {
-                        (
-                            QLinearBase::ConvRot(ConvRotLinear {
-                                group_size,
-                                rotation: OnceLock::new(),
-                                linear,
-                            }),
-                            in_features,
-                            out_features,
-                            attestation,
-                        )
-                    }
+                    let (out_features, in_features) = operand.dims();
+                    let bias = load_bias(operand.checkpoint_bias_dtype().unwrap_or(vb.dtype()))?;
+                    (
+                        QLinearBase::ConvRot(Linear::from_native(operand, bias)),
+                        in_features,
+                        out_features,
+                        attestation,
+                    )
                 }
                 crate::advanced_quant::LoadedAdvancedProjection::Nvfp4 {
                     packed,
@@ -339,7 +304,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
                     let in_features = packed.cols;
                     let linear = Nvfp4Linear::from_packed_in(
                         packed,
-                        bias_tensor,
+                        load_bias(vb.dtype())?,
                         vb.device(),
                         ActPrecision::W4A4,
                         &context,
@@ -368,6 +333,32 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             });
         }
         source.refuse_undeclared_advanced_tensor(&path)?;
+    }
+    if let Some(native) = vb.native_linear_weight(&format!("{key}.weight"))? {
+        let (out_features, in_features) = native.dims();
+        let attestation = native.format_id().to_owned();
+        let b = bias
+            .then(|| {
+                vb.get_unchecked_dtype(
+                    &format!("{key}.bias"),
+                    native.checkpoint_bias_dtype().unwrap_or(vb.dtype()),
+                )
+            })
+            .transpose()?;
+        let layer = Linear::from_native(native, b);
+        return Ok(QLinear {
+            base: QLinearBase::Adapt(LoraLinear::from_linear(
+                layer,
+                in_features,
+                out_features,
+                path.clone(),
+            )),
+            path,
+            in_features,
+            out_features,
+            attestation,
+            bounded_packed_training: false,
+        });
     }
     let scales_key = format!("{key}.scales");
     if vb.contains_tensor(&scales_key) {

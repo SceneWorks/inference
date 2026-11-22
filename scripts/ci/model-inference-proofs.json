@@ -17929,6 +17929,65 @@
     }
   },
   {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+    "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16; fixed generated E4M3/E5M2, calibrated scalar, rowwise and swizzled MXFP8 source matrices; identity, output dtype and additive rank-one adapter assertions",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
+    "required_environment": [],
+    "device_witness": "Successful source-backed Linear and adapted projection outputs observed on the selected CUDA device before exact independent coefficient comparisons",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16/fixed_cuda",
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-anima",
     "target": "candle_gen_anima",
     "target_kind": "lib",
@@ -28371,7 +28430,7 @@
     "package": "candle-gen-flux2",
     "target": "candle_gen_flux2",
     "target_kind": "lib",
-    "fqn": "single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+    "fqn": "single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
     "source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux2",
@@ -28390,8 +28449,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux2 projection/DiT/caption/vision/control models and fitted RGB preview tensors; crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+    "fixture_identity": "CPU tiny Flux2 projection/DiT/caption/vision/control models and fitted RGB preview tensors; crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -28399,7 +28458,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -28417,7 +28476,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
       "requirements": []
     }
   },
@@ -44323,35 +44382,39 @@
       ]
     },
     "execution_role": "direct",
-    "backend": "candle-cpu",
+    "backend": "candle-cuda",
     "expected_devices": [
-      "candle-cpu"
+      "candle-cuda"
     ],
     "cargo_features": [
+      "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight",
+    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight; Synthetic 64x128 F32 canonical weight, G64 online rotation, file-backed signed INT8 codes and per-row scales; CUDA normal and control projection forwards against the canonical CUDA dense reference (cosine > 0.99 for both)",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
-    "default_configuration": "fixed_cpu",
+    "default_configuration": "fixed_cuda",
     "configurations": {
-      "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight/fixed_cpu",
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight/fixed_cuda",
         "environment": {},
         "cargo_features": [
+          "cuda",
           "model-inference-proof"
         ],
-        "backend": "candle-cpu",
+        "backend": "candle-cuda",
         "expected_devices": [
-          "candle-cpu"
+          "candle-cuda"
         ],
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -44359,7 +44422,8 @@
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight",
       "requirements": []
-    }
+    },
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
   },
   {
     "package": "candle-gen-krea",
@@ -44917,35 +44981,39 @@
       ]
     },
     "execution_role": "direct",
-    "backend": "candle-cpu",
+    "backend": "candle-cuda",
     "expected_devices": [
-      "candle-cpu"
+      "candle-cuda"
     ],
     "cargo_features": [
+      "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base",
+    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base; Synthetic 16x64 G64 stored-code CUDA projection; original-basis rank-one LoRA (0.75) and structured 4x8 by 4x8 LoKr (0.5); additive differences against explicit residuals (max absolute error < 1e-5)",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
-    "default_configuration": "fixed_cpu",
+    "default_configuration": "fixed_cuda",
     "configurations": {
-      "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base/fixed_cpu",
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base/fixed_cuda",
         "environment": {},
         "cargo_features": [
+          "cuda",
           "model-inference-proof"
         ],
-        "backend": "candle-cpu",
+        "backend": "candle-cuda",
         "expected_devices": [
-          "candle-cpu"
+          "candle-cuda"
         ],
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -44953,7 +45021,8 @@
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base",
       "requirements": []
-    }
+    },
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
   },
   {
     "package": "candle-gen-krea",
@@ -44971,35 +45040,39 @@
       ]
     },
     "execution_role": "direct",
-    "backend": "candle-cpu",
+    "backend": "candle-cuda",
     "expected_devices": [
-      "candle-cpu"
+      "candle-cuda"
     ],
     "cargo_features": [
+      "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic",
+    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic; Synthetic 64x128 G64 stored-code CUDA projection, valid 4x128 input and exact output shape; scale-length and rotation-group errors",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
-    "default_configuration": "fixed_cpu",
+    "default_configuration": "fixed_cuda",
     "configurations": {
-      "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic/fixed_cpu",
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic/fixed_cuda",
         "environment": {},
         "cargo_features": [
+          "cuda",
           "model-inference-proof"
         ],
-        "backend": "candle-cpu",
+        "backend": "candle-cuda",
         "expected_devices": [
-          "candle-cpu"
+          "candle-cuda"
         ],
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -45007,7 +45080,8 @@
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-krea/src/quant.rs::quant::tests::convrot_int8_constructor_is_typed_error_not_panic",
       "requirements": []
-    }
+    },
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
   },
   {
     "package": "candle-gen-krea",
@@ -45410,35 +45484,39 @@
       ]
     },
     "execution_role": "direct",
-    "backend": "candle-cpu",
+    "backend": "candle-cuda",
     "expected_devices": [
-      "candle-cpu"
+      "candle-cuda"
     ],
     "cargo_features": [
+      "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk",
+    "fixture_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk; Synthetic 16x64 G64 stored-code CUDA time-modulation projection; one adapter visit, rank-one LoRA (0.5), maximum output shift > 1e-4 and preserved ConvRot base",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
-    "default_configuration": "fixed_cpu",
+    "default_configuration": "fixed_cuda",
     "configurations": {
-      "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk/fixed_cpu",
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk/fixed_cuda",
         "environment": {},
         "cargo_features": [
+          "cuda",
           "model-inference-proof"
         ],
-        "backend": "candle-cpu",
+        "backend": "candle-cuda",
         "expected_devices": [
-          "candle-cpu"
+          "candle-cuda"
         ],
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -45446,7 +45524,8 @@
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk",
       "requirements": []
-    }
+    },
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
   },
   {
     "package": "candle-gen-krea",
@@ -69938,6 +70017,65 @@
           "scope": "case"
         }
       ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "convrot_int8::native_projections_match_pinned_kitchen",
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen; tests/fixtures/h3_convrot_int8.json generated from Comfy Kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6, fixed signed codes, per-row scales, F32 bias, channels and G64/G256",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen",
+    "required_environment": [],
+    "device_witness": "Successful production H3 native stored-code and adapted outputs observed on the selected CUDA device before independent Kitchen output comparisons",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen/fixed_cuda",
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Match each native H3 projection against pinned Kitchen output for F16/BF16 exactly and F32 to 2e-5*max(1,abs(expected)); match additive original-basis rank-one residual then restore the same packed base output and resident byte inventory."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen",
+      "requirements": []
     }
   },
   {
@@ -198894,6 +199032,62 @@
     "package": "mlx-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "convrot_int8::native_projections_match_pinned_kitchen",
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/convrot_int8.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "tests/fixtures/h3_convrot_int8.json generated by Comfy Kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6, original signed G64/G256 codes, fixed row scales and bias",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen",
+    "output_contract": "Native Metal H3 projections match F16/BF16 exactly and F32 to 2e-5*max(1,abs(expected)); rank-one additive residual equals rounded original-basis contribution and preserves codes, scales and rotation",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "no_default_features": false,
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "required_environment": [],
+    "reachable_helper_trace": [
+      "Weights::from_file -> mlx_gen_minimax_h3::quant::lin -> mlx_layers::convrot_int8::ConvRotLinear::forward_with_bias -> int8_gemm"
+    ],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen",
+      "case_generated_inputs": true,
+      "requirements": [
+        {
+          "slot": "kitchen-signed-projection",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/convrot_int8.rs",
+            "case_source_sha256": "2a19dd31dd8d35298c9c252032f97dd000ba729779af9d60b2fabac6cc9bd027",
+            "writer": "Within native_projections_match_pinned_kitchen, Array::save_safetensors writes original signed codes, scales, bias and serialized descriptor generated by operands for each oracle case, followed by Weights::from_file(&file)."
+          }
+        }
+      ],
+      "reader_roles": {
+        "mlx-gen::Weights::from_file": "model-weights"
+      }
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong",
     "execution_role": "direct",
     "backend": "mlx",
@@ -205699,6 +205893,45 @@
       "requirements": [],
       "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda_fixture.rs::veda_fixture::native_veda_controls_preserve_carriers_and_capture_published_schedules@389850b6244d6b5293abc94ca9b55d6bd6ea14c8b2ed6dc64cc26cacb9c3e5a5"
     }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "veda_fixture::selected_kernel_actual_device_smoke",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Veda device_self_test deterministic BF16 activations and two-head dense BF16 Q/K predictor; no files",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda/mod.rs::device_self_test and scorer_self_test",
+    "output_contract": "All dense BF16 predictor FP32 logits match gen-core host pool_video_tiles and tile_logits bit for bit. Sparse attention maximum absolute error <= 0.025 and mask discrimination > 0.1.",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "requires the exclusive local Metal token",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda_fixture.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda_fixture.rs::veda_fixture::selected_kernel_actual_device_smoke"
+    },
+    "reachable_helper_trace": [
+      "device_self_test -> scorer_self_test -> metal::scores -> scores_with_weights -> PROJECT -> LOGITS -> host_scores",
+      "device_self_test -> metal_batch -> attend -> host_masked_attention"
+    ]
   },
   {
     "package": "mlx-gen-mochi",
@@ -270716,6 +270949,41 @@
       "reader_roles": {
         "mlx-gen::Weights::from_file": "model-weights"
       }
+    }
+  },
+  {
+    "package": "mlx-gen",
+    "target": "mlx_gen",
+    "target_kind": "lib",
+    "fqn": "logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding",
+    "source": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Original E4M3FN, E5M2, publisher rowwise and swizzled MXFP8 source bytes; 1x1x32 and tail 3x17x35 codebook controls",
+    "configuration_source": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs::logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding",
+    "output_contract": "F64 independent codebook oracle, <=1 BF16 ULP single output and <=2 BF16 ULP multirow; exact MX scale discriminant and pre-bias dtype rounding",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "no_default_features": false,
+    "cargo_target_metadata": {
+      "name": "mlx_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "required_environment": [],
+    "reachable_helper_trace": [
+      "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs -> mlx_layers::fp8::Fp8Linear::forward -> model-selected Metal stream tiled matmul"
+    ],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs::logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding; source-defined codebooks, shapes, activation/weight scales and deterministic weights/inputs",
+      "requirements": []
     }
   },
   {

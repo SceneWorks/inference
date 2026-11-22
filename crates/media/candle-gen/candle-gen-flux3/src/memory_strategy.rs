@@ -207,9 +207,18 @@ fn checked_sum(id: &str, parts: impl Iterator<Item = CoreResult<u64>>) -> CoreRe
 pub fn dit_bytes(id: &str, weights: &Path, precision: Precision) -> CoreResult<u64> {
     let compute_width = compute_width(precision) as u64;
     let headers = safetensors_path_tensor_headers(weights)?;
+    let encoded = candle_gen::logical_weights::projection_prices(
+        weights,
+        &headers,
+        |h| if h.shape.len() >= 2 { compute_width } else { 4 },
+        candle_gen::logical_weights::standard_linear_weight,
+    )?;
     checked_sum(
         id,
         headers.iter().map(|header| {
+            if let Some(&bytes) = encoded.get(&header.name) {
+                return Ok(bytes);
+            }
             tensor_bytes(
                 header,
                 if header.shape.len() >= 2 {
@@ -296,8 +305,8 @@ fn apply_tier_fingerprint(
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
 pub fn autoencoder_bytes(id: &str, weights: &Path) -> CoreResult<u64> {
-    let headers = safetensors_path_tensor_headers(weights)?;
-    checked_sum(id, headers.iter().map(|header| tensor_bytes(header, 4)))
+    candle_gen::logical_weights::selected_component_bytes(weights, 4, |_| true)
+        .map_err(|e| CoreError::Msg(format!("{id}: {e}")))
 }
 
 /// Whether [`crate::text_encoder::Flux3TextEncoder::load`] keeps the checkpoint tensor `name`
@@ -314,21 +323,33 @@ pub fn text_encoder_bytes(id: &str, dir: &Path, tower_width: u64) -> CoreResult<
     let tied = candle_llm::ModelConfig::from_dir(dir)
         .map_err(|e| CoreError::Msg(format!("{id}: text encoder config: {e}")))?
         .tie_word_embeddings;
-    let mut total = 0_u64;
-    for file in crate::text_encoder::shard_files(dir)? {
-        let headers = safetensors_path_tensor_headers(&file)?;
-        let part = checked_sum(
-            id,
-            headers
-                .iter()
-                .filter(|header| text_encoder_keeps(&header.name, tied))
-                .map(|header| tensor_bytes(header, tower_width)),
-        )?;
-        total = total
-            .checked_add(part)
-            .ok_or_else(|| CoreError::Msg(format!("{id}: text encoder byte sum overflow")))?;
+    let files = crate::text_encoder::shard_files(dir)?;
+    let mut headers = Vec::new();
+    for file in &files {
+        headers.extend(safetensors_path_tensor_headers(file)?);
     }
-    Ok(total)
+    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        &files,
+        &headers,
+        |_| tower_width,
+        &candle_gen::logical_weights::CandleCodecResidency::default_device_for_admission(),
+        candle_gen::logical_weights::standard_linear_weight,
+    )?;
+    checked_sum(
+        id,
+        headers
+            .iter()
+            .filter(|h| {
+                text_encoder_keeps(&h.name, tied)
+                    || (!tied
+                        && gen_core::checkpoint_codec::projection_companion_base(&h.name)
+                            == Some("lm_head"))
+            })
+            .map(|header| match encoded.get(&header.name) {
+                Some(&bytes) => Ok(bytes),
+                None => tensor_bytes(header, tower_width),
+            }),
+    )
 }
 
 /// Bytes per element of the DiT's compute dtype.
@@ -483,6 +504,24 @@ pub(crate) fn resolve_route_checkpoint(id: &str, package_dir: &Path) -> CoreResu
     Ok(config)
 }
 
+fn resolved_package_storage(
+    id: &str,
+    spec: &LoadSpec,
+    path: &Path,
+) -> CoreResult<NativeDitStorage> {
+    let actual = NativeDitStorage::from_package(path)?;
+    let selection = actual.source_selection(spec.quantize);
+    let selected = selected_storage(id, selection)?;
+    if actual != selected {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: selected {} but the package quantization marker is {}; install the exact requested native tier",
+            selected.key()?, actual.key()?
+        )));
+    }
+    actual.validate_selection(selection, spec.precision)?;
+    Ok(actual)
+}
+
 /// The DiT storage `spec` selects on a resolved package, preflighted header-only BEFORE any
 /// text-encoder, autoencoder, adapter, memory or device work, for EVERY storage (dense included):
 /// the package marker is exactly the selection (no tier or model fallback), the selection is
@@ -495,25 +534,19 @@ pub(crate) fn preflight_checkpoint(
     package_dir: &Path,
     config: &Flux3Config,
 ) -> CoreResult<NativeDitStorage> {
-    let storage = selected_storage(id, spec.quantize)?;
-    let package_storage = NativeDitStorage::from_package(package_dir)?;
-    if package_storage != storage {
-        return Err(CoreError::Unsupported(format!(
-            "{id}: selected {} but the quantization marker of {} is {}; install or convert the \
-             exact requested native tier (no tier or model fallback)",
-            storage.key()?,
-            package_dir.display(),
-            package_storage.key()?
-        )));
-    }
-    storage.validate_selection(spec.quantize, spec.precision)?;
+    let storage = resolved_package_storage(id, spec, package_dir)?;
     if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
         config.validate_supported()?;
     } else {
         config.validate_native_storage_graph()?;
     }
     let headers = gen_core_flux3::checkpoint_tensor_headers(package_dir)?;
-    crate::dit::validate_checkpoint_headers(&config.dit, storage, &headers)?;
+    crate::dit::validate_source_checkpoint(
+        &config.dit,
+        storage,
+        &package_dir.join(gen_core_flux3::DIT_WEIGHTS_FILE),
+        &headers,
+    )?;
     Ok(storage)
 }
 
@@ -548,18 +581,16 @@ pub(crate) fn generation_contract(
         gen_core_flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let storage = selected_storage(id, spec.quantize)?;
-    let package_storage = NativeDitStorage::from_package(&resources.package_dir)?;
-    if package_storage != storage {
-        return Err(CoreError::Unsupported(format!(
-            "{id}: selected {} but the package quantization marker is {}; install the \
-             exact requested native tier (no tier or model fallback)",
-            storage.key()?,
-            package_storage.key()?
-        )));
+    let storage = resolved_package_storage(id, spec, &resources.package_dir)?;
+    let shared_source = storage.validate_source_headers(
+        &config.dit,
+        &resources.dit_weights(),
+        &gen_core_flux3::checkpoint_tensor_headers(&resources.package_dir)?,
+    )?;
+    if shared_source {
+        contract.calibration = None;
     }
-    storage.validate_selection(spec.quantize, precision)?;
-    apply_tier_fingerprint(&mut contract, spec.quantize)?;
+    apply_tier_fingerprint(&mut contract, storage.quant()?)?;
     let transformer = native_dit_bytes(
         id,
         &resources.dit_weights(),
@@ -705,7 +736,25 @@ pub fn safety_check(
 
 /// The Candle FLUX.3 memory profile (sc-27307): the requested tier, the route gate inside the
 /// shared pipeline, and one phased text-to-image fixture per implemented optimized rung.
+fn resolved_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let quant = match &spec.weights {
+        gen_core::WeightsSource::Dir(path) if path.is_dir() => {
+            resolved_package_storage(&contract.provider_id, spec, path)?.quant()?
+        }
+        _ => spec.quantize,
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
 const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(resolved_tier),
     gates: gen_core::MemoryProfileGates::within(route_gate),
     fixtures: gen_core::MemoryProfileFixtures::routes(&[
         gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE

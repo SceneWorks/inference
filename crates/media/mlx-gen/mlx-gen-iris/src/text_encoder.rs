@@ -561,7 +561,6 @@ pub(crate) struct StreamedLayer {
 impl StreamedLayer {
     #[cfg(test)]
     fn arrays(&self) -> Vec<Array> {
-        use mlx_llm::primitives::projection::Projection;
         let mut out = vec![
             self.input_ln.clone(),
             self.post_ln.clone(),
@@ -571,17 +570,7 @@ impl StreamedLayer {
         for p in [
             &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down,
         ] {
-            match p {
-                Projection::Dense { weight, bias } => {
-                    out.push(weight.clone());
-                    out.extend(bias.iter().cloned());
-                }
-                Projection::Quantized(q) => {
-                    out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()]);
-                    out.extend(q.bias.iter().cloned());
-                }
-                Projection::Prism(_) => unreachable!("the Iris tower has no Prism projection"),
-            }
+            p.push_arrays(&mut out);
         }
         out
     }

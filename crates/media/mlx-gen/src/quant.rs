@@ -12,9 +12,10 @@ use crate::weights::Weights;
 use crate::Result;
 
 pub use mlx_layers::quant::{
-    embedding, is_quant_aligned, lin, needs_load_time_quant, packed_bits, packed_bits_from_headers,
-    packed_bits_from_metadata, packed_quant_bits, packed_quant_bits_at, packed_quant_group_size_at,
-    TokenEmbedding, DEFAULT_GROUP_SIZE, HEADER_PACKED_GROUP_SIZE,
+    embedding, embedding_compute, is_quant_aligned, lin, lin_with_bias, native_lin,
+    needs_load_time_quant, packed_bits, packed_bits_from_headers, packed_bits_from_metadata,
+    packed_quant_bits, packed_quant_bits_at, packed_quant_group_size_at, TokenEmbedding,
+    DEFAULT_GROUP_SIZE, HEADER_PACKED_GROUP_SIZE,
 };
 
 /// Read every tensor of `dir` (possibly sharded safetensors) into an owned key→`Array` map (MLX

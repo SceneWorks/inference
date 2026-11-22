@@ -241,7 +241,7 @@ impl Transformer {
                 let b = format!("layers.{i}.proj.{name}.lora_B");
                 let down = weights.require(&a)?;
                 let up = weights.require(&b)?;
-                let shape = p.base.weight().dims2()?;
+                let shape = p.base.weight_dims()?;
                 if down.dims() != [rank, shape.1]
                     || up.dims() != [shape.0, rank]
                     || down.dtype() != DType::BF16

@@ -434,7 +434,9 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<MossTtsdGenerator> {
         "XY_Tokenizer codec",
     )? {
         // A snapshot dir carries the single-file checkpoint; a File source is the checkpoint itself.
-        WeightsSource::Dir(p) => p.join(CODEC_CHECKPOINT_FILE),
+        WeightsSource::Dir(p) => {
+            candle_audio::weights::checkpoint_file(p.join(CODEC_CHECKPOINT_FILE))
+        }
         WeightsSource::File(p) => p.clone(),
     };
     Ok(MossTtsdGenerator {

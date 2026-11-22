@@ -223,6 +223,16 @@ impl ImageMemoryFacts {
         // --- DiT ---------------------------------------------------------------------------
         let dit_dir = crate::h3_image::tier::resolve_dit_dir(&root, spec);
         let dit_headers = headers(&dit_dir)?;
+        let encoded = if dit_headers.is_empty() {
+            Default::default()
+        } else {
+            let physical: std::collections::BTreeMap<_, _> =
+                dit_headers.iter().map(|h| (h.name.as_str(), h)).collect();
+            mlx_gen::asset_facts::source_bytes(&dit_dir, &dit_headers, |h| {
+                gen_core_h3::h3_memory::encoded_head_width(&h.name, &physical)
+                    .unwrap_or(float_width.unwrap_or(2))
+            })?
+        };
         let blocks = cfg.base.num_layers.max(0) as usize;
         let mut body = vec![0u64; blocks];
         let mut adaln = vec![0u64; blocks];
@@ -232,7 +242,10 @@ impl ImageMemoryFacts {
                 Some(i) if i < blocks => {
                     // The block stack and the refiner follow `spec.precision`; the I/O heads keep
                     // their published widths (four ship float32).
-                    let bytes = loaded_bytes(h, float_width)?;
+                    let bytes = encoded
+                        .get(&h.name)
+                        .copied()
+                        .unwrap_or(loaded_bytes(h, float_width)?);
                     if h.name.contains(".adaln_proj.") {
                         adaln[i] = adaln[i].saturating_add(bytes);
                     } else {
@@ -240,9 +253,17 @@ impl ImageMemoryFacts {
                     }
                 }
                 _ if h.name.starts_with("token_refiner.") => {
-                    trunk = trunk.saturating_add(loaded_bytes(h, float_width)?)
+                    trunk = trunk.saturating_add(
+                        encoded
+                            .get(&h.name)
+                            .copied()
+                            .unwrap_or(loaded_bytes(h, float_width)?),
+                    )
                 }
-                _ => trunk = trunk.saturating_add(h.data_bytes),
+                _ => {
+                    trunk =
+                        trunk.saturating_add(encoded.get(&h.name).copied().unwrap_or(h.data_bytes))
+                }
             }
         }
 
@@ -262,35 +283,67 @@ impl ImageMemoryFacts {
         let layers = format!("{LM_PREFIX}.layers.");
         let embed = format!("{LM_PREFIX}.embed_tokens.");
         let visual = format!("{VISION_PREFIX}.");
-        let shards = TE_SHARDS.chain(std::iter::once(VISION_SHARD));
-        for shard in shards {
-            let path = te_dir.join(format!("model-{shard:05}-of-00014.safetensors"));
-            for h in headers(&path)? {
-                if let Some(rest) = h.name.strip_prefix(&layers) {
-                    let index = rest
-                        .split_once('.')
-                        .and_then(|(i, _)| i.parse::<usize>().ok());
-                    if let Some(slot) = index.and_then(|i| te_layers.get_mut(i)) {
-                        *slot = slot.saturating_add(h.data_bytes);
-                    }
-                } else if h.name.starts_with(&embed) {
-                    te_resident = te_resident.saturating_add(h.data_bytes);
-                } else if h.name.starts_with(&visual) {
-                    vision = vision.saturating_add(h.data_bytes);
+        let files: Vec<_> = TE_SHARDS
+            .chain(std::iter::once(VISION_SHARD))
+            .map(|i| te_dir.join(format!("model-{i:05}-of-00014.safetensors")))
+            .filter(|p| p.is_file())
+            .collect();
+        let mut te_headers = Vec::new();
+        for path in &files {
+            te_headers.extend(headers(path)?);
+        }
+        let te_encoded = mlx_gen::gen_core::checkpoint_codec::projected_checkpoint_bytes(
+            &files,
+            &te_headers,
+            |_| 2,
+            &mlx_gen::logical_weights::MlxCodecResidency,
+            |_, shape| shape.len() == 2,
+        )?;
+        for h in te_headers {
+            let bytes = te_encoded.get(&h.name).copied().unwrap_or(h.data_bytes);
+            if let Some(rest) = h.name.strip_prefix(&layers) {
+                let index = rest
+                    .split_once('.')
+                    .and_then(|(i, _)| i.parse::<usize>().ok());
+                if let Some(slot) = index.and_then(|i| te_layers.get_mut(i)) {
+                    *slot = slot.saturating_add(bytes);
                 }
+            } else if h.name.starts_with(&embed) {
+                te_resident = te_resident.saturating_add(bytes);
+            } else if h.name.starts_with(&visual) {
+                vision = vision.saturating_add(bytes);
             }
         }
 
         // --- VAE ---------------------------------------------------------------------------
         let mut decoder = 0u64;
         let mut encoder = 0u64;
-        for h in headers(&root.join(IMAGE_VAE_COMPONENT))? {
+        let vae_dir = root.join(IMAGE_VAE_COMPONENT);
+        let vae_headers = headers(&vae_dir)?;
+        let vae_encoded = if vae_headers.is_empty() {
+            Default::default()
+        } else {
+            mlx_gen::asset_facts::source_bytes(&vae_dir, &vae_headers, |h| {
+                if h.name.starts_with("encoder.") || h.name.starts_with("quant_conv.") {
+                    2
+                } else {
+                    float_width.unwrap_or(2)
+                }
+            })?
+        };
+        for h in vae_headers {
             if h.name.starts_with("encoder.") || h.name.starts_with("quant_conv.") {
-                encoder = encoder.saturating_add(h.data_bytes);
+                encoder = encoder
+                    .saturating_add(vae_encoded.get(&h.name).copied().unwrap_or(h.data_bytes));
             } else {
                 // `MiniMaxH3ImageVae::load` casts the decode half to `spec.precision`'s dtype; the
                 // encode half (`MiniMaxH3ImageVaeEncoder::load`) keeps its stored widths.
-                decoder = decoder.saturating_add(loaded_bytes(&h, float_width)?);
+                decoder = decoder.saturating_add(
+                    vae_encoded
+                        .get(&h.name)
+                        .copied()
+                        .unwrap_or(loaded_bytes(&h, float_width)?),
+                );
             }
         }
 

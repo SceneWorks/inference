@@ -872,7 +872,116 @@ impl AdapterBackend {
     }
 }
 
+struct NativeLora {
+    base: std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>,
+    factors: Vec<LoraFactor>,
+}
+
+struct LoraFactor {
+    down: candle_nn::Linear,
+    up: candle_nn::Linear,
+    scale: f64,
+}
+
+impl LoraFactor {
+    fn new(op: &AdapterOp) -> candle_audio::candle_core::Result<Self> {
+        let linear =
+            |tensor: &Option<Tensor>| -> candle_audio::candle_core::Result<candle_nn::Linear> {
+                let weight = tensor.as_ref().expect("validated additive LoRA factors");
+                Ok(candle_nn::Linear::new(weight.to_dtype(DType::F32)?, None))
+            };
+        Ok(Self {
+            down: linear(&op.module.a)?,
+            up: linear(&op.module.b)?,
+            scale: (op.effective_scale as f32) as f64,
+        })
+    }
+}
+
+impl candle_nn::linear::NativeLinearWeight for NativeLora {
+    fn forward(
+        &self,
+        x: &Tensor,
+        bias: Option<&Tensor>,
+    ) -> candle_audio::candle_core::Result<Tensor> {
+        use candle_audio::candle_core::Module;
+        let base = self.base.forward(x, bias)?;
+        let x = x.to_dtype(DType::F32)?;
+        let mut result = base.to_dtype(DType::F32)?;
+        for factor in &self.factors {
+            let delta = factor
+                .up
+                .forward(&factor.down.forward(&x)?)?
+                .affine(factor.scale, 0.)?;
+            result = (result + delta)?;
+        }
+        result.to_dtype(base.dtype())
+    }
+
+    fn dense_weight(&self) -> candle_audio::candle_core::Result<Tensor> {
+        let base = self.base.dense_weight()?;
+        let mut weight = base.to_dtype(DType::F32)?;
+        for factor in &self.factors {
+            let delta = factor.up.try_weight()?.matmul(factor.down.try_weight()?)?;
+            weight = (weight + delta.affine(factor.scale, 0.)?)?;
+        }
+        weight.to_dtype(base.dtype())
+    }
+
+    fn checkpoint_bias_dtype(&self) -> Option<DType> {
+        self.base.checkpoint_bias_dtype()
+    }
+    fn format_id(&self) -> &'static str {
+        self.base.format_id()
+    }
+    fn dims(&self) -> (usize, usize) {
+        self.base.dims()
+    }
+    fn device(&self) -> &Device {
+        self.base.device()
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.base.resident_bytes()
+            + self
+                .factors
+                .iter()
+                .flat_map(|pair| [&pair.up, &pair.down])
+                .map(|linear| (linear.weight().elem_count() * std::mem::size_of::<f32>()) as u64)
+                .sum::<u64>()
+    }
+}
+
 impl candle_nn::var_builder::SimpleBackend for AdapterBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_audio::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let Some(ops) = self.plan.ops_for(name) else {
+            return self.inner.native_linear_weight(name, shape, dtype, device);
+        };
+        // XS obtains singular vectors and DoRA/BoRA normalize the sequentially adapted
+        // coefficients. Only the pure additive LoRA stack commutes with a frozen base GEMM.
+        if ops.iter().any(|op| op.kind != AdapterType::Lora) {
+            return Ok(None);
+        }
+        let Some(base) = self
+            .inner
+            .native_linear_weight(name, shape, dtype, device)?
+        else {
+            return Ok(None);
+        };
+        let factors = ops
+            .iter()
+            .map(LoraFactor::new)
+            .collect::<candle_audio::candle_core::Result<_>>()?;
+        Ok(Some(std::sync::Arc::new(NativeLora { base, factors })))
+    }
+
     fn get(
         &self,
         shape: candle_audio::candle_core::Shape,

@@ -80,6 +80,25 @@ def matching_brace(mask: str, opening: int) -> int:
     return position
 
 
+def rust_production_mask(text: str) -> str:
+    """Mask literals/comments and inline test-only modules before inventorying production callers."""
+    mask = rust_mask(text)
+    # Remove test modules before scanning. An unused test fixture cannot satisfy a route.
+    for match in reversed(list(re.finditer(r"#\s*\[\s*cfg\(test\)\s*\]\s*(?:pub(?:\(crate\))?\s+)?mod\s+\w+\s*\{", mask))):
+        start = mask.find("{", match.start())
+        end = matching_brace(mask, start) + 1
+        mask = mask[:match.start()] + " " * (end-match.start()) + mask[end:]
+    return mask
+
+
+def rust_function_bodies(mask: str):
+    """Yield function names and brace-balanced implementation bodies from a Rust source mask."""
+    for declaration in re.finditer(r"\bfn\s+(?:r#)?(\w+)\s*(?:<[^>{}]*>)?\s*\(", mask):
+        opening = mask.find("{", declaration.end())
+        if opening >= 0:
+            yield declaration[1], mask[opening:matching_brace(mask, opening)]
+
+
 def attributes_before(text: str, mask: str, position: int) -> list[str]:
     attributes = []
     while position > 0:
@@ -835,7 +854,15 @@ class RunGraph:
             # SW-6936 adds FLUX.1 conditional pre-load plan/refusal checks (gen-core multi-pass,
             # MLX ControlNet/XLabs IP/PuLID, Candle ControlNet/IP/PuLID) and the preview
             # source scans; none constructs a generator or runs learned compute.
-            controls_sha = '31b81ee7290677f9ccd81fe38e7a0df89e221b20920c48685dc389e64465245c'
+            # SW-7232/7234 add five file/header planning controls and the file-backed
+            # OpenCLIP packed-source remap control. Constructors/readbacks retain source
+            # bytes only; no learned projection or activation computation executes.
+            # Include W4A8-owner delegation and Candle metadata-only owner construction
+            # controls; both inspect source storage and pre-load refusals without forwards.
+            # Exact bare-parameter declarations remain attached under component selection.
+            # The adapter file installer uses a CPU metadata-native base whose forward
+            # and dense-materialization methods panic; only installation/routing is exercised.
+            controls_sha = 'f18ad05cd8beec0962738d595e68320d506ef775cafff6bf41647d55bc94a741'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

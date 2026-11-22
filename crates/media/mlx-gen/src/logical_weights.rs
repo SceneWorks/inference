@@ -26,21 +26,18 @@
 //! MLX's `from_fp8`, E5M2 as the high byte of binary16, and E8M0 as `2^(byte - 127)`.
 //! Scale application and the final bf16 cast remain the plan's codec responsibility.
 //!
-//! Residency is priced **per layer** by the plan ([`gen_core::PlannedResidency`]): MLX has no
-//! packed fp8/int8 matmul on this seam, so its policy is [`DenseResidencyPolicy`] — every
-//! quantized layer prices at its dense bf16 form and every scale/descriptor companion is consumed.
-//! The receipt's measured bytes equal the plan's `resident_bytes()`; that pair is the
-//! packed-vs-dense pricing seam admission reads.
+//! Native ConvRot projections retain signed codes and F32 scales. Other codec rows use their
+//! declared dense fallback. Receipts measure both representations against the admitted plan.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use gen_core::checkpoint_codec::{
-    CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyReport,
-    DenseResidencyPolicy, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
-    LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource, TensorCodecSpec,
-    WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
+    CheckpointCodecRegistration, CodecResidencyPolicy, CodecResidencyReport, LogicalKeyMapping,
+    LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
+    ResidencyMode, ScalarScaleSource, TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::ExecutionRepresentation;
@@ -50,9 +47,6 @@ use mlx_rs::{Array, Dtype};
 
 use crate::weights::Weights;
 use crate::{Error, Result};
-
-/// Descriptor payloads are tiny JSON blobs; anything above this is not a `.comfy_quant` tensor.
-const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
 
 /// The codec rows this engine implements and registers. Register through
 /// [`register_checkpoint_codecs`]; never per family crate.
@@ -66,8 +60,10 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     DENSE_F16_CODEC.codec_id,
     DENSE_F32_CODEC.codec_id,
     FP8_E4M3_SCALAR_CODEC.codec_id,
+    FP8_E4M3_ROWWISE_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
+    gen_core::convrot_int8::CODEC_ID,
     INT8_PER_ROW_CODEC.codec_id,
     NVFP4_CODEC.codec_id,
 ];
@@ -81,47 +77,20 @@ pub fn register_checkpoint_codecs(mut builder: ProviderRegistryBuilder) -> Provi
 }
 
 /// The validated registry the loaders plan against.
-pub fn baseline_codec_registry() -> &'static CheckpointCodecRegistry {
-    static REGISTRY: OnceLock<CheckpointCodecRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
-        CheckpointCodecRegistry::new(BASELINE_CODECS.iter().copied())
-            .expect("the engine codec table is a valid registry")
-    })
-}
+pub use mlx_layers::source::{registry as baseline_codec_registry, MlxCodecResidency};
 
 /// Header-plus-descriptors plan for one safetensors file under the given mapping. Refuses before
-/// any array is created; the error names the exact on-disk tensor. MLX residency is always the
-/// dense fallback ([`DenseResidencyPolicy`]) — this engine has no packed fp8/int8 matmul on the
-/// codec seam.
+/// any array is created. Native row-scaled ConvRot projections are priced at stored width.
 pub fn plan_logical_weights(
     path: &Path,
     mapping: &dyn LogicalKeyMapping,
 ) -> Result<LogicalWeightPlan> {
-    let headers = gen_core::safetensors_path_tensor_headers(path)?;
-    let descriptors = gen_core::read_safetensors_tensor_payloads(
+    Ok(gen_core::checkpoint_codec::plan_safetensors(
         path,
-        |header| header.name.ends_with(".comfy_quant"),
-        MAX_DESCRIPTOR_BYTES,
-    )?;
-    // A checkpoint declares its quantization per layer (`.comfy_quant` tensors), file-wide
-    // (`__metadata__._quantization_metadata`, sc-20641), or not at all; both routes are read and
-    // the compiler refuses a layer the two disagree about.
-    let quantization_metadata = gen_core::safetensors_path_quantization_metadata(path)?;
-    gen_core::compile_logical_weight_plan_with_metadata(
-        &headers,
-        &descriptors,
-        quantization_metadata.as_deref(),
         mapping,
         baseline_codec_registry(),
-        &DenseResidencyPolicy,
-    )
-    .map_err(|error| {
-        Error::Msg(format!(
-            "logical weight plan for {} ({}): {error}",
-            path.display(),
-            mapping.mapping_id()
-        ))
-    })
+        &MlxCodecResidency,
+    )?)
 }
 
 /// How a read leaves its payloads.
@@ -161,11 +130,17 @@ pub fn read_logical_weights(
     // find its source already taken. Refuse by name rather than fail as a missing tensor — a
     // transformed plan is not a plan this engine can honour, and silently reading only the first
     // output would hand the model a fused matrix under a split key's name.
-    if let Some(transformed) = plan
-        .tensors
-        .iter()
-        .find(|tensor| tensor.transform.is_some())
-    {
+    if let Some(transformed) = plan.tensors.iter().find(|tensor| {
+        tensor.transform.is_some()
+            && !(tensor.residency.mode == ResidencyMode::Packed
+                && matches!(
+                    tensor.codec,
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                        | TensorCodecSpec::RowwiseFp8 { .. }
+                        | TensorCodecSpec::ScalarFp8 { .. }
+                        | TensorCodecSpec::Mxfp8 { .. }
+                ))
+    }) {
         return Err(Error::Msg(format!(
             "logical weight read of {}: logical key {:?} is a declared transform of physical \
              tensor {:?}, which this engine's reader does not implement; plan this checkpoint with \
@@ -175,11 +150,30 @@ pub fn read_logical_weights(
             transformed.physical_key,
         )));
     }
+    // This public reader also accepts externally constructed plans. Verify the execution
+    // device and projection semantics before retaining any packed view from that plan.
+    for row in plan
+        .tensors
+        .iter()
+        .filter(|r| r.residency.mode == ResidencyMode::Packed)
+    {
+        let supported = BASELINE_CODECS
+            .iter()
+            .find(|c| c.codec_id == row.codec_id)
+            .is_some_and(|codec| {
+                MlxCodecResidency.residency_for_key(&row.logical_key, codec, &row.codec, &row.shape)
+                    == ResidencyMode::Packed
+            });
+        if !supported {
+            return Err(Error::Msg(format!("{}: {} has no Packed operator for this device and geometry; replan with a dense residency policy", row.physical_key, row.codec_id)));
+        }
+    }
     let mut physical = load_planned_file(path)?;
     let mut on_disk: Vec<&str> = physical.keys().map(String::as_str).collect();
     on_disk.sort_unstable();
     let mut planned: Vec<&str> = plan.all_physical_keys().collect();
     planned.sort_unstable();
+    planned.dedup();
     if on_disk != planned {
         let missing = planned
             .iter()
@@ -199,10 +193,118 @@ pub fn read_logical_weights(
 
     let eager = matches!(mode, LogicalReadMode::Eager(_));
     let mut logical = Weights::empty();
+    logical.source_reads =
+        mlx_layers::source::SourceReads::new(Arc::new(plan.clone()), &[path.to_owned()]);
     for tensor in &plan.tensors {
-        let array = physical
-            .remove(&tensor.physical_key)
-            .ok_or_else(|| Error::MissingTensor(tensor.physical_key.clone()))?;
+        let array = if tensor.transform.is_some() {
+            physical.get(&tensor.physical_key).cloned()
+        } else {
+            physical.remove(&tensor.physical_key)
+        }
+        .ok_or_else(|| Error::MissingTensor(tensor.physical_key.clone()))?;
+        if tensor.residency.mode == ResidencyMode::Packed
+            && matches!(
+                tensor.codec,
+                TensorCodecSpec::ScalarFp8 { .. }
+                    | TensorCodecSpec::Mxfp8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. }
+            )
+        {
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .or_else(|| tensor.logical_key.strip_suffix("_weight"))
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: packed projection requires a weight key",
+                        tensor.logical_key
+                    ))
+                })?;
+            let (mut fp8, scale, input) = bind_fp8(tensor, array, &physical)?;
+            if let Some(obs) = logical.source_reads.get(&tensor.logical_key) {
+                fp8.observe(obs)?;
+            }
+            if eager {
+                fp8.materialize()?;
+            }
+            logical.insert_fp8(base, fp8, scale, input);
+            continue;
+        }
+        if let TensorCodecSpec::ConvRotInt8 { scale, geometry } = &tensor.codec {
+            let scales = companion(tensor, &physical, scale)?;
+            guard_dtype(tensor, &array, Dtype::Int8)?;
+            guard_shape(
+                tensor,
+                &array,
+                &[geometry.out_features, geometry.in_features],
+            )?;
+            guard_dtype(tensor, scales, Dtype::Float32)?;
+            guard_shape(tensor, scales, &[geometry.out_features, 1])?;
+            if tensor.residency.mode != ResidencyMode::Packed {
+                return Err(Error::Msg(format!(
+                    "{}: ConvRot requires packed residency",
+                    tensor.logical_key
+                )));
+            }
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .or_else(|| tensor.logical_key.strip_suffix("_weight"))
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: native projection must map to a weight",
+                        tensor.logical_key
+                    ))
+                })?;
+            let (codes, scales, layout) = if let Some(t) = &tensor.transform {
+                let start = t.rows.start;
+                let n = t.rows.len;
+                if n == 0
+                    || start > geometry.out_features
+                    || n > geometry.out_features - start
+                    || tensor.shape != [n, geometry.in_features]
+                    || (t.half_swap && !n.is_multiple_of(2))
+                {
+                    return Err(Error::Msg(format!(
+                        "{}: invalid ConvRot row transform",
+                        tensor.logical_key
+                    )));
+                }
+                let slice = |x: &Array| -> Result<Array> {
+                    let rows = x.index((start as i32..(start + n) as i32, ..));
+                    if t.half_swap {
+                        let half = n as i32 / 2;
+                        Ok(mlx_rs::ops::concatenate_axis(
+                            &[rows.index((half.., ..)), rows.index((..half, ..))],
+                            0,
+                        )?)
+                    } else {
+                        Ok(rows)
+                    }
+                };
+                (
+                    slice(&array)?,
+                    slice(scales)?,
+                    gen_core::convrot_int8::ConvRotInt8::from_geometry(
+                        geometry.rotation_group,
+                        &[n, geometry.in_features],
+                        &[n, 1],
+                    )
+                    .map_err(Error::Msg)?,
+                )
+            } else {
+                (array, scales.clone(), *geometry)
+            };
+            if let Some(obs) = logical.source_reads.get(&tensor.logical_key) {
+                obs.bind(&codes, &scales, None)?;
+            }
+            if eager {
+                codes.eval()?;
+                scales.eval()?;
+            }
+            logical.insert_convrot(base, layout, codes, scales);
+            continue;
+        }
         let decoded = decode(tensor, array, &physical)?;
         if eager && !matches!(tensor.codec, TensorCodecSpec::Dense) {
             // MLX is lazy: materialize dequantizing projections one by one so the eager resident
@@ -235,8 +337,6 @@ pub fn read_logical_weights(
             source_bytes: plan.source_bytes,
             materialization,
             residency,
-            // MLX serves every quantized row through its dense-side decode as *planned* (the
-            // residency policy is dense-only there), so there is never a packed pricing to demote.
             demotions: Vec::new(),
         },
     })
@@ -245,6 +345,98 @@ pub fn read_logical_weights(
 // =================================================================================================
 // Per-layer codec decode (MLX ops; lazy until the caller evaluates).
 // =================================================================================================
+
+fn bind_fp8(
+    t: &LogicalTensorPlan,
+    mut codes: Array,
+    physical: &HashMap<String, Array>,
+) -> Result<(mlx_layers::fp8::Fp8Linear, bool, bool)> {
+    use gen_core::comfy_quant::ComfyQuantFormat;
+    if let Some(refusal) = t.undeclared_padded_storage_refusal() {
+        return Err(Error::Msg(refusal));
+    }
+    guard_dtype(t, &codes, Dtype::Uint8)?;
+    let (format, mut sw, sx) = match &t.codec {
+        TensorCodecSpec::ScalarFp8 {
+            scale, input_scale, ..
+        } => {
+            let sw = match scale {
+                ScalarScaleSource::Unit => None,
+                ScalarScaleSource::Companion { physical_key } => {
+                    Some(companion(t, physical, physical_key)?.clone())
+                }
+            };
+            let sx = input_scale
+                .as_ref()
+                .map(|key| companion(t, physical, key).cloned())
+                .transpose()?;
+            let encoding = match t.encoding {
+                WeightEncoding::Fp8E4M3 => ComfyQuantFormat::Float8E4M3Fn,
+                WeightEncoding::Fp8E5M2 => ComfyQuantFormat::Float8E5M2,
+                _ => return Err("invalid scalar FP8 storage".into()),
+            };
+            (encoding, sw, sx)
+        }
+        TensorCodecSpec::RowwiseFp8 { scale } => {
+            let scales = companion(t, physical, scale)?.clone();
+            guard_shape(t, &scales, &[codes.shape()[0] as usize])?;
+            guard_dtype(t, &scales, Dtype::Float32)?;
+            (ComfyQuantFormat::Fp8Rowwise, Some(scales), None)
+        }
+        TensorCodecSpec::Mxfp8 {
+            scale,
+            stored_shape,
+            ..
+        } => {
+            guard_shape(t, &codes, stored_shape)?;
+            let scales = companion(t, physical, scale)?.clone();
+            let grid = gen_core::mxfp8_scale_shape(*stored_shape);
+            guard_shape(t, &scales, &grid)?;
+            (ComfyQuantFormat::Mxfp8, Some(scales), None)
+        }
+        _ => unreachable!(),
+    };
+    if let Some(tx) = &t.transform {
+        let start = tx.rows.start;
+        let len = tx.rows.len;
+        if len == 0
+            || start > codes.shape()[0] as usize
+            || len > codes.shape()[0] as usize - start
+            || (tx.half_swap && !len.is_multiple_of(2))
+        {
+            return Err("invalid packed FP8 output row transform".into());
+        }
+        let rows = |a: &Array, lo: usize, hi: usize, swap: bool| -> Result<Array> {
+            let view = a.index(lo as i32..hi as i32);
+            if !swap {
+                return Ok(view);
+            }
+            let h = ((hi - lo) / 2) as i32;
+            Ok(mlx_rs::ops::concatenate_axis(
+                &[&view.index(h..), &view.index(..h)],
+                0,
+            )?)
+        };
+        codes = rows(&codes, start, start + len, tx.half_swap)?;
+        if format == ComfyQuantFormat::Fp8Rowwise {
+            let scale = sw.as_ref().expect("validated FP8 row scales");
+            sw = Some(rows(scale, start, start + len, tx.half_swap)?);
+        }
+        if format == ComfyQuantFormat::Mxfp8 {
+            if tx.half_swap || !start.is_multiple_of(128) || !len.is_multiple_of(128) {
+                return Err(
+                    "MXFP8 row transform must preserve complete 128-row scale atoms".into(),
+                );
+            }
+            let scale = sw.as_ref().expect("validated MXFP8 scale");
+            sw = Some(rows(scale, start, start + len, false)?);
+        }
+    }
+    let has_scale = sw.is_some();
+    let has_input = sx.is_some();
+    let fp8 = mlx_layers::fp8::Fp8Linear::new(format, codes, sw, sx, &t.shape, None)?;
+    Ok((fp8, has_scale, has_input))
+}
 
 fn guard_shape(tensor: &LogicalTensorPlan, array: &Array, expected: &[usize]) -> Result<()> {
     let expected: Vec<i32> = expected.iter().map(|dim| *dim as i32).collect();
@@ -294,28 +486,13 @@ fn companion<'a>(
 /// so those two codes are substituted explicitly. Pinned by the 256-code cross-check test against
 /// `gen_core::fp8_e4m3fn_to_f32`.
 fn e4m3_bytes_to_f32(codes: &Array) -> Result<Array> {
-    let decoded = codes.from_fp8(Dtype::Float32)?;
-    let nan_code = mlx_rs::ops::logical_or(
-        &mlx_rs::ops::eq(codes, Array::from_slice(&[0x7F_u8], &[]))?,
-        &mlx_rs::ops::eq(codes, Array::from_slice(&[0xFF_u8], &[]))?,
-    )?;
-    Ok(mlx_rs::ops::r#where(
-        &nan_code,
-        Array::from_f32(f32::NAN),
-        &decoded,
-    )?)
+    mlx_layers::fp8::decoded_codes(codes, gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn)
 }
 
 /// Decode E5M2 bytes (`U8` view) to f32: E5M2 is IEEE binary16 truncated to its top byte, so
 /// `u16(byte) << 8` reinterpreted as f16 is the exact value (inf/NaN codes included).
 fn e5m2_bytes_to_f32(codes: &Array) -> Result<Array> {
-    let shifted = mlx_rs::ops::multiply(
-        &codes.as_dtype(Dtype::Uint16)?,
-        Array::from_slice(&[256_u16], &[]),
-    )?;
-    Ok(shifted
-        .view_dtype(Dtype::Float16)?
-        .as_dtype(Dtype::Float32)?)
+    mlx_layers::fp8::decoded_codes(codes, gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2)
 }
 
 /// Decode E8M0 shared-exponent bytes (`U8` view) to f32: `2^(byte − 127)` = `u32(byte) << 23`
@@ -386,17 +563,11 @@ fn decode(
     if let Some(refusal) = tensor.matrix_rank_refusal() {
         return Err(Error::Msg(refusal));
     }
-    // Every arm below produces the codec's DENSE resident form. MLX has no packed fp8/int8/fp4
-    // matmul on this seam, so this engine plans [`DenseResidencyPolicy`] for every row — but the
-    // reader must not *assume* that. A `Packed` entry reaching here (a caller planning with a
-    // foreign policy, or a policy that grows a packed row) would dense-decode a layer admission
-    // priced at its packed stored bytes: bf16 is 2 bytes/element against fp8's 1 and NVFP4's 0.5,
-    // so the load silently costs 2–4× the admitted footprint. Refuse instead — the same direction
-    // `candle_gen::logical_weights` takes for a packed plan on a build with no CUDA fp8 leg.
+    // Packed operators are bound by the caller. Only dense decode arms can reach this point.
     if tensor.residency.mode != ResidencyMode::Dense {
         return Err(Error::Msg(format!(
             "codec {}: tensor {:?} was planned with {:?} residency ({} stored bytes), but this \
-             engine decodes every codec to its dense resident form; replan with a dense residency \
+             codec uses a dense resident form on this engine; replan with a dense residency \
              policy instead of silently materializing the dense reconstruction where the plan \
              priced the stored packing",
             tensor.codec_id,
@@ -406,6 +577,9 @@ fn decode(
         )));
     }
     match &tensor.codec {
+        TensorCodecSpec::ConvRotInt8 { .. } => Err(Error::Msg(
+            "ConvRot operands cannot be decoded into a dense tensor".into(),
+        )),
         TensorCodecSpec::Dense => {
             let expected = match tensor.codec_id {
                 id if id == DENSE_BF16_CODEC.codec_id => Dtype::Bfloat16,
@@ -425,6 +599,17 @@ fn decode(
             guard_shape(tensor, &array, &tensor.shape)?;
             guard_dtype(tensor, &array, expected)?;
             Ok(array)
+        }
+        TensorCodecSpec::RowwiseFp8 { scale } => {
+            guard_shape(tensor, &array, &tensor.shape)?;
+            let scales = companion(tensor, physical, scale)?;
+            guard_shape(tensor, scales, &[tensor.shape[0]])?;
+            guard_dtype(tensor, scales, Dtype::Float32)?;
+            guard_dtype(tensor, &array, Dtype::Uint8)?;
+            Ok(
+                mlx_rs::ops::multiply(e4m3_bytes_to_f32(&array)?, scales.reshape(&[-1, 1])?)?
+                    .as_dtype(Dtype::Bfloat16)?,
+            )
         }
         TensorCodecSpec::ScalarFp8 { scale, .. } => {
             // fp8 arrives as the U8 byte view (MLX has no fp8 dtype; the loader re-presents it).
@@ -581,8 +766,10 @@ fn measure_residency(
     plan: &LogicalWeightPlan,
     logical: &Weights,
 ) -> Result<Vec<CodecResidencyReport>> {
-    let mut by_codec: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
-    let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+    let mut by_codec: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
+        BTreeMap::new();
+    let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
+        BTreeMap::new();
     // A transformed tensor contributes one plan entry per logical output, all naming the same
     // physical key (sc-21547), and exactly one of them carries `source_bytes` while its siblings
     // carry zero — the plan compiler's convention. So a plain sum totals the file once, and
@@ -591,45 +778,71 @@ fn measure_residency(
     // counts and resident bytes stay per-logical: each output is separately decoded and separately
     // occupies memory.
     for tensor in &plan.tensors {
-        codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+        let native = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .is_some_and(|base| {
+                logical.planned_fp8(base).is_some() || logical.planned_convrot(base).is_some()
+            });
+        let representation = if native {
+            ExecutionRepresentation::NativePacked
+        } else {
+            ExecutionRepresentation::DenseFallback
+        };
+        let row_key = (tensor.codec_id, representation);
+        codec_by_owner.insert(tensor.physical_key.as_str(), row_key);
         let array = logical.require(&tensor.logical_key)?;
-        let resident_bytes = u64::try_from(array.nbytes()).map_err(|_| {
+        logical
+            .source_reads
+            .materialized(&tensor.logical_key, array)?;
+        let scale_bytes = if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .ok_or_else(|| Error::Msg("ConvRot projection key must end in .weight".into()))?;
+            logical.require(&format!("{base}.weight_scale"))?.nbytes()
+        } else {
+            0
+        };
+        let scale_bytes = if let Some(base) = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .filter(|base| logical.planned_fp8(base).is_some())
+        {
+            [".weight_scale", ".input_scale"]
+                .into_iter()
+                .filter_map(|suffix| logical.peek(&format!("{base}{suffix}")))
+                .map(|a| a.nbytes())
+                .sum()
+        } else {
+            scale_bytes
+        };
+        let resident_bytes = u64::try_from(array.nbytes() + scale_bytes).map_err(|_| {
             Error::Msg(format!(
                 "tensor {:?} resident size overflows u64",
                 tensor.logical_key
             ))
         })?;
-        let report = by_codec
-            .entry(tensor.codec_id)
-            .or_insert(CodecResidencyReport {
-                codec_id: tensor.codec_id,
-                // MLX plans under `DenseResidencyPolicy` only — every codec row decodes to its
-                // dense resident encoding here, so every row this backend reports is a
-                // dense fallback and none of them may ever be labelled native (sc-21484). The
-                // retained-companion assertion below is the same invariant, stated on bytes.
-                representation: ExecutionRepresentation::DenseFallback,
-                tensor_count: 0,
-                source_bytes: 0,
-                resident_bytes: 0,
-            });
+        let report = by_codec.entry(row_key).or_insert(CodecResidencyReport {
+            codec_id: tensor.codec_id,
+            representation,
+            tensor_count: 0,
+            source_bytes: 0,
+            resident_bytes: 0,
+        });
         report.tensor_count += 1;
         report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
         report.resident_bytes = report.resident_bytes.saturating_add(resident_bytes);
     }
     for companion in &plan.companions {
-        let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
+        let Some(row_key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
             continue;
         };
-        // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
-        // this seam — so every companion is consumed by its decode and retains nothing. Adding
-        // the plan's own number in would make the receipt a *copy* of the plan on exactly the
-        // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
-        // packed policy ever reaches this backend, the read refuses rather than silently
-        // agreeing with a residency it never measured.
-        //
-        // Checked outside the `by_codec` lookup below, so a companion whose owner's row is absent
-        // still cannot smuggle a retained residency past this refusal.
-        if companion.resident_bytes != 0 {
+        // Native scales were measured alongside their codes. Other decoders consume their
+        // companions and cannot claim resident bytes for them.
+        let (codec_id, representation) = row_key;
+        if companion.resident_bytes != 0 && *representation != ExecutionRepresentation::NativePacked
+        {
             return Err(Error::Msg(format!(
                 "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
                  this backend decodes every codec through its dense fallback and measures no \
@@ -638,7 +851,7 @@ fn measure_residency(
                 companion.physical_key, companion.resident_bytes
             )));
         }
-        if let Some(report) = by_codec.get_mut(codec_id) {
+        if let Some(report) = by_codec.get_mut(row_key) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
         }
     }
@@ -655,7 +868,7 @@ fn load_planned_file(path: &Path) -> Result<HashMap<String, Array>> {
     // Keep the shared contiguous/full-coverage validation: native MLX alone accepts overlapping
     // or gapped ranges. This is a header read, never crediting the untouched tensor payload.
     gen_core::safetensors_file_tensor_locations(path)?;
-    let arrays = Weights::from_file(path)?.into_tensors();
+    let (arrays, _) = crate::weights::load_safetensors_on_cpu(path)?;
     #[cfg(feature = "model-inference-proof")]
     gen_core::model_input_proof::record_reader_paths(
         "mlx-gen::logical_weights::load_planned_file",
@@ -702,12 +915,52 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+mod fp8_metal_proof;
+
+#[cfg(test)]
 mod tests {
     use super::test_support::{bf16_bytes, write_safetensors};
     use super::*;
     use gen_core::checkpoint_codec::{
         CompanionRole, CompanionTensorPlan, PlannedResidency, ResidencyMode,
     };
+
+    #[test]
+    fn architecture_crops_raw_mxfp8_at_normal_constructor_and_refuses_descriptor_conflicts() {
+        let dir = fixture_dir();
+        for (name, desc, conflicting) in [
+            ("implicit", br#"{"format":"mxfp8"}"#.as_slice(), false),
+            (
+                "explicit",
+                br#"{"format":"mxfp8","orig_shape":[6,41]}"#.as_slice(),
+                true,
+            ),
+        ] {
+            let path = dir.path().join(format!("{name}.safetensors"));
+            write_safetensors(
+                &path,
+                &[
+                    ("model.q.weight", "F8_E4M3", &[32, 64], vec![0x38; 32 * 64]),
+                    ("model.q.weight_scale", "U8", &[128, 4], vec![127; 128 * 4]),
+                    ("model.q.comfy_quant", "U8", &[desc.len()], desc.to_vec()),
+                ],
+            );
+            let mut w = Weights::from_file(&path).unwrap();
+            if conflicting {
+                assert!(w.declare_projection_shape("model.q", [5, 40]).is_err());
+            } else {
+                w.declare_projection_shape("model.q", [5, 40]).unwrap();
+                if crate::metal_available() {
+                    let p = w.source_projection("model.q.weight").unwrap().unwrap();
+                    assert_eq!(p.shape(), [5, 40]);
+                    assert_eq!(p.operands()[0].1.shape(), [32, 64]);
+                } else {
+                    assert_eq!(w.require("model.q.weight").unwrap().shape(), [5, 40]);
+                }
+                assert!(w.declare_projection_shape("model.q", [5, 65]).is_err());
+            }
+        }
+    }
 
     /// File I/O only: preserve all FP8 storage bits and ordinary tensors without decoding.
     #[test]
@@ -749,6 +1002,19 @@ mod tests {
         assert!(load_planned_file(&invalid).is_err());
     }
 
+    // These reference-decode fixtures specifically exercise the announced dense representation.
+    // Native source/direct-constructor tests use the production residency policy.
+    fn plan_logical_weights(
+        path: &Path,
+        mapping: &dyn LogicalKeyMapping,
+    ) -> Result<LogicalWeightPlan> {
+        Ok(gen_core::checkpoint_codec::plan_safetensors(
+            path,
+            mapping,
+            baseline_codec_registry(),
+            &gen_core::checkpoint_codec::DenseResidencyPolicy,
+        )?)
+    }
     struct StripModel;
 
     impl LogicalKeyMapping for StripModel {
@@ -1781,30 +2047,20 @@ mod tests {
         assert_eq!(as_f32(&weights, "alpha"), [2.0]);
     }
 
-    /// **sc-20651 blocker 4: this engine refuses a `Packed` plan entry instead of dense-decoding it.**
-    ///
-    /// Every arm of `decode` produces the codec's dense resident form, because MLX has no packed
-    /// fp8/int8/fp4 matmul on this seam — so this engine's own policy is
-    /// [`DenseResidencyPolicy`]. The reader was *assuming* that rather than checking it. A `Packed`
-    /// entry arriving from a foreign policy (or from a policy that grows a packed row) would
-    /// materialize the dense reconstruction of a layer admission priced at its stored packing:
-    /// bf16 is 2 bytes/element against fp8's 1, so the load silently costs twice the admitted
-    /// footprint, with the receipt reporting the larger number long after admission committed to
-    /// the smaller one.
     #[test]
-    fn read_refuses_a_packed_plan_entry_rather_than_dense_decoding_it() {
+    fn read_refuses_a_foreign_packed_plan_without_a_native_operator() {
         let dir = fixture_dir();
         let path = dir.path().join("packed-plan.safetensors");
-        let descriptor = br#"{"format": "float8_e4m3fn"}"#;
+        let descriptor = br#"{"format": "int8_tensorwise", "per_row": true}"#;
         write_safetensors(
             &path,
             &[
-                ("model.q.weight", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                ("model.q.weight", "I8", &[2, 4], vec![1; 8]),
                 (
                     "model.q.weight_scale",
                     "F32",
-                    &[],
-                    1.0_f32.to_le_bytes().to_vec(),
+                    &[2, 1],
+                    1.0_f32.to_le_bytes().repeat(2),
                 ),
                 (
                     "model.q.comfy_quant",
@@ -1815,7 +2071,7 @@ mod tests {
             ],
         );
 
-        // The engine's own plan is dense, and reads.
+        // The unrotated per-row I8 matrix has a dense decoder; ConvRot uses a separate operator.
         let dense = plan_logical_weights(&path, &StripModel).expect("plan");
         assert_eq!(dense.tensors[0].residency.mode, ResidencyMode::Dense);
         eager_read(&path, &dense);
@@ -1830,7 +2086,7 @@ mod tests {
         let mut materialize = |weights: &mut Weights| weights.materialize();
         let error = read_logical_weights(&path, &packed, LogicalReadMode::Eager(&mut materialize))
             .err()
-            .expect("a packed plan entry must refuse on an engine with no packed leg");
+            .expect("the plain per-row format has no native Metal activation/GEMM contract");
         let error = error.to_string();
         assert!(error.contains("model.q.weight"), "{error}");
         assert!(error.contains("Packed"), "{error}");

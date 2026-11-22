@@ -96,6 +96,16 @@ impl CompletedAudioTransform {
 /// [`StemSeparation`](AudioTransformKind::StemSeparation) — the single vs multi-output shape the
 /// family requires, expressed by one signature rather than two methods.
 pub trait AudioTransform {
+    /// Checkpoint execution and measured resident bytes for the primary source, when available.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+
+    /// Measured checkpoints, including separately loaded encoder and decoder components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
+
     fn descriptor(&self) -> &AudioTransformDescriptor;
     fn validate(&self, req: &AudioTransformRequest) -> Result<()>;
     fn apply(

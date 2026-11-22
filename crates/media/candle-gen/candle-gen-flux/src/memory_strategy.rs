@@ -222,6 +222,12 @@ fn resident_component_bytes(
         return Ok(0);
     }
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let encoded = candle_gen::logical_weights::projection_prices(
+        path,
+        &headers,
+        |_| float_width(),
+        candle_gen::logical_weights::standard_linear_weight,
+    )?;
     let by_name: HashMap<&str, &gen_core::weightsmeta::SafetensorsTensorHeader> = headers
         .iter()
         .map(|header| (header.name.as_str(), header))
@@ -244,7 +250,9 @@ fn resident_component_bytes(
             .name
             .strip_suffix(".weight")
             .filter(|base| packed_bases.contains(base));
-        let bytes = if let Some(base) = packed_base {
+        let bytes = if let Some(&bytes) = encoded.get(&tensor.name) {
+            bytes
+        } else if let Some(base) = packed_base {
             let sidecar = |suffix: &str| {
                 by_name
                     .get(format!("{base}.{suffix}").as_str())

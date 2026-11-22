@@ -104,7 +104,7 @@ struct Umt5Block {
     gate_proj: AdaptableLinear,
     fc1: AdaptableLinear,
     fc2: AdaptableLinear,
-    pos_embedding: Array, // [num_buckets, num_heads], f32
+    pos_embedding: TokenEmbedding, // [num_buckets, num_heads], gathered as f32
 }
 
 impl Umt5Block {
@@ -126,7 +126,11 @@ impl Umt5Block {
             gate_proj: lin("ffn.gate_proj")?,
             fc1: lin("ffn.fc1")?,
             fc2: lin("ffn.fc2")?,
-            pos_embedding: f32(w.require(&format!("{p}.pos_embedding.embedding.weight"))?)?,
+            pos_embedding: quant::embedding_compute(
+                w,
+                &format!("{p}.pos_embedding.embedding"),
+                Dtype::Float32,
+            )?,
         })
     }
 
@@ -142,7 +146,9 @@ impl Umt5Block {
             &mut self.fc1,
             &mut self.fc2,
         ] {
-            lin.quantize(bits, Some(group))?;
+            if lin.fp8_base().is_none() && lin.convrot_base().is_none() {
+                lin.quantize(bits, Some(group))?;
+            }
         }
         Ok(())
     }
@@ -213,11 +219,8 @@ impl Umt5Encoder {
             // source) now, THEN drop w's dense refs for this block — releasing the block's bf16 before
             // the next one loads. Without the drain the sources accumulate to the full ~11 GB (measured
             // 13.6 GiB peak vs 4.1 with it).
-            let mut arrays = vec![
-                block.norm1_w.clone(),
-                block.norm2_w.clone(),
-                block.pos_embedding.clone(),
-            ];
+            let mut arrays = vec![block.norm1_w.clone(), block.norm2_w.clone()];
+            block.pos_embedding.materialize_weights()?;
             block.push_quant_arrays(&mut arrays);
             eval(arrays.iter())?;
             w.remove_prefix(&format!("blocks.{i}."));
@@ -385,7 +388,7 @@ impl Umt5Block {
     fn position_bias(&self, buckets: &Array) -> Result<Array> {
         let seq = buckets.shape()[0];
         let flat = buckets.reshape(&[seq * seq])?;
-        let embeds = self.pos_embedding.take_axis(&flat, 0)?; // [L*L, heads]
+        let embeds = self.pos_embedding.forward(&flat)?; // [L*L, heads]
         let heads = embeds.shape()[1];
         Ok(embeds
             .reshape(&[seq, seq, heads])?

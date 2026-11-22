@@ -54,12 +54,7 @@ struct MappingMlp {
 
 impl MappingMlp {
     fn from_weights(w: &Weights, p: &str) -> GenResult<Self> {
-        let lin = |leaf: &str| -> GenResult<Linear> {
-            Ok(Linear::new(
-                w.require(&join(p, &format!("{leaf}.weight")))?,
-                Some(w.require(&join(p, &format!("{leaf}.bias")))?),
-            ))
-        };
+        let lin = |leaf: &str| -> GenResult<Linear> { w.linear(&join(p, leaf), true) };
         Ok(Self {
             l0: lin("0")?,
             ln1: layer_norm(w, &join(p, "1"))?,
@@ -95,12 +90,7 @@ struct PerceiverAttention {
 
 impl PerceiverAttention {
     fn from_weights(w: &Weights, p: &str, heads: usize, dim_head: usize) -> GenResult<Self> {
-        let lin = |leaf: &str| -> GenResult<Linear> {
-            Ok(Linear::new(
-                w.require(&join(p, &format!("{leaf}.weight")))?,
-                None,
-            ))
-        };
+        let lin = |leaf: &str| -> GenResult<Linear> { w.linear(&join(p, leaf), false) };
         Ok(Self {
             norm1: layer_norm(w, &join(p, "norm1"))?,
             norm2: layer_norm(w, &join(p, "norm2"))?,
@@ -152,8 +142,8 @@ impl FeedForward {
     fn from_weights(w: &Weights, p: &str) -> GenResult<Self> {
         Ok(Self {
             ln: layer_norm(w, &join(p, "0"))?,
-            l1: Linear::new(w.require(&join(p, "1.weight"))?, None),
-            l3: Linear::new(w.require(&join(p, "3.weight"))?, None),
+            l1: w.linear(&join(p, "1"), false)?,
+            l3: w.linear(&join(p, "3"), false)?,
         })
     }
 

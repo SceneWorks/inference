@@ -17,6 +17,7 @@ use crate::{MlxWeightSource, Result};
 /// returns native bf16, so it keeps its own variant rather than using this.
 pub enum TokenEmbedding {
     Dense(Array),
+    Native(crate::NativeProjection, Dtype),
     Quantized {
         wq: Array,
         scales: Array,
@@ -29,8 +30,12 @@ pub enum TokenEmbedding {
 impl TokenEmbedding {
     /// Gather rows for `ids` (`[b, s]`) → `[b, s, hidden]`, cast to f32.
     pub fn forward(&self, ids: &Array) -> Result<Array> {
+        Ok(self.rows(ids)?.as_dtype(Dtype::Float32)?)
+    }
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
         let out = match self {
             Self::Dense(w) => w.take_axis(ids, 0)?,
+            Self::Native(p, dtype) => p.rows_as(ids, *dtype)?,
             Self::Quantized {
                 wq,
                 scales,
@@ -44,7 +49,7 @@ impl TokenEmbedding {
                 dequantize(&pw, &sc, &bi, *group_size, *bits)?
             }
         };
-        Ok(out.as_dtype(Dtype::Float32)?)
+        Ok(out)
     }
 
     /// Build a quantized table directly from **already-packed** parts read off disk — the
@@ -102,6 +107,7 @@ impl TokenEmbedding {
     pub fn materialize_weights(&self) -> Result<()> {
         match self {
             Self::Dense(weight) => mlx_rs::transforms::eval([weight])?,
+            Self::Native(p, _) => p.materialize()?,
             Self::Quantized {
                 wq, scales, biases, ..
             } => mlx_rs::transforms::eval([wq, scales, biases])?,
@@ -465,6 +471,18 @@ pub fn packed_bits_from_metadata(
     Ok(bits)
 }
 
+/// Resolve native codec operands before family-specific casts or affine handling.
+pub fn native_lin(
+    w: &(impl MlxWeightSource + ?Sized),
+    base: &str,
+    bias: bool,
+) -> Result<Option<AdaptableLinear>> {
+    if !crate::NativeProjection::is_declared(w, base, &format!("{base}.weight")) {
+        return Ok(None);
+    }
+    Ok(crate::NativeProjection::from_weights(w, base, bias)?.map(AdaptableLinear::from_native))
+}
+
 /// Load `{base}` as an [`AdaptableLinear`] — **packed** (Q4/Q8) when `{base}.scales` is present (a
 /// pre-quantized snapshot, bit-width inferred from the shapes at `group_size`), else **dense**. `bias`
 /// additionally loads the dense `{base}.bias` (the quantization's own `{base}.biases` is distinct and
@@ -477,11 +495,27 @@ pub fn lin<W: MlxWeightSource + ?Sized>(
     bias: bool,
     group_size: i32,
 ) -> Result<AdaptableLinear> {
-    let bias = if bias {
-        Some(w.require(&format!("{base}.bias"))?.clone())
-    } else {
-        None
-    };
+    let bias = bias
+        .then(|| w.require(&format!("{base}.bias")).cloned())
+        .transpose()?;
+    lin_with_bias(w, base, bias, group_size)
+}
+
+/// A projection whose architecture supplies the bias under a separate key (e.g. EVA q_bias).
+pub fn lin_with_bias(
+    w: &(impl MlxWeightSource + ?Sized),
+    base: &str,
+    bias: Option<Array>,
+    group_size: i32,
+) -> Result<AdaptableLinear> {
+    if crate::NativeProjection::is_declared(w, base, &format!("{base}.weight")) {
+        if let Some(mut native) = crate::NativeProjection::from_weights(w, base, false)? {
+            if let Some(b) = bias {
+                native.set_bias(b)?;
+            }
+            return Ok(AdaptableLinear::from_native(native));
+        }
+    }
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
         let bits = packed_bits(wq, scales, group_size)?;
@@ -507,6 +541,9 @@ pub fn embedding<W: MlxWeightSource + ?Sized>(
     base: &str,
     group_size: i32,
 ) -> Result<TokenEmbedding> {
+    if let Some(native) = crate::NativeProjection::from_weights(w, base, false)? {
+        return Ok(TokenEmbedding::Native(native, Dtype::Bfloat16));
+    }
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
         let bits = packed_bits(wq, scales, group_size)?;
@@ -520,6 +557,21 @@ pub fn embedding<W: MlxWeightSource + ?Sized>(
     }
     Ok(TokenEmbedding::Dense(
         w.require(&format!("{base}.weight"))?.clone(),
+    ))
+}
+
+/// Embedding-table coefficients in an architecture's chosen dense dtype. Encoded tables keep their
+/// source representation; only gathered rows cross the floating-point boundary.
+pub fn embedding_compute(
+    w: &(impl MlxWeightSource + ?Sized),
+    base: &str,
+    dtype: Dtype,
+) -> Result<TokenEmbedding> {
+    if let Some(p) = crate::NativeProjection::from_weights(w, base, false)? {
+        return Ok(TokenEmbedding::Native(p, dtype));
+    }
+    Ok(TokenEmbedding::Dense(
+        w.require(&format!("{base}.weight"))?.as_dtype(dtype)?,
     ))
 }
 

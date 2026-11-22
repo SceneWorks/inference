@@ -177,7 +177,12 @@ fn require_dense(w: &Weights, base: &str, why: &str) -> Result<()> {
 /// A projection the converter left dense — whether by policy or, like `mlp.linear_fc2`
 /// (`in_features = 4304`), because its input width is not group-aligned — simply has no `.scales`
 /// sibling and falls through to the dense arm. No per-tensor special cases.
-fn vision_linear(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
+fn vision_linear(
+    w: &Weights,
+    base: &str,
+    bias: bool,
+    shape: Option<[usize; 2]>,
+) -> Result<QLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
@@ -197,11 +202,11 @@ fn vision_linear(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
             .transpose()?;
         return QLinear::packed(&wq, &scales, &biases, dense_bias, cfg.group_size as usize);
     }
-    let weight = w.get_f32(&weight_key)?;
-    let bias = bias
-        .then(|| w.get_f32(&format!("{base}.bias")))
-        .transpose()?;
-    Ok(QLinear::dense(Linear::new(weight, bias)))
+    Ok(QLinear::dense(w.vision_projection(
+        base,
+        bias,
+        shape.as_ref().map(|s| s.as_slice()),
+    )?))
 }
 
 /// One vision block: pre-LayerNorm full attention + pre-LayerNorm GELU-tanh MLP, both residual.
@@ -220,13 +225,35 @@ struct Block {
 impl Block {
     fn load(w: &Weights, prefix: &str, cfg: &VisionConfig) -> Result<Self> {
         let head_dim = cfg.head_dim();
+        let hidden = cfg.hidden_size;
+        let inner = w.vector_len(&format!("{prefix}.mlp.linear_fc1.bias"))?;
         Ok(Self {
             norm1: layer_norm(w, &format!("{prefix}.norm1"), cfg.norm_eps)?,
             norm2: layer_norm(w, &format!("{prefix}.norm2"), cfg.norm_eps)?,
-            qkv: vision_linear(w, &format!("{prefix}.attn.qkv"), true)?,
-            proj: vision_linear(w, &format!("{prefix}.attn.proj"), true)?,
-            fc1: vision_linear(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
-            fc2: vision_linear(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
+            qkv: vision_linear(
+                w,
+                &format!("{prefix}.attn.qkv"),
+                true,
+                Some([3 * hidden, hidden]),
+            )?,
+            proj: vision_linear(
+                w,
+                &format!("{prefix}.attn.proj"),
+                true,
+                Some([hidden, hidden]),
+            )?,
+            fc1: vision_linear(
+                w,
+                &format!("{prefix}.mlp.linear_fc1"),
+                true,
+                Some([inner, hidden]),
+            )?,
+            fc2: vision_linear(
+                w,
+                &format!("{prefix}.mlp.linear_fc2"),
+                true,
+                Some([hidden, inner]),
+            )?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f64).powf(-0.5),
@@ -302,12 +329,23 @@ impl Merger {
         prefix: &str,
         postshuffle: bool,
         merged_dim: usize,
+        output: usize,
         norm_eps: f64,
     ) -> Result<Self> {
         Ok(Self {
             norm: layer_norm(w, &format!("{prefix}.norm"), norm_eps)?,
-            fc1: vision_linear(w, &format!("{prefix}.linear_fc1"), true)?,
-            fc2: vision_linear(w, &format!("{prefix}.linear_fc2"), true)?,
+            fc1: vision_linear(
+                w,
+                &format!("{prefix}.linear_fc1"),
+                true,
+                Some([merged_dim, merged_dim]),
+            )?,
+            fc2: vision_linear(
+                w,
+                &format!("{prefix}.linear_fc2"),
+                true,
+                Some([output, merged_dim]),
+            )?,
             postshuffle,
             merged_dim,
         })
@@ -368,12 +406,17 @@ impl VisionTower {
         )?;
         // Fold the Conv3d patch-embed weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul; keep its bias.
-        let conv = w.get_f32(&format!("{prefix}.patch_embed.proj.weight"))?;
-        let dims = conv.dims();
-        let embed = dims[0];
-        let in_dim: usize = dims[1..].iter().product();
-        let bias = w.get_f32(&format!("{prefix}.patch_embed.proj.bias"))?;
-        let patch_embed = Linear::new(conv.reshape((embed, in_dim))?, Some(bias));
+        let patch_embed = w.vision_projection(
+            &format!("{prefix}.patch_embed.proj"),
+            true,
+            Some(&[
+                cfg.hidden_size,
+                cfg.in_channels,
+                cfg.temporal_patch_size,
+                cfg.patch_size,
+                cfg.patch_size,
+            ]),
+        )?;
 
         let blocks = (0..cfg.depth)
             .map(|i| Block::load(w, &format!("{prefix}.blocks.{i}"), &cfg))
@@ -385,6 +428,7 @@ impl VisionTower {
             &format!("{prefix}.merger"),
             false,
             merged_dim,
+            cfg.out_hidden_size,
             cfg.norm_eps,
         )?;
         let deepstack_mergers = (0..cfg.deepstack_visual_indexes.len())
@@ -394,6 +438,7 @@ impl VisionTower {
                     &format!("{prefix}.deepstack_merger_list.{i}"),
                     true,
                     merged_dim,
+                    cfg.out_hidden_size,
                     cfg.norm_eps,
                 )
             })
@@ -781,7 +826,7 @@ mod tests {
         insert_packed(&mut map, "blocks.0.attn.qkv", out_dim, in_dim, 3);
         let (_dir, w) = weights_from(&map, Some(G), DType::F32);
 
-        let lin = vision_linear(&w, "blocks.0.attn.qkv", false)?;
+        let lin = vision_linear(&w, "blocks.0.attn.qkv", false, None)?;
         assert!(
             lin.is_packed(),
             "`.scales` + a quantization marker ⇒ packed load, not a silent dense fallback"
@@ -809,10 +854,10 @@ mod tests {
         insert_packed(&mut map, "blocks.0.attn.qkv", 192, 64, 1);
 
         let (_d32, w32) = weights_from(&map, Some(G), DType::F32);
-        assert!(vision_linear(&w32, "blocks.0.attn.qkv", false)?.is_packed());
+        assert!(vision_linear(&w32, "blocks.0.attn.qkv", false, None)?.is_packed());
 
         let (_d64, w64) = weights_from(&map, Some(64), DType::F32);
-        let err = vision_linear(&w64, "blocks.0.attn.qkv", false)
+        let err = vision_linear(&w64, "blocks.0.attn.qkv", false, None)
             .err()
             .expect("a group-32 pack read at group 64 must not load silently");
         assert!(
@@ -843,7 +888,7 @@ mod tests {
         let mut marked = HashMap::new();
         marked.insert("mlp.linear_fc2.weight".to_string(), dense_w.clone());
         let (_d, w) = weights_from(&marked, Some(G), DType::BF16);
-        let lin = vision_linear(&w, "mlp.linear_fc2", false)?;
+        let lin = vision_linear(&w, "mlp.linear_fc2", false, None)?;
         assert!(!lin.is_packed(), "no `.scales` ⇒ dense path unchanged");
         match &lin {
             QLinear::Dense(l) => assert_eq!(
@@ -862,9 +907,37 @@ mod tests {
         let (_d, w) = weights_from(&unmarked, None, DType::BF16);
         assert!(w.packed().is_none(), "no quantization block ⇒ dense tier");
         assert!(
-            !vision_linear(&w, "mlp.linear_fc2", false)?.is_packed(),
+            !vision_linear(&w, "mlp.linear_fc2", false, None)?.is_packed(),
             "no marker ⇒ dense path unchanged"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vision_projects_metadata_only_mxfp8_at_f32_at_logical_width() -> Result<()> {
+        let desc = br#"{"format":"mxfp8"}"#;
+        let map = HashMap::from([
+            (
+                "mlp.linear_fc2.weight".into(),
+                Tensor::from_raw_buffer(&[0x38; 32 * 32], DType::F8E4M3, &[32, 32], &Device::Cpu)?,
+            ),
+            (
+                "mlp.linear_fc2.weight_scale".into(),
+                Tensor::from_slice(&[127u8; 128 * 4], (128, 4), &Device::Cpu)?,
+            ),
+            (
+                "mlp.linear_fc2.comfy_quant".into(),
+                Tensor::from_slice(desc, desc.len(), &Device::Cpu)?,
+            ),
+        ]);
+        let (_dir, weights) = weights_from(&map, None, DType::BF16);
+        let QLinear::Dense(linear) =
+            vision_linear(&weights, "mlp.linear_fc2", false, Some([5, 3]))?
+        else {
+            panic!("expected coefficient fallback on CPU")
+        };
+        assert_eq!(linear.weight_dims()?, (5, 3));
+        assert_eq!(linear.try_weight()?.to_vec2::<f32>()?, vec![vec![1.; 3]; 5]);
         Ok(())
     }
 
@@ -884,7 +957,7 @@ mod tests {
         map.insert("attn.proj.bias".to_string(), bias.clone());
         let (_dir, w) = weights_from(&map, Some(G), DType::F32);
 
-        let packed = vision_linear(&w, "attn.proj", true)?;
+        let packed = vision_linear(&w, "attn.proj", true, None)?;
         assert!(packed.is_packed());
         let reference = QLinear::dense(Linear::new(grid, Some(bias)));
 
@@ -921,7 +994,7 @@ mod tests {
             "fixture precondition: the stored weight really is a float"
         );
 
-        let err = vision_linear(&w, "blocks.0.attn.qkv", false)
+        let err = vision_linear(&w, "blocks.0.attn.qkv", false, None)
             .err()
             .expect("a float `.weight` under a `.scales` sibling must be refused");
         let msg = err.to_string();

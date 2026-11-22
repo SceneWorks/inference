@@ -249,25 +249,28 @@ impl XcodecEncoder {
     /// (HuBERT — the checkpoint's copy, which upstream's `load_state_dict` puts over the
     /// `semantic_ckpts` one) and quantizer 0's codebook. The decoder half is never paged in.
     pub fn load(checkpoint: &Path, device: &Device) -> Result<Self, AudioError> {
-        let st = candle_audio::weights::mmap_safetensors(checkpoint)
-            .map_err(|e| AudioError::Msg(format!("xcodec: open {}: {e}", checkpoint.display())))?;
-        let load = |name: &str| -> Result<Tensor, AudioError> {
-            candle_audio::weights::load_f32(&st, name, device)
+        let source = candle_audio::weights::AudioCheckpoint::open(checkpoint, device)?;
+        let names = source.names();
+        let vb = source.builder(candle_audio::candle_core::DType::F32, device);
+        let load = |name: &str| {
+            vb.get_unchecked(name)
                 .map_err(|e| AudioError::Msg(format!("xcodec: tensor {name:?}: {e}")))
         };
-        let prefixed = |prefix: &'static str| {
-            candle_audio::weights::load_f32_map(&st, device, |name| name.starts_with(prefix))
-                .map_err(|e| AudioError::Msg(format!("xcodec: {e}")))
+        let prefixed = |prefix: &str| {
+            names
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .map(|name| Ok((name.clone(), load(name)?)))
+                .collect::<Result<HashMap<_, _>, AudioError>>()
         };
         let acoustic = prefixed("encoder.")?;
         let semantic = prefixed("encoder_semantic.")?;
-        let hubert = prefixed("semantic_model.")?;
         // Only the DAC encoder's pairs are dim-0 weight norms; HuBERT's positional conv is
         // `weight_norm(dim = 2)` and is folded by `Hubert::load`.
         let acoustic =
             DacEncoder::load(&resolve_weight_norm(acoustic)?, "encoder", &ENCODER_RATES)?;
         let semantic = SemanticEncoder::load(&semantic, "encoder_semantic")?;
-        let hubert = Hubert::load(&hubert, "semantic_model.")?;
+        let hubert = Hubert::from_builder(vb.pp("semantic_model"))?;
 
         let codebook0 = load("quantizer.vq.layers.0._codebook.embed")?;
         let (size, dim) = codebook0.dims2()?;
@@ -276,8 +279,8 @@ impl XcodecEncoder {
                 "xcodec: codebook 0 has {size} entries, expected {CODEBOOK_SIZE}"
             )));
         }
-        let fc_w = load("fc_prior.weight")?;
-        let (fc_out, fc_in) = fc_w.dims2()?;
+        let fc_prior = candle_audio::weights::checkpoint_linear(&vb.pp("fc_prior"), true)?;
+        let (fc_out, fc_in) = fc_prior.weight_dims()?;
         let (ac_out, sem_out) = (acoustic.output_dim()?, semantic.output_dim()?);
         if fc_out != dim || fc_in != ac_out + sem_out {
             return Err(AudioError::Msg(format!(
@@ -289,7 +292,7 @@ impl XcodecEncoder {
             hubert,
             semantic,
             acoustic,
-            fc_prior: Linear::new(fc_w, Some(load("fc_prior.bias")?)),
+            fc_prior,
             codebook0,
             device: device.clone(),
             chunk_frames: DEFAULT_CHUNK_FRAMES,

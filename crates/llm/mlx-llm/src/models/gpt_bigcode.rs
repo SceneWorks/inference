@@ -4,6 +4,7 @@
 //! absolute positions and multi-query attention, and treating it as a Llama alias would load the
 //! checkpoint while producing numerically unrelated SVG source.
 
+use crate::primitives::Projection;
 use mlx_rs::ops::{add, matmul, split_sections};
 use mlx_rs::Array;
 
@@ -11,7 +12,7 @@ use crate::decode::Decode;
 use crate::error::{Error, Result};
 use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, gelu_tanh, layer_norm, linear};
+use crate::primitives::nn::{gelu_tanh, layer_norm, linear};
 use crate::primitives::Weights;
 
 /// Project a multi-row GPTBigCode prefill as a batch of independent matrix-vector products.
@@ -72,12 +73,11 @@ impl GptBigCodeConfig {
 
 /// Native GPTBigCode decoder with learned positions and a single MQA KV head.
 pub struct GptBigCode {
-    token_embedding: Array,
-    position_embedding: Array,
+    token_embedding: Projection,
+    position_embedding: Projection,
     layers: Vec<GptBigCodeLayer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
-    lm_head: Array,
     cfg: GptBigCodeConfig,
 }
 
@@ -85,11 +85,12 @@ impl GptBigCode {
     /// Load the exact StarVector decoder from its namespaced safetensors map.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: GptBigCodeConfig) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        let token_embedding = w.require(&key("transformer.wte.weight"))?.clone();
+        let token_embedding =
+            Projection::from_named(w, &key("transformer.wte.weight"), None, None)?;
         // GPTBigCode ties the output projection to the token embedding. The published
         // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
-        let lm_head = token_embedding.clone();
-        let position_embedding = w.require(&key("transformer.wpe.weight"))?.clone();
+        let position_embedding =
+            Projection::from_named(w, &key("transformer.wpe.weight"), None, None)?;
         let mut layers = Vec::with_capacity(cfg.layers);
         for index in 0..cfg.layers {
             layers.push(GptBigCodeLayer::from_weights(
@@ -104,7 +105,6 @@ impl GptBigCode {
             layers,
             final_norm_weight: w.require(&key("transformer.ln_f.weight"))?.clone(),
             final_norm_bias: w.require(&key("transformer.ln_f.bias"))?.clone(),
-            lm_head,
             cfg,
         };
         w.verify_accessed_gpu_view()?;
@@ -122,15 +122,15 @@ impl GptBigCode {
         let positions: Vec<i32> = (offset..offset + shape[1]).collect();
         let position_ids = Array::from_slice(&positions, &[1, shape[1]]);
         Ok(add(
-            &embed(&self.token_embedding, ids)?,
-            &embed(&self.position_embedding, &position_ids)?,
+            &self.token_embedding.rows(ids)?,
+            &self.position_embedding.rows(&position_ids)?,
         )?)
     }
 
     /// Token embeddings without position rows, used to concatenate the image prefix before one
     /// shared learned-position lookup over the complete multimodal prompt.
     pub fn raw_embed(&self, ids: &Array) -> Result<Array> {
-        embed(&self.token_embedding, ids)
+        self.token_embedding.rows(ids)
     }
 
     /// Prefill multimodal embeddings. Vision rows already occupy positions `0..offset`; `embeds`
@@ -148,7 +148,7 @@ impl GptBigCode {
         )?;
         let sequence = hidden.shape()[1];
         let last = hidden.take_axis(Array::from_slice(&[sequence - 1], &[1]), 1)?;
-        let logits = linear(&last, &self.lm_head, None)?;
+        let logits = self.token_embedding.forward(&last)?;
         Ok(logits.reshape(&[hidden.shape()[0], self.cfg.vocab_size])?)
     }
 
@@ -162,7 +162,7 @@ impl GptBigCode {
         }
         let positions: Vec<i32> = (offset..offset + sequence).collect();
         let ids = Array::from_slice(&positions, &[1, sequence]);
-        Ok(add(embeds, &embed(&self.position_embedding, &ids)?)?)
+        Ok(add(embeds, &self.position_embedding.rows(&ids)?)?)
     }
 
     /// A fresh MQA cache for this decoder.
@@ -188,10 +188,8 @@ struct GptBigCodeLayer {
     attn: GptBigCodeAttention,
     ln_2_weight: Array,
     ln_2_bias: Array,
-    fc_weight: Array,
-    fc_bias: Array,
-    proj_weight: Array,
-    proj_bias: Array,
+    fc: Projection,
+    proj: Projection,
 }
 
 impl GptBigCodeLayer {
@@ -203,10 +201,18 @@ impl GptBigCodeLayer {
             attn: GptBigCodeAttention::from_weights(w, &key("attn"), cfg)?,
             ln_2_weight: w.require(&key("ln_2.weight"))?.clone(),
             ln_2_bias: w.require(&key("ln_2.bias"))?.clone(),
-            fc_weight: w.require(&key("mlp.c_fc.weight"))?.clone(),
-            fc_bias: w.require(&key("mlp.c_fc.bias"))?.clone(),
-            proj_weight: w.require(&key("mlp.c_proj.weight"))?.clone(),
-            proj_bias: w.require(&key("mlp.c_proj.bias"))?.clone(),
+            fc: Projection::from_named(
+                w,
+                &key("mlp.c_fc.weight"),
+                Some(w.require(&key("mlp.c_fc.bias"))?.clone()),
+                None,
+            )?,
+            proj: Projection::from_named(
+                w,
+                &key("mlp.c_proj.weight"),
+                Some(w.require(&key("mlp.c_proj.bias"))?.clone()),
+                None,
+            )?,
         })
     }
 
@@ -222,31 +228,37 @@ impl GptBigCodeLayer {
         )?;
         // The published StarVector safetensors store every GPTBigCode projection in ordinary
         // `[out, in]` layout, matching the shared linear helper.
-        let mlp = linear_batched_gemv(&normed, &self.fc_weight, Some(&self.fc_bias))?;
+        let mlp = self.fc.forward_with_dense(&normed, linear_batched_gemv)?;
         let mlp = gelu_tanh(
             &mlp,
             crate::primitives::activation::ActivationRole::LlmDecode,
         )?;
-        let mlp = linear_batched_gemv(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
+        let mlp = self.proj.forward_with_dense(&mlp, linear_batched_gemv)?;
         Ok(add(&hidden, &mlp)?)
     }
 }
 
 struct GptBigCodeAttention {
-    qkv_weight: Array,
-    qkv_bias: Array,
-    out_weight: Array,
-    out_bias: Array,
+    qkv: Projection,
+    out: Projection,
     cfg: GptBigCodeConfig,
 }
 
 impl GptBigCodeAttention {
     fn from_weights(w: &Weights, prefix: &str, cfg: GptBigCodeConfig) -> Result<Self> {
         Ok(Self {
-            qkv_weight: w.require(&format!("{prefix}.c_attn.weight"))?.clone(),
-            qkv_bias: w.require(&format!("{prefix}.c_attn.bias"))?.clone(),
-            out_weight: w.require(&format!("{prefix}.c_proj.weight"))?.clone(),
-            out_bias: w.require(&format!("{prefix}.c_proj.bias"))?.clone(),
+            qkv: Projection::from_named(
+                w,
+                &format!("{prefix}.c_attn.weight"),
+                Some(w.require(&format!("{prefix}.c_attn.bias"))?.clone()),
+                None,
+            )?,
+            out: Projection::from_named(
+                w,
+                &format!("{prefix}.c_proj.weight"),
+                Some(w.require(&format!("{prefix}.c_proj.bias"))?.clone()),
+                None,
+            )?,
             cfg,
         })
     }
@@ -254,7 +266,7 @@ impl GptBigCodeAttention {
     fn forward(&self, hidden: &Array, cache: &mut dyn KvCache, index: usize) -> Result<Array> {
         let shape = hidden.shape();
         let (batch, sequence) = (shape[0], shape[1]);
-        let qkv = linear_batched_gemv(hidden, &self.qkv_weight, Some(&self.qkv_bias))?;
+        let qkv = self.qkv.forward_with_dense(hidden, linear_batched_gemv)?;
         let head_dim = self.cfg.head_dim();
         // StarCoderBase-1B is `multi_query=true`: one K and one V head.
         let parts = split_sections(
@@ -275,7 +287,7 @@ impl GptBigCodeAttention {
         let attended = sdpa_causal(&query, &keys, &values, 1.0 / (head_dim as f32).sqrt())?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, sequence, self.cfg.hidden_size])?;
-        linear_batched_gemv(&attended, &self.out_weight, Some(&self.out_bias))
+        self.out.forward_with_dense(&attended, linear_batched_gemv)
     }
 }
 
@@ -481,11 +493,6 @@ mod tests {
     #[ignore = "model inference; explicit model-proof workflow"]
     fn tiny_decoder_loads_and_projects_with_tied_token_embeddings() {
         let model = tiny_decoder();
-        assert_eq!(
-            model.lm_head.as_slice::<f32>(),
-            model.token_embedding.as_slice::<f32>()
-        );
-
         let mut cache = model.cache();
         let logits = model
             .logits_from_embeds(&model.embed_at(&input_ids(&[1]), 0).unwrap(), &mut cache)

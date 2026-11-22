@@ -23,10 +23,7 @@ use mlx_gen::{Error, Result};
 const LN_EPS: f32 = 1e-6;
 
 fn linear(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
-    Ok(AdaptableLinear::dense(
-        w.require(&format!("{prefix}.weight"))?.clone(),
-        Some(w.require(&format!("{prefix}.bias"))?.clone()),
-    ))
+    mlx_gen::quant::lin(w, prefix, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 fn require(w: &Weights, key: &str) -> Result<Array> {

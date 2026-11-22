@@ -270,9 +270,7 @@ fn native_projections_match_pinned_kitchen() {
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        let out = loaded
-            .linear
-            .forward(&x)
+        let out = __model_proof_output!(loaded.linear.forward(&x))
             .unwrap()
             .to_dtype(DType::F32)
             .unwrap()
@@ -295,6 +293,62 @@ fn native_projections_match_pinned_kitchen() {
             .linear
             .quantize(candle_gen::gen_core::Quant::Q8)
             .is_err());
+        let mut a = vec![0f32; k];
+        a[0] = 1.;
+        loaded
+            .linear
+            .push_lora_checked(
+                Tensor::from_vec(a, (k, 1), &device).unwrap(),
+                Tensor::ones((1, n), DType::F32, &device).unwrap(),
+                0.25,
+            )
+            .unwrap();
+        let values = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let adapted = values(__model_proof_output!(loaded.linear.forward(&x)).unwrap());
+        let inputs = values(x);
+        let round = |v: f32| match dtype {
+            DType::BF16 => {
+                f32::from_bits(u32::from(candle_gen::gen_core::numeric::bf16_bits(v)) << 16)
+            }
+            DType::F16 => half::f16::from_f32(v).to_f32(),
+            _ => v,
+        };
+        for (i, &base) in floats(&case["expected"]).iter().enumerate() {
+            let want = round(base + round(inputs[(i / n) * k] * 0.25));
+            let tolerance = if dtype == DType::F32 {
+                2e-5 * want.abs().max(1.)
+            } else {
+                0.
+            };
+            assert!(
+                (adapted[i] - want).abs() <= tolerance,
+                "group{g} {dtype:?} adapted output{i}: {} != {want}",
+                adapted[i]
+            );
+        }
+        assert_ne!(out, adapted);
+        assert!(loaded.linear.is_convrot_int8() && loaded.linear.is_packed());
+        assert_eq!(loaded.base_bytes, n * k + n * 4 + expected_bias_bytes);
+        loaded.linear.clear_adapters();
+        let x = Tensor::from_vec(inputs, (m, k), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        assert_eq!(
+            out,
+            values(__model_proof_output!(loaded.linear.forward(&x)).unwrap())
+        );
         println!("native CUDA group{g} {dtype:?} {m}x{k} -> {m}x{n}, oracle matched");
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED convrot_int8::native_projections_match_pinned_kitchen"
+    );
 }

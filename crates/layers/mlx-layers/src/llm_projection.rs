@@ -568,9 +568,108 @@ pub enum Projection {
     Quantized(QuantizedLinear),
     /// Prism ternary affine weight with a folded Hadamard activation rotation.
     Prism(PrismLinear),
+    /// Original signed codes, F32 row scales and shared rotation.
+    Native(crate::NativeProjection),
 }
 
 impl Projection {
+    pub fn expert_shape(&self) -> Result<[i32; 2]> {
+        match self {
+            Self::Native(p) => Ok(p.shape()),
+            Self::Dense { weight, bias: None } => weight
+                .shape()
+                .try_into()
+                .map_err(|_| Error::Config("expert requires a rank-two matrix".into())),
+            Self::Quantized(q) if q.bias.is_none() && q.scales.ndim() == 2 => {
+                Ok([q.scales.shape()[0], q.scales.shape()[1] * q.group_size])
+            }
+            _ => Err(Error::Unsupported(
+                "expert projection has unsupported layout or additive bias".into(),
+            )),
+        }
+    }
+
+    /// Bind a described packed projection before a model casts a source to its compute dtype.
+    pub fn native(
+        w: &(impl crate::MlxWeightSource + ?Sized),
+        key: &str,
+        bias: bool,
+    ) -> Result<Option<Self>> {
+        let Some(base) = key.strip_suffix(".weight") else {
+            return Ok(None);
+        };
+        if !crate::NativeProjection::is_declared(w, base, key) {
+            return Ok(None);
+        }
+        Ok(crate::NativeProjection::from_weights(w, base, bias)?.map(Self::Native))
+    }
+
+    /// Bind the original weight before applying the model's dense compute cast.
+    pub fn from_named(
+        w: &(impl crate::MlxWeightSource + ?Sized),
+        key: &str,
+        bias: Option<Array>,
+        compute: Option<Dtype>,
+    ) -> Result<Self> {
+        let base = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .unwrap_or(key);
+        if let Some(mut native) = crate::NativeProjection::from_key(w, base, key, false)? {
+            if let Some(bias) = bias {
+                native.set_bias(bias)?;
+            }
+            return Ok(Self::Native(native));
+        }
+        let stored = w.require(key)?;
+        let weight = match compute {
+            Some(dtype) => stored.as_dtype(dtype)?,
+            None => stored.clone(),
+        };
+        Ok(Self::Dense { weight, bias })
+    }
+
+    /// Preserve a decoder's dense accumulation scheme when its base is dense.
+    pub fn forward_with_dense(
+        &self,
+        x: &Array,
+        dense: fn(&Array, &Array, Option<&Array>) -> Result<Array>,
+    ) -> Result<Array> {
+        match self {
+            Self::Dense { weight, bias } => dense(x, weight, bias.as_ref()),
+            _ => self.forward(x),
+        }
+    }
+
+    /// Unpack a fused QKV or gate/up projection along its output axis. Native subprojections
+    /// retain their own matching slices of codes and scales and share the source rotation.
+    pub fn load_split(
+        w: &(impl crate::MlxWeightSource + ?Sized),
+        key: &str,
+        ends: &[i32],
+        dtype: Dtype,
+        quant: Option<QuantSpec>,
+    ) -> Result<Vec<Self>> {
+        if let Some(Self::Native(native)) = Self::native(w, key, false)? {
+            let mut start = 0;
+            return ends
+                .iter()
+                .copied()
+                .chain(std::iter::once(native.shape()[0]))
+                .map(|end| {
+                    let part = native.slice_rows(start, end)?;
+                    start = end;
+                    Ok(Self::Native(part))
+                })
+                .collect();
+        }
+        let weight = w.require(key)?.as_dtype(dtype)?;
+        mlx_rs::ops::split_sections(&weight, ends, 0)?
+            .into_iter()
+            .map(|part| Self::load(part, quant))
+            .collect()
+    }
+
     /// Load from a dense `[out, in]` weight, quantizing it if `quant` is set.
     pub fn load(weight: Array, quant: Option<QuantSpec>) -> Result<Self> {
         Self::load_with_bias(weight, None, quant)
@@ -635,8 +734,10 @@ impl Projection {
             LinearBase::Quantized(q) => Ok(Projection::Quantized(
                 QuantizedLinear::from_mlx_quantized(q),
             )),
-            LinearBase::ConvRot(_) | LinearBase::W4A8(_) => Err(Error::Unsupported(
-                "ConvRot/W4A8 adaptable linear has no affine/dense LLM Projection".into(),
+            LinearBase::ConvRot(p) => Ok(Self::Native(crate::NativeProjection::ConvRot(p.clone()))),
+            LinearBase::Fp8(p) => Ok(Self::Native(crate::NativeProjection::Fp8(p.clone()))),
+            LinearBase::W4A8(_) => Err(Error::Unsupported(
+                "W4A8 adaptable linear has no affine/dense LLM Projection".into(),
             )),
         }
     }
@@ -649,6 +750,7 @@ impl Projection {
                 Ok(AdaptableLinear::dense(weight.clone(), bias.clone()))
             }
             Projection::Quantized(q) => Ok(q.to_adaptable_linear()),
+            Projection::Native(p) => Ok(AdaptableLinear::from_native(p.clone())),
             Projection::Prism(_) => Err(Error::Unsupported(
                 "Prism projection cannot convert to an affine/dense AdaptableLinear".into(),
             )),
@@ -661,6 +763,7 @@ impl Projection {
             Projection::Dense { weight, bias } => linear(x, weight, bias.as_ref()),
             Projection::Quantized(q) => q.forward(x),
             Projection::Prism(p) => p.forward(x),
+            Projection::Native(p) => Ok(p.forward(x)?),
         }
     }
 
@@ -694,6 +797,7 @@ impl Projection {
                 )?
                 .as_dtype(q.scales.dtype())?
             }
+            Projection::Native(p) => p.rows(&flat)?,
             Projection::Prism(_) => {
                 return Err(Error::Unsupported(
                     "a Prism projection has no dense rows to gather".into(),
@@ -708,7 +812,10 @@ impl Projection {
 
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Projection::Quantized(_) | Projection::Prism(_))
+        matches!(
+            self,
+            Projection::Quantized(_) | Projection::Prism(_) | Projection::Native(_)
+        )
     }
 
     /// Elements a forward materializes when its activations are **wider** than this projection's
@@ -721,7 +828,7 @@ impl Projection {
         match self {
             Projection::Dense { weight, bias: b } => n(weight) + bias(b),
             Projection::Quantized(q) => n(&q.scales) + n(&q.biases) + bias(&q.bias),
-            Projection::Prism(_) => 0,
+            Projection::Prism(_) | Projection::Native(_) => 0,
         }
     }
 
@@ -737,6 +844,7 @@ impl Projection {
                 out.extend(q.bias.iter().cloned());
             }
             Projection::Prism(p) => p.push_arrays(out),
+            Projection::Native(p) => p.push_arrays(out),
         }
     }
 }

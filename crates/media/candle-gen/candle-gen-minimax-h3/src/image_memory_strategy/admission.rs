@@ -345,6 +345,7 @@ pub struct ImageMemoryFacts {
     te_dims: TeDims,
     /// The largest one-projection f32 decode during a TE layer.
     te_decode: u64,
+    te_fp8: Vec<gen_core::h3_memory::window::CudaFp8Projection>,
     /// Host bytes to prepare the host-packed TE (source map + runtime packs + one repack scratch).
     te_prepare_host: u64,
     /// The f32 vision tower.
@@ -453,18 +454,18 @@ impl ImageMemoryFacts {
                 "{IMAGE_MODEL_ID}: the text encoder has no shards"
             ))
         })?;
-        let (payload, te_prepare_host, te_decode) =
-            crate::memory_strategy::runtime_payloads(&te_dir, true)?;
+        let payloads = crate::memory_strategy::text_payloads(&te_dir)?;
+        let te_prepare_host = payloads.host;
+        let te_decode = payloads.decode;
         // `text_encoder_stream` folds the vision tower into the root for H3 video's grounded pass;
         // here the tower is its own earlier phase, so it is taken back out of the encoder's root.
-        let vision_runtime = payload
+        let vision_runtime = payloads
+            .by_name
             .iter()
             .filter(|(name, _)| name.starts_with(crate::text_encoder::VISION_PREFIX))
             .try_fold(0u64, |n, (_, &b)| add_all([n, b]))?;
         te.resident_bytes = te.resident_bytes.saturating_sub(vision_runtime);
-        let vision_bytes = header_bytes(&te_dir, 4, |name| {
-            name.starts_with(crate::text_encoder::VISION_PREFIX)
-        })?;
+        let vision_bytes = vision_runtime;
 
         // --- DiT ------------------------------------------------------------------------------------
         let dit_cfg = image_dit_config_at(&dit_dir).map_err(unsupported)?;
@@ -531,6 +532,7 @@ impl ImageMemoryFacts {
                 intermediate: te_cfg.intermediate_size as u64,
             },
             te_decode,
+            te_fp8: payloads.fp8,
             te_prepare_host,
             vision_bytes,
             dit_hidden: dit_cfg.hidden_size as u64,
@@ -638,7 +640,13 @@ pub fn estimate(
         let pixels = mul(largest, u64::from(VISION_PATCH * VISION_PATCH) * 3 * 4 * 2)?;
         phases.push(ImagePhaseBytes {
             phase: ImagePhase::VisionTower,
-            device_bytes: add_all([facts.vision_bytes, work, pixels, grounded])?,
+            device_bytes: add_all([
+                facts.vision_bytes,
+                work,
+                pixels,
+                grounded,
+                crate::memory_strategy::text_fp8_work(&facts.te_fp8, true, largest)?,
+            ])?,
             host_bytes: reference_pixels_host,
         });
     }
@@ -658,7 +666,13 @@ pub fn estimate(
     )?;
     phases.push(ImagePhaseBytes {
         phase: ImagePhase::Conditioning,
-        device_bytes: add_all([te_weights, te_work, facts.te_decode, grounded])?,
+        device_bytes: add_all([
+            te_weights,
+            te_work,
+            facts.te_decode,
+            grounded,
+            crate::memory_strategy::text_fp8_work(&facts.te_fp8, false, rows.text_rows)?,
+        ])?,
         // Both routes prepare the host-packed encoder; the streamed one keeps it there.
         host_bytes: add_all([facts.te_prepare_host, reference_pixels_host])?,
     });
@@ -1018,6 +1032,7 @@ pub(crate) fn shipped_scale_facts(adapter_resident: u64) -> ImageMemoryFacts {
             intermediate: 25_600,
         },
         te_decode: 25_600 * 5120 * 4,
+        te_fp8: Vec::new(),
         te_prepare_host: 58_000_000_000,
         vision_bytes: 2_300_000_000,
         dit_hidden: cfg.hidden_size as u64,

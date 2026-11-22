@@ -73,6 +73,37 @@ pub const TIME_PROJ_FLIP_SIN_TO_COS: bool = true;
 /// and not by `half_dim − 1`.
 pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 
+/// Decode only the dense side of a stored-code projection at its receiving dtype. MLX has
+/// already exposed FP8/I8 storage as byte arrays, so an originally floating sibling supplies the
+/// precision. When both are encoded the H3 model's published head role supplies it.
+pub(crate) fn open_dit_weights(dir: &std::path::Path) -> Result<Weights> {
+    Weights::from_dir_with_layout(
+        dir,
+        |_| false,
+        |key, source| {
+            let sibling = key
+                .strip_suffix(".bias")
+                .map(|p| (p, "weight"))
+                .or_else(|| key.strip_suffix(".weight").map(|p| (p, "bias")));
+            let Some((prefix, suffix)) = sibling else {
+                return Dtype::Bfloat16;
+            };
+            if let Some(dtype) = source
+                .get(&format!("{prefix}.{suffix}"))
+                .map(Array::dtype)
+                .filter(|dtype| matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16))
+            {
+                return dtype;
+            }
+            if gen_core_h3::h3_projection_keeps_fp32(prefix) {
+                Dtype::Float32
+            } else {
+                Dtype::Bfloat16
+            }
+        },
+    )
+}
+
 /// An `nn.Linear(in, out, bias=True)` over a stored `[out, in]` weight.
 ///
 /// Distinct from [`crate::dit::layers::LinearNoBias`] because **every** projection in this module
@@ -81,6 +112,7 @@ pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 #[derive(Debug, Clone)]
 pub struct LinearBias {
     weight: Array,
+    native: Option<mlx_gen::NativeProjection>,
     bias: Array,
     /// Forward-time LoRA/LoKr residuals on this projection (SW-7096). Empty unless an install
     /// routes here — only the image DiT does.
@@ -182,12 +214,19 @@ impl LinearBias {
         in_features: i32,
         out_features: i32,
     ) -> Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.clone();
+        w.declare_projection_shape(prefix, [out_features, in_features])?;
+        let key = format!("{prefix}.weight");
+        let native = w.source_projection(&key)?;
+        let weight = w.require(&key)?.clone();
         let bias = w.require(&format!("{prefix}.bias"))?.clone();
-        if weight.shape() != [out_features, in_features] {
+        let logical = native
+            .as_ref()
+            .map(|p| p.shape().to_vec())
+            .unwrap_or_else(|| weight.shape().to_vec());
+        if logical != [out_features, in_features] {
             return Err(Error::Msg(format!(
                 "minimax-h3 dit {prefix}.weight: expected [{out_features}, {in_features}], got {:?}",
-                weight.shape()
+                logical
             )));
         }
         if bias.shape() != [out_features] {
@@ -198,6 +237,7 @@ impl LinearBias {
         }
         Ok(Self {
             weight,
+            native,
             bias,
             adapters: ResidualSlot::default(),
         })
@@ -205,7 +245,11 @@ impl LinearBias {
 
     /// This projection's adapter slot (SW-7096), created on first use at its `[out, in]` shape.
     pub fn adaptable_mut(&mut self) -> Option<&mut mlx_gen::adapters::AdaptableLinear> {
-        let (out, inp) = (self.weight.shape()[0], self.weight.shape()[1]);
+        let [out, inp] = self
+            .native
+            .as_ref()
+            .map(|p| p.shape())
+            .unwrap_or([self.weight.shape()[0], self.weight.shape()[1]]);
         self.adapters.slot_mut(out, inp)
     }
 
@@ -221,12 +265,25 @@ impl LinearBias {
 
     /// The dtype the published bytes carry — f32 for the fp32-kept heads, bf16 otherwise.
     pub fn dtype(&self) -> Dtype {
-        self.weight.dtype()
+        if self.native.is_some() {
+            self.bias.dtype()
+        } else {
+            self.weight.dtype()
+        }
     }
 
     /// Device bytes this projection holds.
     pub fn nbytes(&self) -> usize {
-        self.weight.nbytes() + self.bias.nbytes()
+        self.native
+            .as_ref()
+            .map(|p| match p {
+                mlx_gen::NativeProjection::ConvRot(q) => q.nbytes(),
+                mlx_gen::NativeProjection::Fp8(q) => {
+                    q.codes().nbytes() + q.scales().nbytes() + q.input_scale().nbytes()
+                }
+            })
+            .unwrap_or_else(|| self.weight.nbytes())
+            + self.bias.nbytes()
     }
 
     /// `y = x · Wᵀ + b`, with `x` cast to the weight's own dtype first.
@@ -239,8 +296,10 @@ impl LinearBias {
     /// runs as TF32 on NAX, which rounded `time_embedder`'s output to 2.8e-3 rel-L2 (SW-7092) —
     /// the tensor every AdaLN projection reads. See [`uses_precise_dispatch`].
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let x = x.as_dtype(self.weight.dtype())?;
-        let y = if uses_precise_dispatch(self.weight.dtype()) {
+        let x = x.as_dtype(self.dtype())?;
+        let y = if let Some(proj) = &self.native {
+            proj.forward_with_bias(&x, Some(&self.bias))?
+        } else if uses_precise_dispatch(self.weight.dtype()) {
             mlx_gen::nn::linear_precise(&x, &self.weight, Some(&self.bias))?
         } else {
             mlx_gen::nn::linear(&x, &self.weight, &self.bias)?
@@ -980,6 +1039,180 @@ mod tests {
             })
             .collect();
         Array::from_slice(&v, shape)
+    }
+
+    fn write_checkpoint<K: Into<String>>(
+        dir: &std::path::Path,
+        tensors: impl IntoIterator<Item = (K, &'static str, Vec<usize>, Vec<u8>)>,
+    ) {
+        let mut header = serde_json::Map::new();
+        let mut data: Vec<u8> = vec![];
+        for (name, dtype, shape, bytes) in tensors {
+            let offset = data.len();
+            data.extend_from_slice(&bytes);
+            header.insert(
+                name.into(),
+                serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,data.len()]}),
+            );
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend(data);
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    }
+
+    #[test]
+    fn mixed_w4a8_and_fp8_block_projections_retain_original_operands() {
+        use crate::dit::layers::LinearNoBias;
+
+        let dir = tempfile::tempdir().unwrap();
+        let q = "transformer_blocks.0.attn.to_q";
+        let k = "transformer_blocks.0.attn.to_k";
+        let v = "transformer_blocks.0.attn.to_v";
+        let w4 = br#"{"format":"asym_w4a8_int8","group_size":16,"convrot_groupsize":256}"#;
+        let fp8 = br#"{"format":"float8_e4m3fn"}"#;
+        let codes: Vec<u8> = (0..=255).collect();
+        let relative: Vec<u8> = (0..32).collect();
+        let levels: Vec<f32> = (-8..8).map(|i| i as f32 / 4.).collect();
+        let channel = [0.75f32, 1.25];
+        let fp8_codes = [0x38, 0xbc, 0x7e, 0x00];
+        let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_checkpoint(
+            dir.path(),
+            [
+                (format!("{q}.weight"), "I8", vec![2, 128], codes.clone()),
+                (
+                    format!("{q}.weight_s_rel"),
+                    "F8_E4M3",
+                    vec![2, 16],
+                    relative.clone(),
+                ),
+                (
+                    format!("{q}.weight_s_channel"),
+                    "F32",
+                    vec![2],
+                    bytes(&channel),
+                ),
+                (
+                    format!("{q}.weight_codebook"),
+                    "F32",
+                    vec![16],
+                    bytes(&levels),
+                ),
+                (
+                    format!("{q}.comfy_quant"),
+                    "U8",
+                    vec![w4.len()],
+                    w4.to_vec(),
+                ),
+                (
+                    format!("{k}.weight"),
+                    "F8_E4M3",
+                    vec![2, 2],
+                    fp8_codes.to_vec(),
+                ),
+                (format!("{k}.weight_scale"), "F32", vec![1], bytes(&[1.25])),
+                (
+                    format!("{k}.comfy_quant"),
+                    "U8",
+                    vec![fp8.len()],
+                    fp8.to_vec(),
+                ),
+                (format!("{v}.weight"), "I8", vec![2, 128], codes.clone()),
+                (
+                    format!("{v}.comfy_quant"),
+                    "U8",
+                    vec![w4.len()],
+                    w4.to_vec(),
+                ),
+            ],
+        );
+
+        let mut weights = open_dit_weights(dir.path()).unwrap();
+        assert_eq!(
+            weights
+                .require(&format!("{q}.comfy_quant"))
+                .unwrap()
+                .as_slice::<u8>(),
+            w4
+        );
+        let mut query = LinearNoBias::from_weights(&mut weights, q, Dtype::Bfloat16).unwrap();
+        let w4a8 = query.adaptable_mut().w4a8_base().unwrap();
+        let d = w4a8.descriptor();
+        assert_eq!(
+            (
+                d.out_features,
+                d.in_features,
+                d.group_size,
+                d.rotation_group
+            ),
+            (2, 256, 16, 256)
+        );
+        let arrays = w4a8.base_arrays();
+        let [packed, rel, scales, codebook] = arrays.as_slice() else {
+            panic!("unexpected W4A8 operand set")
+        };
+        assert!(packed.as_slice::<i8>().iter().map(|&c| c as u8).eq(codes));
+        assert_eq!(rel.as_slice::<u8>(), relative);
+        assert_eq!(scales.as_slice::<f32>(), channel);
+        assert_eq!(codebook.as_slice::<f32>(), levels);
+
+        let mut key = LinearNoBias::from_weights(&mut weights, k, Dtype::Bfloat16).unwrap();
+        let fp8 = key.adaptable_mut().fp8_base().unwrap();
+        assert_eq!(
+            fp8.format,
+            mlx_gen::gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn
+        );
+        assert_eq!(fp8.codes().as_slice::<u8>(), fp8_codes);
+        assert_eq!(fp8.scales().as_slice::<f32>(), [1.25]);
+
+        let error = LinearNoBias::from_weights(&mut weights, v, Dtype::Bfloat16).unwrap_err();
+        assert!(
+            matches!(error, Error::MissingTensor(name) if name == format!("{v}.weight_codebook"))
+        );
+    }
+
+    #[test]
+    fn encoded_head_bias_uses_the_role_or_the_original_dense_sibling_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint(
+            dir.path(),
+            [
+                ("proj_in.weight", "F8_E4M3", vec![1, 2], vec![0x38; 2]),
+                ("proj_in.bias", "F8_E4M3", vec![1], vec![0x38]),
+                (
+                    "proj_in.bias.scale_weight",
+                    "F32",
+                    vec![1],
+                    (1.0f32 + 1. / 512.).to_le_bytes().to_vec(),
+                ),
+                (
+                    "context_embedder.weight",
+                    "F8_E5M2",
+                    vec![1, 2],
+                    vec![0x3c; 2],
+                ),
+                ("context_embedder.bias", "F8_E4M3", vec![1], vec![0x38]),
+                ("h.weight", "F16", vec![1, 2], vec![0, 60, 0, 60]),
+                ("h.bias", "F8_E4M3", vec![1], vec![0x38]),
+            ],
+        );
+        let mut weights = open_dit_weights(dir.path()).unwrap();
+        for (prefix, dtype, value) in [
+            ("proj_in", Dtype::Float32, 1. + 1. / 512.),
+            ("context_embedder", Dtype::Bfloat16, 1.),
+            ("h", Dtype::Float16, 1.),
+        ] {
+            let head = LinearBias::from_weights(&mut weights, prefix, 2, 1).unwrap();
+            assert_eq!(head.dtype(), dtype);
+            assert_eq!(head.bias().dtype(), dtype);
+            assert_eq!(
+                head.bias().as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+                value
+            );
+        }
     }
 
     /// SW-7092: exactly the float32 projections take the N=1 full-precision dispatch.

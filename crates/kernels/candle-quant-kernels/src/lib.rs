@@ -54,15 +54,22 @@ const _: fn() = || {
         __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
 };
 
+pub mod convrot;
+pub mod convrot_int8;
 pub mod cublaslt;
 pub mod decode_attention;
+#[cfg(feature = "cuda")]
+pub mod eight_bit_linear;
 pub mod flux3_quant;
+#[cfg(feature = "cuda")]
+pub mod fp8_linear;
 pub mod fused_decode;
 pub mod gated_delta;
 pub mod gdn_prep;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
+pub mod nvfp4_kitchen;
 pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
@@ -136,6 +143,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
     flux3_quant::FLUX3_QUANT_SRC,

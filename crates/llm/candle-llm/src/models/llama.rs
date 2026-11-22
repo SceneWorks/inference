@@ -59,6 +59,10 @@ fn dense_tensor(
     dtype: DType,
     target_device: Option<&Device>,
 ) -> Result<Tensor> {
+    let dtype = w.parameter_dtype(key, dtype);
+    if let Some(dense) = w.encoded_dense(key, dtype, target_device)? {
+        return Ok(dense);
+    }
     let source = w.require(key)?;
     if source.dtype() == DType::U8 && source.rank() >= 3 {
         return Err(Error::Config(format!(
@@ -192,8 +196,10 @@ fn projection_from_weights(
     debug_assert_priced(wkey, format);
     let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
     let scales_key = format!("{stem}.scales");
-    let source = w.require(wkey)?;
-    let target = load_target(w, source, target_device);
+    let target = match w.plain(wkey) {
+        Some(t) => load_target(w, t, target_device),
+        None => target_device.unwrap_or(w.tensor_device(wkey)?),
+    };
     let bias = if with_bias {
         let bias_key = format!("{stem}.bias");
         w.contains(&bias_key)
@@ -202,6 +208,11 @@ fn projection_from_weights(
     } else {
         None
     };
+
+    if let Some(p) = w.checkpoint_projection(wkey, dtype, target, bias.clone())? {
+        return Ok(p);
+    }
+    let source = w.require(wkey)?;
 
     // A prepared Q4 / Q8 snapshot's stored GGML blocks (sc-19375), used exactly as stored.
     if is_ggml_block_tensor(source) {
@@ -453,19 +464,35 @@ impl CausalLm {
 
         let embed_tokens = req(p("embed_tokens.weight"))?;
         let norm = norm_w(p("norm.weight"))?;
-        let head_weight = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
+        let (head_projection, head_device) = if cfg.tie_word_embeddings {
+            (
+                match w.native_projection(
+                    &p("embed_tokens.weight"),
+                    dtype,
+                    embed_tokens.device(),
+                    None,
+                )? {
+                    Some(op) => op,
+                    None => Projection::load_eligible(embed_tokens.clone(), None, nvfp4)?,
+                },
+                embed_tokens.device().clone(),
+            )
         } else {
-            let head_key = if vlm_nested {
-                "lm_head.weight".to_string()
+            let key = if vlm_nested {
+                "lm_head.weight".to_owned()
             } else {
                 join(prefix, "lm_head.weight")
             };
-            req(head_key)?
+            let device = target_device.unwrap_or(w.tensor_device(&key)?);
+            let projection = match w.checkpoint_projection(&key, dtype, device, None)? {
+                Some(p) => p,
+                None => Projection::load_eligible(req(key)?, None, nvfp4)?,
+            };
+            (projection, device.clone())
         };
         let lm_head = Box::new(LmHead {
-            device: head_weight.device().clone(),
-            projection: Projection::load_eligible(head_weight, None, nvfp4)?,
+            device: head_device,
+            projection: head_projection,
         });
 
         let qk_norm = cfg.has_qk_norm();
@@ -529,9 +556,24 @@ impl CausalLm {
                 // the key projection feeds both, so it is loaded once and shared (see
                 // [`KvProjection`] — running one weight through two projections would give the same
                 // numbers at twice the matmul and twice the quantized footprint).
-                let (q, kv) = {
+                let qkv = {
                     let packed = lp("self_attn.qkv_proj.weight");
-                    if w.contains(&packed) {
+                    if let Some(fused) = w.checkpoint_projection(
+                        &packed,
+                        dtype,
+                        target_device
+                            .or_else(|| w.encoded_device(&packed))
+                            .unwrap_or(w.device()),
+                        None,
+                    )? {
+                        if fused.dims() != (qd + 2 * kvd, cfg.hidden_size as usize) {
+                            return Err(Error::Config(format!(
+                                "{packed}: incompatible fused QKV geometry {:?}",
+                                fused.dims()
+                            )));
+                        }
+                        QkvWeights::Fused(fused)
+                    } else if w.contains(&packed) {
                         debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
@@ -558,7 +600,7 @@ impl CausalLm {
                             }
                             Projection::load_eligible(part.contiguous()?, None, format)
                         };
-                        (
+                        QkvWeights::Separate(
                             split(0, qd)?,
                             Some(KvProjection::separate(
                                 split(qd, kvd)?,
@@ -581,12 +623,11 @@ impl CausalLm {
                                 })
                             }
                         };
-                        (q, kv)
+                        QkvWeights::Separate(q, kv)
                     }
                 };
                 Attention::Gqa(LlamaAttention {
-                    q,
-                    kv,
+                    qkv,
                     o: proj_b(lp("self_attn.o_proj.weight"))?,
                     q_norm,
                     k_norm,
@@ -628,8 +669,9 @@ impl CausalLm {
                     "mlp.shared_expert"
                 };
                 let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-                Ffn::Moe(SparseMoe::new(
-                    req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                Ffn::Moe(SparseMoe::from_projections(
+                    w.linear(&lp("mlp.gate.weight"), dtype, None)?,
+                    dtype, // [num_experts, hidden]
                     experts,
                     SwiGlu {
                         gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
@@ -637,7 +679,7 @@ impl CausalLm {
                         down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
                     },
                     if w.contains(&shared_gate_key) {
-                        Some(req(shared_gate_key)?) // [1, hidden]
+                        Some(w.linear(&shared_gate_key, dtype, None)?) // [1, hidden]
                     } else {
                         None
                     },
@@ -656,9 +698,24 @@ impl CausalLm {
                     Some(g) => g.layer_intermediate_size(i, cfg.intermediate_size) as usize,
                     None => inter,
                 };
-                let (gate, up) = {
+                let gate_up = {
                     let packed = lp("mlp.gate_up_proj.weight");
-                    if w.contains(&packed) {
+                    if let Some(fused) = w.checkpoint_projection(
+                        &packed,
+                        dtype,
+                        target_device
+                            .or_else(|| w.encoded_device(&packed))
+                            .unwrap_or(w.device()),
+                        None,
+                    )? {
+                        if fused.dims() != (2 * inter, cfg.hidden_size as usize) {
+                            return Err(Error::Config(format!(
+                                "{packed}: incompatible fused gate/up geometry {:?}",
+                                fused.dims()
+                            )));
+                        }
+                        GateUp::Fused(fused)
+                    } else if w.contains(&packed) {
                         debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
@@ -683,17 +740,16 @@ impl CausalLm {
                             }
                             Projection::load_eligible(part.contiguous()?, None, format)
                         };
-                        (split(0)?, split(inter)?)
+                        GateUp::Separate(split(0)?, split(inter)?)
                     } else {
-                        (
+                        GateUp::Separate(
                             proj(lp("mlp.gate_proj.weight"))?,
                             proj(lp("mlp.up_proj.weight"))?,
                         )
                     }
                 };
                 Ffn::Dense(LlamaMlp {
-                    gate,
-                    up,
+                    gate_up,
                     down: proj(lp("mlp.down_proj.weight"))?,
                     gelu: gemma,
                 })
@@ -2393,9 +2449,14 @@ impl LlamaLayer {
         }
         match &self.attn {
             Attention::Gqa(a) => {
-                census.projections.record(&a.q);
-                if let Some(kv) = &a.kv {
-                    kv.record(&mut census.projections);
+                match &a.qkv {
+                    QkvWeights::Separate(q, kv) => {
+                        census.projections.record(q);
+                        if let Some(kv) = kv {
+                            kv.record(&mut census.projections);
+                        }
+                    }
+                    QkvWeights::Fused(qkv) => census.projections.record(qkv),
                 }
                 census.projections.record(&a.o);
                 for t in a.q_norm.iter().chain(a.k_norm.iter()) {
@@ -2574,12 +2635,12 @@ impl Attention {
 ///
 /// `num_kv_heads` / `head_dim` / `groups` / `sliding_window` are this **layer's** — equal across the
 /// stack for every uniform architecture, and different per layer type on Gemma 4.
+enum QkvWeights {
+    Separate(Projection, Option<KvProjection>),
+    Fused(Projection),
+}
 struct LlamaAttention {
-    q: Projection,
-    /// The key and value projections, which are **one shared weight** on a Gemma 4
-    /// `attention_k_eq_v` layer (there is no `v_proj` in the checkpoint at all) and **absent**
-    /// entirely on a `num_kv_shared_layers` tail layer, which projects no K/V of its own.
-    kv: Option<KvProjection>,
+    qkv: QkvWeights,
     o: Projection,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
@@ -2622,11 +2683,25 @@ impl LlamaAttention {
         // layer (`attention_k_eq_v`) the key matmul runs **once** and the value path takes its raw
         // output — K and V still end up different tensors, because only K takes `k_norm` + RoPE and
         // only V takes the scale-free `v_norm`.
-        let mut q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let kv = self.kv.as_ref().ok_or_else(|| {
-            Error::Msg("attention layer has no key/value projection to run".into())
-        })?;
-        let (raw_k, raw_v) = kv.forward(x)?;
+        let (q, raw_k, raw_v) = match &self.qkv {
+            QkvWeights::Separate(q, kv) => {
+                let kv = kv.as_ref().ok_or_else(|| {
+                    Error::Msg("attention layer has no key/value projection to run".into())
+                })?;
+                let (k, v) = kv.forward(x)?;
+                (q.forward(x)?, k, v)
+            }
+            QkvWeights::Fused(qkv) => {
+                let values = qkv.forward(x)?;
+                let (q, k) = (nh * hd, nkv * hd);
+                (
+                    values.narrow(2, 0, q)?,
+                    values.narrow(2, q, k)?,
+                    values.narrow(2, q + k, k)?,
+                )
+            }
+        };
+        let mut q = q.reshape((b, s, nh, hd))?;
         let mut k = raw_k.reshape((b, s, nkv, hd))?;
         let v = raw_v.reshape((b, s, nkv, hd))?;
 
@@ -2653,8 +2728,12 @@ impl LlamaAttention {
     /// itself. Returns `[b, heads, s, head_dim]`.
     fn project_queries(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
-        let q = self
-            .q
+        let QkvWeights::Separate(q, _) = &self.qkv else {
+            return Err(Error::Config(
+                "a shared-KV tail layer cannot use a fused QKV projection".into(),
+            ));
+        };
+        let q = q
             .forward(x)?
             .reshape((b, s, self.num_heads, self.head_dim))?;
         Ok(self
@@ -3106,23 +3185,40 @@ impl MlaAttention {
 }
 
 /// A gated MLP: SwiGLU (`silu`) by default, or GeGLU (`gelu`, the Gemma activation) when `gelu`.
+enum GateUp {
+    Separate(Projection, Projection),
+    Fused(Projection),
+}
 struct LlamaMlp {
-    gate: Projection,
-    up: Projection,
+    gate_up: GateUp,
     down: Projection,
     gelu: bool,
 }
 
 impl LlamaMlp {
     fn record(&self, census: &mut WeightCensus) {
-        for p in [&self.gate, &self.up, &self.down] {
-            census.projections.record(p);
+        match &self.gate_up {
+            GateUp::Separate(gate, up) => {
+                census.projections.record(gate);
+                census.projections.record(up);
+            }
+            GateUp::Fused(gu) => census.projections.record(gu),
         }
+        census.projections.record(&self.down);
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate.forward(x)?;
-        let up = self.up.forward(x)?;
+        let (g, up) = match &self.gate_up {
+            GateUp::Separate(gate, up) => (gate.forward(x)?, up.forward(x)?),
+            GateUp::Fused(gu) => {
+                let values = gu.forward(x)?;
+                let k = gu.dims().0 / 2;
+                (
+                    values.narrow(candle_core::D::Minus1, 0, k)?,
+                    values.narrow(candle_core::D::Minus1, k, k)?,
+                )
+            }
+        };
         // SwiGLU is one fused launch on the fused path (sc-24137), bit-identical to `silu · up`;
         // the Gemma GeGLU keeps its op chain.
         let gated = if self.gelu {
@@ -3613,11 +3709,16 @@ pub(crate) mod tests {
                 let Attention::Gqa(a) = &layer.attn else {
                     panic!("GQA")
                 };
-                let kv = a.kv.as_ref().unwrap();
+                let QkvWeights::Separate(q, Some(kv)) = &a.qkv else {
+                    panic!("expected split QKV");
+                };
                 let Ffn::Dense(mlp) = &layer.ffn else {
                     panic!("dense MLP")
                 };
-                for p in [&a.q, kv.key(), kv.value().unwrap(), &mlp.gate, &mlp.up] {
+                let GateUp::Separate(gate, up) = &mlp.gate_up else {
+                    panic!("expected split MLP");
+                };
+                for p in [q, kv.key(), kv.value().unwrap(), gate, up] {
                     out.push(p.forward(&x).unwrap());
                 }
             }

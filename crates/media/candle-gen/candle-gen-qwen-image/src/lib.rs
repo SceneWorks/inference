@@ -346,8 +346,7 @@ impl TextEncoderSource {
 }
 
 #[cfg(test)]
-type ComfyuiDitLoadTestHook =
-    Box<dyn FnMut(&std::collections::HashMap<String, Tensor>) -> CResult<()>>;
+type ComfyuiDitLoadTestHook = Box<dyn FnMut(&VarBuilder) -> CResult<()>>;
 
 #[cfg(test)]
 thread_local! {
@@ -358,9 +357,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn run_comfyui_dit_load_test_hook(
-    tensors: &std::collections::HashMap<String, Tensor>,
-) -> CResult<()> {
+fn run_comfyui_dit_load_test_hook(tensors: &VarBuilder) -> CResult<()> {
     COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
         Some(hook) => hook(tensors),
         None => Ok(()),
@@ -385,7 +382,7 @@ struct Pipeline {
     comfyui_dit: Option<gen_core::PinnedWeightsFile>,
     /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830, `vae/
     /// qwen_image_vae.safetensors`, native WAN-VAE keys). When set, the VAE is built from this file
-    /// (key-remapped, see [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE falls back to
+    /// (key-remapped, see [`candle_gen::comfyui_vae::wan_vae_var_builder`]); when `None` the VAE falls back to
     /// the snapshot's `vae/` dir. Independent of `comfyui_dit` (either can be in place).
     comfyui_vae: Option<gen_core::PinnedWeightsFile>,
 }
@@ -864,24 +861,16 @@ impl Pipeline {
                     ));
                 }
                 dit_file.read_unchanged(|path| {
-                    let dit_map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
-                        .map_err(|error| {
-                            CandleError::Msg(format!(
-                                "qwen-image comfyui: load DiT {}: {error}",
-                                path.display()
-                            ))
-                        })?;
-                    let mut dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
+                    let vb = comfyui::transformer_builder(path, DIT_DTYPE, &self.device)?;
                     #[cfg(test)]
-                    run_comfyui_dit_load_test_hook(&dit_map)?;
-                    // sc-18477 adapter routing, unchanged by the pin wrapper: fold only the types
-                    // with no deferred form, otherwise push the adapters as forward-time residuals.
+                    run_comfyui_dit_load_test_hook(&vb)?;
                     let additive = self.adapters.is_empty()
                         || crate::adapters::adapters_additive_capable(&self.adapters)?;
-                    if !self.adapters.is_empty() && !additive {
-                        crate::adapters::merge_adapters(&mut dit_map, &self.adapters)?;
-                    }
-                    let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
+                    let dit_vb = if additive {
+                        vb
+                    } else {
+                        crate::adapters::fold_checkpoint(vb, &self.adapters)?
+                    };
                     let mut dit = QwenTransformer::new_gs(
                         &self.dit_cfg,
                         dit_vb,
@@ -910,15 +899,8 @@ impl Pipeline {
     fn load_vae_seq(&self) -> CResult<QwenVae> {
         match &self.comfyui_vae {
             Some(vae_file) => vae_file.read_unchanged(|path| {
-                let vae_map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
-                    .map_err(|error| {
-                        CandleError::Msg(format!(
-                            "qwen-image comfyui: load VAE {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
-                let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
+                let vae_vb =
+                    candle_gen::comfyui_vae::wan_vae_var_builder(path, ENC_DTYPE, &self.device)?;
                 let vae = QwenVae::new(vae_vb)?;
                 self.device.synchronize()?;
                 Ok(vae)
@@ -1773,7 +1755,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// component build.
 ///
 /// `vae_file`, when `Some`, is the tree's `vae/qwen_image_vae.safetensors` (native WAN-VAE keys,
-/// remapped to the diffusers schema by [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE
+/// remapped to the diffusers schema by [`candle_gen::comfyui_vae::wan_vae_var_builder`]); when `None` the VAE
 /// comes from `snapshot_dir`'s `vae/`. `snapshot_dir` is a resident Qwen-Image diffusers snapshot
 /// supplying the Qwen2.5-VL text encoder (still snapshot-sourced — it is scaled-fp8, sc-10671) and the
 /// tokenizer (and the VAE when `vae_file` is `None`). txt2img only; adapters apply to the remapped
@@ -2041,7 +2023,8 @@ mod tests {
         let hook_done = Arc::clone(&replacement_done);
         COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move |tensors| {
-                let first = tensors["img_in.weight"]
+                let first = tensors
+                    .get_unchecked("img_in.weight")?
                     .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()?;
