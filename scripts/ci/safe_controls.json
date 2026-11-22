@@ -1529,6 +1529,18 @@
       "reason": "Writes two tiny CPU weight shards, opens the shared VAE weight builder and compares loaded affine, scaled FP8 and dense coefficients. This only reads and transforms checkpoint storage. No model, layer forward, activation, accelerator or inference kernel runs."
     },
     {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "weights::tests::native_adapter_deltas_follow_projection_remaps_and_replacements",
+      "source": "crates/media/mlx-gen/src/weights.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Constructs a padded MXFP8 checkpoint handle and attaches literal precomputed float arrays. Checks source and residual metadata, order, key transfers and invalidation. No projection forward, adapter calculation or learned kernel executes."
+    },
+    {
       "package": "mlx-gen-sdxl",
       "kind": "lib",
       "target": "mlx_gen_sdxl",

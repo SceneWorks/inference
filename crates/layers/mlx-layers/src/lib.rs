@@ -46,6 +46,10 @@ pub trait MlxWeightSource {
     fn planned_fp8(&self, _base: &str) -> Option<&crate::fp8::Fp8Linear> {
         None
     }
+    /// Ordered floating-point adapter deltas retained alongside a source-owned native matrix.
+    fn native_projection_deltas(&self, _base: &str) -> &[Array] {
+        &[]
+    }
     fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array;
     fn get(&self, key: &str) -> Option<&Array>;
     /// Inspect an optional operand without claiming it for a block's access set.

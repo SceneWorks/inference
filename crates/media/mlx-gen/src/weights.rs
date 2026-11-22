@@ -29,6 +29,7 @@ pub struct Weights {
     accessed: RefCell<std::collections::HashSet<String>>,
     planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
     planned_fp8: HashMap<String, mlx_layers::fp8::Fp8Linear>,
+    native_deltas: HashMap<String, Vec<Array>>,
 }
 
 impl Weights {
@@ -41,6 +42,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         }
     }
 
@@ -107,6 +109,9 @@ impl Weights {
                     dest.tensors
                         .insert(format!("{target}{suffix}"), array.clone());
                 }
+            }
+            if let Some(deltas) = self.native_deltas.get(source) {
+                dest.native_deltas.insert(target.to_owned(), deltas.clone());
             }
             if let Some(projection) = self.planned_fp8(source) {
                 dest.planned_fp8
@@ -254,6 +259,39 @@ impl Weights {
         mlx_layers::NativeProjection::from_key(self, base, key, false)
     }
 
+    /// Apply an adapter in logical coefficient space. Dense targets fold at their original dtype.
+    /// A native matrix keeps its source operands and binds each floating delta at construction.
+    pub fn merge_projection_delta(
+        &mut self,
+        base: &str,
+        delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    ) -> Result<()> {
+        let key = format!("{base}.weight");
+        if mlx_layers::NativeProjection::is_declared(self, base, &key) {
+            if let Some(p) = mlx_layers::NativeProjection::from_weights(self, base, false)? {
+                let shape = p.shape();
+                let delta = delta_at(&shape)?;
+                mlx_layers::adapters::AdaptableLinear::validate_native_delta(&shape, &delta)?;
+                self.native_deltas
+                    .entry(base.to_owned())
+                    .or_default()
+                    .push(delta);
+                return Ok(());
+            }
+        }
+        let weight = self.require(&key)?;
+        if !weight.dtype().is_float() && weight.dtype() != Dtype::Float64 {
+            return Err(Error::Msg(format!(
+                "{key}: cannot fold an adapter into {:?} storage; a packed projection needs its additive adapter path",
+                weight.dtype()
+            )));
+        }
+        let delta = delta_at(weight.shape())?;
+        let merged = mlx_rs::ops::add(weight, &delta.as_dtype(weight.dtype())?)?;
+        self.insert(key, merged);
+        Ok(())
+    }
+
     pub fn insert_source_projection(
         &mut self,
         key: &str,
@@ -290,6 +328,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         }
     }
 
@@ -328,6 +367,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -651,6 +691,7 @@ path,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -757,6 +798,7 @@ f,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -839,6 +881,7 @@ f,
     /// internal names + conv-weight transposes) when loading real weights.
     pub fn insert(&mut self, key: impl Into<String>, tensor: Array) {
         let key = key.into();
+        Self::invalidate_projection_deltas(&mut self.native_deltas, &key);
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
@@ -853,6 +896,21 @@ f,
     /// Copy the tensor at `from` to the new key `to` (no-op if `from` is absent). A convenience
     /// for the identity-but-renamed entries in a checkpoint→internal mapping.
     pub fn alias(&mut self, from: &str, to: &str) {
+        let deltas = self
+            .projection_base_for_key(from)
+            .and_then(|base| self.native_deltas.get(base))
+            .cloned();
+        self.alias_tensor(from, to);
+        if let Some(deltas) = deltas {
+            let dest = to
+                .strip_suffix(".weight")
+                .or_else(|| to.strip_suffix("_weight"))
+                .unwrap_or(to);
+            self.native_deltas.insert(dest.to_owned(), deltas);
+        }
+    }
+
+    fn alias_tensor(&mut self, from: &str, to: &str) {
         if let Some(t) = self.tensors.get(from).cloned() {
             self.source_reads.alias(from, to);
             if let Some(source) = self.projection_base_for_key(from) {
@@ -884,12 +942,27 @@ f,
         }
     }
 
+    fn invalidate_projection_deltas(deltas: &mut HashMap<String, Vec<Array>>, key: &str) {
+        if deltas.is_empty() {
+            return;
+        }
+        let base = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .or_else(|| gen_core::checkpoint_codec::projection_companion_base(key))
+            .unwrap_or(key);
+        deltas.remove(base);
+    }
+
     /// Remove and return the tensor at `key` (`None` if absent). Lets a **consuming** loader release
     /// each source tensor from the map as soon as it has been copied/quantized into the built model, so
     /// the source and the growing built model don't both stay resident — bounding the load-time
     /// unified-memory transient to ~the built size (sc-11030; the gpt-oss encoder is otherwise a
     /// 13 GB-source + 21/63 GB-built spike). MLX returns the dropped buffer to its reuse pool.
     pub fn remove(&mut self, key: &str) -> Option<Array> {
+        if self.tensors.contains_key(key) {
+            Self::invalidate_projection_deltas(&mut self.native_deltas, key);
+        }
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
@@ -904,7 +977,14 @@ f,
     /// Drop every tensor whose key starts with `prefix` (e.g. `"model.layers.7."` once layer 7 is
     /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
     pub fn remove_prefix(&mut self, prefix: &str) {
-        self.tensors.retain(|k, _| !k.starts_with(prefix));
+        self.tensors.retain(|key, _| {
+            if key.starts_with(prefix) {
+                Self::invalidate_projection_deltas(&mut self.native_deltas, key);
+                false
+            } else {
+                true
+            }
+        });
         self.planned_fp8
             .retain(|base, _| self.tensors.contains_key(&format!("{base}.weight")));
         self.planned_convrot.retain(|base, _| {
@@ -941,7 +1021,8 @@ f,
             .collect()
     }
 
-    /// Consume the container into its raw tensor map (drops metadata and access bookkeeping).
+    /// Export raw checkpoint tensors, excluding runtime adapters, metadata and access bookkeeping.
+    /// Keep the `Weights` view through model construction when applying projection deltas.
     /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
     /// loader, which never has metadata to begin with.
     pub fn into_tensors(mut self) -> HashMap<String, Array> {
@@ -1095,6 +1176,9 @@ impl mlx_layers::MlxWeightSource for Weights {
     fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
         self.source_reads.get(key)
     }
+    fn native_projection_deltas(&self, base: &str) -> &[Array] {
+        self.native_deltas.get(base).map_or(&[], Vec::as_slice)
+    }
     fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
         self.planned_fp8(base)
     }
@@ -1112,6 +1196,72 @@ impl mlx_layers::MlxWeightSource for Weights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constructor and handle metadata only. Neither projection nor adapter forward is evaluated.
+    #[test]
+    fn native_adapter_deltas_follow_projection_remaps_and_replacements() {
+        use mlx_layers::adapters::Adapter;
+        use mlx_layers::{ComfyQuantFormat, MlxWeightSource};
+
+        let mut w = Weights::empty();
+        let fp8 = mlx_layers::fp8::Fp8Linear::new(
+            ComfyQuantFormat::Mxfp8,
+            Array::from_slice(&[0x38u8; 32 * 32], &[32, 32]),
+            Some(Array::from_slice(&[127u8; 512], &[128, 4])),
+            None,
+            &[3, 2],
+            None,
+        )
+        .unwrap();
+        w.insert_source_projection("p.weight", mlx_layers::NativeProjection::Fp8(fp8))
+            .unwrap();
+        for v in [1.0f32, 2.0] {
+            w.merge_projection_delta("p", |shape| {
+                assert_eq!(shape, &[3, 2]);
+                Ok(Array::from_slice(&[v; 6], shape))
+            })
+            .unwrap();
+        }
+        assert!(w
+            .merge_projection_delta("p", |_| Ok(Array::from_f32(7.0)))
+            .is_err());
+        assert_eq!(w.native_projection_deltas("p").len(), 2);
+        w.alias("p.weight", "alias.weight");
+        let mut selected =
+            w.select_renamed(|key| (key == "alias.weight").then(|| "part.weight".into()));
+        let taken = selected
+            .take_renamed(&[("part.weight".into(), "final.weight".into())])
+            .unwrap();
+        assert!(selected.native_projection_deltas("part").is_empty());
+        let layer = mlx_layers::quant::lin(&taken, "final", false, 64).unwrap();
+        assert_eq!(layer.base_shape(), [3, 2]);
+        assert_eq!(layer.fp8_base().unwrap().codes().shape(), &[32, 32]);
+        let residuals = layer
+            .adapters()
+            .iter()
+            .map(|a| match a {
+                Adapter::Lokr { delta, scale } => {
+                    assert_eq!(*scale, 1.0);
+                    delta.as_slice::<f32>()[0]
+                }
+                _ => panic!("expected a logical coefficient delta"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(residuals, [1.0, 2.0]);
+        let via_native = mlx_layers::quant::native_lin(&taken, "final", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(via_native.adapters().len(), 2);
+        w.remove_prefix("alias.");
+        assert!(w.native_projection_deltas("alias").is_empty());
+        assert_eq!(w.native_projection_deltas("p").len(), 2);
+        w.insert("p.weight_scale", Array::from_f32(1.0));
+        assert!(w.native_projection_deltas("p").is_empty());
+        w.insert("raw.weight", Array::from_slice(&[7u8; 6], &[3, 2]));
+        assert!(w
+            .merge_projection_delta("raw", |_| panic!("raw code fold reached adapter math"))
+            .is_err());
+    }
 
     /// Layout/handle bookkeeping only: no evaluation, operator construction or learned work.
     #[test]
