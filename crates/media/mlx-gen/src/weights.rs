@@ -272,6 +272,9 @@ impl Weights {
                 let shape = p.shape();
                 let delta = delta_at(&shape)?;
                 mlx_layers::adapters::AdaptableLinear::validate_native_delta(&shape, &delta)?;
+                // Finish this adapter's reconstruction while its factors are resident. The
+                // model's first forward should only apply the prepared residual to its input.
+                delta.eval()?;
                 self.native_deltas
                     .entry(base.to_owned())
                     .or_default()
