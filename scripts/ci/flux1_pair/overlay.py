@@ -141,8 +141,10 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
 """, 1)
         helper += """thread_local! {
     static PAIR_STEP_CLOCK: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-    static PAIR_STEP_SAMPLE: std::cell::Cell<Option<(u128, candle_core::DType)>> = const { std::cell::Cell::new(None) };
+    static PAIR_STEP_SAMPLE: std::cell::Cell<Option<PairStepSample>> = const { std::cell::Cell::new(None) };
 }
+
+type PairStepSample = (std::time::Instant, std::time::Instant, candle_core::DType);
 
 fn pair_measure_step(x: &Tensor, sigma: f32) {
     if sigma == 1.0 {
@@ -153,13 +155,14 @@ fn pair_measure_step(x: &Tensor, sigma: f32) {
     } else if sigma == 0.0 {
         assert!(x.device().is_cuda());
         x.device().synchronize().unwrap();
-        let elapsed = PAIR_STEP_CLOCK.with(|clock| clock.take().expect("started step clock").elapsed());
-        PAIR_STEP_SAMPLE.with(|sample| assert!(sample.replace(Some((elapsed.as_nanos(), x.dtype()))).is_none()));
+        let ended = std::time::Instant::now();
+        let started = PAIR_STEP_CLOCK.with(|clock| clock.take().expect("started step clock"));
+        PAIR_STEP_SAMPLE.with(|sample| assert!(sample.replace(Some((started, ended, x.dtype()))).is_none()));
     }
 }
 
 #[doc(hidden)]
-pub fn pair_take_step_sample() -> Option<(u128, candle_core::DType)> {
+pub fn pair_take_step_sample() -> Option<PairStepSample> {
     PAIR_STEP_SAMPLE.with(|sample| sample.take())
 }
 """
@@ -180,7 +183,7 @@ pub fn pair_take_step_sample() -> Option<(u128, candle_core::DType)> {
     let output = report.output.ok_or("missing planned output")?;"""
     if measured:
         generate = generate.replace(
-            "    let report =",
+            "    let report = generator.generate_planned(&request, &plan, None, &mut progress)?;",
             """    let measure = std::env::args().nth(1).as_deref() == Some("--measure");
     let warmed = if measure {
         let mut warm_steps = Vec::new();
@@ -203,12 +206,15 @@ pub fn pair_take_step_sample() -> Option<(u128, candle_core::DType)> {
     } else {
         None
     };
+    let mut decode_started = None;
     let started = std::time::Instant::now();
-    let report =""", 1)
-        generate = generate.replace(
-            "    let output =",
-            """    let elapsed = started.elapsed();
-    let output =""", 1)
+    let report = generator.generate_planned(&request, &plan, None, &mut |event| {
+        if measure && matches!(&event, Progress::Decoding) {
+            assert!(decode_started.replace(std::time::Instant::now()).is_none());
+        }
+        progress(event);
+    })?;
+    let ended = std::time::Instant::now();""", 1)
     template = (HERE / "probe.rs.in").read_text(encoding="utf-8")
     cuda_proof = ""
     if not mlx:
@@ -253,8 +259,17 @@ pub fn pair_take_step_sample() -> Option<(u128, candle_core::DType)> {
         if warmed != images[0].pixels {
             return Err("resident warmup changed the seeded RGB8 result".into());
         }
-        emit_step_sample()?;
-        println!("FLUX1_PAIR_TIMING {} {}", elapsed.as_nanos(), peak_working_set()?);
+        let (denoise_started, denoise_ended) = emit_step_sample()?;
+        let decode_started = decode_started.ok_or("missing measured decode phase")?;
+        if !(started <= denoise_started && denoise_ended <= decode_started && decode_started <= ended) {
+            return Err("invalid measured phase order".into());
+        }
+        let host_peak = peak_working_set()?;
+        println!("FLUX1_PAIR_PHASES {} {} {}",
+            (denoise_started - started).as_nanos(),
+            (decode_started - denoise_ended).as_nanos(),
+            (ended - decode_started).as_nanos());
+        println!("FLUX1_PAIR_TIMING {} {host_peak}", (ended - started).as_nanos());
     }
     fs::write(dir.join("output.rgb")''', 1)
         body += (HERE / "performance.rs.in").read_text(encoding="utf-8")

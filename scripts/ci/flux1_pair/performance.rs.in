@@ -1,8 +1,8 @@
 
-fn emit_step_sample() -> Result<(), Box<dyn std::error::Error>> {
-    let (elapsed, dtype) = candle_gen::sampler::pair_take_step_sample().ok_or("missing measured sampler body")?;
-    println!("FLUX1_PAIR_DENOISE {elapsed} {dtype:?} candle-cuda");
-    Ok(())
+fn emit_step_sample() -> Result<(std::time::Instant, std::time::Instant), Box<dyn std::error::Error>> {
+    let (started, ended, dtype) = candle_gen::sampler::pair_take_step_sample().ok_or("missing measured sampler body")?;
+    println!("FLUX1_PAIR_DENOISE {} {dtype:?} candle-cuda", (ended - started).as_nanos());
+    Ok((started, ended))
 }
 
 // Use the Windows kernel-maintained peak resident set for this process. The

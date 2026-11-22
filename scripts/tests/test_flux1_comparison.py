@@ -313,16 +313,22 @@ class FluxPairTests(unittest.TestCase):
                     poolUsedHighBytes=300, poolReservedBytes=400, poolReservedHighBytes=500)
         files = {"stdout.log": b"FLUX1_PAIR_DENOISE 800 BF16 candle-cuda\r\n"
                                b"FLUX1_PAIR_DENOISE 600 BF16 candle-cuda\r\n"
+                               b"FLUX1_PAIR_PHASES 150 10 240\r\n"
                                b"FLUX1_PAIR_TIMING 1000 700\r\nFLUX1_PAIR_COMPLETE flux1_dev\r\n",
                  "plan.json": json.dumps(preflight).encode(),
                  "progress.json": json.dumps(reference["steps"]).encode(),
                  "output.png": payload,
                  "supervisor.json": b'{"returncode": 0, "pid": 34}',
                  "cuda-pool.json": json.dumps(pool).encode()}
-        self.assertEqual(performance.read_sample(files.__getitem__, "dev", preflight, reference, policy),
-                         dict(zip((*performance.TIMING, *performance.MEMORY), (2e-7, 1e-6, 700, 300, 500))))
+        expected = dict(zip((*performance.TIMING, *performance.MEMORY), (2e-7, 1e-6, 700, 300, 500)))
+        expected["phase_nanoseconds"] = {
+            "before_denoise": 150, "after_denoise_before_decode": 10, "decode_through_host_rgb": 240,
+        }
+        self.assertEqual(performance.read_sample(files.__getitem__, "dev", preflight, reference, policy), expected)
         for name, value, reason in (
             ("stdout.log", files["stdout.log"].split(b"\n", 1)[1], "warm-up"),
+            ("stdout.log", files["stdout.log"].replace(b"150 10 240", b"150 10 239"), "render phases"),
+            ("stdout.log", files["stdout.log"].replace(b"150 10 240", b"150 -1 251"), "render phases"),
             ("plan.json", b'{"provider": "other"}', "route"),
             ("output.png", b"mismatch", "RGB8"),
             ("cuda-pool.json", json.dumps(dict(pool, pid=99)).encode(), "allocation high-water"),
@@ -418,6 +424,7 @@ class FluxPairTests(unittest.TestCase):
                             duration = 1100 if failure == "noise" and out.name == "measure-dev-2-head" else 1000
                             lines.extend(("FLUX1_PAIR_DENOISE 900 BF16 candle-cuda",
                                           "FLUX1_PAIR_DENOISE 600 BF16 candle-cuda",
+                                          f"FLUX1_PAIR_PHASES {duration - 600} 0 0",
                                           f"FLUX1_PAIR_TIMING {duration} 4096"))
                         else:
                             for i, sigma in enumerate(sigmas):

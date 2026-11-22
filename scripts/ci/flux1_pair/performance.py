@@ -18,6 +18,7 @@ CONTRACT = {
     "warmup": "one identical materialized generation in each measured process, excluded from timing",
     "timing_scope": "resident planned generation through host RGB, excluding plan, load and evidence writes",
     "step_scope": "synchronized interval from first Euler evaluation through terminal state, divided by three",
+    "phase_breakdown": "diagnostic wall-clock spans before denoise, between denoise and decode, and from decode progress through host RGB",
     "memory_scope": "host process peak working set and continuous CUDA pool peaks across load, warm-up and sample",
     "memory_statistic": "head maximum divided by base maximum, per matched domain",
     "timing_statistic": "median paired head/base ratio with distribution-free min/max interval",
@@ -48,10 +49,11 @@ def read_sample(read, variant, preflight, reference, policy):
     model = "flux1_" + variant
     markers = [line for line in read("stdout.log").decode("utf-8").splitlines() if line.startswith("FLUX1_PAIR_")]
     dtype = reference["states"][-1]["dtype"]
-    if len(markers) != 4 or markers[-1] != "FLUX1_PAIR_COMPLETE " + model:
+    if len(markers) != 5 or markers[-1] != "FLUX1_PAIR_COMPLETE " + model:
         raise ValueError("missing complete warm-up and sample timings on the fidelity device/dtype")
     denoise = [re.fullmatch(r"FLUX1_PAIR_DENOISE ([1-9][0-9]*) (\w+) candle-cuda", line) for line in markers[:2]]
-    timing = re.fullmatch(r"FLUX1_PAIR_TIMING ([1-9][0-9]*) ([1-9][0-9]*)", markers[2])
+    phases = re.fullmatch(r"FLUX1_PAIR_PHASES (0|[1-9][0-9]*) (0|[1-9][0-9]*) (0|[1-9][0-9]*)", markers[2])
+    timing = re.fullmatch(r"FLUX1_PAIR_TIMING ([1-9][0-9]*) ([1-9][0-9]*)", markers[3])
     if not timing or any(not row or row[2] != dtype for row in denoise):
         raise ValueError("missing complete warm-up and sample timings on the fidelity device/dtype")
     end_to_end_ns, host_peak = map(int, timing.groups())
@@ -59,6 +61,9 @@ def read_sample(read, variant, preflight, reference, policy):
     if (not denoise_ns <= end_to_end_ns <= policy["deadlineSeconds"] * 10**9
             or host_peak > policy["childFootprintCapBytes"]):
         raise ValueError("incoherent timing or peak working set above the child cap")
+    phase_ns = tuple(map(int, phases.groups())) if phases else ()
+    if not phase_ns or sum(phase_ns) + denoise_ns != end_to_end_ns:
+        raise ValueError("render phases do not account for measured generation time")
     plan = json.loads(read("plan.json"))
     if plan != preflight or json.loads(read("progress.json")) != reference["steps"]:
         raise ValueError("performance route or completed steps differ from fidelity")
@@ -74,8 +79,12 @@ def read_sample(read, variant, preflight, reference, policy):
             or pool_bytes[0] > min(pool_bytes[1], pool_bytes[2])
             or max(pool_bytes[1:3]) > pool_bytes[3] or pool_bytes[3] > policy["childGpuCapBytes"]):
         raise ValueError("invalid owned CUDA allocation high-water record")
-    return dict(zip((*TIMING, *MEMORY),
-                    (denoise_ns / 3e9, end_to_end_ns / 1e9, host_peak, pool_bytes[1], pool_bytes[3])))
+    return {
+        **dict(zip((*TIMING, *MEMORY),
+                   (denoise_ns / 3e9, end_to_end_ns / 1e9, host_peak, pool_bytes[1], pool_bytes[3]), strict=True)),
+        "phase_nanoseconds": dict(zip(("before_denoise", "after_denoise_before_decode", "decode_through_host_rgb"),
+                                      phase_ns, strict=True)),
+    }
 
 
 def evaluate(samples, variants):
