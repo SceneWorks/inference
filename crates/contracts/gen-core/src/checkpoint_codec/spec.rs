@@ -23,6 +23,8 @@ pub enum TensorCodecSpec {
         scale: ScalarScaleSource,
         /// Consumed activation-scale companion, irrelevant to weight decode.
         input_scale: Option<String>,
+        /// Preserve floating activations and round decoded weights to their compute dtype.
+        /// This does not require persistent dense weights when a backend has a weight-only kernel.
         full_precision_matrix_mult: bool,
     },
     /// Dynamic per-token activation quantization and one original F32 weight scale per output row.
@@ -112,8 +114,8 @@ pub struct PlannedResidency {
 
 /// The backend's plan-time decision: keep a codec's stored packing resident (native path) or take
 /// the dense fallback. Layout facts are in the spec; hardware facts are the policy's own (device
-/// generation, feature gates). A layer whose descriptor sets `full_precision_matrix_mult` never
-/// runs a packed matmul, so a policy must answer [`ResidencyMode::Dense`] for it.
+/// generation, feature gates). Scalar FP8 with `full_precision_matrix_mult` may stay packed when
+/// the backend preserves activation precision. Other full-precision codecs still require Dense.
 pub trait CodecResidencyPolicy {
     /// An architecture can declare a physical tensor as stacked matrices for a routed operator.
     fn residency_for_key(

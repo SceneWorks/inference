@@ -1255,6 +1255,7 @@ mod tests {
                 weight_scale: 2.0,
                 weight_scale_from_companion: true,
                 input_scale: None,
+                full_precision_matrix_mult: false,
             },
         )
         .unwrap()
@@ -1317,7 +1318,7 @@ mod tests {
     }
 
     /// The packed-native policy is a pure layout+hardware predicate: it selects `Packed` only for
-    /// the E4M3 scalar row without `full_precision_matrix_mult`, and the plan prices packed
+    /// aligned scalar FP8 rows, including weight-only multiplication, and the plan prices packed
     /// entries at stored bytes + retained scales instead of dense bf16.
     #[test]
     fn candle_residency_policy_packs_only_the_eligible_e4m3_layers_and_prices_them() {
@@ -1337,7 +1338,7 @@ mod tests {
                     2.0_f32.to_le_bytes().to_vec(),
                 ),
                 ("model.a.comfy_quant", "U8", &[e4m3.len()], e4m3.to_vec()),
-                ("model.b.weight", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                ("model.b.weight", "F8_E4M3", &[16, 16], vec![0x38; 256]),
                 (
                     "model.b.weight_scale",
                     "F32",
@@ -1371,7 +1372,7 @@ mod tests {
             .iter()
             .map(|tensor| (tensor.logical_key.as_str(), tensor))
             .collect();
-        // Eligible: packed at stored bytes (8), its 4-byte scale retained on the companion row.
+        // Eligible: packed at stored bytes, its 4-byte scale retained on the companion row.
         assert_eq!(by_key["a.weight"].residency.mode, ResidencyMode::Packed);
         assert_eq!(by_key["a.weight"].residency.resident_bytes, 256);
         let scale_row = plan
@@ -1380,16 +1381,16 @@ mod tests {
             .find(|companion| companion.physical_key == "model.a.weight_scale")
             .unwrap();
         assert_eq!(scale_row.resident_bytes, 4);
-        // full_precision_matrix_mult: dense by contract, 2 × 4 × bf16 = 16.
-        assert_eq!(by_key["b.weight"].residency.mode, ResidencyMode::Dense);
-        assert_eq!(by_key["b.weight"].residency.resident_bytes, 16);
-        // E5M2 has no native leg: dense.
+        // Full-precision activations retain the aligned weight codes through the weight-only leg.
+        assert_eq!(by_key["b.weight"].residency.mode, ResidencyMode::Packed);
+        assert_eq!(by_key["b.weight"].residency.resident_bytes, 256);
+        // Unaligned E5M2 still requires dense fallback.
         assert_eq!(by_key["c.weight"].residency.mode, ResidencyMode::Dense);
         // Packed vs dense pricing differs end to end.
         let dense_plan = plan_dense(&path);
         assert!(plan.resident_bytes() < dense_plan.resident_bytes());
-        assert_eq!(dense_plan.resident_bytes(), 512 + 2 * 16);
-        assert_eq!(plan.resident_bytes(), (256 + 4) + 16 + 16);
+        assert_eq!(dense_plan.resident_bytes(), 512 + 512 + 16);
+        assert_eq!(plan.resident_bytes(), (256 + 4) + (256 + 4) + 16);
 
         // The probed policy on this machine's devices: CPU (and Metal) are dense-only.
         assert_eq!(
@@ -1419,6 +1420,7 @@ mod tests {
                 weight_scale: 1.0,
                 weight_scale_from_companion: true,
                 input_scale: None,
+                full_precision_matrix_mult: false,
             }
             .resident_bytes(),
             8 + 4,
@@ -1430,6 +1432,7 @@ mod tests {
                 weight_scale: 1.0,
                 weight_scale_from_companion: true,
                 input_scale: Some(0.5),
+                full_precision_matrix_mult: false,
             }
             .resident_bytes(),
             8 + 4 + 4,
@@ -2287,18 +2290,21 @@ mod tests {
             weight_scale: 1.0,
             weight_scale_from_companion: false,
             input_scale: None,
+            full_precision_matrix_mult: true,
         };
         let companion = LogicalTensor::PackedScalarFp8 {
             codes: codes.clone(),
             weight_scale: 0.5,
             weight_scale_from_companion: true,
             input_scale: None,
+            full_precision_matrix_mult: false,
         };
         let both = LogicalTensor::PackedScalarFp8 {
             codes,
             weight_scale: 0.5,
             weight_scale_from_companion: true,
             input_scale: Some(0.25),
+            full_precision_matrix_mult: false,
         };
         assert_eq!(
             unit.resident_bytes(),
