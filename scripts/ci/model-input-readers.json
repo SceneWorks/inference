@@ -406,6 +406,12 @@
         "reader-binding"
       ]
     },
+    "candle-gen::loader::remap_file_var_builder": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
     "candle-gen::testkit::read_ppm": {
       "role": "reference",
       "grades": [
