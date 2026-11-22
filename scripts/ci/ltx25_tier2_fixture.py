@@ -7,6 +7,7 @@ import re
 import struct
 
 from scripts.ci import stage_pinned_hub_snapshots as hub
+from scripts.ci.pinned_hub_source import file_inventory_seal, pinned_file_identity, verify_file_inventory_receipt
 from scripts.ci.sga_paired_performance import CEILING, INTERVAL_COVERAGE, PAIRS
 from scripts.ci.wan_adapter_tier1_fixture import fetch_pinned_header, unique_object
 
@@ -30,6 +31,11 @@ FILES = frozenset({"audio_vae.safetensors", "connector.safetensors", "diffusion_
                    "split_model.json", "temporal_upsampler.safetensors", "text_encoder.safetensors",
                    "transformer.safetensors", "vae_decoder.safetensors", "vae_diffusion_decoder.safetensors",
                    "vae_encoder.safetensors", "vocoder.safetensors"})
+# Exact sorted file rows from the public revision, including the Dev refinement adapter.
+ASSET_INVENTORY = {
+    "dev": ("b35195afd473eda0bac2dfa36915756c6a3717f83fdb76b08ff8b43c6e3180db", 49_900_416_841),
+    "distilled": ("d6e2a561830fd77ae7a55f8aab8bb7dd1e7c6c71bb3cfdec1a333301f67f23d3", 41_000_527_189),
+}
 GIB = 2**30
 POOL_BYTES = 80 * GIB
 CHILD_SECONDS = 900
@@ -48,9 +54,14 @@ REPAIRED_INSTALL = b"""        if self.transformer_variant.is_dev() {
         }"""
 
 
+def model_asset_contract(variant):
+    seal, total = ASSET_INVENTORY[variant]
+    return {"repository": REPOSITORY, "revision": REVISION, "bundle": f"{variant}/q4",
+            "transformer_header_sha256": HEADER[variant], "files_sha256": seal, "asset_bytes": total}
+
+
 def contract(variant):
-    return {"model": {"repository": REPOSITORY, "revision": REVISION, "bundle": f"{variant}/q4",
-                      "transformer_header_sha256": HEADER[variant]},
+    return {"model": model_asset_contract(variant),
             "settings": {"device_capability": "sm_120", "native_case": CASE[variant], "variant": variant,
                          "tier": "q4", "precision": "shipping BF16 DiT and native decoder dtypes",
                          "seed": 18777, "width": 512, "height": 512, "frames": 17, "fps": 24,
@@ -220,12 +231,19 @@ def staged_assets(variant, model_hub, *, stage=True):
         if set(hub.pinned_files(metadata, "distilled_lora")) != {ADAPTER}:
             raise ValueError("unexpected LTX refinement adapter closure")
         expected.add(ADAPTER)
+    paths = tuple(sorted(expected))
+    files = [pinned_file_identity(path, metadata.get(path)) for path in paths]
+    assets = {"repository": REPOSITORY, "revision": REVISION,
+              "files_sha256": file_inventory_seal(files), "files": files}
+    verify_file_inventory_receipt(assets, model_asset_contract(variant))
     if stage:
         hub.stage(groups, model_hub, manifest=lambda *_: (None, None, metadata))
-    verified = hub.verify_pinned_hub_files(REPOSITORY, REVISION, snapshot, tuple(sorted(expected)))
+    verified = hub.verify_pinned_hub_files(REPOSITORY, REVISION, snapshot, paths)
+    if verified["files"] != files:
+        raise ValueError("authenticated LTX snapshot bytes differ from the approved inventory")
     verify_headers(variant, read_header(snapshot / bundle / "transformer.safetensors"),
                    read_header(snapshot / ADAPTER) if variant == "dev" else None)
-    return snapshot, {"manifest_sha256": verified["manifest_sha256"], "files": verified["files"]}
+    return snapshot, assets
 
 
 def preflight(stdout, variant):

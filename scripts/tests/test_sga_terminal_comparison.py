@@ -1,18 +1,22 @@
 """No model compute: terminal pairing decisions and native receipt contracts."""
 
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zlib
 
 from scripts.ci import ltx25_tier2_fixture as ltx
+from scripts.ci import ltx25_tier2_mlx as ltx_mlx
 from scripts.ci import sga_terminal_comparison as comparison
 from scripts.ci import wan_adapter_tier2_fixture as wan
 from scripts.ci import z_image_tier2_fixture as z_image
+from scripts.ci.pinned_hub_source import file_inventory_seal
 
 UUID = "GPU-a123bcde-4321-abcd-abcd-0123456789ab"
 REQUEST = {"selection": comparison.SELECTION, "profile": "ltx25", "variant": "dev",
@@ -52,6 +56,73 @@ class TerminalTests(unittest.TestCase):
         del samples["pair-4-head"]
         with self.assertRaisesRegex(ValueError, "every frozen sample"):
             comparison.summarize(samples)
+
+    def test_accepted_uploads_replay_the_frozen_assets_but_failure_archives_may_omit_them(self):
+        sample = {"identity": {"fixture": "same"}, "timing": {"e2e_ns": 1000}, "peaks": {"device": 1000}}
+        decision = comparison.summarize({name: sample for name, _ in comparison.SAMPLES})
+        toolchain = {"rustc_version": "rustc fixture", "cargo_version": "cargo fixture"}
+        arm = {"overlay_sha256": "fixture", "binary_sha256": "a" * 64,
+               "preflight_stdout": "fixture", "toolchain": toolchain}
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            args = SimpleNamespace(output=root)
+            receipt_path = root / "receipt.json"
+            env = {"RUNNER_TEMP": str(root), "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}
+            with (patch.dict(comparison.os.environ, env), patch.object(comparison, "sample_limits", return_value={}),
+                  patch.object(comparison, "read_sample", return_value=sample)):
+                for profile in (ltx, ltx_mlx, z_image):
+                    for variant in profile.CASE:
+                        with self.subTest(profile=profile.__name__, variant=variant):
+                            contract = {**profile.contract(variant), "base": {}, "head": {}, "policy": {},
+                                        "request": {"variant": variant},
+                                        "overlay_sha256": {arm: "fixture" for arm in comparison.ARMS}}
+                            files = [{"path": "model_index.json", "bytes": 10, "kind": "git_blob_sha1", "digest": "a" * 40},
+                                     {"path": "transformer/model.safetensors", "bytes": 20,
+                                      "kind": "lfs_sha256", "digest": "b" * 64}]
+                            if variant == "dev":
+                                files.insert(0, {"path": ltx.ADAPTER, "bytes": 30,
+                                                 "kind": "lfs_sha256", "digest": ltx.ADAPTER_SHA256})
+                            seal = file_inventory_seal(files)
+                            model = contract["model"]
+                            # Synthetic file seals exercise replay without asset downloads or model compute.
+                            model.update(files_sha256=seal, asset_bytes=sum(row["bytes"] for row in files))
+                            assets = {"repository": model["repository"], "revision": model["revision"],
+                                      "files_sha256": seal, "files": files}
+                            receipt = {**contract, "run_id": "1", "run_attempt": "1", "accepted": True,
+                                       "assets": assets, "files": {}, "arms": {name: arm for name in comparison.ARMS},
+                                       "comparison_result": decision, "physical_claim": {"post_execution_verified": True}}
+                            with patch.object(profile, "preflight", return_value=None):
+                                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                                comparison.verify(args, contract, profile)
+                                forged_rows = deepcopy(files)
+                                forged_rows[-1]["digest"] = "c" * 64
+                                wrong = (None, dict(assets, repository="example/other"), dict(assets, revision="0" * 40),
+                                         dict(assets, files=files[:-1]), dict(assets, files=files + files[-1:]),
+                                         dict(assets, files=list(reversed(files))),
+                                         dict(assets, files=[dict(files[0], bytes=0), *files[1:]]),
+                                         dict(assets, files=forged_rows),
+                                         dict(assets, files=forged_rows, files_sha256=file_inventory_seal(forged_rows)))
+                                for forged in wrong:
+                                    receipt_path.write_text(json.dumps(dict(receipt, assets=forged)), encoding="utf-8")
+                                    with self.assertRaisesRegex(ValueError, "terminal asset"):
+                                        comparison.verify(args, contract, profile)
+                                del receipt["assets"]
+                                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                                with self.assertRaisesRegex(ValueError, "terminal asset"):
+                                    comparison.verify(args, contract, profile)
+                                receipt_path.write_text(json.dumps(dict(receipt, accepted=False)), encoding="utf-8")
+                                comparison.verify(args, contract, profile)
+
+    def test_dev_adapter_sha_is_checked_independently(self):
+        for profile in (ltx, ltx_mlx):
+            contract = profile.contract("dev")
+            model = contract["model"]
+            files = [{"path": ltx.ADAPTER, "bytes": 42, "kind": "lfs_sha256", "digest": "a" * 64}]
+            model.update(files_sha256=file_inventory_seal(files), asset_bytes=42)
+            assets = {"repository": model["repository"], "revision": model["revision"],
+                      "files_sha256": model["files_sha256"], "files": files}
+            with self.assertRaisesRegex(ValueError, "frozen refinement adapter SHA-256"):
+                comparison.verify_assets(contract, assets)
 
     def test_ltx_stages_adapter_route_and_decoded_content(self):
         for variant, stage1 in ltx.STAGE1.items():
@@ -123,6 +194,11 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(wan.policy(cuda["variant"], UUID)["deadlineSeconds"], 240)
         self.assertNotEqual(wan.contract(cuda["variant"])["sources"]["model"],
                             wan.contract(mlx["variant"])["sources"]["model"])
+        for request in (cuda, mlx):
+            contract = wan.contract(request["variant"])
+            comparison.verify_assets(contract, contract["expected_asset_identity"])
+            with self.assertRaisesRegex(ValueError, "frozen asset content"):
+                comparison.verify_assets(contract, {})
 
     def test_wan_candle_receipt_requires_both_experts_to_install_adapters(self):
         variant = "a14b-t2v-candle"

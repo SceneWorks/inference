@@ -78,8 +78,8 @@ weights are private temporary job files.
 
 Select `eng4b-tier2` and request `flux1-eng4b-pair` on `candle-cuda`.
 Both arms use locked Cargo release builds and the planned route. The reference
-is inference main at `481a982db44b58937c15c2d3f0cbf918b116d04d`. Both arms
-include the shared loader changes merged in PR #1492. The head is the exact
+is the frozen native-format revision `be45bdf746c5d4a12d4db76f9653b8686e7f33f8`.
+Both arms include the shared native checkpoint loaders. The head is the exact
 dispatched revision and tree. Both use the full Q4 Dev and Schnell
 snapshots and the request settings above. The controller verifies the
 published file hashes before and after the comparison. One instrumented
@@ -114,7 +114,9 @@ render. Set the child deadline to at most 360 seconds and keep the existing
 one-second guard poll, 24 GiB child host cap and 18 GiB child GPU cap. At the
 360-second limit the physical claim allows 198 minutes plus the existing
 release reserve. The existing six-hour job timeout also covers builds and
-asset verification. The workflow requires provisioned cache entries.
+asset verification. By default the workflow requires provisioned cache entries.
+Set `"download_missing": true` in the `flux1-eng4b-pair` request to stage absent
+files from the exact pinned Hub snapshots before verification.
 The profile measures CUDA resident Q4 Dev and Schnell. FLUX.1 conditional
 modes use `conditional-tier1` and its separate immutable asset bindings.
 Native BFL and the ControlNet and PuLID injection routes retain their

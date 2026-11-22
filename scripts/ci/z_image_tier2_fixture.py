@@ -7,6 +7,7 @@ import struct
 import zlib
 
 from scripts.ci import stage_pinned_hub_snapshots as hub
+from scripts.ci.pinned_hub_source import file_inventory_seal, pinned_file_identity
 from scripts.ci.sga_adapter_comparison import bounded_owned_file
 from scripts.ci.sga_paired_performance import CEILING, INTERVAL_COVERAGE, PAIRS
 from scripts.ci.veda_extract_frame_png import png
@@ -130,19 +131,13 @@ pub fn take_z_image_terminal_sample() -> Option<ZImageTerminalSample> {
     return {shared: source, f"{family}/bin/{binary}.rs": probe}
 
 
-def file_seal(files):
-    return hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def asset_inventory(variant, upstream):
     files = []
     for name, row in sorted(upstream.items()):
         if name != "model_index.json" and name.split("/")[0] not in COMPONENTS:
             continue
-        digest, kind = ((row["lfs"]["sha256"], "lfs_sha256") if "lfs" in row
-                        else (row["blobId"], "git_blob_sha1"))
-        files.append({"path": name, "bytes": row["size"], "kind": kind, "digest": digest})
-    if file_seal(files) != MODELS[variant][2] or sum(row["bytes"] for row in files) != MODELS[variant][3]:
+        files.append(pinned_file_identity(name, row))
+    if file_inventory_seal(files) != MODELS[variant][2] or sum(row["bytes"] for row in files) != MODELS[variant][3]:
         raise ValueError("Z-Image snapshot component inventory differs from its approved revision")
     return files
 

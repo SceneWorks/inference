@@ -5,8 +5,8 @@ from pathlib import Path
 import re
 
 from scripts.ci.ltx25_tier2_fixture import (
-    ADAPTER, ADAPTER_HEADER, ADAPTER_SHA256, ADAPTER_TARGETS, HEADER, REPOSITORY,
-    REVISION, edit_once, staged_assets as staged_assets,
+    ADAPTER, ADAPTER_HEADER, ADAPTER_SHA256, ADAPTER_TARGETS, edit_once,
+    model_asset_contract, staged_assets as staged_assets,
 )
 from scripts.ci.sga_paired_performance import CEILING, INTERVAL_COVERAGE, PAIRS
 from scripts.ci.wan_adapter_tier1_fixture import unique_object
@@ -21,8 +21,7 @@ CHILD_FOOTPRINT_CAP_BYTES = 80 * GIB
 
 def contract(variant):
     return {
-        "model": {"repository": REPOSITORY, "revision": REVISION, "bundle": f"{variant}/q4",
-                  "transformer_header_sha256": HEADER[variant]},
+        "model": model_asset_contract(variant),
         "settings": {"device": {"kind": "mlx-metal", "index": 0}, "native_case": CASE[variant],
                      "variant": variant, "tier": "q4", "precision": "shipping BF16 compute",
                      "seed": 18777, "width": 512, "height": 512, "frames": 17, "fps": 24,

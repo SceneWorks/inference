@@ -20,6 +20,7 @@ from scripts.ci import model_inference_proofs as proof
 from scripts.ci import sga_adapter_comparison as source_pair
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.pinned_hub_source import verify_file_inventory_receipt
 from scripts.ci.sga_paired_performance import PAIRS, compare_peaks, compare_timing
 from scripts.ci.stage_pinned_hub_snapshots import hub_root
 from scripts.ci.wan_adapter_tier1_fixture import unique_object
@@ -191,6 +192,19 @@ def terminal_hub_root(backend, profile, env):
     return root.resolve(strict=True)
 
 
+def verify_assets(contract, assets):
+    if "expected_asset_identity" in contract:
+        if assets != contract["expected_asset_identity"]:
+            raise ValueError("terminal receipt lacks the frozen asset content identities")
+        return
+    verify_file_inventory_receipt(assets, contract["model"])
+    adapter = contract["settings"].get("adapter")
+    if adapter is not None and not any(
+            row["path"] == adapter["file"] and row["kind"] == "lfs_sha256" and row["digest"] == adapter["sha256"]
+            for row in assets["files"]):
+        raise ValueError("terminal receipt lacks the frozen refinement adapter SHA-256")
+
+
 def execute(args, contract, profile):
     env = os.environ.copy()
     cuda = args.backend == "candle-cuda"
@@ -219,6 +233,7 @@ def execute(args, contract, profile):
             receipt["hardware"]["capability"] = require_sm120(binding)
         model_hub = terminal_hub_root(args.backend, profile, env)
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
+        verify_assets(contract, receipt["assets"])
         child_env = {key: value for key, value in env.items() if not proof.SENSITIVE_ENVIRONMENT.search(key)}
         child_env.update(CARGO_INCREMENTAL="0", PAIR_TIER2_VARIANT=variant, PAIR_TIER2_SNAPSHOT=str(snapshot))
         if hasattr(profile, "asset_environment"):
@@ -317,8 +332,7 @@ def verify(args, contract, profile):
             raise ValueError("terminal upload artifact changed")
     if not receipt["accepted"]:
         return
-    if "expected_asset_identity" in contract and receipt.get("assets") != contract["expected_asset_identity"]:
-        raise ValueError("accepted terminal receipt lacks the frozen asset content identities")
+    verify_assets(contract, receipt.get("assets"))
     required = set(allowed) - {f"{name}.guard.jsonl" for name, _ in SAMPLES}
     if not required <= receipt["files"].keys() or receipt["physical_claim"].get("post_execution_verified") is not True:
         raise ValueError("accepted terminal receipt lacks exact supervised sample evidence")

@@ -2,7 +2,7 @@
 
 The two native Candle CUDA cases use the published Diffusers model and the
 request from the corresponding real-weight conformance test. Each compares the
-same variant from the merged ENG-4a engine `e86b8d5fc493c16b2d9d852e0c9ecbdefee58294`
+same variant from the frozen native-format baseline `481a982db44b58937c15c2d3f0cbf918b116d04d`
 and the exact dispatched source on one leased physical Blackwell GPU (SM 12.0).
 
 | Case | Official immutable snapshot | Native request |
@@ -14,7 +14,9 @@ Both requests use seed 42, count one, the resident BF16 compute route and the
 native VAE. The provider casts the official Turbo FP32 transformer shards to
 BF16. The Base transformer is published in BF16. The profile authenticates
 the pinned input files before and after the pair and rejects extra
-safetensors shards in the native component directories.
+safetensors shards in the native component directories. Upload verification
+replays the exact repository, revision, file inventory, byte total and content
+digests from the archived metadata.
 
 Both exact source builds compile the provider plan without loading a model
 before the controller claims the GPU. A completed generation must match the
