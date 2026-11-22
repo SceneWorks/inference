@@ -2469,8 +2469,8 @@ fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
 /// Candle's own `coerce_float` boundary is the rule for both: a float tensor is materialized at
 /// `DIT_DTYPE` and everything else keeps its stored width. That prices a dense diffusers
 /// `transformer/` at bf16 and an INT8-ConvRot file at its resident `i8` code planes; the ConvRot
-/// per-row `weight_scale` is read through `get_native_f32` and stays at its stored f32 width, so it
-/// is priced as stored rather than cast. The one source that needs more is an **MLX-packed tier**,
+/// per-row `weight_scale` retains its stored f32 width. A named ConvRot import additionally prices
+/// source-precision bias when the native projection retains it. An **MLX-packed tier**
 /// whose affine triples Candle repacks into a device-format GGML tensor that is neither the source
 /// sidecars nor a dense matrix of the packed weight's shortened last dimension —
 /// `mlx_packed_qtensor_resident_bytes` is the shared pricing for exactly that conversion.
@@ -2480,6 +2480,13 @@ fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
 /// fp8 / NVFP4 layer stays packed or decodes dense — see [`native_dit_resident_bytes`].
 fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
     let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    dit_header_resident_bytes(path, &headers)
+}
+
+fn dit_header_resident_bytes(
+    path: &std::path::Path,
+    headers: &[gen_core::SafetensorsTensorHeader],
+) -> gen_core::Result<u64> {
     let by_name = headers
         .iter()
         .map(|header| (header.name.as_str(), header))
@@ -2491,9 +2498,9 @@ fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
         .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
     let mut total = 0_u64;
     let mut dense = Vec::new();
-    for header in &headers {
+    for header in headers {
         if header.name.ends_with(".weight_scale") {
-            // ConvRot's per-output-row int8 scale: `get_native_f32` keeps it at its stored f32.
+            // Native ConvRot keeps its per-output-row scale at the stored F32 width.
             total = total
                 .checked_add(header.data_bytes)
                 .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
@@ -2549,6 +2556,103 @@ fn native_pricing_residency() -> candle_gen::logical_weights::CandleCodecResiden
     }
 }
 
+fn native_dit_plan(
+    path: &std::path::Path,
+    headers: &[gen_core::SafetensorsTensorHeader],
+    cfg: Option<&crate::config::Krea2Config>,
+    residency: &candle_gen::logical_weights::CandleCodecResidency,
+) -> gen_core::Result<gen_core::checkpoint_codec::LogicalWeightPlan> {
+    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
+    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
+        &prefix,
+        crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
+    );
+    candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))
+}
+
+fn is_wide_convrot_bias(header: &gen_core::SafetensorsTensorHeader) -> bool {
+    use gen_core::weightsmeta::Dtype;
+    matches!(header.dtype, Dtype::F32 | Dtype::F8_E4M3 | Dtype::F8_E5M2)
+}
+
+fn retained_convrot_bias_extra(
+    plan: &gen_core::checkpoint_codec::LogicalWeightPlan,
+    headers: &[gen_core::SafetensorsTensorHeader],
+    baseline_width: impl Fn(&gen_core::SafetensorsTensorHeader) -> u64,
+) -> gen_core::Result<u64> {
+    let biases: std::collections::BTreeSet<_> = plan
+        .tensors
+        .iter()
+        .filter_map(|row| row.retained_convrot_bias_key())
+        .collect();
+    let mut present = headers
+        .iter()
+        .filter(|header| is_wide_convrot_bias(header) && biases.contains(&header.name))
+        .peekable();
+    if present.peek().is_none() {
+        return Ok(0);
+    }
+    let projected =
+        gen_core::checkpoint_codec::projected_bytes_from_plan(plan, headers, |_| DIT_WIDTH)?;
+    present.try_fold(0_u64, |bytes, header| {
+        let baseline = header.materialized_bytes(baseline_width(header))?;
+        projected
+            .get(&header.name)
+            .and_then(|retained| retained.checked_sub(baseline))
+            .and_then(|extra| bytes.checked_add(extra))
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "krea: invalid ConvRot bias price for {}",
+                    header.name
+                ))
+            })
+    })
+}
+
+fn convrot_dit_resident_bytes(
+    path: &std::path::Path,
+    residency: impl FnOnce() -> candle_gen::logical_weights::CandleCodecResidency,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let baseline = dit_header_resident_bytes(path, &headers)?;
+    // Stock ConvRot projects only the bias-free trunk. A custom file may also encode a
+    // bias-bearing front or head projection. Only those files need a plan to price bias.
+    let int8_projections: std::collections::BTreeSet<_> = headers
+        .iter()
+        .filter(|header| header.dtype == Dtype::I8)
+        .filter_map(|header| header.name.strip_suffix(".weight"))
+        .collect();
+    if !headers.iter().any(|header| {
+        is_wide_convrot_bias(header)
+            && header
+                .name
+                .strip_suffix(".bias")
+                .is_some_and(|stem| int8_projections.contains(stem))
+    }) {
+        return Ok(baseline);
+    }
+    let residency = residency();
+    if !residency.fp8_e4m3_native {
+        return Ok(baseline);
+    }
+
+    // The named ConvRot route opens the mapped file without declaring new logical shapes.
+    let plan = native_dit_plan(path, &headers, None, &residency)?;
+    let extra = retained_convrot_bias_extra(&plan, &headers, |header| {
+        if header.is_float() {
+            DIT_WIDTH
+        } else {
+            header.dtype.size() as u64
+        }
+    })?;
+    baseline
+        .checked_add(extra)
+        .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))
+}
+
 /// Load-exact bytes of a **planned single-file native DiT import**, priced from the compiled plan
 /// the loader consumes (SC-22667 review).
 ///
@@ -2578,13 +2682,7 @@ fn native_dit_resident_bytes(
     use gen_core::checkpoint_codec::ResidencyMode;
 
     let headers = gen_core::safetensors_path_tensor_headers(path)?;
-    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
-    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
-        &prefix,
-        crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
-    );
-    let plan = candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
-        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let plan = native_dit_plan(path, &headers, cfg, residency)?;
     let dit_plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed);
     let dit_plan = match cfg {
         Some(cfg) => dit_plan.with_num_layers(cfg.num_layers),
@@ -2628,7 +2726,8 @@ fn native_dit_resident_bytes(
             .checked_add(companion.resident_bytes)
             .ok_or_else(overflow)?;
     }
-    Ok(total)
+    let bias_extra = retained_convrot_bias_extra(&plan, &headers, |_| DIT_WIDTH)?;
+    total.checked_add(bias_extra).ok_or_else(overflow)
 }
 
 /// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
@@ -2689,7 +2788,7 @@ fn loaded_asset_facts(
         ));
     }
     let transformer = component_bytes_or_no_signal(match (convrot_dit, native_dit) {
-        (Some(convrot), _) => dit_resident_bytes(convrot),
+        (Some(convrot), _) => convrot_dit_resident_bytes(convrot, native_pricing_residency),
         (None, Some(native)) => native_dit_resident_bytes(
             native,
             crate::config::Krea2Config::from_snapshot(root)
@@ -5207,8 +5306,8 @@ mod tests {
     /// **compiled plan** under the loader's own residency, not from stored headers through the
     /// `coerce_float` rule:
     ///
-    /// * an `F8_E4M3` row takes the exact dense decode on every host (the fp8 leg is masked for this
-    ///   import) and lands as `DIT_DTYPE` — 2 bytes per element, where the stored header says 1;
+    /// * an `F8_E4M3` row uses its stored width on a native host and lands as `DIT_DTYPE`
+    ///   on a dense-only host, using 2 bytes per logical element instead of the stored byte;
     /// * an NVFP4 row on a host below the `sm_120` floor decodes dense bf16 over its **logical**
     ///   shape, and on an eligible host stays packed only where Krea's role table serves it W4A4 —
     ///   the Kitchen fixture's block 0 is an edge block, so `Nvfp4Quant::Mixed` demotes it to dense
@@ -5295,6 +5394,86 @@ mod tests {
             dense_expected,
             "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
              contract prices what the role table builds rather than what the plan priced"
+        );
+    }
+
+    #[test]
+    fn native_convrot_import_prices_only_the_bias_its_projection_retains() {
+        use ::safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+        use candle_gen::logical_weights::CandleCodecResidency;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let biased = fixture.path().join("biased.safetensors");
+        let bias_free = fixture.path().join("bias-free.safetensors");
+        let codes = [0_u8; 16 * 64];
+        let scales = [1_f32.to_le_bytes(); 16].concat();
+        let descriptor = br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64}"#;
+        let dense_weight = [0_u8; 16 * 64 * 2];
+        let f32_bias = [0_u8; 16 * 4];
+        let make_view = |dtype, shape, bytes| TensorView::new(dtype, shape, bytes).unwrap();
+        for (path, has_native_bias) in [(&biased, true), (&bias_free, false)] {
+            let mut tensors = vec![
+                (
+                    "first.weight",
+                    make_view(Dtype::I8, vec![16, 64], &codes[..]),
+                ),
+                (
+                    "first.weight_scale",
+                    make_view(Dtype::F32, vec![16, 1], &scales[..]),
+                ),
+                (
+                    "first.comfy_quant",
+                    make_view(Dtype::U8, vec![descriptor.len()], &descriptor[..]),
+                ),
+                (
+                    "txtmlp.1.weight",
+                    make_view(Dtype::BF16, vec![16, 64], &dense_weight[..]),
+                ),
+                (
+                    "txtmlp.1.bias",
+                    make_view(Dtype::F32, vec![16], &f32_bias[..]),
+                ),
+            ];
+            if has_native_bias {
+                tensors.push(("first.bias", make_view(Dtype::F32, vec![16], &f32_bias[..])));
+            }
+            serialize_to_file(tensors, None, path).unwrap();
+        }
+
+        let native = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            ..CandleCodecResidency::DENSE
+        };
+        let dense = CandleCodecResidency::DENSE;
+        let ordinary_bias = 16 * DIT_WIDTH;
+        let native_bias = 16 * 4;
+        let packed_without_native_bias = 16 * 64 + 16 * 4 + 16 * 64 * DIT_WIDTH + ordinary_bias;
+        assert_eq!(
+            native_dit_resident_bytes(&bias_free, None, &native).unwrap(),
+            packed_without_native_bias
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&biased, None, &native).unwrap(),
+            packed_without_native_bias + native_bias
+        );
+        assert!(
+            native_dit_resident_bytes(&biased, None, &dense).is_err(),
+            "the mapped loader requires native ConvRot execution"
+        );
+
+        let biased_baseline = dit_resident_bytes(&biased).unwrap();
+        assert_eq!(
+            convrot_dit_resident_bytes(&biased, || native).unwrap(),
+            biased_baseline + native_bias - ordinary_bias
+        );
+        assert_eq!(
+            convrot_dit_resident_bytes(&biased, || dense).unwrap(),
+            biased_baseline
+        );
+        assert_eq!(
+            convrot_dit_resident_bytes(&bias_free, || panic!("bias-free pricing needs no device"))
+                .unwrap(),
+            dit_resident_bytes(&bias_free).unwrap()
         );
     }
 
