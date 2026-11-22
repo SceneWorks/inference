@@ -16,6 +16,7 @@ timeout is reported as `unreachable`, never as absent. Other repositories that h
 the same name are ignored, so a role cannot be ambiguous.
 """
 import argparse
+import errno
 import faulthandler
 import hashlib
 import json
@@ -326,21 +327,54 @@ class _RecordLinkedEtag(urllib.request.HTTPRedirectHandler):
 
 def _same_bytes(path, size, sha):
     """Whether a file another job placed holds exactly the bytes this job downloaded."""
-    if path.stat().st_size != size:
-        return False
     state = hashlib.sha256()
     with path.open("rb") as stream:
+        if os.fstat(stream.fileno()).st_size != size:
+            return False
+        read = 0
         while chunk := stream.read(STAGE_CHUNK):
+            read += len(chunk)
+            if read > size:
+                return False
             state.update(chunk)
-    return state.hexdigest() == sha
+    return read == size and state.hexdigest() == sha
 
 
-def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=None, expected_bytes=None):
+def publish_download(temporary, destination, size, sha, *, guard=None, under_staging_lock=False):
+    """Publish a verified partial atomically and reconcile a concurrent same-byte placement."""
+    if guard is not None:
+        guard(destination)
+    try:
+        if os.name == "nt":
+            os.rename(temporary, destination)
+        else:
+            try:
+                os.link(temporary, destination)
+            except OSError as error:
+                if (not under_staging_lock or guard is None
+                        or error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP)):
+                    raise
+                # Some macOS SMB volumes allow same-directory rename but cannot make hard links.
+                # The common staging lock serializes publication by every participating stager.
+                if guard(destination):
+                    raise FileExistsError(destination) from error
+                os.replace(temporary, destination)
+    except FileExistsError:
+        if guard is not None:
+            guard(destination)
+        if not _same_bytes(destination, size, sha):
+            raise ValueError(f"{destination} was placed concurrently with other bytes; not replaced")
+        return True
+    return False
+
+
+def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=None, expected_bytes=None,
+                 expected_git_blob=None, publish=publish_download):
     """Stream `url` to a temporary file beside `destination`, then place it without overwriting.
 
     Returns (bytes, sha256, linked_etag, placed_by_another_job). The temporary file is this process's own (a unique
     `mkstemp` name), so cleanup never touches another job's partial. An existing destination is
-    never replaced (`os.link` on POSIX, `os.rename` on Windows both refuse it). When another job
+    never replaced by the default publisher. When another job
     on the same host places the destination first (run 44431653018: several runner listeners
     share one hub), this download is discarded if the placed file has the same size and SHA-256
     (`placed_by_another_job` is then True), and refused otherwise.
@@ -348,6 +382,8 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
     """
     if probe(destination)["exists"]:
         raise FileExistsError(f"refusing to overwrite existing asset {destination}")
+    if expected_git_blob is not None and expected_bytes is None:
+        raise ValueError("a pinned Git blob needs its exact byte count")
     destination.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": "flux1-asset-stager/1"})
     if token:
@@ -359,6 +395,8 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
                                              suffix=".partial", dir=destination.parent)
     temporary = Path(temporary)
     digest_state, size = hashlib.sha256(), 0
+    git_digest = (hashlib.sha1(f"blob {expected_bytes}\0".encode())
+                  if expected_git_blob is not None else None)
     # An HTTP request, not a file: bound by name so the text-mode file-open audit does not read it
     # as a locale-decoded `Path.open`. The body is consumed as bytes.
     request_url = opener.open
@@ -373,6 +411,8 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
                     raise ValueError(f"download exceeds the sealed byte count for {url}")
                 sink.write(chunk)
                 digest_state.update(chunk)
+                if git_digest is not None:
+                    git_digest.update(chunk)
             sink.flush()
             os.fsync(sink.fileno())
         if expected is not None and int(expected) != size:
@@ -382,20 +422,12 @@ def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=N
         sha = digest_state.hexdigest()
         if expected_sha256 is not None and sha != expected_sha256:
             raise ValueError(f"downloaded bytes differ from the sealed SHA-256 for {url}")
+        if git_digest is not None and git_digest.hexdigest() != expected_git_blob:
+            raise ValueError(f"downloaded bytes differ from the pinned Git blob SHA-1 for {url}")
         etag = (getattr(opener, "linked_etag", None) or recorder.linked_etag or "").strip('"')
         if re.fullmatch(r"[0-9a-f]{64}", etag) and etag != sha:
             raise ValueError(f"downloaded bytes for {url} differ from the Hub's LFS SHA-256")
-        try:
-            if os.name == "nt":
-                os.rename(temporary, destination)
-            else:
-                os.link(temporary, destination)
-                temporary.unlink()
-        except FileExistsError:
-            if not _same_bytes(destination, size, sha):
-                raise ValueError(f"{destination} was placed concurrently with other bytes; not replaced")
-            return size, sha, etag or None, True
-        return size, sha, etag or None, False
+        return size, sha, etag or None, publish(temporary, destination, size, sha)
     finally:
         if temporary.exists():
             temporary.unlink()

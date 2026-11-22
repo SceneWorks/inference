@@ -220,11 +220,11 @@ def stage_terminal_snapshots(hub, provenance):
             selected[name] = asset
         return tree, raw, selected
 
-    def fetch(url, destination):
+    def fetch(url, destination, **transfer):
         identity = by_destination[destination]
         confined(destination.parent.resolve(), hub, destination)
-        return fetch_pinned(url, destination, expected_sha256=identity["sha256"],
-                            expected_bytes=identity["bytes"])
+        transfer.update(expected_sha256=identity["sha256"], expected_bytes=identity["bytes"])
+        return fetch_pinned(url, destination, **transfer)
 
     hub_snapshots.stage(pins, hub, manifest=terminal_manifest, fetch=fetch)
 

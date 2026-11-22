@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import errno
+from functools import partial
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -37,7 +38,9 @@ import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.ci.pinned_hub_source import pinned_manifest, verify_pinned_hub_files  # noqa: E402
+from scripts.ci.flux1_conditional_asset_inventory import confined, publish_download  # noqa: E402
+from scripts.ci.model_inference_proofs import unlinked_path  # noqa: E402
+from scripts.ci.pinned_hub_source import pinned_file_identity, pinned_manifest, verify_pinned_hub_files  # noqa: E402
 
 GIB = 1024**3
 # Free space a staging run must leave on the model root's volume.
@@ -78,13 +81,47 @@ def staging_lock_path(hub: Path, repository: str, revision: str, file: str) -> P
             / revision / (file + ".lock"))
 
 
+def _guard_lock(path: Path, hub: Path) -> None:
+    unlinked_path(path, hub)
+    if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+        raise ValueError(f"staging lock must be a regular unshared file: {path}")
+
+
+def _asset_present(path: Path, hub: Path) -> bool:
+    # Hugging Face uses symlink leaves to in-hub blobs. Writes and directory
+    # creation must always use real, unlinked ancestors inside the hub.
+    unlinked_path(path.parent, hub)
+    if path.parent.exists() and not path.parent.is_dir():
+        raise ValueError(f"snapshot asset parent is not a directory: {path.parent}")
+    if not os.path.lexists(path):
+        return False
+    try:
+        resolved = confined(path.resolve(strict=True), hub, path)
+    except FileNotFoundError as error:
+        raise ValueError(f"snapshot asset has a dangling link: {path}") from error
+    if not resolved.is_file():
+        raise ValueError(f"snapshot asset is not a regular file: {path}")
+    return True
+
+
 @contextmanager
 def staging_lock(hub: Path, repository: str, revision: str, file: str):
     """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
+    hub = hub.resolve(strict=True)
     path = staging_lock_path(hub, repository, revision, file)
+    _guard_lock(path, hub)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+b") as handle:
+    _guard_lock(path, hub)
+
+    def open_lock(name, flags):
+        return os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
+
+    with open(path, "a+b", opener=open_lock) as handle:
+        _guard_lock(path, hub)
+        opened = os.fstat(handle.fileno())
+        if opened.st_nlink != 1 or not os.path.samestat(opened, path.lstat()):
+            raise ValueError(f"staging lock changed during open: {path}")
         if handle.seek(0, 2) == 0:
             handle.write(b"0")
             handle.flush()
@@ -150,6 +187,7 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
     """Fetch every absent pinned file, then authenticate every pinned file; return the receipt."""
     if fetch is None:
         from scripts.ci.flux1_conditional_asset_inventory import fetch_pinned as fetch
+    hub = hub.resolve(strict=True)
     free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
     plans = []
     for name, pin in sorted(snapshots.items()):
@@ -157,9 +195,16 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
         _, _, inventory = manifest(repository, revision)
         files = pinned_files(inventory, subfolder)
         base = snapshot_dir(hub, repository, revision)
-        absent = {file: size for file, size in files.items() if not (base / file).exists()}
+        absent = {}
+        for file in files:
+            if ("\\" in file or ":" in file or any(part in ("", ".", "..") for part in file.split("/"))):
+                raise ValueError(f"unsafe pinned snapshot asset path: {file}")
+            identity = pinned_file_identity(file, inventory[file])
+            if not _asset_present(base / file, hub):
+                _guard_lock(staging_lock_path(hub, repository, revision, file), hub)
+                absent[file] = identity
         plans.append((name, pin, base, files, absent))
-    needed = sum(size for *_, absent in plans for size in absent.values())
+    needed = sum(identity["bytes"] for *_, absent in plans for identity in absent.values())
     free = free_bytes(hub)
     if needed + DISK_RESERVE_BYTES > free:
         raise ValueError(f"staging needs {needed / GIB:.1f} GiB plus a {DISK_RESERVE_BYTES / GIB:.0f} GiB reserve "
@@ -168,14 +213,29 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
     for name, pin, base, files, absent in plans:
         fetched, placed_by_another_job = [], []
         for file in sorted(absent):
+            destination = base / file
             with staging_lock(hub, pin["repository"], pin["revision"], file):
                 # Staged for an earlier slot of the same revision, or by another job on this host.
-                if (base / file).exists():
+                if _asset_present(destination, hub):
                     continue
                 url = HF_RESOLVE.format(repo=pin["repository"], revision=pin["revision"], name=urllib.parse.quote(file))
-                print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
-                _, _, _, placed = fetch(url, base / file)
+                identity = absent[file]
+                size = identity["bytes"]
+                print(f"staging {pin['repository']}@{pin['revision']}/{file} ({size / GIB:.2f} GiB)", flush=True)
+                digest_arg = "expected_sha256" if identity["kind"] == "lfs_sha256" else "expected_git_blob"
+                publish = partial(publish_download, guard=partial(_asset_present, hub=hub), under_staging_lock=True)
+                try:
+                    _, _, _, placed = fetch(url, destination, expected_bytes=size, publish=publish,
+                                            **{digest_arg: identity["digest"]})
+                except FileExistsError:
+                    # A peer using the Hub outside this stager can win before the
+                    # transfer starts. The whole-snapshot check below authenticates it.
+                    if not _asset_present(destination, hub):
+                        raise
+                    placed = True
                 (placed_by_another_job if placed else fetched).append(file)
+        for file in files:
+            _asset_present(base / file, hub)
         verified = verify(pin["repository"], pin["revision"], base, tuple(sorted(files)))
         path = base / pin["subfolder"] if pin["subfolder"] else base
         receipt[name] = {**pin, "path": str(path), "status": verified["status"], "fetched": fetched,
