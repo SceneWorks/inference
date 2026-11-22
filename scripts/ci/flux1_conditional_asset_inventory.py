@@ -34,6 +34,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci.file_lock import exclusive_file_lock
 from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 from scripts.ci.flux1_pair.fs_probe import Unreachable, probe
 
@@ -339,36 +340,30 @@ def _renamex_excl(source, destination):
 
 
 def _locked_replace_if_absent(temporary, destination):
-    """Serialize `probe` + `os.replace` via an exclusive sibling lockfile (`O_CREAT | O_EXCL`).
+    """Serialize `probe` + `os.replace` via a crash-safe OS file lock (`exclusive_file_lock`).
 
     Used only when neither `os.link` nor an atomic no-overwrite rename is supported by the
     filesystem (e.g. exFAT/SMB shares). Guarantees concurrent staging jobs never clobber an
-    already-placed `destination`.
+    already-placed `destination`, and recovers immediately if a previous publisher crashed or was
+    killed while holding the placement lock.
     """
     lock_path = destination.parent / f".{destination.name}.place.lock"
-    deadline = time.monotonic() + PLACE_LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            if probe(destination)["exists"]:
-                raise FileExistsError(destination)
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for placement lock {lock_path}")
-            time.sleep(PLACE_LOCK_POLL_SECONDS)
-    try:
+
+    def check_absent(_wait_count):
+        if probe(destination)["exists"]:
+            raise FileExistsError(destination)
+
+    with exclusive_file_lock(
+        lock_path,
+        poll_seconds=PLACE_LOCK_POLL_SECONDS,
+        timeout_seconds=PLACE_LOCK_TIMEOUT_SECONDS,
+        remove_on_exit=True,
+        fallback_excl_on_notsup=True,
+        on_wait=check_absent,
+    ):
         if probe(destination)["exists"]:
             raise FileExistsError(destination)
         os.replace(temporary, destination)
-    finally:
-        try:
-            os.close(fd)
-        finally:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def _place_without_overwrite(temporary, destination):

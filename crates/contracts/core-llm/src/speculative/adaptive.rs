@@ -632,6 +632,42 @@ impl AdaptiveSpeculativeReport {
             cost: None,
         }
     }
+
+    /// Serialize this report to its canonical JSON wire representation, shared by the OpenAI
+    /// server `x_decode` extension and benchmark `BenchRow` telemetry.
+    pub fn to_wire_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "adaptive": self.adaptive,
+            "candidates": self.candidates.iter().map(|c| c.label()).collect::<Vec<_>>(),
+            "initial_proposer": self.initial_proposer.label(),
+            "initial_depth": self.initial_depth,
+            "final_proposer": self.final_proposer.label(),
+            "final_depth": self.final_depth,
+            "depth_changes": self.depth_changes,
+            "proposer_switches": self.proposer_switches,
+            "plain_reason": self.plain_reason,
+            "events": self.events.iter().map(|e| serde_json::json!({
+                "token_offset": e.token_offset,
+                "verify_step": e.verify_step,
+                "kind": e.kind.label(),
+                "from_proposer": e.from_proposer.label(),
+                "from_depth": e.from_depth,
+                "to_proposer": e.to_proposer.label(),
+                "to_depth": e.to_depth,
+                "reason": e.reason,
+            })).collect::<Vec<_>>(),
+            "cost": self.cost.map(|c| serde_json::json!({
+                "proposal_ms": c.proposal_ms(),
+                "verify_ms": c.verify_ms(),
+                "rollback_ms": c.rollback_ms(),
+                "sync_ms": c.sync_ms(),
+                "total_ms": c.total_ms(),
+                "host_syncs": c.host_syncs,
+                "committed_tokens": c.committed_tokens,
+                "ms_per_committed_token": c.ms_per_committed_token(),
+            })),
+        })
+    }
 }
 
 /// Inputs fed to [`AdaptiveSpeculativeController::observe_step`] after each decode step.
@@ -3472,5 +3508,101 @@ mod tests {
         let dear_cost = dear_report.cost.expect("dear cost summary");
         assert_eq!(dear_cost.proposal_ns - cheap_cost.proposal_ns, 190_000_000);
         assert_eq!(dear_cost.total_ns - cheap_cost.total_ns, 190_000_000);
+    }
+
+    #[test]
+    fn adaptive_speculative_report_to_wire_json_contract() {
+        let report = AdaptiveSpeculativeReport {
+            adaptive: true,
+            candidates: vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            initial_proposer: ProposerKind::Mtp,
+            initial_depth: 3,
+            final_proposer: ProposerKind::PromptLookup,
+            final_depth: 5,
+            depth_changes: 1,
+            proposer_switches: 1,
+            events: vec![AdaptiveSpeculativeEvent {
+                token_offset: 24,
+                verify_step: 8,
+                kind: AdaptiveEventKind::ProposerSwitched,
+                from_proposer: ProposerKind::Mtp,
+                from_depth: 3,
+                to_proposer: ProposerKind::PromptLookup,
+                to_depth: 5,
+                reason: "probe beat incumbent".into(),
+            }],
+            plain_reason: None,
+            cost: Some(AdaptiveCostSummary {
+                proposal_ns: 2_500_000,
+                verify_ns: 12_000_000,
+                rollback_ns: 500_000,
+                sync_ns: 1_000_000,
+                total_ns: 16_000_000,
+                host_syncs: 8,
+                committed_tokens: 32,
+            }),
+        };
+
+        let wire = report.to_wire_json();
+        assert_eq!(wire["adaptive"], true);
+        assert_eq!(
+            wire["candidates"],
+            serde_json::json!(["mtp", "prompt_lookup", "none"])
+        );
+        assert_eq!(wire["initial_proposer"], "mtp");
+        assert_eq!(wire["initial_depth"], 3);
+        assert_eq!(wire["final_proposer"], "prompt_lookup");
+        assert_eq!(wire["final_depth"], 5);
+        assert_eq!(wire["depth_changes"], 1);
+        assert_eq!(wire["proposer_switches"], 1);
+        assert!(wire["plain_reason"].is_null());
+
+        let events = wire["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            serde_json::json!({
+                "token_offset": 24,
+                "verify_step": 8,
+                "kind": "proposer_switched",
+                "from_proposer": "mtp",
+                "from_depth": 3,
+                "to_proposer": "prompt_lookup",
+                "to_depth": 5,
+                "reason": "probe beat incumbent",
+            })
+        );
+
+        let expected_cost = serde_json::json!({
+            "proposal_ms": 2.5,
+            "verify_ms": 12.0,
+            "rollback_ms": 0.5,
+            "sync_ms": 1.0,
+            "total_ms": 16.0,
+            "host_syncs": 8,
+            "committed_tokens": 32,
+            "ms_per_committed_token": 0.5,
+        });
+        assert_eq!(wire["cost"], expected_cost);
+
+        let plain = AdaptiveSpeculativeReport::auto_stayed_plain(
+            "speculative: no eligible proposer advertised",
+            vec![ProposerKind::None],
+        );
+        let plain_wire = plain.to_wire_json();
+        assert_eq!(plain_wire["adaptive"], true);
+        assert_eq!(plain_wire["candidates"], serde_json::json!(["none"]));
+        assert_eq!(plain_wire["initial_proposer"], "none");
+        assert_eq!(plain_wire["final_proposer"], "none");
+        assert_eq!(
+            plain_wire["plain_reason"],
+            "speculative: no eligible proposer advertised"
+        );
+        assert!(plain_wire["cost"].is_null());
+        assert_eq!(plain_wire["events"][0]["kind"], "stayed_plain");
     }
 }

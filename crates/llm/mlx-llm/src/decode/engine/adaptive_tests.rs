@@ -1218,3 +1218,262 @@ fn adaptive_charges_mtp_catch_up_to_switch_cost_and_summary() {
         dear_adaptive.events
     );
 }
+
+#[test]
+fn adaptive_charges_draft_model_catch_up_to_switch_cost_and_summary() {
+    use crate::decode::proposers::DraftModelProposer;
+
+    struct ScriptedDraft {
+        vocab: usize,
+        prompt_len: usize,
+        sequence: Vec<i32>,
+        clock: Rc<FakeClock>,
+        step_cost: Duration,
+        replay_cost: Duration,
+        accurate_ranges: Vec<std::ops::Range<usize>>,
+        replay_lens: RefCell<Vec<usize>>,
+    }
+
+    impl ScriptedDraft {
+        fn is_accurate(&self, step_idx: usize) -> bool {
+            self.accurate_ranges.iter().any(|r| r.contains(&step_idx))
+        }
+
+        fn draft_token(&self, step_idx: usize) -> i32 {
+            let expected = self
+                .sequence
+                .get(step_idx)
+                .copied()
+                .unwrap_or(((step_idx + 1) % self.vocab) as i32);
+            if self.is_accurate(step_idx) {
+                expected
+            } else {
+                ((expected as usize + 5) % self.vocab) as i32
+            }
+        }
+    }
+
+    impl SpeculativeTarget for ScriptedDraft {
+        type Cache = MockCache;
+        type Rollback = MockRollback;
+
+        fn new_cache(&self) -> MockCache {
+            MockCache { len: 0 }
+        }
+
+        fn cache_len(&self, cache: &MockCache) -> i32 {
+            cache.len
+        }
+
+        fn rollback(&self, width: usize) -> MockRollback {
+            MockRollback {
+                provisioned_width: width,
+                armed: false,
+            }
+        }
+
+        fn forward(
+            &self,
+            cache: &mut MockCache,
+            ids: &Array,
+            _rope_offset: i32,
+            _scope: LogitsScope,
+            _want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            let n = ids.shape()[1] as usize;
+            let start = cache.len as usize;
+            let is_prefill = start == 0 && n == self.prompt_len;
+            if !is_prefill {
+                // Plain-probe catch-up feeds the 2 probed tokens right after prefill; switch-back
+                // catch-up replays the >2 inactive tokens accumulated during PromptLookup.
+                if (start == self.prompt_len && n == 2) || n > 2 {
+                    self.replay_lens.borrow_mut().push(n);
+                    self.clock.advance(self.replay_cost);
+                } else {
+                    self.clock.advance(self.step_cost);
+                }
+            }
+            cache.len += n as i32;
+            let last_pos = start + n - 1;
+            let step_idx = last_pos.saturating_sub(self.prompt_len.saturating_sub(1));
+            let mut row = vec![-2.0f32; self.vocab];
+            row[(self.draft_token(step_idx) as usize) % self.vocab] = 4.5;
+            Ok(TargetOutput {
+                logits: Array::from_slice(&row, &[1, self.vocab as i32]),
+                hidden: None,
+            })
+        }
+
+        fn attention_label(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    let vocab = 128;
+    let prompt: Vec<i32> = (10..26).collect();
+    let mut seq = Vec::new();
+    // Phase 1 (0..45): open-ended; DraftModel matches accurately.
+    for i in 0..45 {
+        seq.push(30 + (i % 90));
+    }
+    // Phase 2 (45..125): repeated prompt spans; DraftModel misses while PromptLookup wins probe
+    // and accumulates an inactive backlog for DraftModel catch-up.
+    for i in 0..80 {
+        seq.push(prompt[i % prompt.len()]);
+    }
+    // Phase 3 (125..195): open-ended; PromptLookup dries up and triggers DraftModel switch-back
+    // probe whose catch-up replay runs inside `Proposer::catch_up` (`switch_overhead_ns`).
+    for i in 0..70 {
+        seq.push(30 + ((i * 7 + 13) % 90));
+    }
+    let config = greedy_config(seq.len());
+    let plan = AutoSpeculativePlan {
+        candidates: vec![
+            AutoCandidate {
+                proposer: ProposerKind::DraftModel,
+                recommended_depth: 2,
+                max_depth: 5,
+            },
+            AutoCandidate {
+                proposer: ProposerKind::PromptLookup,
+                recommended_depth: 4,
+                max_depth: 6,
+            },
+            AutoCandidate::plain(),
+        ],
+        fallbacks: Vec::new(),
+    };
+
+    #[derive(Clone, Copy)]
+    enum CatchUpTier {
+        Zero,
+        Small,
+        Expensive,
+    }
+
+    let run_tier = |tier: CatchUpTier| {
+        let clock = Rc::new(FakeClock::default());
+        let target = ScriptedTarget::new(vocab, prompt.len(), seq.clone(), clock.clone());
+        let draft = ScriptedDraft {
+            vocab,
+            prompt_len: prompt.len(),
+            sequence: seq.clone(),
+            clock: clock.clone(),
+            step_cost: Duration::from_millis(3),
+            replay_cost: match tier {
+                CatchUpTier::Zero => Duration::ZERO,
+                CatchUpTier::Small => Duration::from_millis(5),
+                CatchUpTier::Expensive => Duration::from_millis(250),
+            },
+            accurate_ranges: vec![0..45, 125..195],
+            replay_lens: RefCell::new(Vec::new()),
+        };
+        let mut proposer = DraftModelProposer::new(&draft, 6);
+        let run = with_decode_clock(Some(clock), || {
+            generate_speculative(
+                &target,
+                &mut proposer,
+                SpeculativePrompt::Tokens(&prompt),
+                &config,
+                2,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions {
+                    pipelining: Pipelining::Auto,
+                    speculative_mode: Speculative::Auto,
+                    adaptive_plan: Some(plan.clone()),
+                    provisioned_max_depth: Some(6),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(run.output.tokens, seq);
+        let replays = draft.replay_lens.borrow().clone();
+        (run, replays)
+    };
+
+    let (zero_run, zero_replays) = run_tier(CatchUpTier::Zero);
+    let (small_run, small_replays) = run_tier(CatchUpTier::Small);
+    let (dear_run, dear_replays) = run_tier(CatchUpTier::Expensive);
+
+    assert!(
+        zero_replays.len() >= 2 && zero_replays.iter().any(|&n| n > 2),
+        "expected plain probe and switch-back replay catch-ups: {zero_replays:?}"
+    );
+    assert_eq!(small_replays, zero_replays);
+    assert!(
+        dear_replays.len() >= 2 && dear_replays.iter().any(|&n| n > 2),
+        "expected plain probe and switch-back replay catch-ups: {dear_replays:?}"
+    );
+
+    let zero_adaptive = zero_run
+        .report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+    let small_adaptive = small_run
+        .report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+    let dear_adaptive = dear_run
+        .report
+        .adaptive_speculative
+        .as_ref()
+        .expect("adaptive report");
+
+    // Cheap catch-up still switches back to DraftModel.
+    assert!(
+        small_adaptive.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProposerSwitched
+                && e.to_proposer == ProposerKind::DraftModel
+        }),
+        "expected cheap catch-up to switch back to DraftModel: {:?}",
+        small_adaptive.events
+    );
+    let zero_cost = zero_adaptive.cost.expect("zero cost summary");
+    let small_cost = small_adaptive.cost.expect("small cost summary");
+    let small_count = small_replays.len() as u64;
+    assert_eq!(
+        small_cost.proposal_ns - zero_cost.proposal_ns,
+        small_count * 5_000_000
+    );
+    assert_eq!(
+        small_cost.total_ns - zero_cost.total_ns,
+        small_count * 5_000_000
+    );
+
+    // Expensive catch-up is charged to switch_overhead_ns (not filtered out as a host stall by
+    // Stretch::of), causing the switch-back probe to revert rather than switching at a net loss.
+    let dear_cost = dear_adaptive.cost.expect("dear cost summary");
+    let dear_count = dear_replays.len() as u64;
+    assert!(
+        dear_cost.proposal_ns >= dear_count * 250_000_000,
+        "draft catch-up work must be included in proposal_ns: {:?}",
+        dear_cost
+    );
+    assert!(
+        dear_cost.total_ns >= dear_cost.proposal_ns,
+        "draft catch-up work must be included in total_ns: {:?}",
+        dear_cost
+    );
+    assert!(
+        dear_adaptive.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProbeReverted
+                && e.from_proposer == ProposerKind::DraftModel
+                && e.to_proposer == ProposerKind::PromptLookup
+                && e.reason.contains("catch-up")
+        }),
+        "expensive draft catch-up must revert the DraftModel switch-back probe: {:?}",
+        dear_adaptive.events
+    );
+    assert!(
+        !dear_adaptive.events.iter().any(|e| {
+            e.kind == AdaptiveEventKind::ProposerSwitched
+                && e.to_proposer == ProposerKind::DraftModel
+        }),
+        "expensive draft catch-up must not commit a switch back to DraftModel: {:?}",
+        dear_adaptive.events
+    );
+}

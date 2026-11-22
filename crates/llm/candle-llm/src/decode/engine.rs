@@ -447,14 +447,17 @@ pub trait Proposer {
 
     /// Bring the proposer up to date with steps the target ran **without** a proposal — the
     /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
-    /// [`core_llm::AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
-    /// paired with its predecessor's target hidden row in `preceding_hidden`
-    /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
-    /// before the next [`propose`](Self::propose). Each probe step was also
-    /// [`commit`](Self::commit)ted (no drafts, its row in `kept_hidden`). The default does
-    /// nothing — right for a proposer whose state is the history alone (n-gram) or that
-    /// [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
-    /// `draft_model` is never probed (`auto` never resolves to it).
+    /// [`core_llm::AcceptanceMonitor::probing`]) or an inactive `prompt_lookup` stretch under
+    /// adaptive `auto` (SW-7237): `tokens` were fed at RoPE positions `position..`, each paired
+    /// with its predecessor's target hidden row in `preceding_hidden` (`[1, tokens.len(), hidden]`,
+    /// when [`wants_hidden`](Self::wants_hidden)). Called once, before the next
+    /// [`propose`](Self::propose), inside the engine's `switch_overhead_ns` timing seam. Each
+    /// inactive step was also [`commit`](Self::commit)ted (no drafts from this proposer). The
+    /// default does nothing — right for a proposer whose state is the history alone (n-gram) or
+    /// that [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
+    /// [`MtpProposer`](super::proposers::MtpProposer) and
+    /// [`DraftModelProposer`](super::proposers::DraftModelProposer) replay their inactive backlog
+    /// here so catch-up cost is charged as switching overhead.
     fn catch_up(
         &mut self,
         _tokens: &[i32],
@@ -1079,7 +1082,6 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     let mut lookup_proposer = crate::decode::proposers::NgramProposer::default();
     let mut probed: Vec<(i32, Option<Tensor>)> = Vec::new();
     let mut probe_position = 0i32;
-    let mut inactive_draft_tokens = 0usize;
     let mut demoted = controller.is_demoted();
     let elapsed_ns = |start: Option<std::time::Duration>| -> u64 {
         start.zip(clock.as_ref()).map_or(0, |(s, c)| {
@@ -1116,9 +1118,6 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             catchup_ns = elapsed_ns(cu_clock);
             proposal_ns = proposal_ns.saturating_add(catchup_ns);
         }
-        if use_primary {
-            inactive_draft_tokens = 0;
-        }
         let remaining = config.max_new_tokens - generated.len();
         let active_depth = (step_plan.depth as usize).min(provisioned_width);
         let k = if demoted || probing || step_plan.proposer == ProposerKind::None {
@@ -1139,9 +1138,11 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         let record_catchup = !demoted
             && (probing
                 || (use_lookup
-                    && wants_hidden
-                    && kind == ProposerKind::Mtp
-                    && controller.can_switch_to(ProposerKind::Mtp)));
+                    && ((wants_hidden
+                        && kind == ProposerKind::Mtp
+                        && controller.can_switch_to(ProposerKind::Mtp))
+                        || (kind == ProposerKind::DraftModel
+                            && controller.can_switch_to(ProposerKind::DraftModel)))));
         let prev_hidden_for_catchup = if record_catchup && wants_hidden {
             previous_hidden.clone()
         } else {
@@ -1461,35 +1462,28 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                         probed.push((tok, pred));
                     }
                 }
-                if !probing && probed.len() > MAX_MTP_CATCHUP_TOKENS {
-                    probed.clear();
-                    controller.retire_proposer(ProposerKind::Mtp);
+                if !probing {
+                    let catchup_limit = match kind {
+                        ProposerKind::Mtp => Some(MAX_MTP_CATCHUP_TOKENS),
+                        ProposerKind::DraftModel => Some(MAX_DRAFT_CATCHUP_TOKENS),
+                        _ => None,
+                    };
+                    if catchup_limit.is_some_and(|limit| probed.len() > limit) {
+                        probed.clear();
+                        controller.retire_proposer(kind);
+                    }
                 }
             }
             if use_primary
                 || probing
                 || (use_lookup && kind != ProposerKind::Mtp && controller.can_switch_to(kind))
             {
-                if use_lookup && kind == ProposerKind::DraftModel {
-                    inactive_draft_tokens = inactive_draft_tokens.saturating_add(1 + accepted);
-                    if inactive_draft_tokens > MAX_DRAFT_CATCHUP_TOKENS {
-                        controller.retire_proposer(ProposerKind::DraftModel);
-                    } else {
-                        proposer.commit(
-                            cur,
-                            &draft_ids[..accepted],
-                            kept_hidden.as_ref(),
-                            position + 1,
-                        )?;
-                    }
-                } else {
-                    proposer.commit(
-                        cur,
-                        &draft_ids[..accepted],
-                        kept_hidden.as_ref(),
-                        position + 1,
-                    )?;
-                }
+                proposer.commit(
+                    cur,
+                    &draft_ids[..accepted],
+                    kept_hidden.as_ref(),
+                    position + 1,
+                )?;
             }
             if keep_primary_hidden {
                 previous_hidden = last_row(kept_hidden.as_ref())?;

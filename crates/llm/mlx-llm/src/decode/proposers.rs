@@ -286,6 +286,19 @@ where
         };
         Ok(())
     }
+
+    fn catch_up(&mut self, _: &T, tokens: &[i32], _: Option<&Array>, _: i32) -> Result<()> {
+        let replay = if !self.pending.is_empty() {
+            std::mem::take(&mut self.pending)
+        } else if !tokens.is_empty() {
+            tokens.to_vec()
+        } else {
+            return Ok(());
+        };
+        let logits = self.feed(&replay)?;
+        eval([&logits])?;
+        Ok(())
+    }
 }
 
 /// A Qwen3.8 multimodal prompt whose visual rows have already been encoded and fused into the

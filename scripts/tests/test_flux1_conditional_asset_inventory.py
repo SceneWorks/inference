@@ -688,6 +688,105 @@ class ConditionalAssetInventory(unittest.TestCase):
                         placed_flags = sorted(r[2][3] for r in results)
                         self.assertEqual(placed_flags, [False, True])
 
+    @unittest.skipIf(os.name == "nt", "POSIX flock and dead-PID lock recovery test")
+    def test_fetch_pinned_recovers_placement_lock_after_publisher_death(self):
+        import errno
+        import fcntl
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": "7"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                return FakeResponse(b"weights")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+
+            # 1) Real child process acquires `flock` on `.place.lock` and is SIGKILLed before
+            #    unlinking it: kernel releases `flock` immediately, so `fetch_pinned` recovers
+            #    without timing out, places `dest`, and removes the leftover `.place.lock`.
+            kill_dir = root / "sigkill_recovery"
+            kill_dir.mkdir()
+            dest = kill_dir / "model.safetensors"
+            lock_path = kill_dir / f".{dest.name}.place.lock"
+            holder_script = (
+                "import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "print('LOCKED', flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", holder_script, str(lock_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "LOCKED")
+                self.assertTrue(lock_path.exists())
+                # Confirm the child actually holds the OS flock before killing it.
+                with open(lock_path, "r+b") as probe_handle:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                proc.kill()
+                proc.wait(timeout=10.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10.0)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            self.assertTrue(lock_path.exists(), "SIGKILLed child leaves sibling lockfile on disk")
+            with (
+                patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                patch.object(assets, "_renamex_excl", return_value=False),
+            ):
+                size, sha, _, placed = assets.fetch_pinned(
+                    "https://example/model",
+                    dest,
+                    opener=FakeOpener(),
+                )
+            self.assertEqual((size, sha, placed), (7, hashlib.sha256(b"weights").hexdigest(), False))
+            self.assertEqual(dest.read_bytes(), b"weights")
+            self.assertEqual([p.name for p in kill_dir.iterdir()], ["model.safetensors"])
+
+            # 2) Exotic filesystem where `flock` itself raises ENOTSUP: fallback `O_CREAT | O_EXCL`
+            #    records the owner PID and reclaims a stale lockfile left by a dead process.
+            notsup_dir = root / "enotsup_dead_pid_recovery"
+            notsup_dir.mkdir()
+            dest2 = notsup_dir / "model.safetensors"
+            lock_path2 = notsup_dir / f".{dest2.name}.place.lock"
+            dead_child = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead_child.wait(timeout=10.0)
+            lock_path2.write_bytes(f"{dead_child.pid}\n".encode("ascii"))
+
+            with (
+                patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+                patch.object(assets, "_renamex_excl", return_value=False),
+                patch.object(fcntl, "flock", side_effect=OSError(errno.ENOTSUP, "Operation not supported")),
+            ):
+                size2, sha2, _, placed2 = assets.fetch_pinned(
+                    "https://example/model",
+                    dest2,
+                    opener=FakeOpener(),
+                )
+            self.assertEqual((size2, sha2, placed2), (7, hashlib.sha256(b"weights").hexdigest(), False))
+            self.assertEqual(dest2.read_bytes(), b"weights")
+            self.assertEqual([p.name for p in notsup_dir.iterdir()], ["model.safetensors"])
+
 
 if __name__ == "__main__":
     unittest.main()

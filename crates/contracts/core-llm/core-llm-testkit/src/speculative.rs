@@ -1575,39 +1575,7 @@ impl BenchRow {
             });
         let adaptive_speculative = report
             .and_then(|r| r.adaptive_speculative.as_ref())
-            .map(|a| {
-                json!({
-                    "adaptive": a.adaptive,
-                    "candidates": a.candidates.iter().map(|c| c.label()).collect::<Vec<_>>(),
-                    "initial_proposer": a.initial_proposer.label(),
-                    "initial_depth": a.initial_depth,
-                    "final_proposer": a.final_proposer.label(),
-                    "final_depth": a.final_depth,
-                    "depth_changes": a.depth_changes,
-                    "proposer_switches": a.proposer_switches,
-                    "plain_reason": a.plain_reason,
-                    "events": a.events.iter().map(|e| json!({
-                        "token_offset": e.token_offset,
-                        "verify_step": e.verify_step,
-                        "kind": e.kind.label(),
-                        "from_proposer": e.from_proposer.label(),
-                        "from_depth": e.from_depth,
-                        "to_proposer": e.to_proposer.label(),
-                        "to_depth": e.to_depth,
-                        "reason": e.reason,
-                    })).collect::<Vec<_>>(),
-                    "cost": a.cost.map(|c| json!({
-                        "proposal_ms": c.proposal_ms(),
-                        "verify_ms": c.verify_ms(),
-                        "rollback_ms": c.rollback_ms(),
-                        "sync_ms": c.sync_ms(),
-                        "total_ms": c.total_ms(),
-                        "host_syncs": c.host_syncs,
-                        "committed_tokens": c.committed_tokens,
-                        "ms_per_committed_token": c.ms_per_committed_token(),
-                    })),
-                })
-            });
+            .map(core_llm::AdaptiveSpeculativeReport::to_wire_json);
         // The SW-7200/SW-F356/SW-F357 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
         let path_keys = [
             ("speculative", json!(self.speculative)),

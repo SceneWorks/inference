@@ -588,6 +588,24 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         self.cache = Some(cache);
         result
     }
+
+    fn catch_up(&mut self, tokens: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        let replay = if !self.pending.is_empty() {
+            std::mem::take(&mut self.pending)
+        } else if !tokens.is_empty() {
+            tokens.to_vec()
+        } else {
+            return Ok(());
+        };
+        let mut cache = self.take_cache()?;
+        let result = self
+            .draft
+            .forward_step(&mut cache, StepRequest::last(&replay))
+            .map(|_| ());
+        self.draft_forwards += 1;
+        self.cache = Some(cache);
+        result
+    }
 }
 
 impl<D: StepModel> DraftModelProposer<'_, D> {
