@@ -132,6 +132,11 @@ evidence.
    `candle-audio-kokoro`'s `weights::tests::vendored_pickle_refuses_a_tensor_larger_than_its_storage`.
    Re-apply on a re-vendor unless upstream bounds the read itself.
 
+10. `src/cuda_backend/{mod,im2col_launch}.rs` (SW-F336) dispatches native CUDA
+    im2col outputs above `u32::MAX` elements to a grid-stride kernel with 64-bit
+    indexing. The smaller launch stays unchanged. Keep this paired with the
+    `candle-kernels` entries in `src/conv.cu` when updating either vendor.
+
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
 

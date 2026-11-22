@@ -27,7 +27,7 @@ check. If this vendor dir ever moves or is dropped, update that consumer patch i
 
 ## Changes vs upstream
 
-There are **four** changes vs upstream:
+There are **five** changes vs upstream:
 
 1. `build.rs` adds three `-gencode` flags to the **statically-linked quant/moe kernel** build
    (`build_lib()` → `libmoe.a`), turning its single-arch SASS object into a true **multi-arch fatbin**
@@ -52,13 +52,18 @@ There are **four** changes vs upstream:
    decode work and register spills. It is what makes 2..8-row speculative-verify passes cheap
    (Qwen3.8 27B: a 4-row Q4_K pass went from 2.2x to 1.4x a 1-row pass). Upstreamable.
 
+5. `src/conv.cu` (SW-F336) adds the `im2col_large_*` entries for outputs above
+   `u32::MAX` elements. Those entries use a bounded grid with 64-bit indexing and
+   share the existing element computation. Keep them paired with the
+   `candle-core` CUDA im2col dispatcher when updating either vendor.
+
 The licence texts are not a code change: `LICENSE-MIT` and `LICENSE-APACHE` are upstream's
 repository-root files at `1e6aa85e`, copied unmodified, because the crate is `MIT OR Apache-2.0` and
 upstream ships them only at the repository root.
 
 Everything else — every other `.cu`/`.cuh` source (and the rest of `mmvq_gguf.cu`), `lib.rs`, `ffi.rs`, `Cargo.toml` — is byte-for-byte
-upstream, so candle-core links an otherwise-identical Rust/symbol surface (a fatter `libmoe.a` + the new
-`cast_i32_*` PTX symbols). Diff against the upstream rev to confirm these are the sole deltas.
+upstream, so candle-core links an otherwise-identical Rust/symbol surface (a fatter `libmoe.a` plus the new
+`cast_i32_*` and `im2col_large_*` PTX symbols). Diff against the upstream rev to confirm these are the sole deltas.
 
 ### Why
 
