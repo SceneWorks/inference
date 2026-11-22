@@ -232,7 +232,27 @@ def role_inventory(role, hub, budget, metadata_only):
         return {**entry, "status": "unreachable", "candidates": [], "unreachable": str(error)}
 
 
-def inventory(hub, runner, metadata_only=False):
+def sealed_case_assets(cases, runner):
+    """Resolve the union of only the sealed, single-file ENG-4b cases requested."""
+    if (runner not in WINDOWS_ROUTES or type(cases) is not list or not cases
+            or any(type(case) is not str for case in cases) or len(cases) != len(set(cases))):
+        raise ValueError("selected conditional inventory requires distinct ENG-4b cases on an exact Windows runner")
+    path = ROOT / "scripts/ci/flux1_pair/conditional_eng4b_assets.json"
+    pins = json.loads(path.read_text(encoding="utf-8"))["cases"]
+    assets = {}
+    for case in cases:
+        if case not in pins or set(pins[case]["assets"]) != set(CASES[case][2]):
+            raise ValueError("conditional inventory case has no sealed asset footprint: " + case)
+        for role, row in pins[case]["assets"].items():
+            _, name, revision = PRODUCT_SOURCES[role]
+            if (name is None or revision != row["revision"] or assets.get(role, row) != row
+                    or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
+                raise ValueError("conditional inventory seal disagrees with the product pin: " + role)
+            assets[role] = row
+    return assets
+
+
+def inventory(hub, runner, metadata_only=False, *, selected_cases=None):
     if runner not in RUNNERS:
         raise ValueError("runner is not an approved conditional proof host")
     progress(f"resolve_hub mode={'metadata' if metadata_only else 'hash'}")
@@ -241,28 +261,37 @@ def inventory(hub, runner, metadata_only=False):
         raise ValueError("configured model hub is not a directory")
     budget = Budget(MAX_METADATA_SECONDS if metadata_only else None)
     backend = "candle-cuda" if runner in WINDOWS_ROUTES else "mlx"
-    needed = sorted({role for _, backends, roles in CASES.values() if backend in backends
-                     for role in roles})
+    cases_for_backend = {case: roles for case, (_, backends, roles) in CASES.items() if backend in backends}
+    sealed = sealed_case_assets(selected_cases, runner) if selected_cases is not None else {}
+    if sealed:
+        cases_for_backend = {case: cases_for_backend[case] for case in selected_cases}
+    needed = sorted({role for roles in cases_for_backend.values() for role in roles})
     roles = {role: role_inventory(role, hub, budget, metadata_only) for role in needed}
+    for role, pin in sealed.items():
+        row = roles[role]
+        row["expected_sha256"] = pin["sha256"]
+        if not metadata_only and row["status"] == "unique" and row["candidates"][0]["sha256"] != pin["sha256"]:
+            row["status"] = "digest_mismatch"
     cases = {}
-    for case, (_, backends, required) in CASES.items():
-        if backend in backends:
-            cases[case] = {"ready": not metadata_only and all(roles[role]["status"] == "unique"
-                                                              for role in required),
-                           "roles": list(required)}
+    for case, required in cases_for_backend.items():
+        cases[case] = {"ready": not metadata_only and all(roles[role]["status"] == "unique" for role in required),
+                       "roles": list(required)}
 
     def with_status(status):
         return sorted(role for role, row in roles.items() if row["status"] == status)
 
-    return {"schema": 2, "protocol": "flux1-conditional-asset-inventory-v2", "runner": runner,
-            "backend": backend, "hub": str(hub), "mode": "metadata" if metadata_only else "hash",
-            "hashes_complete": not metadata_only, "hash_bytes": budget.bytes,
-            "selection_rule": "product-manifest repository/file/revision only; other repositories ignored",
-            "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
-            "missing_roles": with_status("missing"), "off_pin_roles": with_status("off_pin"),
-            "unreachable_roles": with_status("unreachable"),
-            "incomplete_roles": with_status("incomplete"),
-            "roles": roles, "cases": cases}
+    result = {"schema": 2, "protocol": "flux1-conditional-asset-inventory-v2", "runner": runner,
+              "backend": backend, "hub": str(hub), "mode": "metadata" if metadata_only else "hash",
+              "hashes_complete": not metadata_only, "hash_bytes": budget.bytes,
+              "selection_rule": "product-manifest repository/file/revision only; other repositories ignored",
+              "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
+              "missing_roles": with_status("missing"), "off_pin_roles": with_status("off_pin"),
+              "unreachable_roles": with_status("unreachable"),
+              "incomplete_roles": with_status("incomplete"),
+              "roles": roles, "cases": cases}
+    if sealed:
+        result.update(selected_cases=selected_cases, digest_mismatch_roles=with_status("digest_mismatch"))
+    return result
 
 
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
@@ -306,7 +335,7 @@ def _same_bytes(path, size, sha):
     return state.hexdigest() == sha
 
 
-def fetch_pinned(url, destination, token=None, opener=None):
+def fetch_pinned(url, destination, token=None, opener=None, *, expected_sha256=None):
     """Stream `url` to a temporary file beside `destination`, then place it without overwriting.
 
     Returns (bytes, sha256, linked_etag, placed_by_another_job). The temporary file is this process's own (a unique
@@ -315,6 +344,7 @@ def fetch_pinned(url, destination, token=None, opener=None):
     on the same host places the destination first (run 44431653018: several runner listeners
     share one hub), this download is discarded if the placed file has the same size and SHA-256
     (`placed_by_another_job` is then True), and refused otherwise.
+    An optional receipt hash must match before either publication path.
     """
     if probe(destination)["exists"]:
         raise FileExistsError(f"refusing to overwrite existing asset {destination}")
@@ -344,6 +374,8 @@ def fetch_pinned(url, destination, token=None, opener=None):
         if expected is not None and int(expected) != size:
             raise ValueError(f"short download for {url}: {size} of {expected} bytes")
         sha = digest_state.hexdigest()
+        if expected_sha256 is not None and sha != expected_sha256:
+            raise ValueError(f"downloaded bytes differ from the sealed SHA-256 for {url}")
         etag = (getattr(opener, "linked_etag", None) or recorder.linked_etag or "").strip('"')
         if re.fullmatch(r"[0-9a-f]{64}", etag) and etag != sha:
             raise ValueError(f"downloaded bytes for {url} differ from the Hub's LFS SHA-256")
@@ -371,14 +403,16 @@ def stage_files(role, hub):
     return [(repo, revision, file) for file in GEMMA_STAGE_FILES]
 
 
-def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
+def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned, *, selected_cases=None):
     """Fetch every product-pinned file the inventory reports missing, off-pin or incomplete.
 
     Existing files are kept and reported, never replaced; `refs/main` is never written; no
-    directory is listed. Returns one receipt row per pinned file considered.
+    directory is listed. If selected_cases is provided, use only their sealed file union.
+    Returns one receipt row per pinned file considered.
     """
     hub = Path(hub).expanduser().resolve(strict=True)
-    before = inventory(hub, runner, metadata_only=True)
+    sealed = sealed_case_assets(selected_cases, runner) if selected_cases is not None else {}
+    before = inventory(hub, runner, metadata_only=True, selected_cases=selected_cases)
     receipts = []
     for role, row in sorted(before["roles"].items()):
         if row["status"] not in STAGE_STATUSES:
@@ -387,6 +421,8 @@ def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
         while pending:
             repo, revision, file = pending.pop(0)
             destination = pinned_path(hub, repo, revision, file)
+            if sealed:
+                confined(destination.parent.resolve(), hub, destination)
             url = HF_RESOLVE.format(repo=repo, revision=revision,
                                     name=urllib.parse.quote(file))
             receipt = {"role": role, "repo": repo, "revision": revision, "file": file,
@@ -395,7 +431,8 @@ def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
                 receipt["action"] = "kept-existing"
             else:
                 progress(f"stage role={role} {repo}@{revision}/{file}")
-                size, sha, etag, placed_by_another_job = fetch(url, destination, token=token)
+                expected = {"expected_sha256": sealed[role]["sha256"]} if sealed else {}
+                size, sha, etag, placed_by_another_job = fetch(url, destination, token=token, **expected)
                 receipt.update(action="kept-existing-placed-by-another-job" if placed_by_another_job else "fetched",
                                bytes=size, sha256=sha, hub_lfs_sha256_verified=etag is not None)
             receipts.append(receipt)
@@ -416,9 +453,9 @@ def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
 
 def plan_request(backend, request, expected_sha, tier):
     if (type(request) is not dict or not {"selection", "runner"} <= set(request)
-            or set(request) - {"selection", "runner", "mode"}
+            or set(request) - {"selection", "runner", "mode", "cases"}
             or request["selection"] != "flux1-asset-inventory"):
-        raise ValueError("inventory needs exact selection, runner and optional mode")
+        raise ValueError("inventory needs exact selection, runner and optional mode and cases")
     mode = request.get("mode", "hash")
     if mode not in {"hash", "metadata"}:
         raise ValueError("inventory mode must be hash or metadata")
@@ -427,12 +464,17 @@ def plan_request(backend, request, expected_sha, tier):
         raise ValueError("inventory backend and selected runner differ")
     if tier != "none":
         raise ValueError("asset inventory requires flux1_pair=none")
+    if "cases" in request:
+        sealed_case_assets(request["cases"], runner)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
                                    encoding="utf-8").strip()
     if expected_sha != head:
         raise ValueError("inventory source SHA differs from checked-out branch")
-    return {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
-            "backend": backend, "source_sha": head, "mode": mode}
+    result = {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
+              "backend": backend, "source_sha": head, "mode": mode}
+    if "cases" in request:
+        result["selected_cases"] = request["cases"]
+    return result
 
 
 def main():
@@ -471,14 +513,27 @@ def main():
     root = os.environ.get("FLUX1_HUB")
     if not root:
         parser.error("FLUX1_HUB is required")
+    selected = plan.get("selected_cases")
+    if selected and args.stage_pinned_assets and plan["mode"] != "hash":
+        parser.error("selected case staging requires hash-mode inventory")
     progress(f"start runner={plan['selected_runner']} mode={plan['mode']} "
              f"stage_pinned_assets={args.stage_pinned_assets}")
     try:
-        staged = (stage_pinned_assets(root, plan["selected_runner"],
-                                      token=os.environ.get("HF_TOKEN") or None)
-                  if args.stage_pinned_assets else None)
-        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
+        stage_error = None
+        staged = []
+        if args.stage_pinned_assets:
+            try:
+                staged = stage_pinned_assets(root, plan["selected_runner"], token=os.environ.get("HF_TOKEN") or None,
+                                             selected_cases=selected)
+            except (OSError, ValueError) as error:
+                if not selected:
+                    raise
+                stage_error = str(error)
+        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata",
+                           selected_cases=selected)
         result["staging"] = {"requested": args.stage_pinned_assets, "files": staged or []}
+        if stage_error:
+            result["staging"]["failure"] = stage_error
     finally:
         faulthandler.cancel_dump_traceback_later()
         if hasattr(signal, "SIGALRM"):
@@ -488,6 +543,8 @@ def main():
     result["runner_name"] = os.environ.get("RUNNER_NAME")  # provenance only
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    if selected and args.stage_pinned_assets and (stage_error or not all(row["ready"] for row in result["cases"].values())):
+        parser.error(stage_error or "selected conditional assets did not match their sealed inputs")
 
 
 if __name__ == "__main__":

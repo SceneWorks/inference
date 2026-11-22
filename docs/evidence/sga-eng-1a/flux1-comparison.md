@@ -141,3 +141,16 @@ The child deadline is at most 20 minutes. At that limit, the claim budgets
 caps apply. This comparison covers conditional fidelity on the fixed fixture.
 The complete real-Q4 Dev and Schnell timing and memory comparison uses the
 separate `eng4b-tier2` profile.
+
+If the target Windows listener lacks these inputs, dispatch the existing
+asset inventory once with `backend=candle-cuda`, `flux1_pair=none`,
+`stage_pinned_assets=true` and this request for the affected listener.
+
+```json
+{"selection":"flux1-asset-inventory","runner":"cuda-windows-2","mode":"hash","cases":["control-pose","ip-dev","pulid-fake"]}
+```
+
+This setup stages only absent files from the union of the selected cases.
+It checks the sealed SHA-256 before publishing each download and hashes all
+selected installed files before reporting the cases ready. A digest mismatch
+leaves the existing file in place and fails the setup with an inventory receipt.

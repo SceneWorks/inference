@@ -20,7 +20,7 @@ on:
         type: string
         required: true
       stage_pinned_assets:
-        description: 'Asset inventory only: first fetch every product-pinned file the inventory reports missing, off-pin or incomplete into the runner Hub cache (stdlib HTTPS; never overwrites; setup, no model load)'
+        description: 'Asset inventory only: stage absent product-pinned files into the runner cache. A request with cases limits staging to those sealed Windows FLUX.1 cases.'
         type: boolean
         default: false
 
@@ -364,12 +364,14 @@ jobs:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
         run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py "$STAGE_FLAG" --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$INVENTORY_OUTPUT"
       - name: Inventory installed assets on Windows (no model load)
+        id: windows_inventory
         if: runner.os == 'Windows'
         shell: cmd
         env:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
         run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py %STAGE_FLAG% --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%INVENTORY_OUTPUT%"'
       - name: Upload candidate paths and hashes only
+        if: success() || (failure() && steps.windows_inventory.outcome == 'failure' && fromJSON(inputs.request).cases != null)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flux1-conditional-asset-inventory-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
