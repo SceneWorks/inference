@@ -58,9 +58,9 @@ use candle_gen::train::lora::{
 // LyCORIS engine + the ComfyUI/lightx2v diff-patch fold this crate previously hand-copied. Only the
 // SCAIL-2-specific key→module resolution (bare/prefixed dotted paths, no kohya table) stays local below.
 use candle_gen::train::merge::{
-    merge_diff_patch_file, merge_into, merge_one_thirdparty, no_target_matched,
+    merge_diff_patch_file, merge_into, merge_source_thirdparty, no_target_matched,
     parse_loha_thirdparty, parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile,
-    LoraTriple, Role,
+    CheckpointDeltas, LoraTriple, MergeTargets, Role,
 };
 // Re-exported so `candle_gen_scail2::{MergeReport, has_diff_patch_keys}` (the crate's public surface,
 // the worker's lightning-routing probe) keep resolving after the hoist.
@@ -126,7 +126,7 @@ fn classify_lokr_key(key: &str) -> Option<(String, &'static str)> {
 /// blob → factor rank. Linear-only (a non-2-D pair, a half-pair, or an unresolved module is skipped);
 /// any `.diff`/`.diff_b` in the same (lightx2v) file is handled separately by [`merge_diff_patch_file`].
 fn merge_lora_file(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     report: &mut MergeReport,
@@ -156,7 +156,7 @@ fn merge_lora_file(
             continue;
         }
         let base_key = format!("{path}.weight");
-        if !base.contains_key(&base_key) {
+        if base.target_info(&base_key)?.is_none() {
             report.skipped_keys += 1;
             continue;
         }
@@ -173,7 +173,7 @@ fn merge_lora_file(
 /// (alpha defaults to rank), per-module factors grouped, `δ = (alpha/rank)·kron(w1,w2)·scale`
 /// reconstructed and merged. Linear-only.
 fn merge_lokr_file(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     report: &mut MergeReport,
@@ -195,15 +195,14 @@ fn merge_lokr_file(
 
     for (path, f) in grouped {
         let base_key = format!("{path}.weight");
-        let Some(w) = base.get(&base_key) else {
+        let Some(w) = base.target_info(&base_key)? else {
             report.skipped_keys += 1;
             continue;
         };
-        if w.dims().len() != 2 {
+        if w.shape.dims().len() != 2 {
             report.skipped_keys += 1; // Linear-only surface
             continue;
         }
-        let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
         let delta = reconstruct_lokr_delta(
             f.get("lokr_w1"),
             f.get("lokr_w1_a"),
@@ -214,7 +213,7 @@ fn merge_lokr_file(
             alpha,
             rank,
             scale,
-            (out_f, in_f),
+            w.declared_matrix()?,
         )?;
         merge_into(base, &base_key, &delta, report)?;
     }
@@ -222,17 +221,17 @@ fn merge_lokr_file(
 }
 
 /// Merge a third-party LyCORIS **LoKr** file (`lokr_*` keys, per-module `.alpha`, no `networkType`
-/// stamp) into `base` at `scale`, via the shared [`parse_lokr_thirdparty`] + [`merge_one_thirdparty`].
+/// stamp) into `base` at `scale`, via the shared [`parse_lokr_thirdparty`] + [`merge_source_thirdparty`].
 /// Each raw key resolves by prefix-strip (SCAIL-2 has no kohya table); the per-module lycoris scale is
 /// baked into the delta closure. Linear-only.
 fn merge_lokr_thirdparty(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_lokr_thirdparty(af)? {
-        merge_one_thirdparty(
+        merge_source_thirdparty(
             base,
             Some(strip_lora_prefix(&raw)),
             |bs| g.delta(bs, scale),
@@ -244,13 +243,13 @@ fn merge_lokr_thirdparty(
 
 /// Merge a third-party LyCORIS **LoHa** file (`hada_*` keys) into `base` at `scale`.
 fn merge_loha_thirdparty(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_loha_thirdparty(af)? {
-        merge_one_thirdparty(
+        merge_source_thirdparty(
             base,
             Some(strip_lora_prefix(&raw)),
             |bs| g.delta(bs, scale),
@@ -273,42 +272,20 @@ pub fn merge_adapters(
     merge_with(specs, |spec, af, report| merge_file(map, spec, af, report))
 }
 
-/// SCAIL-2 folds deltas before model construction. Decode only targeted coefficients on the CPU;
-/// untargeted native matrices continue to bind and execute through the checkpoint reader.
+/// Apply adapter deltas through the source builder, preserving the native base of every packed target.
 pub(crate) fn fold_checkpoint(
     vb: candle_gen::candle_nn::VarBuilder<'static>,
     specs: &[AdapterSpec],
 ) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
-    let mut overrides = HashMap::new();
+    let mut targets = CheckpointDeltas::new(vb);
     merge_with(specs, |spec, af, report| {
-        candle_gen::train::merge::fold_checkpoint_file(
-            &vb,
-            &mut overrides,
-            af,
-            |key| {
-                if let Some(stem) = key.strip_suffix(".diff_b") {
-                    return Some(format!("{}.bias", strip_lora_prefix(stem)));
-                }
-                let path = key
-                    .strip_suffix(".diff")
-                    .map(|s| strip_lora_prefix(s).to_owned())
-                    .or_else(|| classify_lora_key(key).map(|(p, _)| p))
-                    .or_else(|| classify_lokr_key(key).map(|(p, _)| p))
-                    .or_else(|| {
-                        wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES)
-                            .or_else(|| wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES))
-                            .map(|(p, _)| strip_lora_prefix(p).to_owned())
-                    });
-                path.map(|p| format!("{p}.weight"))
-            },
-            |map| merge_file(map, spec, af, report),
-        )
+        merge_file(&mut targets, spec, af, report)
     })?;
-    Ok(candle_gen::loader::overlay_var_builder(vb, overrides))
+    Ok(targets.into_var_builder())
 }
 
 fn merge_file(
-    map: &mut HashMap<String, Tensor>,
+    map: &mut impl MergeTargets,
     spec: &AdapterSpec,
     af: &AdapterFile,
     report: &mut MergeReport,

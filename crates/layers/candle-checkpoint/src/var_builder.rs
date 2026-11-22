@@ -538,6 +538,25 @@ impl ProjectionSource {
 }
 
 impl SimpleBackend for ProjectionSource {
+    fn tensor_info(&self, name: &str) -> Result<Option<candle_nn::var_builder::TensorInfo>> {
+        if let Some(row) = self.reader().planned(name) {
+            Ok(Some(candle_nn::var_builder::TensorInfo {
+                shape: row.shape.as_slice().into(),
+                padded_shape: matches!(
+                    row.codec,
+                    gen_core::checkpoint_codec::TensorCodecSpec::Mxfp8 {
+                        logical_shape_declared: false,
+                        ..
+                    }
+                )
+                .then_some(gen_core::mxfp8_padded_shape),
+                source_packed: row.residency.mode
+                    == gen_core::checkpoint_codec::ResidencyMode::Packed,
+            }))
+        } else {
+            SimpleBackend::tensor_info(self.mmap(), name)
+        }
+    }
     fn native_linear_weight(
         &self,
         key: &str,
@@ -830,6 +849,44 @@ impl Remapped {
     }
 }
 impl SimpleBackend for Remapped {
+    fn tensor_info(&self, name: &str) -> Result<Option<candle_nn::var_builder::TensorInfo>> {
+        let Some((physical, view)) = self.names.get(name) else {
+            return Ok(None);
+        };
+        let source = match &self.source {
+            MappedWeights::Checkpoint(src) => {
+                src.tensor_info(Self::logical(src, physical, name))?
+            }
+            MappedWeights::Plain(st) => SimpleBackend::tensor_info(st, physical)?,
+        };
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let shape = match view {
+            SourceView::Whole(_) => source.shape,
+            SourceView::Matrix { rows, cols, .. } => (*rows, *cols).into(),
+            SourceView::Reshape { shape, .. } => shape.as_slice().into(),
+            SourceView::Rows { rows, .. } => {
+                let mut dims = source.shape.dims().to_vec();
+                let first = dims
+                    .first_mut()
+                    .ok_or_else(|| Error::Msg(format!("{name}: row view of scalar")))?;
+                *first = *rows;
+                dims.into()
+            }
+            SourceView::Transposed(_) => {
+                let (rows, cols) = source.shape.dims2()?;
+                (cols, rows).into()
+            }
+        };
+        Ok(Some(candle_nn::var_builder::TensorInfo {
+            shape,
+            source_packed: source.source_packed,
+            padded_shape: matches!(view, SourceView::Whole(_) | SourceView::Transposed(_))
+                .then_some(source.padded_shape)
+                .flatten(),
+        }))
+    }
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         self.read(name, None, dtype, dev)
     }

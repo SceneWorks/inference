@@ -110487,7 +110487,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls. The adapted native constructor uses its rounded-input base and separately applies two original-input matrix deltas, with bias and exact dense fold controls"
         ]
       }
     },

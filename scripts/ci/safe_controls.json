@@ -1515,6 +1515,20 @@
       "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
     },
     {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "loader::adapter_projection::tests::native_delta_constructor_preserves_source_bias_and_ordered_dense_folds",
+      "source": "crates/media/candle-gen/candle-gen/src/loader/adapter_projection.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CPU constructor and coefficient inspection only. A synthetic checkpoint backend forbids dense reads of its packed matrix. Stacks literal diff-patch tensors, checks bias/shape skips, retained bytes and exact dense weight fold order; no forward, learned matrix multiply or inference kernel executes."
+    },
+    {
       "package": "candle-gen-z-image",
       "kind": "lib",
       "target": "candle_gen_z_image",

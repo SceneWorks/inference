@@ -39,7 +39,7 @@ use candle_gen::train::lora::{
 // this crate previously hand-copied. Only the Wan-specific key→module resolution stays local below.
 use candle_gen::train::merge::{
     build_kohya_table, merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile,
-    LoraTriple, Role,
+    CheckpointDeltas, LoraTriple, MergeTargets, Role,
 };
 // Re-exported so `candle_gen_wan::MergeReport` (the crate's public surface) keeps resolving.
 pub use candle_gen::train::merge::MergeReport;
@@ -200,7 +200,7 @@ fn classify_lokr_key(
 /// Merge one LoRA file into `base` at `scale`: classify every key, fold complete `(down, up)` pairs
 /// into `{path}.weight`. `rank` is `A`'s leading dim; `alpha` the per-target `.alpha` (default `rank`).
 fn merge_lora_file(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     table: &BTreeMap<String, String>,
@@ -228,7 +228,7 @@ fn merge_lora_file(
             continue;
         }
         let base_key = format!("{path}.weight");
-        if !base.contains_key(&base_key) {
+        if base.target_info(&base_key)?.is_none() {
             report.skipped_keys += 1;
             continue;
         }
@@ -243,7 +243,7 @@ fn merge_lora_file(
 /// Merge one LoKr file into `base` at `scale`: `rank`/`alpha` from file metadata, per-module factors
 /// grouped, `δ = (alpha/rank)·kron(w1,w2)·scale` reconstructed and merged.
 fn merge_lokr_file(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     table: &BTreeMap<String, String>,
@@ -266,15 +266,14 @@ fn merge_lokr_file(
 
     for (path, f) in grouped {
         let base_key = format!("{path}.weight");
-        let Some(w) = base.get(&base_key) else {
+        let Some(w) = base.target_info(&base_key)? else {
             report.skipped_keys += 1;
             continue;
         };
-        if w.dims().len() != 2 {
+        if w.shape.dims().len() != 2 {
             report.skipped_keys += 1;
             continue;
         }
-        let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
         let delta = reconstruct_lokr_delta(
             f.get("lokr_w1"),
             f.get("lokr_w1_a"),
@@ -285,7 +284,7 @@ fn merge_lokr_file(
             alpha,
             rank,
             scale,
-            (out_f, in_f),
+            w.declared_matrix()?,
         )?;
         merge_into(base, &base_key, &delta, report)?;
     }
@@ -306,7 +305,7 @@ pub fn merge_adapters(
     })
 }
 
-/// Preserve the VACE-Fun coefficient fold while leaving the other matrices source-backed.
+/// Apply adapter deltas through the source builder, preserving the native base of every packed target.
 pub(crate) fn fold_checkpoint(
     vb: candle_gen::candle_nn::VarBuilder<'static>,
     files: &[std::path::PathBuf],
@@ -324,26 +323,15 @@ pub(crate) fn fold_checkpoint(
             }
         }
     }
-    let mut overrides = HashMap::new();
+    let mut targets = CheckpointDeltas::new(vb);
     merge_with(specs, |spec, af, report| {
-        candle_gen::train::merge::fold_checkpoint_file(
-            &vb,
-            &mut overrides,
-            af,
-            |key| {
-                classify_lora_key(key, &table)
-                    .map(|(p, _)| p)
-                    .or_else(|| classify_lokr_key(key, &table).map(|(p, _)| p))
-                    .map(|p| format!("{p}.weight"))
-            },
-            |map| merge_file(map, &table, spec, af, report),
-        )
+        merge_file(&mut targets, &table, spec, af, report)
     })?;
-    Ok(candle_gen::loader::overlay_var_builder(vb, overrides))
+    Ok(targets.into_var_builder())
 }
 
 fn merge_file(
-    map: &mut HashMap<String, Tensor>,
+    map: &mut impl MergeTargets,
     table: &BTreeMap<String, String>,
     spec: &AdapterSpec,
     af: &AdapterFile,

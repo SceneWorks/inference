@@ -222,6 +222,15 @@ impl CpuCastMmap {
 }
 
 impl SimpleBackend for CpuCastMmap {
+    fn tensor_info(
+        &self,
+        name: &str,
+    ) -> CoreResult<Option<candle_gen::candle_nn::var_builder::TensorInfo>> {
+        match &self.tensors {
+            candle_gen::loader::MappedWeights::Checkpoint(src) => src.tensor_info(name),
+            candle_gen::loader::MappedWeights::Plain(st) => SimpleBackend::tensor_info(st, name),
+        }
+    }
     fn native_linear_weight(
         &self,
         name: &str,
@@ -516,7 +525,7 @@ pub struct Scail2 {
 
 impl Scail2 {
     /// Open the flat or sharded DiT once. Dense tensors widen on CPU before GPU transfer, and
-    /// coefficient-fold adapters replace only the tensors they successfully modify.
+    /// adapters preserve source-native projections and fold ordinary dense targets on the host.
     fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
         let files = match self.layout {
             SnapshotLayout::SharedMlxTier => vec![self.root.join("dit.safetensors")],

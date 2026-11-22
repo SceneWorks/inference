@@ -2092,7 +2092,7 @@ pub fn reconstruct_lokr_delta(
     alpha: f32,
     rank: f32,
     scale: f32,
-    base_shape: (usize, usize),
+    base_shape: impl Into<Option<(usize, usize)>>,
 ) -> Result<Tensor> {
     if !scale.is_finite() {
         return Err(CandleError::Msg(format!(
@@ -2130,8 +2130,11 @@ pub fn reconstruct_lokr_delta(
             ))
         }
     };
-    let (out_f, in_f) = base_shape;
-    let delta = kron2d(&factor1, &factor2)?.reshape((out_f, in_f))?;
+    let delta = kron2d(&factor1, &factor2)?;
+    let delta = match base_shape.into() {
+        Some(shape) => delta.reshape(shape)?,
+        None => delta,
+    };
     Ok((delta * eff)?)
 }
 
@@ -2200,9 +2203,12 @@ pub fn reconstruct_loha_delta(
     w2_a: &Tensor,
     w2_b: &Tensor,
     scale: f32,
-    base_shape: (usize, usize),
+    base_shape: impl Into<Option<(usize, usize)>>,
 ) -> Result<Tensor> {
-    let (out_f, in_f) = base_shape;
+    let (out_f, in_f) = match base_shape.into() {
+        Some(shape) => shape,
+        None => (w1_a.dims2()?.0, w1_b.dims2()?.1),
+    };
     let oriented = |a: &Tensor, b: &Tensor| {
         let (a, b) = (a.dims(), b.dims());
         a.len() == 2 && b.len() == 2 && a[0] == out_f && b[1] == in_f && a[1] == b[0]
