@@ -313,13 +313,15 @@ fn install_ltx_adapters_with_policy(
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
     let mut report = AdditiveReport::default();
     let mut used_refinement = false;
+    let device = dit.device().clone();
 
     for (source, spec) in specs.iter().enumerate() {
         let pass_scales = effective_pass_scales(spec)?;
         let refinement = match policy {
-            InstallPolicy::Ltx25Dev => refinement::read_over_cap(spec, &mut used_refinement)?,
+            InstallPolicy::Ltx25Dev => refinement::read_shipped(spec, &mut used_refinement)?,
             _ => None,
         };
+        let pinned_refinement = refinement.is_some();
         let mut file = match refinement {
             Some(file) => file,
             None => {
@@ -481,6 +483,14 @@ fn install_ltx_adapters_with_policy(
             let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
             let b =
                 (up.to_dtype(DType::F32)?.t()?.contiguous()? * (alpha as f64 / scale_rank as f64))?;
+            // The authenticated Dev factors use the existing CPU conversion
+            // one pair at a time, then wait on the destination for installation.
+            // Do not accumulate a second complete copy of the adapter on the host.
+            let (a, b) = if pinned_refinement {
+                (a.to_device(&device)?, b.to_device(&device)?)
+            } else {
+                (a, b)
+            };
             debug_assert_eq!(a.dims(), &[in_features, rank]);
             debug_assert_eq!(b.dims(), &[rank, out_features]);
             pending.entry(path).or_default().push(PendingLora {
@@ -492,7 +502,6 @@ fn install_ltx_adapters_with_policy(
         }
     }
 
-    let device = dit.device().clone();
     let mut matched = HashSet::new();
     // Keep the originating selected spec through parsing and target installation. A stack-level
     // aggregate is insufficient: one valid Eros/distill adapter must not make a second, unrelated

@@ -6,8 +6,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+#[cfg(feature = "model-inference-proof")]
+use candle_gen::gen_core::model_input_proof::{record_inputs, InputIdentity, InputRole};
 use candle_gen::gen_core::weightsmeta::{self, Dtype};
-use candle_gen::gen_core::{self, AdapterKind, AdapterSpec};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::merge::{AdapterFile, MAX_ADAPTER_BYTES};
 use candle_gen::{CandleError, Result};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,8 @@ struct RefinementPin {
     factors: usize,
     max_factor_bytes: u64,
 }
+
+const SHIPPED_FILENAME: &str = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors";
 
 // SceneWorks/ltx-2.5-mlx @ 081658ce6886cacba20817ce0359bbefef706ff2,
 // distilled_lora/ltx-2.5-22b-distilled-lora-450-bf16.safetensors.
@@ -44,7 +48,7 @@ const SHIPPED_REFINEMENT: RefinementPin = RefinementPin {
 
 fn refuse(path: &Path, reason: &str) -> CandleError {
     CandleError::Msg(format!(
-        "ltx_2_5: adapter {} exceeds the {MAX_ADAPTER_BYTES}-byte cap for buffered adapters: {reason}",
+        "ltx_2_5: cannot load {} as the shipped Dev refinement LoRA: {reason}",
         path.display()
     ))
 }
@@ -53,15 +57,18 @@ fn read_error(path: &Path, error: io::Error) -> CandleError {
     CandleError::Msg(format!("read adapter {}: {error}", path.display()))
 }
 
-/// Keep the shared buffered path for ordinary adapters. Only one exact bundled
-/// artifact may exceed its cap in a Dev load, including through path aliases.
-pub(super) fn read_over_cap(
+/// Reserve the manifest's exact filename for the shipped refinement. Ordinary
+/// adapters keep the buffered path. A renamed copy must meet the same pin.
+pub(super) fn read_shipped(
     spec: &AdapterSpec,
     used_refinement: &mut bool,
 ) -> Result<Option<AdapterFile>> {
     let path = &spec.path;
+    let shipped_name = path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(SHIPPED_FILENAME));
     let metadata = std::fs::metadata(path).map_err(|error| read_error(path, error))?;
-    if metadata.len() <= MAX_ADAPTER_BYTES {
+    if !shipped_name && metadata.len() <= MAX_ADAPTER_BYTES {
         return Ok(None);
     }
     if *used_refinement {
@@ -74,7 +81,11 @@ pub(super) fn read_over_cap(
     if !metadata.is_file() || metadata.len() != pin.file_bytes || spec.kind != AdapterKind::Lora {
         return Err(refuse(
             path,
-            "expected the exact shipped Dev refinement LoRA",
+            &format!(
+                "expected a regular LoRA file of {} bytes, found {} bytes (buffered adapter cap: {MAX_ADAPTER_BYTES} bytes)",
+                pin.file_bytes,
+                metadata.len(),
+            ),
         ));
     }
     let file = File::open(path).map_err(|error| read_error(path, error))?;
@@ -85,12 +96,18 @@ pub(super) fn read_over_cap(
             "opened file differs from the shipped Dev refinement LoRA",
         ));
     }
-    let adapter = gen_core::__model_input_result!(
-        read_pinned(file, path, pin),
-        "candle-gen-ltx::adapters::refinement::read_over_cap",
-        ArtifactInput,
-        &[path]
-    )?;
+    let adapter = read_pinned(file, path, pin)?;
+    #[cfg(feature = "model-inference-proof")]
+    record_inputs(
+        "candle-gen-ltx::adapters::refinement::read_shipped/verified-weights",
+        InputRole::ArtifactInput,
+        &[InputIdentity::validated(
+            path,
+            pin.file_sha256,
+            "candle-gen-ltx::adapters::refinement::read_pinned",
+            "pinned SHA-256 matched both the preauthentication pass and the decoded bytes on the same open file",
+        )],
+    );
     *used_refinement = true;
     Ok(Some(adapter))
 }
@@ -365,5 +382,30 @@ mod tests {
         .unwrap();
         let (overlap, pin) = encode(&broken_header, &[0; 8]);
         assert!(failure(&overlap, &pin).contains("expected contiguous offset"));
+    }
+
+    #[test]
+    fn reserves_the_shipped_filename_even_for_a_valid_small_lora() {
+        let (bytes, _) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let shipped = dir.path().join(SHIPPED_FILENAME);
+        let ordinary = dir.path().join("small.safetensors");
+        std::fs::write(&shipped, &bytes).unwrap();
+        std::fs::write(&ordinary, &bytes).unwrap();
+
+        let mut used = false;
+        let spec = AdapterSpec::new(shipped, 1.0, AdapterKind::Lora);
+        let error = read_shipped(&spec, &mut used).err().unwrap();
+        assert!(error.to_string().contains("expected a regular LoRA file"));
+        assert!(!used);
+        let spec = AdapterSpec::new(ordinary, 1.0, AdapterKind::Lora);
+        assert!(read_shipped(&spec, &mut used).unwrap().is_none());
+        assert_eq!(
+            candle_gen::train::merge::read_adapter(&spec.path)
+                .unwrap()
+                .tensors
+                .len(),
+            2
+        );
     }
 }
