@@ -228,13 +228,18 @@ pub(crate) fn materialize(
     keys: &[(String, String)],
     policy: CastPolicy,
 ) -> Result<Weights> {
-    let mut out = Weights::empty();
-    for (file_key, built_key) in keys {
-        let array = view.remove(file_key).ok_or_else(|| {
-            Error::Msg(format!(
-                "iris stream: the checkpoint no longer holds `{file_key}` (it changed after load)"
-            ))
-        })?;
+    let mut out = view.take_renamed(keys)?;
+    let native = out.native_tensor_keys();
+    let mut materialized_keys: Vec<_> = out.keys().map(str::to_owned).collect();
+    materialized_keys.sort();
+    for built_key in materialized_keys {
+        if native.contains(&built_key) {
+            // Loading is not a constructor read: keep unused-key validation independent of
+            // materialization, and never round a native projection's codes or companions.
+            read_native_tensor(out.peek(&built_key).expect("selected native tensor"))?;
+            continue;
+        }
+        let array = out.remove(&built_key).expect("selected dense tensor");
         mlx_rs::transforms::eval_pending_loads([&array])?;
         let packed = array.dtype() == Dtype::Uint32
             || built_key.ends_with(".scales")
@@ -243,14 +248,21 @@ pub(crate) fn materialize(
             array.dtype(),
             Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
         );
-        let array = match policy.target(built_key, array.ndim(), packed, float) {
+        let array = match policy.target(&built_key, array.ndim(), packed, float) {
             Some(target) if target != array.dtype() => array.as_dtype(target)?,
             _ => array,
         };
         eval([&array])?;
-        out.insert(built_key.clone(), array);
+        out.insert(built_key, array);
     }
     Ok(out)
+}
+
+/// Drain the lazy file read using the same CPU-first policy as dense tensors, without casting.
+pub(crate) fn read_native_tensor(array: &mlx_rs::Array) -> Result<()> {
+    mlx_rs::transforms::eval_pending_loads([array])?;
+    eval([array])?;
+    Ok(())
 }
 
 /// The tensor headers of `path` as stored.

@@ -76,6 +76,7 @@ impl Weights {
     /// A component remap shares the physical source's receipt and rotation handles.
     pub fn component_view(&self) -> Self {
         Self {
+            metadata: self.metadata.clone(),
             source_reads: self.source_reads.clone(),
             ..Self::empty()
         }
@@ -87,21 +88,93 @@ impl Weights {
         let mut dest = self.component_view();
         for key in self.keys() {
             let Some(target) = select(key) else { continue };
-            let a = self.get(key).expect("key iterated from this map");
-            dest.tensors.insert(target.clone(), a.clone());
-            dest.alias_source_row(key, &target);
-            if let (Some(from), Some(to)) =
-                (key.strip_suffix(".weight"), target.strip_suffix(".weight"))
-            {
-                if let Some(p) = self.planned_fp8(from) {
-                    dest.planned_fp8.insert(to.to_owned(), p.clone());
+            self.copy_renamed_to(&mut dest, key, &target);
+        }
+        dest
+    }
+
+    fn copy_renamed_to(&self, dest: &mut Self, from: &str, to: &str) {
+        let array = self.get(from).expect("selected tensor is present");
+        dest.tensors.insert(to.to_owned(), array.clone());
+        dest.alias_source_row(from, to);
+        if let Some(source) = self.projection_base_for_key(from) {
+            let target = to
+                .strip_suffix(".weight")
+                .or_else(|| to.strip_suffix("_weight"))
+                .unwrap_or(to);
+            for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                if let Some(array) = self.tensors.get(&format!("{source}{suffix}")) {
+                    dest.tensors
+                        .insert(format!("{target}{suffix}"), array.clone());
                 }
-                if let Some(g) = self.planned_convrot(from) {
-                    dest.planned_convrot.insert(to.to_owned(), g);
+            }
+            if let Some(projection) = self.planned_fp8(source) {
+                dest.planned_fp8
+                    .insert(target.to_owned(), projection.clone());
+            }
+            if let Some(geometry) = self.planned_convrot(source) {
+                dest.planned_convrot.insert(target.to_owned(), geometry);
+            }
+        }
+    }
+
+    fn projection_base_for_key<'a>(&self, key: &'a str) -> Option<&'a str> {
+        key.strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .or_else(|| {
+                (self.tensors.contains_key(&format!("{key}.comfy_quant"))
+                    || self.planned_fp8.contains_key(key)
+                    || self.planned_convrot.contains_key(key))
+                .then_some(key)
+            })
+    }
+
+    /// Consume a selected window without detaching its native operators or physical-source facts.
+    /// A selected projection owns its generated descriptors and scales even when those keys were
+    /// absent from the file header used to plan the window. Array handles move without a payload
+    /// copy; the source map releases the entire selected group before the caller materializes it.
+    pub fn take_renamed(&mut self, keys: &[(String, String)]) -> Result<Self> {
+        let mut mapping = std::collections::BTreeMap::<String, String>::new();
+        let mut targets = HashMap::<String, String>::new();
+        let mut add = |from: String, to: String| -> Result<()> {
+            if !self.tensors.contains_key(&from) {
+                return Err(Error::MissingTensor(from));
+            }
+            if let Some(previous) = mapping.insert(from.clone(), to.clone()) {
+                if previous != to {
+                    return Err(Error::Msg(format!("conflicting tensor remap for {from}")));
+                }
+            }
+            if let Some(previous) = targets.insert(to.clone(), from.clone()) {
+                if previous != from {
+                    return Err(Error::Msg(format!("conflicting tensor sources for {to}")));
+                }
+            }
+            Ok(())
+        };
+        for (from, to) in keys {
+            add(from.clone(), to.clone())?;
+            if let Some(source) = self.projection_base_for_key(from) {
+                let target = to
+                    .strip_suffix(".weight")
+                    .or_else(|| to.strip_suffix("_weight"))
+                    .unwrap_or(to);
+                for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                    let companion = format!("{source}{suffix}");
+                    if self.tensors.contains_key(&companion) {
+                        add(companion, format!("{target}{suffix}"))?;
+                    }
                 }
             }
         }
-        dest
+        let mut dest = self.component_view();
+        for (from, to) in &mapping {
+            self.copy_renamed_to(&mut dest, from, to);
+        }
+        for from in mapping.keys() {
+            self.remove(from);
+        }
+        Ok(dest)
     }
 
     /// Retain the complete physical matrix once when a family splits contiguous output rows.
@@ -782,9 +855,11 @@ f,
     pub fn alias(&mut self, from: &str, to: &str) {
         if let Some(t) = self.tensors.get(from).cloned() {
             self.source_reads.alias(from, to);
-            if let (Some(source), Some(dest)) =
-                (from.strip_suffix(".weight"), to.strip_suffix(".weight"))
-            {
+            if let Some(source) = self.projection_base_for_key(from) {
+                let dest = to
+                    .strip_suffix(".weight")
+                    .or_else(|| to.strip_suffix("_weight"))
+                    .unwrap_or(to);
                 for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
                     if let Some(array) = self.tensors.get(&format!("{source}{suffix}")).cloned() {
                         self.tensors.insert(format!("{dest}{suffix}"), array);
@@ -922,9 +997,17 @@ f,
             .chain(self.planned_convrot.keys().map(String::as_str))
             .chain(self.planned_fp8.keys().map(String::as_str))
             .flat_map(|base| {
-                [".weight", ".weight_scale", ".input_scale", ".comfy_quant"]
-                    .into_iter()
-                    .map(move |suffix| format!("{base}{suffix}"))
+                [
+                    "",
+                    ".weight",
+                    "_weight",
+                    ".bias",
+                    ".weight_scale",
+                    ".input_scale",
+                    ".comfy_quant",
+                ]
+                .into_iter()
+                .map(move |suffix| format!("{base}{suffix}"))
             })
             .filter(|key| self.tensors.contains_key(key))
             .collect()
@@ -1029,6 +1112,137 @@ impl mlx_layers::MlxWeightSource for Weights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Layout/handle bookkeeping only: no evaluation, operator construction or learned work.
+    #[test]
+    fn native_component_windows_keep_companions_observations_and_constructor_reads() {
+        use gen_core::checkpoint_codec::*;
+        use gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let descriptor =
+            br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64,"per_row":true}"#;
+        let headers = [
+            SafetensorsTensorHeader {
+                name: "source.weight".into(),
+                dtype: Stored::I8,
+                shape: vec![2, 64],
+                data_bytes: 128,
+            },
+            SafetensorsTensorHeader {
+                name: "source.weight_scale".into(),
+                dtype: Stored::F32,
+                shape: vec![2, 1],
+                data_bytes: 8,
+            },
+            SafetensorsTensorHeader {
+                name: "source.bias".into(),
+                dtype: Stored::F32,
+                shape: vec![2],
+                data_bytes: 8,
+            },
+            SafetensorsTensorHeader {
+                name: "source.comfy_quant".into(),
+                dtype: Stored::U8,
+                shape: vec![descriptor.len()],
+                data_bytes: descriptor.len() as u64,
+            },
+        ];
+        let codecs = CheckpointCodecRegistry::new(
+            DENSE_CODECS
+                .iter()
+                .chain(COMFY_QUANT_CODECS.iter())
+                .copied(),
+        )
+        .unwrap();
+        let plan = compile_logical_weight_plan(
+            &headers,
+            &BTreeMap::from([("source.comfy_quant".into(), descriptor.to_vec())]),
+            &IdentityKeyMapping,
+            &codecs,
+            &SourceCodecResidency,
+        )
+        .unwrap();
+        let mut source = Weights::from_map(HashMap::from([
+            (
+                "source.weight".into(),
+                Array::from_slice(&[1i8; 128], &[2, 64]),
+            ),
+            (
+                "source.weight_scale".into(),
+                Array::from_slice(&[1.2345f32, 2.3456], &[2, 1]),
+            ),
+            (
+                "source.bias".into(),
+                Array::from_slice(&[0.12345f32, 0.23456], &[2]),
+            ),
+            (
+                "source.comfy_quant".into(),
+                Array::from_slice(descriptor, &[descriptor.len() as i32]),
+            ),
+        ]));
+        source.source_reads = mlx_layers::source::SourceReads::new(Arc::new(plan), &[]);
+        source
+            .metadata
+            .insert("producer".into(), "layout-control".into());
+        assert!(source.native_tensor_keys().contains("source.bias"));
+
+        // A physical-header selector may name only the matrix. Normalized companions still
+        // travel with it, including when the destination architecture names a bare parameter.
+        let selected = source.select_renamed(|key| (key == "source.weight").then(|| "bare".into()));
+        assert_eq!(selected.metadata("producer"), Some("layout-control"));
+        assert!(selected.source_reads.get("bare").is_some());
+        assert!(selected.native_tensor_keys().contains("bare"));
+        assert_eq!(
+            selected.peek("bare.weight_scale").unwrap().dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(
+            selected.unused_keys().len(),
+            3,
+            "selection is not constructor consumption"
+        );
+
+        let count = source.len();
+        assert!(source
+            .take_renamed(&[("missing.weight".into(), "target.weight".into())])
+            .is_err());
+        assert_eq!(
+            source.len(),
+            count,
+            "a refused window leaves the source intact"
+        );
+        assert!(source
+            .take_renamed(&[
+                ("source.weight".into(), "target.weight".into()),
+                ("source.bias".into(), "target.weight".into()),
+            ])
+            .is_err());
+        assert_eq!(source.len(), count);
+
+        let window = source
+            .take_renamed(&[
+                ("source.weight".into(), "target.weight".into()),
+                ("source.bias".into(), "target.bias".into()),
+            ])
+            .unwrap();
+        assert!(
+            source.is_empty(),
+            "the old window releases codes, scales and descriptors together"
+        );
+        assert!(window.source_reads.get("target.weight").is_some());
+        assert_eq!(window.peek("target.weight").unwrap().dtype(), Dtype::Int8);
+        assert_eq!(
+            window.peek("target.weight_scale").unwrap().dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(window.peek("target.bias").unwrap().dtype(), Dtype::Float32);
+        assert_eq!(window.unused_keys().len(), 4);
+        window.require("target.weight").unwrap();
+        assert_eq!(window.unused_keys().len(), 3);
+        assert!(window.unused_keys().contains(&"target.comfy_quant"));
+    }
 
     /// CPU reader only: no model, learned operation, coherence probe, or GPU evaluation.
     #[test]

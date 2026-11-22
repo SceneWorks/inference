@@ -206,11 +206,32 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
         crate::stream::before_backbone_targets(load_sources, BACKBONE_PREFIX, compute, None)?;
     let mut source = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
-    let mut keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    keys.sort();
     // Split the export into the backbone (`pixel.*`, prefix stripped) and the reducer, casting each
     // backbone matrix to the compute dtype one tensor at a time (the generation loader's policy).
-    let mut backbone = Weights::empty();
+    let backbone_keys: Vec<_> = source
+        .keys()
+        .filter_map(|key| {
+            let name = key.strip_prefix(BACKBONE_PREFIX)?;
+            (!streamed || !is_stack_key(key)).then(|| (key.to_owned(), name.to_owned()))
+        })
+        .collect();
+    let mut backbone = source.take_renamed(&backbone_keys)?;
+    let native = backbone.native_tensor_keys();
+    let mut keys: Vec<_> = backbone.keys().map(str::to_owned).collect();
+    keys.sort();
+    for key in keys {
+        if native.contains(&key) {
+            crate::stream::read_native_tensor(
+                backbone.peek(&key).expect("native backbone source"),
+            )?;
+        } else {
+            let array = backbone.remove(&key).expect("dense backbone source");
+            let array = crate::model::read_backbone_tensor(&key, array, compute)?;
+            backbone.insert(key, array);
+        }
+    }
+    let mut keys: Vec<String> = source.keys().map(str::to_owned).collect();
+    keys.sort();
     let (mut reducer_weight, mut reducer_bias) = (None, None);
     for key in keys {
         let Some(array) = source.remove(&key) else {
@@ -220,10 +241,7 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
         if streamed && is_stack_key(&key) {
             continue;
         }
-        if let Some(name) = key.strip_prefix(BACKBONE_PREFIX) {
-            let array = crate::model::read_backbone_tensor(name, array, compute)?;
-            backbone.insert(name, array);
-        } else if key == REDUCER_WEIGHT {
+        if key == REDUCER_WEIGHT {
             mlx_rs::transforms::eval_pending_loads([&array])?;
             reducer_weight = Some(array);
         } else if key == REDUCER_BIAS {
