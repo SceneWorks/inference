@@ -946,10 +946,9 @@ f,
         if deltas.is_empty() {
             return;
         }
-        let base = key
-            .strip_suffix(".weight")
+        let base = gen_core::checkpoint_codec::projection_companion_base(key)
+            .or_else(|| key.strip_suffix(".weight"))
             .or_else(|| key.strip_suffix("_weight"))
-            .or_else(|| gen_core::checkpoint_codec::projection_companion_base(key))
             .unwrap_or(key);
         deltas.remove(base);
     }
@@ -1215,6 +1214,7 @@ mod tests {
         .unwrap();
         w.insert_source_projection("p.weight", mlx_layers::NativeProjection::Fp8(fp8))
             .unwrap();
+        w.insert("p.scale_weight", Array::from_f32(1.0));
         for v in [1.0f32, 2.0] {
             w.merge_projection_delta("p", |shape| {
                 assert_eq!(shape, &[3, 2]);
@@ -1255,6 +1255,12 @@ mod tests {
         w.remove_prefix("alias.");
         assert!(w.native_projection_deltas("alias").is_empty());
         assert_eq!(w.native_projection_deltas("p").len(), 2);
+        let mut legacy = w.clone();
+        legacy.alias("p.weight", "p.scale.weight");
+        legacy.insert("p.scale_weight", Array::from_f32(2.0));
+        assert!(legacy.native_projection_deltas("p").is_empty());
+        assert_eq!(legacy.native_projection_deltas("p.scale").len(), 2);
+
         w.insert("p.weight_scale", Array::from_f32(1.0));
         assert!(w.native_projection_deltas("p").is_empty());
         w.insert("raw.weight", Array::from_slice(&[7u8; 6], &[3, 2]));
