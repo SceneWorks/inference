@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use super::{backbone_dir, exec, host, Case, Dtype, LoadShape, LoadSpec, TextBatch, WeightsSource};
 use crate::IrisDiT;
 
-const FP8: [&str; 2] = ["t_embedder.mlp.2.weight", "blocks.0.attn.q_proj_x.weight"];
+const LEGACY_FP8: &str = "blocks.0.attn.q_proj_x.weight";
+const FP8: [&str; 2] = ["t_embedder.mlp.2.weight", LEGACY_FP8];
 const CONVROT: [&str; 2] = [
     "modulation_cores.adaln_img.weight",
     "blocks.1.attn.v_proj_y.weight",
@@ -79,6 +80,7 @@ fn write_native_backbone(original: &Path, output: &Path) -> (String, String) {
         assert_eq!(cols, 64);
         let base = name.strip_suffix(".weight").unwrap();
         let encoded_fp8 = FP8.contains(&name.as_str());
+        let legacy_scale = name == LEGACY_FP8;
         let (encoding, codes, descriptor, scale_shape, scale) = if encoded_fp8 {
             (
                 "F8_E4M3",
@@ -106,24 +108,34 @@ fn write_native_backbone(original: &Path, output: &Path) -> (String, String) {
         push_tensor(
             &mut headers,
             &mut payload,
-            format!("{base}.weight_scale"),
+            if legacy_scale {
+                format!("{base}.scale_weight")
+            } else {
+                format!("{base}.weight_scale")
+            },
             "F32",
             scale_shape,
             &scale,
         );
-        push_tensor(
-            &mut headers,
-            &mut payload,
-            format!("{base}.comfy_quant"),
-            "U8",
-            json!([descriptor.len()]),
-            descriptor,
-        );
+        if !legacy_scale {
+            push_tensor(
+                &mut headers,
+                &mut payload,
+                format!("{base}.comfy_quant"),
+                "U8",
+                json!([descriptor.len()]),
+                descriptor,
+            );
+        }
         if encoded_fp8 {
             push_tensor(
                 &mut headers,
                 &mut payload,
-                format!("{base}.input_scale"),
+                if legacy_scale {
+                    format!("{base}.scale_input")
+                } else {
+                    format!("{base}.input_scale")
+                },
                 "F32",
                 json!([]),
                 &0.0625f32.to_le_bytes(),

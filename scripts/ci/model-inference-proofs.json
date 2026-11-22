@@ -168048,7 +168048,7 @@
     "fixture_identity": {
       "kind": "committed-and-source-defined-miniature",
       "fixture_root": "crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot/iris",
-      "recipe": "Copy the configuration and deterministically replace two skeleton and two block projections with signed E4M3 FP8 and group-64 per-row ConvRot INT8 codes and publisher scales. Log both checkpoint SHA-256 digests."
+      "recipe": "Copy the configuration and deterministically replace two skeleton and two block projections with signed E4M3 FP8 and group-64 per-row ConvRot INT8 codes and publisher scales. The skeleton FP8 projection carries a descriptor and the block FP8 projection uses legacy scale_weight and scale_input companions. Log both checkpoint SHA-256 digests."
     },
     "configuration_source": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs and the existing stream_tests::Case and stream_tests::exec helpers",
     "output_contract": "BF16 Iris backbone output has the input shape and finite, nonconstant values. Eager and deferred Metal outputs are exactly equal at windows one, two, and full. Both codecs retain the expected operands and report two native-packed projections, publisher scale bytes, and no fallback from the bound checkpoint.",
