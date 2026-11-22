@@ -13,16 +13,21 @@ PROBE_TIMEOUT_SECONDS = 10.0
 
 # The child stats or reads one path and prints a JSON line; a blocked filesystem call stays in it.
 PROBE_CHILD = r"""
-import json, os, sys
+import json, os, stat, sys
 op, path, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
 row = {"exists": False}
 try:
-    info = os.stat(path)
-    row = {"exists": True, "is_file": os.path.isfile(path), "is_dir": os.path.isdir(path),
-           "size": info.st_size, "resolved": os.path.realpath(path)}
-    if op == "read" and row["is_file"]:
-        with open(path, "rb") as source:
-            row["text"] = source.read(limit + 1).decode("utf-8")
+    if op == "lstat":
+        info = os.lstat(path)
+        reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        row = {"exists": True, "linked": stat.S_ISLNK(info.st_mode) or bool(reparse)}
+    else:
+        info = os.stat(path)
+        row = {"exists": True, "is_file": os.path.isfile(path), "is_dir": os.path.isdir(path),
+               "size": info.st_size, "resolved": os.path.realpath(path)}
+        if op == "read" and row["is_file"]:
+            with open(path, "rb") as source:
+                row["text"] = source.read(limit + 1).decode("utf-8")
 except FileNotFoundError:
     pass
 except NotADirectoryError:
@@ -36,7 +41,7 @@ class Unreachable(Exception):
 
 
 def probe(path, op="stat", limit=0, timeout=None):
-    """Stat (or read up to `limit` bytes of) one exact path in a child process."""
+    """Stat, check an unfollowed leaf, or read up to `limit` bytes in a bounded child."""
     timeout = PROBE_TIMEOUT_SECONDS if timeout is None else timeout
     child = subprocess.Popen([sys.executable, "-I", "-c", PROBE_CHILD, op, str(path), str(limit)],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,

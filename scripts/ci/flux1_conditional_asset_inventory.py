@@ -373,7 +373,10 @@ def _locked_replace_if_absent(temporary, destination):
     lock_path = destination.parent / f".{destination.name}.place.lock"
 
     def check_absent(_wait_count):
-        if probe(destination)["exists"]:
+        leaf = probe(destination, op="lstat")
+        if leaf["exists"]:
+            if leaf["linked"]:
+                raise ValueError(f"refusing to replace linked asset {destination}")
             raise FileExistsError(destination)
 
     with exclusive_file_lock(

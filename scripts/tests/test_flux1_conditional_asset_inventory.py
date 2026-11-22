@@ -770,6 +770,28 @@ class ConditionalAssetInventory(unittest.TestCase):
                         placed_flags = sorted(r[2][3] for r in results)
                         self.assertEqual(placed_flags, [False, True])
 
+    @unittest.skipIf(os.name == "nt", "Windows uses no-replace rename")
+    def test_fallback_refuses_to_replace_a_dangling_destination(self):
+        import errno
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            dest, missing = root / "asset.safetensors", root / "missing.safetensors"
+            dest.symlink_to(missing.name)
+            body = io.BytesIO(b"weights")
+            body.headers = {"Content-Length": "7"}
+            opener = SimpleNamespace(open=lambda *_args, **_kwargs: body)
+            with (patch("os.link", side_effect=OSError(errno.ENOTSUP, "hard links unavailable")),
+                  patch.object(assets, "_renamex_excl", return_value=False) as rename,
+                  patch("os.replace") as replace,
+                  self.assertRaisesRegex(ValueError, "refusing to replace linked asset")):
+                assets.fetch_pinned("https://example/asset", dest, opener=opener)
+            rename.assert_called_once()
+            replace.assert_not_called()
+            self.assertEqual(os.readlink(dest), missing.name)
+            self.assertFalse(missing.exists())
+            self.assertEqual(list(root.iterdir()), [dest])
+
     @unittest.skipIf(os.name == "nt", "POSIX flock and dead-PID lock recovery test")
     def test_fetch_pinned_recovers_placement_lock_after_publisher_death(self):
         import errno

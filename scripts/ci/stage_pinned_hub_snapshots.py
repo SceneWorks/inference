@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 from functools import partial
 import json
 import os
@@ -97,24 +98,47 @@ def _publish_verified_symlink(temporary: Path, destination: Path, *, hub: Path, 
     _guard_directory(blobs, hub)
     blobs.mkdir(parents=True, exist_ok=True)
     _guard_directory(blobs, hub)
+    identity = temporary.lstat()
     owned = Path(tempfile.mkdtemp(prefix=".model-proof-", dir=blobs))
     blob = owned / destination.name
-    moved = False
+    target = os.path.relpath(blob, destination.parent)
     try:
         # This job exclusively created the private directory. The payload was already fsynced
         # and authenticated before publication, and the move leaves its bytes untouched.
         _guard_directory(owned, hub)
         os.rename(temporary, blob)
-        moved = True
         _guard_directory(owned, hub)
         _asset_present(destination, hub)
         # Creating a link fails if any writer has published this leaf, even after the guard.
-        os.symlink(os.path.relpath(blob, destination.parent), destination)
-    except (OSError, ValueError):
-        if moved:
-            blob.unlink(missing_ok=True)
-        owned.rmdir()
+        os.symlink(target, destination)
+    except BaseException:
+        try:
+            _discard_unpublished_blob(blob, identity, destination, hub)
+        except (OSError, ValueError):
+            # Preserve ambiguous state and the original failure.
+            pass
         raise
+
+
+def _discard_unpublished_blob(blob, identity, destination, hub):
+    _guard_directory(blob.parent, hub)
+    _guard_directory(destination.parent, hub)
+    try:
+        target = os.readlink(destination)
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.EINVAL):
+            raise
+    else:
+        if os.path.abspath(destination.parent / target) == str(blob):
+            return  # Publication may have completed before Python received the interruption.
+    try:
+        current = blob.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if os.path.samestat(identity, current):
+            blob.unlink()
+    blob.parent.rmdir()
 
 
 @contextmanager

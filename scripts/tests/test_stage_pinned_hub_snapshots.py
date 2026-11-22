@@ -324,6 +324,37 @@ class Staging(unittest.TestCase):
             self.assertFalse(os.path.lexists(destination))
             self.assertEqual(list(destination.parent.glob("*.partial")), [])
 
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_darwin_fallback_cleans_only_unpublished_blob_on_interruption(self):
+        for operation in ("rename", "symlink"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                hub = Path(temporary).resolve()
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                destination = base / "q8/model.safetensors"
+                destination.parent.mkdir(parents=True)
+                (base / "q8/config.json").write_bytes(b"{}")
+                system_call = getattr(os, operation)
+
+                def interrupted(*args):
+                    system_call(*args)
+                    raise KeyboardInterrupt()
+
+                error = OSError(errno.ENOTSUP, "hard links unavailable")
+                with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
+                      patch.object(os, operation, side_effect=interrupted),
+                      self.assertRaises(KeyboardInterrupt)):
+                    self.stage_downloads(hub, self.FILES)
+                self.assertEqual(list(destination.parent.glob("*.partial")), [])
+                blobs = base.parent.parent / "blobs"
+                if operation == "rename":
+                    self.assertFalse(os.path.lexists(destination))
+                    self.assertEqual(list(blobs.iterdir()), [])
+                else:
+                    self.assertTrue(destination.is_symlink())
+                    self.assertEqual(destination.read_bytes(), b"weights")
+                    self.assertEqual(list(blobs.iterdir()), [destination.resolve().parent])
+
     def test_refuses_wrong_manifest_digest_before_publishing_lfs_or_git_bytes(self):
         leaf = "q8/model.safetensors"
         for kind in ("lfs", "git"):
