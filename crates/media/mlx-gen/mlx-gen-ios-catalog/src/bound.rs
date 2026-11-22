@@ -235,6 +235,9 @@ impl Generator for BoundGenerator {
     fn checkpoint_weight_facts(&self) -> Option<CheckpointWeightFacts> {
         self.inner.checkpoint_weight_facts()
     }
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<CheckpointWeightFacts> {
+        self.inner.checkpoint_weight_facts_by_source()
+    }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         self.inner.memory_strategy_contract()
     }
@@ -561,6 +564,12 @@ impl BoundTransform {
 }
 
 impl Transform for BoundTransform {
+    fn checkpoint_weight_facts(&self) -> Option<CheckpointWeightFacts> {
+        self.inner.checkpoint_weight_facts()
+    }
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<CheckpointWeightFacts> {
+        self.inner.checkpoint_weight_facts_by_source()
+    }
     fn descriptor(&self) -> &TransformDescriptor {
         self.inner.descriptor()
     }

@@ -480,7 +480,21 @@ pub fn native_lin(
     if !crate::NativeProjection::is_declared(w, base, &format!("{base}.weight")) {
         return Ok(None);
     }
-    Ok(crate::NativeProjection::from_weights(w, base, bias)?.map(AdaptableLinear::from_native))
+    crate::NativeProjection::from_weights(w, base, bias)?
+        .map(|native| bind_native_linear(w, base, native))
+        .transpose()
+}
+
+fn bind_native_linear(
+    w: &(impl MlxWeightSource + ?Sized),
+    base: &str,
+    native: crate::NativeProjection,
+) -> Result<AdaptableLinear> {
+    let mut layer = AdaptableLinear::from_native(native);
+    for delta in w.native_projection_deltas(base) {
+        layer.merge_dense_delta(delta)?;
+    }
+    Ok(layer)
 }
 
 /// Load `{base}` as an [`AdaptableLinear`] — **packed** (Q4/Q8) when `{base}.scales` is present (a
@@ -513,7 +527,7 @@ pub fn lin_with_bias(
             if let Some(b) = bias {
                 native.set_bias(b)?;
             }
-            return Ok(AdaptableLinear::from_native(native));
+            return bind_native_linear(w, base, native);
         }
     }
     if let Some(scales) = w.get(&format!("{base}.scales")) {

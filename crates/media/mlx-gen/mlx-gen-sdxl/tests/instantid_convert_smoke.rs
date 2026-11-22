@@ -51,12 +51,16 @@ fn instantid_converted_weights_load() {
         kv.len()
     );
     for (i, (k, v)) in kv.iter().enumerate() {
-        assert_eq!(k.shape(), v.shape(), "K/V shape mismatch at pair {i}");
         assert_eq!(
-            *k.shape().last().unwrap(),
+            k.base_shape(),
+            v.base_shape(),
+            "K/V shape mismatch at pair {i}"
+        );
+        assert_eq!(
+            *k.base_shape().last().unwrap(),
             2048,
             "K/V pair {i} input dim != cross_attention_dim 2048: {:?}",
-            k.shape()
+            k.base_shape()
         );
     }
 

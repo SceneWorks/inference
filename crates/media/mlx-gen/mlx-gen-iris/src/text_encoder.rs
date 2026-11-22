@@ -17,7 +17,6 @@
 //! so this port runs only the real tokens and writes zeros — bit-for-bit the same conditioning
 //! without the pad compute.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
@@ -25,7 +24,7 @@ use gen_core_iris::{assemble_window, TextEncoderConfig, TextWindow, PROMPT_PREFI
 use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::gen_core;
 use mlx_gen::{Error, Quant, Result};
-use mlx_llm::primitives::projection::{QuantGrid, QuantSpec};
+use mlx_llm::primitives::projection::{Projection, QuantGrid, QuantSpec};
 use mlx_llm::{CausalLm, ModelConfig};
 use mlx_rs::ops::{concatenate_axis, stack_axis, zeros};
 use mlx_rs::transforms::eval;
@@ -113,7 +112,10 @@ pub(crate) const LANGUAGE_HEAD_KEY: &str = "lm_head.weight";
 /// Whether the text-only encoder reads tensor `name`: the language tower, and the output head when
 /// it is untied. The vision tower (`model.visual.*`) is never read on any Iris route.
 pub(crate) fn is_text_tower_tensor(name: &str, untied_head: bool) -> bool {
-    name.starts_with(LANGUAGE_TOWER_PREFIX) || (untied_head && name == LANGUAGE_HEAD_KEY)
+    name.starts_with(LANGUAGE_TOWER_PREFIX)
+        || (untied_head
+            && (name == LANGUAGE_HEAD_KEY
+                || gen_core::checkpoint_codec::projection_companion_base(name) == Some("lm_head")))
 }
 
 /// Every safetensors file of the snapshot at `dir`: the shards its `model.safetensors.index.json`
@@ -429,6 +431,17 @@ pub(crate) fn tower_layer_of(name: &str) -> Option<usize> {
 /// Per decoder layer, its `(file key, built key)` pairs; and its read price.
 pub(crate) type TowerInventory = (Vec<Vec<(String, String)>>, Vec<crate::stream::BlockRead>);
 
+pub(crate) fn is_streamed_resident(name: &str) -> bool {
+    let Some(name) = name.strip_prefix(LANGUAGE_TOWER_PREFIX) else {
+        return false;
+    };
+    matches!(name, "embed_tokens.weight" | "norm.weight")
+        || matches!(
+            gen_core::checkpoint_codec::projection_companion_base(name),
+            Some("embed_tokens" | "norm")
+        )
+}
+
 pub(crate) fn tower_layer_inventory(
     files: &[std::path::PathBuf],
     layers: usize,
@@ -437,9 +450,20 @@ pub(crate) fn tower_layer_inventory(
     for file in files {
         headers.extend(crate::stream::headers(file)?);
     }
+    let prices = crate::stream::SourcePrices::compile(files, &headers, |name| {
+        tower_layer_of(name).is_some()
+    })?;
+    tower_inventory_from_headers(&headers, layers, &prices)
+}
+
+pub(crate) fn tower_inventory_from_headers(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    layers: usize,
+    prices: &crate::stream::SourcePrices,
+) -> Result<TowerInventory> {
     let mut grouped: Vec<Vec<&gen_core::weightsmeta::SafetensorsTensorHeader>> =
         vec![Vec::new(); layers];
-    for header in &headers {
+    for header in headers {
         if let Some(i) = tower_layer_of(&header.name) {
             grouped
                 .get_mut(i)
@@ -461,6 +485,7 @@ pub(crate) fn tower_layer_inventory(
         .map(|layer| {
             let mut keys: Vec<(String, String)> = layer
                 .iter()
+                .filter(|h| !prices.is_companion(&h.name))
                 .map(|h| (h.name.clone(), h.name.clone()))
                 .collect();
             keys.sort();
@@ -469,8 +494,8 @@ pub(crate) fn tower_layer_inventory(
         .collect();
     let reads = grouped
         .iter()
-        .map(|layer| crate::stream::block_read(layer, crate::stream::CastPolicy::Tower))
-        .collect();
+        .map(|layer| prices.block_read(layer, crate::stream::CastPolicy::Tower))
+        .collect::<Result<_>>()?;
     Ok((keys, reads))
 }
 
@@ -485,13 +510,25 @@ pub(crate) struct StreamedTower {
     files: Vec<std::path::PathBuf>,
     keys: Vec<Vec<(String, String)>>,
     reads: Vec<crate::stream::BlockRead>,
-    /// `[vocab, hidden]` bf16.
-    embed: Array,
+    /// Dense bf16 or a source-native table gathered directly by token ID.
+    embed: Projection,
     /// The final norm, applied only to the last state (HF's `output_hidden_states` layout).
     norm: Array,
     /// The packed artifact's stored quantization (`None`: the dense tier).
     stored_quant: Option<QuantSpec>,
     rope: mlx_llm::primitives::rope::Rope,
+}
+
+impl StreamedTower {
+    pub(crate) fn embed(&self, ids: &Array) -> Result<Array> {
+        self.embed.rows(ids).map_err(from_llm)
+    }
+
+    fn resident_arrays(&self) -> Vec<Array> {
+        let mut arrays = vec![self.norm.clone()];
+        self.embed.push_arrays(&mut arrays);
+        arrays
+    }
 }
 
 /// A test-build hook run as each streamed tower window opens.
@@ -509,7 +546,8 @@ thread_local! {
 impl StreamedTower {
     /// Read and build layer `i` from a fresh view (the read proof's body), returning its arrays.
     pub(crate) fn read_layer(&self, i: usize) -> Result<Vec<Array>> {
-        let mut view = mlx_gen::weights::Weights::from_paths(&self.files, Path::new(""))?;
+        let mut view =
+            crate::stream::open_window(&self.files, std::slice::from_ref(&self.keys[i]))?;
         let map =
             crate::stream::materialize(&mut view, &self.keys[i], crate::stream::CastPolicy::Tower)?;
         let layer = StreamedLayer::build(&map, i, self.stored_quant)?;
@@ -524,7 +562,8 @@ impl StreamedTower {
 
     /// Read and build layer `i` (the streamed-layer proof runs its forward).
     pub(crate) fn build_layer(&self, i: usize) -> Result<StreamedLayer> {
-        let mut view = mlx_gen::weights::Weights::from_paths(&self.files, Path::new(""))?;
+        let mut view =
+            crate::stream::open_window(&self.files, std::slice::from_ref(&self.keys[i]))?;
         let map =
             crate::stream::materialize(&mut view, &self.keys[i], crate::stream::CastPolicy::Tower)?;
         StreamedLayer::build(&map, i, self.stored_quant)
@@ -532,10 +571,6 @@ impl StreamedTower {
 
     pub(crate) fn config(&self) -> &ModelConfig {
         &self.cfg
-    }
-
-    pub(crate) fn embed_table(&self) -> &Array {
-        &self.embed
     }
 
     pub(crate) fn rope(&self) -> &mlx_llm::primitives::rope::Rope {
@@ -576,11 +611,14 @@ impl StreamedLayer {
     }
 
     fn build(w: &mlx_gen::weights::Weights, i: usize, stored: Option<QuantSpec>) -> Result<Self> {
-        use mlx_llm::primitives::projection::Projection;
         let stem = layer_stem(i);
         let key = |suffix: &str| format!("{stem}{suffix}");
         let get = |suffix: &str| -> Result<Array> { Ok(w.require(&key(suffix))?.clone()) };
         let proj = |name: &str| -> Result<Projection> {
+            let weight = key(&format!("{name}.weight"));
+            if let Some(native) = Projection::native(w, &weight, false).map_err(from_llm)? {
+                return Ok(native);
+            }
             let scales = key(&format!("{name}.scales"));
             match (w.get(&scales), stored) {
                 (Some(scales), Some(spec)) => Projection::from_quantized(
@@ -705,19 +743,6 @@ impl IrisTextEncoder {
             &model_cfg,
             quant,
         )?;
-        let mut tensors = HashMap::new();
-        for file in &files {
-            let part = Array::load_safetensors(file).map_err(|e| {
-                Error::Msg(format!(
-                    "iris: loading text-encoder shard {}: {e}",
-                    file.display()
-                ))
-            })?;
-            tensors.extend(
-                part.into_iter()
-                    .filter(|(name, _)| is_text_tower_tensor(name, untied_head)),
-            );
-        }
         // A pre-quantized tower (`crate::packed`) is read as stored — only at its own tier — and
         // the decoder builds it like any dense one; a dense tower is packed at load when a tier is
         // asked for.
@@ -731,7 +756,10 @@ impl IrisTextEncoder {
             }
             None => text_encoder_quant_spec(&model_cfg, quant)?,
         };
-        let mut weights = mlx_llm::primitives::weights::Weights::from_map(tensors);
+        let mut weights = mlx_llm::primitives::Weights::from_selected_shards(&files, |key| {
+            is_text_tower_tensor(key, untied_head)
+        })
+        .map_err(from_llm)?;
         let lm = match quant {
             // `from_weights` evaluates every parameter group it built (the load boundary), so no
             // forward ever reads a weight from disk.
@@ -800,47 +828,36 @@ impl IrisTextEncoder {
         };
         let embed_key = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
         let norm_key = format!("{LANGUAGE_TOWER_PREFIX}norm.weight");
-        let resident = |name: &str| name == embed_key || name == norm_key;
+        let embed_base = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens");
+        let resident = is_streamed_resident;
         // iOS: only the embedding and the final norm are read here; every decoder layer is read
         // inside its own window's priced read quantum.
         crate::stream::before_tower_load(quanta::LOAD, &files, resident, &model_cfg, quant)?;
         let (keys, reads) = tower_layer_inventory(&files, model_cfg.num_layers)?;
-        let (mut embed, mut norm) = (None, None);
-        for file in &files {
-            let part = Array::load_safetensors(file).map_err(|e| {
-                Error::Msg(format!(
-                    "iris: loading text-encoder shard {}: {e}",
-                    file.display()
-                ))
-            })?;
-            for (name, array) in part {
-                if name == format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.scales") {
-                    return Err(Error::Unsupported(format!(
-                        "iris: {} stores a packed token embedding; the streamed tower reads it \
-                         dense (the Iris packed tower keeps it bf16)",
-                        dir.display()
-                    )));
-                }
-                if !resident(&name) {
-                    continue;
-                }
-                mlx_rs::transforms::eval_pending_loads([&array])?;
-                let array = array.as_dtype(Dtype::Bfloat16)?;
-                eval([&array])?;
-                if name == embed_key {
-                    embed = Some(array);
-                } else {
-                    norm = Some(array);
-                }
-            }
+        let view = mlx_llm::primitives::Weights::from_selected_shards(&files, resident)
+            .map_err(from_llm)?;
+        if view.contains(&format!("{embed_base}.scales")) {
+            return Err(Error::Unsupported(format!(
+                "iris: {} stores an affine token embedding; the Iris packed tower keeps it bf16",
+                dir.display()
+            )));
         }
-        let missing = |key: &str| Error::MissingTensor(key.to_owned());
+        let embed = Projection::from_named(&view, &embed_key, None, Some(Dtype::Bfloat16))
+            .map_err(from_llm)?;
+        let norm = view
+            .require(&norm_key)
+            .map_err(from_llm)?
+            .as_dtype(Dtype::Bfloat16)?;
+        view.materialize_accessed().map_err(from_llm)?;
+        let mut resident_arrays = vec![norm.clone()];
+        embed.push_arrays(&mut resident_arrays);
+        eval(resident_arrays.iter())?;
         #[cfg(feature = "model-inference-proof")]
         let input_files = files.clone();
         let tower = StreamedTower {
             rope: model_cfg.build_rope(),
-            embed: embed.ok_or_else(|| missing(&embed_key))?,
-            norm: norm.ok_or_else(|| missing(&norm_key))?,
+            embed,
+            norm,
             cfg: model_cfg,
             files,
             keys,
@@ -927,7 +944,7 @@ impl IrisTextEncoder {
             Tower::Streamed(tower) => {
                 assert_eq!(tower.reads.len(), tower.cfg.num_layers);
                 assert!(
-                    tower.embed.nbytes() > 0 && tower.norm.nbytes() > 0,
+                    tower.resident_arrays().iter().all(|a| a.nbytes() > 0),
                     "streamed tower must own its embedding and final norm"
                 );
             }
@@ -943,7 +960,7 @@ impl IrisTextEncoder {
                 crate::anchor_tests::materialized_addresses(groups.iter().flatten())
             }
             Tower::Streamed(tower) => {
-                crate::anchor_tests::materialized_addresses([&tower.embed, &tower.norm])
+                crate::anchor_tests::materialized_addresses(tower.resident_arrays().iter())
             }
         }
     }
@@ -966,12 +983,12 @@ impl IrisTextEncoder {
     /// decoder's own group materialization uses): a buffer two handles share is counted once,
     /// wherever in the groups the second handle sits.
     pub fn resident_weight_bytes(&self) -> u64 {
-        let lm = match &self.tower {
-            Tower::Resident(lm) => lm,
-            Tower::Streamed(t) => return (t.embed.nbytes() + t.norm.nbytes()) as u64,
+        let groups = match &self.tower {
+            Tower::Resident(lm) => lm.param_groups(),
+            Tower::Streamed(tower) => vec![tower.resident_arrays()],
         };
         let mut seen = std::collections::BTreeSet::new();
-        lm.param_groups()
+        groups
             .iter()
             .flatten()
             .filter(|a| {
@@ -983,10 +1000,10 @@ impl IrisTextEncoder {
             .sum()
     }
 
-    /// Whether the tower's projections are affine-packed.
+    /// Whether the tower uses the stored or load-time affine tier.
     pub fn is_quantized(&self) -> bool {
         match &self.tower {
-            Tower::Resident(lm) => lm.is_quantized(),
+            Tower::Resident(lm) => lm.resident_quant().is_some(),
             Tower::Streamed(t) => t.stored_quant.is_some(),
         }
     }
@@ -1201,7 +1218,7 @@ impl IrisTextEncoder {
             streamed_embedding_bytes(cfg, n.max(0) as u64),
         )?;
         let ids = Array::from_slice(&window.input_ids, &[1, n]);
-        let h = mlx_llm::primitives::nn::embed(&tower.embed, &ids).map_err(from_llm)?;
+        let h = tower.embed(&ids)?;
         let (cos, sin) = tower
             .rope
             .cos_sin(n, 0, Dtype::Bfloat16)
@@ -1226,7 +1243,7 @@ impl IrisTextEncoder {
             &plan,
             cancel,
             h,
-            || mlx_gen::weights::Weights::from_paths(&tower.files, Path::new("")),
+            || Ok(mlx_gen::weights::Weights::empty()),
             |mut h, view, range| {
                 #[cfg(test)]
                 TOWER_WINDOW_HOOK.with(|hook| {
@@ -1238,6 +1255,7 @@ impl IrisTextEncoder {
                     quanta::LAYER_READ,
                     crate::stream::window_read_bytes(&tower.reads[range.clone()]),
                 )?;
+                *view = crate::stream::open_window(&tower.files, &tower.keys[range.clone()])?;
                 let mut built = Vec::with_capacity(range.len());
                 for i in range.clone() {
                     let map = crate::stream::materialize(

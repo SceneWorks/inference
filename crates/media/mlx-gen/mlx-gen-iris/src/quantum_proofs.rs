@@ -904,8 +904,7 @@ fn streamed_body() {
             let ids: Vec<i32> = (0..n).map(|i| (i * 7 + 3) % cfg.vocab_size).collect();
             let (peak, out) = measure(|| {
                 let ids = Array::from_slice(&ids, &[1, n]);
-                let h = mlx_llm::primitives::nn::embed(tower.embed_table(), &ids)
-                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+                let h = tower.embed(&ids)?;
                 let (cos, sin) = tower
                     .rope()
                     .cos_sin(n, 0, Dtype::Bfloat16)

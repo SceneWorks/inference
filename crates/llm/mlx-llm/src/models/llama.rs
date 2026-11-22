@@ -150,7 +150,7 @@ pub struct CausalLm {
     compute_dtype: Dtype,
     /// HF training's buffer-value rounding, separate from phase arithmetic precision.
     training_frequency_storage: Option<Dtype>,
-    quantized: bool,
+    pub(crate) native_projections: bool,
     /// The load-time quantization the projections were built with (`None` for none): its bits
     /// and group size shape the K/V as much as the config does.
     load_quant: Option<QuantSpec>,
@@ -435,6 +435,7 @@ impl CausalLm {
         // apart, so the *checkpoint* decides: probe the nested embedding table and fall back to the
         // flat root. Getting this wrong is not a subtle numeric error — the flat lookup simply does
         // not resolve against an HF Gemma 4 snapshot and the load fails on a missing tensor.
+        let bindings_before = w.native_bindings();
         let gemma4_nested =
             cfg.architecture.is_gemma4() && w.contains("model.language_model.embed_tokens.weight");
         let vlm_nested = cfg.architecture.is_qwen3_vl() || gemma4_nested;
@@ -561,7 +562,6 @@ impl CausalLm {
         // (`Weights::materialize_groups`). Under `Stack::Sequential` that is the resident set
         // (embeddings, final norm, LM head) — the streamed layers are verified per pass in
         // `crate::residency::SequentialStack::run_layer`.
-        let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,
             stack,
@@ -569,7 +569,7 @@ impl CausalLm {
             lm_head,
             rope,
             full_rope,
-            quantized,
+            native_projections: w.native_bindings() != bindings_before,
             load_quant: quant,
             weights_identity: String::new(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f32).sqrt()),
@@ -646,9 +646,9 @@ impl CausalLm {
         &self.cfg
     }
 
-    /// Whether the projections were quantized on load.
+    /// Whether the decoder holds native or affine quantized projections.
     pub fn is_quantized(&self) -> bool {
-        self.quantized
+        self.native_projections || self.resident_quant().is_some()
     }
 
     /// The affine spec the quantized projections hold — the snapshot's stored one, which its
@@ -690,7 +690,7 @@ impl CausalLm {
     /// rounding, on a fresh model before any forward/cache. Generic explicit-dtype
     /// constructors deliberately retain legacy F32-frequency inference semantics.
     pub fn with_training_frequency_storage(mut self) -> Result<Self> {
-        if !self.cfg.architecture.is_qwen3_vl() || self.quantized {
+        if !self.cfg.architecture.is_qwen3_vl() || self.is_quantized() {
             return Err(Error::Unsupported(
                 "training frequency profile requires a dense Qwen3-VL teacher".into(),
             ));
@@ -733,7 +733,11 @@ impl CausalLm {
         use sha2::{Digest, Sha256};
         let mut described = format!(
             "{:?}|kv={:?}|quantized={}|load_quant={:?}|weights={}",
-            self.cfg, self.compute_dtype, self.quantized, self.load_quant, self.weights_identity
+            self.cfg,
+            self.compute_dtype,
+            self.is_quantized(),
+            self.load_quant,
+            self.weights_identity
         );
         // Preserve the exact legacy fingerprint when the frequency values are F32.
         if let Some(storage) = self.training_frequency_storage {

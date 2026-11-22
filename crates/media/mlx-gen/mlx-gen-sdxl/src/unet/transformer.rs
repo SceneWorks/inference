@@ -126,13 +126,6 @@ impl AttentionMHA {
         Ok(())
     }
 
-    /// Install the IP-Adapter decoupled K/V projections (sc-3059). `k_ip`/`v_ip` are the
-    /// `ip_adapter.{n}.to_k_ip/to_v_ip` weights (`[hidden, cross_attention_dim]`, bias-free).
-    fn install_ip(&mut self, k_ip: Array, v_ip: Array) {
-        self.to_k_ip = Some(AdaptableLinear::dense(k_ip, None));
-        self.to_v_ip = Some(AdaptableLinear::dense(v_ip, None));
-    }
-
     fn quantize_using(
         &mut self,
         prefix: &str,
@@ -304,19 +297,8 @@ impl TransformerBlock {
         model_dims: i32,
         num_heads: i32,
     ) -> Result<Self> {
-        // GEGLU: `ff.net.0.proj` is one `[2*hidden, D]` Linear on disk, row-split into value/gate
-        // halves. Determine `2*hidden` from the packed `.scales` grid (rows) when present, else from
-        // the dense weight — the split rows are identical either way (sc-8746). The packed row-slice
-        // is byte-identical to the dense split-then-quantize (quantization is per-row).
         let ff_proj = format!("{prefix}.ff.net.0.proj");
-        let two_h = match w.get(&format!("{ff_proj}.scales")) {
-            Some(scales) => scales.shape()[0],
-            None => w.require(&format!("{ff_proj}.weight"))?.shape()[0],
-        };
-        let [(lo1, hi1), (lo2, hi2)] = crate::quant::geglu_half_ranges(two_h)?;
-        // Value/gate halves — the same actual row selector serves header normalization.
-        let linear1 = crate::quant::lin_geglu_half(w, &ff_proj, lo1, hi1)?;
-        let linear2 = crate::quant::lin_geglu_half(w, &ff_proj, lo2, hi2)?;
+        let (linear1, linear2) = crate::quant::geglu_pair(w, &ff_proj)?;
         // FFN output (`ff.net.2`) is a plain quantized Linear.
         let linear3 = crate::quant::lin(w, &format!("{prefix}.ff.net.2"), true)?;
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
@@ -419,11 +401,6 @@ impl TransformerBlock {
         self.linear1.materialize_weights()?;
         self.linear2.materialize_weights()?;
         self.linear3.materialize_weights()
-    }
-
-    /// Install this block's IP-Adapter K/V projections into its cross-attention (sc-3059).
-    fn install_ip(&mut self, k_ip: Array, v_ip: Array) {
-        self.attn2.install_ip(k_ip, v_ip);
     }
 
     /// The **already-built** IP-Adapter K/V projections on this block's cross-attention, for rung-4
@@ -1195,12 +1172,15 @@ impl Transformer2D {
 
     /// Install IP-Adapter K/V projections into each block's cross-attention, consuming one
     /// `(to_k_ip, to_v_ip)` pair per block from `pairs` (sc-3059). Pairs are consumed in block order.
-    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Array, Array)>) -> Result<()> {
+    pub fn install_ip<P: Into<AdaptableLinear>>(
+        &mut self,
+        pairs: &mut impl Iterator<Item = (P, P)>,
+    ) -> Result<()> {
         for block in &mut self.blocks {
             let (k_ip, v_ip) = pairs
                 .next()
                 .ok_or_else(|| mlx_gen::Error::Msg("ip_adapter: not enough K/V pairs".into()))?;
-            block.install_ip(k_ip, v_ip);
+            block.set_ip_projections(k_ip.into(), v_ip.into());
         }
         Ok(())
     }

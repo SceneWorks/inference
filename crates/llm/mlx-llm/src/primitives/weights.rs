@@ -18,7 +18,7 @@
 //! (sc-15750). The two crates cannot share a type — `mlx-gen` depends on `mlx-llm`, not the reverse
 //! — so the semantics are mirrored deliberately and the names kept identical.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Weights {
     tensors: HashMap<String, Array>,
+    native_bindings: Cell<u64>,
     source_reads: mlx_layers::source::SourceReads,
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
@@ -101,11 +102,18 @@ pub fn process_footprint_bytes() -> u64 {
     footprint::current()
 }
 
+/// The StarVector adapter applies LayerNorm over [image tokens, hidden channels].
+/// Its matrix-shaped weight is an elementwise coefficient in both loaders and admission.
+pub(crate) fn coefficient_key(key: &str) -> bool {
+    key == "model.image_projection.norm.weight"
+}
+
 impl Weights {
     /// Construct directly from an in-memory map (used by converters and tests).
     pub fn from_map(tensors: HashMap<String, Array>) -> Self {
         Self {
             tensors,
+            native_bindings: Cell::new(0),
             source_reads: Default::default(),
             accessed: RefCell::new(HashSet::new()),
             released: HashSet::new(),
@@ -119,6 +127,17 @@ impl Weights {
         Self {
             source_reads,
             ..Self::from_map(tensors)
+        }
+    }
+
+    pub(crate) fn native_bindings(&self) -> u64 {
+        self.native_bindings.get()
+    }
+
+    pub(crate) fn native_load_report(&self) -> core_llm::LoadReport {
+        core_llm::LoadReport {
+            projections: self.source_reads.native_projection_report(),
+            ..Default::default()
         }
     }
 
@@ -138,11 +157,13 @@ impl Weights {
             .cloned()
             .into_iter()
             .collect();
-        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+        let source_reads = mlx_layers::source::prepare_sources_for_consumers(
             &mut tensors,
             &[path.to_owned()],
             &declarations,
             crate::models::qwen35::stacked_expert_key,
+            coefficient_key,
+            |_, _| mlx_rs::Dtype::Bfloat16,
         )?;
         Ok(Self {
             source_reads,
@@ -168,16 +189,27 @@ impl Weights {
     }
 
     pub(crate) fn from_shards(shards: Vec<std::path::PathBuf>) -> Result<Self> {
-        #[cfg(feature = "model-inference-proof")]
-        let __input_paths = shards.clone(); // deterministic merge order
-        crate::load_progress::register_files(&shards);
+        Self::from_selected_shards(&shards, |_| true)
+    }
+
+    /// Open the caller's validated shards in order and bind only its component. The selector
+    /// includes companion keys, so a media tower can skip a neighboring vision tower or
+    /// deferred decoder layers before allocating their decoded operands.
+    pub fn from_selected_shards(
+        shards: &[std::path::PathBuf],
+        selected: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
+        crate::load_progress::register_files(shards);
         let mut tensors = HashMap::new();
         let mut declarations = Vec::new();
-        for shard in &shards {
+        for shard in shards {
             let (part, meta) = crate::load_progress::load_with_metadata(shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
             declarations.extend(meta.get("_quantization_metadata").cloned());
             for (name, tensor) in part {
+                if !selected(&name) {
+                    continue;
+                }
                 if tensors.insert(name.clone(), tensor).is_some() {
                     return Err(Error::Msg(format!(
                         "duplicate key {name} in {}",
@@ -190,13 +222,15 @@ impl Weights {
         crate::model_input_proof::record_reader_paths(
             "mlx-llm::primitives::Weights::from_dir",
             crate::model_input_proof::InputRole::ModelWeights,
-            &__input_paths,
+            shards,
         );
-        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+        let source_reads = mlx_layers::source::prepare_sources_for_consumers(
             &mut tensors,
-            &shards,
+            shards,
             &declarations,
             crate::models::qwen35::stacked_expert_key,
+            coefficient_key,
+            |_, _| mlx_rs::Dtype::Bfloat16,
         )?;
         Ok(Self {
             source_reads,
@@ -387,6 +421,9 @@ impl Weights {
                 .iter()
                 .map(|key| (key.as_str(), &self.tensors[key])),
         )?;
+        for key in &resident {
+            self.source_reads.materialized(key, &self.tensors[key])?;
+        }
         let mut report = Materialized::default();
         // Pacing (see the method docs): what the footprint may hold before the next group reads.
         let start = read_footprint();
@@ -450,6 +487,9 @@ impl Weights {
         }
         if !batch.is_empty() {
             Self::verify_batch(&batch)?;
+        }
+        for key in &pending {
+            self.source_reads.materialized(key, &self.tensors[key])?;
         }
         Ok(report)
     }
@@ -528,6 +568,9 @@ pub(crate) fn eval_groups(groups: &[Vec<Array>]) -> Result<()> {
 }
 
 impl mlx_layers::MlxWeightSource for Weights {
+    fn native_bound(&self) {
+        self.native_bindings.set(self.native_bindings.get() + 1);
+    }
     fn peek(&self, key: &str) -> Option<&Array> {
         self.metadata(key)
     }

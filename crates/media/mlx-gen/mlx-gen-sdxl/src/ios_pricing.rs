@@ -134,7 +134,6 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
 /// logical layouts and install branches only; it supplies neither a native backing certificate nor
 /// a ProcessGrowth bridge. No model, GenerationRequest, image, schedule or Array is constructed.
 pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::Value> {
-    use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
     use serde_json::json;
     if spec.pid.is_some() {
         return Err(Error::Unsupported(
@@ -172,15 +171,11 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
                 )?;
             }
             let file = crate::loader::resolve_unet_weight_file(root, crate::model::DTYPE)?;
-            (
-                "diffusers",
-                safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))?,
-                Vec::new(),
-            )
+            ("diffusers", pricing_headers(file)?, Vec::new())
         }
         WeightsSource::File(file) => {
             // The actual native loader opens the entire fused file before component remapping.
-            for h in safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))? {
+            for h in fused_pricing_headers(file)? {
                 crate::quant::header_dtype(h.dtype)?;
             }
             let source = crate::ldm::component_header_source(file)?;
@@ -224,8 +219,7 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
         let path = match source {
             WeightsSource::File(p) | WeightsSource::Dir(p) => p,
         };
-        let headers =
-            safetensors_path_tensor_headers(path).map_err(|e| Error::Msg(e.to_string()))?;
+        let headers = pricing_headers(path)?;
         let (_, complete, convs) = crate::unet::adapter_target_paths_from_headers(&cfg, &headers);
         // ControlNet::from_weights uses the SAME down BlockSpec selector, then the same mid
         // constructors. It has no up stack or conv_out; its own embedding and zero heads are fixed.
@@ -253,10 +247,8 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
         }
         Some(WeightsSource::Dir(dir)) => {
             let (encoder_file, weights_file) = crate::loader::resolve_ip_adapter_files(dir)?;
-            let encoder = safetensors_path_tensor_headers(encoder_file)
-                .map_err(|e| Error::Msg(e.to_string()))?;
-            let weights = safetensors_path_tensor_headers(weights_file)
-                .map_err(|e| Error::Msg(e.to_string()))?;
+            let encoder = pricing_headers(encoder_file)?;
+            let weights = pricing_headers(weights_file)?;
             let indices =
                 crate::ip_adapter::ip_kv_indices(weights.iter().map(|h| h.name.as_str()))?;
             let (_, complete, _) =
@@ -282,10 +274,24 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
                 };
                 let k = lookup("k")?;
                 let v = lookup("v")?;
-                pairs.push(json!({"target":slot,"k_shape":k.shape,"v_shape":v.shape,
+                let mut pair = json!({"target":slot,"k_shape":k.shape,"v_shape":v.shape,
                     "k_dtype":format!("{:?}",crate::quant::loaded_header_dtype(&weights,k)?),
                     "v_dtype":format!("{:?}",crate::quant::loaded_header_dtype(&weights,v)?),
-                    "installed":"dense_kv_before_unet_quantization"}));
+                    "installed":"dense_kv_before_unet_quantization"});
+                if ["k", "v"].iter().any(|role| {
+                    weights
+                        .iter()
+                        .any(|h| h.name == format!("ip_adapter.{index}.to_{role}_ip.scales"))
+                }) {
+                    pair["installed"] = json!("source_kv_before_unet_quantization");
+                    for role in ["k", "v"] {
+                        pair[format!("{role}_projection")] = projection_semantic_fact(
+                            &weights,
+                            &format!("ip_adapter.{index}.to_{role}_ip"),
+                        )?;
+                    }
+                }
+                pairs.push(pair);
             }
             let vision = VisionConfig::vit_h_14();
             let resampler = ResamplerConfig::plus_sdxl_vit_h();
@@ -300,7 +306,7 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
     };
     let vae_overlay=spec.components.get(crate::loader::VAE_FP16_FIX_COMPONENT).map(|source| {
         let file=crate::loader::resolve_vae_fp16_fix_file(source)?;
-        let headers=safetensors_path_tensor_headers(file).map_err(|e|Error::Msg(e.to_string()))?;
+        let headers=pricing_headers(file)?;
         Ok::<_,Error>(json!({"installed":"fp16_fix_vae","loaded_source_layouts":configured_component_layouts(&headers)?}))
     }).transpose()?;
     let mut identity = json!({"provider":"sdxl","load_form":form,"load_quantization_after_adapters_and_ip":spec.quantize.map(|q|q.bits()),
@@ -310,6 +316,47 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
         identity["order_dependent_unet_aliases"] = json!(alternatives);
     }
     Ok(identity)
+}
+
+/// The published SDXL iOS ledger models dense and affine operators. Authenticate actual
+/// source layouts before granting either family to an overlay or pricing a direct capture.
+fn pricing_headers(
+    path: impl AsRef<Path>,
+) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+    selected_pricing_headers(path.as_ref(), |_| true)
+}
+
+fn fused_pricing_headers(
+    path: &Path,
+) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+    selected_pricing_headers(path, |name| {
+        gen_core_family::sdxl_ldm::remap_sdxl_ldm_key(name).is_some()
+    })
+}
+
+fn selected_pricing_headers(
+    path: &Path,
+    selected: impl Fn(&str) -> bool,
+) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+    use mlx_gen::gen_core::{checkpoint_codec::projected_checkpoint_plan, weightsmeta};
+    let headers = weightsmeta::safetensors_path_tensor_headers(path)?;
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.to_path_buf());
+    } else {
+        weightsmeta::collect_safetensors_files(path, &mut files)?;
+        files.sort();
+    }
+    if let Some(plan) = projected_checkpoint_plan(
+        &files,
+        &headers,
+        selected,
+        &mlx_gen::logical_weights::MlxCodecResidency,
+        |_, shape| Some(shape.to_vec()),
+    )? {
+        return Err(Error::Unsupported(format!("SDXL iOS has no reviewed load and operator allocation evidence for checkpoint codecs {:?} at {}", plan.codec_ids(), path.display())));
+    }
+    Ok(headers)
 }
 
 fn projection_semantic_fact(
@@ -1755,7 +1802,7 @@ fn collect_pack_effect(
     effects: &mut q::LinearEffects,
 ) -> Result<()> {
     let mut work = linear.clone();
-    if work.bits.is_none() {
+    if !work.base.is_quantized {
         // The native pack guard is admitted before the quantize op validates the base.
         points.push(LoadPackPoint {
             before_resident: *retained,
@@ -1909,10 +1956,11 @@ impl Priced {
         let dtype = crate::model::DTYPE;
         let arch = inputs.arch.clone();
         let one = |p: &Path| vec![p.to_path_buf()];
-        let headers = |file: &Path| {
-            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
-                .map_err(|e| Error::Msg(e.to_string()))
-        };
+        let headers = |file: &Path| pricing_headers(file);
+        if inputs.fused.is_some() {
+            // All component header views below originate in this one physical checkpoint.
+            fused_pricing_headers(&inputs.unet)?;
+        }
         use gen_core_family::sdxl_ldm::SdxlComponent as C;
         let component_headers = |file: &Path, component: C| match &inputs.fused {
             Some(fused) => Ok(fused.source.headers_with(component, &fused.world)),
@@ -2352,7 +2400,7 @@ impl Priced {
                                     "sdxl selected world missing ordered pack target: {path}"
                                 ))
                             })?;
-                            if projection.bits.is_none() {
+                            if !projection.base.is_quantized {
                                 // The native pack guard precedes the quantize op's validation.
                                 self.load_quantize.push(LoadPackPoint {
                                     before_resident: retained,

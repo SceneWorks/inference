@@ -4914,6 +4914,7 @@ fn configured_pack_timing_preserves_final_alignment_and_unconfigured_rejection_h
         residuals: Vec::new(),
         group_size: 64,
         bits: None,
+        native: None,
     };
     // A metadata install declaration, not native state injection or a scratch/physical oracle.
     // Every real native file/value/guard-prefix assertion remains in the separate P5/TP tests.

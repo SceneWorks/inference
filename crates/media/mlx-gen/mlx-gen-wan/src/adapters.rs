@@ -1,7 +1,8 @@
 //! Wan2.2 LoRA application (sc-2683) — wires the reference `mlx_video/lora/` into the Wan
 //! generate path plus the Wan key→module map.
 //!
-//! **Strategy: weight MERGE** (the reference Wan path), not a forward-time residual. The reference
+//! **Strategy.** Dense source weights use the reference fold. FP8 and ConvRot matrices retain the
+//! original encoded operation and apply the same logical delta to the original activations. The reference
 //! `generate_wan.py` applies LoRA through `load_wan_model` → `load_and_apply_loras` →
 //! `apply_loras_to_weights`: for a bf16 expert it folds `ΔW = (B·A)·(alpha/rank)·strength` (computed
 //! at the factor dtype, cast to the weight dtype) **into the weight** before the forward; for a
@@ -37,7 +38,9 @@
 
 use std::collections::BTreeMap;
 
-use mlx_rs::ops::{add, matmul, multiply};
+#[cfg(test)]
+use mlx_rs::ops::add;
+use mlx_rs::ops::{matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::loader::{
@@ -49,7 +52,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterApplyReport, AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, MlxWeightSource, Result};
 
 // sc-27342: key normalization, the load-time merge path and the forward-time additive path
 // live in sibling modules; the report types and family classification stay here.
@@ -74,6 +77,8 @@ const PREFIXES: [&str; 4] = [
 /// silently dropped).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WanLoraReport {
+    /// Reconstructed deltas retained as residuals over immutable native checkpoint projections.
+    pub native_residuals: usize,
     /// Module weights actually merged (one per resolved target, across all applicable specs).
     pub applied: usize,
     /// Specs that applied to this expert (shared + this-expert-specific).
@@ -124,7 +129,7 @@ fn execution_adapter_policy(
     mode: &str,
 ) -> serde_json::Value {
     serde_json::json!({"mode":mode, "expert":format!("{expert:?}"),
-        "applied_targets":report.applied, "entries":report.per_spec.iter().map(|outcome| {
+        "applied_targets":report.applied, "native_residuals":report.native_residuals, "entries":report.per_spec.iter().map(|outcome| {
             let spec = &specs[outcome.spec_index];
             serde_json::json!({"load_index":outcome.spec_index, "path":spec.path,
                 "scale_bits":spec.scale.to_bits(), "applied":outcome.applied, "skipped":outcome.skipped})

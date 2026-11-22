@@ -53,6 +53,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_nn::var_builder::TensorInfo;
 
 use crate::gen_core::weightsmeta as wmeta;
 use crate::quant::LokrFactors;
@@ -198,6 +199,85 @@ pub fn read_scalar_opt(key: &str, field: &str, t: &Tensor) -> Result<Option<f32>
     Ok(Some(v))
 }
 
+/// An adapter's logical target. Checkpoint sources retain validated deltas until an operator
+/// asks for them. A materialized coefficient map folds each delta immediately.
+pub trait MergeTargets {
+    fn target_info(&self, key: &str) -> Result<Option<TensorInfo>>;
+    fn apply_matched(&mut self, key: &str, delta: &Tensor) -> Result<()>;
+}
+
+impl MergeTargets for HashMap<String, Tensor> {
+    fn target_info(&self, key: &str) -> Result<Option<TensorInfo>> {
+        Ok(self.get(key).map(|t| TensorInfo::dense(t.shape().clone())))
+    }
+    fn apply_matched(&mut self, key: &str, delta: &Tensor) -> Result<()> {
+        let weight = self
+            .get_mut(key)
+            .ok_or_else(|| CandleError::Msg(format!("missing adapter target {key}")))?;
+        *weight = (weight.to_dtype(DType::F32)? + delta.to_dtype(DType::F32)?)?;
+        Ok(())
+    }
+}
+
+pub struct CheckpointDeltas {
+    base: candle_nn::VarBuilder<'static>,
+    deltas: HashMap<String, Vec<Tensor>>,
+    folded: HashMap<String, Tensor>,
+}
+impl CheckpointDeltas {
+    pub fn new(base: candle_nn::VarBuilder<'static>) -> Self {
+        Self {
+            base,
+            deltas: HashMap::new(),
+            folded: HashMap::new(),
+        }
+    }
+    pub fn into_var_builder(self) -> candle_nn::VarBuilder<'static> {
+        crate::loader::adapter_var_builder(self.base, self.folded, self.deltas)
+    }
+}
+impl MergeTargets for CheckpointDeltas {
+    fn target_info(&self, key: &str) -> Result<Option<TensorInfo>> {
+        if !self.base.contains_tensor(key) {
+            return Ok(None);
+        }
+        if let Some(info) = self.base.tensor_info(key)? {
+            return Ok(Some(info));
+        }
+        if let Some(op) = self.base.native_linear_weight(key)? {
+            return Ok(Some(TensorInfo {
+                shape: op.dims().into(),
+                source_packed: true,
+                padded_shape: None,
+            }));
+        }
+        let cpu = self.base.clone().set_device(Device::Cpu);
+        Ok(Some(TensorInfo::dense(
+            cpu.get_unchecked(key)?.shape().clone(),
+        )))
+    }
+    fn apply_matched(&mut self, key: &str, delta: &Tensor) -> Result<()> {
+        // A native bias can carry more precision than the model's activation dtype. Let
+        // the constructor select its epilogue dtype before applying the bias deltas.
+        if key.ends_with(".bias")
+            || self
+                .target_info(key)?
+                .is_some_and(|info| info.source_packed || info.padded_shape.is_some())
+        {
+            self.deltas
+                .entry(key.to_owned())
+                .or_default()
+                .push(delta.to_dtype(DType::F32)?);
+            return Ok(());
+        }
+        if !self.folded.contains_key(key) {
+            let host = self.base.clone().set_device(Device::Cpu);
+            self.folded.insert(key.to_owned(), host.get_unchecked(key)?);
+        }
+        self.folded.apply_matched(key, delta)
+    }
+}
+
 /// Merge `delta` (`[out, in]`, expected f32) into the base weight at `key`, computing `W += δ` in f32
 /// (the stored f32 sum is cast to the model load dtype when the loader serves it). A missing key or a
 /// shape-mismatched base (e.g. a 4-D conv weight under a 2-D Linear delta) is surfaced as skipped,
@@ -205,23 +285,19 @@ pub fn read_scalar_opt(key: &str, field: &str, t: &Tensor) -> Result<Option<f32>
 /// already return f32, so it is an idempotent no-op that keeps the merged bytes identical whether the
 /// caller pre-cast or not.
 pub fn merge_into(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     key: &str,
     delta: &Tensor,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let merged = {
-        let Some(w) = base.get(key) else {
-            report.skipped_keys += 1;
-            return Ok(());
-        };
-        if w.dims() != delta.dims() {
-            report.skipped_keys += 1;
-            return Ok(());
-        }
-        (w.to_dtype(DType::F32)? + delta.to_dtype(DType::F32)?)?
-    };
-    base.insert(key.to_string(), merged);
+    if !base
+        .target_info(key)?
+        .is_some_and(|info| info.matches(delta.shape()))
+    {
+        report.skipped_keys += 1;
+        return Ok(());
+    }
+    base.apply_matched(key, delta)?;
     report.merged += 1;
     Ok(())
 }
@@ -285,7 +361,7 @@ struct DiffPatch {
 /// mirrors ComfyUI's own warn-and-skip and [`merge_into`]'s missing/mismatched-base guard. A no-op for
 /// a file carrying no `.diff`/`.diff_b`.
 pub fn merge_diff_patch_file(
-    base: &mut HashMap<String, Tensor>,
+    base: &mut impl MergeTargets,
     af: &AdapterFile,
     scale: f32,
     resolve_stem: impl Fn(&str) -> String,
@@ -308,7 +384,9 @@ pub fn merge_diff_patch_file(
         match &g.diff {
             Some(diff) => {
                 let wkey = format!("{path}.weight");
-                let base_ok = base.get(&wkey).is_some_and(|w| w.dims() == diff.dims());
+                let base_ok = base
+                    .target_info(&wkey)?
+                    .is_some_and(|info| info.matches(diff.shape()));
                 if !base_ok {
                     // Cross-architecture (or out-of-surface) weight delta: skip the whole module,
                     // dropping its coupled bias delta too (surfaced, never a half-patch).
@@ -418,7 +496,11 @@ impl ThirdPartyLokr {
 
     /// Reconstruct this module's `[out, in]` delta (lycoris per-module scale × `user_scale` baked in),
     /// via the shared [`reconstruct_lokr_delta`] (lycoris scale as `alpha` over `rank = 1.0`).
-    pub fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
+    pub fn delta(
+        &self,
+        base_shape: impl Into<Option<(usize, usize)>>,
+        user_scale: f32,
+    ) -> Result<Tensor> {
         reconstruct_lokr_delta(
             self.w1.as_ref(),
             self.w1_a.as_ref(),
@@ -489,7 +571,11 @@ impl ThirdPartyLoha {
     /// Reconstruct this module's `[out, in]` Hadamard delta (lycoris scale × `user_scale` baked in).
     /// Errors if a `hada_w1/w2` `a`/`b` leg is missing (a conv-tucker-only module never reaches here —
     /// it resolves to a 4-D base and skips first).
-    pub fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
+    pub fn delta(
+        &self,
+        base_shape: impl Into<Option<(usize, usize)>>,
+        user_scale: f32,
+    ) -> Result<Tensor> {
         let (w1_a, w1_b, w2_a, w2_b) = match (&self.w1_a, &self.w1_b, &self.w2_a, &self.w2_b) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => {
@@ -567,21 +653,40 @@ pub fn merge_one_thirdparty(
     delta_at: impl FnOnce((usize, usize)) -> Result<Tensor>,
     report: &mut MergeReport,
 ) -> Result<()> {
+    merge_source_thirdparty(
+        base,
+        path,
+        |shape| {
+            delta_at(shape.ok_or_else(|| {
+                CandleError::Msg("dense adapter target has no matrix geometry".into())
+            })?)
+        },
+        report,
+    )
+}
+
+/// A source without declared axes validates the factors' natural shape against its storage
+/// geometry now and against the architecture's actual projection when constructing the model.
+pub fn merge_source_thirdparty(
+    base: &mut impl MergeTargets,
+    path: Option<&str>,
+    delta_at: impl FnOnce(Option<(usize, usize)>) -> Result<Tensor>,
+    report: &mut MergeReport,
+) -> Result<()> {
     let Some(path) = path else {
         report.skipped_keys += 1;
         return Ok(());
     };
     let base_key = format!("{path}.weight");
-    let Some(w) = base.get(&base_key) else {
+    let Some(w) = base.target_info(&base_key)? else {
         report.skipped_keys += 1;
         return Ok(());
     };
-    if w.dims().len() != 2 {
+    if w.shape.dims().len() != 2 {
         report.skipped_keys += 1; // Linear-only surface (the conv surface is LoRA-only)
         return Ok(());
     }
-    let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
-    let delta = delta_at((out_f, in_f))?;
+    let delta = delta_at(w.declared_matrix()?)?;
     merge_into(base, &base_key, &delta, report)
 }
 

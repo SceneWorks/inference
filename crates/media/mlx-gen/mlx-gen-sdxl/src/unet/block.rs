@@ -429,7 +429,10 @@ impl UNetBlock2D {
 
     /// Install IP-Adapter K/V projections into this block's cross-attention transformers (sc-3059),
     /// consuming pairs in transformer/block order. A no-attention block consumes nothing.
-    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Array, Array)>) -> Result<()> {
+    pub fn install_ip<P: Into<AdaptableLinear>>(
+        &mut self,
+        pairs: &mut impl Iterator<Item = (P, P)>,
+    ) -> Result<()> {
         if let Some(attns) = &mut self.attentions {
             for a in attns {
                 a.install_ip(pairs)?;

@@ -281,7 +281,8 @@ impl Pipeline {
         let vb = self.component_vb(sub, DIT_DTYPE)?;
         // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`), so a
         // `proj_out.scales` sibling is present iff this is a pre-quantized q4/q8 tier.
-        let packed = vb.contains_tensor("proj_out.scales");
+        let packed =
+            crate::adapters::requires_additive(&vb, &self.root.join(sub), "wan-14b", &specs)?;
         if packed {
             let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
             if specs.is_empty() {

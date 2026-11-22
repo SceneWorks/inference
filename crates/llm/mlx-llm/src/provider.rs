@@ -595,11 +595,14 @@ impl Decoder {
     /// quantized, dense when they are not, unknown for a quantized decoder with no affine spec
     /// (Prism).
     fn resident_quantization(&self) -> core_llm::ResidentQuantization {
-        let spec = match self {
-            Decoder::Causal(m) => m.resident_quant(),
-            Decoder::Qwen35(m) => m.resident_quant(),
+        let (native, spec) = match self {
+            Decoder::Causal(m) => (m.native_projections, m.resident_quant()),
+            Decoder::Qwen35(m) => (m.native_projections, m.resident_quant()),
         };
-        resident_quantization(self.is_quantized(), spec.map(|q| q.bits))
+        resident_quantization(
+            self.is_quantized(),
+            spec.filter(|_| !native).map(|q| q.bits),
+        )
     }
 
     /// The decoder as the backend-neutral multimodal seam. Both backbones implement [`VlmDecode`]
@@ -2274,7 +2277,7 @@ impl LlamaProvider {
             block_draft: None,
             load_report: core_llm::LoadReport {
                 fallbacks: load_fallbacks,
-                ..core_llm::LoadReport::default()
+                ..weights.native_load_report()
             },
         })
     }
@@ -2286,8 +2289,13 @@ impl LlamaProvider {
         let Some(head) = head else { return };
         let outcome = match &mut self.model {
             Decoder::Qwen35(model) => model
-                .attach_companion_mtp(head)
-                .map(|()| speculative_max_depth([qwen35_attention_geometry(model.config())]))
+                .attach_companion_mtp_report(head)
+                .map(|report| {
+                    (
+                        speculative_max_depth([qwen35_attention_geometry(model.config())]),
+                        report,
+                    )
+                })
                 .map_err(|e| format!("mtp_head: {e}")),
             Decoder::Causal(_) => Err(format!(
                 "{}; this model's family is `{}`",
@@ -2298,10 +2306,28 @@ impl LlamaProvider {
         match outcome {
             // The same backend-true depth a native head advertises (sc-24438): a companion head
             // runs the identical one-layer predictor through the identical verify path.
-            Ok(max_depth) => self
-                .descriptor
-                .capabilities
-                .advertise_mtp(max_depth, recommended_depths().mtp),
+            Ok((max_depth, head)) => {
+                for row in head.projections {
+                    if let Some(existing) = self
+                        .load_report
+                        .projections
+                        .iter_mut()
+                        .find(|p| p.kind == row.kind)
+                    {
+                        existing.count += row.count;
+                        existing.params += row.params;
+                        existing.resident_bytes += row.resident_bytes;
+                    } else {
+                        self.load_report.projections.push(row);
+                    }
+                }
+                self.load_report
+                    .projections
+                    .sort_by(|a, b| a.kind.cmp(&b.kind));
+                self.descriptor
+                    .capabilities
+                    .advertise_mtp(max_depth, recommended_depths().mtp);
+            }
             Err(reason) => self
                 .load_report
                 .fallbacks
@@ -2385,7 +2411,7 @@ impl LlamaProvider {
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
-        self.model.is_quantized()
+        self.model.is_quantized() || !self.load_report.projections.is_empty()
     }
 
     /// The cross-turn prefix cache's byte budget (sc-24437) — what the load admitted for it.
@@ -3294,15 +3320,20 @@ impl<'a> TextPipeline<'a> {
 /// The numeric policy a completed report binds: the resident projection format the loaded
 /// decoder holds and the device. Recorded for every load — a dense load (`requested = None`)
 /// observes its resident format too; `requested_quantization` is then `null`.
-fn numeric_policy(
-    requested: Option<Quantize>,
-    resident_projection_quantized: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "requested_quantization": requested.map(|requested| format!("{requested:?}")),
-        "resident_projection_quantized": resident_projection_quantized,
+pub(crate) fn numeric_policy(report: &core_llm::LoadReport, quantized: bool) -> serde_json::Value {
+    let mut policy = serde_json::json!({
+        "requested_quantization": report.requested.map(|requested| format!("{requested:?}")),
+        "resident_projection_quantized": quantized || !report.projections.is_empty(),
         "device": "metal",
-    })
+    });
+    if !report.projections.is_empty() {
+        policy["native_projection_kinds"] = serde_json::json!(report
+            .projections
+            .iter()
+            .map(|p| &p.kind)
+            .collect::<Vec<_>>());
+    }
+    policy
 }
 
 impl TextLlm for LlamaProvider {
@@ -3347,10 +3378,7 @@ impl TextLlm for LlamaProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
-        scope.observe_numeric_policy(numeric_policy(
-            self.load_report.requested,
-            self.is_quantized(),
-        ));
+        scope.observe_numeric_policy(numeric_policy(&self.load_report, self.is_quantized()));
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -6795,11 +6823,27 @@ mod numeric_policy_tests {
     /// quantized policy value is unchanged from the requested-only form.
     #[test]
     fn dense_and_quantized_loads_both_observe_resident_numeric_policy() {
-        let dense = numeric_policy(None, false);
+        let mut report = core_llm::LoadReport::default();
+        let dense = numeric_policy(&report, false);
         assert_eq!(dense["requested_quantization"], serde_json::Value::Null);
         assert_eq!(dense["resident_projection_quantized"], false);
         assert_eq!(dense["device"], "metal");
-        let quantized = numeric_policy(Some(Quantize::Q4), true);
+        report.projections.push(core_llm::ProjectionReport {
+            kind: "convrot_int8".into(),
+            count: 1,
+            params: 128,
+            resident_bytes: 136,
+        });
+        let native = numeric_policy(&report, false);
+        assert_eq!(native["resident_projection_quantized"], true);
+        assert_eq!(
+            native["native_projection_kinds"],
+            serde_json::json!(["convrot_int8"])
+        );
+        assert!(native["requested_quantization"].is_null());
+        report.projections.clear();
+        report.requested = Some(Quantize::Q4);
+        let quantized = numeric_policy(&report, true);
         assert_eq!(quantized["requested_quantization"], "Q4");
         assert_eq!(quantized["resident_projection_quantized"], true);
         assert_ne!(dense, quantized);

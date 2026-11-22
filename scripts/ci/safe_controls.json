@@ -1515,6 +1515,58 @@
       "reason": "Temporary safetensors headers, bounded descriptor bytes and source-plan/residency arithmetic only; validates physical owners, companions and malformed-input refusal without a backend tensor or learned execution."
     },
     {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "loader::adapter_projection::tests::native_delta_constructor_preserves_source_bias_and_ordered_dense_folds",
+      "source": "crates/media/candle-gen/candle-gen/src/loader/adapter_projection.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CPU constructor and coefficient inspection only. A synthetic checkpoint backend forbids dense reads of its packed matrix. Stacks literal diff-patch tensors, checks bias/shape skips, retained bytes and exact dense weight fold order; no forward, learned matrix multiply or inference kernel executes."
+    },
+    {
+      "package": "candle-gen-z-image",
+      "kind": "lib",
+      "target": "candle_gen_z_image",
+      "test": "pipeline::tests::dequantized_vae_vb_folds_packed_triples_from_one_mapping",
+      "source": "crates/media/candle-gen/candle-gen-z-image/src/pipeline.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Writes two tiny CPU weight shards, opens the shared VAE weight builder and compares loaded affine, scaled FP8 and dense coefficients. This only reads and transforms checkpoint storage. No model, layer forward, activation, accelerator or inference kernel runs."
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "weights::tests::native_adapter_deltas_follow_projection_remaps_and_replacements",
+      "source": "crates/media/mlx-gen/src/weights.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Constructs a padded MXFP8 checkpoint handle and attaches literal precomputed float arrays. Checks source and residual metadata, order, key transfers and invalidation. No projection forward, adapter calculation or learned kernel executes."
+    },
+    {
+      "package": "mlx-gen-sdxl",
+      "kind": "lib",
+      "target": "mlx_gen_sdxl",
+      "test": "ip_adapter::projection_source_tests::resampler_and_decoupled_kv_keep_native_operands_and_logical_widths",
+      "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Constructs tiny source-backed operators, verifies their signed storage, numeric slot order, logical shapes and metadata arithmetic. No forward or learned kernel runs."
+    },
+    {
       "package": "mlx-gen-sdxl",
       "kind": "lib",
       "target": "mlx_gen_sdxl",
@@ -1593,6 +1645,90 @@
         "win32"
       ],
       "reason": "Loads a tiny real adapter file into a metadata-only CPU NativeLinearWeight through the production additive installer. Preserves apply/skip/base-kind assertions; explicit panic guards prohibit base forward and dense materialization. No learned or GPU execution."
+    },
+    {
+      "package": "mlx-gen-ios-catalog",
+      "kind": "lib",
+      "target": "mlx_gen_ios_catalog",
+      "test": "ios_admission::tests::sana_bound_generator_rechecks_geometry_tile_mode_and_capacity_before_the_provider",
+      "source": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Checks metadata admission and exact forwarding of two fake checkpoint receipts through a bound generator. The fake generator only updates call counters and returns an empty image list. No model load or compute executes."
+    },
+    {
+      "package": "mlx-gen-ios-catalog",
+      "kind": "lib",
+      "target": "mlx_gen_ios_catalog",
+      "test": "ios_admission::tests::restore_and_depth_are_keyed_admitted_and_request_bound",
+      "source": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Checks admission metadata, request guards and exact receipt forwarding through a bound transform with fake delegates. The transform clones image bytes and the depth fake returns a typed error. No model load or compute executes."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_memory::tests::native_sources_do_not_use_verified_affine_or_dense_bounds",
+      "source": "crates/llm/mlx-llm/src/load_memory.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only synthetic JSON tensor headers, cell classification and verified-table comparisons are evaluated."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::numeric_policy_tests::dense_and_quantized_loads_both_observe_resident_numeric_policy",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only backend-neutral LoadReport values and JSON execution identity fields are constructed and compared."
+    },
+    {
+      "package": "mlx-layers",
+      "kind": "lib",
+      "target": "mlx_layers",
+      "test": "source::admission_tests::selected_native_rotations_charge_one_shared_allocation_pair",
+      "source": "crates/layers/mlx-layers/src/source.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Exercises checked byte arithmetic, tensor selection and rotation deduplication on two synthetic plan rows. No arrays, devices or operators are constructed."
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "weights::tests::native_component_windows_keep_companions_observations_and_constructor_reads",
+      "source": "crates/media/mlx-gen/src/weights.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Array-handle and source-layout metadata only: validates companion remapping, alias observations, atomic refusal and constructor-read tracking without tensor evaluation, projection construction, forward or kernel execution."
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "lib",
+      "target": "mlx_gen_iris",
+      "test": "stream::tests::selected_codec_windows_price_original_operands_rotation_and_coefficient_decode",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/src/stream.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Synthetic headers and a bounded JSON codec declaration feed pure source-plan, constructor, allocation and window arithmetic. No backend tensor, device probe or model execution."
     }
   ]
 }

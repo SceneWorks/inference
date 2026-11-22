@@ -45,7 +45,6 @@
 //! drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`] for the table, the
 //! controls, and the explicit limits of the claim.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_gen::gen_core::MemoryPhase;
@@ -67,9 +66,7 @@ use mlx_rs::{random, Array};
 use crate::causal::CausalKreaTransformer;
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
 use crate::generate::{generate_i2v_latents, generate_latents, generate_v2v_latents, ArGenParams};
-use crate::load::{
-    load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
-};
+use crate::load::{load_transformer_weights, probe_packed_quant, resolve_load_time_quant};
 use crate::{ProviderVae, VAE_TILING};
 
 /// z16 Wan VAE temporal compression (a latent frame decodes to `TEMPORAL_STRIDE` output frames).
@@ -810,11 +807,7 @@ fn load_transformer(
     quant: Option<Quant>,
 ) -> Result<(CausalKreaTransformer, Vec<AdapterApplyReport>)> {
     let weights = open_transformer_weights(root)?;
-    let raw: HashMap<String, Array> = weights
-        .keys()
-        .map(|k| (k.to_string(), weights.get(k).expect("listed key").clone()))
-        .collect();
-    let (mut dit, packed) = load_krea_realtime_transformer_with_quant(raw, cfg)?;
+    let (mut dit, packed) = load_transformer_weights(&weights, cfg)?;
     // Reconcile the requested tier against the one actually on disk, then quantize a dense base if the
     // caller asked for it (a no-op over an already-packed base — hence the reconciliation, which turns
     // a width mismatch into a loud error instead of silently serving the stored tier).

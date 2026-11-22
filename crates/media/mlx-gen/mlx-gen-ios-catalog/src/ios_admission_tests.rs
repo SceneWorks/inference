@@ -4,8 +4,8 @@ use super::*;
 use crate::sdxl::tests::{admit_fixture_rows as admit_with_rows, budget, DEVICE};
 use gen_core_iris::depth::{DepthOutput, IrisDepthEstimator};
 use mlx_gen::gen_core::{
-    GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform, TransformDescriptor,
-    WeightsSource,
+    CheckpointWeightFacts, GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform,
+    TransformDescriptor, WeightsSource,
 };
 use std::cell::Cell;
 use std::path::Path;
@@ -180,9 +180,58 @@ fn unserved_modes_are_typed_mode_refusals() {
     );
 }
 
+fn probe_checkpoint_facts(root: &Path) -> Vec<CheckpointWeightFacts> {
+    use mlx_gen::gen_core::{
+        compile_logical_weight_plan,
+        weightsmeta::{Dtype, SafetensorsTensorHeader},
+        CheckpointCodecRegistry, CheckpointReadAccounting, DenseResidencyPolicy,
+        ExecutionRepresentation, IdentityKeyMapping, NativeExecutionCapability, PinnedWeightsFile,
+        DENSE_CODECS,
+    };
+
+    const KEY: &str = "probe.weight";
+    let plan = std::sync::Arc::new(
+        compile_logical_weight_plan(
+            &[SafetensorsTensorHeader {
+                name: KEY.into(),
+                dtype: Dtype::F16,
+                shape: vec![1],
+                data_bytes: 2,
+            }],
+            &Default::default(),
+            &IdentityKeyMapping,
+            &CheckpointCodecRegistry::new(DENSE_CODECS.iter().copied()).unwrap(),
+            &DenseResidencyPolicy,
+        )
+        .unwrap(),
+    );
+    ["backbone", "companion"]
+        .into_iter()
+        .map(|name| {
+            let path = root.join(name);
+            // Only the file identity is read. The mock supplies the observed rows directly.
+            std::fs::write(&path, [0_u8; 2]).unwrap();
+            let accounting = CheckpointReadAccounting::new(
+                plan.clone(),
+                NativeExecutionCapability::new([]),
+                &[],
+            );
+            accounting
+                .record(KEY, ExecutionRepresentation::DenseFallback, 2)
+                .unwrap();
+            accounting
+                .facts()
+                .unwrap()
+                .with_verified_source(&PinnedWeightsFile::pin(&path).unwrap())
+                .unwrap()
+        })
+        .collect()
+}
+
 struct ProbeGenerator {
     desc: mlx_gen::gen_core::ModelDescriptor,
     calls: Rc<Cell<u32>>,
+    checkpoint_facts: Vec<CheckpointWeightFacts>,
 }
 impl Generator for ProbeGenerator {
     fn descriptor(&self) -> &mlx_gen::gen_core::ModelDescriptor {
@@ -190,6 +239,9 @@ impl Generator for ProbeGenerator {
     }
     fn validate(&self, _: &GenerationRequest) -> Result<()> {
         Ok(())
+    }
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<CheckpointWeightFacts> {
+        self.checkpoint_facts.clone()
     }
     fn generate(
         &self,
@@ -542,12 +594,16 @@ fn sana_bound_generator_rechecks_geometry_tile_mode_and_capacity_before_the_prov
         .unwrap();
     let probe_calls = calls.clone();
     let live = headroom.clone();
+    let sources = tempfile::tempdir().unwrap();
+    let checkpoint_facts = probe_checkpoint_facts(sources.path());
+    let provider_facts = checkpoint_facts.clone();
     let bound = admitted
         .load_generator_using(
             move |_| {
                 Ok(Box::new(ProbeGenerator {
                     desc,
                     calls: probe_calls,
+                    checkpoint_facts: provider_facts,
                 }))
             },
             Box::new(move |_| {
@@ -559,6 +615,8 @@ fn sana_bound_generator_rechecks_geometry_tile_mode_and_capacity_before_the_prov
             }),
         )
         .unwrap();
+    assert_eq!(bound.checkpoint_weight_facts(), None);
+    assert_eq!(bound.checkpoint_weight_facts_by_source(), checkpoint_facts);
     let IosWork::Generate(req) = &candidate.work else {
         unreachable!()
     };
@@ -591,17 +649,27 @@ fn sana_bound_generator_rechecks_geometry_tile_mode_and_capacity_before_the_prov
     assert_eq!(calls.get(), 1, "a capacity recheck must precede every call");
 }
 
-struct ProbeTransform(TransformDescriptor, Rc<Cell<u32>>);
+struct ProbeTransform {
+    descriptor: TransformDescriptor,
+    calls: Rc<Cell<u32>>,
+    checkpoint_facts: Vec<CheckpointWeightFacts>,
+}
 impl Transform for ProbeTransform {
+    fn checkpoint_weight_facts(&self) -> Option<CheckpointWeightFacts> {
+        (self.calls.get() > 0).then(|| self.checkpoint_facts[0].clone())
+    }
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<CheckpointWeightFacts> {
+        self.checkpoint_facts.clone()
+    }
     fn descriptor(&self) -> &TransformDescriptor {
-        &self.0
+        &self.descriptor
     }
     fn validate(&self, _: &TransformRequest) -> Result<()> {
-        self.1.set(self.1.get() + 1);
+        self.calls.set(self.calls.get() + 1);
         Ok(())
     }
     fn apply(&self, req: &TransformRequest, _: &mut dyn FnMut(Progress)) -> Result<Image> {
-        self.1.set(self.1.get() + 1);
+        self.calls.set(self.calls.get() + 1);
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -690,14 +758,22 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
         .map(|r| (r.descriptor)())
         .find(|d| d.id == IRIS_RESTORE_ID)
         .unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let checkpoint_facts = probe_checkpoint_facts(sources.path());
     let bound = crate::bound::BoundTransform::new(
-        Box::new(ProbeTransform(descriptor, calls.clone())),
+        Box::new(ProbeTransform {
+            descriptor,
+            calls: calls.clone(),
+            checkpoint_facts: checkpoint_facts.clone(),
+        }),
         admitted.spec.clone(),
         admitted.binding,
         admitted.required_bytes(),
         Box::new(|_| Ok(())),
         None,
     );
+    assert_eq!(bound.checkpoint_weight_facts(), None);
+    assert_eq!(bound.checkpoint_weight_facts_by_source(), checkpoint_facts);
     let IosWork::Restore(req) = &restore.work else {
         unreachable!()
     };
@@ -715,6 +791,10 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
     ));
     bound.apply(req, &mut |_| {}).unwrap();
     assert_eq!(calls.get(), 1);
+    assert_eq!(
+        bound.checkpoint_weight_facts().as_ref(),
+        checkpoint_facts.first()
+    );
 
     let rows = [row(&registry, &depth, 1 << 20)];
     let admitted = admit_with_rows(

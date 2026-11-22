@@ -104,6 +104,9 @@ fn load_as(w: &Weights, key: &str, dtype: Dtype) -> Result<Array> {
 /// `[dim, in·pt·ph·pw]` (kept f32), mirroring the base Wan converter's `patch_embedding` handling.
 /// The flatten order `(in, pt, ph, pw)` matches [`patchify`]'s `(C, pt, ph, pw)` token packing.
 fn load_patch_embedding(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::quant::native_lin(w, prefix, true)? {
+        return Ok(native);
+    }
     let weight = w.require(&format!("{prefix}.weight"))?;
     let s = weight.shape();
     let cols: i32 = s[1..].iter().product();

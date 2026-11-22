@@ -46,12 +46,19 @@ pub trait MlxWeightSource {
     fn planned_fp8(&self, _base: &str) -> Option<&crate::fp8::Fp8Linear> {
         None
     }
+    /// Ordered floating-point adapter deltas retained alongside a source-owned native matrix.
+    fn native_projection_deltas(&self, _base: &str) -> &[Array] {
+        &[]
+    }
     fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array;
     fn get(&self, key: &str) -> Option<&Array>;
     /// Inspect an optional operand without claiming it for a block's access set.
     fn peek(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }
+    /// A constructor successfully bound a native operator, including for in-memory sources
+    /// without a file plan. Materialization and resident bytes are accounted separately.
+    fn native_bound(&self) {}
     fn observation(&self, _key: &str) -> Option<crate::source::Observation> {
         None
     }
@@ -153,6 +160,9 @@ impl NativeProjection {
                 Self::ConvRot(p) => p.observe(observation)?,
             }
         }
+        if native.is_some() {
+            w.native_bound();
+        }
         Ok(native)
     }
     fn bind_key(
@@ -164,6 +174,7 @@ impl NativeProjection {
         if let Some(p) = w.planned_fp8(base) {
             let mut p = p.clone();
             w.require(key)?;
+            w.get(&format!("{base}.comfy_quant"));
             w.get(&format!("{base}.weight_scale"));
             w.get(&format!("{base}.input_scale"));
             if bias {

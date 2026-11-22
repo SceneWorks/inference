@@ -15,7 +15,6 @@
 //! T5 encoder, and the Z-Image 16-ch VAE (via E4's [`crate::vae::load_sd3_vae`]). The loader's job is
 //! the snapshot-layout glue + the diffusers→MLX weight-key remap each reused module expects.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
@@ -156,30 +155,10 @@ pub fn load_text_encoders(root: &Path) -> Result<Sd3TextEncoders> {
         .map_err(|error| Error::Msg(error.to_string()))?;
     let clip_l = load_clip_l(&artifacts.clip_l)?;
     let clip_g = load_clip_g(&artifacts.clip_g)?;
-    let t5_w = load_t5_weights(&artifacts.t5_shards)?;
+    let t5_w = Weights::from_paths(&artifacts.t5_shards, &root.join("text_encoder_3"))?;
     let t5 = mlx_gen_flux::T5TextEncoder::from_weights(&t5_w, "")?;
     t5_w.materialize_accessed()?;
     Ok(Sd3TextEncoders { clip_l, clip_g, t5 })
-}
-
-/// Load exactly the master T5 shards selected by the shared identity resolver. Reject duplicate
-/// tensor keys across shards instead of letting later directory order silently overwrite them.
-fn load_t5_weights(shards: &[std::path::PathBuf]) -> Result<Weights> {
-    let mut merged = Weights::empty();
-    let mut keys = BTreeSet::new();
-    for shard in shards {
-        let w = Weights::from_file(shard)?;
-        for k in w.keys().map(String::from).collect::<Vec<_>>() {
-            if !keys.insert(k.clone()) {
-                return Err(Error::Msg(format!(
-                    "sd3 t5: duplicate tensor key `{k}` in resolved master shard {}",
-                    shard.display()
-                )));
-            }
-            merged.insert(k.clone(), w.require(&k)?.clone());
-        }
-    }
-    Ok(merged)
 }
 
 /// Load the CLIP BPE tokenizer (one instance serves both CLIP encoders — `tokenizer/` and

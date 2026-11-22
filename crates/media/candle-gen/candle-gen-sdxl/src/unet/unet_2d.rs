@@ -741,7 +741,10 @@ impl UNet2DConditionModel {
     /// `attn_processors` order (down → up → mid; see `visit_cross_attn_mut`)
     /// — 70 pairs for SDXL. Errors on a count mismatch (too few or too many) rather than silently
     /// leaving cross-attentions un-/over-installed.
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip_adapter<P: Into<candle_nn::Linear>>(
+        &mut self,
+        pairs: Vec<(P, P)>,
+    ) -> Result<()> {
         let mut pairs = pairs.into_iter();
         self.visit_cross_attn_mut(&mut |xa| match pairs.next() {
             Some((k, v)) => {

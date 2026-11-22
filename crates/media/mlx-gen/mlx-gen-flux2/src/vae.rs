@@ -126,7 +126,12 @@ mod tiling_tests {
 
 // Validate checkpoint (OIHW) shapes before transposition or lazy graph construction.
 fn validate_decoder_weights(w: &Weights, config: &Flux2VaeDecoderConfig) -> Result<()> {
-    validate_decoder_shapes(config, |key| Ok(w.require(key)?.shape().to_vec()))
+    validate_decoder_shapes(config, |key| {
+        if let Some(op) = w.source_projection(key)? {
+            return Ok(op.shape().to_vec());
+        }
+        Ok(w.require(key)?.shape().to_vec())
+    })
 }
 
 fn validate_decoder_shapes(
@@ -334,10 +339,14 @@ impl VaeAttention {
         // q/k/v/out carry bias; weights are loaded f32 (the VAE runs f32). `quantize` casts to bf16
         // before packing so the scales byte-match the fork's bf16 `nn.quantize` (sc-2604 chokepoint).
         let lin = |n: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                f32w(w, &format!("{prefix}.{n}.weight"))?,
-                Some(f32w(w, &format!("{prefix}.{n}.bias"))?),
-            ))
+            let mut layer = mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.{n}"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?;
+            layer.cast_weights(Dtype::Float32)?;
+            Ok(layer)
         };
         Ok(Self {
             gn_w: f32w(w, &format!("{prefix}.group_norm.weight"))?,

@@ -21,7 +21,6 @@
 //!
 //! [`gen_core_iris::assemble_window`]: gen_core_iris::assemble_window
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
@@ -217,23 +216,15 @@ impl IrisTextEncoder {
             device.clone()
         };
 
-        let mut tensors = HashMap::new();
-        for file in shard_files(dir)? {
-            let part =
-                candle_gen::candle_core::safetensors::load(&file, &Device::Cpu).map_err(|e| {
-                    Error::Msg(format!(
-                        "iris: loading text-encoder shard {}: {e}",
-                        file.display()
-                    ))
-                })?;
-            for (key, tensor) in part {
-                if key.starts_with("model.visual.") {
-                    continue;
-                }
-                tensors.insert(key, tensor.to_device(&staging)?);
-            }
-        }
-        let weights = LlmWeights::from_map(tensors, staging);
+        let (plain, source) = candle_gen::weights::Weights::from_files_filtered_staged(
+            &shard_files(dir)?,
+            device,
+            dtype,
+            &["model.language_model.", "lm_head."],
+            |tensor| Ok(tensor.to_device(&staging)?),
+        )?
+        .into_checkpoint_parts();
+        let weights = LlmWeights::from_checkpoint_parts(plain, source, device.clone());
         let lm = match quant {
             None => CausalLm::from_weights_dtype(&weights, "", model_cfg, None, dtype),
             Some(_) => CausalLm::from_weights_on_device_dtype(

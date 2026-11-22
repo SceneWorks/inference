@@ -342,6 +342,7 @@ pub(crate) fn clip_header_linear(
         residuals: Vec::new(),
         group_size: crate::quant::GROUP_SIZE,
         bits,
+        native: None,
     })
 }
 

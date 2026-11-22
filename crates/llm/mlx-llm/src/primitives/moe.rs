@@ -167,6 +167,7 @@ impl SwitchLinear {
                 }
                 parts.push(Projection::Native(mlx_layers::NativeProjection::Fp8(op)));
             }
+            w.native_bound();
             return Ok(Some(Self::Source {
                 parts,
                 shape: [n, k],

@@ -110487,7 +110487,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls. The adapted native constructor uses its rounded-input base and separately applies two original-input matrix deltas, with bias and exact dense fold controls"
         ]
       }
     },
@@ -168034,6 +168034,45 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs::stream_tests::a_deferred_generation_reproduces_the_eager_one",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "mlx_gen_iris",
+    "target_kind": "lib",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs",
+    "fqn": "stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "fixture_identity": {
+      "kind": "committed-and-source-defined-miniature",
+      "fixture_root": "crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot/iris",
+      "recipe": "Copy the configuration and deterministically replace two skeleton and two block projections with signed E4M3 FP8 and group-64 per-row ConvRot INT8 codes and publisher scales. The skeleton FP8 projection carries a descriptor and the block FP8 projection uses legacy scale_weight and scale_input companions. Log both checkpoint SHA-256 digests."
+    },
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs and the existing stream_tests::Case and stream_tests::exec helpers",
+    "output_contract": "BF16 Iris backbone output has the input shape and finite, nonconstant values. Eager and deferred Metal outputs are exactly equal at windows one, two, and full. Both codecs retain the expected operands and report two native-packed projections, publisher scale bytes, and no fallback from the bound checkpoint.",
+    "body_completion_marker": "MODEL_INFERENCE_BODY_COMPLETED stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
+    "expected_devices": [
+      "mlx-metal"
+    ],
+    "device_observation": "Actual selected MLX stream inside the backbone forward scope",
+    "device_environment": "MODEL_INFERENCE_CASE_FQN",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs::stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
       "requirements": []
     }
   },

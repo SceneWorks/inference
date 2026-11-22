@@ -287,7 +287,7 @@ impl Resampler {
 /// (`ip_adapter.{n}.to_k_ip/to_v_ip.weight`, bias-free `[hidden, cross_attention_dim]`), in the
 /// diffusers `ip_adapter.{n}` **numeric order** — which is the UNet cross-attention walk order the UNet
 /// installs them in. 70 pairs for SDXL.
-pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Tensor, Tensor)>> {
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Linear, Linear)>> {
     let mut idxs: Vec<u32> = w
         .keys()
         .filter_map(|k| {
@@ -304,8 +304,8 @@ pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Tensor, Tensor)>> {
     }
     idxs.into_iter()
         .map(|n| {
-            let k = w.require(&format!("ip_adapter.{n}.to_k_ip.weight"))?;
-            let v = w.require(&format!("ip_adapter.{n}.to_v_ip.weight"))?;
+            let k = w.linear(&format!("ip_adapter.{n}.to_k_ip"), false)?;
+            let v = w.linear(&format!("ip_adapter.{n}.to_v_ip"), false)?;
             Ok((k, v))
         })
         .collect()
@@ -505,8 +505,8 @@ mod tests {
         let pairs = load_ip_kv_pairs(&w).unwrap();
         assert_eq!(pairs.len(), 3);
         for (k, v) in &pairs {
-            assert_eq!(k.dims(), &[4, 6]);
-            assert_eq!(v.dims(), &[4, 6]);
+            assert_eq!(k.weight_dims().unwrap(), (4, 6));
+            assert_eq!(v.weight_dims().unwrap(), (4, 6));
         }
     }
 

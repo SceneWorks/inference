@@ -1,4 +1,4 @@
-//! The load-time merge path: LoRA / LoKr / third-party deltas folded into the base weights.
+//! Load-time Wan adapters fold into dense weights or attach to the original native projection.
 
 use super::*;
 
@@ -61,10 +61,10 @@ pub(super) fn merge_one(
             continue;
         };
         let wkey = format!("{path}.weight");
-        let Some(base) = w.get(&wkey).cloned() else {
+        if w.peek(&wkey).is_none() {
             report.skipped.push(path);
             continue;
-        };
+        }
         // Reject degenerate factors BEFORE deriving the scale (F-058, mirroring the additive twin's
         // guard at `install_one_lora_additive`). A non-2-D factor or a 0-size `lora_A` leading dim
         // would make `rank = 0`, so `alpha/rank = 0/0 = NaN` (or `∞`) silently replaces the ENTIRE base
@@ -90,12 +90,7 @@ pub(super) fn merge_one(
         let alpha = parts.alpha.or(cfg_alpha).map(|a| a as f64).unwrap_or(rank);
         // (alpha/rank)·strength as a single value, matching the reference's Python-float `scale·strength`.
         let eff = (alpha / rank * spec.scale as f64) as f32;
-        let delta = matmul(&up, &down)?;
-        // Dtype-matched scalar preserves the factor dtype (the reference's weak `delta * (scale*strength)`).
-        let delta = multiply(&delta, &scalar(eff).as_dtype(delta.dtype())?)?;
-        let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
-        w.insert(wkey, merged);
-        report.applied += 1;
+        merge_wan_delta(w, path, |_| Ok(matmul(&up, &down)?), eff, report)?;
     }
     Ok(())
 }
@@ -116,17 +111,13 @@ pub(super) fn merge_one_lokr(
     let file = parse_lokr(lw)?;
     for (raw_path, factors) in &file.groups {
         let path = normalize(raw_path);
-        let wkey = format!("{path}.weight");
-        let Some(base) = w.get(&wkey).cloned() else {
-            report.skipped.push(path);
-            continue;
-        };
-        // Reconstruct f32 (the SDXL merge precedent, sc-2640) — the merge casts to the weight dtype.
-        let delta = file.delta(factors, base.shape(), Dtype::Float32)?;
-        let delta = multiply(&delta, &scalar(scale).as_dtype(delta.dtype())?)?;
-        let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
-        w.insert(wkey, merged);
-        report.applied += 1;
+        merge_wan_delta(
+            w,
+            path,
+            |shape| file.delta(factors, shape, Dtype::Float32),
+            scale,
+            report,
+        )?;
     }
     Ok(())
 }
@@ -155,10 +146,8 @@ pub(super) fn resolve_wan_thirdparty(
         .unwrap_or_else(|| normalize(raw))
 }
 
-/// Merge one third-party-reconstructed `[out,in]` delta into `w` at the resolved module path
-/// (sc-3671): `W += δ·scale` cast to the weight dtype, the same fold as LoRA/peft-LoKr. A path with no
-/// weight in this expert is surfaced (skipped), never fatal.
-pub(super) fn merge_wan_thirdparty_delta(
+/// Apply one logical delta at the resolved path and retain the mode used for this target.
+pub(super) fn merge_wan_delta(
     w: &mut Weights,
     path: String,
     delta_at: impl FnOnce(&[i32]) -> Result<Array>,
@@ -166,14 +155,17 @@ pub(super) fn merge_wan_thirdparty_delta(
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let wkey = format!("{path}.weight");
-    let Some(base) = w.get(&wkey).cloned() else {
+    if w.peek(&wkey).is_none() {
         report.skipped.push(path);
         return Ok(());
-    };
-    let delta = delta_at(base.shape())?;
-    let delta = multiply(&delta, &scalar(scale).as_dtype(delta.dtype())?)?;
-    let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
-    w.insert(wkey, merged);
+    }
+    w.merge_projection_delta(&path, |shape| {
+        let delta = delta_at(shape)?;
+        Ok(multiply(&delta, &scalar(scale).as_dtype(delta.dtype())?)?)
+    })?;
+    if !w.native_projection_deltas(&path).is_empty() {
+        report.native_residuals += 1;
+    }
     report.applied += 1;
     Ok(())
 }
@@ -192,7 +184,7 @@ pub(super) fn merge_one_lokr_thirdparty(
     let table = wan_module_table(w);
     for (raw, g) in &parse_lokr_thirdparty(lw)? {
         let path = resolve_wan_thirdparty(raw, &table, normalize);
-        merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
+        merge_wan_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
     }
     Ok(())
 }
@@ -209,7 +201,7 @@ pub(super) fn merge_one_loha_thirdparty(
     let table = wan_module_table(w);
     for (raw, g) in &parse_loha_thirdparty(lw)? {
         let path = resolve_wan_thirdparty(raw, &table, normalize);
-        merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
+        merge_wan_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
     }
     Ok(())
 }
@@ -272,6 +264,11 @@ pub(super) fn merge_adapters_into(
     for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
         apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
     }
-    record_execution_adapters(specs, &report, expert, "dense_fold");
+    let mode = match report.native_residuals {
+        0 => "dense_fold",
+        n if n == report.applied => "native_residual",
+        _ => "dense_fold_and_native_residual",
+    };
+    record_execution_adapters(specs, &report, expert, mode);
     Ok(report)
 }

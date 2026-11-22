@@ -147,6 +147,23 @@ pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
 
+/// A biased channel projection stored as either a matrix or an OIHW 1x1 convolution.
+pub(crate) fn pointwise_linear(w: &Weights, base: &str) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::quant::native_lin(w, base, true)? {
+        return Ok(native);
+    }
+    let weight = w.require(&format!("{base}.weight"))?;
+    let [out, input, ..] = weight.shape() else {
+        return Err(mlx_gen::Error::Msg(format!(
+            "{base}: expected a matrix or 1x1 convolution"
+        )));
+    };
+    Ok(AdaptableLinear::dense(
+        weight.reshape(&[*out, *input])?,
+        Some(w.require(&format!("{base}.bias"))?.clone()),
+    ))
+}
+
 /// Actual base-model GEGLU row selector, shared by construction and header normalization.
 /// Adapter UP routing intentionally has a different existing odd-row floor split.
 pub(crate) fn geglu_half_ranges(output_rows: i32) -> Result<[(i32, i32); 2]> {
@@ -164,10 +181,31 @@ pub(crate) fn geglu_half_ranges(output_rows: i32) -> Result<[(i32, i32); 2]> {
 /// codes + scales + biases + dense bias along axis 0 — valid because group-wise affine quantization
 /// is per-row independent, so this is byte-identical to the dense path's split-then-quantize), else
 /// row-slice the dense weight + bias. `base` is `…transformer_blocks.{k}.ff.net.0.proj`.
-pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Result<AdaptableLinear> {
+pub(crate) fn geglu_pair(w: &Weights, base: &str) -> Result<(AdaptableLinear, AdaptableLinear)> {
     if let Some(native) = mlx_gen::NativeProjection::from_weights(w, base, true)? {
-        return Ok(AdaptableLinear::from_native(native.slice_rows(lo, hi)?));
+        // MXFP8 may pad the stored codes. Split the authenticated logical projection.
+        let [(a, b), (c, d)] = geglu_half_ranges(native.shape()[0])?;
+        return Ok((
+            AdaptableLinear::from_native(native.slice_rows(a, b)?),
+            AdaptableLinear::from_native(native.slice_rows(c, d)?),
+        ));
     }
+    let weight = w.require(&format!("{base}.weight"))?;
+    let rows = w
+        .get(&format!("{base}.scales"))
+        .unwrap_or(weight)
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| mlx_gen::Error::Msg(format!("{base}: GEGLU projection requires rows")))?;
+    let [(a, b), (c, d)] = geglu_half_ranges(rows)?;
+    Ok((
+        lin_geglu_half(w, base, a, b)?,
+        lin_geglu_half(w, base, c, d)?,
+    ))
+}
+
+pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Result<AdaptableLinear> {
     let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
     let row_slice = |a: &Array| -> Result<Array> { Ok(a.take_axis(&idx, 0)?) };
     let bias_full = w.require(&format!("{base}.bias"))?;
