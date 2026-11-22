@@ -4626,6 +4626,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for step in [compile, lint]:
             self.assertFalse(step.get("continue-on-error", False))
 
+    def test_windows_cuda_jobs_queue_before_allocating_build_storage(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        queue = {"group": "inference-windows-cuda-build-storage", "queue": "max"}
+        for name in ("windows-cuda-check", "windows-cuda"):
+            with self.subTest(job=name):
+                job = jobs[name]
+                self.assertEqual(job["concurrency"], queue)
+                steps = {step.get("name"): index for index, step in enumerate(job["steps"])}
+                admission = steps["Wait for Windows CUDA build space"]
+                cache = steps["Cache Cargo and CUDA objects"]
+                report = steps["Report Windows CUDA build space before cleanup"]
+                self.assertLess(admission, cache)
+                self.assertEqual(report, len(job["steps"]) - 1)
+                step = job["steps"][admission]
+                self.assertNotIn("if", step)
+                self.assertFalse(step.get("continue-on-error", False))
+                self.assertEqual(
+                    step["run"], "./scripts/ci/windows-cuda-build-space.ps1 -WaitForSpace"
+                )
+                self.assertEqual(
+                    job["steps"][report]["run"], "./scripts/ci/windows-cuda-build-space.ps1"
+                )
+
     def test_windows_cuda_check_exercises_real_supervisor_without_gpu(self) -> None:
         job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]
         steps = job["steps"]
