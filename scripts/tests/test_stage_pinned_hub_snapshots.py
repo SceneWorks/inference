@@ -357,6 +357,37 @@ class Staging(unittest.TestCase):
 
 
 class WorkflowStaging(unittest.TestCase):
+    def test_unmounted_macos_volume_hub_root_falls_back_consistently_with_campaign_planner(self):
+        from scripts.release import speculative_bench_campaign as campaign
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            absent = "/Volumes/SceneWorksAbsentModelsVolumeForTest/huggingface/hub"
+            env = {"MODEL_PROOF_HUB_ROOT": absent, "HOME": str(home)}
+            expected = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+            self.assertEqual(staging.resolve_hub_root(env, platform="darwin"), expected)
+            self.assertEqual(staging.resolve_hub_root(env, platform="linux"), Path(absent))
+            with patch.object(campaign.sys, "platform", "darwin"):
+                resolved_path, pin = campaign.hub_pin(
+                    f"hub:SceneWorks/qwen3.8-27b-abliterated-mlx@{REV}/q4", env, "row r"
+                )
+            self.assertEqual(pin["subfolder"], "q4")
+            self.assertEqual(
+                resolved_path,
+                str(
+                    Path(os.path.realpath(expected))
+                    / "models--SceneWorks--qwen3.8-27b-abliterated-mlx"
+                    / "snapshots"
+                    / REV
+                    / "q4"
+                ),
+            )
+            local_root = str(home / "custom-hub")
+            self.assertEqual(
+                staging.resolve_hub_root({"MODEL_PROOF_HUB_ROOT": local_root, "HOME": str(home)}, platform="darwin"),
+                Path(local_root),
+            )
+
     def test_staging_runs_before_the_proof_on_every_platform_from_the_validated_plan(self):
         steps = yaml.safe_load((ROOT / ".github/workflows/model-inference-proofs.yml").read_text(encoding="utf-8"))["jobs"]["prove"]["steps"]
         names = [step.get("name") for step in steps]

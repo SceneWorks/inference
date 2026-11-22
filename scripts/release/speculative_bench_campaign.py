@@ -323,7 +323,19 @@ def hub_pin(value: str, environ: dict[str, str], what: str) -> tuple[str, dict[s
     if not root:
         raise MatrixError(f"{what}: a Hub pin needs ${HUB_ROOT_ENV} (the runner's Hub root)")
     repository, revision = match.group("repository"), match.group("revision")
-    base = Path(os.path.realpath(os.path.expanduser(root)))
+    expanded = os.path.expanduser(root)
+    if not _absolute(expanded):
+        raise MatrixError(f"{what}: ${HUB_ROOT_ENV} must be an absolute or ~ path, got {root!r}")
+    root_path = Path(expanded)
+    if (
+        sys.platform == "darwin"
+        and len(root_path.parts) >= 3
+        and root_path.parts[:2] == ("/", "Volumes")
+        and not Path("/", "Volumes", root_path.parts[2]).exists()
+    ):
+        home = Path(os.path.expanduser(environ.get("HOME") or "~"))
+        root_path = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+    base = Path(os.path.realpath(root_path))
     path = base / ("models--" + repository.replace("/", "--")) / "snapshots" / revision
     if subfolder:
         path = path.joinpath(*subfolder.split("/"))
