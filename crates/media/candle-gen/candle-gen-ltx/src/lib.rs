@@ -549,6 +549,8 @@ impl Pipeline {
             })?
         };
         if self.transformer_variant.is_dev() {
+            // Resident blocks own their tensors. The streamed path retains its own builder.
+            drop(dit_vb);
             adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?;
         } else {
             adapters::install_ltx25_adapters(&mut avdit, adapters)?;

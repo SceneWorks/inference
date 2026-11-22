@@ -8,10 +8,10 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, Tensor};
 #[cfg(feature = "model-inference-proof")]
 use candle_gen::gen_core::model_input_proof::{record_inputs, InputIdentity, InputRole};
-use candle_gen::gen_core::weightsmeta::{self, Dtype};
+use candle_gen::gen_core::weightsmeta::{self, Dtype, SafetensorsTensorLocation};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, CancelFlag};
 use candle_gen::residency::check_cancel;
-use candle_gen::train::merge::{AdapterFile, MAX_ADAPTER_BYTES};
+use candle_gen::train::merge::MAX_ADAPTER_BYTES;
 use candle_gen::{CandleError, Result};
 use sha2::{Digest, Sha256};
 
@@ -25,6 +25,7 @@ struct RefinementPin {
 }
 
 const SHIPPED_FILENAME: &str = "ltx-2.5-22b-distilled-lora-450-bf16.safetensors";
+const READ_BYTES: usize = 64 * 1024;
 
 // SceneWorks/ltx-2.5-mlx @ 081658ce6886cacba20817ce0359bbefef706ff2,
 // distilled_lora/ltx-2.5-22b-distilled-lora-450-bf16.safetensors.
@@ -60,11 +61,11 @@ fn read_error(path: &Path, error: io::Error) -> CandleError {
 
 /// Reserve the manifest's exact filename for the shipped refinement. Ordinary
 /// adapters keep the buffered path. A renamed copy must meet the same pin.
-pub(super) fn read_shipped(
-    spec: &AdapterSpec,
+pub(super) fn read_shipped<'a>(
+    spec: &'a AdapterSpec,
     used_refinement: &mut bool,
-    cancel: &CancelFlag,
-) -> Result<Option<AdapterFile>> {
+    cancel: &'a CancelFlag,
+) -> Result<Option<RefinementSource<'a, File>>> {
     let path = &spec.path;
     let shipped_name = path
         .file_name()
@@ -100,19 +101,100 @@ pub(super) fn read_shipped(
         ));
     }
     let adapter = read_pinned(file, path, pin, cancel)?;
-    #[cfg(feature = "model-inference-proof")]
-    record_inputs(
-        "candle-gen-ltx::adapters::refinement::read_shipped/verified-weights",
-        InputRole::ArtifactInput,
-        &[InputIdentity::validated(
-            path,
-            pin.file_sha256,
-            "candle-gen-ltx::adapters::refinement::read_pinned",
-            "pinned SHA-256 matched both the preauthentication pass and the decoded bytes on the same open file",
-        )],
-    );
     *used_refinement = true;
     Ok(Some(adapter))
+}
+
+pub(super) struct VerifiedFactor {
+    offset: u64,
+    bytes: usize,
+    shape: Vec<usize>,
+    sha256: [u8; 32],
+}
+
+type NamedFactors = Vec<(String, VerifiedFactor)>;
+
+/// The same open handle used for whole-file authentication, with no retained tensor payload.
+pub(super) struct RefinementSource<'a, R> {
+    file: R,
+    path: &'a Path,
+    pin: &'a RefinementPin,
+    cancel: &'a CancelFlag,
+    meta: HashMap<String, String>,
+    factors: NamedFactors,
+    remaining: usize,
+    scratch: Vec<u8>,
+}
+
+impl<R: Read + Seek> RefinementSource<'_, R> {
+    pub(super) fn take_layout(&mut self) -> (HashMap<String, String>, NamedFactors) {
+        (
+            std::mem::take(&mut self.meta),
+            std::mem::take(&mut self.factors),
+        )
+    }
+
+    pub(super) fn read_factor(&mut self, factor: VerifiedFactor) -> Result<Tensor> {
+        let Self {
+            file,
+            path,
+            cancel,
+            remaining,
+            scratch,
+            ..
+        } = self;
+        check_cancel(cancel)?;
+        file.seek(SeekFrom::Start(factor.offset))
+            .map_err(|error| read_error(path, error))?;
+        let bytes = &mut scratch[..factor.bytes];
+        let mut hash = Sha256::new();
+        for chunk in bytes.chunks_mut(READ_BYTES) {
+            check_cancel(cancel)?;
+            file.read_exact(chunk)
+                .map_err(|error| read_error(path, error))?;
+            hash.update(&*chunk);
+        }
+        check_cancel(cancel)?;
+        if <[u8; 32]>::from(hash.finalize()) != factor.sha256 {
+            return Err(refuse(
+                path,
+                "LoRA factor SHA-256 changed after authentication",
+            ));
+        }
+        let tensor = Tensor::from_raw_buffer(bytes, DType::BF16, &factor.shape, &Device::Cpu)?;
+        *remaining -= 1;
+        Ok(tensor)
+    }
+
+    pub(super) fn finish(mut self) -> Result<()> {
+        check_cancel(self.cancel)?;
+        if self.remaining != 0 {
+            return Err(refuse(
+                self.path,
+                "not all authenticated LoRA factors were consumed",
+            ));
+        }
+        let length = self
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|error| read_error(self.path, error))?;
+        if length != self.pin.file_bytes {
+            return Err(refuse(self.path, "file size changed after authentication"));
+        }
+        check_cancel(self.cancel)?;
+        #[cfg(feature = "model-inference-proof")]
+        record_inputs(
+            "candle-gen-ltx::adapters::refinement::read_shipped/verified-weights",
+            InputRole::ArtifactInput,
+            &[InputIdentity::validated(
+                self.path,
+                self.pin.file_sha256,
+                "candle-gen-ltx::adapters::refinement::read_pinned",
+                "pinned whole-file SHA-256 matched and every decoded factor matched its authenticated SHA-256 on the same open file",
+            )],
+        );
+        Ok(())
+    }
 }
 
 fn finish_hash(file: &mut impl Read, path: &Path, pin: &RefinementPin, hash: Sha256) -> Result<()> {
@@ -135,31 +217,49 @@ fn authenticate_payload(
     file: &mut impl Read,
     path: &Path,
     pin: &RefinementPin,
-    data_start: u64,
+    locations: Vec<SafetensorsTensorLocation>,
     mut hash: Sha256,
     cancel: &CancelFlag,
-) -> Result<()> {
-    let mut scratch = [0u8; 64 * 1024];
-    let mut remaining = pin.file_bytes - data_start;
-    while remaining != 0 {
-        check_cancel(cancel)?;
-        let n = remaining.min(scratch.len() as u64) as usize;
-        let chunk = &mut scratch[..n];
-        file.read_exact(chunk)
-            .map_err(|error| read_error(path, error))?;
-        hash.update(&*chunk);
-        remaining -= n as u64;
+) -> Result<NamedFactors> {
+    let mut scratch = [0u8; READ_BYTES];
+    let mut factors = Vec::with_capacity(locations.len());
+    // The validated layout covers the file contiguously and is in byte order.
+    for location in locations {
+        let header = location.header;
+        let bytes = header.data_bytes as usize;
+        let mut remaining = bytes;
+        let mut factor_hash = Sha256::new();
+        while remaining != 0 {
+            check_cancel(cancel)?;
+            let n = remaining.min(scratch.len());
+            let chunk = &mut scratch[..n];
+            file.read_exact(chunk)
+                .map_err(|error| read_error(path, error))?;
+            hash.update(&*chunk);
+            factor_hash.update(&*chunk);
+            remaining -= n;
+        }
+        factors.push((
+            header.name,
+            VerifiedFactor {
+                offset: location.file_offset,
+                bytes,
+                shape: header.shape,
+                sha256: factor_hash.finalize().into(),
+            },
+        ));
     }
     check_cancel(cancel)?;
-    finish_hash(file, path, pin, hash)
+    finish_hash(file, path, pin, hash)?;
+    Ok(factors)
 }
 
-fn read_pinned(
-    mut file: impl Read + Seek,
-    path: &Path,
-    pin: &RefinementPin,
-    cancel: &CancelFlag,
-) -> Result<AdapterFile> {
+fn read_pinned<'a, R: Read + Seek>(
+    mut file: R,
+    path: &'a Path,
+    pin: &'a RefinementPin,
+    cancel: &'a CancelFlag,
+) -> Result<RefinementSource<'a, R>> {
     check_cancel(cancel)?;
     let mut prefix = [0u8; 8];
     file.read_exact(&mut prefix)
@@ -204,10 +304,10 @@ fn read_pinned(
     let mut hash = Sha256::new();
     hash.update(prefix);
     hash.update(&layout.header_json);
-    authenticate_payload(&mut file, path, pin, layout.data_start, hash, cancel)?;
+    let factors = authenticate_payload(&mut file, path, pin, layout.tensors, hash, cancel)?;
 
-    // Rewind the same handle and hash exactly what this second pass consumes.
-    // This also refuses in-place changes between authentication and decoding.
+    // Recheck the header on the same handle. Each factor is checked when the
+    // installer seeks to its payload, before the decoded values can be used.
     check_cancel(cancel)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| read_error(path, error))?;
@@ -223,35 +323,22 @@ fn read_pinned(
             "safetensors header changed after authentication",
         ));
     }
-    let mut hash = Sha256::new();
-    hash.update(prefix);
-    hash.update(&layout.header_json);
-
-    // The validated layout covers the file contiguously and is in byte order.
-    // Retain native factors and reuse one encoded-factor scratch buffer.
-    let mut tensors = HashMap::with_capacity(pin.factors);
-    let scratch_bytes = layout
-        .tensors
+    check_cancel(cancel)?;
+    let max_bytes = factors
         .iter()
-        .map(|location| location.header.data_bytes)
+        .map(|(_, factor)| factor.bytes)
         .max()
-        .unwrap_or_default();
-    let mut scratch = vec![0; scratch_bytes as usize];
-    for location in layout.tensors {
-        check_cancel(cancel)?;
-        let factor = location.header;
-        let bytes = &mut scratch[..factor.data_bytes as usize];
-        file.read_exact(bytes)
-            .map_err(|error| read_error(path, error))?;
-        hash.update(&*bytes);
-        check_cancel(cancel)?;
-        let tensor = Tensor::from_raw_buffer(bytes, DType::BF16, &factor.shape, &Device::Cpu)?;
-        tensors.insert(factor.name, tensor);
-    }
-    check_cancel(cancel)?;
-    finish_hash(&mut file, path, pin, hash)?;
-    check_cancel(cancel)?;
-    Ok(AdapterFile { tensors, meta })
+        .unwrap_or(0);
+    Ok(RefinementSource {
+        file,
+        path,
+        pin,
+        cancel,
+        meta,
+        remaining: factors.len(),
+        factors,
+        scratch: vec![0; max_bytes],
+    })
 }
 
 #[cfg(test)]
@@ -305,18 +392,28 @@ mod tests {
         let (bytes, pin) = fixture();
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), &bytes).unwrap();
-        let adapter = read_pinned(
+        let cancel = CancelFlag::new();
+        let mut source = read_pinned(
             File::open(file.path()).unwrap(),
             Path::new("display-only.safetensors"),
             &pin,
-            &CancelFlag::new(),
+            &cancel,
         )
         .unwrap();
-        assert_eq!(adapter.meta["lora_rank"], "1");
-        assert_eq!(adapter.meta["lora_alpha"], "1");
-        assert_eq!(adapter.tensors[A].dtype(), DType::BF16);
+        let (meta, factors) = source.take_layout();
+        assert_eq!(meta["lora_rank"], "1");
+        assert_eq!(meta["lora_alpha"], "1");
+        assert_eq!(source.scratch.len(), pin.max_factor_bytes as usize);
+        assert_eq!(source.remaining, pin.factors);
+        let tensors: HashMap<_, _> = factors
+            .into_iter()
+            .rev()
+            .map(|(name, factor)| (name, source.read_factor(factor).unwrap()))
+            .collect();
+        source.finish().unwrap();
+        assert_eq!(tensors[A].dtype(), DType::BF16);
         assert_eq!(
-            adapter.tensors[A]
+            tensors[A]
                 .to_dtype(DType::F32)
                 .unwrap()
                 .to_vec2::<f32>()
@@ -324,7 +421,7 @@ mod tests {
             vec![vec![1.0, -2.0]]
         );
         assert_eq!(
-            adapter.tensors[B]
+            tensors[B]
                 .to_dtype(DType::F32)
                 .unwrap()
                 .to_vec2::<f32>()
@@ -352,6 +449,7 @@ mod tests {
         struct ChangeOnRewind {
             file: Cursor<Vec<u8>>,
             rewound: bool,
+            change_at: usize,
         }
 
         impl Read for ChangeOnRewind {
@@ -362,29 +460,77 @@ mod tests {
 
         impl Seek for ChangeOnRewind {
             fn seek(&mut self, offset: SeekFrom) -> io::Result<u64> {
-                assert_eq!(offset, SeekFrom::Start(0));
-                self.rewound = true;
-                *self.file.get_mut().last_mut().unwrap() ^= 1;
+                if offset == SeekFrom::Start(0) {
+                    self.rewound = true;
+                    self.file.get_mut()[self.change_at] ^= 1;
+                }
                 self.file.seek(offset)
             }
         }
 
         let (mut bytes, pin) = fixture();
         let path = Path::new("adapter.safetensors");
+        let cancel = CancelFlag::new();
+        let change_at = bytes.len() - 1;
         let mut source = ChangeOnRewind {
             file: Cursor::new(bytes.clone()),
             rewound: false,
+            change_at,
         };
-        assert!(read_pinned(&mut source, path, &pin, &CancelFlag::new()).is_err());
+        let mut adapter = read_pinned(&mut source, path, &pin, &cancel).unwrap();
+        let (_, factors) = adapter.take_layout();
+        for (name, factor) in factors {
+            let result = adapter.read_factor(factor);
+            if name == B {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("factor SHA-256 changed after authentication"));
+            } else {
+                assert_eq!(name, A);
+                assert!(result.is_ok());
+            }
+        }
+        assert!(adapter.finish().is_err());
         assert!(source.rewound);
 
-        *bytes.last_mut().unwrap() ^= 1;
+        let mut changed_header = ChangeOnRewind {
+            file: Cursor::new(bytes.clone()),
+            rewound: false,
+            change_at: 8,
+        };
+        let header_error = read_pinned(&mut changed_header, path, &pin, &cancel)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(header_error.contains("header changed after authentication"));
+
+        bytes[change_at] ^= 1;
         let mut already_changed = ChangeOnRewind {
             file: Cursor::new(bytes),
             rewound: false,
+            change_at,
         };
-        assert!(read_pinned(&mut already_changed, path, &pin, &CancelFlag::new()).is_err());
+        assert!(read_pinned(&mut already_changed, path, &pin, &cancel).is_err());
         assert!(!already_changed.rewound);
+    }
+
+    #[test]
+    fn refuses_size_changes_after_checked_factors_were_consumed() {
+        let (bytes, pin) = fixture();
+        let cancel = CancelFlag::new();
+        let mut source = read_pinned(
+            Cursor::new(bytes),
+            Path::new("adapter.safetensors"),
+            &pin,
+            &cancel,
+        )
+        .unwrap();
+        let (_, factors) = source.take_layout();
+        for (_, factor) in factors {
+            source.read_factor(factor).unwrap();
+        }
+        source.file.get_mut().push(0);
+        let error = source.finish().unwrap_err().to_string();
+        assert!(error.contains("file size changed after authentication"));
     }
 
     #[test]
@@ -418,8 +564,9 @@ mod tests {
                     !self.cancel.is_cancelled(),
                     "reader rewound after cancellation"
                 );
-                assert_eq!(offset, SeekFrom::Start(0));
-                self.rewound = true;
+                if offset == SeekFrom::Start(0) {
+                    self.rewound = true;
+                }
                 self.file.seek(offset)
             }
         }
@@ -434,7 +581,12 @@ mod tests {
                 cancel_after_rewind,
                 rewound: false,
             };
-            let result = read_pinned(&mut source, Path::new("adapter.safetensors"), &pin, &cancel);
+            let result = read_pinned(&mut source, Path::new("adapter.safetensors"), &pin, &cancel)
+                .and_then(|mut source| {
+                    let (_, factors) = source.take_layout();
+                    let (_, first_factor) = factors.into_iter().next().unwrap();
+                    source.read_factor(first_factor).map(|_| ())
+                });
             assert!(matches!(result, Err(CandleError::Canceled)));
             assert_eq!(source.rewound, cancel_after_rewind);
         }
