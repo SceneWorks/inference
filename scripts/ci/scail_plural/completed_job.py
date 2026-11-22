@@ -1,6 +1,7 @@
 """Quiet GPU 0's completed Windows Job is distinct from a sampled owned zero."""
 
 from scripts.media_campaign_supervisor import GPU_READS_PER_TICK
+from scripts.ci.scail_plural.wddm_retry import valid_gap_clocks
 
 
 OWNED_ZERO_CAPTURE = {
@@ -60,10 +61,7 @@ def terminal_scope(guard, end, pool, card, claim, basis):
             # KeepSystemGrowth records read_ns before PairCudaProbe polls PDH;
             # Observer records at_ns after BOTH gauges. Windows may return the
             # same tick for both reads. A previous attempt cannot overlap.
-            start, finish = gap["start_ns"], gap["end_ns"]
-            lower, upper = gap["local_filetime_before"], gap["local_filetime_after"]
-            if not (all(type(v) is int and v > 0 for v in (start, finish, lower, upper))
-                    and 0 <= finish - start <= tick_ns and 0 <= (upper - lower) * 100 <= tick_ns
+            if not (valid_gap_clocks(gap, tick_ns)
                     and final[-2]["at_ns"] < final[-1]["read_ns"] <= gap["start_ns"] <= gap["end_ns"] <= final[-1]["at_ns"]
                     and gap["retried"] is True and gap["retry_sample"] is None
                     and series["samples"] and gap["previous"] == series["samples"][-1]
@@ -123,10 +121,9 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
             raise UnverifiedOrderedZero("expected exactly one located terminal WDDM gap per gauge")
         gap = diagnostics["events"][0]
         start, finish = gap["start_ns"], gap["end_ns"]
-        lower, upper = gap["local_filetime_before"], gap["local_filetime_after"]
+        lower = gap["local_filetime_before"]
         if not (
-            all(type(v) is int and v > 0 for v in (start, finish, lower, upper))
-            and 0 <= finish - start <= tick_ns and 0 <= (upper - lower) * 100 <= tick_ns
+            valid_gap_clocks(gap, tick_ns)
             and final["read_ns"] <= start <= finish <= final["at_ns"]
             and gap["retried"] is True and gap["recovered"] is False and gap["retry_sample"] is None
             and series["samples"] and gap["previous"] == series["samples"][-1] and lower >= gap["previous"][0]

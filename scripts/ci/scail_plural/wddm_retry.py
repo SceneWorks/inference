@@ -24,6 +24,13 @@ def local_filetime():
 MAX_RETRY_EVENTS = 64
 
 
+def valid_gap_clocks(event, tick_ns):
+    start, finish = event["start_ns"], event["end_ns"]
+    lower, upper = event["local_filetime_before"], event["local_filetime_after"]
+    return (all(type(v) is int and v > 0 for v in (start, finish, lower, upper))
+            and 0 <= finish - start <= tick_ns and 0 <= (upper - lower) * 100 <= tick_ns)
+
+
 def same_tick_fresh(event, tick_ns):
     sample = event["retry_sample"]
     lower, upper = event["local_filetime_before"], event["local_filetime_after"]

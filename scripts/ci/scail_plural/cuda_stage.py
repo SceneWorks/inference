@@ -3,6 +3,7 @@
 import time
 
 from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
+from scripts.ci.scail_plural.wddm_retry import valid_gap_clocks
 from scripts.media_campaign_supervisor import SupervisionError
 
 
@@ -458,6 +459,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         if len(misses) != series["missing_active_polls"]:
             return None  # bounded diagnostic cannot locate every genuine gap
         for e in misses:
+            if fresh_cuda and not valid_gap_clocks(e, guard["admission"]["pollMillis"] * 1_000_000):
+                return None
             if not (
                 max(mark["at_ns"], last_used)
                 < e["start_ns"]

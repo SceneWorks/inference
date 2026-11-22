@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from zipfile import ZipFile
 
 from scripts.ci import scail2_recover_owned_zero as recovery
 from scripts.ci.scail_plural import cuda_stage as stage
@@ -51,6 +52,16 @@ class OwnedZeroRecovery(unittest.TestCase):
         guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]["free_bytes"] = 1
         with self.assertRaises(ValueError):
             scope(guard, pool, claim, archived=False, fresh=True)
+
+    def test_fresh_strict_post_output_gap_validates_both_clocks(self):
+        for gauge in ("dedicated", "shared"):
+            guard, pool, claim = fixture()
+            diagnostics = guard["fit_observation"]["wddm_retry"]
+            diagnostics["dedicated"]["events"][0]["start_ns"] += 1
+            self.assertIsNotNone(scope(guard, pool, claim, archived=False, fresh=True))
+            diagnostics[gauge]["events"][0]["local_filetime_after"] = 0
+            self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
+            self.assertIsNotNone(scope(guard, pool, claim, archived=False))
 
     def test_archived_tied_read_only_and_raw_record_preserved(self):
         guard, pool, claim = fixture()
@@ -129,6 +140,24 @@ class OwnedZeroRecovery(unittest.TestCase):
         for key, cert in certificates.items():
             encoded = (json.dumps(cert, sort_keys=True, separators=(",", ":")) + "\n").encode()
             self.assertEqual(hashlib.sha256(encoded).hexdigest(), expected[key])
+        # Reproduce the strict interior (non-tied) post-output path on the two
+        # authentic records. A malformed clock on either gauge must refuse it.
+        with ZipFile(archive) as raw:
+            for count in (3, 5):
+                claim = json.loads(raw.read("receipt.json"))["counts"][str(count)]["claim"]
+                pool = json.loads(raw.read(f"count-{count}.cuda-pool.json"))
+                for gauge in ("dedicated", "shared"):
+                    for field, change in (("local_filetime_after", lambda _: 0),
+                                          ("local_filetime_after", lambda v: v + 2_500_001),
+                                          ("start_ns", float)):
+                        with self.subTest(count=count, gauge=gauge, field=field):
+                            guard = json.loads(raw.read(f"count-{count}.supervisor.json"))
+                            diagnostics = guard["fit_observation"]["wddm_retry"]
+                            diagnostics["dedicated"]["events"][0]["start_ns"] += 1
+                            self.assertIsNotNone(scope(guard, pool, claim, archived=False, fresh=True))
+                            event = diagnostics[gauge]["events"][0]
+                            event[field] = change(event[field])
+                            self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "changed.zip"
             path.write_bytes(archive.read_bytes() + b"x")
