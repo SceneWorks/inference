@@ -323,7 +323,10 @@ def validate_rejected_growth(guard, end, native_pool, card, *, completed_job=Fal
         raise ValueError("CUDA usage resumed after the original Job exited")
 
 
-def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None, archived_owned_zero=False, fresh_cuda=False):
+def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None, archived_owned_zero=False,
+                 fresh_cuda=False, last_rejection_live=False):
+    if last_rejection_live and not archived_owned_zero:
+        raise ValueError("last live rejection requires the authenticated archival recovery")
     raw = guard["fit_observation"]
     end = raw.get("cuda_render_end")
     if end is None:
@@ -448,7 +451,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         from scripts.ci.scail_plural.completed_job import ordered_owned_zero, UnverifiedOrderedZero
         claim, _ = completed_job
         try:
-            scope.update(ordered_owned_zero(guard, end, card, claim, last_used))
+            scope.update(ordered_owned_zero(guard, end, card, claim, last_used,
+                                            last_rejection_live=last_rejection_live))
         except UnverifiedOrderedZero:
             if archived_owned_zero:
                 raise

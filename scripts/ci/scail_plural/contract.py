@@ -205,10 +205,13 @@ class IncompleteWddmSamples(ValueError):
 
 def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision, *,
                  completed_job=None, archived_owned_zero=False, fresh_cuda=False):
+    last_rejection_live = False
     if archived_owned_zero:
-        from scripts.ci.scail_plural.completed_job import OWNED_ZERO_CAPTURE
-        if (backend != "candle-cuda" or approved.cuda_device_uuid != GPU0 or count not in (3, 5)
-                or revision != OWNED_ZERO_CAPTURE["inference_revision"] or completed_job is None
+        from scripts.ci.scail_plural.completed_job import LAST_LIVE_CAPTURE, OWNED_ZERO_CAPTURE
+        last_rejection_live = revision == LAST_LIVE_CAPTURE["inference_revision"] and count == 3 and fresh_cuda
+        earlier_capture = revision == OWNED_ZERO_CAPTURE["inference_revision"] and count in (3, 5)
+        if (backend != "candle-cuda" or approved.cuda_device_uuid != GPU0
+                or not (earlier_capture or last_rejection_live) or completed_job is None
                 or completed_job[1] != "owned-job-completion"):
             raise ValueError("unexpected source for archived owned-zero evidence")
     validate_native(data, backend, count)
@@ -323,7 +326,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             validate_guard_samples(guard, raw["cuda_render_end"], raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"])
         growth, growth_count = tenant_growth(guard, uuid)
         stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job,
-                             archived_owned_zero=archived_owned_zero, fresh_cuda=fresh_cuda)
+                             archived_owned_zero=archived_owned_zero, fresh_cuda=fresh_cuda,
+                             last_rejection_live=last_rejection_live)
         if stage is not None and (incomplete or "basis" in stage):
             scope = stage
             incomplete = False

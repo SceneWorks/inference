@@ -12,6 +12,14 @@ OWNED_ZERO_CAPTURE = {
     "receipt_sha256": "d423f72d816ac6145c7553623a26e99f67fd59db8e83ab228a89ede8698ce8af",
 }
 
+LAST_LIVE_CAPTURE = {
+    "run_id": "44969015053", "run_attempt": "1", "artifact_id": "14735122440",
+    "inference_revision": "4fdd13cce7f590be0aed3c52a73a9cea9e6d1b54",
+    "plan_sha256": "476e244074871e6e486107e4f65a515bf593a3c593d009c679a7ffbb2b2dee51",
+    "archive_sha256": "ebb9d70b374f2e2e430fe292a6bf0f0d15d9c702142a657158d1bf525f17d388",
+    "receipt_sha256": "d711f34b0c83b54b41b147921b9601fe999b74ccaec8823b6dceadcd6d9fc545",
+}
+
 
 def validate_guard_samples(guard, end, card):
     admission = guard["admission"]
@@ -81,20 +89,23 @@ class UnverifiedOrderedZero(ValueError):
     """The missed gauge cannot be located inside the final post-output attempt."""
 
 
-def ordered_owned_zero(guard, end, card, claim, last_used):
+def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_live=False):
     """Locate the two absent gauges within one rejected read, before the actual owned zero."""
     from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
 
     mark, zero, events = end["pool"], end["zero"], end["rejected_growth"]
     completion = guard["owned_completion"]
     release = claim["release_background_activity"]["samples"]
+    # The two archived Jobs retired at different observed calls. Preserve
+    # each original ownership bracket, including the real following zero.
+    before_zero = "live" if last_rejection_live else "exited_empty"
     if not (
         guard["returncode"] == 0 and completion == claim["owned_execution_completion"]
         and completion == dict(scope="supervisor-owned-windows-job", root_pid=guard["pid"],
                                root_returncode=0, waited_returncode=0, owned_pids=[], job_member_pids=[])
         and claim["release_metadata_verification"] == {"status": "verified"} and len(release) == 5
         and all(s["selected_card"]["used_mib"] == s["selected_card"]["utilization_percent"] == 0 for s in release)
-        and len(events) >= 2 and zero["before"] == zero["after"] == "exited_empty"
+        and len(events) >= 2 and zero["before"] == before_zero and zero["after"] == "exited_empty"
         and [e["card_index"] for e in end["pool_growth"]] == list(range(mark["card_index"], zero["card_index"]))
         and all(e["next_card_index"] == zero["card_index"] for e in events)
         and all(a["child_growth_bytes"] >= b["child_growth_bytes"] for a, b in zip(events, events[1:]))
@@ -103,7 +114,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
     validate_guard_samples(guard, end, card)
     final = events[-1]
     if not (
-        final["before"] == "live" and final["after"] == "exited_empty"
+        final["before"] == "live" and final["after"] == before_zero
         and final["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE
         and final["child_growth_bytes"] > 0
         and mark["at_ns"] < events[-2]["at_ns"] < final["read_ns"] == last_used
@@ -137,4 +148,20 @@ def ordered_owned_zero(guard, end, card, claim, last_used):
             and dedicated["local_filetime_after"] <= shared["local_filetime_before"]
             and shared["end_ns"] == final["at_ns"]):
         raise UnverifiedOrderedZero("terminal gauge timestamps contradict the original synchronous read order")
+    if last_rejection_live:
+        ded_samples = guard["cuda_attribution"]["wddm_dedicated"]["samples"]
+        shared_samples = raw["wddm_shared"]["samples"]
+        # Each completed card read and rejected substitution polled both gauges.
+        # The last live attempt yielded the recorded gap; the following Job exit
+        # yielded the real owned card zero and no PDH observation.
+        live_polls = zero["card_index"] + len(events)
+        if not (
+            len(events) == 3
+            and all(e["before"] == e["after"] == "live" and e["child_growth_bytes"] > 0
+                    and e["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE for e in events)
+            and len(ded_samples) == len(shared_samples) and len(ded_samples) + 1 == live_polls
+            and all(d[0] <= s[0] for d, s in zip(ded_samples, shared_samples))
+            and all(s[0] < d[0] for s, d in zip(shared_samples, ded_samples[1:]))
+        ):
+            raise UnverifiedOrderedZero("incomplete paired WDDM observations before the last live attempt")
     return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])
