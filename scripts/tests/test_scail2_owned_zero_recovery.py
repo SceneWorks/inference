@@ -122,7 +122,8 @@ class OwnedZeroRecovery(unittest.TestCase):
                 elif problem == "failed-unlock-survey":
                     claim["release_metadata_verification"] = {"status": "inconclusive-driver-query-timing"}
                 elif problem == "nonquiet-unlock":
-                    claim["release_background_activity"]["samples"][0]["selected_card"]["used_mib"] = 1
+                    # After a verified-empty Job, resident memory is foreign; a busy card is not quiet.
+                    claim["release_background_activity"]["samples"][0]["selected_card"]["utilization_percent"] = 99
                 elif problem == "breached-reserve":
                     raw["card_samples_monotonic_ns_free_owned_or_fallback_bytes"][0][1] = 1
                 elif problem == "breached-cap":

@@ -11,7 +11,7 @@ from zipfile import ZipFile
 
 from scripts.ci import scail2_plural_fit as runner
 from scripts.ci import scail2_recover_completed_job as recovery
-from scripts.ci.scail_plural import contract, cuda_stage
+from scripts.ci.scail_plural import completed_job, contract, cuda_stage
 from scripts.tests.test_scail2_cuda_stage import fixture_with_rejected_growth
 
 
@@ -94,13 +94,87 @@ class CompletedJob(unittest.TestCase):
                 elif problem == "reserve":
                     attempts[-1]["free_bytes"] = 49
                 elif problem == "reused-card":
-                    claim["release_background_activity"]["samples"][4]["selected_card"]["used_mib"] = 1
+                    # Owned memory did not return to the admission reading and the Job is unverified.
+                    claim["release_background_activity"]["samples"][4]["selected_card"]["used_mib"] = (
+                        completed_job.RELEASE_BASELINE_TOLERANCE_MIB + 1)
                 elif problem == "release":
                     claim["release_metadata_verification"]["status"] = "inconclusive-driver-query-timing"
                 elif problem == "return":
                     guard["returncode"] = 1
                 with self.assertRaises(ValueError):
                     scope(guard, pool, claim)
+
+    def _owned_empty(self, guard, claim):
+        completion = dict(scope="supervisor-owned-windows-job", root_pid=guard["pid"], root_returncode=0,
+                          waited_returncode=0, owned_pids=[], job_member_pids=[])
+        guard["owned_completion"] = completion
+        claim["owned_execution_completion"] = dict(completion)
+
+    def _cards(self, claim, phase, used, utilization=0):
+        claim[phase + "_background_activity"] = {"samples": [
+            {"selected_card": {"used_mib": used, "utilization_percent": utilization}} for _ in range(5)]}
+
+    def test_foreign_idle_allocation_at_admission_and_release_is_accepted(self):
+        # Release is never an idle-card check: memory resident before admission stays resident.
+        guard, pool, claim = completed_fixture()
+        self._cards(claim, "admission", 498)
+        self._cards(claim, "release", 498)
+        self.assertEqual(scope(guard, pool, claim)["terminal_rejected_attempts"], 4)
+
+    def test_unowned_memory_after_a_verified_empty_job_is_accepted(self):
+        # Run 45247572882 count 3: 19 MiB at admission, an unrelated idle 498 MiB at release,
+        # 0% utilization, and the owned Windows Job verified empty.
+        guard, pool, claim = completed_fixture()
+        self._cards(claim, "admission", 19)
+        self._cards(claim, "release", 498)
+        self._owned_empty(guard, claim)
+        self.assertEqual(scope(guard, pool, claim)["terminal_rejected_attempts"], 4)
+
+    def test_owned_memory_not_returning_to_the_admission_baseline_is_rejected(self):
+        for job in ("unverified", "member-left", "other-root"):
+            with self.subTest(job=job):
+                guard, pool, claim = completed_fixture()
+                self._cards(claim, "admission", 19)
+                self._cards(claim, "release", 19 + completed_job.RELEASE_BASELINE_TOLERANCE_MIB + 1)
+                if job != "unverified":
+                    self._owned_empty(guard, claim)
+                    if job == "member-left":
+                        claim["owned_execution_completion"]["job_member_pids"] = [guard["pid"] + 1]
+                    else:
+                        claim["owned_execution_completion"]["root_pid"] = guard["pid"] + 1
+                with self.assertRaisesRegex(ValueError, "quiet CUDA release"):
+                    scope(guard, pool, claim)
+        guard, pool, claim = completed_fixture()
+        self._cards(claim, "admission", 19)
+        self._cards(claim, "release", 19 + completed_job.RELEASE_BASELINE_TOLERANCE_MIB)
+        self.assertEqual(scope(guard, pool, claim)["terminal_rejected_attempts"], 4)
+
+    def test_busy_release_card_is_rejected_even_after_an_empty_job(self):
+        guard, pool, claim = completed_fixture()
+        self._cards(claim, "release", 0, utilization=99)
+        self._owned_empty(guard, claim)
+        with self.assertRaisesRegex(ValueError, "quiet CUDA release"):
+            scope(guard, pool, claim)
+
+    def test_launch_read_without_wddm_is_accepted_and_gaps_after_allocation_are_not(self):
+        mib = 1 << 20
+        # 35 zero-owned launch reads; the gauge has a counter only from the 2nd read (34 samples).
+        card = [[i, 9 * mib, 0] for i in range(35)] + [[35 + i, 8 * mib, 490 * mib] for i in range(20)]
+        samples = [[i, 264 * 1024] for i in range(34)] + [[34 + i, 490 * mib] for i in range(20)]
+        self.assertEqual(completed_job.unsampled_launch_reads(card, samples), 1)
+        # Every launch read sampled but one sample missing after allocation: nothing is excused,
+        # so the terminal count stays one short and is rejected.
+        launch = [[i, 264 * 1024] for i in range(35)]
+        self.assertEqual(completed_job.unsampled_launch_reads(card, launch + samples[35:]), 0)
+        self.assertEqual(completed_job.unsampled_launch_reads(card, launch + samples[34:]), 0)
+        # No zero-owned launch read, or two missing launch samples: nothing is excused.
+        self.assertEqual(completed_job.unsampled_launch_reads(card[35:], samples[34:]), 0)
+        self.assertEqual(completed_job.unsampled_launch_reads(card, samples[1:]), 0)
+        # A gap after allocation still fails the terminal witness (the fixture's own gauges).
+        guard, pool, claim = completed_fixture()
+        guard["cuda_attribution"]["wddm_dedicated"]["samples"].pop(-2)
+        with self.assertRaises(ValueError):
+            scope(guard, pool, claim)
 
     def test_only_exact_gpu0_continuation_adds_the_archived_pointer(self):
         with patch.object(runner.proof, "repository_identity", return_value={"revision": "r", "tree": "t"}):

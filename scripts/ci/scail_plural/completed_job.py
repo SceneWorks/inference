@@ -2,6 +2,12 @@
 
 from scripts.media_campaign_supervisor import GPU_READS_PER_TICK
 from scripts.ci.scail_plural.wddm_retry import valid_gap_clocks
+from scripts.release.veda_cuda_guard import STABLE_MAX_UTILIZATION_PERCENT
+
+# Driver bookkeeping on an idle card moves memory.used by a few MiB between reads.
+RELEASE_BASELINE_TOLERANCE_MIB = 64
+# A freshly launched process has a WDDM context below this size before any CUDA allocation.
+LAUNCH_CONTEXT_BYTES = 1 << 20
 
 
 OWNED_ZERO_CAPTURE = {
@@ -21,6 +27,48 @@ LAST_LIVE_CAPTURE = {
 }
 
 
+def owned_job_empty(guard, claim):
+    """The supervisor reaped the owned Windows Job: no member or owned process remains."""
+    completion = guard.get("owned_completion")
+    return (completion is not None and completion == claim.get("owned_execution_completion")
+            and completion == dict(scope="supervisor-owned-windows-job", root_pid=guard.get("pid"),
+                                   root_returncode=0, waited_returncode=0, owned_pids=[], job_member_pids=[]))
+
+
+def quiet_release(guard, claim):
+    """Five verified release reads on a quiet card whose owned memory is gone.
+
+    Never an idle-card requirement: memory.used must return to this job's own admission
+    reading (plus driver jitter), or the owned Job must be verified empty, in which case any
+    remaining resident memory belongs to someone else. Utilization uses admission's quiet bound.
+    """
+    release = claim["release_background_activity"]["samples"]
+    admission = claim.get("admission_background_activity", {}).get("samples", [])
+    cards = [sample["selected_card"] for sample in release]
+    baseline = max((sample["selected_card"]["used_mib"] for sample in admission), default=0)
+    if not (claim["release_metadata_verification"] == {"status": "verified"} and len(release) == 5
+            and type(baseline) is int and baseline >= 0
+            and all(type(card["used_mib"]) is int and card["used_mib"] >= 0
+                    and type(card["utilization_percent"]) is int
+                    and 0 <= card["utilization_percent"] <= STABLE_MAX_UTILIZATION_PERCENT for card in cards)):
+        return False
+    returned = all(card["used_mib"] <= baseline + RELEASE_BASELINE_TOLERANCE_MIB for card in cards)
+    return returned or owned_job_empty(guard, claim)
+
+
+def unsampled_launch_reads(card, samples):
+    """Card reads taken at launch, before the process had a WDDM counter, carry no memory.
+
+    One such read is allowed only when the gauge's pre-allocation samples are exactly one
+    fewer than the card's leading zero-owned rows, so every read after the first owned
+    allocation still needs its own WDDM sample.
+    """
+    leading = next((index for index, row in enumerate(card) if row[2] > 0), len(card))
+    before_allocation = next((index for index, sample in enumerate(samples)
+                              if sample[1] >= LAUNCH_CONTEXT_BYTES), len(samples))
+    return 1 if 0 < leading < len(card) and before_allocation == leading - 1 else 0
+
+
 def validate_guard_samples(guard, end, card):
     admission = guard["admission"]
     reserve, cap = admission["gpuFreeReserveBytes"], admission["childGpuCapBytes"]
@@ -38,13 +86,10 @@ def terminal_scope(guard, end, pool, card, claim, basis):
     mark = end["pool"]
     events = end["rejected_growth"]
     final = [e for e in events if e["next_card_index"] == len(card)]
-    release = claim["release_background_activity"]["samples"]
     if not (
         basis in ("archived-supervisor-return", "owned-job-completion")
         and guard["returncode"] == 0
-        and claim["release_metadata_verification"] == {"status": "verified"}
-        and len(release) == 5
-        and all(s["selected_card"]["used_mib"] == 0 and s["selected_card"]["utilization_percent"] == 0 for s in release)
+        and quiet_release(guard, claim)
         and len(final) == GPU_READS_PER_TICK
         and events[-len(final):] == final
         and [e["card_index"] for e in end["pool_growth"]] == list(range(mark["card_index"], len(card)))
@@ -60,7 +105,8 @@ def terminal_scope(guard, end, pool, card, claim, basis):
     for key, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]), ("shared", raw["wddm_shared"])):
         unresolved = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]
         if (len(unresolved) != series["missing_active_polls"] or len(unresolved) > 1
-                or len(series["samples"]) + len(unresolved) != len(card) + len(events)):
+                or len(series["samples"]) + len(unresolved)
+                != len(card) + len(events) - unsampled_launch_reads(card, series["samples"])):
             # Each actual card attempt polled both gauges. A missing live
             # observation anywhere else would make this narrower witness unsafe.
             raise ValueError("unlocated WDDM gap during render")
@@ -95,7 +141,6 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
 
     mark, zero, events = end["pool"], end["zero"], end["rejected_growth"]
     completion = guard["owned_completion"]
-    release = claim["release_background_activity"]["samples"]
     # The two archived Jobs retired at different observed calls. Preserve
     # each original ownership bracket, including the real following zero.
     before_zero = "live" if last_rejection_live else "exited_empty"
@@ -103,8 +148,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
         guard["returncode"] == 0 and completion == claim["owned_execution_completion"]
         and completion == dict(scope="supervisor-owned-windows-job", root_pid=guard["pid"],
                                root_returncode=0, waited_returncode=0, owned_pids=[], job_member_pids=[])
-        and claim["release_metadata_verification"] == {"status": "verified"} and len(release) == 5
-        and all(s["selected_card"]["used_mib"] == s["selected_card"]["utilization_percent"] == 0 for s in release)
+        and quiet_release(guard, claim)
         and len(events) >= 2 and zero["before"] == before_zero and zero["after"] == "exited_empty"
         and [e["card_index"] for e in end["pool_growth"]] == list(range(mark["card_index"], zero["card_index"]))
         and all(e["next_card_index"] == zero["card_index"] for e in events)
