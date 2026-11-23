@@ -568,7 +568,8 @@ impl Sources {
         }
         if variant == MossImageVariant::Base
             && spec.components.keys().any(|id| {
-                id != MOSS_SHARED_SNAPSHOT_COMPONENT
+                id != "checkpoint-transformer"
+                    && id != MOSS_SHARED_SNAPSHOT_COMPONENT
                     && id != mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT
             })
         {
@@ -1082,6 +1083,52 @@ pub(crate) fn fp32_map(w: &Weights) -> Result<BTreeMap<String, Vec<f32>>> {
 
 #[cfg(test)]
 mod cpu_tests {
+    #[test]
+    fn base_import_preparation_accepts_replacement_but_still_refuses_dmd_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().join("base")))
+            .with_checkpoint_component(
+                "transformer",
+                WeightsSource::File(tmp.path().join("imported.safetensors")),
+            );
+        spec.components.insert(
+            MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
+            WeightsSource::Dir(tmp.path().join("shared")),
+        );
+        let error = Sources::prepare_inner(
+            MossImageVariant::Base,
+            &spec,
+            Some(MossImageAcceleration::Off),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error
+                .replace('\\', "/")
+                .contains("shared/text_encoder/config.json"),
+            "{error}"
+        );
+        spec.components.insert(
+            DMD_LORA_COMPONENT.into(),
+            WeightsSource::File(tmp.path().join("dmd.safetensors")),
+        );
+        let error = Sources::prepare_inner(
+            MossImageVariant::Base,
+            &spec,
+            Some(MossImageAcceleration::Off),
+            &mut || Ok(()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("Base cannot load SFT-only DMD components"),
+            "{error}"
+        );
+    }
+
     fn header_fixture() -> Vec<u8> {
         let header = serde_json::json!({
             "__metadata__": { "padding": "x".repeat(HEADER_READ_BYTES * 2 + 17) },

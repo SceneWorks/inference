@@ -265,8 +265,8 @@ fn owned_shard_bytes(s: &Sources, mode: MossImageAcceleration) -> gen_core::Resu
         .assets(mode)?
         .iter()
         .filter(|a| a.relative.ends_with(".safetensors"))
-        .filter_map(|a| moss_image_asset(a.repo, a.revision, &a.relative))
-        .map(|a| a.bytes)
+        // Price the authenticated source, including caller-owned single-file replacements.
+        .map(|a| a.pin.target_fingerprint().size)
         .max()
         .unwrap_or(0);
     for adapter in &s.spec.adapters {
@@ -415,6 +415,78 @@ pub(crate) fn safety_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_transformer_staging_uses_the_largest_retained_source_pin() {
+        let mut sources = crate::tests::synthetic_sources();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut asset =
+            |file: &str, bytes: usize, role, repo, revision, relative: &str, name: &str| {
+                let path = tmp.path().join(file);
+                std::fs::write(&path, vec![0; bytes]).unwrap();
+                let pin = PinnedWeightsFile::pin(&path).unwrap();
+                sources.headers.insert(
+                    *pin.content_sha256(),
+                    vec![weightsmeta::SafetensorsTensorHeader {
+                        name: name.into(),
+                        dtype: weightsmeta::Dtype::F32,
+                        shape: vec![1],
+                        data_bytes: 4,
+                    }],
+                );
+                crate::loader::Asset {
+                    #[cfg(feature = "test-support")]
+                    fixture_digest: None,
+                    pin,
+                    role,
+                    repo,
+                    revision,
+                    relative: relative.into(),
+                }
+            };
+        let companion = asset(
+            "companion",
+            8,
+            MossImageAssetRole::TextEncoder,
+            SFT_REPO,
+            SFT_REVISION,
+            "text_encoder/model-00001-of-00004.safetensors",
+            "language_model.weight",
+        );
+        let imported = asset(
+            "imported",
+            64,
+            MossImageAssetRole::Transformer,
+            IMPORTED_TRANSFORMER_REPOSITORY,
+            IMPORTED_TRANSFORMER_REVISION,
+            IMPORTED_TRANSFORMER_PATH,
+            "weight",
+        );
+        let imported_path = imported.pin.loader_path().to_owned();
+        sources.ordinary = vec![companion, imported];
+        assert_eq!(
+            owned_shard_bytes(&sources, MossImageAcceleration::Off).unwrap(),
+            64
+        );
+        let request = GenerationRequest::default();
+        let resolved = MossImageResolved::resolve(MossImageVariant::Sft, &request).unwrap();
+        let facts = selected_facts(&sources, MossImageAcceleration::Off).unwrap();
+        let workspace = request_workspace_bytes(
+            request.width,
+            request.height,
+            1,
+            resolved.max_sequence_length,
+            branches(&resolved),
+        )
+        .unwrap();
+        assert_eq!(
+            estimate(&sources, &resolved, &request, 1, false).unwrap(),
+            facts.base_bytes + workspace + 64
+        );
+        std::fs::write(imported_path, vec![0; 65]).unwrap();
+        assert!(owned_shard_bytes(&sources, MossImageAcceleration::Off).is_err());
+    }
+
     #[test]
     fn ordered_edit_provider_guard_accepts_one_to_four_only_with_component() {
         let mut spec = LoadSpec::new(WeightsSource::Dir("unused-memory-guard".into()));
