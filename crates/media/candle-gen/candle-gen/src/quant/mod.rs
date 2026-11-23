@@ -50,6 +50,8 @@ pub(crate) fn dequant_vae_grid(
     }
 }
 
+pub use candle_layers::quantization_cache::{quantize_cached, quantize_on_source_device_cached};
+
 #[cfg(test)]
 mod tests {
     use super::*;

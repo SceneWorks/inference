@@ -201,3 +201,5 @@ impl From<&str> for CandleError {
 /// Crate-wide result over [`CandleError`] (the rich candle-side `Result`; provider `Generator`
 /// bodies bridge the tail into `gen_core::Result` via `?` + the [`From`] above).
 pub type Result<T> = std::result::Result<T, CandleError>;
+
+pub mod quantization_cache;

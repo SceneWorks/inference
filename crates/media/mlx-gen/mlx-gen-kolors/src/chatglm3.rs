@@ -32,7 +32,7 @@
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::module::Param;
-use mlx_rs::nn::{Linear, QuantizedLinear};
+use mlx_rs::nn::Linear;
 use mlx_rs::ops::{
     add, addmm, concatenate_axis, cos as cos_op, dequantize, matmul, multiply, sin as sin_op,
     split, subtract,
@@ -228,7 +228,7 @@ impl ChatGlmLinear {
                 weight: Param::new(w.as_dtype(Dtype::Bfloat16)?),
                 bias: Param::new(None),
             };
-            let ql = QuantizedLinear::try_from_linear(linear, group, bits)?;
+            let ql = mlx_gen::quant::quantize_linear_cached(linear, group, bits)?;
             *self = ChatGlmLinear::Quant {
                 q: ql.inner.weight.value,
                 scales: ql.scales.value,

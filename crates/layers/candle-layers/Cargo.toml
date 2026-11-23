@@ -18,6 +18,7 @@ model-inference-proof = [
 ]
 
 [dependencies]
+bytemuck = "1"
 sceneworks-gen-core = { workspace = true }
 core-llm = { workspace = true }
 candle-core = { workspace = true }

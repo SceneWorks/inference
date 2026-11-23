@@ -1268,6 +1268,7 @@ dependencies = [
 name = "candle-layers"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "candle-core",
  "candle-nn",
  "candle-quant-kernels",
@@ -3286,7 +3287,9 @@ dependencies = [
 name = "mlx-layers"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "core-llm",
+ "half",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-gen-core",

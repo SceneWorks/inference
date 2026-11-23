@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::quantize;
+pub use mlx_layers::quantization_cache::{quantize_cached, quantize_linear_cached};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
@@ -88,7 +88,7 @@ pub fn quantize_map(
             // triple right away bounds the dense transient to one tensor.
             v.eval()?;
             let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
+            let (wq, scales, biases) = quantize_cached(&wbf16, group_size, bits)?;
             eval([&wq, &scales, &biases])?;
             out.insert(format!("{base}.weight"), wq);
             out.insert(format!("{base}.scales"), scales);
@@ -440,7 +440,8 @@ mod tests {
         )
         .unwrap();
         // The eager reference, from bytes read while the file is intact.
-        let (ewq, esc, ebi) = quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), 64, 8).unwrap();
+        let (ewq, esc, ebi) =
+            mlx_rs::ops::quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), 64, 8).unwrap();
         eval([&ewq, &esc, &ebi]).unwrap();
 
         let lazy = load_dir_map(tmp.path()).unwrap();
