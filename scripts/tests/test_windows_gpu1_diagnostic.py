@@ -515,3 +515,48 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+GPU0_WORKFLOW = ROOT / '.github/workflows/windows-gpu0-adapter-diagnostic.yml'
+
+
+class WindowsGpu0AdapterWorkflowTests(unittest.TestCase):
+    """The GPU0 adapter metadata check is dispatch-only, serialized, and runs no model."""
+
+    def setUp(self):
+        self.text = GPU0_WORKFLOW.read_text(encoding='utf-8')
+        self.workflow = yaml.safe_load(self.text)
+        self.job = self.workflow['jobs']['gpu0-adapter']
+
+    def test_dispatch_only_on_the_serialized_real_weights_windows_host(self):
+        # PyYAML parses the bare `on` key as boolean True.
+        self.assertEqual(self.workflow[True], {'workflow_dispatch': None})
+        self.assertEqual(self.workflow['permissions'], {'contents': 'read'})
+        self.assertEqual(self.workflow['concurrency'],
+                         {'group': 'inference-real-weights-physical-host', 'cancel-in-progress': False})
+        self.assertEqual(list(self.workflow['jobs']), ['gpu0-adapter'])
+        self.assertEqual(self.job['runs-on'], ['self-hosted', 'windows', 'cuda', 'real-weights'])
+        self.assertEqual(self.job['timeout-minutes'], 5)
+        self.assertEqual(self.job['env'], {'CUDA_VISIBLE_DEVICES': '-1'})
+
+    def test_steps_read_only_metadata_from_a_gpu1_masked_parent(self):
+        steps = self.job['steps']
+        self.assertEqual(len(steps), 4)
+        checkout, interpreter, probe, upload = steps
+        self.assertRegex(checkout['uses'], r'^actions/checkout@[0-9a-f]{40}$')
+        self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': False})
+        self.assertIn('locate-existing-reviewed-python-without-installation.cmd', interpreter['run'])
+        self.assertEqual(probe['env'], {'CUDA_VISIBLE_DEVICES': '1', 'CUDA_DEVICE_ORDER': 'PCI_BUS_ID'})
+        self.assertEqual(probe['timeout-minutes'], 1)
+        self.assertIn('cuda_identity(card, adapter)', probe['run'])
+        self.assertIn('-gt 8192', probe['run'])
+        self.assertRegex(upload['uses'], r'^actions/upload-artifact@[0-9a-f]{40}$')
+        self.assertEqual(upload['with']['retention-days'], 3)
+        self.assertTrue(upload['with']['path'].endswith('/adapter.json'))
+
+    def test_no_build_install_or_model_execution(self):
+        commands = '\n'.join(step.get('run', '') for step in self.job['steps']).lower()
+        for forbidden in ('cargo ', 'pip ', 'uv ', 'huggingface', 'safetensors', 'model_inference_proofs',
+                          'cuinit', 'stage_pinned_hub_snapshots', 'torch', 'mlx'):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, commands)
