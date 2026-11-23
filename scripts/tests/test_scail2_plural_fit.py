@@ -310,11 +310,11 @@ class PluralQualification(unittest.TestCase):
                 receipt["counts"][str(n)] = dict(result, native={"count": n}, body={"ok": True}, claim=claim)
                 for suffix in ["stdout.log", "stderr.log", "supervisor.json", "cuda-pool.json"]:
                     name = f"count-{n}.{suffix}"
-                    (dest / name).write_text("{}")
+                    (dest / name).write_text("{}", encoding="utf-8")
                     receipt["logs"][name] = {"sha256": runner.tier1.sha(dest / name)}
             def verify():
                 path = dest / "receipt.json"
-                path.write_text(json.dumps(receipt))
+                path.write_text(json.dumps(receipt), encoding="utf-8")
                 with patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_RUN_ID": "1",
                         "GITHUB_RUN_ATTEMPT": "1", "SCAIL_PLURAL_RECEIPT_SHA256": runner.tier1.sha(path)}):
                     runner.verify(SimpleNamespace(output=dest), contract)

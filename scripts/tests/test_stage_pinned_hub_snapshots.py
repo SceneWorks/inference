@@ -720,7 +720,7 @@ class ScailPluralCache(unittest.TestCase):
 
     def test_failed_native_link_probe_aborts_before_hub_staging(self):
         plan_file = self.home / "plan.json"
-        plan_file.write_text(json.dumps(self.plan))
+        plan_file.write_text(json.dumps(self.plan), encoding="utf-8")
         with (patch.dict(os.environ, dict(self.env, GITHUB_ENV=str(self.home / "env"),
                                           RUNNER_TEMP=str(self.home))),
               patch.object(sys, "argv", ["stage", "--plan", str(plan_file)]),

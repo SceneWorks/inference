@@ -53,7 +53,7 @@ class WindowsDedicatedMemoryTests(TestCase):
 
     def test_actual_instance_array_controls_uniqueness_even_if_scalar_index_aliases(self):
         api = MagicMock()
-        api.open.return_value = api.add.return_value = api.collect.return_value = api.close.return_value = 0
+        api.open_query.return_value = api.add.return_value = api.collect.return_value = api.close.return_value = 0
         name = f"pid_{PID}_{LUID}_phys_0"
         sample = [10, 512]
         api.read.return_value = sample

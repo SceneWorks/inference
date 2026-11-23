@@ -40,7 +40,7 @@ class VideoTier1Cohorts(unittest.TestCase):
                         row = {"case": case, "trace": spec["trace"], "tensor_shape": shape, "warmups": 1,
                                "allocator_peak_bytes": 100, "settings": spec["settings"],
                                "samples": [{"elapsed_ns": 100, "outer_steps": steps}]}
-                        (out / "result.json").write_text(json.dumps(row))
+                        (out / "result.json").write_text(json.dumps(row), encoding="utf-8")
                         obs = pair.read_observed(out, case)
                         def capture():
                             return evidence.capture(obs["result"], bytes.fromhex(obs["initial_le_f32_hex"]),
@@ -132,7 +132,7 @@ class VideoTier1Cohorts(unittest.TestCase):
                 pair.execute(SimpleNamespace(output=output), contract)
             fixture.assert_not_called()
             build.assert_not_called()
-            receipt = json.loads((output / "receipt.json").read_text())
+            receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
             self.assertFalse(receipt["accepted"])
             self.assertEqual(receipt["observations"], {})
 

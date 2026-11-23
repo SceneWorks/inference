@@ -29,7 +29,7 @@ class VideoFixtureTests(unittest.TestCase):
                 for layer, width in enumerate((first, last)):
                     key = f"up_blocks.{stage}.resnets.{layer}.spatial_res_block.conv1.weight"
                     self.assertEqual(rows[key], {"dtype": dtype, "shape": [out, width, 3, 3]})
-        aux = json.loads((fixture.HERE / "aux_shapes.json").read_text())
+        aux = json.loads((fixture.HERE / "aux_shapes.json").read_text(encoding="utf-8"))
         self.assertEqual(aux["image_encoder"]["vision_model.encoder.layers.31.mlp.fc1.weight"], [5120, 1280])
         self.assertEqual(aux["vae"]["quant_conv.weight"], [8, 8, 1, 1])
 

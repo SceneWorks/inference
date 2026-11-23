@@ -28,19 +28,19 @@ def row(backend):
 
 def source(backend, cuda_uuid=None):
     directory = ROOT / "scripts/ci/scail_plural"
-    shim = (directory / ("mlx.rs.in" if backend == "mlx" else "cuda.rs.in")).read_text()
+    shim = (directory / ("mlx.rs.in" if backend == "mlx" else "cuda.rs.in")).read_text(encoding="utf-8")
     if backend == "candle-cuda":
-        shim = shim.replace("@POOL@", (ROOT / "scripts/ci/wan_pair/cuda_pool.rs.in").read_text())
+        shim = shim.replace("@POOL@", (ROOT / "scripts/ci/wan_pair/cuda_pool.rs.in").read_text(encoding="utf-8"))
     gpu0 = backend == "candle-cuda" and cuda_uuid == c.GPU0
     return (
         (directory / "probe.rs.in")
-        .read_text()
+        .read_text(encoding="utf-8")
         .replace("@CHECK_CUDA_DEVICE@", "    let cuda_device = cuda_identity()?;\n" if gpu0 else "")
         .replace("@RECORD_CUDA_DEVICE@", '    let mut result = result;\n    result["cuda_device"] = cuda_device;\n' if gpu0 else "")
         .replace("@BACKEND@", shim)
         .replace("@CARRIERS@", json.dumps(c.CARRIERS, separators=(",", ":")))
         .replace("@PINS@", ",\n".join(f'("{n}","{d}")' for n, (_, d) in c.FILES.items()))
-    ) + ((directory / "cuda_identity.rs.in").read_text() if gpu0 else "")
+    ) + ((directory / "cuda_identity.rs.in").read_text(encoding="utf-8") if gpu0 else "")
 
 
 def plan(backend, request, head):
@@ -295,7 +295,7 @@ def execute(args, contract):
         if backend == "candle-cuda":
             c.validate_cuda_hardware(hw, approved.cuda_device_uuid)
         expected_device = c.cuda_identity(hw, adapter) if approved.cuda_device_uuid == c.GPU0 else None
-        stage = json.loads(Path(os.environ["MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"]).read_text())[
+        stage = json.loads(Path(os.environ["MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"]).read_text(encoding="utf-8"))[
             "snapshots"
         ][c.SLOT]
         snapshot = Path(os.environ[c.SLOT])
@@ -448,7 +448,7 @@ def verify(args, contract):
             if receipt["adapter"]
             else None
         )
-        body = proof.verify_execution(contract["case"], (dest / (name + ".stdout.log")).read_text())
+        body = proof.verify_execution(contract["case"], (dest / (name + ".stdout.log")).read_text(encoding="utf-8"))
         actual = measured_outcome(
             record["native"], guard, pool, receipt["adapter"], receipt["hardware"],
             backend, count, approved, contract["head"], completed_job=(record["claim"], "owned-job-completion")

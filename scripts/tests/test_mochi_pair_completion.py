@@ -103,7 +103,7 @@ class MochiCompletionTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             out = Path(temp)
             packet = {"pid": 14, "case": boundary.CASE, "uuid": UUID, "ready_utc_ns": 1}
-            (out / "mochi-ready.json").write_text(json.dumps(packet))
+            (out / "mochi-ready.json").write_text(json.dumps(packet), encoding="utf-8")
             job = MagicMock()
             job.members.return_value, job.root_identity.return_value = {14}, (12345, False)
             gauge = wddm.DedicatedSamples(ADAPTER, UUID)
@@ -117,7 +117,7 @@ class MochiCompletionTests(unittest.TestCase):
                 observer.poll(job, cuda_active=True)
                 ack = json.loads((out / "mochi-ack.json").read_bytes())
                 self.assertEqual((ack["ready"], ack["sample"], ack["created_filetime"]), (packet, [116, 44], 12345))
-                (out / "mochi-release.json").write_text(json.dumps({"ack": ack, "release_utc_ns": ack["ack_utc_ns"]+1}))
+                (out / "mochi-release.json").write_text(json.dumps({"ack": ack, "release_utc_ns": ack["ack_utc_ns"]+1}), encoding="utf-8")
                 observer.check_release()
                 self.assertEqual(observer.release["sample_count"], 3)
                 observer.close()

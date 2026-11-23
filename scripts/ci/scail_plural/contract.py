@@ -55,7 +55,7 @@ FILES = {
 }
 COUNTS = {"mlx": [6, 2], "candle-cuda": [6, 2, 3, 4, 5]}
 FQN = "plural_fit::measure_real_weights"
-CARRIERS = json.loads(Path(__file__).with_name("carriers.json").read_text())
+CARRIERS = json.loads(Path(__file__).with_name("carriers.json").read_text(encoding="utf-8"))
 
 
 def cuda_constraints(uuid):

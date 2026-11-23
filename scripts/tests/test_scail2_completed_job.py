@@ -157,6 +157,6 @@ class CompletedJob(unittest.TestCase):
                             gauge["events"][-1]["local_filetime_after"] = 0
                     else:
                         tail[-1]["pool"]["poolReservedHighBytes"] -= 1
-                    guard_path.write_text(json.dumps(guard))
+                    guard_path.write_text(json.dumps(guard), encoding="utf-8")
                     with self.assertRaises(ValueError):
                         recovery.replay_files(root, policy)

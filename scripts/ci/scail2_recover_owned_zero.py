@@ -37,7 +37,7 @@ def derive_certificates(dest, policy, pin, counts, missing, schema, *, fresh_cud
         record = receipt["counts"][str(count)]
         guard = json.loads((dest / f"count-{count}.supervisor.json").read_bytes())
         pool = json.loads((dest / f"count-{count}.cuda-pool.json").read_bytes())
-        body = runner.proof.verify_execution(contract["case"], (dest / f"count-{count}.stdout.log").read_text())
+        body = runner.proof.verify_execution(contract["case"], (dest / f"count-{count}.stdout.log").read_text(encoding="utf-8"))
         if record["body"] != body or record["telemetry_failure"] != "incomplete_wddm_samples":
             raise ValueError("native execution or original failure differs")
         args = (record["native"], guard, pool, receipt["adapter"], receipt["hardware"],

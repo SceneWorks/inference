@@ -32,7 +32,7 @@ def replay_files(dest, policy):
     claim = record["claim"]
     guard = json.loads((dest / "count-6.supervisor.json").read_bytes())
     pool = json.loads((dest / "count-6.cuda-pool.json").read_bytes())
-    body = runner.proof.verify_execution(original["case"], (dest / "count-6.stdout.log").read_text())
+    body = runner.proof.verify_execution(original["case"], (dest / "count-6.stdout.log").read_text(encoding="utf-8"))
     if record["accepted"] is not False or record["body"] != body or guard.get("owned_completion") is not None:
         raise ValueError("original native body or expected historical supervision changed")
     args = (native, guard, pool, receipt["adapter"], receipt["hardware"], "candle-cuda", 6, policy, original["head"])

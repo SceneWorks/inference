@@ -116,7 +116,7 @@ class SharedHeadroom(unittest.TestCase):
                 if label == 'model-proof-admission-sample-' + str(completed + 1) and len(attempts) == completed + 2:
                     raise failure
                 if label == 'model-proof-claimed-device' and len(attempts) > 1:
-                    persisted.extend(json.loads((output / 'model-proof-admission-samples.json').read_text()))
+                    persisted.extend(json.loads((output / 'model-proof-admission-samples.json').read_text(encoding="utf-8")))
                 return ([partial if len(attempts) <= completed + 1 else fresh], [])
             with self.subTest(completed=completed):
                 receipt, _ = self.claim(read, clock=FakeClock(), original_deadline_monotonic=20, lock_trace=locks)

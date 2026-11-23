@@ -13,7 +13,7 @@ CASES = {f"{lane}-scail2-{route}": VARIANT for lane in ("mlx", "cuda")
 
 
 def _header():
-    return json.loads((HERE / "headers.json").read_text())[VARIANT]
+    return json.loads((HERE / "headers.json").read_text(encoding="utf-8"))[VARIANT]
 
 
 def _f32(key, shape):

@@ -92,7 +92,7 @@ def _sample(raw):
 class _Pdh:
     def __init__(self):
         dll = C.WinDLL("pdh.dll", winmode=0x800)
-        self.open = _function(dll, "PdhOpenQueryW", [C.c_wchar_p, C.c_size_t, C.POINTER(HANDLE)])
+        self.open_query = _function(dll, "PdhOpenQueryW", [C.c_wchar_p, C.c_size_t, C.POINTER(HANDLE)])
         self.add = _function(dll, "PdhAddEnglishCounterW", [HANDLE, C.c_wchar_p, C.c_size_t, C.POINTER(HANDLE)])
         self.collect = _function(dll, "PdhCollectQueryData", [HANDLE])
         self.raw = _function(dll, "PdhGetRawCounterValue", [HANDLE, C.POINTER(DWORD), C.POINTER(_Raw)])
@@ -147,7 +147,7 @@ def _query(adapter, pid=None, *, diagnostic=None, usage="Dedicated Usage"):
         instance = f"pid_{pid}_{instance}"
         category = "GPU Process Memory"
     api, query = _Pdh(), HANDLE()
-    _check(api.open(None, 0, C.byref(query)), "PdhOpenQueryW")
+    _check(api.open_query(None, 0, C.byref(query)), "PdhOpenQueryW")
     try:
         def counter(name):
             handle = HANDLE()

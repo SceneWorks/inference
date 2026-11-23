@@ -124,11 +124,11 @@ class ModelWorkflowRoutes(unittest.TestCase):
                 data = {"runner": ["expected"], "asset_setup": selector}
                 if selector == "scail2-plural-fit":
                     data.update(protocol="scail2-plural-fit-v1", asset_setup="hub-snapshots")
-                (root / "model-proof-plan.json").write_text(json.dumps(data))
+                (root / "model-proof-plan.json").write_text(json.dumps(data), encoding="utf-8")
                 output = root / "output"
                 subprocess.run([sys.executable, "-I", "-"], input=python, text=True, check=True,
-                               env=dict(os.environ, RUNNER_TEMP=location, GITHUB_OUTPUT=str(output)))
-                row, = json.loads(output.read_text().removeprefix("matrix="))["include"]
+                               env=dict(os.environ, RUNNER_TEMP=location, GITHUB_OUTPUT=str(output)), encoding="utf-8")
+                row, = json.loads(output.read_text(encoding="utf-8").removeprefix("matrix="))["include"]
                 self.assertEqual(row["paired_source"], selector in selectors)
                 fresh = selector in (*selectors, "scail2-plural-fit")
                 self.assertEqual(row["fresh_source"], fresh)
@@ -174,11 +174,11 @@ class ModelWorkflowRoutes(unittest.TestCase):
             git(origin, "config", "uploadpack.allowFilter", "true")
             git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
             git(origin, "commit", "-q", "--allow-empty", "-m", "history")
-            (origin / "source").write_text("before migration")
+            (origin / "source").write_text("before migration", encoding="utf-8")
             git(origin, "add", "source")
             git(origin, "commit", "-qm", "trusted base")
             base = git(origin, "rev-parse", "HEAD")
-            (origin / "source").write_text("after migration")
+            (origin / "source").write_text("after migration", encoding="utf-8")
             git(origin, "commit", "-qam", "candidate")
             head = git(origin, "rev-parse", "HEAD")
             git(origin, "clone", "-q", "--depth=2", "--filter=blob:none", "--no-checkout", origin.as_uri(), str(workspace))
@@ -186,12 +186,12 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertEqual(git(workspace, "config", "remote.origin.promisor"), "true")
             git(workspace, "remote", "set-url", "origin", (origin.parent / "offline").as_uri())
             legacy = subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(workspace),
-                                     str(origin.parent / "reused-clone")], capture_output=True, text=True)
+                                     str(origin.parent / "reused-clone")], capture_output=True, text=True, encoding="utf-8")
             self.assertNotEqual(legacy.returncode, 0)
             self.assertIn("promisor", legacy.stderr)
 
             marker = workspace / "listener-owned"
-            marker.write_text("preserve")
+            marker.write_text("preserve", encoding="utf-8")
             env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="paired-src-42-3")
             def run_step(step, check=True):
                 return subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=workspace,
@@ -218,7 +218,7 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertFalse(owned.exists())
             self.assertEqual(git(workspace, "rev-parse", "--is-shallow-repository"), "true")
             self.assertEqual(git(workspace, "rev-parse", "HEAD"), head)
-            self.assertEqual(marker.read_text(), "preserve")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
 
             # SCAIL needs a complete tip tree for its fixture overlay, but no
             # paired migration base. Reproduce checkout v5's SHA-only fetch.
@@ -231,11 +231,11 @@ class ModelWorkflowRoutes(unittest.TestCase):
             git(owned, "clone", "--quiet", "--shared", "--no-checkout", str(owned), str(scratch))
             git(scratch, "checkout", "--quiet", "--detach", head)
             self.assertEqual(git(scratch, "rev-parse", "HEAD^{tree}"), git(origin, "rev-parse", head + "^{tree}"))
-            (scratch / "source").write_text("fixture overlay")
-            self.assertEqual((owned / "source").read_text(), "after migration")
+            (scratch / "source").write_text("fixture overlay", encoding="utf-8")
+            self.assertEqual((owned / "source").read_text(encoding="utf-8"), "after migration")
             run_step(cleanup)
             self.assertFalse(owned.exists())
-            self.assertEqual(marker.read_text(), "preserve")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
 
     def test_owned_paths_and_runner_context_are_step_not_job_environment(self):
         for filename, name in (('model-inference-proofs.yml', 'prove'), ('real-weights.yml', 'model-proof-execute')):

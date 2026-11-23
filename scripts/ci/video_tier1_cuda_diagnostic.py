@@ -12,7 +12,7 @@ MANIFEST = "scripts/ci/video_tier1_cuda_diagnostic_retained.json"
 MANIFEST_SHA256 = "8fc228aa249af227b66ae969e4d6f764ef77ecd69e4c0b00bd4be75b772ae24c"
 ROOT_HANDLE_SOURCE = {
     "scripts/media_campaign_windows.py": "a980a1a9b88fa26232e482a7768a5454cb26990957a17e2095677c6ed9ae87e1",
-    "scripts/ci/wddm_process_memory.py": "a2f1c1fb67675e45d67360b21e0804a9f2818238105412c92928fe5b4cd5a644",
+    "scripts/ci/wddm_process_memory.py": "d55814d1cba06bb3c999557ac92869175cecf2f112db91251d7cf9ea8739e45a",
 }
 TIMING_PAIRS = 20
 TIMING_CALLS = {"cuda-ti2v5b-t2v-heun": 256, "cuda-svd-euler-cfg": 32}

@@ -554,7 +554,7 @@ class MultiCudaSupervisorTests(unittest.TestCase):
             # The child emits the allocator receipt and exits between live NVIDIA polls.
             pool_path.write_text(json.dumps({"pid": 1000, "cudaDeviceUuid": policy.cuda_device_uuid,
                 "poolUsedBytes": 100, "poolUsedHighBytes": 120, "poolReservedBytes": 128,
-                "poolReservedHighBytes": 140}))
+                "poolReservedHighBytes": 140}), encoding="utf-8")
             return 0
         timeline.child.wait = wait
         with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=system), \
@@ -564,7 +564,7 @@ class MultiCudaSupervisorTests(unittest.TestCase):
             result = self.run_fake(timeline, [probe], [policy])
         self.assertIsNone(result.peak_gpu_bytes)
         guard = dict(dataclasses.asdict(result), cuda_attribution=probe.measurement())
-        pool = json.loads(pool_path.read_text())
+        pool = json.loads(pool_path.read_text(encoding="utf-8"))
         self.assertEqual((pool["pid"], pool["cudaDeviceUuid"]), (result.pid, policy.cuda_device_uuid))
         observed = evidence.cuda_process(guard, pool["poolReservedHighBytes"], adapter)
         self.assertEqual(observed["pool_fallback_peak_bytes"], 0)

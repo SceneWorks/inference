@@ -354,7 +354,7 @@ class TargetedCudaTests(unittest.TestCase):
                     out.mkdir()
                     for name in ("stdout.log", "stderr.log", "supervisor.json", "cuda-pool.json"):
                         if issue != "missing log" or name != "stderr.log":
-                            (out / name).write_text("{}")
+                            (out / name).write_text("{}", encoding="utf-8")
                 mock(proof.paired, "invoke", side_effect=simulate)
                 mock(proof, "read_observed", return_value={"raw": True})
                 evaluation = mock(proof, "evaluate", return_value={"evaluated": True})

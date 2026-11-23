@@ -61,7 +61,7 @@ class WanPlanningTests(unittest.TestCase):
             src.mkdir(parents=True)
             original = b"// Existing production code.\n"
             (src / "lib.rs").write_bytes(original)
-            (root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.96.0"\n')
+            (root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.96.0"\n', encoding="utf-8")
             git("add", ".")
             git("commit", "-qm", "base")
             base = git("rev-parse", "HEAD")
@@ -73,8 +73,8 @@ class WanPlanningTests(unittest.TestCase):
             bundle.mkdir(parents=True)
             (bundle / "mlx_probe.rs.in").write_bytes(b"test\n@WAN_PAIR_COMMON@\n@WAN_MLX_SWAP_ARM@")
             (bundle / "common.rs.in").write_bytes(b"common")
-            (bundle / "fixture.py").write_text("# Fake metadata-only fixture")
-            (bundle / "headers.json").write_text(json.dumps({v: {"source": "pinned", "geometry": {"model.safetensors": {}}} for v in pair.VARIANTS.values()}))
+            (bundle / "fixture.py").write_text("# Fake metadata-only fixture", encoding="utf-8")
+            (bundle / "headers.json").write_text(json.dumps({v: {"source": "pinned", "geometry": {"model.safetensors": {}}} for v in pair.VARIANTS.values()}), encoding="utf-8")
             git("add", ".")
             git("commit", "-qm", "candidate")
             head = git("rev-parse", "HEAD")
@@ -300,7 +300,7 @@ class WanEvidenceTests(unittest.TestCase):
             receipt["comparisons"] = {self.case: evidence.compare([result]*5, [result]*5, pair.SETTINGS)}
             args = SimpleNamespace(output=output)
             def verify():
-                (output / "receipt.json").write_text(json.dumps(receipt))
+                (output / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
                 # Re-bind here to exercise semantic checks independently of producer commitment.
                 with patch.dict(os.environ, WAN_PAIR_RECEIPT_SHA256=pair.sha(output / "receipt.json")):
                     pair.verify(args, plan)
@@ -309,7 +309,7 @@ class WanEvidenceTests(unittest.TestCase):
             with patch.dict(os.environ, WAN_PAIR_RECEIPT_SHA256=pair.sha(output / "receipt.json")):
                 changed = deepcopy(original)
                 changed["fixtures"][self.case]["files"]["tensor.safetensors"] = "1"*64
-                (output / "receipt.json").write_text(json.dumps(changed))
+                (output / "receipt.json").write_text(json.dumps(changed), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "supervisor receipt"):
                     pair.verify(args, plan)
             for change in (
@@ -336,7 +336,7 @@ class WanEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "raw observations"):
                 verify()
             receipt = original
-            (output / f"{self.case}-p1-base.stdout.log").write_text("")
+            (output / f"{self.case}-p1-base.stdout.log").write_text("", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "log identity"):
                 verify()
 
