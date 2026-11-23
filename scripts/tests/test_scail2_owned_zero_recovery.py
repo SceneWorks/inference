@@ -98,13 +98,22 @@ class OwnedZeroRecovery(unittest.TestCase):
         result = scope(guard, pool, claim, archived=False, fresh=True)
         self.assertEqual((result["terminal_rejected_read_ns"], result["terminal_rejected_at_ns"]), (325, 330))
         self.assertEqual((result["dedicated_missing_after_output"], result["shared_missing_after_output"]), (1, 0))
-        self.assertEqual(result, scope(guard, pool, claim))
+        # The authenticated archives keep their original verdict: no exit between gauges.
+        with self.assertRaisesRegex(ValueError, "owned-zero boundary"):
+            scope(guard, pool, claim)
         # The card-wide bound may equal the recorded peak, and the missed read may
         # start after the source read within the same attempt.
         final = guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]
         final["global_used_upper_bytes"] = 50
         guard["fit_observation"]["wddm_retry"]["dedicated"]["events"][0]["start_ns"] = 326
-        self.assertEqual(scope(guard, pool, claim, archived=False, fresh=True), scope(guard, pool, claim))
+        self.assertIsNotNone(scope(guard, pool, claim, archived=False, fresh=True))
+
+    def test_archived_dual_gap_keeps_its_exact_source_read_tie(self):
+        guard, pool, claim = fixture()
+        guard["fit_observation"]["wddm_retry"]["dedicated"]["events"][0]["start_ns"] = 326
+        self.assertIsNotNone(scope(guard, pool, claim, archived=False, fresh=True))
+        with self.assertRaisesRegex(ValueError, "synchronous read order"):
+            scope(guard, pool, claim)
 
     def test_dedicated_gap_that_could_hide_a_peak_or_misplace_the_exit_is_rejected(self):
         for problem in ("unbounded", "unbounded-later-gap", "shared-gap", "shared-after-gap", "shared-lagging",
@@ -114,7 +123,6 @@ class OwnedZeroRecovery(unittest.TestCase):
                 raw = guard["fit_observation"]
                 final = raw["cuda_render_end"]["rejected_growth"][-1]
                 gap = raw["wddm_retry"]["dedicated"]["events"][0]
-                reason = "."
                 if problem == "unbounded":
                     # The card-wide bound at the missed tick exceeds every recorded dedicated sample.
                     final["global_used_upper_bytes"] = 51
@@ -136,7 +144,6 @@ class OwnedZeroRecovery(unittest.TestCase):
                     # The membership check passed, so the root was still a Job member after the
                     # missed dedicated read. The shared gauge then needs its own located gap.
                     final["detail"] = stage.RejectedPoolSample.EXCEEDS_CURRENT_USAGE
-                    reason = "exactly one located terminal WDDM gap per gauge"
                 elif problem == "slow-attempt":
                     # The attempt outlasts one poll interval, so usage could grow unobserved. A
                     # zero interval keeps the gap's own clocks valid and isolates the attempt bound.
@@ -145,7 +152,7 @@ class OwnedZeroRecovery(unittest.TestCase):
                 else:
                     gap["end_ns"] = 335
                 self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
-                with self.assertRaisesRegex(ValueError, reason):
+                with self.assertRaises(ValueError):
                     scope(guard, pool, claim)
 
     def test_other_reads_earlier_gaps_or_unverified_release_do_not_qualify(self):

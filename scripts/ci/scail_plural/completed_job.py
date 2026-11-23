@@ -83,12 +83,48 @@ def bounded_terminal_gap(guard, attempt):
             and attempt["global_used_upper_bytes"] <= peak)
 
 
-def paired_gauges(guard):
-    """Every attempt that read dedicated memory read shared memory next, and no other."""
-    ded = guard["cuda_attribution"]["wddm_dedicated"]["samples"]
-    shared = guard["fit_observation"]["wddm_shared"]["samples"]
-    return (len(ded) == len(shared) and all(d[0] <= s[0] for d, s in zip(ded, shared))
-            and all(s[0] < d[0] for s, d in zip(shared, ded[1:])))
+# FILETIME counts 100 ns intervals from 1601; the Unix epoch is 11,644,473,600 s later.
+FILETIME_UNIX_EPOCH_NS = 11_644_473_600 * 1_000_000_000
+LOCAL_OFFSET_STEP_NS = 15 * 60 * 1_000_000_000
+# Two Windows monotonic ticks (15.625 ms each) between a card record and its UTC stamp.
+MAX_CLOCK_SPREAD_NS = 32_000_000
+
+
+def final_attempt_unobserved(guard, end, card, samples, launch):
+    """Each earlier card read or attempt holds its own WDDM sample; the final attempt holds none.
+
+    Card rows and attempts carry monotonic times. PDH samples carry the local system
+    FILETIME. The supervisor stamps each tenant-growth read in UTC just after its card
+    row, which fixes monotonic to UTC within the stamps' spread, and the local offset
+    is a whole number of 15-minute steps. Each sample must then lie after the previous
+    record and by its own record, in windows wider apart than the clock tolerance, so
+    no sample can stand in for another attempt's.
+    """
+    records = []
+    for index in range(len(card) + 1):
+        records.extend(e["at_ns"] for e in end["rejected_growth"] if e["next_card_index"] == index)
+        if index < len(card):
+            records.append(card[index][0])
+    pool_rows = {e["card_index"] for e in end["pool_growth"]}
+    growth = [e for e in guard["samples"] if e["phase"] == "cuda-global-used-upper-bound-sample"]
+    offsets = []
+    for index, (at_ns, free, used) in enumerate(card):
+        if (len(offsets) < len(growth) and index not in pool_rows
+                and (free, used) == (growth[len(offsets)]["gpuFreeBytes"], growth[len(offsets)]["childGlobalUsedGrowthBytes"])):
+            offsets.append(growth[len(offsets)]["at_ns"] - at_ns)
+    if (not growth or len(offsets) != len(growth) or min(offsets) < 0
+            or max(offsets) - min(offsets) > MAX_CLOCK_SPREAD_NS
+            or launch + len(samples) + 1 != len(records) or not samples):
+        return False
+    tolerance = 2 * (max(offsets) - min(offsets))
+    times = [stamp * 100 - FILETIME_UNIX_EPOCH_NS - min(offsets) for stamp, _ in samples]
+    local = sorted(t - records[launch + k] for k, t in enumerate(times))[len(times) // 2]
+    local = round(local / LOCAL_OFFSET_STEP_NS) * LOCAL_OFFSET_STEP_NS
+    for k, at in enumerate(times):
+        own = launch + k
+        if not ((own == 0 or records[own - 1] + tolerance < at - local) and at - local <= records[own] + tolerance):
+            return False
+    return True
 
 
 def validate_guard_samples(guard, end, card):
@@ -102,7 +138,7 @@ def validate_guard_samples(guard, end, card):
         raise ValueError("a CUDA source sample breaches its approved guard")
 
 
-def terminal_scope(guard, end, pool, card, claim, basis):
+def terminal_scope(guard, end, pool, card, claim, basis, *, fresh=False):
     from scripts.ci.scail_plural.cuda_stage import validate_rejected_growth
     from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
 
@@ -125,19 +161,20 @@ def terminal_scope(guard, end, pool, card, claim, basis):
     tick_ns = guard["admission"]["pollMillis"] * 1_000_000
     counts = {}
     gaps = {}
-    # PairCudaProbe reads dedicated memory, then checks Job membership. An invalid
-    # allocation with an exited Job means the root left before that check, so the
-    # shared read that follows, and a dedicated read without a located gap, had no
-    # process to observe. Paired gauge timestamps rule out a sample from that attempt.
-    exited = final[-1]["detail"] == RejectedPoolSample.INVALID_ALLOCATION and final[-1]["after"] == "exited_empty"
-    if exited and not paired_gauges(guard):
-        raise ValueError("unlocated WDDM gap during render")
+    # Fresh runs only: PairCudaProbe reads dedicated memory, then checks Job
+    # membership. An invalid allocation with an exited Job means the root left
+    # before that check, so the shared read that follows, and a dedicated read
+    # without a located gap, had no process to observe. The sample clocks must
+    # place every other sample in its own earlier attempt.
+    exited = (fresh and final[-1]["detail"] == RejectedPoolSample.INVALID_ALLOCATION
+              and final[-1]["after"] == "exited_empty")
     for key, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]), ("shared", raw["wddm_shared"])):
         unresolved = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]
         unobservable = int(exited and not unresolved)
+        launch = unsampled_launch_reads(card, series["samples"])
         if (len(unresolved) != series["missing_active_polls"] or len(unresolved) > 1
-                or len(series["samples"]) + len(unresolved)
-                != len(card) + len(events) - unsampled_launch_reads(card, series["samples"]) - unobservable):
+                or len(series["samples"]) + len(unresolved) != len(card) + len(events) - launch - unobservable
+                or (unobservable and not final_attempt_unobserved(guard, end, card, series["samples"], launch))):
             # Each actual card attempt polled both gauges. A missing live
             # observation anywhere else would make this narrower witness unsafe.
             raise ValueError("unlocated WDDM gap during render")
@@ -153,7 +190,7 @@ def terminal_scope(guard, end, pool, card, claim, basis):
                     and gap["local_filetime_before"] >= series["samples"][-1][0]):
                 raise ValueError("WDDM gap is outside the final post-output CUDA attempt")
         counts[key+"_missing_after_output"] = len(unresolved)
-    if gaps and basis == "owned-job-completion" and not bounded_terminal_gap(guard, final[-1]):
+    if fresh and (gaps or exited) and not bounded_terminal_gap(guard, final[-1]):
         raise ValueError("WDDM gap in the final CUDA attempt is not bounded by its card read")
     if ("dedicated" in gaps and "shared" in gaps
             and (gaps["dedicated"]["end_ns"] > gaps["shared"]["start_ns"]
@@ -168,7 +205,7 @@ class UnverifiedOrderedZero(ValueError):
     """The missed gauge cannot be located inside the final post-output attempt."""
 
 
-def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_live=False):
+def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_live=False, fresh=False):
     """Locate the two absent gauges within one rejected read, before the actual owned zero."""
     from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
 
@@ -193,7 +230,7 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
     # PairCudaProbe polls dedicated before it checks Job membership. An invalid
     # allocation with an exited Job means the root left between those reads, so
     # the shared gauge that follows had no process left to read.
-    exited_mid_attempt = not last_rejection_live and final["detail"] == RejectedPoolSample.INVALID_ALLOCATION
+    exited_mid_attempt = fresh and not last_rejection_live and final["detail"] == RejectedPoolSample.INVALID_ALLOCATION
     if not (
         final["before"] == "live" and final["after"] == before_zero
         and (final["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE or exited_mid_attempt)
@@ -236,10 +273,10 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
             raise UnverifiedOrderedZero("dedicated gap before the Job exit is unbounded or out of order")
         return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])
     dedicated, shared = gaps
-    # KeepSystemGrowth reads first (the loop bounds both gaps by its read_ns).
-    # PairCudaProbe polls dedicated before it rejects
-    # the pool. The observer then polls shared before recording the rejected attempt.
-    if not (dedicated["end_ns"] <= shared["start_ns"]
+    # KeepSystemGrowth reads first (the loop bounds both gaps by its read_ns; the
+    # archived captures keep their exact tie). PairCudaProbe polls dedicated before
+    # it rejects the pool. The observer then polls shared before recording the attempt.
+    if not ((fresh or dedicated["start_ns"] == final["read_ns"]) and dedicated["end_ns"] <= shared["start_ns"]
             and dedicated["local_filetime_after"] <= shared["local_filetime_before"]
             and shared["end_ns"] == final["at_ns"]):
         raise UnverifiedOrderedZero("terminal gauge timestamps contradict the original synchronous read order")

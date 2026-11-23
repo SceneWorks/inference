@@ -405,7 +405,7 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         if completed_job is not None and end.get("rejected_growth"):
             from scripts.ci.scail_plural.completed_job import terminal_scope
             claim, basis = completed_job
-            return terminal_scope(guard, end, native_pool, card, claim, basis)
+            return terminal_scope(guard, end, native_pool, card, claim, basis, fresh=fresh_cuda)
         if end.get("rejected_growth"):
             raise ValueError("rejected CUDA pool attempt without a verified owned zero")
         return None
@@ -455,7 +455,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         claim, _ = completed_job
         try:
             scope.update(ordered_owned_zero(guard, end, card, claim, last_used,
-                                            last_rejection_live=last_rejection_live))
+                                            last_rejection_live=last_rejection_live,
+                                            fresh=fresh_cuda and not archived_owned_zero))
         except UnverifiedOrderedZero:
             if archived_owned_zero:
                 raise
