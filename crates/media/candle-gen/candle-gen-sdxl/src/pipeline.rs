@@ -61,7 +61,7 @@ use gen_core_family::sdxl_ldm::SdxlComponent;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
 use candle_gen::gen_core::sampling::{
@@ -82,17 +82,18 @@ use candle_gen_pid::PidEngine;
 /// Re-exported (sc-8373) so `candle-gen-instantid` loads the SAME `sdxl` student — InstantID composes
 /// the SDXL VAE, so there is no InstantID-specific PiD checkpoint.
 pub const PID_BACKBONE: &str = "sdxl";
-use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
 
 use crate::long_prompt::{self, ChunkPlan};
 use crate::SdxlVaeDecoder;
-use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
+use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 
 // The vendored, packed-detecting SDXL UNet (sc-5165 / sc-9416): its Linear surface routes through the
 // shared `candle_gen::quant` seam, so it loads a pre-quantized MLX tier (SceneWorks/sdxl-base-mlx
-// q4/q8) straight from the packed parts. Aliased to avoid clashing with the stock (dense) UNet type.
-use crate::unet::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
+// q4/q8) straight from the packed parts.
+use crate::conditioning::{combine_clip_embeddings, ClipTower};
+use crate::loaders::new_sdxl_unet;
+use crate::unet::UNet2DConditionModel as VendoredUNet;
 use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE};
 use rand::{rngs::StdRng, SeedableRng};
 use tokenizers::Tokenizer;
@@ -488,70 +489,95 @@ pub(crate) struct Components {
     pub(crate) pid: Option<Arc<PidEngine>>,
 }
 
-/// The SDXL denoise UNet, in one of two builds that share the txt2img `forward(x, t, ehs)` contract
-/// (sc-9416):
-///
-/// - [`Self::Stock`] — the stock candle-transformers `UNet2DConditionModel`, built for a **dense**
-///   diffusers snapshot (bf16/f16). Byte-identical to pre-sc-9416, incl. the fused flash-attention
-///   path; this is the default for every dense SDXL/RealVisXL checkpoint (zero regression).
-/// - [`Self::Vendored`] — the crate's vendored UNet, whose Linear surface packed-detects through the
-///   shared `candle_gen::quant`. Built **only** for a pre-quantized MLX tier
-///   (`SceneWorks/sdxl-base-mlx` q4/q8), where the whole attention/FF/proj/time-embed Linear surface
-///   loads straight from the packed `{weight u32, scales, biases}` parts (no dense staging) and the
-///   convolutions + norms stay dense. Runs the math attention (the vendored flash path is a stub).
-///
-/// Both are `Arc`-shared so the seed/prompt-independent UNet is cached across `generate` calls (sc-5037)
-/// and cheaply cloned per render.
+/// The vendored denoiser shares source-aware projections across checkpoint representations.
 #[derive(Clone)]
 pub(crate) enum SdxlUnet {
-    Stock(Arc<UNet2DConditionModel>),
     Vendored(Arc<VendoredUNet>),
     Packed(Arc<VendoredUNet>),
 }
 
-impl SdxlUnet {
-    /// The txt2img denoise forward, dispatched to whichever build. Both compute the SDXL ε-prediction
-    /// `[B, 4, h, w]` for `(latents, timestep, dual-CLIP embeddings)` — the packed vendored UNet is
-    /// pinned bit-identical to the stock UNet on a dense build by the vendored-vs-stock parity test.
-    pub(crate) fn forward(
-        &self,
-        xs: &Tensor,
-        timestep: f64,
-        encoder_hidden_states: &Tensor,
-    ) -> Result<Tensor> {
-        match self {
-            Self::Stock(u) => Ok(u.forward(xs, timestep, encoder_hidden_states)?),
-            Self::Vendored(u) | Self::Packed(u) => {
-                Ok(u.forward(xs, timestep, encoder_hidden_states)?)
-            }
+/// Hidden and pooled embeddings share the same CFG row and phase geometry.
+#[derive(Clone)]
+pub(crate) struct TextConditioning {
+    hidden: Tensor,
+    pooled: Tensor,
+    time_ids: Vec<((usize, usize), Tensor)>,
+}
+
+impl TextConditioning {
+    fn new(hidden: Tensor, pooled: Tensor) -> Self {
+        Self {
+            hidden,
+            pooled,
+            time_ids: Vec::new(),
         }
+    }
+
+    fn with_sizes(&self, initial: (u32, u32), output: (u32, u32)) -> Result<Self> {
+        let mut conditioning = self.clone();
+        let batch = self.hidden.dim(0)?;
+        for (width, height) in [initial, output] {
+            let scale = crate::denoise::SPATIAL_SCALE;
+            let shape = ((height / scale) as usize, (width / scale) as usize);
+            if conditioning.time_ids.iter().any(|(key, _)| *key == shape) {
+                continue;
+            }
+            let ids = crate::denoise::text_time_ids_for_size(
+                batch,
+                width,
+                height,
+                self.hidden.device(),
+                self.hidden.dtype(),
+            )?;
+            conditioning.time_ids.push((shape, ids));
+        }
+        Ok(conditioning)
+    }
+
+    fn row(&self, index: usize) -> Result<Self> {
+        let row = |tensor: &Tensor| tensor.narrow(0, index, 1)?.contiguous();
+        let time_ids = self
+            .time_ids
+            .iter()
+            .map(|(shape, ids)| Ok((*shape, row(ids)?)))
+            .collect::<candle_core::Result<_>>()?;
+        Ok(Self {
+            hidden: row(&self.hidden)?,
+            pooled: row(&self.pooled)?,
+            time_ids,
+        })
+    }
+
+    fn time_ids(&self, shape: (usize, usize)) -> Result<&Tensor> {
+        self.time_ids
+            .iter()
+            .find(|(key, _)| *key == shape)
+            .map(|(_, ids)| ids)
+            .ok_or_else(|| {
+                CandleError::Msg(format!("sdxl: missing time IDs for latent shape {shape:?}"))
+            })
     }
 }
 
-/// One SDXL CLIP text encoder, in one of two builds that share the `forward(ids) -> last hidden`
-/// contract (sc-9527):
-///
-/// - [`Self::Stock`] — the stock candle-transformers `ClipTextTransformer`, built for a **dense**
-///   diffusers snapshot. Byte-identical to the pre-sc-9527 txt2img path (zero regression on every
-///   dense SDXL/RealVisXL checkpoint).
-/// - [`Self::Vendored`] — the crate's vendored CLIP tower, whose Linear surface packed-detects through
-///   `candle_gen::quant`. Built **only** for a pre-quantized MLX tier (`SceneWorks/sdxl-base-mlx`
-///   q4/q8), where every attention / MLP `Linear` loads straight from the packed
-///   `{weight u32, scales, biases}` parts (no dense staging).
-///
-/// The vendored tower is pinned bit-identical to the stock one on a dense build by the
-/// `clip::tests::vendored_dense_matches_stock` parity test.
-pub(crate) enum CandleModule {
-    Stock(stable_diffusion::clip::ClipTextTransformer),
-    Vendored(crate::clip::ClipTextTransformer),
-}
-
-impl CandleModule {
-    /// The last-hidden-state forward `ids [B, S] -> [B, S, embed_dim]`, dispatched to whichever build.
-    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+impl SdxlUnet {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        conditioning: &TextConditioning,
+    ) -> Result<Tensor> {
+        let (_, _, h, w) = xs.dims4()?;
+        let ids = conditioning.time_ids((h, w))?;
         match self {
-            Self::Stock(m) => Ok(m.forward(ids)?),
-            Self::Vendored(m) => Ok(m.forward(ids)?),
+            Self::Vendored(unet) | Self::Packed(unet) => Ok(unet.forward_instantid(
+                xs,
+                timestep,
+                &conditioning.hidden,
+                &conditioning.pooled,
+                ids,
+                None,
+                None,
+            )?),
         }
     }
 }
@@ -591,7 +617,8 @@ impl Pipeline {
 
     /// SDXL dual-CLIP conditioning: encode `prompt` (cond) and `uncond` through both encoders, stack
     /// `[uncond, cond]` on the batch axis, and concatenate the two encoders on the feature axis —
-    /// shape `[2, tokens, 2048]`, cast to the compute dtype. Mirrors the spike's `text_embeddings`.
+    /// shape `[2, tokens, 2048]`. bigG also supplies one pooled vector per row. Both tensors use the
+    /// compute dtype.
     ///
     /// **Caller obligation (sc-14195):** this is **always** batch 2, regardless of the request's
     /// guidance — the uncond row is encoded unconditionally. So every denoise lane that runs
@@ -611,7 +638,7 @@ impl Pipeline {
         prompt: &str,
         uncond: &str,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Tensor> {
+    ) -> Result<TextConditioning> {
         // sc-20528: a prompt past CLIP's 77-token window is chunked, not rejected. The chunk count is
         // decided ONCE for the whole request — the two encoders are concatenated on the feature axis
         // and `[uncond, cond]` are stacked on the batch axis, so all four encodings must land on the
@@ -640,16 +667,17 @@ impl Pipeline {
             chunks,
             on_progress,
         )?;
-        Ok(Tensor::cat(&[l, g], D::Minus1)?)
+        let (hidden, pooled) = combine_clip_embeddings(l, g)?;
+        Ok(TextConditioning::new(hidden, pooled))
     }
 
     pub(crate) fn text_embeddings_resident(
         &self,
         toks: &SdxlTokenizers,
-        models: &(CandleModule, CandleModule),
+        models: &(ClipTower, ClipTower),
         prompt: &str,
         uncond: &str,
-    ) -> Result<Tensor> {
+    ) -> Result<TextConditioning> {
         let (plan_l, plan_g) = self.chunk_plans(toks)?;
         Self::record_text_representation(Clip::L, &models.0);
         Self::record_text_representation(Clip::BigG, &models.1);
@@ -659,7 +687,8 @@ impl Pipeline {
         )?;
         let l = self.encode_loaded(&models.0, &toks.tok_l, &plan_l, prompt, uncond, chunks)?;
         let g = self.encode_loaded(&models.1, &toks.tok_g, &plan_g, prompt, uncond, chunks)?;
-        Ok(Tensor::cat(&[l, g], D::Minus1)?)
+        let (hidden, pooled) = combine_clip_embeddings(l, g)?;
+        Ok(TextConditioning::new(hidden, pooled))
     }
 
     /// The per-encoder [`ChunkPlan`] pair for this pipeline's CLIP configs (`pad_with` +
@@ -701,7 +730,7 @@ impl Pipeline {
         uncond: &str,
         chunks: usize,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let text_model = self.load_text_model(which)?;
         Self::record_text_representation(which, &text_model);
         let result = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
@@ -710,159 +739,77 @@ impl Pipeline {
         candle_gen::residency::synchronize_result(&self.device, result)
     }
 
-    pub(crate) fn load_text_models(&self) -> Result<(CandleModule, CandleModule)> {
+    pub(crate) fn load_text_models(&self) -> Result<(ClipTower, ClipTower)> {
         Ok((
             self.load_text_model(Clip::L)?,
             self.load_text_model(Clip::BigG)?,
         ))
     }
 
-    fn record_text_representation(which: Clip, model: &CandleModule) {
+    fn record_text_representation(which: Clip, model: &ClipTower) {
         let key = match which {
             Clip::L => "sdxl/clip_l/representation",
             Clip::BigG => "sdxl/clip_bigg/representation",
         };
-        let representation = match model {
-            CandleModule::Stock(_) => "dense",
-            CandleModule::Vendored(_) => "packed_or_imported",
-        };
-        candle_gen::execution::policy(key, representation.into());
+        candle_gen::execution::policy(key, model.representation.into());
     }
 
-    fn load_text_model(&self, which: Clip) -> Result<CandleModule> {
-        let (_tok_repo, weights_sub) = which.sources();
-        let clip_cfg = match which {
-            Clip::L => &self.config.clip,
-            Clip::BigG => self
-                .config
-                .clip2
-                .as_ref()
-                .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
+    fn load_text_model(&self, which: Clip) -> Result<ClipTower> {
+        let Some(ldm) = &self.ldm else {
+            return ClipTower::load_snapshot(&self.root, which, &self.device, self.dtype);
         };
-        // The tokenizer is now loaded+parsed ONCE on the generator (sc-8991 / F-011) from the
-        // caller-staged component (sc-13663) and passed in, rather than re-read per encode. The CLIP
-        // *weights* still load and drop inside this function (the sc-4987 peak-VRAM lever); only the
-        // tiny tokenizer is cached.
-        //
-        // sc-9527 (sc-9089j follow-up to sc-9416): the MLX SDXL tiers ALSO pack the dual CLIP text
-        // encoders (a `quantization` block in `text_encoder{,_2}/config.json` + `.scales`-packed Linears
-        // under `model.safetensors`). The txt2img conditioning uses only each encoder's last hidden
-        // state (`forward`), so we build the **vendored, packed-detecting** CLIP tower when the tier is
-        // packed — every Linear (attn q/k/v/out_proj, MLP fc1/fc2) loads straight from the packed parts —
-        // and the stock dense builder otherwise (byte-identical, pinned by the vendored-vs-stock parity
-        // test). The `group_size` is threaded from the component config (sc-9410).
-        let text_model: CandleModule = if let Some(ldm) = &self.ldm {
-            let component = match which {
-                Clip::L => SdxlComponent::ClipL,
-                Clip::BigG => SdxlComponent::ClipBigG,
-            };
-            let tower = if let Some(quant) = self.quant {
-                // Stage the dense fused CLIP map in system RAM, then fold each projection directly
-                // onto the compute device. Building the tower on the accelerator first would require
-                // the dense tier to fit before Q4/Q8 could make it smaller.
-                let cpu = Device::Cpu;
-                let vb = ldm
-                    .builder(component, self.dtype, &self.device)
-                    .stage_dense_on(cpu);
-                let mut tower = crate::clip::ClipTextTransformer::new_gs(
-                    vb,
-                    &which.vendored_config(),
-                    candle_gen::quant::MLX_GROUP_SIZE,
-                )?;
-                tower.quantize_onto(quant, &self.device)?;
-                tower
-            } else {
-                let vb = ldm.builder(component, self.dtype, &self.device);
-                crate::clip::ClipTextTransformer::new_gs(
-                    vb,
-                    &which.vendored_config(),
-                    candle_gen::quant::MLX_GROUP_SIZE,
-                )?
-            };
-            CandleModule::Vendored(tower)
+        let component = match which {
+            Clip::L => SdxlComponent::ClipL,
+            Clip::BigG => SdxlComponent::ClipBigG,
+        };
+        let vb = ldm.builder(component, self.dtype, &self.device);
+        // Keep load-time affine quantization's dense staging off the accelerator.
+        let vb = if self.quant.is_some() {
+            vb.stage_dense_on(Device::Cpu)
         } else {
-            match detect_packed_clip(&self.root, &which)? {
-                Some((packed_file, group_size)) => {
-                    let vs =
-                        candle_gen::mmap_var_builder(&[packed_file], self.dtype, &self.device)?;
-                    let tower = crate::clip::ClipTextTransformer::new_gs(
-                        vs,
-                        &which.vendored_config(),
-                        group_size,
-                    )?;
-                    CandleModule::Vendored(tower)
-                }
-                None => {
-                    // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16
-                    // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it
-                    // halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change.
-                    // The embeddings are cast to `dtype` below.
-                    let stock = crate::loaders::load_stock_clip(
-                        clip_cfg,
-                        snapshot_file(&self.root, weights_sub)?,
-                        &self.device,
-                        self.dtype,
-                    )?;
-                    CandleModule::Stock(stock)
-                }
-            }
+            vb
         };
-
-        Ok(text_model)
+        let mut model = ClipTower::load(
+            vb,
+            which,
+            candle_gen::quant::MLX_GROUP_SIZE,
+            "packed_or_imported",
+        )?;
+        if let Some(quant) = self.quant {
+            model.quantize_onto(quant, &self.device)?;
+        }
+        Ok(model)
     }
 
     fn encode_loaded(
         &self,
-        text_model: &CandleModule,
+        text_model: &ClipTower,
         tokenizer: &Tokenizer,
         plan: &ChunkPlan,
         prompt: &str,
         uncond: &str,
         chunks: usize,
-    ) -> Result<Tensor> {
-        // sc-20528: one forward per CLIP window, concatenated on the sequence axis (the A1111/compel
-        // "long prompt weighting" shape). A prompt that fits produces exactly one window whose ids are
-        // the tokenizer output right-padded with the pad token — bit-for-bit the pre-sc-20528 encoding,
-        // so nothing about a ≤77-token render changes.
-        let encode = |text: &str| -> Result<Tensor> {
-            let rows = plan.rows_aligned(tokenizer, text, chunks)?;
-            let mut hidden = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let ids = Tensor::new(row.as_slice(), &self.device)?.unsqueeze(0)?;
-                hidden.push(text_model.forward(&ids)?);
-            }
-            // Take the single window straight through rather than routing it via `cat` — the ≤77 path
-            // stays the identical tensor the old code produced.
-            if hidden.len() == 1 {
-                Ok(hidden.remove(0))
-            } else {
-                Ok(Tensor::cat(&hidden, 1)?)
-            }
-        };
-
-        let cond = encode(prompt)?;
-        let uncond = encode(uncond)?;
-        Ok(Tensor::cat(&[uncond, cond], 0)?.to_dtype(self.dtype)?)
-        // `text_model` drops here, freeing this encoder's weights before the caller loads the next
-        // (sc-4987). The `tokenizer` is borrowed from the generator's cache and outlives this call.
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let (hidden, pooled) =
+            text_model.encode(tokenizer, plan, &[uncond, prompt], chunks, &self.device)?;
+        Ok((
+            hidden.to_dtype(self.dtype)?,
+            pooled.map(|t| t.to_dtype(self.dtype)).transpose()?,
+        ))
     }
 
-    /// Load the heavy [`Components`] (UNet + f16 VAE) for the given flash-attn setting. The UNet reads
-    /// from the snapshot (fused flash-attention when built `--features flash-attn` AND `use_flash_attn`
-    /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves from the caller-staged
-    /// `vae_fp16_fix` component (sc-13663). The generator owns the caching of the result across calls
-    /// (sc-5037); this is the cache-miss loader.
-    pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
-        let unet = self.load_unet(use_flash_attn)?;
+    /// Load the heavy components on a cache miss. The generator owns their residency.
+    pub(crate) fn load_components(&self) -> Result<Components> {
+        let unet = self.load_unet()?;
         let (vae, pid) = self.load_decoders()?;
         Ok(Components { unet, vae, pid })
     }
 
-    pub(crate) fn load_unet(&self, use_flash_attn: bool) -> Result<SdxlUnet> {
+    pub(crate) fn load_unet(&self) -> Result<SdxlUnet> {
         // sc-9416: a **packed** MLX tier (`SceneWorks/sdxl-base-mlx` q4/q8) ships its UNet under the
         // non-`.fp16` filename with a `quantization` block in `unet/config.json` and `.scales`-packed
         // Linear weights. Detect it and load the vendored packed-detecting UNet straight from the packed
-        // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
+        // parts. Dense snapshots use the same conditioned UNet with dense projections.
         let unet = if let Some(ldm) = &self.ldm {
             let cpu = Device::Cpu;
             let build_device = if self.quant.is_some() {
@@ -876,7 +823,7 @@ impl Pipeline {
             } else {
                 vs
             };
-            let mut vendored = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+            let mut vendored = new_sdxl_unet(vs)?;
             if !self.adapters.is_empty() {
                 let linear = crate::adapters::install_additive(
                     &mut vendored,
@@ -907,7 +854,7 @@ impl Pipeline {
                     // dense convs (`load_packed_unet_with_adapters`), so the q4/q8 footprint survives instead
                     // of dequant-folding the FF (the retired sc-9528 path).
                     let vendored = if self.adapters.is_empty() {
-                        self.load_packed_unet(&packed_file, group_size)?
+                        self.load_vendored_unet(&packed_file)?
                     } else {
                         self.load_packed_unet_with_adapters(&packed_file, group_size)?
                     };
@@ -916,33 +863,12 @@ impl Pipeline {
                 None => {
                     let unet_file =
                         snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-                    if use_flash_attn && self.adapters.is_empty() {
-                        // **Unadapted + flash only.** The fused flash-attn kernel never materializes the full
-                        // `[B·H, S, S]` scores tensor, so it does not hit the i32-overflow (sc-11154 / F-081)
-                        // and needs no additive seam; keep the stock candle UNet so the fused kernel is used
-                        // (byte-identical to pre-sc-5165). An ADAPTED render falls through to the vendored
-                        // additive path below (sc-11682): the vendored flash path is a stub, and an additive
-                        // residual over a pristine (evictable) mmap base is worth more for an adapted render
-                        // than the fused kernel — so the old stock fold path is retired and adapted renders
-                        // always take the i32-overflow-safe vendored math path.
-                        let unet =
-                            crate::loaders::load_flash_unet(unet_file, &self.device, self.dtype)?;
-                        SdxlUnet::Stock(Arc::new(unet))
+                    let vendored = if self.adapters.is_empty() {
+                        self.load_vendored_unet(&unet_file)?
                     } else {
-                        // Math-path attention (the default — no `flash-attn` feature — AND every adapted
-                        // render): the stock candle UNet materializes a full `[B·H, S, S]` scores tensor that
-                        // overflows i32 at ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently
-                        // corrupts on CUDA (sc-11154 / F-081). Route through the vendored UNet, whose math
-                        // attention is the i32-overflow-safe `sdpa_budgeted_flat` (bit-identical to the stock
-                        // forward per `vendored_unet_matches_stock_forward`); an adapter rides additively over
-                        // the mmap base (sc-11682), never folded.
-                        let vendored = if self.adapters.is_empty() {
-                            self.load_dense_vendored_unet(&unet_file)?
-                        } else {
-                            self.load_dense_vendored_unet_with_adapters(&unet_file)?
-                        };
-                        SdxlUnet::Vendored(Arc::new(vendored))
-                    }
+                        self.load_dense_vendored_unet_with_adapters(&unet_file)?
+                    };
+                    SdxlUnet::Vendored(Arc::new(vendored))
                 }
             }
         };
@@ -993,13 +919,10 @@ impl Pipeline {
     /// `{weight, scales, biases}` triple, while the convolutions + norms load dense. No adapter is
     /// installed (the packed tier is inference-only), so the four attention projections' `LoraLinear`
     /// bases are their packed `QLinear` and the forward is exactly `x·Wᵀ + b` (dequant-on-forward).
-    fn load_packed_unet(&self, unet_file: &Path, _group_size: usize) -> Result<VendoredUNet> {
+    fn load_vendored_unet(&self, unet_file: &Path) -> Result<VendoredUNet> {
         let vs =
             candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
-        // The vendored `new` threads the default MLX group size (64) — validated == the config group in
-        // `detect_packed_unet` — through its packed-detecting leaves; `sdxl_unet_config` is the canonical
-        // 3-block SDXL geometry (`use_linear_projection = true`, matching the packed `proj_in/out`).
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+        new_sdxl_unet(vs)
     }
 
     /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s applied
@@ -1031,7 +954,7 @@ impl Pipeline {
         // (exactly as the mmap path) and the (conv-folded) dense weights via the vb dtype. `false` = no
         // flash-attn on the packed path.
         let vs = VarBuilder::from_tensors(raw, self.dtype, &self.device);
-        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        let mut unet = new_sdxl_unet(vs)?;
         // Push the LoRA/LoKr residuals onto the packed Linear leaves — the base stays packed.
         let add =
             crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
@@ -1043,22 +966,8 @@ impl Pipeline {
         Ok(unet)
     }
 
-    /// Build the **dense** SDXL UNet through the vendored stack (sc-11154 / F-081). The vendored math
-    /// attention routes through the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_flat`], so the
-    /// dense (no-flash) path no longer materializes an over-`i32::MAX` `[B·H, S, S]` scores tensor at
-    /// the advertised 2048² envelope (the stock candle UNet does — silent CUDA corruption). The
-    /// vendored copy is bit-identical to the stock forward (`vendored_unet_matches_stock_forward`), and
-    /// the diffusers fp16 checkpoint layout is shared: its `linear_detect` leaves see no `.scales`
-    /// siblings and load every Linear dense (the same code path the packed loader takes for un-packed
-    /// tensors). No adapter is installed, so each attention projection's base is its dense Linear.
-    fn load_dense_vendored_unet(&self, unet_file: &Path) -> Result<VendoredUNet> {
-        let vs =
-            candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
-    }
-
     /// Dense vendored UNet with the [`AdapterSpec`]s applied **additively** (sc-11682) — the adapted
-    /// counterpart of [`Self::load_dense_vendored_unet`], through the i32-overflow-safe vendored stack.
+    /// counterpart of [`Self::load_vendored_unet`], through the i32-overflow-safe vendored stack.
     /// The bf16 base stays a **pristine mmap** (never folded into a host `from_tensors` map), so
     /// epic-10765 offload/eviction can drop-and-restore it cheaply — a fold `W += δ` mutates the weight
     /// into a non-disk-re-derivable host copy that must be pinned. The adapter rides as forward-time
@@ -1071,7 +980,7 @@ impl Pipeline {
         let table = crate::adapters::build_sdxl_kohya_table_from_file(unet_file)?;
         let vs =
             candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
-        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        let mut unet = new_sdxl_unet(vs)?;
         let lin =
             crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
         let conv = crate::adapters::install_additive_conv(
@@ -1095,7 +1004,7 @@ impl Pipeline {
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
-        text_embeddings: &Tensor,
+        text_embeddings: &TextConditioning,
         unet: &SdxlUnet,
         vae: &SdxlVaeDecoder,
         pid: Option<&PidEngine>,
@@ -1139,7 +1048,7 @@ impl Pipeline {
     pub(crate) fn denoise_images(
         &self,
         req: &GenerationRequest,
-        text_embeddings: &Tensor,
+        text_embeddings: &TextConditioning,
         unet: &SdxlUnet,
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
@@ -1243,7 +1152,7 @@ impl Pipeline {
     fn render_with<T>(
         &self,
         req: &GenerationRequest,
-        text_embeddings: &Tensor,
+        text_embeddings: &TextConditioning,
         unet: &SdxlUnet,
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
@@ -1251,7 +1160,7 @@ impl Pipeline {
     ) -> Result<Vec<T>> {
         // Both cached resident components and staged components enter here.
         let representation = match unet {
-            SdxlUnet::Stock(_) | SdxlUnet::Vendored(_) => "dense",
+            SdxlUnet::Vendored(_) => "dense",
             SdxlUnet::Packed(_) => "packed",
         };
         candle_gen::execution::policy("sdxl/unet/representation", representation.into());
@@ -1291,6 +1200,8 @@ impl Pipeline {
             Some(run) => run.plan().phase_output_size(0),
             None => (self.config.width as u32, self.config.height as u32),
         };
+        let output_size = run.map_or((init_w, init_h), |run| run.plan().output_size());
+        let text_embeddings = text_embeddings.with_sizes((init_w, init_h), output_size)?;
         let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
         let init_clean = match &req.source_image {
             Some(source) => Some(self.encode_source_image(source, init_w, init_h)?),
@@ -1301,10 +1212,7 @@ impl Pipeline {
         // embedding (row 1 of the `[uncond, cond]` dual-CLIP stack — Lightning runs one conditioned
         // forward per step, so the uncond row is unused). Built once, reused for every image.
         let lightning_ctx = if lightning {
-            Some((
-                lightning_policy(steps)?,
-                text_embeddings.narrow(0, 1, 1)?.contiguous()?,
-            ))
+            Some((lightning_policy(steps)?, text_embeddings.row(1)?))
         } else {
             None
         };
@@ -1346,7 +1254,7 @@ impl Pipeline {
                     name,
                     &init,
                     init_clean.as_ref(),
-                    text_embeddings,
+                    &text_embeddings,
                     unet,
                     steps,
                     use_guide,
@@ -1385,14 +1293,14 @@ impl Pipeline {
     /// backends share one reference schedule.
     ///
     /// `init` is the seeded unit-normal noise (CPU `StdRng` → device, f32; the sc-3673 launch-portable
-    /// contract); `cond` is the cond-only text embedding `[1, T, 2048]`. Returns latents in the compute
+    /// contract). `cond` carries the single conditional row. Returns latents in the compute
     /// dtype (f16) for the shared [`decode`](Self::decode).
     #[allow(clippy::too_many_arguments)]
     fn denoise_lightning(
         &self,
         init: &Tensor,
         policy: &LightningPolicy,
-        cond: &Tensor,
+        cond: &TextConditioning,
         unet: &SdxlUnet,
         cancel: &gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -1458,7 +1366,7 @@ impl Pipeline {
         sampler: &str,
         init: &Tensor,
         init_clean: Option<&Tensor>,
-        text_embeddings: &Tensor,
+        text_embeddings: &TextConditioning,
         unet: &SdxlUnet,
         steps: usize,
         use_guide: bool,
@@ -1518,7 +1426,7 @@ impl Pipeline {
         let ehs = if use_guide {
             text_embeddings.clone()
         } else {
-            text_embeddings.narrow(0, 1, 1)?.contiguous()?
+            text_embeddings.row(1)?
         };
         if req.guidance_method.as_deref() == Some("cfg_pp")
             && use_guide
@@ -1545,11 +1453,9 @@ impl Pipeline {
             // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.
             let eps = if use_guide && crate::sequential_cfg_enabled() {
                 let model_in = x_in.to_dtype(self.dtype)?;
-                let uncond =
-                    unet.forward(&model_in, t as f64, &ehs.narrow(0, 0, 1)?.contiguous()?)?;
+                let uncond = unet.forward(&model_in, t as f64, &ehs.row(0)?)?;
                 candle_gen::residency::check_cancel(&req.cancel)?;
-                let cond =
-                    unet.forward(&model_in, t as f64, &ehs.narrow(0, 1, 1)?.contiguous()?)?;
+                let cond = unet.forward(&model_in, t as f64, &ehs.row(1)?)?;
                 (&uncond + ((cond - &uncond)? * guidance)?)?
             } else {
                 let model_in = if use_guide {
@@ -1607,7 +1513,7 @@ impl Pipeline {
         ms: &DiscreteModelSampling,
         sigmas: &[f32],
         mut latents: Tensor,
-        ehs: &Tensor,
+        ehs: &TextConditioning,
         unet: &SdxlUnet,
         guidance: f64,
         seed: u64,
@@ -1634,23 +1540,9 @@ impl Pipeline {
         let predict_pair = |x_in: &Tensor, t: f32| -> gen_core::Result<(Tensor, Tensor)> {
             let (eps_u, eps_c) = if crate::sequential_cfg_enabled() {
                 let model_in = x_in.to_dtype(self.dtype).map_err(CandleError::from)?;
-                let u = unet.forward(
-                    &model_in,
-                    t as f64,
-                    &ehs.narrow(0, 0, 1)
-                        .map_err(CandleError::from)?
-                        .contiguous()
-                        .map_err(CandleError::from)?,
-                )?;
+                let u = unet.forward(&model_in, t as f64, &ehs.row(0)?)?;
                 candle_gen::residency::check_cancel(&req.cancel)?;
-                let c = unet.forward(
-                    &model_in,
-                    t as f64,
-                    &ehs.narrow(0, 1, 1)
-                        .map_err(CandleError::from)?
-                        .contiguous()
-                        .map_err(CandleError::from)?,
-                )?;
+                let c = unet.forward(&model_in, t as f64, &ehs.row(1)?)?;
                 (
                     u.to_dtype(DType::F32).map_err(CandleError::from)?,
                     c.to_dtype(DType::F32).map_err(CandleError::from)?,
@@ -1910,7 +1802,7 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 /// follow-up to sc-9416): `Some((packed_weight_file, group_size))` when
 /// `text_encoder{,_2}/config.json` carries a `quantization` block ([`PackedConfig`]) AND the packed
 /// weight file (`model.safetensors`, not the dense `.fp16` name) exists, else `None` — a dense
-/// diffusers snapshot loads through the stock builder unchanged. A missing config (e.g. a bare
+/// diffusers snapshot loads through the dense projection path. A missing config (e.g. a bare
 /// single-file checkpoint) is treated as dense; the downstream loader gives the precise "missing X"
 /// error. `group_size` is threaded from the config (defaulting to 64 via [`PackedConfig`], never
 /// silent-dense — the sc-9410 rule) into the vendored CLIP's Linear seam.
@@ -2513,6 +2405,53 @@ mod tests {
     /// mirrored up) so the whole [`Pipeline::render`] seam runs on CPU in milliseconds. The only
     /// dimension that matters to the CFG-batch contract is `cross_attention_dim` — the conditioning
     /// this UNet consumes is `[B, tokens, 16]`, the shape-analogue of the real `[B, 77, 2048]`.
+    #[test]
+    fn text_conditioning_pairs_cfg_rows_with_each_canvas() {
+        let device = Device::Cpu;
+        let hidden = Tensor::new(&[[[1.0f32]], [[2.0f32]]], &device).unwrap();
+        let pooled = Tensor::new(&[[3.0f32], [4.0]], &device).unwrap();
+        let conditioning = TextConditioning::new(hidden, pooled)
+            .with_sizes((640, 384), (1280, 768))
+            .unwrap();
+
+        for (row, expected_hidden, expected_pooled) in [(0, 1.0, 3.0), (1, 2.0, 4.0)] {
+            let selected = conditioning.row(row).unwrap();
+            assert_eq!(
+                selected.hidden.to_vec3::<f32>().unwrap(),
+                vec![vec![vec![expected_hidden]]]
+            );
+            assert_eq!(
+                selected.pooled.to_vec2::<f32>().unwrap(),
+                vec![vec![expected_pooled]]
+            );
+            assert_eq!(
+                selected
+                    .time_ids((48, 80))
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap(),
+                vec![vec![384.0, 640.0, 0.0, 0.0, 384.0, 640.0]],
+            );
+            assert_eq!(
+                selected
+                    .time_ids((96, 160))
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap(),
+                vec![vec![768.0, 1280.0, 0.0, 0.0, 768.0, 1280.0]],
+            );
+            assert!(selected.time_ids((80, 48)).is_err());
+        }
+    }
+
+    fn tiny_conditioned_unet(vb: VarBuilder<'_>) -> VendoredUNet {
+        // Fixture adds six 8-wide time embeddings to the 16-wide pooled text row.
+        VendoredUNet::new(vb.clone(), 4, 4, false, tiny_unet_cfg())
+            .unwrap()
+            .with_add_embedding(vb, 8, 16 + 6 * 8)
+            .unwrap()
+    }
+
     fn tiny_unet_cfg() -> crate::unet::UNet2DConditionModelConfig {
         crate::unet::UNet2DConditionModelConfig {
             center_input_sample: false,
@@ -2574,16 +2513,9 @@ mod tests {
         let dtype = DType::F32;
 
         let unet_vm = VarMap::new();
-        let unet = SdxlUnet::Vendored(Arc::new(
-            VendoredUNet::new(
-                VarBuilder::from_varmap(&unet_vm, dtype, &device),
-                4,
-                4,
-                false,
-                tiny_unet_cfg(),
-            )
-            .unwrap(),
-        ));
+        let unet = SdxlUnet::Vendored(Arc::new(tiny_conditioned_unet(VarBuilder::from_varmap(
+            &unet_vm, dtype, &device,
+        ))));
         let vae_vm = VarMap::new();
         let vae = SdxlVaeDecoder::new(
             VarBuilder::from_varmap(&vae_vm, dtype, &device),
@@ -2610,10 +2542,19 @@ mod tests {
         // `text_embeddings()` always hands `render` the `[uncond, cond]` stack — here `[A, B]`.
         let row_a = Tensor::full(0.35f32, (1, 5, 16), &device).unwrap();
         let row_b = Tensor::full(-0.80f32, (1, 5, 16), &device).unwrap();
-        let stack = |top: &Tensor, bottom: &Tensor| Tensor::cat(&[top, bottom], 0).unwrap();
-        let ab = stack(&row_a, &row_b); // the real layout: uncond row 0, cond row 1
-        let bb = stack(&row_b, &row_b); // cond in BOTH rows
-        let aa = stack(&row_a, &row_a); // uncond in BOTH rows
+        let pooled_a = Tensor::full(0.25f32, (1, 16), &device).unwrap();
+        let pooled_b = Tensor::full(-0.60f32, (1, 16), &device).unwrap();
+        let stack = |top: (&Tensor, &Tensor), bottom: (&Tensor, &Tensor)| {
+            TextConditioning::new(
+                Tensor::cat(&[top.0, bottom.0], 0).unwrap(),
+                Tensor::cat(&[top.1, bottom.1], 0).unwrap(),
+            )
+        };
+        let a = (&row_a, &pooled_a);
+        let b = (&row_b, &pooled_b);
+        let ab = stack(a, b); // uncond row 0, cond row 1
+        let bb = stack(b, b);
+        let aa = stack(a, a);
 
         let req_at = |guidance: f32, count: u32| GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
@@ -2625,7 +2566,7 @@ mod tests {
             guidance: Some(guidance),
             ..Default::default()
         };
-        let render = |guidance: f32, ehs: &Tensor| {
+        let render = |guidance: f32, ehs: &TextConditioning| {
             pipe.render(
                 &req_at(guidance, 1),
                 ehs,
@@ -2699,16 +2640,9 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::F32;
         let vars = VarMap::new();
-        let unet = SdxlUnet::Vendored(Arc::new(
-            VendoredUNet::new(
-                VarBuilder::from_varmap(&vars, dtype, &device),
-                4,
-                4,
-                false,
-                tiny_unet_cfg(),
-            )
-            .unwrap(),
-        ));
+        let unet = SdxlUnet::Vendored(Arc::new(tiny_conditioned_unet(VarBuilder::from_varmap(
+            &vars, dtype, &device,
+        ))));
         let vae = tiny_sdxl_vae(&device);
         let encoder_vars = VarMap::new();
         crate::unet::VaeMomentsEncoder::new(
@@ -2767,7 +2701,10 @@ mod tests {
         assert_eq!(plan.denoise_sigmas(), split.denoise_sigmas());
         assert_eq!(plan.denoise_spans(), vec![0..4]);
         assert_eq!(split.denoise_spans(), vec![0..2, 2..4]);
-        let embeddings = Tensor::full(0.4f32, (2, 5, 16), &device).unwrap();
+        let embeddings = TextConditioning::new(
+            Tensor::full(0.4f32, (2, 5, 16), &device).unwrap(),
+            Tensor::full(0.25f32, (2, 16), &device).unwrap(),
+        );
 
         let generate = |plan, staged| {
             let run = gen_core::RenderRun::new(plan, &req.cancel, None);

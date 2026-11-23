@@ -427,9 +427,9 @@ impl CrossAttention {
 
     /// Install the IP-Adapter decoupled K/V projections (sc-5491): `k_ip`/`v_ip` are the
     /// `ip_adapter.{n}.to_k_ip/to_v_ip` weights (`[inner, cross_attention_dim]`, bias-free).
-    pub fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
-        self.to_k_ip = Some(nn::Linear::new(k_ip, None));
-        self.to_v_ip = Some(nn::Linear::new(v_ip, None));
+    pub fn install_ip<P: Into<nn::Linear>>(&mut self, k_ip: P, v_ip: P) {
+        self.to_k_ip = Some(k_ip.into());
+        self.to_v_ip = Some(v_ip.into());
         // sc-9424: any precomputed K/V from an earlier `set_ip` was projected with the OLD weights;
         // drop it so the next `set_ip` rebuilds against these freshly-installed projections. (Install is
         // a one-time load-time op that always precedes `set_ip`, so this is defensive, not hot-path.)

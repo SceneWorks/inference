@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 /// record names one, so "which proposer ran" is visible per request and a request that resolved
 /// to no proposer says so (`none`) rather than silently downgrading. The labels are the request
 /// vocabulary of [`SpeculativeProposer`](crate::SpeculativeProposer) plus `none` (sc-24433).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProposerKind {
     /// No proposer: the token-at-a-time path (also what a request whose speculation resolved to
     /// nothing runs — its [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) says why).
@@ -1576,7 +1577,20 @@ fn weight_of(candidates: &[(i32, f32)], token: i32) -> f32 {
         .unwrap_or(0.0)
 }
 
+pub mod adaptive;
 pub mod tree;
+
+pub use adaptive::{
+    ngram_peek_match_len, resolve_auto_candidates, withdraws_auto_draft_model, AdaptiveAction,
+    AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeController,
+    AdaptiveSpeculativeEvent, AdaptiveSpeculativeReport, AdaptiveStepInput, AdaptiveStepPlan,
+    AutoCandidate, AutoCandidateContext, AutoSpeculativePlan, StepCost, ADAPTIVE_COOLDOWN_VERIFIES,
+    ADAPTIVE_GROW_ACCEPTANCE_RATIO, ADAPTIVE_LOOKUP_DRY_STEPS, ADAPTIVE_LOOKUP_TRIGGER_MATCHES,
+    ADAPTIVE_MAX_DEPTH_CHANGES, ADAPTIVE_MAX_SWITCHES, ADAPTIVE_PROBE_MIN_TIMED_STEPS,
+    ADAPTIVE_PROBE_STEPS, ADAPTIVE_SHRINK_ACCEPTANCE_RATIO, ADAPTIVE_SWITCH_IMPROVEMENT_MARGIN,
+    ADAPTIVE_UNTIMED_SWITCH_GAIN, AUTO_DRAFT_MODEL_NOT_ADMITTED, MAX_DRAFT_CATCHUP_TOKENS,
+    MAX_MTP_CATCHUP_TOKENS, NGRAM_PEEK_WINDOW_TOKENS,
+};
 
 #[cfg(test)]
 mod tests;

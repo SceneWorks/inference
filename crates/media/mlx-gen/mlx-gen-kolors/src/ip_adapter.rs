@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -43,7 +43,7 @@ fn is_packed(w: &Weights) -> bool {
 pub fn load_kolors_ip_adapter(
     snapshot: &Path,
     dtype: Dtype,
-) -> Result<(IpImageEncoder, Vec<(Array, Array)>)> {
+) -> Result<(IpImageEncoder, mlx_gen_sdxl::ip_adapter::IpKvPairs)> {
     let mut enc_w = Weights::from_file(snapshot.join("image_encoder/model.safetensors"))?;
     // F-143: never cast a pre-quantized packed payload (its u32 codes/scales would be corrupted),
     // matching the SDXL IP-Adapter loader's F-082 guard.
@@ -72,6 +72,7 @@ pub fn load_kolors_ip_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::Array;
 
     #[test]
     fn is_packed_detects_scales_key_like_sdxl_guard() {

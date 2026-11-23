@@ -41,6 +41,17 @@ pub struct TreeVerifyCapabilities {
     pub max_rows: u32,
 }
 
+/// Exact multi-boundary prefix-checkpoint support advertised by a loaded provider (feature SW-F356).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrefixCheckpointCapabilities {
+    /// Maximum boundary checkpoints retained per request.
+    pub max_checkpoints_per_request: u32,
+    /// Whether explicit [`PrefixDocumentSpan`](crate::PrefixDocumentSpan) hints are honored.
+    pub supports_document_span: bool,
+    /// Whether hybrid recurrent decoders capture interior boundaries inside prefill.
+    pub supports_hybrid_boundaries: bool,
+}
+
 /// Upstream-recommended sampling presets for a model whose thinking and non-thinking modes use
 /// different distributions. These are discovery metadata: a client may initialize controls from
 /// the applicable preset, then sends an ordinary explicit [`Sampling`] request.
@@ -109,6 +120,8 @@ pub struct TextLlmCapabilities {
     /// Tree verification this model runs, and its row bound (feature SW-F328). `None`: a
     /// `tree` request verifies linearly, the reason named in its decode report.
     pub tree_verify: Option<TreeVerifyCapabilities>,
+    /// Exact multi-boundary prefix-checkpoint support (feature SW-F356). `None` when not wired.
+    pub prefix_checkpoints: Option<PrefixCheckpointCapabilities>,
     /// The output constraint KINDS this provider can enforce (empty = none).
     ///
     /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
@@ -268,6 +281,37 @@ impl TextLlmCapabilities {
 
         if req.speculative_verify == (crate::SpeculativeVerify::Tree { max_rows: 0 }) {
             return reject("speculative tree verification needs max_rows >= 1".into());
+        }
+
+        if let Some(span) = req.prefix_checkpoints.and_then(|p| p.document) {
+            match span {
+                crate::request::PrefixDocumentSpan::Messages { count } => {
+                    if count == 0 || count > req.messages.len() {
+                        return reject(format!(
+                            "prefix_checkpoints document messages count {count} out of 1..={}",
+                            req.messages.len()
+                        ));
+                    }
+                }
+                crate::request::PrefixDocumentSpan::MessageChars { message, chars } => {
+                    if message >= req.messages.len()
+                        || chars == 0
+                        || req.messages[message].text_content().is_empty()
+                    {
+                        return reject(format!(
+                            "prefix_checkpoints document message_chars ({message}, {chars}) requires \
+                             a valid message index with non-empty text and chars >= 1"
+                        ));
+                    }
+                }
+                crate::request::PrefixDocumentSpan::Tokens { count } => {
+                    if count == 0 {
+                        return reject(
+                            "prefix_checkpoints document tokens count must be >= 1".into(),
+                        );
+                    }
+                }
+            }
         }
 
         if let Some(c) = &req.constraint {
@@ -559,5 +603,67 @@ mod tests {
         let err = caps.validate_request("test", &req).unwrap_err();
         assert!(matches!(err, Error::InvalidRequest(_)));
         assert!(err.to_string().contains("thinking is disabled"));
+    }
+
+    #[test]
+    fn prefix_checkpoint_document_spans_are_validated() {
+        use crate::{PrefixCheckpointPolicy, PrefixDocumentSpan};
+
+        let caps = TextLlmCapabilities::default();
+        let mut req = request();
+
+        req.prefix_checkpoints = Some(PrefixCheckpointPolicy::with_document(
+            PrefixDocumentSpan::Messages { count: 1 },
+        ));
+        caps.validate_request("test", &req).unwrap();
+
+        req.prefix_checkpoints = Some(PrefixCheckpointPolicy::with_document(
+            PrefixDocumentSpan::MessageChars {
+                message: 0,
+                chars: 3,
+            },
+        ));
+        caps.validate_request("test", &req).unwrap();
+
+        req.prefix_checkpoints = Some(PrefixCheckpointPolicy::with_document(
+            PrefixDocumentSpan::Tokens { count: 16 },
+        ));
+        caps.validate_request("test", &req).unwrap();
+
+        for bad in [
+            PrefixDocumentSpan::Messages { count: 0 },
+            PrefixDocumentSpan::Messages { count: 2 },
+            PrefixDocumentSpan::MessageChars {
+                message: 1,
+                chars: 3,
+            },
+            PrefixDocumentSpan::MessageChars {
+                message: 0,
+                chars: 0,
+            },
+            PrefixDocumentSpan::Tokens { count: 0 },
+        ] {
+            req.prefix_checkpoints = Some(PrefixCheckpointPolicy::with_document(bad));
+            assert!(
+                matches!(
+                    caps.validate_request("test", &req),
+                    Err(Error::InvalidRequest(_))
+                ),
+                "{bad:?}"
+            );
+        }
+
+        // Empty text message cannot satisfy MessageChars even when index is in bounds.
+        let mut empty_message_req = TextLlmRequest::new(vec![Message::user("")], 8);
+        empty_message_req.prefix_checkpoints = Some(PrefixCheckpointPolicy::with_document(
+            PrefixDocumentSpan::MessageChars {
+                message: 0,
+                chars: 1,
+            },
+        ));
+        assert!(matches!(
+            caps.validate_request("test", &empty_message_req),
+            Err(Error::InvalidRequest(_))
+        ));
     }
 }

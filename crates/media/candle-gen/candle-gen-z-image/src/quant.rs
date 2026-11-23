@@ -20,14 +20,14 @@
 //! [`MatmulStrategy::DequantDense`](candle_gen::quant::MatmulStrategy::DequantDense) arm, which owns
 //! that behavior. This module re-exports that shared `QLinear` under the crate-local name the vendored
 //! DiT / TE build their projections from, and keeps the thin dense-or-packed [`QEmbedding`] wrapper +
-//! the [`dequant_packed_to_dense`] VAE helper the packed loaders need.
+//! the [`candle_gen::quant::dequant_packed_to_dense`] VAE helper the packed loaders need.
 //!
 //! Z-Image has no *dense-tier on-the-fly* quant path (the only quantized tier is the pre-packed MLX
 //! one), so — like the FLUX.1 seam and unlike the flux2 seam — this crate never folds a dense weight;
 //! it only packed-detects. The [`QLinear::quantize`] / `quantize_onto` folds on the shared type are
 //! simply never called here.
 
-use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Module, VarBuilder};
 use candle_gen::quant as shared;
 
@@ -76,33 +76,6 @@ impl QEmbedding {
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }
-}
-
-/// Dequantize an MLX-packed triple (`{base}.weight` u32 + `{base}.scales` + `{base}.biases`) to a
-/// **dense** `[out, in]` tensor on `device` at `out_dtype` (Q4 via the exact affine grid, Q8 via the
-/// exact-grid dequant — [`candle_gen::quant::repack`]). Used only by the VAE loader
-/// ([`crate::pipeline`]): the packed tier's VAE quantizes just the 8 tiny (512×64) mid-block attention
-/// projections, so — rather than vendor the whole 685-line `AutoEncoderKL` for negligible weights — the
-/// packed VAE weights are dequantized to dense here and handed to the **stock** VAE through a
-/// `VarBuilder::from_tensors` overlay. This still loads *from the packed parts* (no dense bf16 tier is
-/// downloaded); the ~2 MB one-time dequant is trivial next to the DiT/TE the packed path serves natively.
-pub fn dequant_packed_to_dense(
-    vb: &VarBuilder,
-    base: &str,
-    device: &Device,
-    out_dtype: candle_gen::candle_core::DType,
-) -> Result<Tensor> {
-    use candle_gen::candle_core::DType;
-    let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-    let scales = vb.get_unchecked_dtype(&format!("{base}.scales"), DType::F32)?;
-    let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
-    let (wq_cols, s_cols) = (wq.dims2()?.1, scales.dims2()?.1);
-    let grid = match shared::mlx_packed_bits(wq_cols, s_cols) {
-        4 => shared::dequant_mlx_q4_reference(&wq, &scales, &biases)?,
-        8 => shared::dequant_mlx_q8(&wq, &scales, &biases)?,
-        b => candle_gen::candle_core::bail!("z-image vae: unsupported MLX packed bit-width {b}"),
-    };
-    grid.to_device(device)?.to_dtype(out_dtype)
 }
 
 #[cfg(test)]
@@ -273,7 +246,7 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
-        let dense = dequant_packed_to_dense(&vb, "to_q", &dev, DType::F32)?;
+        let dense = candle_gen::quant::dequant_packed_to_dense(&vb, "to_q", &dev, DType::F32)?;
         assert_eq!(dense.dims(), &[out_dim, in_dim]);
         let grid_t = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
         let dev_max = (dense.sub(&grid_t)?).abs()?.max_all()?.to_scalar::<f32>()?;

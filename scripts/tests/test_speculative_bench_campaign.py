@@ -2441,3 +2441,389 @@ class CudaCardSelectionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GITHUB_ENV": str(self.directory / "e")}), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.select.main(["GPU-1", str(self.directory)]), 1)
+
+
+class PrefixCheckpointsCampaignTests(unittest.TestCase):
+    """SW-F356: campaign planning, default parsing, and paired E5 decision support."""
+
+    def test_prompt_set_and_prefix_checkpoints_knobs_plan_and_refuse_baseline(self) -> None:
+        (row,) = plan(
+            {
+                "rows": [
+                    {
+                        "id": "ckpt-auto",
+                        "snapshot": "bonsai-mlx",
+                        "runs": ["epic"],
+                        "prefix_cache_bytes": "default",
+                        "prompt_set": "prefix_checkpoints",
+                        "prefix_checkpoints": "auto",
+                    }
+                ]
+            },
+            lane="mlx",
+        )["rows"]
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PROMPT_SET"], "prefix_checkpoints")
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PREFIX_CHECKPOINTS"], "auto")
+
+        for bad in (
+            {"id": "bad-ps", "snapshot": "bonsai-mlx", "runs": ["epic"], "prompt_set": "other"},
+            {"id": "bad-cp", "snapshot": "bonsai-mlx", "runs": ["epic"], "prefix_checkpoints": "all"},
+            {"id": "ps-base", "snapshot": "bonsai-mlx", "prompt_set": "prefix_checkpoints"},
+            {"id": "cp-base", "snapshot": "bonsai-mlx", "prefix_checkpoints": "off"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [bad]}, lane="mlx")
+
+    def test_defaults_table_reports_prefix_checkpoints_auto_as_measured_and_pairs_twins(self) -> None:
+        entries = {e["entry"]: e for e in campaign.default_entries(LIVE_DEFAULTS)}
+        for key in (
+            "MLX.prefix_checkpoints",
+            "CANDLE_CUDA.prefix_checkpoints",
+            "CANDLE_METAL.prefix_checkpoints",
+            "CANDLE_CPU.prefix_checkpoints",
+        ):
+            self.assertIn(key, entries)
+            self.assertTrue(entries[key]["on"])
+            self.assertFalse(entries[key]["provisional"])
+            self.assertEqual(entries[key]["kind"], "prefix_checkpoints")
+            self.assertEqual(entries[key]["value"], "PrefixCheckpointMode::Auto")
+
+        with tempfile.TemporaryDirectory() as td:
+            def ckpt_row(row_id, mode, ttft):
+                def make(run, k):
+                    return document(
+                        run,
+                        prefix_cache_bytes=1 << 20,
+                        value=lambda p, o, m: (50.0 if m == "decode_tok_s" else ttft) + jitter(k),
+                        row_extra=lambda p, o: {"prefix_checkpoints": {"policy": mode}},
+                    )
+
+                env = {
+                    "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "1048576",
+                    "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                    "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": mode,
+                }
+                return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+            directory = write_campaign(
+                Path(td) / "ckpt",
+                [ckpt_row("ckpt-auto", "auto", 40.0), ckpt_row("ckpt-off", "off", 100.0)],
+            )
+            decisions = {
+                d["entry"]: d
+                for d in campaign.compare_campaigns([directory], LIVE_DEFAULTS)["defaults"]
+            }
+            decision = decisions["CANDLE_CUDA.prefix_checkpoints"]
+            self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+            self.assertFalse(decision["flip"])
+
+    def test_compare_and_paths_surface_wall_ttft_memory_and_checkpoint_overhead(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            def ckpt_row(row_id, mode, wall_base, ttft_base, peak_bytes, checkpoints):
+                def make(run, k):
+                    def val(p, o, m):
+                        if m == "decode_tok_s":
+                            return 60.0 + jitter(k)
+                        if m == "ttft_ms":
+                            return ttft_base + jitter(k)
+                        return 0.0
+
+                    doc = document(
+                        run,
+                        prefix_cache_bytes=1 << 20,
+                        value=val,
+                        row_extra=lambda p, o: {
+                            "wall_ms": {"mean": wall_base + jitter(k), "stddev": 0.5, "n": 3},
+                            "peak_memory_bytes": {
+                                "mean": float(peak_bytes),
+                                "stddev": 0.0,
+                                "n": 3,
+                            },
+                            "prefix_checkpoints": checkpoints[k - 1],
+                        },
+                    )
+                    return doc
+
+                env = {
+                    "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "1048576",
+                    "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                    "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": mode,
+                }
+                return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+            auto_pc = {
+                "policy": "document",
+                "reused_tokens": 96,
+                "reread_tokens": 12,
+                "matched_kind": "document",
+                "checkpoints_captured": 2,
+                "captured_bytes": 4096,
+                "restore_ms": 1.25,
+                "capture_ms": 2.75,
+                "resident_bytes": 8192,
+                "protected_bytes": 4096,
+                "evicted_entries": 0,
+                "fallbacks": [],
+            }
+            auto_checkpoints = [
+                {**auto_pc, "restore_ms": 1.0, "fallbacks": ["z", "a"]},
+                {**auto_pc, "restore_ms": 1.5, "fallbacks": ["a", 123]},
+                {**auto_pc, "restore_ms": True, "matched_kind": None, "fallbacks": None},
+            ]
+            off_pc = {
+                "policy": "off",
+                "reused_tokens": 0,
+                "reread_tokens": 108,
+                "matched_kind": None,
+                "checkpoints_captured": 0,
+                "captured_bytes": 0,
+                "restore_ms": 0.0,
+                "capture_ms": 0.0,
+                "resident_bytes": 0,
+                "protected_bytes": 0,
+                "evicted_entries": 0,
+                "fallbacks": [],
+            }
+            directory = write_campaign(
+                Path(td) / "ckpt-full",
+                [
+                    ckpt_row("ckpt-auto", "auto", 220.0, 35.0, 2 << 30, auto_checkpoints),
+                    ckpt_row("ckpt-off", "off", 340.0, 120.0, 2 << 30, [off_pc] * 3),
+                ],
+            )
+            report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
+            decision = {d["entry"]: d for d in report["defaults"]}["CANDLE_CUDA.prefix_checkpoints"]
+            self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+            wall_judged = [j for j in decision["judged"] if j["metric"] == "wall_ms"]
+            self.assertTrue(wall_judged, "wall_ms must be judged for prefix_checkpoints")
+            self.assertTrue(all(j["verdict"] == "pass" for j in wall_judged))
+
+            paired = report["prefix_checkpoints"]
+            self.assertEqual(len(paired), 6)
+            sample = paired[0]
+            self.assertEqual(sample["wall_ms"]["verdict"], "pass")
+            self.assertAlmostEqual(sample["wall_ms"]["candidate"]["mean"], 220.0, places=2)
+            self.assertAlmostEqual(sample["wall_ms"]["reference"]["mean"], 340.0, places=2)
+            self.assertEqual(sample["ttft_ms"]["verdict"], "pass")
+            self.assertEqual(sample["peak_memory_bytes"]["on"]["mean"], float(2 << 30))
+            on_pc = sample["prefix_checkpoints"]["on"]
+            self.assertEqual(on_pc["capture_ms"], 2.75)
+            self.assertEqual(on_pc["restore_ms"], 1.25)
+            self.assertEqual(on_pc["captured_bytes"], 4096)
+            self.assertEqual(on_pc["reused_tokens"], 96)
+            self.assertEqual(on_pc["reread_tokens"], 12)
+            self.assertEqual(on_pc["resident_bytes"], 8192)
+            self.assertEqual(on_pc["protected_bytes"], 4096)
+            self.assertEqual(on_pc["policies"], ["document"])
+            self.assertEqual(on_pc["matched_kinds"], ["document"])
+            self.assertEqual(on_pc["fallbacks"], ["a", "z"])
+
+            md = campaign.markdown_report(report)
+            self.assertIn("## Prefix checkpoints — paired on vs off rows", md)
+            self.assertIn("220.0 vs 340.0", md)
+            self.assertIn("96 / 12 (document)", md)
+            self.assertIn("2.75", md)
+            self.assertIn("1.25", md)
+            self.assertIn("4096 / 8192 / 4096", md)
+
+            # `paths_report` / `paths_markdown` surface prefix_checkpoints overhead when present.
+            def path_document(run, k):
+                row = path_row("chat", "open_ended", "off", tok_s=50.0, wall=220.0, hits=(96, 96))
+                row["prefix_checkpoints"] = auto_checkpoints[k - 1]
+                return paths_document([row])
+
+            paths_dir = write_campaign(
+                Path(td) / "ckpt-paths",
+                [
+                    {
+                        "id": "p-auto",
+                        "runs": ["epic"],
+                        "document": path_document,
+                        "env": {
+                            "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "default",
+                            "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                            "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": "auto",
+                        },
+                    }
+                ],
+                lane="mlx",
+            )
+            pr = campaign.paths_report([paths_dir])
+            summary_pc = pr["summary"][0]["prefix_checkpoints"]
+            self.assertEqual(summary_pc, on_pc)
+            pmd = campaign.paths_markdown(pr)
+            self.assertIn("### Prefix checkpoints", pmd)
+            self.assertIn("| off | document | 96 | 12 | 2.75 | 1.25 | 4096 | 8192 | 4096 | document |", pmd)
+
+    def test_cross_revision_epic_with_checkpoints_compares_against_pre_epic_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            def make_doc(run, k):
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": "auto"}})
+                    if run == "epic"
+                    else None
+                )
+                return document(
+                    run,
+                    value=lambda p, o, m: (
+                        (55.0 if run == "epic" else 50.0) if m == "decode_tok_s" else 80.0
+                    ) + jitter(k),
+                    row_extra=extra,
+                )
+
+            directory = write_campaign(
+                Path(td) / "cross-rev",
+                [{"id": "paired", "runs": ["epic", "baseline"], "document": make_doc}],
+            )
+            report = campaign.compare_campaigns([directory], LIVE_DEFAULTS)
+            self.assertEqual(report["schema"], campaign.COMPARE_SCHEMA)
+            self.assertEqual(len(report["rows"]), 1)
+
+            # Within the same run (`epic`), conflicting checkpoint modes are still refused.
+            def mixed_epic(run, k):
+                policy = "auto" if k == 1 else "off"
+                extra = (
+                    (lambda p, o: {"prefix_checkpoints": {"policy": policy}})
+                    if run == "epic"
+                    else None
+                )
+                return document(run, row_extra=extra)
+
+            bad_dir = write_campaign(
+                Path(td) / "mixed-epic",
+                [{"id": "mixed", "runs": ["epic", "baseline"], "document": mixed_epic}],
+            )
+            with self.assertRaisesRegex(campaign.Refused, "prefix_checkpoints"):
+                campaign.compare_campaigns([bad_dir], LIVE_DEFAULTS)
+
+    def test_adaptive_speculative_paths_and_paired_compare_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            adaptive_auto = {
+                "adaptive": True,
+                "candidates": ["mtp", "prompt_lookup", "none"],
+                "initial_proposer": "mtp",
+                "initial_depth": 2,
+                "final_proposer": "prompt_lookup",
+                "final_depth": 4,
+                "depth_changes": 1,
+                "proposer_switches": 1,
+                "plain_reason": None,
+                "events": [
+                    {
+                        "token_offset": 32,
+                        "verify_step": 12,
+                        "kind": "proposer_switched",
+                        "from_proposer": "mtp",
+                        "from_depth": 3,
+                        "to_proposer": "prompt_lookup",
+                        "to_depth": 4,
+                        "reason": "probe beat incumbent",
+                    }
+                ],
+                "cost": {
+                    "proposal_ms": 2.0,
+                    "verify_ms": 10.0,
+                    "rollback_ms": 0.5,
+                    "sync_ms": 0.5,
+                    "total_ms": 13.0,
+                    "host_syncs": 10,
+                    "committed_tokens": 26,
+                    "ms_per_committed_token": 0.5,
+                },
+            }
+
+            # 1) paths_report & paths_markdown surface adaptive_speculative telemetry.
+            row_auto = path_row("code_edit", "predictable", "auto", tok_s=90.0, wall=150.0)
+            row_auto["adaptive_speculative"] = adaptive_auto
+            paths_dir = write_campaign(
+                Path(td) / "adaptive-paths",
+                [
+                    {
+                        "id": "p-adaptive",
+                        "runs": ["epic"],
+                        "process_repeats": 1,
+                        "document": lambda run, k: paths_document([row_auto]),
+                        "env": {},
+                    }
+                ],
+                lane="mlx",
+            )
+            pr = campaign.paths_report([paths_dir])
+            summary_ad = pr["summary"][0]["adaptive_speculative"]
+            self.assertIsNotNone(summary_ad)
+            self.assertTrue(summary_ad["adaptive"])
+            self.assertEqual(summary_ad["initial_proposers"], ["mtp"])
+            self.assertEqual(summary_ad["final_proposers"], ["prompt_lookup"])
+            self.assertEqual(summary_ad["depth_changes"], 1.0)
+            self.assertEqual(summary_ad["proposer_switches"], 1.0)
+            self.assertAlmostEqual(summary_ad["cost"]["ms_per_committed_token"], 0.5, places=2)
+            pmd = campaign.paths_markdown(pr)
+            self.assertIn("### Adaptive speculative", pmd)
+            self.assertIn("mtp -> prompt_lookup", pmd)
+
+            # 2) compare_campaigns & markdown_report emit adaptive_speculative paired rows
+            #    covering both auto-vs-off and vs_baseline_auto.
+            def make_doc(run, k):
+                def extra(p, o):
+                    is_epic_auto = run == "epic" and o == "auto"
+                    base = {
+                        "wall_ms": {"n": 3, "mean": (140.0 if is_epic_auto else 220.0) + jitter(k)},
+                        "peak_memory_bytes": {"n": 3, "mean": float(2 << 30)},
+                    }
+                    if is_epic_auto:
+                        base.update(
+                            {
+                                "adaptive_speculative": adaptive_auto,
+                                "mean_accepted_length": 3.0,
+                                "accepted_tokens": 60,
+                                "verify_steps": 20,
+                                "generated_tokens": 80,
+                            }
+                        )
+                    else:
+                        base.update(
+                            {
+                                "mean_accepted_length": 0.0,
+                                "accepted_tokens": 0,
+                                "verify_steps": 80,
+                                "generated_tokens": 80,
+                            }
+                        )
+                    return base
+
+                def val(p, o, m):
+                    if m == "decode_tok_s":
+                        return (92.0 if (run == "epic" and o == "auto") else 60.0) + jitter(k)
+                    if m == "ttft_ms":
+                        return 25.0 + jitter(k)
+                    return 50.0
+
+                return document(run, value=val, row_extra=extra)
+
+            cmp_dir = write_campaign(
+                Path(td) / "adaptive-cmp",
+                [{"id": "paired-adaptive", "runs": ["epic", "baseline"], "document": make_doc}],
+            )
+            report = campaign.compare_campaigns([cmp_dir], LIVE_DEFAULTS)
+            paired = report["adaptive_speculative"]
+            self.assertTrue(paired, "expected adaptive_speculative paired entries")
+            sample = paired[0]
+            self.assertAlmostEqual(sample["wall_ms"]["candidate"]["mean"], 140.0, places=1)
+            self.assertAlmostEqual(sample["wall_ms"]["reference"]["mean"], 220.0, places=1)
+            self.assertIsNotNone(sample["vs_baseline_auto"])
+            self.assertAlmostEqual(
+                sample["vs_baseline_auto"]["wall_ms"]["candidate"]["mean"], 140.0, places=1
+            )
+            self.assertAlmostEqual(
+                sample["vs_baseline_auto"]["wall_ms"]["reference"]["mean"], 220.0, places=1
+            )
+            self.assertEqual(sample["accepted_per_pass"], 3.0)
+            self.assertEqual(sample["tokens_per_pass"], 4.0)
+            self.assertEqual(sample["adaptive_speculative"]["final_proposers"], ["prompt_lookup"])
+            self.assertEqual(sample["adaptive_speculative"]["proposer_switches"], 1.0)
+
+            md = campaign.markdown_report(report)
+            self.assertIn("## Adaptive speculative — paired auto vs off (SW-7237)", md)
+            self.assertIn("### Adaptive speculative — candidate auto vs baseline auto", md)
+            self.assertIn("140.0 vs 220.0", md)
+            self.assertIn("mtp -> prompt_lookup", md)

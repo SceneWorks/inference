@@ -1400,6 +1400,15 @@ mod tests {
             .unwrap();
         assert_eq!(row.tensor_count, 2);
         assert_eq!(row.resident_bytes, 68);
+        assert_eq!(
+            tracker.native_projection_report(),
+            vec![core_llm::ProjectionReport {
+                kind: "fp8_e4m3".into(),
+                count: 2,
+                params: 64,
+                resident_bytes: 68,
+            }]
+        );
     }
 
     #[test]
@@ -1432,6 +1441,7 @@ mod tests {
         assert_eq!(completed.resident_bytes(), 2304 + 8192 + 256);
         tracker.record("packed", DenseFallback, 8192).unwrap();
         tracker.record("packed", NativePacked, 2304).unwrap();
+        assert!(tracker.native_projection_report().is_empty());
         assert_eq!(tracker.materialized_bytes("packed"), Some(8192));
         assert_eq!(tracker.facts().unwrap().receipt().demotions.len(), 1);
     }

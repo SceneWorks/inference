@@ -500,7 +500,12 @@ impl Pipeline {
         }
         let vb = self.component_vb("transformer", DIT_DTYPE)?;
         // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`).
-        let packed = vb.contains_tensor("proj_out.scales");
+        let packed = adapters::requires_additive(
+            &vb,
+            &self.root.join("transformer"),
+            "wan",
+            &self.adapters,
+        )?;
         if packed {
             let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
             if self.adapters.is_empty() {

@@ -17953,7 +17953,7 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16; fixed generated E4M3/E5M2, calibrated scalar, rowwise and swizzled MXFP8 source matrices; identity, output dtype and additive rank-one adapter assertions",
+    "fixture_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16; fixed generated E4M3/E5M2 raw and weight-only described scalar, calibrated scalar, rowwise and swizzled MXFP8 source matrices; identity, output dtype and additive rank-one adapter assertions",
     "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
     "required_environment": [],
     "device_witness": "Successful source-backed Linear and adapted projection outputs observed on the selected CUDA device before exact independent coefficient comparisons",
@@ -17976,7 +17976,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference."
+          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference. Prove raw and described full-precision E4M3/E5M2 with exact 19x48 activations and 48x48 weights spanning three K tiles, partial M/N tiles and an input offset. Preserve BF16, F16 and F32 activation precision, scaled weight rounding, bias, packed residence and the additive rank-one residual."
         ]
       }
     },
@@ -110487,7 +110487,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls. The adapted native constructor uses its rounded-input base and separately applies two original-input matrix deltas, with bias and exact dense fold controls"
         ]
       }
     },
@@ -168034,6 +168034,45 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs::stream_tests::a_deferred_generation_reproduces_the_eager_one",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "mlx_gen_iris",
+    "target_kind": "lib",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs",
+    "fqn": "stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "fixture_identity": {
+      "kind": "committed-and-source-defined-miniature",
+      "fixture_root": "crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot/iris",
+      "recipe": "Copy the configuration and deterministically replace two skeleton and two block projections with signed E4M3 FP8 and group-64 per-row ConvRot INT8 codes and publisher scales. The skeleton FP8 projection carries a descriptor and the block FP8 projection uses legacy scale_weight and scale_input companions. Log both checkpoint SHA-256 digests."
+    },
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs and the existing stream_tests::Case and stream_tests::exec helpers",
+    "output_contract": "BF16 Iris backbone output has the input shape and finite, nonconstant values. Eager and deferred Metal outputs are exactly equal at windows one, two, and full. Both codecs retain the expected operands and report two native-packed projections, publisher scale bytes, and no fallback from the bound checkpoint.",
+    "body_completion_marker": "MODEL_INFERENCE_BODY_COMPLETED stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
+    "expected_devices": [
+      "mlx-metal"
+    ],
+    "device_observation": "Actual selected MLX stream inside the backbone forward scope",
+    "device_environment": "MODEL_INFERENCE_CASE_FQN",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests/native_formats.rs::stream_tests::native_formats::source_native_fp8_and_convrot_match_eager_and_windowed_on_metal",
       "requirements": []
     }
   },
@@ -270960,9 +270999,9 @@
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
-    "fixture_identity": "Original E4M3FN, E5M2, publisher rowwise and swizzled MXFP8 source bytes; 1x1x32 and tail 3x17x35 codebook controls",
+    "fixture_identity": "Original E4M3FN, E5M2, publisher rowwise and swizzled MXFP8 source bytes; calibrated 1x1x32 and tail 3x17x35 controls plus scalar weight-only midpoint and 17x19x67 controls",
     "configuration_source": "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs::logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding",
-    "output_contract": "F64 independent codebook oracle, <=1 BF16 ULP single output and <=2 BF16 ULP multirow; exact MX scale discriminant and pre-bias dtype rounding",
+    "output_contract": "F64 calibrated codebook oracle, <=1 BF16 ULP single output and <=2 BF16 ULP multirow; exact MX scale and weight-only midpoint/pre-bias discriminants; scalar weight-only against scaled cast-before-matmul F32/F16/BF16 oracle with packed byte residency",
     "cargo_features": [
       "model-inference-proof"
     ],
@@ -270978,7 +271017,7 @@
     },
     "required_environment": [],
     "reachable_helper_trace": [
-      "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs -> mlx_layers::fp8::Fp8Linear::forward -> model-selected Metal stream tiled matmul"
+      "crates/media/mlx-gen/src/logical_weights/fp8_metal_proof.rs -> check_weight_only_scalar_projection and calibrated controls -> mlx_layers::fp8::Fp8Linear::forward -> model-selected Metal stream tiled matmul"
     ],
     "input_contract": {
       "fixture_kind": "source-defined",

@@ -439,6 +439,7 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
             speculative: Vec::new(),
             supported_constraints: vec![],
             tree_verify: None,
+            prefix_checkpoints: None,
         },
     }
 }

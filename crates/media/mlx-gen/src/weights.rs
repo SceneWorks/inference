@@ -29,6 +29,7 @@ pub struct Weights {
     accessed: RefCell<std::collections::HashSet<String>>,
     planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
     planned_fp8: HashMap<String, mlx_layers::fp8::Fp8Linear>,
+    native_deltas: HashMap<String, Vec<Array>>,
 }
 
 impl Weights {
@@ -41,6 +42,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         }
     }
 
@@ -76,6 +78,7 @@ impl Weights {
     /// A component remap shares the physical source's receipt and rotation handles.
     pub fn component_view(&self) -> Self {
         Self {
+            metadata: self.metadata.clone(),
             source_reads: self.source_reads.clone(),
             ..Self::empty()
         }
@@ -87,21 +90,96 @@ impl Weights {
         let mut dest = self.component_view();
         for key in self.keys() {
             let Some(target) = select(key) else { continue };
-            let a = self.get(key).expect("key iterated from this map");
-            dest.tensors.insert(target.clone(), a.clone());
-            dest.alias_source_row(key, &target);
-            if let (Some(from), Some(to)) =
-                (key.strip_suffix(".weight"), target.strip_suffix(".weight"))
-            {
-                if let Some(p) = self.planned_fp8(from) {
-                    dest.planned_fp8.insert(to.to_owned(), p.clone());
+            self.copy_renamed_to(&mut dest, key, &target);
+        }
+        dest
+    }
+
+    fn copy_renamed_to(&self, dest: &mut Self, from: &str, to: &str) {
+        let array = self.get(from).expect("selected tensor is present");
+        dest.tensors.insert(to.to_owned(), array.clone());
+        dest.alias_source_row(from, to);
+        if let Some(source) = self.projection_base_for_key(from) {
+            let target = to
+                .strip_suffix(".weight")
+                .or_else(|| to.strip_suffix("_weight"))
+                .unwrap_or(to);
+            for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                if let Some(array) = self.tensors.get(&format!("{source}{suffix}")) {
+                    dest.tensors
+                        .insert(format!("{target}{suffix}"), array.clone());
                 }
-                if let Some(g) = self.planned_convrot(from) {
-                    dest.planned_convrot.insert(to.to_owned(), g);
+            }
+            if let Some(deltas) = self.native_deltas.get(source) {
+                dest.native_deltas.insert(target.to_owned(), deltas.clone());
+            }
+            if let Some(projection) = self.planned_fp8(source) {
+                dest.planned_fp8
+                    .insert(target.to_owned(), projection.clone());
+            }
+            if let Some(geometry) = self.planned_convrot(source) {
+                dest.planned_convrot.insert(target.to_owned(), geometry);
+            }
+        }
+    }
+
+    fn projection_base_for_key<'a>(&self, key: &'a str) -> Option<&'a str> {
+        key.strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .or_else(|| {
+                (self.tensors.contains_key(&format!("{key}.comfy_quant"))
+                    || self.planned_fp8.contains_key(key)
+                    || self.planned_convrot.contains_key(key))
+                .then_some(key)
+            })
+    }
+
+    /// Consume a selected window without detaching its native operators or physical-source facts.
+    /// A selected projection owns its generated descriptors and scales even when those keys were
+    /// absent from the file header used to plan the window. Array handles move without a payload
+    /// copy; the source map releases the entire selected group before the caller materializes it.
+    pub fn take_renamed(&mut self, keys: &[(String, String)]) -> Result<Self> {
+        let mut mapping = std::collections::BTreeMap::<String, String>::new();
+        let mut targets = HashMap::<String, String>::new();
+        let mut add = |from: String, to: String| -> Result<()> {
+            if !self.tensors.contains_key(&from) {
+                return Err(Error::MissingTensor(from));
+            }
+            if let Some(previous) = mapping.insert(from.clone(), to.clone()) {
+                if previous != to {
+                    return Err(Error::Msg(format!("conflicting tensor remap for {from}")));
+                }
+            }
+            if let Some(previous) = targets.insert(to.clone(), from.clone()) {
+                if previous != from {
+                    return Err(Error::Msg(format!("conflicting tensor sources for {to}")));
+                }
+            }
+            Ok(())
+        };
+        for (from, to) in keys {
+            add(from.clone(), to.clone())?;
+            if let Some(source) = self.projection_base_for_key(from) {
+                let target = to
+                    .strip_suffix(".weight")
+                    .or_else(|| to.strip_suffix("_weight"))
+                    .unwrap_or(to);
+                for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                    let companion = format!("{source}{suffix}");
+                    if self.tensors.contains_key(&companion) {
+                        add(companion, format!("{target}{suffix}"))?;
+                    }
                 }
             }
         }
-        dest
+        let mut dest = self.component_view();
+        for (from, to) in &mapping {
+            self.copy_renamed_to(&mut dest, from, to);
+        }
+        for from in mapping.keys() {
+            self.remove(from);
+        }
+        Ok(dest)
     }
 
     /// Retain the complete physical matrix once when a family splits contiguous output rows.
@@ -181,6 +259,42 @@ impl Weights {
         mlx_layers::NativeProjection::from_key(self, base, key, false)
     }
 
+    /// Apply an adapter in logical coefficient space. Dense targets fold at their original dtype.
+    /// A native matrix keeps its source operands and binds each floating delta at construction.
+    pub fn merge_projection_delta(
+        &mut self,
+        base: &str,
+        delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    ) -> Result<()> {
+        let key = format!("{base}.weight");
+        if mlx_layers::NativeProjection::is_declared(self, base, &key) {
+            if let Some(p) = mlx_layers::NativeProjection::from_weights(self, base, false)? {
+                let shape = p.shape();
+                let delta = delta_at(&shape)?;
+                mlx_layers::adapters::AdaptableLinear::validate_native_delta(&shape, &delta)?;
+                // Finish this adapter's reconstruction while its factors are resident. The
+                // model's first forward should only apply the prepared residual to its input.
+                delta.eval()?;
+                self.native_deltas
+                    .entry(base.to_owned())
+                    .or_default()
+                    .push(delta);
+                return Ok(());
+            }
+        }
+        let weight = self.require(&key)?;
+        if !weight.dtype().is_float() && weight.dtype() != Dtype::Float64 {
+            return Err(Error::Msg(format!(
+                "{key}: cannot fold an adapter into {:?} storage; a packed projection needs its additive adapter path",
+                weight.dtype()
+            )));
+        }
+        let delta = delta_at(weight.shape())?;
+        let merged = mlx_rs::ops::add(weight, &delta.as_dtype(weight.dtype())?)?;
+        self.insert(key, merged);
+        Ok(())
+    }
+
     pub fn insert_source_projection(
         &mut self,
         key: &str,
@@ -217,6 +331,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         }
     }
 
@@ -255,6 +370,7 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -578,6 +694,7 @@ path,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -684,6 +801,7 @@ f,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
+            native_deltas: HashMap::new(),
         })
     }
 
@@ -766,6 +884,7 @@ f,
     /// internal names + conv-weight transposes) when loading real weights.
     pub fn insert(&mut self, key: impl Into<String>, tensor: Array) {
         let key = key.into();
+        Self::invalidate_projection_deltas(&mut self.native_deltas, &key);
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
@@ -780,11 +899,28 @@ f,
     /// Copy the tensor at `from` to the new key `to` (no-op if `from` is absent). A convenience
     /// for the identity-but-renamed entries in a checkpoint→internal mapping.
     pub fn alias(&mut self, from: &str, to: &str) {
+        let deltas = self
+            .projection_base_for_key(from)
+            .and_then(|base| self.native_deltas.get(base))
+            .cloned();
+        self.alias_tensor(from, to);
+        if let Some(deltas) = deltas {
+            let dest = to
+                .strip_suffix(".weight")
+                .or_else(|| to.strip_suffix("_weight"))
+                .unwrap_or(to);
+            self.native_deltas.insert(dest.to_owned(), deltas);
+        }
+    }
+
+    fn alias_tensor(&mut self, from: &str, to: &str) {
         if let Some(t) = self.tensors.get(from).cloned() {
             self.source_reads.alias(from, to);
-            if let (Some(source), Some(dest)) =
-                (from.strip_suffix(".weight"), to.strip_suffix(".weight"))
-            {
+            if let Some(source) = self.projection_base_for_key(from) {
+                let dest = to
+                    .strip_suffix(".weight")
+                    .or_else(|| to.strip_suffix("_weight"))
+                    .unwrap_or(to);
                 for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
                     if let Some(array) = self.tensors.get(&format!("{source}{suffix}")).cloned() {
                         self.tensors.insert(format!("{dest}{suffix}"), array);
@@ -809,12 +945,26 @@ f,
         }
     }
 
+    fn invalidate_projection_deltas(deltas: &mut HashMap<String, Vec<Array>>, key: &str) {
+        if deltas.is_empty() {
+            return;
+        }
+        let base = gen_core::checkpoint_codec::projection_companion_base(key)
+            .or_else(|| key.strip_suffix(".weight"))
+            .or_else(|| key.strip_suffix("_weight"))
+            .unwrap_or(key);
+        deltas.remove(base);
+    }
+
     /// Remove and return the tensor at `key` (`None` if absent). Lets a **consuming** loader release
     /// each source tensor from the map as soon as it has been copied/quantized into the built model, so
     /// the source and the growing built model don't both stay resident — bounding the load-time
     /// unified-memory transient to ~the built size (sc-11030; the gpt-oss encoder is otherwise a
     /// 13 GB-source + 21/63 GB-built spike). MLX returns the dropped buffer to its reuse pool.
     pub fn remove(&mut self, key: &str) -> Option<Array> {
+        if self.tensors.contains_key(key) {
+            Self::invalidate_projection_deltas(&mut self.native_deltas, key);
+        }
         if let Some(base) = key
             .strip_suffix(".weight")
             .or_else(|| key.strip_suffix(".weight_scale"))
@@ -829,7 +979,14 @@ f,
     /// Drop every tensor whose key starts with `prefix` (e.g. `"model.layers.7."` once layer 7 is
     /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
     pub fn remove_prefix(&mut self, prefix: &str) {
-        self.tensors.retain(|k, _| !k.starts_with(prefix));
+        self.tensors.retain(|key, _| {
+            if key.starts_with(prefix) {
+                Self::invalidate_projection_deltas(&mut self.native_deltas, key);
+                false
+            } else {
+                true
+            }
+        });
         self.planned_fp8
             .retain(|base, _| self.tensors.contains_key(&format!("{base}.weight")));
         self.planned_convrot.retain(|base, _| {
@@ -866,7 +1023,8 @@ f,
             .collect()
     }
 
-    /// Consume the container into its raw tensor map (drops metadata and access bookkeeping).
+    /// Export raw checkpoint tensors, excluding runtime adapters, metadata and access bookkeeping.
+    /// Keep the `Weights` view through model construction when applying projection deltas.
     /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
     /// loader, which never has metadata to begin with.
     pub fn into_tensors(mut self) -> HashMap<String, Array> {
@@ -922,9 +1080,17 @@ f,
             .chain(self.planned_convrot.keys().map(String::as_str))
             .chain(self.planned_fp8.keys().map(String::as_str))
             .flat_map(|base| {
-                [".weight", ".weight_scale", ".input_scale", ".comfy_quant"]
-                    .into_iter()
-                    .map(move |suffix| format!("{base}{suffix}"))
+                [
+                    "",
+                    ".weight",
+                    "_weight",
+                    ".bias",
+                    ".weight_scale",
+                    ".input_scale",
+                    ".comfy_quant",
+                ]
+                .into_iter()
+                .map(move |suffix| format!("{base}{suffix}"))
             })
             .filter(|key| self.tensors.contains_key(key))
             .collect()
@@ -1012,6 +1178,9 @@ impl mlx_layers::MlxWeightSource for Weights {
     fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
         self.source_reads.get(key)
     }
+    fn native_projection_deltas(&self, base: &str) -> &[Array] {
+        self.native_deltas.get(base).map_or(&[], Vec::as_slice)
+    }
     fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
         self.planned_fp8(base)
     }
@@ -1029,6 +1198,210 @@ impl mlx_layers::MlxWeightSource for Weights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constructor and handle metadata only. Neither projection nor adapter forward is evaluated.
+    #[test]
+    fn native_adapter_deltas_follow_projection_remaps_and_replacements() {
+        use mlx_layers::adapters::Adapter;
+        use mlx_layers::{ComfyQuantFormat, MlxWeightSource};
+
+        let mut w = Weights::empty();
+        let fp8 = mlx_layers::fp8::Fp8Linear::new(
+            ComfyQuantFormat::Mxfp8,
+            Array::from_slice(&[0x38u8; 32 * 32], &[32, 32]),
+            Some(Array::from_slice(&[127u8; 512], &[128, 4])),
+            None,
+            &[3, 2],
+            None,
+        )
+        .unwrap();
+        w.insert_source_projection("p.weight", mlx_layers::NativeProjection::Fp8(fp8))
+            .unwrap();
+        w.insert("p.scale_weight", Array::from_f32(1.0));
+        for v in [1.0f32, 2.0] {
+            w.merge_projection_delta("p", |shape| {
+                assert_eq!(shape, &[3, 2]);
+                Ok(Array::from_slice(&[v; 6], shape))
+            })
+            .unwrap();
+        }
+        assert!(w
+            .merge_projection_delta("p", |_| Ok(Array::from_f32(7.0)))
+            .is_err());
+        assert_eq!(w.native_projection_deltas("p").len(), 2);
+        w.alias("p.weight", "alias.weight");
+        let mut selected =
+            w.select_renamed(|key| (key == "alias.weight").then(|| "part.weight".into()));
+        let taken = selected
+            .take_renamed(&[("part.weight".into(), "final.weight".into())])
+            .unwrap();
+        assert!(selected.native_projection_deltas("part").is_empty());
+        let layer = mlx_layers::quant::lin(&taken, "final", false, 64).unwrap();
+        assert_eq!(layer.base_shape(), [3, 2]);
+        assert_eq!(layer.fp8_base().unwrap().codes().shape(), &[32, 32]);
+        let residuals = layer
+            .adapters()
+            .iter()
+            .map(|a| match a {
+                Adapter::Lokr { delta, scale } => {
+                    assert_eq!(*scale, 1.0);
+                    delta.as_slice::<f32>()[0]
+                }
+                _ => panic!("expected a logical coefficient delta"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(residuals, [1.0, 2.0]);
+        let via_native = mlx_layers::quant::native_lin(&taken, "final", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(via_native.adapters().len(), 2);
+        w.remove_prefix("alias.");
+        assert!(w.native_projection_deltas("alias").is_empty());
+        assert_eq!(w.native_projection_deltas("p").len(), 2);
+        let mut legacy = w.clone();
+        legacy.alias("p.weight", "p.scale.weight");
+        legacy.insert("p.scale_weight", Array::from_f32(2.0));
+        assert!(legacy.native_projection_deltas("p").is_empty());
+        assert_eq!(legacy.native_projection_deltas("p.scale").len(), 2);
+
+        w.insert("p.weight_scale", Array::from_f32(1.0));
+        assert!(w.native_projection_deltas("p").is_empty());
+        w.insert("raw.weight", Array::from_slice(&[7u8; 6], &[3, 2]));
+        assert!(w
+            .merge_projection_delta("raw", |_| panic!("raw code fold reached adapter math"))
+            .is_err());
+    }
+
+    /// Layout/handle bookkeeping only: no evaluation, operator construction or learned work.
+    #[test]
+    fn native_component_windows_keep_companions_observations_and_constructor_reads() {
+        use gen_core::checkpoint_codec::*;
+        use gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let descriptor =
+            br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64,"per_row":true}"#;
+        let headers = [
+            SafetensorsTensorHeader {
+                name: "source.weight".into(),
+                dtype: Stored::I8,
+                shape: vec![2, 64],
+                data_bytes: 128,
+            },
+            SafetensorsTensorHeader {
+                name: "source.weight_scale".into(),
+                dtype: Stored::F32,
+                shape: vec![2, 1],
+                data_bytes: 8,
+            },
+            SafetensorsTensorHeader {
+                name: "source.bias".into(),
+                dtype: Stored::F32,
+                shape: vec![2],
+                data_bytes: 8,
+            },
+            SafetensorsTensorHeader {
+                name: "source.comfy_quant".into(),
+                dtype: Stored::U8,
+                shape: vec![descriptor.len()],
+                data_bytes: descriptor.len() as u64,
+            },
+        ];
+        let codecs = CheckpointCodecRegistry::new(
+            DENSE_CODECS
+                .iter()
+                .chain(COMFY_QUANT_CODECS.iter())
+                .copied(),
+        )
+        .unwrap();
+        let plan = compile_logical_weight_plan(
+            &headers,
+            &BTreeMap::from([("source.comfy_quant".into(), descriptor.to_vec())]),
+            &IdentityKeyMapping,
+            &codecs,
+            &SourceCodecResidency,
+        )
+        .unwrap();
+        let mut source = Weights::from_map(HashMap::from([
+            (
+                "source.weight".into(),
+                Array::from_slice(&[1i8; 128], &[2, 64]),
+            ),
+            (
+                "source.weight_scale".into(),
+                Array::from_slice(&[1.2345f32, 2.3456], &[2, 1]),
+            ),
+            (
+                "source.bias".into(),
+                Array::from_slice(&[0.12345f32, 0.23456], &[2]),
+            ),
+            (
+                "source.comfy_quant".into(),
+                Array::from_slice(descriptor, &[descriptor.len() as i32]),
+            ),
+        ]));
+        source.source_reads = mlx_layers::source::SourceReads::new(Arc::new(plan), &[]);
+        source
+            .metadata
+            .insert("producer".into(), "layout-control".into());
+        assert!(source.native_tensor_keys().contains("source.bias"));
+
+        // A physical-header selector may name only the matrix. Normalized companions still
+        // travel with it, including when the destination architecture names a bare parameter.
+        let selected = source.select_renamed(|key| (key == "source.weight").then(|| "bare".into()));
+        assert_eq!(selected.metadata("producer"), Some("layout-control"));
+        assert!(selected.source_reads.get("bare").is_some());
+        assert!(selected.native_tensor_keys().contains("bare"));
+        assert_eq!(
+            selected.peek("bare.weight_scale").unwrap().dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(
+            selected.unused_keys().len(),
+            3,
+            "selection is not constructor consumption"
+        );
+
+        let count = source.len();
+        assert!(source
+            .take_renamed(&[("missing.weight".into(), "target.weight".into())])
+            .is_err());
+        assert_eq!(
+            source.len(),
+            count,
+            "a refused window leaves the source intact"
+        );
+        assert!(source
+            .take_renamed(&[
+                ("source.weight".into(), "target.weight".into()),
+                ("source.bias".into(), "target.weight".into()),
+            ])
+            .is_err());
+        assert_eq!(source.len(), count);
+
+        let window = source
+            .take_renamed(&[
+                ("source.weight".into(), "target.weight".into()),
+                ("source.bias".into(), "target.bias".into()),
+            ])
+            .unwrap();
+        assert!(
+            source.is_empty(),
+            "the old window releases codes, scales and descriptors together"
+        );
+        assert!(window.source_reads.get("target.weight").is_some());
+        assert_eq!(window.peek("target.weight").unwrap().dtype(), Dtype::Int8);
+        assert_eq!(
+            window.peek("target.weight_scale").unwrap().dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(window.peek("target.bias").unwrap().dtype(), Dtype::Float32);
+        assert_eq!(window.unused_keys().len(), 4);
+        window.require("target.weight").unwrap();
+        assert_eq!(window.unused_keys().len(), 3);
+        assert!(window.unused_keys().contains(&"target.comfy_quant"));
+    }
 
     /// CPU reader only: no model, learned operation, coherence probe, or GPU evaluation.
     #[test]

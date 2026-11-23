@@ -1944,8 +1944,8 @@ fn assert_device_positions_steps_match(what: &str, host_model: &CausalLm, dev_mo
         } else {
             StepRequest::last(tokens)
         };
-        let h = host_model.forward_step(&mut hc, req).unwrap();
-        let d = dev_model.forward_step(&mut dc, req).unwrap();
+        let h = host_model.forward_step(&mut hc, req.clone()).unwrap();
+        let d = dev_model.forward_step(&mut dc, req.clone()).unwrap();
         let g = dev_model.forward_step(&mut gc, req).unwrap();
         assert_rows_close(&format!("{what} step {n} logits"), &d.logits, &h.logits);
         assert_eq!(

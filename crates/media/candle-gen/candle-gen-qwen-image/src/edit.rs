@@ -305,10 +305,8 @@ pub(crate) fn load_transformer(
         let _ = crate::adapters::install_additive(&mut dit, adapters)?;
         return Ok(dit);
     }
-    // Dense fold FALLBACK (sc-11684): LoHa / untagged-LyCORIS-LoKr on a dense base — no deferred additive
-    // form, so fold the delta into the weight before the MMDiT is built (each merged tensor cast to
-    // `dtype` + moved to `device` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path).
-    // Bit-exact but not streamable; these adapter types are rare and dense-only.
+    // LoHa and untagged LyCORIS LoKr reconstruct full module deltas. Dense targets fold in
+    // source order; a source-native projection applies each delta to its original input.
     let vb = crate::adapters::fold_checkpoint(
         component_vb(root, "transformer", dtype, device)?,
         adapters,

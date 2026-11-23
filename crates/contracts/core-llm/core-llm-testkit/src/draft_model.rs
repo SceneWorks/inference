@@ -1143,6 +1143,7 @@ pub fn qwen3vl_image_prompts() -> Vec<BenchPrompt> {
             thinking: None,
             tool_calls: Vec::new(),
         }],
+        prefix_checkpoints: None,
     };
     vec![
         prompt(

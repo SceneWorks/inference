@@ -1,8 +1,5 @@
-//! SDXL component loaders for the InstantID provider (sc-5491, epic 5480) — the candle twins of
-//! `mlx-gen-sdxl`'s `load_unet_dtype` / `load_vae` / `load_controlnet`. The txt2img `crate::pipeline`
-//! loads the **stock** candle-transformers UNet internally; InstantID needs the **vendored** UNet (the
-//! one carrying the `add_embedding` micro-conditioning + the decoupled IP-Adapter cross-attention from
-//! phase 2c), so these build that stack from an SDXL snapshot + a diffusers ControlNet checkpoint.
+//! SDXL UNet, VAE, and ControlNet loaders. Plain SDXL and InstantID share the
+//! vendored UNet with its pooled-text and time-ID conditioning head.
 //!
 //! The IP-Adapter K/V install is NOT done here — the caller (the `candle-gen-instantid` glue) loads the
 //! converted `ip-adapter.safetensors` (`image_proj.*` Resampler + `ip_adapter.*` pairs) and calls
@@ -22,46 +19,24 @@ use crate::unet::{
     sdxl_unet_config, ControlNet, ControlNetConfig, UNet2DConditionModel, VaeMomentsEncoder,
 };
 
-/// SDXL `add_embedding` dims (diffusers `unet/config.json`): `addition_time_embed_dim = 256`,
-/// `projection_class_embeddings_input_dim = 2816` (pooled 1280 + 6·256). The InstantID UNet needs the
-/// `add_embedding` head the plain `forward` omits.
 const ADDITION_TIME_EMBED_DIM: usize = 256;
 const PROJECTION_INPUT_DIM: usize = 2816;
 
-/// Build the stock flash-attention UNet against the same model geometry and checkpoint reader
-/// as the vendored math-attention path.
-pub(crate) fn load_flash_unet(
-    file: PathBuf,
-    device: &Device,
-    dtype: DType,
-) -> Result<candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel> {
-    use candle_transformers::models::stable_diffusion::unet_2d as stock;
-    let cfg = sdxl_unet_config();
-    let blocks = cfg
-        .blocks
-        .into_iter()
-        .map(|block| stock::BlockConfig {
-            out_channels: block.out_channels,
-            use_cross_attn: block.use_cross_attn,
-            attention_head_dim: block.attention_head_dim,
-        })
-        .collect();
-    let stock_cfg = stock::UNet2DConditionModelConfig {
-        blocks,
-        center_input_sample: cfg.center_input_sample,
-        flip_sin_to_cos: cfg.flip_sin_to_cos,
-        freq_shift: cfg.freq_shift,
-        layers_per_block: cfg.layers_per_block,
-        downsample_padding: cfg.downsample_padding,
-        mid_block_scale_factor: cfg.mid_block_scale_factor,
-        norm_num_groups: cfg.norm_num_groups,
-        norm_eps: cfg.norm_eps,
-        cross_attention_dim: cfg.cross_attention_dim,
-        use_linear_projection: cfg.use_linear_projection,
-        sliced_attention_size: None,
-    };
-    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
-    Ok(stock::UNet2DConditionModel::new(vb, 4, 4, true, stock_cfg)?)
+/// Build the shared SDXL UNet body and its pooled-text + six time-ID conditioning head.
+pub(crate) fn new_sdxl_unet(vb: VarBuilder<'_>) -> Result<UNet2DConditionModel> {
+    // diffusers unet/config.json: projection input = pooled 1280 + 6 time IDs × 256.
+    new_conditioned_unet(vb, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)
+}
+
+fn new_conditioned_unet(
+    vb: VarBuilder<'_>,
+    addition_time_embed_dim: usize,
+    projection_input_dim: usize,
+) -> Result<UNet2DConditionModel> {
+    Ok(
+        UNet2DConditionModel::new(vb.clone(), 4, 4, false, sdxl_unet_config())?
+            .with_add_embedding(vb, addition_time_embed_dim, projection_input_dim)?,
+    )
 }
 
 pub(crate) fn load_stock_clip(
@@ -94,8 +69,7 @@ pub fn load_instantid_unet(
     // One mmap'd VarBuilder feeds both the UNet body and the `add_embedding` head (both live in the
     // same `unet/` checkpoint). `VarBuilder` is Arc-backed, so the clone is cheap.
     let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
-    let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-        .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+    let unet = new_sdxl_unet(vs)?;
     Ok(unet)
 }
 
@@ -173,8 +147,7 @@ pub fn load_vendored_unet_with_adapters(
             // Conv LoRA folds into the dense convs; the packed Linears stay packed for the additive push.
             let conv = crate::adapters::fold_conv_adapters(&mut raw, adapters, &table)?;
             let vs = VarBuilder::from_tensors(raw, dtype, device);
-            let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
+            let mut unet = new_conditioned_unet(vs, addition_time_embed_dim, projection_input_dim)?;
             let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             crate::adapters::guard_each_adapter_matched(
                 adapters,
@@ -194,8 +167,7 @@ pub fn load_vendored_unet_with_adapters(
             };
             let table = crate::adapters::build_sdxl_kohya_table_from_file(&unet_file)?;
             let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
-            let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
+            let mut unet = new_conditioned_unet(vs, addition_time_embed_dim, projection_input_dim)?;
             let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
             crate::adapters::guard_each_adapter_matched(

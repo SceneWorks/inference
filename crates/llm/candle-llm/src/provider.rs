@@ -10,30 +10,34 @@
 use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use candle_core::{DType, Device, Tensor};
 use core_llm::DraftReport;
 use core_llm::{
-    AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
-    Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
-    JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message,
-    ModelSamplingDefaults, MtpStats, ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort,
-    RenderOptions, Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer,
-    StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
-    VideoRef,
+    AudioRef, BoundaryCandidates, Channel, ChatTemplate, CheckpointTelemetry, Constraint,
+    ConstraintDecodeTable, ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish,
+    GenerationTimings, ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint,
+    Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults, MtpStats,
+    NearTailConfig, PlannedAdmission, PlannedBoundary, PrefixCheckpointMode,
+    PrefixCheckpointPolicy, PrefixKind, PrefixPlannedContext, PrefixReuse, ProposerCapabilities,
+    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
+    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef, PREFIX_DOCUMENT_UNALIGNED,
+    PREFIX_PROPOSER_INCOMPATIBLE,
 };
 use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_adaptive,
     graph_demoted_step_admission_bytes, graph_workspace_admission_bytes_with_hidden_row,
-    prefill_restored, tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask,
-    CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason,
-    GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache,
-    PrefixStats, Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel,
-    StreamEvent, TappedQwen35,
+    prefill_restored_with_plan, tree_extra_positions, AdaptiveEngineConfig, BlockDraftProposer,
+    Boundary, ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer,
+    FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer,
+    NoProposer, PrefixCache, PrefixRestoreOutcome, PrefixStats, Proposer, RequestSpan,
+    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
 };
 use crate::device::select_device;
 use crate::error::to_core;
@@ -57,7 +61,7 @@ pub const PROVIDER_ID: &str = "candle-llama";
 
 // The prefix-cache reasons are the shared ones (sc-24437, E8): both backends name a bypass or a
 // snapshot that was not kept in the same words.
-use core_llm::{PREFIX_COPY_FAILED, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED};
+use core_llm::{PREFIX_COPY_FAILED, PREFIX_PAGED_NOT_SNAPSHOTTED};
 
 // The provider split by concern (sc-27302); every item stays reachable from this module, its
 // siblings and the tests through the glob imports below.
@@ -1089,6 +1093,8 @@ pub struct LlamaProvider {
     /// What became of the load's named draft (resident, or refused with the reason), reported in
     /// [`TextLlm::load_report`]. `None` when no draft was named.
     draft_report: Option<DraftReport>,
+    /// Defaults-table prefix-checkpoint mode (`off` | `auto`) used when a request leaves it unset.
+    prefix_checkpoints_default: PrefixCheckpointMode,
     /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the
     /// device's defaults-table row ([`crate::device::decode_defaults`]) unless
     /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
@@ -1593,10 +1599,10 @@ impl LlamaProvider {
     /// before the first. Says which path ran (`Reference`, `Mtp { drafts }`, …) and its counters;
     /// the MTP subset also reaches callers as `TextLlmOutput::mtp`.
     pub fn last_decode_record(&self) -> Option<DecodeRecord> {
-        *self
-            .last_decode
+        self.last_decode
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The speculative option a request that leaves it unset runs with on this provider: its
@@ -1610,6 +1616,16 @@ impl LlamaProvider {
     /// choice, e.g. a server flag); a request's own `speculative` / legacy `mtp` still wins.
     pub fn set_speculative_default(&mut self, speculative: core_llm::Speculative) {
         self.speculative_default = speculative;
+    }
+
+    /// The prefix-checkpoint mode an unset request runs with on this provider.
+    pub fn prefix_checkpoints_default(&self) -> PrefixCheckpointMode {
+        self.prefix_checkpoints_default
+    }
+
+    /// Override the default prefix-checkpoint mode for requests that leave it unset.
+    pub fn set_prefix_checkpoints_default(&mut self, mode: PrefixCheckpointMode) {
+        self.prefix_checkpoints_default = mode;
     }
 
     /// Select the loop a request whose speculation is off decodes on — one selector for both
@@ -1655,45 +1671,45 @@ impl LlamaProvider {
         self.prefix_cache().stats()
     }
 
+    /// Drop every entry from the cross-turn prefix cache.
+    pub fn clear_prefix_cache(&self) {
+        self.prefix_cache().clear();
+    }
+
     fn prefix_cache(&self) -> std::sync::MutexGuard<'_, PrefixCache> {
         self.prefix
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Where the rendered conversation ends and the generation prompt begins, when that is a
-    /// strict token prefix of `prompt_ids` (sc-24437): the point the hybrid decoder's prefix-cache
-    /// snapshot is taken at, because the next chat turn re-renders these messages and extends
-    /// them (whatever the template later does to this turn's reply). `None` when the template
-    /// renders the messages differently without a generation prompt.
-    fn conversation_boundary(
+    /// Resolve all candidate prefix boundaries (`document`, `shared_root`, `prev_message`,
+    /// `conversation_end`), plus whether an explicit document span failed to align.
+    fn resolve_boundary_candidates(
         &self,
         messages: &[Message],
         req: &TextLlmRequest,
         prompt_ids: &[i32],
-    ) -> Option<usize> {
-        let rendered = self
-            .template
-            .render_with(
-                messages,
-                &RenderOptions {
-                    add_generation_prompt: false,
-                    enable_thinking: req.enable_thinking_kwarg(),
-                    reasoning_effort: req.reasoning_effort,
-                    preserve_thinking: req.preserve_thinking,
-                    tools: &req.tools,
-                    // The same date the request's own render used (none on Candle), so the
-                    // conversation is a prefix of the prompt.
-                    date_string: None,
-                },
-            )
-            .ok()?;
-        let ids = self.tokenizer.encode(&rendered, false).ok()?;
-        let len = ids.len();
-        (len > 0
-            && len < prompt_ids.len()
-            && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b))
-        .then_some(len)
+        policy: PrefixCheckpointPolicy,
+    ) -> (BoundaryCandidates, bool) {
+        core_llm::prefix::resolve_boundary_candidates(
+            self.template.as_ref(),
+            &self.tokenizer,
+            messages,
+            req,
+            prompt_ids,
+            policy,
+            None,
+        )
+    }
+
+    /// Peak request-time snapshot bytes needed to capture `boundary`.
+    fn boundary_snapshot_bytes(&self, boundary: PlannedBoundary, mtp: bool) -> Option<u64> {
+        match &self.model {
+            Decoder::Qwen35(_) => {
+                self.prefix_snapshot_bytes(boundary.position, Some(boundary.position), mtp)
+            }
+            Decoder::Causal(_) => self.prefix_snapshot_bytes(boundary.position, None, false),
+        }
     }
 
     /// An upper bound on the bytes of the prefix-cache snapshot a text request on the engine
@@ -2811,6 +2827,7 @@ impl LlamaProvider {
                 core_llm::requested_prefix_cache_bytes(crate::device::decode_backend(device), None),
             )),
             speculative_default: crate::device::decode_defaults(device).speculative,
+            prefix_checkpoints_default: crate::device::decode_defaults(device).prefix_checkpoints,
             draft: None,
             block_draft: None,
             draft_report: None,
@@ -2955,6 +2972,8 @@ impl LlamaProvider {
                     ),
                 )),
                 speculative_default: crate::device::decode_defaults(device).speculative,
+                prefix_checkpoints_default: crate::device::decode_defaults(device)
+                    .prefix_checkpoints,
                 draft: None,
                 block_draft: None,
                 draft_report: None,
@@ -3020,6 +3039,7 @@ impl LlamaProvider {
                 core_llm::requested_prefix_cache_bytes(crate::device::decode_backend(device), None),
             )),
             speculative_default: crate::device::decode_defaults(device).speculative,
+            prefix_checkpoints_default: crate::device::decode_defaults(device).prefix_checkpoints,
             draft: None,
             block_draft: None,
             draft_report: None,
@@ -3173,6 +3193,7 @@ impl LlamaProvider {
                 core_llm::requested_prefix_cache_bytes(backend, None),
             )),
             speculative_default: backend.defaults().speculative,
+            prefix_checkpoints_default: backend.defaults().prefix_checkpoints,
             draft: None,
             block_draft: None,
             draft_report: None,

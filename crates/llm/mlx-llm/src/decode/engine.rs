@@ -69,8 +69,10 @@ use mlx_rs::{Array, Dtype};
 use core_llm::speculative::tree::{greedy_tree_step, sampled_tree_step, walk_tree, TreeStep};
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
-    AcceptanceMonitor, CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, PlainDecode,
-    ProposerKind, SamplerPath, Speculative, StepObservation,
+    ngram_peek_match_len, AdaptiveAction, AdaptiveSpeculativeController, AdaptiveSpeculativeReport,
+    AdaptiveStepInput, AutoSpeculativePlan, CudaGraphsReport, DecodeReport, HostSampleReason,
+    PathReport, PlainDecode, ProposerKind, SamplerPath, Speculative, StepCost,
+    MAX_DRAFT_CATCHUP_TOKENS, MAX_MTP_CATCHUP_TOKENS, NGRAM_PEEK_WINDOW_TOKENS,
 };
 use core_llm::{DraftTree, TreeVerifyReport, TreeWalk};
 
@@ -1381,13 +1383,16 @@ pub trait Proposer<T: SpeculativeTarget + ?Sized> {
 
     /// Bring the proposer up to date with steps the target ran **without** a proposal — the
     /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
-    /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
-    /// paired with its predecessor's target hidden row in `preceding_hidden`
-    /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
-    /// before the next [`propose`](Self::propose). The default does nothing — right for a
-    /// proposer whose state is the history alone (n-gram) or that [`commit`](Self::commit)
-    /// advances on a step without a proposal (a block draft; `draft_model`, which `auto` never
-    /// resolves to).
+    /// [`core_llm::AcceptanceMonitor::probing`]) or an inactive `prompt_lookup` stretch under
+    /// adaptive `auto` (SW-7237): `tokens` were fed at RoPE positions `position..`, each paired
+    /// with its predecessor's target hidden row in `preceding_hidden` (`[1, tokens.len(), hidden]`,
+    /// when [`wants_hidden`](Self::wants_hidden)). Called once, before the next
+    /// [`propose`](Self::propose), inside the engine's `switch_overhead_ns` timing seam. The
+    /// default does nothing — right for a proposer whose state is the history alone (n-gram) or
+    /// that [`commit`](Self::commit) advances on a step without a proposal (a block draft);
+    /// [`MtpProposer`](super::proposers::MtpProposer) and
+    /// [`DraftModelProposer`](super::proposers::DraftModelProposer) replay their inactive backlog
+    /// here so catch-up cost is charged as switching overhead.
     fn catch_up(
         &mut self,
         _target: &T,
@@ -1475,7 +1480,7 @@ pub struct EngineOptions<'a, 'c> {
     /// Whether the token-at-a-time loop may pipeline (see [`generate_speculative`]).
     pub pipelining: Pipelining,
     /// The request's speculative option (sc-24446). [`Speculative::Auto`] runs under `auto`'s
-    /// acceptance monitor ([`AcceptanceMonitor::for_request`], against the plain loop this run
+    /// acceptance monitor ([`core_llm::AcceptanceMonitor::for_request`], against the plain loop this run
     /// would fall back to — pipelined or not), which demotes a proposer that is not paying for
     /// itself to token-at-a-time decoding (see [`generate_speculative`]); any other option — an
     /// explicit proposer, `off`, the default — runs the proposer to the end.
@@ -1484,6 +1489,16 @@ pub struct EngineOptions<'a, 'c> {
     /// linearly. A target that cannot verify a tree on its cache
     /// ([`SpeculativeTarget::tree_unsupported`]) verifies linearly and the report names why.
     pub tree_rows: usize,
+    /// Resolved candidate pool for `Speculative::Auto` (feature SW-F357, story SW-7237). When
+    /// `None` under `Speculative::Auto`, the engine constructs a single-proposer plan from the
+    /// passed proposer and `drafts`.
+    pub adaptive_plan: Option<AutoSpeculativePlan>,
+    /// Maximum verify overshoot provisioned by admission / cache sizing (`None`: `drafts`).
+    /// Caps adaptive depth growth so a mid-request resize never overflows rollback buffers.
+    pub provisioned_max_depth: Option<usize>,
+    /// Optional explicit plain-decode reason stamped onto `AdaptiveSpeculativeReport` when no
+    /// proposer runs.
+    pub plain_reason: Option<String>,
 }
 
 /// The most tokens the pipelined loop reads back unpipelined while the caller has delivered
@@ -1620,6 +1635,9 @@ where
         pipelining,
         speculative_mode,
         tree_rows,
+        adaptive_plan,
+        provisioned_max_depth,
+        plain_reason,
     } = options;
     let mut owned_sampler;
     let sampler: &mut dyn TokenSampler = match sampler {
@@ -1636,6 +1654,63 @@ where
     } else {
         drafts
     };
+    let provisioned_width = provisioned_max_depth
+        .unwrap_or_else(|| {
+            if speculative_mode == Speculative::Auto {
+                adaptive_plan
+                    .as_ref()
+                    .map_or(width, |p| p.max_depth() as usize)
+                    .max(width)
+            } else {
+                width
+            }
+        })
+        .max(width);
+    let can_pipeline = pipelining == Pipelining::Auto
+        && crate::switches::PIPELINING.enabled()
+        && constraint.is_none()
+        && !sampler.reads_history();
+    let plain_decode = if can_pipeline {
+        PlainDecode::MlxPipelined
+    } else {
+        PlainDecode::MlxUnpipelined
+    };
+    let clock = core_llm::decode_clock();
+    let plan = adaptive_plan.unwrap_or_else(|| {
+        let mut fallback_plan = AutoSpeculativePlan::single(
+            kind,
+            u32::try_from(width).unwrap_or(u32::MAX),
+            u32::try_from(provisioned_width).unwrap_or(u32::MAX),
+        );
+        if kind == ProposerKind::None {
+            if let Some(reason) = plain_reason.clone() {
+                fallback_plan.fallbacks.push(reason);
+            }
+        }
+        fallback_plan
+    });
+    let mut switchable = vec![kind];
+    if speculative_mode == Speculative::Auto
+        && kind != ProposerKind::None
+        && kind != ProposerKind::PromptLookup
+        && plan.candidate(ProposerKind::PromptLookup).is_some()
+    {
+        switchable.push(ProposerKind::PromptLookup);
+    }
+    if !switchable.contains(&ProposerKind::None) {
+        switchable.push(ProposerKind::None);
+    }
+    let mut controller = AdaptiveSpeculativeController::for_request(
+        speculative_mode,
+        plan,
+        switchable,
+        plain_decode,
+        clock.is_some(),
+        u32::try_from(provisioned_width).unwrap_or(u32::MAX),
+        kind,
+        u32::try_from(width).unwrap_or(u32::MAX),
+        plain_reason,
+    );
     let mut stats = SpeculativeStats::default();
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
@@ -1646,6 +1721,7 @@ where
     let finished = |generated: Vec<i32>,
                     finish: FinishReason,
                     stats: SpeculativeStats,
+                    adaptive: AdaptiveSpeculativeReport,
                     sampler: &dyn TokenSampler,
                     timer: Option<GenerationTimer>,
                     start_len: i32,
@@ -1672,6 +1748,7 @@ where
                 kind,
                 width,
                 &stats,
+                Some(adaptive),
                 sampler.path(),
                 crate::primitives::fused::fused_tally().since(&fused_start),
             ),
@@ -1692,7 +1769,14 @@ where
             SpeculativePrompt::Tokens(_) => 0,
         };
         return Ok(finished(
-            generated, finish, stats, sampler, timer, start_len, on_event,
+            generated,
+            finish,
+            stats,
+            controller.report(),
+            sampler,
+            timer,
+            start_len,
+            on_event,
         ));
     }
 
@@ -1733,7 +1817,7 @@ where
         timer.finish_prefill(arrays)?;
         core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
-    let mut rollback = target.rollback(width);
+    let mut rollback = target.rollback(provisioned_width);
     // Tree verification (feature SW-F328): only on a speculative run, at most the shared row
     // bound, and only where the target can keep a tree branch on this cache — otherwise the run
     // verifies linearly and the report names why.
@@ -1760,7 +1844,14 @@ where
     if cancel.is_cancelled() {
         finish = FinishReason::Cancelled;
         let mut run = finished(
-            generated, finish, stats, sampler, timer, start_len, on_event,
+            generated,
+            finish,
+            stats,
+            controller.report(),
+            sampler,
+            timer,
+            start_len,
+            on_event,
         );
         run.report.fallbacks.extend(tree_fallback);
         return Ok(run);
@@ -1774,10 +1865,6 @@ where
     // Whether the token-at-a-time steps may pipeline: the draws are device-resident and
     // independent of the host. A run with no proposer pipelines from token 0; a speculative run
     // `auto` demotes hands its remaining plain steps to the same loop.
-    let can_pipeline = pipelining == Pipelining::Auto
-        && crate::switches::PIPELINING.enabled()
-        && constraint.is_none()
-        && !sampler.reads_history();
     if can_pipeline && kind == ProposerKind::None && !wants_hidden {
         if let Some(warm) = warm.as_ref() {
             eval([warm])?;
@@ -1804,7 +1891,14 @@ where
             on_event,
         )?;
         let mut run = finished(
-            generated, finish, stats, sampler, timer, start_len, on_event,
+            generated,
+            finish,
+            stats,
+            controller.report(),
+            sampler,
+            timer,
+            start_len,
+            on_event,
         );
         run.report.fallbacks.extend(tree_fallback);
         return Ok(run);
@@ -1828,7 +1922,14 @@ where
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         let mut run = finished(
-            generated, finish, stats, sampler, timer, start_len, on_event,
+            generated,
+            finish,
+            stats,
+            controller.report(),
+            sampler,
+            timer,
+            start_len,
+            on_event,
         );
         run.report.fallbacks.extend(tree_fallback);
         return Ok(run);
@@ -1846,56 +1947,76 @@ where
     }
 
     // ---- Speculative steps. ----
-    // `auto`'s acceptance monitor (sc-24446): a timed one first runs a plain probe (no proposal;
-    // the steps' hidden rows kept so the proposer catches up before its first proposal), then
-    // judges each window on the request's own measured costs. Once demoted, no step proposes,
-    // asks for hidden rows or commits to the proposer — the rest of the run is token-at-a-time,
-    // handed to the pipelined loop when the draws allow it. A step is timed from the top of the
-    // loop to the end of the proposer commit (the decision's read-back forces its forward);
-    // emitting its tokens is outside.
-    let clock = core_llm::decode_clock();
-    let mut monitor = AcceptanceMonitor::for_request(
-        speculative_mode,
-        kind,
-        u32::try_from(width).unwrap_or(u32::MAX),
-        if can_pipeline {
-            PlainDecode::MlxPipelined
-        } else {
-            PlainDecode::MlxUnpipelined
-        },
-        clock.is_some(),
-    );
+    // Under `auto` (SW-F357 / SW-7237), `AdaptiveSpeculativeController` runs an initial plain
+    // baseline probe, adapts depth within provisioned bounds, switches between the primary GPU
+    // proposer and zero-memory `prompt_lookup` via bounded probing, and demotes losing paths to
+    // plain decoding (pipelined when eligible). Explicit `off` / `{proposer, depth}` run
+    // authoritatively without resizing or switching.
+    let mut lookup_proposer = crate::decode::proposers::NgramProposer::default();
     let mut probed: Vec<(i32, Option<Array>)> = Vec::new();
     let mut probe_position = 0i32;
-    let mut demoted = false;
+    let mut demoted = controller.is_demoted();
+    let elapsed_ns = |start: Option<std::time::Duration>| -> u64 {
+        start.zip(clock.as_ref()).map_or(0, |(s, c)| {
+            u64::try_from(c.now().saturating_sub(s).as_nanos()).unwrap_or(u64::MAX)
+        })
+    };
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
             break;
         }
-        let probing = monitor.as_ref().is_some_and(AcceptanceMonitor::probing);
-        if !probing && !probed.is_empty() {
+        let step_plan = controller.next_step();
+        let probing = step_plan.probing_plain;
+        let use_lookup = !demoted
+            && !probing
+            && step_plan.proposer == ProposerKind::PromptLookup
+            && kind != ProposerKind::PromptLookup;
+        let use_primary =
+            !demoted && !probing && step_plan.proposer == kind && kind != ProposerKind::None;
+        let step_started = clock.as_ref().map(|c| c.now());
+        let mut catchup_ns = 0u64;
+        let mut proposal_ns = 0u64;
+        let verify_ns;
+        let mut sync_ns = 0u64;
+        let mut rollback_ns = 0u64;
+        let mut step_host_syncs = 0u64;
+        if use_primary && !probed.is_empty() {
+            let cu_clock = clock.as_ref().map(|c| c.now());
             catch_up(target, &mut *proposer, &mut probed, probe_position)?;
+            catchup_ns = elapsed_ns(cu_clock);
+            proposal_ns = proposal_ns.saturating_add(catchup_ns);
+            if matches!(kind, ProposerKind::Mtp | ProposerKind::DraftModel) {
+                // `MtpProposer::catch_up` and `DraftModelProposer::catch_up` run a
+                // host-synchronized `eval(...)` over the caught-up state.
+                step_host_syncs += 1;
+            }
         }
-        let started = monitor
-            .as_ref()
-            .and(clock.as_ref())
-            .map(|clock| clock.now());
+
         let remaining = config.max_new_tokens - generated.len();
-        let k = if demoted || probing {
+        let active_depth = (step_plan.depth as usize).min(provisioned_width);
+        let k = if demoted || probing || step_plan.proposer == ProposerKind::None {
             0
         } else {
-            width.min(remaining.saturating_sub(1))
+            active_depth.min(remaining.saturating_sub(1))
         };
-        let wants_hidden = wants_hidden && !demoted;
+        let keep_primary_hidden =
+            wants_hidden && !demoted && (probing || use_primary || controller.can_switch_to(kind));
         let base = target.cache_len(cache);
         let position = base + position_delta;
-        if probing {
-            if probed.is_empty() {
-                probe_position = position;
-            }
-            probed.push((cur, previous_hidden.clone()));
-        }
+        let record_catchup = !demoted
+            && (probing
+                || (use_lookup
+                    && ((wants_hidden
+                        && kind == ProposerKind::Mtp
+                        && controller.can_switch_to(ProposerKind::Mtp))
+                        || (kind == ProposerKind::DraftModel
+                            && controller.can_switch_to(ProposerKind::DraftModel)))));
+        let prev_hidden_for_catchup = if record_catchup && wants_hidden {
+            previous_hidden.clone()
+        } else {
+            None
+        };
         let checkpoint = constraint.as_ref().map(|c| c.checkpoint());
 
         // 1. Propose. The constraint is rewound only when a sampled draft advanced it. A tree run
@@ -1907,7 +2028,11 @@ where
             let ctx = ProposeContext {
                 cur,
                 history: &history,
-                previous_hidden: previous_hidden.as_ref(),
+                previous_hidden: if use_primary {
+                    previous_hidden.as_ref()
+                } else {
+                    None
+                },
                 position,
                 max_drafts: k,
                 budget_drafts: remaining.saturating_sub(1),
@@ -1921,8 +2046,39 @@ where
             };
             // Every MLX proposal (a draft list or a tree) is host tokens, so the call's wall time
             // includes the draft's device work (SW-7200).
+            let prop_clock = clock.as_ref().map(|c| c.now());
             let draft_started = std::time::Instant::now();
-            let proposed = if tree_rows > 0 {
+            let proposed = if use_lookup {
+                // Only build a branching lookup tree when tree workspace was provisioned and
+                // admitted for the primary route (`kind.builds_trees()`); otherwise run linear
+                // lookup within `k <= provisioned_width`.
+                if tree_rows > 0 && kind.builds_trees() {
+                    let tree = lookup_proposer
+                        .propose_tree(target, &ctx, &mut draft_sampler)?
+                        .pruned(k, tree_rows, |t| config.stop_tokens.contains(&t));
+                    if tree.is_chain() {
+                        let drafts = tree.nodes().iter().map(|n| n.token).collect();
+                        let dists = tree.nodes().iter().map_while(|n| n.dist.clone()).collect();
+                        (Proposal { drafts, dists }, None)
+                    } else {
+                        (Proposal::default(), Some(tree))
+                    }
+                } else if tree_rows > 0 {
+                    let capped = ProposeContext {
+                        max_drafts: k.min(tree_rows),
+                        ..ctx
+                    };
+                    (
+                        lookup_proposer.propose(target, &capped, &mut draft_sampler)?,
+                        None,
+                    )
+                } else {
+                    (
+                        lookup_proposer.propose(target, &ctx, &mut draft_sampler)?,
+                        None,
+                    )
+                }
+            } else if tree_rows > 0 {
                 let tree = proposer
                     .propose_tree(target, &ctx, &mut draft_sampler)?
                     .pruned(k, tree_rows, |t| config.stop_tokens.contains(&t));
@@ -1936,6 +2092,10 @@ where
             } else {
                 (proposer.propose(target, &ctx, &mut draft_sampler)?, None)
             };
+            proposal_ns = proposal_ns.saturating_add(elapsed_ns(prop_clock));
+            if !use_lookup && kind != ProposerKind::PromptLookup {
+                step_host_syncs += 1;
+            }
             stats
                 .draft_time
                 .get_or_insert_with(core_llm::DraftTime::default)
@@ -1957,17 +2117,20 @@ where
                     finish = FinishReason::Cancelled;
                     break;
                 }
+                let ver_clock = clock.as_ref().map(|c| c.now());
                 let (walk, kept_hidden, workspace) = tree_step(
                     target,
                     cache,
                     &tree,
                     (cur, base, position),
-                    wants_hidden,
+                    keep_primary_hidden,
                     &history,
                     config,
                     sampler,
                     constraint.as_deref_mut(),
                 )?;
+                verify_ns = elapsed_ns(ver_clock);
+                step_host_syncs += 1;
                 if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
                     c.rewind(checkpoint);
                 }
@@ -2029,15 +2192,18 @@ where
                     rollback.begin(cache)?;
                     (LogitsScope::All, input_ids(&verify))
                 };
-                let out = target.forward(cache, &input, position, scope, wants_hidden)?;
+                let ver_clock = clock.as_ref().map(|c| c.now());
+                let out = target.forward(cache, &input, position, scope, keep_primary_hidden)?;
                 drop(input);
                 if let Some(hidden) = out.hidden.as_ref() {
                     eval([hidden, &out.logits])?;
                 }
+                verify_ns = elapsed_ns(ver_clock);
                 stats.forwards += 1;
                 stats.verify_steps += 1;
 
                 // 3. Decide. Only a decision over drafts advances the constraint provisionally.
+                let sync_clock = clock.as_ref().map(|c| c.now());
                 let Decision {
                     committed,
                     accepted,
@@ -2051,6 +2217,8 @@ where
                     sampler,
                     constraint.as_deref_mut(),
                 )?;
+                sync_ns = elapsed_ns(sync_clock);
+                step_host_syncs += 1;
                 if num_drafts > 0 {
                     if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
                         c.rewind(checkpoint);
@@ -2059,6 +2227,7 @@ where
                 stats.accepted += accepted;
 
                 // 4. Recover the cache to `[cur, accepted…]`.
+                let rb_clock = clock.as_ref().map(|c| c.now());
                 let keep_len = 1 + accepted;
                 let kept_hidden = if num_drafts == 0 {
                     out.hidden
@@ -2082,7 +2251,7 @@ where
                                 &input_ids(&verify[..keep_len]),
                                 position,
                                 LogitsScope::Last,
-                                wants_hidden,
+                                keep_primary_hidden,
                             )?;
                             if let Some(hidden) = replayed.hidden.as_ref() {
                                 eval([hidden])?;
@@ -2093,6 +2262,7 @@ where
                         }
                     }
                 };
+                rollback_ns = elapsed_ns(rb_clock);
                 (
                     committed,
                     accepted,
@@ -2110,28 +2280,92 @@ where
         }
         release.advance(committed.len());
         if !demoted {
-            proposer.commit(
-                target,
-                cur,
-                &draft_ids[..accepted],
-                kept_hidden.as_ref(),
-                position + 1,
-            )?;
-            previous_hidden = match kept_hidden.as_ref() {
-                Some(h) => Some(seq_rows(h, accepted as i32, 1)?),
-                None => None,
-            };
+            if record_catchup {
+                if probed.is_empty() {
+                    probe_position = position;
+                }
+                probed.push((cur, prev_hidden_for_catchup));
+                if !probing && accepted > 0 {
+                    for (i, &tok) in draft_ids[..accepted].iter().enumerate() {
+                        let pred = match kept_hidden.as_ref() {
+                            Some(h) => Some(seq_rows(h, i as i32, 1)?),
+                            None => None,
+                        };
+                        probed.push((tok, pred));
+                    }
+                }
+                if !probing {
+                    let catchup_limit = match kind {
+                        ProposerKind::Mtp => Some(MAX_MTP_CATCHUP_TOKENS),
+                        ProposerKind::DraftModel => Some(MAX_DRAFT_CATCHUP_TOKENS),
+                        _ => None,
+                    };
+                    if catchup_limit.is_some_and(|limit| probed.len() > limit) {
+                        probed.clear();
+                        controller.retire_proposer(kind);
+                    }
+                }
+            }
+            if use_primary
+                || probing
+                || (use_lookup && kind != ProposerKind::Mtp && controller.can_switch_to(kind))
+            {
+                proposer.commit(
+                    target,
+                    cur,
+                    &draft_ids[..accepted],
+                    kept_hidden.as_ref(),
+                    position + 1,
+                )?;
+            }
+            if keep_primary_hidden {
+                previous_hidden = match kept_hidden.as_ref() {
+                    Some(h) => Some(seq_rows(h, accepted as i32, 1)?),
+                    None => None,
+                };
+            } else {
+                previous_hidden = None;
+            }
         }
-        let elapsed = started
-            .zip(clock.as_ref())
-            .map(|(start, clock)| clock.now().saturating_sub(start));
-        let demote_now = monitor.as_mut().is_some_and(|m| {
-            m.observe_step(StepObservation {
-                accepted,
-                drafts: num_drafts,
-                elapsed,
-            })
+        let total_ns = elapsed_ns(step_started);
+        let lookup_peek_len = if controller.is_adaptive()
+            && !demoted
+            && !probing
+            && step_plan.proposer != ProposerKind::PromptLookup
+            && controller.can_switch_to(ProposerKind::PromptLookup)
+        {
+            // Peek over history + committed tokens of this step (without mutating history yet).
+            let mut peek_history =
+                Vec::with_capacity(history.len().min(NGRAM_PEEK_WINDOW_TOKENS) + committed.len());
+            let start = history.len().saturating_sub(NGRAM_PEEK_WINDOW_TOKENS);
+            peek_history.extend_from_slice(&history[start..]);
+            peek_history.extend_from_slice(&committed);
+            ngram_peek_match_len(
+                &peek_history,
+                lookup_proposer.max_ngram,
+                4,
+                NGRAM_PEEK_WINDOW_TOKENS,
+            )
+        } else {
+            0
+        };
+        let action = controller.observe_step(AdaptiveStepInput {
+            accepted,
+            drafts: num_drafts,
+            committed: committed.len(),
+            generated_tokens: (generated.len() + committed.len()) as u64,
+            cost: StepCost {
+                proposal_ns,
+                verify_ns,
+                rollback_ns,
+                sync_ns,
+                switch_overhead_ns: catchup_ns,
+                total_ns,
+                host_syncs: step_host_syncs,
+            },
+            lookup_peek_len,
         });
+        let demote_now = action == AdaptiveAction::DemoteToPlain;
 
         // 5. Commit through the shared event path.
         for &token in &committed {
@@ -2168,6 +2402,7 @@ where
             demoted = true;
             stats.demoted_at = Some(generated.len());
             previous_hidden = None;
+            probed.clear();
             if can_pipeline {
                 // Hand the rest to the pipelined loop: one plain step feeds `cur` (committed,
                 // emitted, not yet in the cache) and draws the next token, which the loop then
@@ -2205,7 +2440,7 @@ where
             }
         }
     }
-    stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    stats.monitor = controller.last_monitor_decision();
     // A window that demotes on the step that also ends the run (its budget, a stop token, the
     // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
     // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
@@ -2215,7 +2450,14 @@ where
     }
 
     let mut run = finished(
-        generated, finish, stats, sampler, timer, start_len, on_event,
+        generated,
+        finish,
+        stats,
+        controller.report(),
+        sampler,
+        timer,
+        start_len,
+        on_event,
     );
     run.report.fallbacks.extend(tree_fallback);
     Ok(run)
@@ -2539,6 +2781,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
     proposer: ProposerKind,
     drafts: usize,
     stats: &SpeculativeStats,
+    adaptive_speculative: Option<AdaptiveSpeculativeReport>,
     sampler: Option<SamplerPath>,
     fused: core_llm::FusedTally,
 ) -> DecodeReport {
@@ -2586,6 +2829,8 @@ fn report<T: SpeculativeTarget + ?Sized>(
         speculative_monitor: stats.monitor,
         prefix_hit_tokens: 0,
         prefix_cache: none(),
+        prefix_checkpoints: None,
+        adaptive_speculative,
         fallbacks: Vec::new(),
         tree_verify: stats.tree,
         draft_time: stats.draft_time,
@@ -2730,3 +2975,6 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 mod tree_tests;
+
+#[cfg(test)]
+mod adaptive_tests;

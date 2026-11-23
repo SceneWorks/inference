@@ -507,14 +507,10 @@ fn autoencoder_bytes(weights: &Path) -> CoreResult<u64> {
     projected_safetensors_bytes(weights, |_| ResidentProjection::Float32)
 }
 
-/// Key prefix of the Qwen3-VL language tower inside the VLM checkpoint.
-const LANGUAGE_TOWER_PREFIX: &str = "model.language_model.";
-/// The untied output head, at the checkpoint root.
-const LANGUAGE_HEAD_KEY: &str = "lm_head.weight";
-
 /// Resident bytes of the text encoder as [`crate::text_encoder::Flux3TextEncoder::load`] builds
 /// it: the shared decoder reads the language tower (`model.language_model.*`) and, when the head
-/// is untied, `lm_head.weight`, casting each to bf16 whatever the file stores. The vision tower
+/// is untied, its output head. Eligible source-native matrices keep their projection operands;
+/// other floating weights use the decoder's bf16 compute precision. The vision tower
 /// rides along on disk and is materialized by nothing on this route.
 fn text_encoder_bytes(dir: &Path) -> CoreResult<u64> {
     let untied_head = !mlx_llm::ModelConfig::from_dir(dir)
@@ -522,9 +518,7 @@ fn text_encoder_bytes(dir: &Path) -> CoreResult<u64> {
         .tie_word_embeddings;
     let shards = crate::text_encoder::weight_shards(dir)?;
     mlx_gen::asset_facts::projected_shards_bytes(&shards, |header| {
-        if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
-            || (untied_head && header.name == LANGUAGE_HEAD_KEY)
-        {
+        if crate::text_encoder::is_text_tower_tensor(&header.name, untied_head) {
             ResidentProjection::Bfloat16
         } else {
             ResidentProjection::Omit

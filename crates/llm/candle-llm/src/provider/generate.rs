@@ -83,6 +83,10 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
+    fn clear_prefix_cache(&self) {
+        self.clear_prefix_cache();
+    }
+
     fn synchronize_before_release(&self) -> CoreResult<()> {
         // This is the decoder/VLM's OWN device, including an explicitly selected
         // non-blocking CUDA stream; an image generator's stream is not a fence for it.
@@ -146,8 +150,17 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_resolving(req, on_event, false)
+        self.generate_resolving(req, on_event, AutoResolveFlags::default())
     }
+}
+
+/// Retry flags for `auto` request admission (SW-7200 / SW-7237): clamp adaptive depth growth
+/// headroom before withdrawing a resident block draft or draft model on tight-memory requests.
+#[derive(Clone, Copy, Debug, Default)]
+struct AutoResolveFlags {
+    block_draft_withheld: bool,
+    draft_model_withheld: bool,
+    clamp_adaptive_depth: bool,
 }
 
 /// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
@@ -195,14 +208,37 @@ pub(super) fn map_finish(f: FinishReason) -> CoreFinish {
 }
 
 impl LlamaProvider {
-    /// [`TextLlm::generate`]; `block_draft_withheld` resolves `auto` without its block-draft
-    /// preference (a request whose memory refused the preferred draft, SW-7200) and names
-    /// [`core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED`].
+    /// Filter an [`core_llm::AutoSpeculativePlan`] to candidates runnable on this loaded provider.
+    fn filter_auto_plan(
+        &self,
+        mut plan: core_llm::AutoSpeculativePlan,
+    ) -> core_llm::AutoSpeculativePlan {
+        let has_mtp = matches!(&self.model, Decoder::Qwen35(_)) && self.mtp.is_some();
+        let has_block = matches!(&self.model, Decoder::Qwen35(_)) && self.block_draft.is_some();
+        let has_draft = self.draft.is_some();
+        plan.candidates.retain(|c| match c.proposer {
+            ProposerKind::Mtp => has_mtp,
+            ProposerKind::BlockDraft => has_block,
+            ProposerKind::DraftModel => has_draft,
+            ProposerKind::PromptLookup | ProposerKind::None => true,
+        });
+        if !plan
+            .candidates
+            .iter()
+            .any(|c| c.proposer == ProposerKind::None)
+        {
+            plan.candidates.push(core_llm::AutoCandidate::plain());
+        }
+        plan
+    }
+
+    /// [`TextLlm::generate`]; `flags` retries `auto` with clamped adaptive depth or without a
+    /// resident draft when request memory admission refuses it.
     fn generate_resolving(
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        block_draft_withheld: bool,
+        flags: AutoResolveFlags,
     ) -> CoreResult<TextLlmOutput> {
         let _progress = req.install_progress();
         // Request start: a request that fails or is cancelled (anywhere below, before the record
@@ -316,35 +352,93 @@ impl LlamaProvider {
         // instead, by name (sc-24436, E2). A request that leaves the option unset runs this
         // device's defaults-table default (E5, sc-24446).
         let speculative = req.speculative_or(self.speculative_default);
-        // The engine gets the option itself: under `auto` it monitors the proposer it runs and
-        // demotes one measurably slower than plain decoding to its ordinary steps (sc-24446, E5);
-        // an explicit `{proposer, depth}` runs as asked. (Named apart from the MTP branch's
-        // `speculative` flag, which shadows `speculative` below.)
+        // The engine gets the option itself: under `auto` it runs the shared adaptive speculative
+        // controller (SW-F357 / SW-7237); an explicit `{proposer, depth}` runs as asked.
         let requested_speculative = speculative;
-        // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
-        // campaign recorded it faster for this device's backend, draft format and target tier —
-        // and not on a request whose memory refused it once already (resolved again without it,
-        // by name).
-        let resolution = core_llm::fit_draft_context(
-            core_llm::resolve_speculative_with(
-                speculative,
+        let (plan, mut fallbacks, mut adaptive_plan) = if speculative == core_llm::Speculative::Auto
+        {
+            let raw_plan = core_llm::resolve_auto_candidates(
                 &self.descriptor.capabilities,
-                !block_draft_withheld && self.auto_prefers_block_draft(),
-            ),
-            &self.descriptor.capabilities,
-            self.draft_context(),
-            admitted_prompt,
-            req.max_new_tokens,
-        );
+                core_llm::AutoCandidateContext {
+                    auto_prefers_block_draft: !flags.block_draft_withheld
+                        && self.auto_prefers_block_draft(),
+                    block_draft_withheld: flags.block_draft_withheld,
+                    draft_model_withheld: flags.draft_model_withheld,
+                    draft_context: self.draft_context(),
+                    prompt_tokens: admitted_prompt,
+                    max_new_tokens: req.max_new_tokens,
+                },
+            );
+            let filtered = self.filter_auto_plan(raw_plan);
+            let primary = filtered.primary();
+            let plan = match primary.proposer {
+                ProposerKind::None => SpeculativePlan::Off,
+                ProposerKind::Mtp => SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::Mtp,
+                    depth: primary.recommended_depth,
+                },
+                ProposerKind::PromptLookup => SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::PromptLookup,
+                    depth: primary.recommended_depth,
+                },
+                ProposerKind::DraftModel => SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::DraftModel,
+                    depth: primary.recommended_depth,
+                },
+                ProposerKind::BlockDraft => SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::BlockDraft,
+                    depth: primary.recommended_depth,
+                },
+            };
+            let fb = filtered.fallbacks.clone();
+            (plan, fb, Some(filtered))
+        } else {
+            let resolution = core_llm::fit_draft_context(
+                core_llm::resolve_speculative_with(
+                    speculative,
+                    &self.descriptor.capabilities,
+                    !flags.block_draft_withheld && self.auto_prefers_block_draft(),
+                ),
+                &self.descriptor.capabilities,
+                self.draft_context(),
+                admitted_prompt,
+                req.max_new_tokens,
+            );
+            let fb: Vec<String> = flags
+                .block_draft_withheld
+                .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
+                .into_iter()
+                .chain(resolution.fallback)
+                .collect();
+            (resolution.plan, fb, None)
+        };
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
-        let (mut route, route_fallback) = self.decode_route(resolution.plan);
-        let mut fallbacks: Vec<String> = block_draft_withheld
-            .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
-            .into_iter()
-            .chain(resolution.fallback)
-            .chain(route_fallback)
-            .collect();
+        let (mut route, route_fallback) = self.decode_route(plan);
+        fallbacks.extend(route_fallback);
+        // Bound adaptive depth growth by CUDA graph runner capture ceiling (when enabled) and
+        // by admission headroom.
+        let graph_depth_cap = if cuda_graphs_on {
+            (GraphRunner::<Qwen35Model>::MAX_CAPTURED_TOKENS.saturating_sub(1)) as u32
+        } else {
+            u32::MAX
+        };
+        let adaptive_ceiling = if let Some(ref ap) = adaptive_plan {
+            if flags.clamp_adaptive_depth || route.drafts() == 0 {
+                route.drafts()
+            } else {
+                ap.max_depth().min(graph_depth_cap).max(route.drafts())
+            }
+        } else {
+            route.drafts()
+        };
+        let admission_route = match route {
+            DecodeRoute::Engine { proposer, drafts } if drafts > 0 => DecodeRoute::Engine {
+                proposer,
+                drafts: adaptive_ceiling,
+            },
+            other => other,
+        };
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
         // will actually run (a proposer on the engine), at the advertised row bound — else
         // linear, by name. An image or video request verifies its tree too (SW-7209): the
@@ -359,7 +453,7 @@ impl LlamaProvider {
                 DecodeRoute::Engine { proposer, drafts }
                     if proposer != ProposerKind::None && drafts > 0 =>
                 {
-                    resolution.plan
+                    plan
                 }
                 _ => SpeculativePlan::Off,
             },
@@ -368,24 +462,30 @@ impl LlamaProvider {
         fallbacks.extend(tree.fallback);
         let tree_rows = tree.max_rows as usize;
         let required = self
-            .request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
+            .request_bytes(
+                admission_route,
+                admitted_prompt,
+                req.max_new_tokens,
+                vision_workspace,
+            )
             .and_then(|bytes| {
                 bytes.checked_add(tree_request_bytes(
                     &self.model,
-                    route.proposer(),
-                    route.drafts(),
+                    admission_route.proposer(),
+                    admission_route.drafts(),
                     tree_rows,
                     admitted_prompt,
                     req.max_new_tokens,
-                    self.tree_tap_width(route.proposer()),
+                    self.tree_tap_width(admission_route.proposer()),
                 )?)
             })
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
-        // The cross-turn prefix cache (sc-24437) serves the engine's text routes. It keys on token
-        // ids, which cannot tell two images (or clips) behind the same placeholder ids apart — a
-        // multimodal prompt neither reads nor feeds it — and the reference loop is the parity
-        // oracle, which always prefills cold; the report names either. The hybrid decoder
-        // snapshots at the end of the rendered conversation, the prefix the next turn extends.
+        // The cross-turn prefix cache (sc-24437 / SW-F356) serves the engine's text routes. It
+        // keys on token ids, which cannot tell two images (or clips) behind the same placeholder
+        // ids apart — a multimodal prompt neither reads nor feeds it — and the reference loop is
+        // the parity oracle, which always prefills cold; the report names either.
+        let checkpoint_policy = req.prefix_checkpoints_or(self.prefix_checkpoints_default);
+        let mut checkpoint_fallbacks: Vec<String> = Vec::new();
         let prefix_on = self.prefix_cache().budget_bytes() > 0;
         let prefix_route = !multimodal && !gemma4_mm_request && route != DecodeRoute::Reference;
         let (mut prefix_path, mut prefix_reason) =
@@ -396,6 +496,9 @@ impl LlamaProvider {
                 ),
                 shared => shared,
             };
+        if let Some(reason) = prefix_reason {
+            checkpoint_fallbacks.push(reason.to_string());
+        }
         let prefix_mtp = matches!(
             route,
             DecodeRoute::Engine {
@@ -403,61 +506,213 @@ impl LlamaProvider {
                 ..
             }
         );
-        let prefix_boundary = match &self.model {
-            Decoder::Qwen35(_) if prefix_on && prefix_route => {
-                self.conversation_boundary(messages, req, &prompt_ids)
+        let prefix_store = prefix_on && prefix_route;
+        let boundary_candidates = if prefix_store {
+            let (cands, doc_unaligned) =
+                self.resolve_boundary_candidates(messages, req, &prompt_ids, checkpoint_policy);
+            if doc_unaligned {
+                checkpoint_fallbacks.push(PREFIX_DOCUMENT_UNALIGNED.to_string());
             }
-            _ => None,
-        };
-        let snapshot_bytes = self
-            .prefix_snapshot_bytes(
-                prompt_ids.len().saturating_add(req.max_new_tokens as usize),
-                prefix_boundary,
-                prefix_mtp,
-            )
-            .ok_or_else(|| CoreError::InvalidRequest("prefix snapshot estimate overflow".into()))?;
-        let available = request_available_memory(self.model.device())?;
-        // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
-        // evicts them least-recently-used first, and the snapshot it would leave behind is
-        // admitted with it — or not taken, so caching never makes a request fail and never takes
-        // memory admission did not grant.
-        let prefix_admission = if prefix_on && prefix_route {
-            self.prefix_cache()
-                .admit(required, snapshot_bytes, available)
+            cands
         } else {
-            core_llm::PrefixAdmission {
-                available: self.prefix_cache().reclaim_for(required, available),
-                snapshot: false,
-            }
+            BoundaryCandidates::default()
         };
-        let keep_prefix = prefix_admission.snapshot;
-        if prefix_on && prefix_route && !keep_prefix {
-            prefix_reason = Some(PREFIX_NOT_ADMITTED);
+        let reuse_mode = match &self.model {
+            Decoder::Causal(_) => PrefixReuse::AnyPrefix,
+            Decoder::Qwen35(_) => PrefixReuse::WholeEntry,
+        };
+        let build_plan = |prefix: &PrefixCache, reused: usize| {
+            let plan = core_llm::plan_prefix_boundaries_with_exact(
+                prompt_ids.len(),
+                reused,
+                reuse_mode,
+                checkpoint_policy,
+                boundary_candidates,
+                NearTailConfig::default(),
+                |pos| pos <= prompt_ids.len() && prefix.contains_exact(&prompt_ids[..pos]),
+            );
+            let mut items = Vec::with_capacity(plan.captures.len() + 1);
+            for &b in &plan.captures {
+                let bytes = self.boundary_snapshot_bytes(b, prefix_mtp).ok_or_else(|| {
+                    CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                })?;
+                items.push((b, bytes));
+            }
+            if reuse_mode == PrefixReuse::AnyPrefix && !prompt_ids.is_empty() {
+                let conv_bytes = self
+                    .prefix_snapshot_bytes(
+                        prompt_ids.len().saturating_add(req.max_new_tokens as usize),
+                        None,
+                        false,
+                    )
+                    .ok_or_else(|| {
+                        CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                    })?;
+                items.push((
+                    PlannedBoundary {
+                        position: prompt_ids.len(),
+                        kind: PrefixKind::Conversation,
+                        protected: false,
+                    },
+                    conv_bytes,
+                ));
+            }
+            Ok::<_, CoreError>((plan, items))
+        };
+        let available = request_available_memory(self.model.device())?;
+        let (boundary_plan, planned_with_costs, planned_admission) = if prefix_store {
+            let mut prefix = self.prefix_cache();
+            let hit = prefix.peek_match(&prompt_ids, prefix_mtp);
+            let match_idx = hit.map(|(idx, _)| idx);
+            let peeked_reused = hit.map_or(0, |(_, len)| len);
+            let (mut plan, mut items) = build_plan(&prefix, peeked_reused)?;
+            // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
+            // evicts them least-recently-used first while pinning the matched hit entry against
+            // optional snapshot eviction.
+            let adm = prefix.admit_planned_for(
+                required,
+                &items,
+                available,
+                PrefixPlannedContext {
+                    prompt: Some(&prompt_ids),
+                    keep_match: match_idx,
+                    promote_reused: plan.promote_reused,
+                    conversation_reuse: Some(reuse_mode),
+                },
+            );
+            let after_hit = prefix.peek_match(&prompt_ids, prefix_mtp);
+            let reused_after = after_hit.map_or(0, |(_, len)| len);
+            let final_adm = if reused_after < peeked_reused {
+                let (new_plan, new_items) = build_plan(&prefix, reused_after)?;
+                plan = new_plan;
+                items = new_items;
+                if !adm.admission.snapshot {
+                    PlannedAdmission {
+                        admission: core_llm::PrefixAdmission {
+                            available: adm.admission.available,
+                            snapshot: false,
+                        },
+                        kept: Vec::new(),
+                        evicted_entries: adm.evicted_entries,
+                        fallback: adm.fallback,
+                    }
+                } else {
+                    let second = prefix.admit_planned_for(
+                        required,
+                        &items,
+                        adm.admission.available,
+                        PrefixPlannedContext {
+                            prompt: Some(&prompt_ids),
+                            keep_match: after_hit.map(|(idx, _)| idx),
+                            promote_reused: plan.promote_reused,
+                            conversation_reuse: Some(reuse_mode),
+                        },
+                    );
+                    PlannedAdmission {
+                        evicted_entries: adm.evicted_entries.saturating_add(second.evicted_entries),
+                        ..second
+                    }
+                }
+            } else {
+                adm
+            };
+            (plan, items, final_adm)
+        } else {
+            (
+                core_llm::BoundaryPlan::default(),
+                Vec::new(),
+                PlannedAdmission {
+                    admission: core_llm::PrefixAdmission {
+                        available: self.prefix_cache().reclaim_for(required, available),
+                        snapshot: false,
+                    },
+                    kept: Vec::new(),
+                    evicted_entries: 0,
+                    fallback: None,
+                },
+            )
+        };
+        let keep_prefix = planned_admission.admission.snapshot;
+        let kept_boundaries = planned_admission.kept;
+        let checkpoint_evictions = planned_admission.evicted_entries;
+        if let Some(fb) = planned_admission.fallback {
+            if !planned_with_costs.is_empty() && !keep_prefix {
+                prefix_reason = Some(fb);
+            }
+            if !planned_with_costs.is_empty() {
+                checkpoint_fallbacks.push(fb.to_string());
+            }
         }
+        let snapshot_bytes: u64 = if keep_prefix {
+            planned_with_costs
+                .iter()
+                .filter(|(b, _)| kept_boundaries.contains(b))
+                .fold(0u64, |acc, &(_, bytes)| acc.saturating_add(bytes))
+        } else {
+            0
+        };
         if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
-            if keep_prefix {
-                required.saturating_add(snapshot_bytes)
-            } else {
-                required
-            },
-            prefix_admission.available,
+            required.saturating_add(snapshot_bytes),
+            planned_admission.admission.available,
         ) {
-            // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
-            // prompt lookup or plain — what `auto` admitted before the preference), by name.
-            // Nothing has run: no K/V, no prefill, no preprocessing.
+            // Under `auto`, first clamp adaptive depth growth headroom back to `recommended_depth`
+            // so a tight request that previously fit is never refused for adaptive ceiling sizing;
+            // then withdraw an un-admitted block draft or draft model and re-resolve cleanly.
+            if requested_speculative == core_llm::Speculative::Auto
+                && matches!(error, CoreError::RequestResourceExhausted(_))
+                && adaptive_ceiling > route.drafts()
+                && !flags.clamp_adaptive_depth
+            {
+                drop(_cuda_graphs_scope);
+                drop(_progress);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    AutoResolveFlags {
+                        clamp_adaptive_depth: true,
+                        ..flags
+                    },
+                );
+            }
             if core_llm::withdraws_auto_block_draft(requested_speculative, route.proposer(), &error)
             {
                 drop(_cuda_graphs_scope);
                 drop(_progress);
-                return self.generate_resolving(req, on_event, true);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    AutoResolveFlags {
+                        block_draft_withheld: true,
+                        clamp_adaptive_depth: false,
+                        ..flags
+                    },
+                );
+            }
+            if core_llm::withdraws_auto_draft_model(requested_speculative, route.proposer(), &error)
+            {
+                drop(_cuda_graphs_scope);
+                drop(_progress);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    AutoResolveFlags {
+                        draft_model_withheld: true,
+                        clamp_adaptive_depth: false,
+                        ..flags
+                    },
+                );
             }
             return Err(error);
         }
-        let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
+        let mut checkpoint_telemetry = CheckpointTelemetry {
+            evicted_entries: checkpoint_evictions,
+            fallbacks: checkpoint_fallbacks,
+            ..CheckpointTelemetry::default()
+        };
 
         self.model
             .device()
@@ -519,8 +774,28 @@ impl LlamaProvider {
                 route = refit;
                 fallbacks.push(why);
                 fallbacks.extend(route_fallback);
+                if let Some(ap) = adaptive_plan.as_mut() {
+                    ap.candidates
+                        .retain(|c| c.proposer != ProposerKind::DraftModel);
+                }
             }
         }
+        let provisioned_drafts = if route.drafts() == 0 {
+            0
+        } else {
+            (adaptive_ceiling as usize).max(route.drafts() as usize)
+        };
+        if let Some(ap) = adaptive_plan.as_mut() {
+            *ap = ap.clone().clamped_to(provisioned_drafts as u32);
+        }
+        let plain_reason = (route.proposer() == ProposerKind::None)
+            .then(|| fallbacks.first().cloned())
+            .flatten();
+        let adaptive_cfg = AdaptiveEngineConfig {
+            adaptive_plan: adaptive_plan.clone(),
+            provisioned_max_depth: Some(provisioned_drafts),
+            plain_reason: plain_reason.clone(),
+        };
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -707,7 +982,7 @@ impl LlamaProvider {
                 let mut draft_proposer = match route_proposer {
                     ProposerKind::DraftModel => Some(self.draft_proposer(
                         prompt_len.saturating_add(config.max_new_tokens),
-                        drafts,
+                        provisioned_drafts,
                     )?),
                     _ => None,
                 };
@@ -753,8 +1028,8 @@ impl LlamaProvider {
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_workspace),
-                                drafts,
+                                capacity + tree_extra_positions(provisioned_drafts, tree_workspace),
+                                provisioned_drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
@@ -809,7 +1084,7 @@ impl LlamaProvider {
                             }
                             (None, None, None) => &mut no_proposer,
                         };
-                        let run = generate_speculative_monitored(
+                        let run = generate_speculative_adaptive(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -832,6 +1107,7 @@ impl LlamaProvider {
                             None,
                             requested_speculative,
                             tree_rows,
+                            adaptive_cfg.clone(),
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -855,34 +1131,50 @@ impl LlamaProvider {
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_workspace),
-                                drafts,
+                                capacity + tree_extra_positions(provisioned_drafts, tree_workspace),
+                                provisioned_drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        let restored = self
-                            .prefix_cache()
-                            .restore_into(&mut cache, &prompt_ids, speculative)
-                            .map_err(to_core)?;
-                        let prefilled = prefill_restored(
+                        let restore_outcome = if prefix_on && prefix_route {
+                            self.prefix_cache()
+                                .restore_with_diagnostic(&mut cache, &prompt_ids, speculative)
+                                .map_err(to_core)?
+                        } else {
+                            PrefixRestoreOutcome {
+                                restored: None,
+                                proposer_skipped_longer: false,
+                                restore_time: Duration::ZERO,
+                            }
+                        };
+                        let prefilled = prefill_restored_with_plan(
                             stepper,
                             &mut cache,
-                            restored,
+                            restore_outcome,
                             &prompt_ids,
-                            prefix_boundary,
+                            &kept_boundaries,
                             speculative || block.is_some(),
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        checkpoint_telemetry.restore_time = prefilled.restore_time;
+                        checkpoint_telemetry.capture_time = prefilled.capture_time;
+                        checkpoint_telemetry.matched_kind =
+                            prefilled.matched_kind.map(|k| k.label().to_string());
+                        if prefilled.proposer_skipped_longer {
+                            checkpoint_telemetry.push_fallback(PREFIX_PROPOSER_INCOMPATIBLE);
+                        }
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
-                        let snapshot = prefilled.boundary;
+                        let capture_lens: Vec<usize> =
+                            prefilled.boundaries.iter().map(Boundary::len).collect();
+                        let snapshots = prefilled.boundaries;
                         if let Some(head) = mtp_proposer.take() {
                             mtp_proposer = Some(
                                 head.resume_from(prefilled.mtp)
-                                    .capture_at(snapshot.as_ref().map(Boundary::len)),
+                                    .capture_at_many(&capture_lens),
                             );
                         }
                         let mut prefill = None;
@@ -906,7 +1198,7 @@ impl LlamaProvider {
                             }
                             (None, None, None) => &mut no_proposer,
                         };
-                        let run = generate_speculative_monitored(
+                        let run = generate_speculative_adaptive(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -926,6 +1218,7 @@ impl LlamaProvider {
                             Some(&mut boundary),
                             requested_speculative,
                             tree_rows,
+                            adaptive_cfg.clone(),
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -935,12 +1228,40 @@ impl LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
-                        let captured = mtp_proposer.as_mut().and_then(MtpProposer::take_captured);
-                        if let Err(e) =
-                            self.prefix_cache()
-                                .store(&prompt_ids, &[], &cache, snapshot, captured)
-                        {
-                            prefix_reason = Some(prefix_store_reason(&e));
+                        let captured = mtp_proposer
+                            .as_mut()
+                            .map_or_else(Vec::new, MtpProposer::take_captured_all);
+                        if keep_prefix {
+                            if let Err(e) = self.prefix_cache().record_checkpoint_store(
+                                &mut checkpoint_telemetry,
+                                |prefix| {
+                                    prefix.store_checkpoints(
+                                        &prompt_ids,
+                                        &[],
+                                        run.output.finish_reason,
+                                        &cache,
+                                        &kept_boundaries,
+                                        snapshots,
+                                        &captured,
+                                        boundary_plan.promote_reused,
+                                    )
+                                },
+                            ) {
+                                let reason = prefix_store_reason(&e);
+                                prefix_reason = Some(reason);
+                                checkpoint_telemetry.push_fallback(reason);
+                            }
+                        } else if let Some(pb) = boundary_plan.promote_reused {
+                            if prefix_store
+                                && run.output.finish_reason != FinishReason::Cancelled
+                                && pb.position <= prompt_ids.len()
+                            {
+                                let _ = self.prefix_cache().promote_protected_counting_evictions(
+                                    &prompt_ids[..pb.position],
+                                    pb.kind,
+                                    &mut checkpoint_telemetry.evicted_entries,
+                                );
+                            }
                         }
                         run
                     }
@@ -989,7 +1310,7 @@ impl LlamaProvider {
                 let mut draft_proposer = match route_proposer {
                     ProposerKind::DraftModel => Some(self.draft_proposer(
                         prompt_len.saturating_add(config.max_new_tokens),
-                        drafts,
+                        provisioned_drafts,
                     )?),
                     _ => None,
                 };
@@ -1024,8 +1345,8 @@ impl LlamaProvider {
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_workspace),
-                                drafts,
+                                capacity + tree_extra_positions(provisioned_drafts, tree_workspace),
+                                provisioned_drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
@@ -1045,7 +1366,7 @@ impl LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let run = generate_speculative_monitored(
+                        let run = generate_speculative_adaptive(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -1065,6 +1386,7 @@ impl LlamaProvider {
                             None,
                             requested_speculative,
                             tree_rows,
+                            adaptive_cfg.clone(),
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -1082,8 +1404,21 @@ impl LlamaProvider {
                         // spans included) is only known here, so its static preallocation is
                         // admitted here, before anything is allocated.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let spliced_route = match route {
+                            DecodeRoute::Engine { proposer, drafts } if drafts > 0 => {
+                                DecodeRoute::Engine {
+                                    proposer,
+                                    drafts: u32::try_from(provisioned_drafts).unwrap_or(u32::MAX),
+                                }
+                            }
+                            other => other,
+                        };
                         let required = self
-                            .spliced_request_bytes(route, m.expanded_ids.len(), req.max_new_tokens)
+                            .spliced_request_bytes(
+                                spliced_route,
+                                m.expanded_ids.len(),
+                                req.max_new_tokens,
+                            )
                             .ok_or_else(|| {
                                 CoreError::InvalidRequest("request memory estimate overflow".into())
                             })?;
@@ -1097,8 +1432,8 @@ impl LlamaProvider {
                         )?;
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_workspace),
-                                drafts,
+                                capacity + tree_extra_positions(provisioned_drafts, tree_workspace),
+                                provisioned_drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let logits = model
@@ -1110,7 +1445,7 @@ impl LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let run = generate_speculative_monitored(
+                        let run = generate_speculative_adaptive(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -1130,6 +1465,7 @@ impl LlamaProvider {
                             None,
                             requested_speculative,
                             tree_rows,
+                            adaptive_cfg.clone(),
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -1150,24 +1486,38 @@ impl LlamaProvider {
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_workspace),
-                                drafts,
+                                capacity + tree_extra_positions(provisioned_drafts, tree_workspace),
+                                provisioned_drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        let restored = self
-                            .prefix_cache()
-                            .restore_into(&mut cache, &prompt_ids, false)
-                            .map_err(to_core)?;
-                        let prefilled = prefill_restored(
+                        let restore_outcome = if prefix_on && prefix_route {
+                            self.prefix_cache()
+                                .restore_with_diagnostic(&mut cache, &prompt_ids, false)
+                                .map_err(to_core)?
+                        } else {
+                            PrefixRestoreOutcome {
+                                restored: None,
+                                proposer_skipped_longer: false,
+                                restore_time: Duration::ZERO,
+                            }
+                        };
+                        let prefilled = prefill_restored_with_plan(
                             stepper,
                             &mut cache,
-                            restored,
+                            restore_outcome,
                             &prompt_ids,
-                            None,
+                            &kept_boundaries,
                             false,
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        checkpoint_telemetry.restore_time = prefilled.restore_time;
+                        checkpoint_telemetry.capture_time = prefilled.capture_time;
+                        checkpoint_telemetry.matched_kind =
+                            prefilled.matched_kind.map(|k| k.label().to_string());
+                        if prefilled.proposer_skipped_longer {
+                            checkpoint_telemetry.push_fallback(PREFIX_PROPOSER_INCOMPATIBLE);
+                        }
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
                         if prefix_hit > 0 {
@@ -1181,7 +1531,7 @@ impl LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let run = generate_speculative_monitored(
+                        let run = generate_speculative_adaptive(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
@@ -1201,6 +1551,7 @@ impl LlamaProvider {
                             Some(&mut boundary),
                             requested_speculative,
                             tree_rows,
+                            adaptive_cfg.clone(),
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -1211,14 +1562,35 @@ impl LlamaProvider {
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
                         if keep_prefix {
-                            if let Err(e) = self.prefix_cache().store(
-                                &prompt_ids,
-                                &run.output.tokens,
-                                &cache,
-                                None,
-                                None,
+                            if let Err(e) = self.prefix_cache().record_checkpoint_store(
+                                &mut checkpoint_telemetry,
+                                |prefix| {
+                                    prefix.store_checkpoints(
+                                        &prompt_ids,
+                                        &run.output.tokens,
+                                        run.output.finish_reason,
+                                        &cache,
+                                        &kept_boundaries,
+                                        Vec::new(),
+                                        &[],
+                                        boundary_plan.promote_reused,
+                                    )
+                                },
                             ) {
-                                prefix_reason = Some(prefix_store_reason(&e));
+                                let reason = prefix_store_reason(&e);
+                                prefix_reason = Some(reason);
+                                checkpoint_telemetry.push_fallback(reason);
+                            }
+                        } else if let Some(pb) = boundary_plan.promote_reused {
+                            if prefix_store
+                                && run.output.finish_reason != FinishReason::Cancelled
+                                && pb.position <= prompt_ids.len()
+                            {
+                                let _ = self.prefix_cache().promote_protected_counting_evictions(
+                                    &prompt_ids[..pb.position],
+                                    pb.kind,
+                                    &mut checkpoint_telemetry.evicted_entries,
+                                );
                             }
                         }
                         run
@@ -1414,6 +1786,24 @@ impl LlamaProvider {
             )
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(ProposerKind::None)
+            .with_adaptive_speculative(if requested_speculative == core_llm::Speculative::Auto {
+                core_llm::AdaptiveSpeculativeReport::auto_stayed_plain(
+                    plain_reason.unwrap_or_else(|| {
+                        "reference decode path does not run speculative proposers".into()
+                    }),
+                    adaptive_plan.as_ref().map_or_else(
+                        || vec![ProposerKind::None],
+                        core_llm::AutoSpeculativePlan::kinds,
+                    ),
+                )
+            } else {
+                core_llm::AdaptiveSpeculativeReport::explicit(
+                    ProposerKind::None,
+                    0,
+                    plain_reason,
+                    None,
+                )
+            })
             .with_span_tallies(&request_span)
             .with_cuda_graphs(reference_path_graphs(
                 request_span.cuda_graphs(),
@@ -1423,10 +1813,20 @@ impl LlamaProvider {
         decode_record.prefix_hit_tokens = prefix_hit as u64;
         decode_record.prefix_cache = prefix_path;
         decode_record.prefix_cache_reason = prefix_reason;
+        {
+            let prefix_store_ref = self.prefix_cache();
+            decode_record.prefix_checkpoints = Some(checkpoint_telemetry.into_report(
+                checkpoint_policy.label(),
+                prefix_hit as u64,
+                prompt_len.saturating_sub(prefix_hit) as u64,
+                prefix_store_ref.resident_bytes(),
+                prefix_store_ref.protected_bytes(),
+            ));
+        }
         *self
             .last_decode
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record.clone());
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning

@@ -1019,6 +1019,24 @@ pub(crate) fn counting_cache_clones<R>(f: impl FnOnce() -> R) -> (R, usize) {
 }
 
 impl Qwen35Cache {
+    /// Synthetic single-attention-layer `Qwen35Cache` holding `seq` positions for
+    /// non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_attn_only_for_test(seq: i32) -> Self {
+        let mut kv = ContiguousKvCache::new(1);
+        if seq > 0 {
+            let ones = Array::ones::<f32>(&[1, 1, seq, 2]).unwrap();
+            kv.update(0, &ones, &ones).unwrap();
+        }
+        Self {
+            loop_plan: None,
+            layers: vec![Qwen35LayerCache::Attn(AttnKv {
+                kv,
+                tree_mask: None,
+            })],
+        }
+    }
+
     fn check_plan(&self, cfg: &Qwen35Config) -> Result<()> {
         if self.loop_plan != cfg.sensenova_loop || self.layers.len() != cfg.visit_count() {
             return Err(Error::Config(
@@ -1149,6 +1167,16 @@ impl Qwen35Cache {
         for l in &mut self.layers {
             if let Qwen35LayerCache::Delta(c) = l {
                 c.capture_at(position);
+            }
+        }
+    }
+
+    /// Ask the next forward outside any checkpoint window to capture every DeltaNet layer's state
+    /// at every boundary in `positions` strictly inside that forward (SW-F356).
+    pub fn capture_boundaries(&mut self, positions: &[i32]) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at_many(positions);
             }
         }
     }
@@ -1418,6 +1446,7 @@ pub struct Qwen35Model {
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
+    pub(crate) native_projections: bool,
     /// The affine spec the quantized projections hold: the snapshot's stored spec when its
     /// quantized triples were loaded, else the load-time spec; `None` for dense or Prism.
     resident_quant: Option<QuantSpec>,
@@ -1478,6 +1507,15 @@ pub struct MtpCache {
 }
 
 impl MtpCache {
+    /// Empty MTP cache for non-inference prefix-checkpoint unit tests.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            layers: Vec::new(),
+            steps: 0,
+        }
+    }
+
     /// Bytes the predictor's KV block buffers hold (story sc-24437).
     pub fn bytes(&self) -> u64 {
         self.layers.iter().map(|a| a.kv.bytes()).sum()
@@ -1536,9 +1574,9 @@ impl Qwen35Model {
         &self.cfg
     }
 
-    /// Whether the large projections were quantized on load.
+    /// Whether the decoder holds native, affine or Prism quantized projections.
     pub fn is_quantized(&self) -> bool {
-        self.quantized
+        self.native_projections || self.quantized
     }
 
     /// The affine spec the quantized projections hold (stored in the snapshot or applied at
@@ -2420,6 +2458,7 @@ impl Qwen35Model {
             let t = req(key)?;
             precision.norm_weight(t, prism.is_some())
         };
+        let bindings_before = w.native_bindings();
         let stored_quant = cfg.quantization;
         if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
             return Err(Error::Config(
@@ -2643,6 +2682,7 @@ impl Qwen35Model {
             eps,
             cfg,
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
+            native_projections: w.native_bindings() != bindings_before,
             resident_quant: match prism {
                 Some(_) => None,
                 None if saw_stored.get() => stored_quant,
@@ -2955,6 +2995,13 @@ impl Qwen35Model {
     /// Qwen3.8 checkpoint convention (`1 + w`) of the official lineage the published heads are
     /// derived from. Every tensor in the head must be consumed.
     pub fn attach_companion_mtp(&mut self, dir: &std::path::Path) -> Result<()> {
+        self.attach_companion_mtp_report(dir).map(|_| ())
+    }
+
+    pub(crate) fn attach_companion_mtp_report(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Result<core_llm::LoadReport> {
         if self.mtp.is_some() {
             return Err(Error::Config(core_llm::COMPANION_MTP_ALREADY_NATIVE.into()));
         }
@@ -3010,7 +3057,7 @@ impl Qwen35Model {
         // The target now carries one predictor layer: what its config prices the head's state by
         // (the prefix-cache snapshot's head KV, sc-24437).
         self.cfg.mtp_num_hidden_layers = 1;
-        Ok(())
+        Ok(w.native_load_report())
     }
 }
 

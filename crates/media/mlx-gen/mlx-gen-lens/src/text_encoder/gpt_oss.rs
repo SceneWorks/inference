@@ -24,12 +24,13 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::ops::{
     add, argsort_axis, broadcast_to, concatenate_axis, cos as cos_op, divide, floor_divide,
-    gather_mm, gather_qmm, matmul, max_axes, maximum, minimum, multiply, quantize, sigmoid,
-    sin as sin_op, softmax_axis, split, split_sections, subtract, sum_axes,
+    gather_mm, gather_qmm, matmul, max_axes, maximum, minimum, multiply, sigmoid, sin as sin_op,
+    softmax_axis, split, split_sections, subtract, sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::quant::quantize_cached as quantize;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 
@@ -1034,9 +1035,12 @@ mod moe_grouped_tests {
     use mlx_rs::ops::quantized_matmul;
 
     #[test]
-    fn full_precision_scalar_experts_bind_decoded_input_major_coefficients() {
-        // A scalar FP8 bank with an explicit full-precision matrix multiply uses the loader's
-        // chosen float width, then the normal GptOss expert constructor consumes those rows.
+    fn full_precision_scalar_experts_bind_input_major_coefficients() {
+        use mlx_gen::mlx_layers::NativeProjection;
+        use mlx_llm::primitives::{moe::SwitchLinear, projection::Projection};
+
+        // A scalar FP8 bank retains its bytes for Metal while each expert uses floating
+        // activations. The fallback decodes coefficients to the chosen width without Metal.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("experts.safetensors");
         let key = "model.layers.0.mlp.experts.gate_up_proj";
@@ -1059,7 +1063,8 @@ mod moe_grouped_tests {
         let mut w =
             Weights::from_file_with_layout(&path, stacked_expert_key, |_, _| Dtype::Float32)
                 .unwrap();
-        assert!(w.get(&format!("{key}.comfy_quant")).is_none());
+        let metal = mlx_gen::metal_available();
+        assert_eq!(w.get(&format!("{key}.comfy_quant")).is_some(), metal);
         w.insert(format!("{key}_bias"), Array::zeros::<f32>(&[2, 2]).unwrap());
         let bound = ExpertProjection::load(
             &w,
@@ -1070,13 +1075,32 @@ mod moe_grouped_tests {
             None,
         )
         .unwrap();
-        let ExpertProjection::Dense { weight, bias } = bound else {
-            panic!("expected decoded FP8 bank")
-        };
-        assert_eq!(weight.shape(), &[2, 3, 2]);
-        assert_eq!(bias.shape(), &[2, 2]);
-        weight.eval().unwrap();
-        assert_eq!(weight.as_slice::<f32>(), &[scale; 12]);
+        match bound {
+            ExpertProjection::Source(SwitchLinear::Source { parts, shape }) => {
+                assert!(metal);
+                assert_eq!(shape, [2, 3]);
+                assert_eq!(parts.len(), 2);
+                for part in parts {
+                    let Projection::Native(NativeProjection::Fp8(fp8)) = part else {
+                        panic!("expected one packed scalar FP8 operator per expert")
+                    };
+                    assert!(fp8.full_precision_matrix_mult());
+                    assert_eq!(fp8.codes().shape(), &[2, 3]);
+                    assert_eq!(fp8.codes().dtype(), Dtype::Uint8);
+                    assert_eq!(fp8.codes().nbytes(), 6);
+                    assert_eq!(fp8.scales().as_slice::<f32>(), &[scale]);
+                    assert_eq!(fp8.bias().unwrap().shape(), &[2]);
+                }
+            }
+            ExpertProjection::Dense { weight, bias } => {
+                assert!(!metal);
+                assert_eq!(weight.shape(), &[2, 3, 2]);
+                assert_eq!(bias.shape(), &[2, 2]);
+                weight.eval().unwrap();
+                assert_eq!(weight.as_slice::<f32>(), &[scale; 12]);
+            }
+            _ => panic!("unexpected scalar FP8 expert bank representation"),
+        }
         assert!(ExpertProjection::load(
             &w,
             "model.layers.0.mlp",

@@ -51,8 +51,10 @@ use candle_core::Tensor;
 use core_llm::speculative::tree::{greedy_tree_step, sampled_tree_step, walk_tree, TreeStep};
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
-    AcceptanceMonitor, DraftTree, PlainDecode, ProposerKind, SamplerPath, Speculative,
-    StepObservation, TreeVerifyReport, TreeWalk,
+    ngram_peek_match_len, AdaptiveAction, AdaptiveSpeculativeController, AdaptiveSpeculativeReport,
+    AdaptiveStepInput, AutoSpeculativePlan, DraftTree, PlainDecode, ProposerKind, SamplerPath,
+    Speculative, StepCost, TreeVerifyReport, TreeWalk, MAX_DRAFT_CATCHUP_TOKENS,
+    MAX_MTP_CATCHUP_TOKENS, NGRAM_PEEK_WINDOW_TOKENS,
 };
 
 use crate::decode::cancel::CancelFlag;
@@ -445,14 +447,17 @@ pub trait Proposer {
 
     /// Bring the proposer up to date with steps the target ran **without** a proposal — the
     /// plain probe `auto`'s timed acceptance monitor runs before the first proposal (sc-24446,
-    /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
-    /// paired with its predecessor's target hidden row in `preceding_hidden`
-    /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
-    /// before the next [`propose`](Self::propose). Each probe step was also
-    /// [`commit`](Self::commit)ted (no drafts, its row in `kept_hidden`). The default does
-    /// nothing — right for a proposer whose state is the history alone (n-gram) or that
-    /// [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
-    /// `draft_model` is never probed (`auto` never resolves to it).
+    /// [`core_llm::AcceptanceMonitor::probing`]) or an inactive `prompt_lookup` stretch under
+    /// adaptive `auto` (SW-7237): `tokens` were fed at RoPE positions `position..`, each paired
+    /// with its predecessor's target hidden row in `preceding_hidden` (`[1, tokens.len(), hidden]`,
+    /// when [`wants_hidden`](Self::wants_hidden)). Called once, before the next
+    /// [`propose`](Self::propose), inside the engine's `switch_overhead_ns` timing seam. Each
+    /// inactive step was also [`commit`](Self::commit)ted (no drafts from this proposer). The
+    /// default does nothing — right for a proposer whose state is the history alone (n-gram) or
+    /// that [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
+    /// [`MtpProposer`](super::proposers::MtpProposer) and
+    /// [`DraftModelProposer`](super::proposers::DraftModelProposer) replay their inactive backlog
+    /// here so catch-up cost is charged as switching overhead.
     fn catch_up(
         &mut self,
         _tokens: &[i32],
@@ -584,9 +589,20 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     )
 }
 
+/// Adaptive speculative configuration passed by providers to [`generate_speculative_adaptive`]
+/// (SW-F357 / SW-7237).
+#[derive(Clone, Debug, Default)]
+pub struct AdaptiveEngineConfig {
+    /// Resolved candidate pool for `Speculative::Auto`.
+    pub adaptive_plan: Option<AutoSpeculativePlan>,
+    /// Maximum verify overshoot provisioned in cache / admission (`None`: `drafts`).
+    pub provisioned_max_depth: Option<usize>,
+    /// Explicit or fallback plain-decode reason when no proposer runs.
+    pub plain_reason: Option<String>,
+}
+
 /// [`generate_speculative_with`] for a request that asked for `speculative_mode` (sc-24446): under
-/// [`Speculative::Auto`] the run is watched by `auto`'s acceptance monitor
-/// ([`AcceptanceMonitor::for_request`] against [`PlainDecode::Candle`]); any other option — an
+/// [`Speculative::Auto`] the run is watched by `auto`'s adaptive controller; any other option — an
 /// explicit proposer, `off` — is [`generate_speculative_with`].
 ///
 /// ## Demotion (sc-24446)
@@ -634,6 +650,41 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
     speculative_mode: Speculative,
     tree_rows: usize,
 ) -> Result<SpeculativeRun> {
+    generate_speculative_adaptive(
+        model,
+        proposer,
+        prompt,
+        config,
+        drafts,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        on_prefill_complete,
+        speculative_mode,
+        tree_rows,
+        AdaptiveEngineConfig::default(),
+    )
+}
+
+/// [`generate_speculative_monitored`] with full SW-7237 adaptive speculative configuration
+/// (candidate pool, provisioned depth ceiling, and plain-decode diagnostic reason).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_speculative_adaptive<M: StepModel + ?Sized, P: Proposer + ?Sized>(
+    model: &M,
+    proposer: &mut P,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    drafts: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+    speculative_mode: Speculative,
+    tree_rows: usize,
+    adaptive: AdaptiveEngineConfig,
+) -> Result<SpeculativeRun> {
     run_engine(
         model,
         proposer,
@@ -648,6 +699,7 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
         None,
         speculative_mode,
         tree_rows,
+        adaptive,
     )
 }
 
@@ -712,6 +764,7 @@ pub fn generate_with_sampler<M: StepModel + ?Sized>(
         Some(sampler),
         Speculative::Off,
         0,
+        AdaptiveEngineConfig::default(),
     )
 }
 
@@ -751,6 +804,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     mut sampler: Option<&mut dyn TokenSampler>,
     speculative_mode: Speculative,
     tree_rows: usize,
+    adaptive_cfg: AdaptiveEngineConfig,
 ) -> Result<SpeculativeRun> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -774,6 +828,61 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     }
     let wants_hidden = proposer.wants_hidden();
     let kind = proposer.kind();
+    let width = if kind == ProposerKind::None {
+        0
+    } else {
+        drafts
+    };
+    let provisioned_width = adaptive_cfg
+        .provisioned_max_depth
+        .unwrap_or_else(|| {
+            if speculative_mode == Speculative::Auto {
+                adaptive_cfg
+                    .adaptive_plan
+                    .as_ref()
+                    .map_or(width, |p| p.max_depth() as usize)
+                    .max(width)
+            } else {
+                width
+            }
+        })
+        .max(width);
+    let clock = core_llm::decode_clock();
+    let plan = adaptive_cfg.adaptive_plan.unwrap_or_else(|| {
+        let mut fallback_plan = AutoSpeculativePlan::single(
+            kind,
+            u32::try_from(width).unwrap_or(u32::MAX),
+            u32::try_from(provisioned_width).unwrap_or(u32::MAX),
+        );
+        if kind == ProposerKind::None {
+            if let Some(reason) = adaptive_cfg.plain_reason.clone() {
+                fallback_plan.fallbacks.push(reason);
+            }
+        }
+        fallback_plan
+    });
+    let mut switchable = vec![kind];
+    if speculative_mode == Speculative::Auto
+        && kind != ProposerKind::None
+        && kind != ProposerKind::PromptLookup
+        && plan.candidate(ProposerKind::PromptLookup).is_some()
+    {
+        switchable.push(ProposerKind::PromptLookup);
+    }
+    if !switchable.contains(&ProposerKind::None) {
+        switchable.push(ProposerKind::None);
+    }
+    let mut controller = AdaptiveSpeculativeController::for_request(
+        speculative_mode,
+        plan,
+        switchable,
+        PlainDecode::Candle,
+        clock.is_some(),
+        u32::try_from(provisioned_width).unwrap_or(u32::MAX),
+        kind,
+        u32::try_from(width).unwrap_or(u32::MAX),
+        adaptive_cfg.plain_reason,
+    );
 
     // ---- Prefill (or adopt the caller's), warm the proposer. ----
     let mut owned: Option<M::Cache> = None;
@@ -792,10 +901,10 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 .len()
                 .saturating_add(config.max_new_tokens)
                 .saturating_add(tree_extra_positions(
-                    drafts,
+                    provisioned_width,
                     core_llm::tree_workspace_rows(kind, tree_rows),
                 ));
-            let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
+            let cache = owned.insert(model.new_cache_for(capacity, provisioned_width)?);
             // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
             core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             let out = model.forward_step(
@@ -878,6 +987,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     let done = |generated: Vec<i32>,
                 finish: FinishReason,
                 stats: SpeculativeStats,
+                adaptive: AdaptiveSpeculativeReport,
                 verify_host_syncs: u64,
                 cache: &M::Cache,
                 on_event: &mut dyn FnMut(StreamEvent)| {
@@ -904,6 +1014,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 u32::try_from(drafts).unwrap_or(u32::MAX)
             })
             .with_verify_syncs(verify_host_syncs)
+            .with_adaptive_speculative(adaptive)
             .with_span_tallies(&span);
         SpeculativeRun {
             output: GenerationOutput {
@@ -920,6 +1031,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             generated,
             finish,
             stats,
+            controller.report(),
             verify_host_syncs,
             cache,
             on_event,
@@ -944,6 +1056,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             generated,
             finish,
             stats,
+            controller.report(),
             verify_host_syncs,
             cache,
             on_event,
@@ -962,23 +1075,19 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     }
 
     // ---- Speculative steps. ----
-    // `auto`'s acceptance monitor (sc-24446): a timed one first runs a plain probe (no proposal;
-    // the steps' hidden rows kept so the proposer catches up before its first proposal), then
-    // judges each window on the request's own measured costs. Once demoted, no step proposes,
-    // asks for hidden rows or commits to the proposer — the rest of the run is the ordinary
-    // token-at-a-time step. A step is timed from the top of the loop to the end of the proposer
-    // commit (its host readback is inside); emitting its tokens is outside.
-    let clock = core_llm::decode_clock();
-    let mut monitor = AcceptanceMonitor::for_request(
-        speculative_mode,
-        kind,
-        u32::try_from(drafts).unwrap_or(u32::MAX),
-        PlainDecode::Candle,
-        clock.is_some(),
-    );
+    // Under `auto` (SW-F357 / SW-7237), `AdaptiveSpeculativeController` runs an initial plain
+    // baseline probe, adapts depth within provisioned bounds, switches between the primary GPU
+    // proposer and zero-memory `prompt_lookup` via bounded probing, and demotes losing paths to
+    // plain token-at-a-time steps. Explicit `off` / `{proposer, depth}` run authoritatively.
+    let mut lookup_proposer = crate::decode::proposers::NgramProposer::default();
     let mut probed: Vec<(i32, Option<Tensor>)> = Vec::new();
     let mut probe_position = 0i32;
-    let mut demoted = false;
+    let mut demoted = controller.is_demoted();
+    let elapsed_ns = |start: Option<std::time::Duration>| -> u64 {
+        start.zip(clock.as_ref()).map_or(0, |(s, c)| {
+            u64::try_from(c.now().saturating_sub(s).as_nanos()).unwrap_or(u64::MAX)
+        })
+    };
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
@@ -988,30 +1097,57 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             finish = FinishReason::Stopped;
             break;
         }
-        let probing = monitor.as_ref().is_some_and(AcceptanceMonitor::probing);
-        if !probing && !probed.is_empty() {
-            catch_up(&mut *proposer, &mut probed, probe_position)?;
-        }
-        let started = monitor
-            .as_ref()
-            .and(clock.as_ref())
-            .map(|clock| clock.now());
+        let step_plan = controller.next_step();
+        let probing = step_plan.probing_plain;
+        let use_lookup = !demoted
+            && !probing
+            && step_plan.proposer == ProposerKind::PromptLookup
+            && kind != ProposerKind::PromptLookup;
+        let use_primary =
+            !demoted && !probing && step_plan.proposer == kind && kind != ProposerKind::None;
+        let step_started = clock.as_ref().map(|c| c.now());
         let step_syncs = host_sync_count();
+        let mut catchup_ns = 0u64;
+        let mut proposal_ns = 0u64;
+        let verify_ns;
+        let sync_ns;
+        let rollback_ns;
+        if use_primary && !probed.is_empty() {
+            let cu_clock = clock.as_ref().map(|c| c.now());
+            catch_up(&mut *proposer, &mut probed, probe_position)?;
+            catchup_ns = elapsed_ns(cu_clock);
+            proposal_ns = proposal_ns.saturating_add(catchup_ns);
+        }
         let remaining = config.max_new_tokens - generated.len();
-        let k = if demoted || probing {
+        let active_depth = (step_plan.depth as usize).min(provisioned_width);
+        let k = if demoted || probing || step_plan.proposer == ProposerKind::None {
             0
         } else {
-            drafts.min(remaining.saturating_sub(1))
+            active_depth.min(remaining.saturating_sub(1))
         };
-        let wants_hidden = wants_hidden && !demoted;
+        let keep_primary_hidden =
+            wants_hidden && !demoted && (probing || use_primary || controller.can_switch_to(kind));
+        // On a hidden-row primary route (`Mtp` / `BlockDraft`), keep `want_hidden = true` on
+        // linear `forward_step` calls while not demoted (even if `PromptLookup` runs after the
+        // primary retired): CUDA graph admission prices `(1..=K+1, want_hidden=true)` plus the
+        // demoted plain step `(1, want_hidden=false)`, so keeping `want_hidden = true` reuses the
+        // priced graph shapes instead of capturing unpriced `(1+k, want_hidden=false)` shapes.
+        let step_want_hidden = wants_hidden && !demoted;
         let base = cache.len();
         let position = base + position_delta;
-        if probing {
-            if probed.is_empty() {
-                probe_position = position;
-            }
-            probed.push((cur, previous_hidden.clone()));
-        }
+        let record_catchup = !demoted
+            && (probing
+                || (use_lookup
+                    && ((wants_hidden
+                        && kind == ProposerKind::Mtp
+                        && controller.can_switch_to(ProposerKind::Mtp))
+                        || (kind == ProposerKind::DraftModel
+                            && controller.can_switch_to(ProposerKind::DraftModel)))));
+        let prev_hidden_for_catchup = if record_catchup && wants_hidden {
+            previous_hidden.clone()
+        } else {
+            None
+        };
         let cur_ids = input_ids(&[cur], device)?;
         let constraint_checkpoint = constraint.as_ref().map(|c| c.checkpoint());
 
@@ -1025,7 +1161,11 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 cur,
                 cur_ids: &cur_ids,
                 history: &history,
-                previous_hidden: previous_hidden.as_ref(),
+                previous_hidden: if use_primary {
+                    previous_hidden.as_ref()
+                } else {
+                    None
+                },
                 position,
                 max_drafts: k,
                 budget_drafts: remaining.saturating_sub(1),
@@ -1038,9 +1178,21 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 constraint: constraint.as_deref_mut(),
                 device_greedy,
             };
+            let prop_clock = clock.as_ref().map(|c| c.now());
             let draft_started = std::time::Instant::now();
             let tree = if tree_rows > 0 {
-                proposer.propose_tree(&ctx, &mut sampler)?
+                if use_lookup {
+                    // Only build a branching lookup tree when tree workspace was provisioned and
+                    // admitted for the primary route (`kind.builds_trees()`); otherwise fall
+                    // through to linear `lookup_proposer.propose` within `k <= provisioned_width`.
+                    if kind.builds_trees() {
+                        lookup_proposer.propose_tree(&ctx, &mut sampler)?
+                    } else {
+                        None
+                    }
+                } else {
+                    proposer.propose_tree(&ctx, &mut sampler)?
+                }
             } else {
                 None
             };
@@ -1064,10 +1216,21 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                             max_drafts: k.min(tree_rows),
                             ..ctx
                         };
-                        (proposer.propose(&capped, &mut sampler)?, None)
+                        if use_lookup {
+                            (lookup_proposer.propose(&capped, &mut sampler)?, None)
+                        } else {
+                            (proposer.propose(&capped, &mut sampler)?, None)
+                        }
                     }
-                    None => (proposer.propose(&ctx, &mut sampler)?, None),
+                    None => {
+                        if use_lookup {
+                            (lookup_proposer.propose(&ctx, &mut sampler)?, None)
+                        } else {
+                            (proposer.propose(&ctx, &mut sampler)?, None)
+                        }
+                    }
                 };
+            proposal_ns = proposal_ns.saturating_add(elapsed_ns(prop_clock));
             // A proposal left on the device was timed only up to its enqueue (SW-7200).
             let on_device = matches!(proposed.0.drafts, Some(Drafts::Device(_)));
             stats
@@ -1093,8 +1256,9 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             let verify = TreeVerify {
                 tree: &tree,
                 anchor: cur,
-                want_hidden: wants_hidden,
+                want_hidden: keep_primary_hidden,
             };
+            let ver_clock = clock.as_ref().map(|c| c.now());
             let out = match model.forward_tree(cache, &verify) {
                 Ok(out) => out,
                 Err(e) => {
@@ -1102,6 +1266,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                     return Err(e);
                 }
             };
+            verify_ns = elapsed_ns(ver_clock);
             stats.forwards += 1;
             stats.verify_steps += 1;
             let workspace = out.mask_bytes.saturating_add(cache.tree_bytes()) as u64;
@@ -1111,6 +1276,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 finish = FinishReason::Cancelled;
                 break;
             }
+            let sync_clock = clock.as_ref().map(|c| c.now());
             let walk = tree_walk(
                 &out.step.logits,
                 &tree,
@@ -1119,8 +1285,11 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 &mut rng,
                 plain_greedy,
                 constraint.as_deref_mut(),
-            )
-            .and_then(|walk| cache.commit_tree(base, &walk.path).map(|()| walk));
+            );
+            sync_ns = elapsed_ns(sync_clock);
+            let rb_clock = clock.as_ref().map(|c| c.now());
+            let walk = walk.and_then(|walk| cache.commit_tree(base, &walk.path).map(|()| walk));
+            rollback_ns = elapsed_ns(rb_clock);
             let walk = match walk {
                 Ok(walk) => walk,
                 Err(e) => {
@@ -1176,16 +1345,19 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 }
                 Drafts::Device(d) => Tensor::cat(&[&cur_ids, d], 1)?,
             };
+            let ver_clock = clock.as_ref().map(|c| c.now());
             let out = model.forward_step(
                 cache,
                 StepRequest {
                     tokens: StepTokens::Device(&verify_ids),
                     scope: LogitsScope::All,
-                    want_hidden: wants_hidden,
+                    want_hidden: step_want_hidden,
                     prefill: false,
                     snapshot_at: None,
+                    snapshot_points: Vec::new(),
                 },
             )?;
+            verify_ns = elapsed_ns(ver_clock);
             stats.forwards += 1;
             stats.verify_steps += 1;
             if cancel.is_cancelled() {
@@ -1198,6 +1370,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
 
             // 3. Decide, on host, from one transfer. A caller sampler only ever runs without drafts:
             //    its one row is the caller's draw.
+            let sync_clock = clock.as_ref().map(|c| c.now());
             let (draft_ids, committed, accepted) = match sampler.as_deref_mut() {
                 Some(sampler) => {
                     let n = out.logits.dim(1)?;
@@ -1222,6 +1395,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                     constraint.as_deref_mut(),
                 )?,
             };
+            sync_ns = elapsed_ns(sync_clock);
             if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
                 c.rewind(checkpoint);
             }
@@ -1234,6 +1408,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             // 4. Recover the cache to `[cur, accepted…]`: a direct rollback when the cache can, else
             //    back to the step start plus a replay of the kept prefix (a cache without per-token
             //    checkpoints).
+            let rb_clock = clock.as_ref().map(|c| c.now());
             let keep_len = 1 + accepted;
             let kept_hidden = if accepted == num_drafts {
                 out.hidden
@@ -1254,7 +1429,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                         replay.extend_from_slice(&draft_ids[..accepted]);
                         let replayed = model.forward_step(
                             cache,
-                            StepRequest::last(&replay).with_hidden(wants_hidden),
+                            StepRequest::last(&replay).with_hidden(step_want_hidden),
                         )?;
                         stats.forwards += 1;
                         stats.replays += 1;
@@ -1263,6 +1438,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                     Err(e) => return Err(e),
                 }
             };
+            rollback_ns = elapsed_ns(rb_clock);
             (draft_ids, committed, accepted, kept_hidden, num_drafts)
         };
         if let Some(report) = stats.tree.as_mut() {
@@ -1272,25 +1448,89 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             report.accepted_tokens += accepted as u64;
         }
         if !demoted {
-            proposer.commit(
-                cur,
-                &draft_ids[..accepted],
-                kept_hidden.as_ref(),
-                position + 1,
-            )?;
-            previous_hidden = last_row(kept_hidden.as_ref())?;
+            if record_catchup {
+                if probed.is_empty() {
+                    probe_position = position;
+                }
+                probed.push((cur, prev_hidden_for_catchup));
+                if !probing && accepted > 0 {
+                    for (i, &tok) in draft_ids[..accepted].iter().enumerate() {
+                        let pred = match kept_hidden.as_ref() {
+                            Some(h) => Some(h.narrow(1, i, 1)?),
+                            None => None,
+                        };
+                        probed.push((tok, pred));
+                    }
+                }
+                if !probing {
+                    let catchup_limit = match kind {
+                        ProposerKind::Mtp => Some(MAX_MTP_CATCHUP_TOKENS),
+                        ProposerKind::DraftModel => Some(MAX_DRAFT_CATCHUP_TOKENS),
+                        _ => None,
+                    };
+                    if catchup_limit.is_some_and(|limit| probed.len() > limit) {
+                        probed.clear();
+                        controller.retire_proposer(kind);
+                    }
+                }
+            }
+            if use_primary
+                || probing
+                || (use_lookup && kind != ProposerKind::Mtp && controller.can_switch_to(kind))
+            {
+                proposer.commit(
+                    cur,
+                    &draft_ids[..accepted],
+                    kept_hidden.as_ref(),
+                    position + 1,
+                )?;
+            }
+            if keep_primary_hidden {
+                previous_hidden = last_row(kept_hidden.as_ref())?;
+            } else {
+                previous_hidden = None;
+            }
         }
-        verify_host_syncs += host_sync_count().wrapping_sub(step_syncs);
-        let elapsed = started
-            .zip(clock.as_ref())
-            .map(|(start, clock)| clock.now().saturating_sub(start));
-        let demote_now = monitor.as_mut().is_some_and(|m| {
-            m.observe_step(StepObservation {
-                accepted,
-                drafts: num_drafts,
-                elapsed,
-            })
+        let step_host_syncs = host_sync_count().wrapping_sub(step_syncs);
+        verify_host_syncs += step_host_syncs;
+        let total_ns = elapsed_ns(step_started);
+        let lookup_peek_len = if controller.is_adaptive()
+            && !demoted
+            && !probing
+            && step_plan.proposer != ProposerKind::PromptLookup
+            && controller.can_switch_to(ProposerKind::PromptLookup)
+        {
+            let mut peek_history =
+                Vec::with_capacity(history.len().min(NGRAM_PEEK_WINDOW_TOKENS) + committed.len());
+            let start = history.len().saturating_sub(NGRAM_PEEK_WINDOW_TOKENS);
+            peek_history.extend_from_slice(&history[start..]);
+            peek_history.extend_from_slice(&committed);
+            ngram_peek_match_len(
+                &peek_history,
+                lookup_proposer.max_ngram,
+                4,
+                NGRAM_PEEK_WINDOW_TOKENS,
+            )
+        } else {
+            0
+        };
+        let action = controller.observe_step(AdaptiveStepInput {
+            accepted,
+            drafts: num_drafts,
+            committed: committed.len(),
+            generated_tokens: (generated.len() + committed.len()) as u64,
+            cost: StepCost {
+                proposal_ns,
+                verify_ns,
+                rollback_ns,
+                sync_ns,
+                switch_overhead_ns: catchup_ns,
+                total_ns,
+                host_syncs: step_host_syncs,
+            },
+            lookup_peek_len,
         });
+        let demote_now = action == AdaptiveAction::DemoteToPlain;
 
         // 5. Commit through the shared event path.
         let mut emitted = 0usize;
@@ -1334,9 +1574,10 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             demoted = true;
             stats.demoted_at = Some(generated.len());
             previous_hidden = None;
+            probed.clear();
         }
     }
-    stats.monitor = monitor.as_ref().and_then(AcceptanceMonitor::last_decision);
+    stats.monitor = controller.last_monitor_decision();
     // A window that demotes on the step that also ends the run (its budget, a stop token, the
     // caller's stop, a cancel) leaves the loop before the demotion is recorded above: the run was
     // still demoted there, so the report's `speculative_demoted_at` and its monitor decision
@@ -1349,6 +1590,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         generated,
         finish,
         stats,
+        controller.report(),
         verify_host_syncs,
         cache,
         on_event,
@@ -4570,5 +4812,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod adaptive_tests;
 #[cfg(test)]
 mod tree_tests;

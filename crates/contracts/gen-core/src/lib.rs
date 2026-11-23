@@ -399,3 +399,10 @@ pub mod snapshot_inventory;
 mod ios_build_identity;
 #[doc(hidden)]
 pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;
+
+/// Durable cache interface shared by native weight quantizers.
+pub mod quantization_cache;
+pub use quantization_cache::{
+    QuantizationArtifact, QuantizationArtifactCache, QuantizationArtifactKey,
+    QuantizationCacheContext,
+};

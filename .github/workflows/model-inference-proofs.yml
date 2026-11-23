@@ -139,6 +139,11 @@ jobs:
           # Paired video proofs verify their migration base as an ancestor before building.
           fetch-depth: ${{ matrix.paired_source && '0' || '1' }}
           persist-credentials: false
+      - name: Own disposable Windows proof storage
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/cleanup-runner-storage
+        with:
+          dev-host: 'true'
       - name: Check out the exact pre-migration engine for the paired proof
         if: matrix.asset_setup == 'flux1-comparison'
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -311,8 +316,9 @@ jobs:
             exit /b 1
           )
           set "RUSTC_WRAPPER="
-          set "TEMP=%RUNNER_TEMP%"
-          set "TMP=%RUNNER_TEMP%"
+          if not defined DEV_HOST_JOB_ROOT exit /b 1
+          set "TEMP=%DEV_HOST_JOB_ROOT%"
+          set "TMP=%DEV_HOST_JOB_ROOT%"
           "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
       - name: Validate owned evidence tree before any upload
         working-directory: ${{ env.MODEL_PROOF_CWD }}
@@ -325,6 +331,7 @@ jobs:
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Upload exact case evidence, safe generated outputs, logs and summary
+        id: proof_artifact
         if: always() && steps.evidence.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -338,6 +345,11 @@ jobs:
           checkout="paired-src-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           test "$MODEL_PROOF_CWD" = "$checkout"
           rm -rf -- "$checkout"
+
+      - name: Confirm evidence is published before disposable cleanup
+        if: ${{ always() && runner.os == 'Windows' && steps.proof_artifact.outcome == 'success' }}
+        shell: powershell
+        run: '"DEV_HOST_WORK_UPLOADS_COMPLETE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
   inventory:
     name: Manual CPU-only FLUX.1 asset inventory

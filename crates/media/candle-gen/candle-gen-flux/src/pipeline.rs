@@ -59,7 +59,6 @@
 //! snapshot (root `flux1-*.safetensors`) takes the stock candle-transformers path unchanged. On-the-fly
 //! quantization of a dense tier is still NOT done (only the pre-packed tier is a quantized path).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -627,33 +626,7 @@ impl Pipeline {
 
     fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
         let files = self.component_files("vae")?;
-        // One mapping serves both the key enumeration and every load (the z-image sibling of
-        // sc-27386): the names are collected before the mapping is boxed into the backend.
-        let st = candle_gen::mmap_safetensors_multi(&files)?;
-        let names: Vec<String> = st.tensors().into_iter().map(|(k, _)| k).collect();
-        let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
-
-        let packed_bases: std::collections::HashSet<String> = names
-            .iter()
-            .filter_map(|k| k.strip_suffix(".scales").map(|b| b.to_string()))
-            .collect();
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for key in names {
-            if key.ends_with(".scales") || key.ends_with(".biases") {
-                continue; // folded into the dequantized dense `.weight`
-            }
-            if let Some(base) = key.strip_suffix(".weight") {
-                if packed_bases.contains(base) {
-                    let dense = crate::quant::dequant_packed_to_dense(&src, base, device, dtype)?;
-                    tensors.insert(key.clone(), dense);
-                    continue;
-                }
-            }
-            // The mmap backend's `get_unchecked` is `load(key, device)` then `to_dtype(dtype)`.
-            let t = src.get_unchecked_dtype(&key, dtype)?;
-            tensors.insert(key, t);
-        }
-        Ok(VarBuilder::from_tensors(tensors, dtype, device))
+        candle_gen::loader::dequantized_vae_vb(&files, dtype, device)
     }
 
     /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as

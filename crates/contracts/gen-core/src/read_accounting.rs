@@ -442,6 +442,42 @@ impl CheckpointReadAccounting {
         (plan, measured)
     }
 
+    /// Measured source-native projection operands for a text provider's load report. Resolve
+    /// aliased reads and expert views exactly as the checkpoint receipt does, including shared
+    /// scales. Unread rows and floating coefficient caches have no native operator to report.
+    pub fn native_projection_report(&self) -> Vec<core_llm::ProjectionReport> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (plan, measured) = self.resolved(&state);
+        let mut kinds = BTreeMap::new();
+        for (&index, &(representation, bytes)) in &measured.rows {
+            if representation != ExecutionRepresentation::NativePacked {
+                continue;
+            }
+            let row = &plan.tensors[index];
+            let kind = match &row.codec {
+                TensorCodecSpec::ScalarFp8 { .. } if row.encoding == WeightEncoding::Fp8E5M2 => {
+                    "fp8_e5m2"
+                }
+                TensorCodecSpec::ScalarFp8 { .. } => "fp8_e4m3",
+                TensorCodecSpec::RowwiseFp8 { .. } => "fp8_e4m3_rowwise",
+                TensorCodecSpec::Mxfp8 { .. } => "mxfp8",
+                TensorCodecSpec::ConvRotInt8 { .. } => "convrot_int8",
+                TensorCodecSpec::Nvfp4 { .. } => "nvfp4",
+                _ => continue,
+            };
+            let report = kinds
+                .entry(kind)
+                .or_insert_with(|| core_llm::ProjectionReport {
+                    kind: kind.to_owned(),
+                    ..Default::default()
+                });
+            report.count += 1;
+            report.params += row.shape.iter().map(|&d| d as u64).product::<u64>();
+            report.resident_bytes += bytes;
+        }
+        kinds.into_values().collect()
+    }
+
     pub fn receipt(&self) -> LogicalWeightReceipt {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (plan, measured) = self.resolved(&state);

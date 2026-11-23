@@ -1199,19 +1199,11 @@ pub struct Autoencoder {
 
 impl Autoencoder {
     pub fn from_weights(w: &Weights, cfg: &VaeConfig) -> Result<Self> {
-        let squeeze_lin = |name: &str| -> Result<AdaptableLinear> {
-            let cw = w.require(&format!("{name}.weight"))?;
-            let sh = cw.shape();
-            Ok(AdaptableLinear::dense(
-                cw.reshape(&[sh[0], sh[1]])?,
-                Some(w.require(&format!("{name}.bias"))?.clone()),
-            ))
-        };
         Ok(Self {
             encoder: Encoder::from_weights(w, cfg)?,
             decoder: Decoder::from_weights(w, cfg)?,
-            quant_proj: squeeze_lin("quant_conv")?,
-            post_quant_proj: squeeze_lin("post_quant_conv")?,
+            quant_proj: crate::quant::pointwise_linear(w, "quant_conv")?,
+            post_quant_proj: crate::quant::pointwise_linear(w, "post_quant_conv")?,
             scaling_factor: cfg.scaling_factor,
             dtype: w.require("decoder.conv_in.weight")?.dtype(),
         })

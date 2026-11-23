@@ -19,7 +19,6 @@
 //!   indexing: entry `k` is the output of block `k`) concatenated **per token** in layer order —
 //!   `[L, 8 · 2560]` bf16 — with ids `(0, 0, 0, position)`.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
@@ -66,6 +65,10 @@ fn from_llm(e: mlx_llm::Error) -> Error {
         mlx_llm::Error::Canceled => Error::Canceled,
         other => Error::Msg(format!("flux3 text encoder: {other}")),
     }
+}
+
+pub(crate) fn is_text_tower_tensor(key: &str, untied_head: bool) -> bool {
+    key.starts_with("model.language_model.") || (untied_head && key.starts_with("lm_head."))
 }
 
 /// The safetensors files [`Flux3TextEncoder::load`] opens for the snapshot at `dir`: the shards
@@ -168,7 +171,6 @@ impl Flux3TextEncoder {
             None => (Dtype::Bfloat16, cfg.window_max_length()),
         };
         let files = weight_shards(dir)?;
-        let mut tensors = HashMap::new();
         for file in &files {
             if !file.is_file() {
                 return Err(Error::Msg(format!(
@@ -176,15 +178,11 @@ impl Flux3TextEncoder {
                     file.display()
                 )));
             }
-            let part = Array::load_safetensors(file).map_err(|e| {
-                Error::Msg(format!(
-                    "flux3: loading text-encoder shard {}: {e}",
-                    file.display()
-                ))
-            })?;
-            tensors.extend(part);
         }
-        let weights = mlx_llm::primitives::weights::Weights::from_map(tensors);
+        let weights = mlx_llm::primitives::Weights::from_selected_shards(&files, |key| {
+            is_text_tower_tensor(key, !model_cfg.tie_word_embeddings)
+        })
+        .map_err(from_llm)?;
         // `from_weights` evaluates every parameter group it built (the load boundary), so no
         // forward ever reads a weight from disk.
         let lm = match training {

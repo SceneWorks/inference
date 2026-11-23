@@ -155,6 +155,17 @@ fn projected_source_rows(
         &crate::logical_weights::MlxCodecResidency,
         |_, shape| shape.len() == 2,
     )?;
+    Ok((
+        projected_rows_with_encodings(headers, projection, &encoded)?,
+        !encoded.is_empty(),
+    ))
+}
+
+fn projected_rows_with_encodings(
+    headers: &[SafetensorsTensorHeader],
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+    encoded: &std::collections::BTreeMap<String, u64>,
+) -> Result<Vec<ResidentTensorBytes>> {
     let mut rows = projected_tensor_headers(headers, |h| {
         if encoded.contains_key(&h.name) {
             ResidentProjection::Stored
@@ -167,7 +178,7 @@ fn projected_source_rows(
             row.resident_bytes = bytes;
         }
     }
-    Ok((rows, !encoded.is_empty()))
+    Ok(rows)
 }
 
 /// Return the physical source qualification with the retained bytes used for admission, so
@@ -191,7 +202,35 @@ pub fn projected_shards_bytes(
     for file in files {
         headers.extend(safetensors_path_tensor_headers(file)?);
     }
-    total_projected_bytes(projected_source_rows(files, &headers, projection)?.0)
+    let selected: HashSet<_> = headers
+        .iter()
+        .filter(|h| projection(h) != ResidentProjection::Omit)
+        .map(|h| h.name.as_str())
+        .collect();
+    let Some(plan) = gen_core::checkpoint_codec::projected_checkpoint_plan(
+        files,
+        &headers,
+        |key| selected.contains(key),
+        &mlx_layers::source::MlxCodecResidency,
+        |_, shape| (shape.len() == 2).then(|| shape.to_vec()),
+    )?
+    else {
+        return projected_tensor_headers_bytes(&headers, projection);
+    };
+    let bytes =
+        mlx_layers::source::projected_bytes_from_plan(&plan, &headers, |header| match projection(
+            header,
+        ) {
+            ResidentProjection::Float32 => 4,
+            ResidentProjection::Omit => 0,
+            _ => 2,
+        })?;
+    let held =
+        mlx_layers::source::retained_auxiliary_bytes(&plan, |key| selected.contains(key), Some)
+            .ok_or_else(|| Error::Msg("retained source operand byte count overflow".into()))?;
+    total_projected_bytes(projected_rows_with_encodings(&headers, projection, &bytes)?)?
+        .checked_add(held)
+        .ok_or_else(|| Error::Msg("retained shard byte count overflow".into()))
 }
 
 fn source_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
@@ -266,10 +305,13 @@ pub fn projected_tensor_headers(
         .iter()
         .map(|tensor| {
             let base = tensor.name.strip_suffix(".weight");
-            let policy = if base.is_some_and(|base| packed_bases.contains(base)) {
+            let requested = projection(tensor);
+            let policy = if requested != ResidentProjection::Omit
+                && base.is_some_and(|base| packed_bases.contains(base))
+            {
                 ResidentProjection::Stored
             } else {
-                projection(tensor)
+                requested
             };
             let resident_bytes = match policy {
                 ResidentProjection::Stored => tensor.data_bytes,

@@ -123,6 +123,11 @@ import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, NamedTuple
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from scripts.ci.stage_pinned_hub_snapshots import resolve_hub_root  # noqa: E402
+
 SCHEMA = "sceneworks.decode-speedups.baseline/4"
 CAMPAIGN_SCHEMA = "sceneworks.decode-speedups.campaign/1"
 COMPARE_SCHEMA = "sceneworks.decode-speedups.compare/1"
@@ -151,6 +156,8 @@ PATHS_SCHEMA = "sceneworks.decode-speedups.paths/1"
 RUNS = ("epic", "baseline")
 FORMATS = ("bf16", "q8", "q4", "nvfp4")
 THINKING = ("default", "off", "on", "xhigh", "medium", "low")
+PROMPT_SETS = ("default", "prefix_checkpoints")
+PREFIX_CHECKPOINTS = ("off", "auto")
 DEFAULT_PROCESS_REPEATS = 3
 CANDLE_SWITCHES = (
     "CANDLE_LLM_CUDA_GRAPHS",
@@ -193,6 +200,8 @@ ROW_KEYS = {
     "switches",
     "without_mtp",
     "memory_cap_gib",
+    "prompt_set",
+    "prefix_checkpoints",
 }
 ROW_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MAX_ROWS = 64
@@ -319,7 +328,11 @@ def hub_pin(value: str, environ: dict[str, str], what: str) -> tuple[str, dict[s
     if not root:
         raise MatrixError(f"{what}: a Hub pin needs ${HUB_ROOT_ENV} (the runner's Hub root)")
     repository, revision = match.group("repository"), match.group("revision")
-    base = Path(os.path.realpath(os.path.expanduser(root)))
+    try:
+        root_path = resolve_hub_root(environ)
+    except ValueError as error:
+        raise MatrixError(f"{what}: {error} (got {root!r})") from error
+    base = Path(os.path.realpath(root_path))
     path = base / ("models--" + repository.replace("/", "--")) / "snapshots" / revision
     if subfolder:
         path = path.joinpath(*subfolder.split("/"))
@@ -502,10 +515,27 @@ def plan_row(
         knobs["SPECULATIVE_BENCH_PREFIX_CACHE_BYTES"] = str(budget)
         if budget != 0:
             epic_only.append("prefix_cache_bytes")
+    if "prompt_set" in row:
+        prompt_set = _text(row["prompt_set"], f"{tag}: prompt_set")
+        if prompt_set not in PROMPT_SETS:
+            raise MatrixError(
+                f"{tag}: prompt_set must be one of {list(PROMPT_SETS)}, got {prompt_set!r}"
+            )
+        knobs["SPECULATIVE_BENCH_PROMPT_SET"] = prompt_set
+        if prompt_set != "default":
+            epic_only.append("prompt_set")
+    if "prefix_checkpoints" in row:
+        checkpoints = _text(row["prefix_checkpoints"], f"{tag}: prefix_checkpoints")
+        if checkpoints not in PREFIX_CHECKPOINTS:
+            raise MatrixError(
+                f"{tag}: prefix_checkpoints must be one of {list(PREFIX_CHECKPOINTS)}, got {checkpoints!r}"
+            )
+        knobs["SPECULATIVE_BENCH_PREFIX_CHECKPOINTS"] = checkpoints
+        epic_only.append("prefix_checkpoints")
     if "baseline" in runs and epic_only:
         raise MatrixError(
             f"{tag}: {epic_only} cannot run on the pre-epic baseline (no draft models, companion "
-            "heads or prefix cache there); give the row runs [\"epic\"]"
+            "heads, prefix cache or prefix checkpoints there); give the row runs [\"epic\"]"
         )
 
     switches = row.get("switches", {})
@@ -1581,6 +1611,7 @@ def document_config(process: Process) -> dict[str, Any]:
             name: (value or {}).get("env")
             for name, value in (provenance.get("switches") or {}).items()
         },
+        "prefix_checkpoints": _prefix_checkpoints_mode(process),
         "prompts": sorted({(r.get("prompt_id"), r.get("class")) for r in doc.get("rows") or []}),
     }
 
@@ -1605,10 +1636,24 @@ def check_row_evidence(processes: list[Process]) -> list[str]:
     reference["prompts"] = sorted(
         {p for process in processes for p in document_config(process)["prompts"]}
     )
+    by_run_checkpoints: dict[str, tuple[str, str | None]] = {}
     for process in processes:
         name = f"{process.campaign}/{process.row} {process.run}-{process.index}"
         config = document_config(process)
         for key, value in config.items():
+            if key == "prefix_checkpoints":
+                # Pre-epic baseline documents do not emit checkpoint telemetry (`None`), whereas
+                # current epic documents emit their active policy (`auto`/`off`/`document`). Enforce
+                # equality within each run without rejecting cross-revision epic-vs-baseline pairs.
+                expected_run = by_run_checkpoints.get(process.run)
+                if expected_run is None:
+                    by_run_checkpoints[process.run] = (f"{process.run}-{process.index}", value)
+                elif value != expected_run[1]:
+                    refusals.append(
+                        f"{name}: {key} {value!r} differs from {expected_run[1]!r} "
+                        f"({expected_run[0]} / the row's prompt set)"
+                    )
+                continue
             if value != reference[key]:
                 refusals.append(
                     f"{name}: {key} {value!r} differs from {reference[key]!r} "
@@ -1791,6 +1836,7 @@ FIELD_MEASUREMENT = {
     "fused_rotation": ("switch", "MLX_LLM_FUSED_ROTATION"),
     "gdn_kernel": ("switch", "MLX_LLM_GDN_KERNEL"),
     "prefix_cache_bytes": ("prefix_cache", None),
+    "prefix_checkpoints": ("prefix_checkpoints", None),
     "speculative": ("speculative", None),
 }
 DEFAULTS_BACKENDS = {
@@ -1836,7 +1882,7 @@ def default_entries(source: str) -> list[dict[str, Any]]:
                         "backend": backend,
                         "field": name,
                         "value": value,
-                        "on": value not in ("false", "Speculative::Off", "0"),
+                        "on": value not in ("false", "Speculative::Off", "0", "PrefixCheckpointMode::Off"),
                         "kind": kind,
                         "switch": switch,
                         "provisional": "PROVISIONAL" in justification,
@@ -1856,7 +1902,33 @@ def _prefix_cache_on(process: Process) -> bool:
     return bool((process.document.get("load") or {}).get("prefix_cache_bytes") or 0)
 
 
-def _context(process: Process, exclude_switch: str | None, include_cache: bool) -> str:
+def _prefix_checkpoints_mode(process: Process) -> str | None:
+    env = process.row_entry.get("env") or {}
+    mode = env.get("SPECULATIVE_BENCH_PREFIX_CHECKPOINTS")
+    if mode in PREFIX_CHECKPOINTS:
+        return mode
+    rows = process.document.get("rows") or []
+    policies = {
+        (row.get("prefix_checkpoints") or {}).get("policy")
+        for row in rows
+        if isinstance(row.get("prefix_checkpoints"), dict)
+    }
+    if not policies:
+        return None
+    if policies == {"off"}:
+        return "off"
+    if policies <= {"auto", "document"}:
+        return "auto"
+    return None
+
+
+def _context(
+    process: Process,
+    exclude_switch: str | None,
+    include_cache: bool,
+    *,
+    include_checkpoints: bool = True,
+) -> str:
     """Everything two epic rows of one campaign must share to be an on/off pair — twins: their
     whole configuration (options included) and process schedule (``runs``: a row alternating with
     pre-epic processes is a different measurement regime), but the setting under test."""
@@ -1876,6 +1948,8 @@ def _context(process: Process, exclude_switch: str | None, include_cache: bool) 
     }
     if include_cache:
         config["prefix_cache"] = _prefix_cache_on(process)
+    if not include_checkpoints:
+        config.pop("prefix_checkpoints", None)
     return json.dumps({"campaign": process.campaign, **config}, sort_keys=True, default=str)
 
 
@@ -1884,6 +1958,8 @@ def _deliberate(entry: dict[str, Any], processes: list[Process]) -> bool:
     non-zero prefix-cache budget): a row that did so and has no twin is a missing measurement."""
     if entry["kind"] == "switch":
         return entry["switch"] in (processes[0].row_entry.get("switches") or {})
+    if entry["kind"] == "prefix_checkpoints":
+        return _prefix_checkpoints_mode(processes[0]) == "auto"
     return entry["kind"] == "prefix_cache" and _prefix_cache_on(processes[0])
 
 
@@ -1911,6 +1987,12 @@ def _pairs(
         elif entry["kind"] == "prefix_cache":
             state = _prefix_cache_on(processes[0])
             context = _context(processes[0], None, include_cache=False)
+        elif entry["kind"] == "prefix_checkpoints":
+            mode = _prefix_checkpoints_mode(processes[0])
+            if mode not in PREFIX_CHECKPOINTS:
+                continue
+            state = mode == "auto"
+            context = _context(processes[0], None, include_cache=True, include_checkpoints=False)
         else:
             return [], []
         buckets.setdefault(context, {}).setdefault(state, []).append(processes)
@@ -2037,7 +2119,13 @@ def decide_defaults(
                     splits: tuple[str | None, ...] = (None,)
                     if entry["kind"] == "prefix_cache" and _splits_by_hit(on, prompt_id, on_option):
                         splits = ("miss", "hit")
-                    cells = [(m, h, s) for m, h in METRICS.items() for s in splits]
+                    metrics_for_entry = list(METRICS.items())
+                    if entry["kind"] == "prefix_checkpoints" and (
+                        metric_values(on, prompt_id, on_option, "wall_ms")
+                        or metric_values(off, prompt_id, off_option, "wall_ms")
+                    ):
+                        metrics_for_entry.append(("wall_ms", False))
+                    cells = [(m, h, s) for m, h in metrics_for_entry for s in splits]
                     for metric, higher, samples in cells:
                         if plain:
                             result = {
@@ -2081,7 +2169,12 @@ def decide_defaults(
                         )
         outcome = _e5_outcome(entry, judged)
         if unpaired:
-            what = "the prefix cache" if entry["kind"] == "prefix_cache" else entry["switch"]
+            if entry["kind"] == "prefix_cache":
+                what = "the prefix cache"
+            elif entry["kind"] == "prefix_checkpoints":
+                what = "prefix checkpoints"
+            else:
+                what = entry["switch"]
             outcome["reason"] += (
                 f"; unpaired, no twin row identical but for {what}: "
                 + ", ".join(f"{p[0].campaign}/{p[0].row}" for p in unpaired)
@@ -2099,6 +2192,273 @@ def decide_defaults(
             }
         )
     return decisions
+
+
+_CHECKPOINT_NUMERIC_FIELDS = (
+    "reused_tokens",
+    "reread_tokens",
+    "checkpoints_captured",
+    "captured_bytes",
+    "restore_ms",
+    "capture_ms",
+    "resident_bytes",
+    "protected_bytes",
+    "evicted_entries",
+)
+
+
+def _checkpoint_telemetry(processes: list[Process], prompt_id: str, option: str) -> dict[str, Any] | None:
+    blocks = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        pc = (table.get((prompt_id, option)) or {}).get("prefix_checkpoints")
+        if isinstance(pc, dict):
+            blocks.append(pc)
+    return _summarize_checkpoint_blocks(blocks)
+
+
+def _summarize_checkpoint_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not blocks:
+        return None
+    out: dict[str, Any] = {
+        field: _mean([v for v in (_number(b.get(field)) for b in blocks) if v is not None])
+        for field in _CHECKPOINT_NUMERIC_FIELDS
+    }
+    out["policies"] = sorted({b["policy"] for b in blocks if isinstance(b.get("policy"), str)})
+    out["matched_kinds"] = sorted(
+        {b["matched_kind"] for b in blocks if isinstance(b.get("matched_kind"), str)}
+    )
+    out["fallbacks"] = sorted(
+        {f for b in blocks for f in (b.get("fallbacks") or []) if isinstance(f, str)}
+    )
+    return out
+
+
+def prefix_checkpoints_paired(
+    groups: dict[tuple[str, str], list[Process]], max_noise: float
+) -> list[dict[str, Any]]:
+    """Paired ``prefix_checkpoints`` on-vs-off summaries (wall latency, TTFT, decode rate,
+    snapshot capture/restore overhead, reuse counters, memory footprint, and peak RAM)."""
+    epic_rows = []
+    for processes in groups.values():
+        epic = sorted((p for p in processes if p.run == "epic"), key=lambda p: p.index)
+        if epic:
+            epic_rows.append(epic)
+    stub_entry = {"kind": "prefix_checkpoints", "switch": None}
+    out: list[dict[str, Any]] = []
+    by_backend: dict[str, list[list[Process]]] = {}
+    for processes in epic_rows:
+        backend = processes[0].document.get("backend")
+        if isinstance(backend, str):
+            by_backend.setdefault(backend, []).append(processes)
+    for backend, backend_rows in sorted(by_backend.items()):
+        pairs, _ = _pairs(stub_entry, backend_rows)
+        for on, off, option_pairs in pairs:
+            config = document_config(on[0])
+            for prompt_id, prompt_class in config["prompts"]:
+                for on_option, off_option in option_pairs:
+                    metrics: dict[str, Any] = {}
+                    for metric, higher in (
+                        ("wall_ms", False),
+                        ("ttft_ms", False),
+                        ("decode_tok_s", True),
+                    ):
+                        metrics[metric] = verdict(
+                            metric_values(on, prompt_id, on_option, metric),
+                            metric_values(off, prompt_id, off_option, metric),
+                            higher,
+                            max_noise,
+                        )
+                    on_peaks = metric_values(on, prompt_id, on_option, "peak_memory_bytes")
+                    off_peaks = metric_values(off, prompt_id, off_option, "peak_memory_bytes")
+                    out.append(
+                        {
+                            "backend": backend,
+                            "model": family_label(on[0]),
+                            "on_row": f"{on[0].campaign}/{on[0].row}",
+                            "off_row": f"{off[0].campaign}/{off[0].row}",
+                            "prompt_id": prompt_id,
+                            "class": prompt_class,
+                            "option": on_option if on_option == off_option else f"{on_option} vs {off_option}",
+                            "on_n": len(on),
+                            "off_n": len(off),
+                            "wall_ms": metrics["wall_ms"],
+                            "ttft_ms": metrics["ttft_ms"],
+                            "decode_tok_s": metrics["decode_tok_s"],
+                            "peak_memory_bytes": {
+                                "on": series(on_peaks),
+                                "off": series(off_peaks),
+                            },
+                            "prefix_checkpoints": {
+                                "on": _checkpoint_telemetry(on, prompt_id, on_option),
+                                "off": _checkpoint_telemetry(off, prompt_id, off_option),
+                            },
+                        }
+                    )
+    return out
+
+
+_ADAPTIVE_COST_FIELDS = (
+    "proposal_ms",
+    "verify_ms",
+    "rollback_ms",
+    "sync_ms",
+    "total_ms",
+    "ms_per_committed_token",
+)
+
+
+def _summarize_adaptive_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not blocks:
+        return None
+    costs = [b["cost"] for b in blocks if isinstance(b.get("cost"), dict)]
+    cost_summary = (
+        {
+            field: _mean([v for v in (_number(c.get(field)) for c in costs) if v is not None])
+            for field in _ADAPTIVE_COST_FIELDS
+        }
+        if costs
+        else None
+    )
+    return {
+        "adaptive": any(bool(b.get("adaptive")) for b in blocks),
+        "initial_proposers": sorted(
+            {b["initial_proposer"] for b in blocks if isinstance(b.get("initial_proposer"), str)}
+        ),
+        "final_proposers": sorted(
+            {b["final_proposer"] for b in blocks if isinstance(b.get("final_proposer"), str)}
+        ),
+        "initial_depth": _mean(
+            [v for v in (_number(b.get("initial_depth")) for b in blocks) if v is not None]
+        ),
+        "final_depth": _mean(
+            [v for v in (_number(b.get("final_depth")) for b in blocks) if v is not None]
+        ),
+        "depth_changes": _mean(
+            [v for v in (_number(b.get("depth_changes")) for b in blocks) if v is not None]
+        ),
+        "proposer_switches": _mean(
+            [v for v in (_number(b.get("proposer_switches")) for b in blocks) if v is not None]
+        ),
+        "plain_reasons": sorted(
+            {b["plain_reason"] for b in blocks if isinstance(b.get("plain_reason"), str)}
+        ),
+        "cost": cost_summary,
+    }
+
+
+def _adaptive_telemetry(processes: list[Process], prompt_id: str, option: str) -> dict[str, Any] | None:
+    blocks = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        block = (table.get((prompt_id, option)) or {}).get("adaptive_speculative")
+        if isinstance(block, dict):
+            blocks.append(block)
+    return _summarize_adaptive_blocks(blocks)
+
+
+def _row_ratio_mean(processes: list[Process], prompt_id: str, option: str, field: str) -> float | None:
+    vals = []
+    for process in processes:
+        table, _ = rows_by_key(process)
+        row = table.get((prompt_id, option)) or {}
+        if field == "tokens_per_pass":
+            gen = _number(row.get("generated_tokens"))
+            ver = _number(row.get("verify_steps"))
+            if gen is not None and ver:
+                vals.append(gen / ver)
+        else:
+            v = _number(row.get(field))
+            if v is not None:
+                vals.append(v)
+    return _mean(vals)
+
+
+def adaptive_speculative_paired(
+    groups: dict[tuple[str, str], list[Process]], max_noise: float
+) -> list[dict[str, Any]]:
+    """Paired ``auto`` vs ``off`` (and ``epic/auto`` vs ``baseline/auto`` when present)
+    adaptive speculative summaries (SW-7237 AC3): full-request time, TTFT, decode rate,
+    accepted tokens per target pass, tokens per pass, peak memory, and adaptive transitions."""
+    out: list[dict[str, Any]] = []
+    for (_, _), processes in sorted(groups.items()):
+        epic = sorted((p for p in processes if p.run == "epic"), key=lambda p: p.index)
+        if not epic:
+            continue
+        config = document_config(epic[0])
+        options = set(config["options"])
+        if not ({"auto", "off"} <= options):
+            continue
+        has_adaptive = any(
+            isinstance(
+                (rows_by_key(p)[0].get((prompt_id, "auto")) or {}).get("adaptive_speculative"),
+                dict,
+            )
+            for p in epic
+            for prompt_id, _ in config["prompts"]
+        )
+        if not has_adaptive:
+            continue
+        baseline = sorted((p for p in processes if p.run == "baseline"), key=lambda p: p.index)
+        backend = epic[0].document.get("backend")
+        model = family_label(epic[0])
+        row_label = f"{epic[0].campaign}/{epic[0].row}"
+        for prompt_id, prompt_class in config["prompts"]:
+            vs_off: dict[str, Any] = {}
+            for metric, higher in (
+                ("wall_ms", False),
+                ("ttft_ms", False),
+                ("decode_tok_s", True),
+            ):
+                vs_off[metric] = verdict(
+                    metric_values(epic, prompt_id, "auto", metric),
+                    metric_values(epic, prompt_id, "off", metric),
+                    higher,
+                    max_noise,
+                )
+            vs_baseline_auto: dict[str, Any] | None = None
+            if baseline and "auto" in set(document_config(baseline[0])["options"]):
+                vs_baseline_auto = {
+                    metric: verdict(
+                        metric_values(epic, prompt_id, "auto", metric),
+                        metric_values(baseline, prompt_id, "auto", metric),
+                        higher,
+                        max_noise,
+                    )
+                    for metric, higher in (
+                        ("wall_ms", False),
+                        ("ttft_ms", False),
+                        ("decode_tok_s", True),
+                    )
+                }
+            out.append(
+                {
+                    "backend": backend,
+                    "model": model,
+                    "row": row_label,
+                    "prompt_id": prompt_id,
+                    "class": prompt_class,
+                    "sampling": epic[0].document.get("sampling"),
+                    "epic_n": len(epic),
+                    "baseline_n": len(baseline),
+                    "wall_ms": vs_off["wall_ms"],
+                    "ttft_ms": vs_off["ttft_ms"],
+                    "decode_tok_s": vs_off["decode_tok_s"],
+                    "vs_baseline_auto": vs_baseline_auto,
+                    "accepted_per_pass": _row_ratio_mean(
+                        epic, prompt_id, "auto", "mean_accepted_length"
+                    ),
+                    "tokens_per_pass": _row_ratio_mean(
+                        epic, prompt_id, "auto", "tokens_per_pass"
+                    ),
+                    "peak_memory_bytes": {
+                        "auto": series(metric_values(epic, prompt_id, "auto", "peak_memory_bytes")),
+                        "off": series(metric_values(epic, prompt_id, "off", "peak_memory_bytes")),
+                    },
+                    "adaptive_speculative": _adaptive_telemetry(epic, prompt_id, "auto"),
+                }
+            )
+    return out
 
 
 def _fmt(value: Any, digits: int = 1) -> str:
@@ -2231,6 +2591,102 @@ def markdown_report(report: dict[str, Any]) -> str:
                 f"{j['on_n']}/{j['off_n']} | "
                 f"{_fmt(j['delta_pct'])} | {_fmt(j['margin_pct'])} | {j['verdict']} | {j['reason']} |"
             )
+    if report.get("prefix_checkpoints"):
+        gib = 1024**3
+        lines += [
+            "",
+            "## Prefix checkpoints — paired on vs off rows",
+            "",
+            "| backend | family | on / off | prompt | option | wall ms (on vs off, Δ %) | TTFT ms (on vs off, Δ %) | decode tok/s (on vs off, Δ %) | peak mem GiB (on / off) | reused / reread | capture ms | restore ms | captured / resident / protected bytes |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for item in report["prefix_checkpoints"]:
+            def _cmp_cell(m: dict[str, Any], digits: int = 1) -> str:
+                c = (m.get("candidate") or {}).get("mean")
+                r = (m.get("reference") or {}).get("mean")
+                d = m.get("delta_pct")
+                delta = "—" if d is None else f"{d:+.1f}%"
+                return f"{_fmt(c, digits)} vs {_fmt(r, digits)} ({delta})"
+
+            on_peak = ((item.get("peak_memory_bytes") or {}).get("on") or {}).get("mean")
+            off_peak = ((item.get("peak_memory_bytes") or {}).get("off") or {}).get("mean")
+            peak_cell = (
+                f"{'—' if on_peak is None else f'{on_peak / gib:.2f}'} / "
+                f"{'—' if off_peak is None else f'{off_peak / gib:.2f}'}"
+            )
+            on_pc = (item.get("prefix_checkpoints") or {}).get("on") or {}
+            reused = _fmt(on_pc.get("reused_tokens"), 0)
+            reread = _fmt(on_pc.get("reread_tokens"), 0)
+            kinds = ",".join(on_pc.get("matched_kinds") or [])
+            reuse_cell = f"{reused} / {reread}" + (f" ({kinds})" if kinds else "")
+            cap_ms = _fmt(on_pc.get("capture_ms"), 2)
+            res_ms = _fmt(on_pc.get("restore_ms"), 2)
+            bytes_cell = (
+                f"{_fmt(on_pc.get('captured_bytes'), 0)} / "
+                f"{_fmt(on_pc.get('resident_bytes'), 0)} / "
+                f"{_fmt(on_pc.get('protected_bytes'), 0)}"
+            )
+            lines.append(
+                f"| {item['backend']} | {item['model']} | {item['on_row']} / {item['off_row']} | "
+                f"{item['prompt_id']} | `{item['option']}` | "
+                f"{_cmp_cell(item['wall_ms'], 1)} | {_cmp_cell(item['ttft_ms'], 1)} | "
+                f"{_cmp_cell(item['decode_tok_s'], 2)} | {peak_cell} | {reuse_cell} | "
+                f"{cap_ms} | {res_ms} | {bytes_cell} |"
+            )
+    if report.get("adaptive_speculative"):
+        gib = 1024**3
+        lines += [
+            "",
+            "## Adaptive speculative — paired auto vs off (SW-7237)",
+            "",
+            "| backend | family | row | prompt | wall ms (auto vs off, Δ %) | TTFT ms (auto vs off, Δ %) | decode tok/s (auto vs off, Δ %) | accepted/pass | tok/pass | peak mem GiB (auto / off) | initial -> final | depthΔ / switches |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for item in report["adaptive_speculative"]:
+            def _cmp_adaptive(m: dict[str, Any], digits: int = 1) -> str:
+                c = (m.get("candidate") or {}).get("mean")
+                r = (m.get("reference") or {}).get("mean")
+                d = m.get("delta_pct")
+                delta = "—" if d is None else f"{d:+.1f}%"
+                return f"{_fmt(c, digits)} vs {_fmt(r, digits)} ({delta})"
+
+            auto_peak = ((item.get("peak_memory_bytes") or {}).get("auto") or {}).get("mean")
+            off_peak = ((item.get("peak_memory_bytes") or {}).get("off") or {}).get("mean")
+            peak_cell = (
+                f"{'—' if auto_peak is None else f'{auto_peak / gib:.2f}'} / "
+                f"{'—' if off_peak is None else f'{off_peak / gib:.2f}'}"
+            )
+            ad = item.get("adaptive_speculative") or {}
+            init_p = ",".join(ad.get("initial_proposers") or []) or "—"
+            fin_p = ",".join(ad.get("final_proposers") or []) or "—"
+            transitions = (
+                f"{_fmt(ad.get('depth_changes'), 1)} / {_fmt(ad.get('proposer_switches'), 1)}"
+            )
+            lines.append(
+                f"| {item['backend']} | {item['model']} | {item['row']} | {item['prompt_id']} | "
+                f"{_cmp_adaptive(item['wall_ms'], 1)} | {_cmp_adaptive(item['ttft_ms'], 1)} | "
+                f"{_cmp_adaptive(item['decode_tok_s'], 2)} | {_fmt(item.get('accepted_per_pass'), 2)} | "
+                f"{_fmt(item.get('tokens_per_pass'), 2)} | {peak_cell} | {init_p} -> {fin_p} | "
+                f"{transitions} |"
+            )
+        baseline_auto_items = [
+            item for item in report["adaptive_speculative"] if item.get("vs_baseline_auto")
+        ]
+        if baseline_auto_items:
+            lines += [
+                "",
+                "### Adaptive speculative — candidate auto vs baseline auto",
+                "",
+                "| backend | family | row | prompt | wall ms (cand vs base, Δ %) | TTFT ms (cand vs base, Δ %) | decode tok/s (cand vs base, Δ %) |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for item in baseline_auto_items:
+                vba = item["vs_baseline_auto"]
+                lines.append(
+                    f"| {item['backend']} | {item['model']} | {item['row']} | {item['prompt_id']} | "
+                    f"{_cmp_adaptive(vba['wall_ms'], 1)} | {_cmp_adaptive(vba['ttft_ms'], 1)} | "
+                    f"{_cmp_adaptive(vba['decode_tok_s'], 2)} |"
+                )
     if report.get("incomplete"):
         lines += [
             "",
@@ -2403,6 +2859,8 @@ def compare_campaigns(
         "comparisons": comparisons,
         "not_comparable": not_comparable,
         "defaults": defaults,
+        "prefix_checkpoints": prefix_checkpoints_paired(groups, max_noise),
+        "adaptive_speculative": adaptive_speculative_paired(groups, max_noise),
         "incomplete": incomplete,
         "notes": notes,
     }
@@ -2515,6 +2973,16 @@ def path_measurement(row: dict[str, Any], context: str) -> dict[str, Any] | None
         ),
         "peak_memory_bytes": max(values("peak_memory_bytes"), default=None),
         "memory_added_bytes": max(added, default=None),
+        "prefix_checkpoints": (
+            row.get("prefix_checkpoints")
+            if isinstance(row.get("prefix_checkpoints"), dict)
+            else None
+        ),
+        "adaptive_speculative": (
+            row.get("adaptive_speculative")
+            if isinstance(row.get("adaptive_speculative"), dict)
+            else None
+        ),
     }
 
 
@@ -2545,6 +3013,8 @@ def paths_report(directories: list[Path]) -> dict[str, Any]:
                 "thinking": (document.get("thinking") or {}).get("setting"),
                 "sampling": document.get("sampling"),
                 "prefix_cache_bytes": env.get("SPECULATIVE_BENCH_PREFIX_CACHE_BYTES", "0"),
+                "prompt_set": env.get("SPECULATIVE_BENCH_PROMPT_SET", "default"),
+                "prefix_checkpoints": _prefix_checkpoints_mode(process) or "default",
             }
             load = document.get("load") or {}
             offs = {
@@ -2667,10 +3137,30 @@ def summarize_paths(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     (e["measurement"]["memory_added_bytes"] for e in bucket if e["measurement"]["memory_added_bytes"] is not None),
                     default=None,
                 ),
+                "prefix_checkpoints": _summarize_path_checkpoints(bucket),
+                "adaptive_speculative": _summarize_path_adaptive(bucket),
                 "speedup_vs_off": ratios,
             }
         )
     return out
+
+
+def _summarize_path_adaptive(bucket: list[dict[str, Any]]) -> dict[str, Any] | None:
+    blocks = [
+        e["measurement"]["adaptive_speculative"]
+        for e in bucket
+        if isinstance(e["measurement"].get("adaptive_speculative"), dict)
+    ]
+    return _summarize_adaptive_blocks(blocks)
+
+
+def _summarize_path_checkpoints(bucket: list[dict[str, Any]]) -> dict[str, Any] | None:
+    blocks = [
+        e["measurement"]["prefix_checkpoints"]
+        for e in bucket
+        if isinstance(e["measurement"].get("prefix_checkpoints"), dict)
+    ]
+    return _summarize_checkpoint_blocks(blocks)
 
 
 AUTO_MTP_PATH = "mtp@recommended"
@@ -2783,6 +3273,47 @@ def paths_markdown(report: dict[str, Any]) -> str:
                 f"{_fmt(wall['all'], 2)} | {_fmt(row['ttft_ms'], 0)} | {accepted} | {draft} | "
                 f"{memory} | {fallbacks} |"
             )
+        if any(r.get("prefix_checkpoints") for r in rows):
+            lines += [
+                "",
+                "### Prefix checkpoints",
+                "",
+                "| path | policy | reused | reread | capture ms | restore ms | captured bytes | resident bytes | protected bytes | matched kind |",
+                "|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for row in rows:
+                pc = row.get("prefix_checkpoints")
+                if not pc:
+                    continue
+                lines.append(
+                    f"| {row['path']} | {','.join(pc.get('policies') or []) or '—'} | "
+                    f"{_fmt(pc.get('reused_tokens'), 0)} | {_fmt(pc.get('reread_tokens'), 0)} | "
+                    f"{_fmt(pc.get('capture_ms'), 2)} | {_fmt(pc.get('restore_ms'), 2)} | "
+                    f"{_fmt(pc.get('captured_bytes'), 0)} | {_fmt(pc.get('resident_bytes'), 0)} | "
+                    f"{_fmt(pc.get('protected_bytes'), 0)} | {','.join(pc.get('matched_kinds') or []) or '—'} |"
+                )
+        if any(r.get("adaptive_speculative") for r in rows):
+            lines += [
+                "",
+                "### Adaptive speculative",
+                "",
+                "| path | adaptive | initial -> final | depth (init -> final) | depthΔ | switches | ms/tok | plain reason |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            for row in rows:
+                ad = row.get("adaptive_speculative")
+                if not ad:
+                    continue
+                init_p = ",".join(ad.get("initial_proposers") or []) or "—"
+                fin_p = ",".join(ad.get("final_proposers") or []) or "—"
+                ms_tok = _fmt((ad.get("cost") or {}).get("ms_per_committed_token"), 2)
+                plain_r = "; ".join(ad.get("plain_reasons") or []) or "—"
+                lines.append(
+                    f"| {row['path']} | {ad.get('adaptive')} | {init_p} -> {fin_p} | "
+                    f"{_fmt(ad.get('initial_depth'), 1)} -> {_fmt(ad.get('final_depth'), 1)} | "
+                    f"{_fmt(ad.get('depth_changes'), 1)} | {_fmt(ad.get('proposer_switches'), 1)} | "
+                    f"{ms_tok} | {plain_r} |"
+                )
     if report["auto_inputs"]:
         lines += [
             "",

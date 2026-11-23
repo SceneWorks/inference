@@ -197,43 +197,44 @@ fn write_json(path: PathBuf, v: &serde_json::Value) -> Result<()> {
 /// `ffn.0`/`ffn.2` → `ffn.fc1`/`ffn.fc2`; the `freqs` buffer is dropped. Everything else (attn, norms,
 /// modulation, head) passes through unchanged.
 pub fn sanitize_wan_transformer(raw: &HashMap<String, Array>) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::new();
-    for (key, value) in raw {
-        if key == "patch_embedding.weight" {
-            let s = value.shape();
-            let cols: i32 = s[1..].iter().product();
+    Ok(sanitize_wan_transformer_weights(&Weights::from_map(raw.clone()))?.into_tensors())
+}
+
+/// Normalize Wan transformer names without separating native operators from their source.
+pub fn sanitize_wan_transformer_weights(raw: &Weights) -> Result<Weights> {
+    let mut out = raw.select_renamed(wan_transformer_key);
+    if let Some(weight) = raw.peek("patch_embedding.weight") {
+        let shape = weight.shape();
+        if shape.len() != 2 {
+            let cols: i32 = shape[1..].iter().product();
             out.insert(
-                "patch_embedding_proj.weight".into(),
-                value.reshape(&[s[0], cols])?,
+                "patch_embedding_proj.weight",
+                weight.reshape(&[shape[0], cols])?,
             );
-            continue;
         }
-        if key == "patch_embedding.bias" {
-            out.insert("patch_embedding_proj.bias".into(), value.clone());
-            continue;
-        }
-        let renamed_seq = [
-            ("text_embedding.0.", "text_embedding_0."),
-            ("text_embedding.2.", "text_embedding_1."),
-            ("time_embedding.0.", "time_embedding_0."),
-            ("time_embedding.2.", "time_embedding_1."),
-            ("time_projection.1.", "time_projection."),
-        ]
-        .iter()
-        .find_map(|(p, r)| key.strip_prefix(p).map(|rest| format!("{r}{rest}")));
-        if let Some(new) = renamed_seq {
-            out.insert(new, value.clone());
-            continue;
-        }
-        if key == "freqs" {
-            continue;
-        }
-        let new = key
-            .replace(".ffn.0.", ".ffn.fc1.")
-            .replace(".ffn.2.", ".ffn.fc2.");
-        out.insert(new, value.clone());
     }
     Ok(out)
+}
+
+fn wan_transformer_key(key: &str) -> Option<String> {
+    if key == "freqs" {
+        return None;
+    }
+    let renamed = [
+        ("patch_embedding.", "patch_embedding_proj."),
+        ("text_embedding.0.", "text_embedding_0."),
+        ("text_embedding.2.", "text_embedding_1."),
+        ("time_embedding.0.", "time_embedding_0."),
+        ("time_embedding.2.", "time_embedding_1."),
+        ("time_projection.1.", "time_projection."),
+    ]
+    .iter()
+    .find_map(|(from, to)| key.strip_prefix(from).map(|rest| format!("{to}{rest}")))
+    .unwrap_or_else(|| {
+        key.replace(".ffn.0.", ".ffn.fc1.")
+            .replace(".ffn.2.", ".ffn.fc2.")
+    });
+    Some(renamed)
 }
 
 /// Port of `sanitize_wan_t5_weights`: the sole rename `.ffn.gate.0.` → `.ffn.gate_proj.` (the gate

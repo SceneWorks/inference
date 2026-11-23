@@ -1,7 +1,7 @@
 //! Krea Realtime 14B transformer **load path** (sc-8435 S2, non-gated).
 //!
 //! Krea Realtime 14B is Wan 2.1 T2V 14B weight-for-weight, so once
-//! [`sanitize_krea_realtime_transformer`] has collapsed either on-disk layout to the internal Wan DiT
+//! [`crate::convert::sanitize_krea_realtime_transformer`] has collapsed either on-disk layout to the internal Wan DiT
 //! key names it loads straight into the reused [`mlx_gen_wan::WanTransformer`] via its
 //! [`from_weights`](mlx_gen_wan::WanTransformer::from_weights). This module wraps that with an
 //! **explicit completeness + shape check** ([`verify_transformer_tensors`]) so a truncated shard, a
@@ -43,7 +43,7 @@ use mlx_gen_wan::WanTransformer;
 use mlx_rs::Array;
 
 use crate::config::KreaRealtimeConfig;
-use crate::convert::sanitize_krea_realtime_transformer;
+use crate::convert::sanitize_transformer_weights;
 
 /// The reused Wan `_quantize_predicate` surface: the per-block Linears that ship **packed** on a
 /// quantized tier (mirrors `mlx_gen_wan::convert`'s `WAN_QUANT_SUFFIXES` and the `Block::quantize`
@@ -80,7 +80,7 @@ const QUANT_PROBE_LINEAR: &str = "blocks.0.self_attn.q";
 /// `from_quantized_parts`.
 const SUPPORTED_GROUP_SIZES: [i32; 3] = [32, 64, 128];
 
-/// One expected **internal** (post-[`sanitize_krea_realtime_transformer`]) transformer tensor: the key
+/// One expected **internal** (post-[`crate::convert::sanitize_krea_realtime_transformer`]) transformer tensor: the key
 /// [`mlx_gen_wan::WanTransformer::from_weights`] reads and the config-derived shape it must carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorSpec {
@@ -240,7 +240,7 @@ fn preview(items: &[String]) -> String {
     }
 }
 
-/// Assert `map` (an already-[`sanitize_krea_realtime_transformer`]d internal weight map) contains
+/// Assert `map` (an already-[`crate::convert::sanitize_krea_realtime_transformer`]d internal weight map) contains
 /// **exactly** the tensors [`expected_transformer_tensors`] derives from `cfg`, each at its exact
 /// shape — no missing, no extra, no wrong shape. On any discrepancy returns a single [`Error::Msg`]
 /// summarizing the (capped) missing / extra / mis-shaped keys. Shape checks read only tensor metadata,
@@ -249,50 +249,54 @@ pub fn verify_transformer_tensors(
     map: &HashMap<String, Array>,
     cfg: &WanModelConfig,
 ) -> Result<()> {
-    let expected = expected_transformer_tensors(cfg);
-    let expected_names: HashSet<&str> = expected.iter().map(|s| s.name.as_str()).collect();
+    verify_transformer_weights(&mut Weights::from_map(map.clone()), cfg)
+}
 
+fn verify_transformer_weights(weights: &mut Weights, cfg: &WanModelConfig) -> Result<()> {
+    let expected = expected_transformer_tensors(cfg);
+    let expected_names: HashSet<&str> = expected.iter().map(|spec| spec.name.as_str()).collect();
     let mut missing = Vec::new();
     let mut mis_shape = Vec::new();
+    let mut native_companions = HashSet::new();
     for spec in &expected {
-        match map.get(&spec.name) {
-            None => missing.push(spec.name.clone()),
-            Some(tensor) => {
-                if tensor.shape() != spec.shape.as_slice() {
-                    mis_shape.push(format!(
-                        "{} (want {:?}, got {:?})",
-                        spec.name,
-                        spec.shape,
-                        tensor.shape()
-                    ));
-                }
+        let base = match (spec.name.strip_suffix(".weight"), spec.shape.as_slice()) {
+            (Some(base), &[rows, cols]) => {
+                weights.declare_projection_shape(base, [rows, cols])?;
+                Some(base)
             }
+            _ => None,
+        };
+        let Some(stored) = weights.peek(&spec.name) else {
+            missing.push(spec.name.clone());
+            continue;
+        };
+        let logical = if let Some(base) = base {
+            weights.source_projection(&spec.name)?.map(|projection| {
+                native_companions.insert(format!("{base}.comfy_quant"));
+                native_companions.insert(format!("{base}.weight_scale"));
+                if matches!(&projection, mlx_gen::NativeProjection::Fp8(_)) {
+                    native_companions.insert(format!("{base}.input_scale"));
+                }
+                projection.shape()
+            })
+        } else {
+            None
+        };
+        let actual = logical
+            .as_ref()
+            .map_or(stored.shape(), |shape| shape.as_slice());
+        if actual != spec.shape.as_slice() {
+            mis_shape.push(format!(
+                "{} (want {:?}, got {:?})",
+                spec.name, spec.shape, actual
+            ));
         }
     }
 
-    let mut native_companions = HashSet::new();
-    if map.keys().any(|k| k.ends_with(".comfy_quant")) {
-        let weights = Weights::from_map(map.clone());
-        for base in map.keys().filter_map(|k| k.strip_suffix(".comfy_quant")) {
-            if !expected_names.contains(format!("{base}.weight").as_str()) {
-                continue;
-            }
-            if let Some(projection) =
-                mlx_gen::NativeProjection::from_weights(&weights, base, false)?
-            {
-                native_companions.insert(format!("{base}.comfy_quant"));
-                native_companions.insert(format!("{base}.weight_scale"));
-                if matches!(projection, mlx_gen::NativeProjection::Fp8(_)) {
-                    // The FP8 constructor already checked the optional scalar dtype, shape and value.
-                    native_companions.insert(format!("{base}.input_scale"));
-                }
-            }
-        }
-    }
-    let mut extra: Vec<String> = map
+    let mut extra: Vec<String> = weights
         .keys()
-        .filter(|k| !expected_names.contains(k.as_str()) && !native_companions.contains(k.as_str()))
-        .cloned()
+        .filter(|key| !expected_names.contains(key) && !native_companions.contains(*key))
+        .map(str::to_owned)
         .collect();
 
     if missing.is_empty() && extra.is_empty() && mis_shape.is_empty() {
@@ -316,7 +320,7 @@ pub fn verify_transformer_tensors(
 }
 
 /// Recover the pre-quantized tier a Krea Realtime transformer weight **map** ships at, or `None` for a
-/// dense bf16 snapshot. The `HashMap` entry point, used after [`sanitize_krea_realtime_transformer`];
+/// dense bf16 snapshot. The `HashMap` entry point, used after [`crate::convert::sanitize_krea_realtime_transformer`];
 /// [`probe_packed_quant`] is the [`Weights`]-flavoured sibling.
 ///
 /// The tier is derived from the packed **shapes**, not trusted from a manifest: MLX affine quantization
@@ -502,7 +506,7 @@ pub fn resolve_load_time_quant(
 /// Load a native Krea Realtime 14B transformer weight map (either on-disk layout — single-file
 /// `model.`-prefixed or sharded `transformer/` bare) into the reused [`mlx_gen_wan::WanTransformer`].
 ///
-/// The pipeline is: [`sanitize_krea_realtime_transformer`] (normalize the layout, map onto the
+/// The pipeline is: [`crate::convert::sanitize_krea_realtime_transformer`] (normalize the layout, map onto the
 /// internal Wan DiT names, cast the float tensors F16 → bf16) → [`resolve_snapshot_quant`] (recover the
 /// on-disk tier from the packed shapes) → [`verify_transformer_tensors`] (assert the full,
 /// exactly-shaped inventory for *that* tier is present) → [`mlx_gen_wan::WanTransformer::from_weights`],
@@ -528,13 +532,21 @@ pub fn load_krea_realtime_transformer_with_quant(
     raw: HashMap<String, Array>,
     cfg: &KreaRealtimeConfig,
 ) -> Result<(WanTransformer, Option<WanQuant>)> {
-    let sanitized = sanitize_krea_realtime_transformer(raw)?;
-    let quant = resolve_snapshot_quant(&sanitized, &cfg.wan)?;
+    load_transformer_weights(&Weights::from_map(raw), cfg)
+}
+
+pub(crate) fn load_transformer_weights(
+    raw: &Weights,
+    cfg: &KreaRealtimeConfig,
+) -> Result<(WanTransformer, Option<WanQuant>)> {
+    let mut weights = sanitize_transformer_weights(raw)?;
+    let quant = probe_packed_quant(&weights, &cfg.wan)?;
     let mut wan = cfg.wan.clone();
     wan.quantization = quant;
-    verify_transformer_tensors(&sanitized, &wan)?;
-    let weights = Weights::from_map(sanitized);
-    Ok((WanTransformer::from_weights(&weights, &wan)?, quant))
+    verify_transformer_weights(&mut weights, &wan)?;
+    let transformer = WanTransformer::from_weights(&weights, &wan)?;
+    weights.materialize_accessed()?;
+    Ok((transformer, quant))
 }
 
 #[cfg(test)]
@@ -705,11 +717,57 @@ mod tests {
             format!("{base}.comfy_quant"),
             Array::from_slice(desc, &[desc.len() as i32]),
         );
+        let scale = 0.251_234_56_f32;
+        map.insert(format!("{base}.input_scale"), Array::from_f32(scale));
+        let prefixed = map
+            .iter()
+            .map(|(key, array)| (format!("model.{key}"), array.clone()))
+            .collect();
+        let mut sanitized = sanitize_transformer_weights(&Weights::from_map(prefixed)).unwrap();
+        verify_transformer_weights(&mut sanitized, &cfg).unwrap();
+        let bound = sanitized
+            .source_projection(&format!("{base}.weight"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.operands()[2].1.as_slice::<f32>(), &[scale]);
         verify_transformer_tensors(&map, &cfg).unwrap();
         map.insert(format!("{base}.input_scale"), Array::from_f32(0.0));
         assert!(verify_transformer_tensors(&map, &cfg).is_err());
         map.insert(format!("{base}.input_scale"), Array::from_f32(0.25));
         map.insert("unrelated.input_scale".into(), Array::from_f32(0.25));
+        assert!(verify_transformer_tensors(&map, &cfg).is_err());
+    }
+
+    #[test]
+    fn transformer_inventory_validates_padded_native_weights_by_logical_shape() {
+        let mut cfg = tiny_wan(33, 64);
+        cfg.num_layers = 1;
+        cfg.num_heads = 1;
+        let mut map: HashMap<_, _> = expected_transformer_tensors(&cfg)
+            .into_iter()
+            .map(|spec| (spec.name, Array::zeros::<f32>(&spec.shape).unwrap()))
+            .collect();
+        let base = "blocks.0.self_attn.q";
+        let desc = br#"{"format":"mxfp8","orig_shape":[33,33]}"#;
+        map.insert(
+            format!("{base}.weight"),
+            Array::from_slice(&[0x38u8; 64 * 64], &[64, 64]),
+        );
+        map.insert(
+            format!("{base}.weight_scale"),
+            Array::from_slice(&[127u8; 128 * 4], &[128, 4]),
+        );
+        map.insert(
+            format!("{base}.comfy_quant"),
+            Array::from_slice(desc, &[desc.len() as i32]),
+        );
+        verify_transformer_tensors(&map, &cfg).unwrap();
+
+        let mismatch = br#"{"format":"mxfp8","orig_shape":[34,33]}"#;
+        map.insert(
+            format!("{base}.comfy_quant"),
+            Array::from_slice(mismatch, &[mismatch.len() as i32]),
+        );
         assert!(verify_transformer_tensors(&map, &cfg).is_err());
     }
 

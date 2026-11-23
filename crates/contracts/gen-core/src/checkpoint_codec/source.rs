@@ -43,6 +43,11 @@ pub fn projection_companion_base(name: &str) -> Option<&str> {
 /// Layer-owned matrix spellings, including fused OpenCLIP parameters. The physical key is
 /// retained in the plan; only companion ownership uses the normalized layer base.
 pub(super) fn projection_weight_base(name: &str) -> Option<&str> {
+    // Legacy `.scale_weight` is a companion, not an `_weight` parameter. Classify known
+    // companions first so source selection never drops their original scale operands.
+    if projection_companion_base(name).is_some() {
+        return None;
+    }
     name.strip_suffix(".weight")
         .or_else(|| name.strip_suffix("_weight"))
 }
@@ -911,6 +916,7 @@ mod tests {
             CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
         let rows: &[(&str, &str, &[usize], &[u8])] = &[
             ("unet.proj.weight", "F8_E5M2", &[2, 2], &[0x3c; 4]),
+            ("unet.proj.scale_weight", "F16", &[1], &[0x00, 0x41]),
             ("unet.proj.bias", "F16", &[2], &[0; 4]),
             ("clip.position_ids", "I64", &[1], &[0; 8]),
             ("vae.conv.weight", "F16", &[2, 2], &[0; 8]),
@@ -921,6 +927,13 @@ mod tests {
             .unwrap();
         assert_eq!(plan.tensors.len(), 1);
         assert_eq!(plan.tensors[0].physical_key, "unet.proj.weight");
+        assert!(matches!(
+            &plan.tensors[0].codec,
+            TensorCodecSpec::ScalarFp8 {
+                scale: ScalarScaleSource::Companion { physical_key },
+                ..
+            } if physical_key == "unet.proj.scale_weight"
+        ));
         for name in [
             "unet.proj.inv_s",
             "unet.proj.weight.__scale",

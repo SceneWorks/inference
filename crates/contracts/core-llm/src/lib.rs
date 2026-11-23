@@ -104,8 +104,8 @@ pub use block_draft::{
 };
 pub use cancel::CancelFlag;
 pub use capabilities::{
-    ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
-    TextLlmDescriptor, TreeVerifyCapabilities,
+    ModelSamplingDefaults, MtpCapabilities, PrefixCheckpointCapabilities, ProposerCapabilities,
+    TextLlmCapabilities, TextLlmDescriptor, TreeVerifyCapabilities,
 };
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
@@ -139,11 +139,17 @@ pub use output::{
 };
 pub use paging::BlockAllocator;
 pub use prefix::{
-    prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
-    PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
-    PrefixStats, PrefixStore, PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED,
-    PREFIX_COPY_FAILED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
-    PREFIX_PAGED_NOT_SNAPSHOTTED,
+    plan_prefix_boundaries, plan_prefix_boundaries_with_exact, prefix_cache_budget,
+    prefix_path_before_lookup, render_prefix_boundary, requested_prefix_cache_bytes,
+    resolve_boundary_candidates, resolve_document_boundary, BoundaryCandidates, BoundaryPlan,
+    CheckpointTelemetry, InsertOutcome, NearTailConfig, PlannedAdmission, PlannedBoundary,
+    PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixInsertOutcome,
+    PrefixKind, PrefixLookup, PrefixMatch, PrefixPlannedContext, PrefixReuse, PrefixStats,
+    PrefixStore, PrefixStoreOutcome, MAX_CHECKPOINTS_PER_REQUEST, PREFIX_CANCELLED_NOT_STORED,
+    PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED,
+    PREFIX_DOCUMENT_UNALIGNED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
+    PREFIX_PAGED_NOT_SNAPSHOTTED, PREFIX_PARTIAL_ADMISSION_TRIMMED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PREFIX_PROTECTED_CAP_DEMOTED, PREFIX_PROTECTED_PRESERVED,
 };
 pub use prepare::{
     check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
@@ -166,13 +172,15 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use report::{
-    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
-    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
-    TreeVerifyReport,
+    prefix_budget_fallback, AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent,
+    AdaptiveSpeculativeReport, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
+    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport,
+    PrefixCheckpointReport, ProjectionReport, TreeVerifyReport,
 };
 pub use request::{
-    HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
-    Speculative, SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
+    HostSampleReason, LoadSpec, MtpMode, PrefixCheckpointMode, PrefixCheckpointPolicy,
+    PrefixDocumentSpan, Quantize, ReasoningEffort, SamplerPath, Sampling, Speculative,
+    SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_draft_load, admit_load_memory, admit_request_memory, admit_request_memory_with_geometry,
@@ -193,19 +201,27 @@ pub use speculative::{
     accept_greedy_run, accept_token, auto_block_draft_decision, auto_block_draft_tier,
     auto_prefers_block_draft, decode_clock, demotion_threshold, draft_compatibility,
     draft_load_refusal, draft_model_capabilities, draft_refusal, draft_tokenizer_refusal,
-    draft_unpriced_refusal, fit_draft_context, greedy_commit, ngram_propose, no_proposer_fallback,
-    prompt_lookup_capabilities, resolve_speculative, resolve_speculative_with, settle_draft,
-    verify_depth_bound, with_decode_clock, withdraws_auto_block_draft, Acceptance,
-    AcceptanceMonitor, AutoBlockDraftDecision, DecodeClock, DemotionBasis, MonitorDecision,
-    PlainDecode, ProposerKind, ResidentQuantization, SpeculativePlan, SpeculativeResolution,
-    StepObservation, WallClock, ACCEPTANCE_PROBE_VERIFIES, AUTO_BLOCK_DRAFT_DECISIONS,
-    AUTO_BLOCK_DRAFT_NOT_ADMITTED, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
+    draft_unpriced_refusal, fit_draft_context, greedy_commit, ngram_peek_match_len, ngram_propose,
+    no_proposer_fallback, prompt_lookup_capabilities, resolve_auto_candidates, resolve_speculative,
+    resolve_speculative_with, settle_draft, verify_depth_bound, with_decode_clock,
+    withdraws_auto_block_draft, withdraws_auto_draft_model, Acceptance, AcceptanceMonitor,
+    AdaptiveAction, AdaptiveSpeculativeController, AdaptiveStepInput, AdaptiveStepPlan,
+    AutoBlockDraftDecision, AutoCandidate, AutoCandidateContext, AutoSpeculativePlan, DecodeClock,
+    DemotionBasis, MonitorDecision, PlainDecode, ProposerKind, ResidentQuantization,
+    SpeculativePlan, SpeculativeResolution, StepCost, StepObservation, WallClock,
+    ACCEPTANCE_PROBE_VERIFIES, ADAPTIVE_COOLDOWN_VERIFIES, ADAPTIVE_GROW_ACCEPTANCE_RATIO,
+    ADAPTIVE_LOOKUP_DRY_STEPS, ADAPTIVE_LOOKUP_TRIGGER_MATCHES, ADAPTIVE_MAX_DEPTH_CHANGES,
+    ADAPTIVE_MAX_SWITCHES, ADAPTIVE_PROBE_MIN_TIMED_STEPS, ADAPTIVE_PROBE_STEPS,
+    ADAPTIVE_SHRINK_ACCEPTANCE_RATIO, ADAPTIVE_SWITCH_IMPROVEMENT_MARGIN,
+    ADAPTIVE_UNTIMED_SWITCH_GAIN, AUTO_BLOCK_DRAFT_DECISIONS, AUTO_BLOCK_DRAFT_NOT_ADMITTED,
+    AUTO_DRAFT_MODEL_NOT_ADMITTED, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_AT_ONE_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_PER_EXTRA_DRAFT, CAPTIONER_NO_PREFIX_CACHE,
     CAPTIONER_NO_PROPOSER, CLEAR_LOSS_CONFIDENCE_Z, CLEAR_LOSS_GAIN, CLEAR_LOSS_MIN_TIMED_STEPS,
-    DRAFT_MODEL_NOT_LOADED, DRAFT_MODEL_RECOMMENDED_DEPTH, MEASURED_GAIN_MARGIN,
-    MIN_TIMED_WINDOW_STEPS, MTP_DEMOTE_BELOW_AT_ONE_DRAFT, MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
-    MTP_RECOMMENDED_DEPTH, PLAIN_PROBE_MAX_STEPS, PLAIN_PROBE_STEPS, PROMPT_LOOKUP_DEMOTE_BELOW,
+    DRAFT_MODEL_NOT_LOADED, DRAFT_MODEL_RECOMMENDED_DEPTH, MAX_DRAFT_CATCHUP_TOKENS,
+    MAX_MTP_CATCHUP_TOKENS, MEASURED_GAIN_MARGIN, MIN_TIMED_WINDOW_STEPS,
+    MTP_DEMOTE_BELOW_AT_ONE_DRAFT, MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT, MTP_RECOMMENDED_DEPTH,
+    NGRAM_PEEK_WINDOW_TOKENS, PLAIN_PROBE_MAX_STEPS, PLAIN_PROBE_STEPS, PROMPT_LOOKUP_DEMOTE_BELOW,
     PROMPT_LOOKUP_RECOMMENDED_DEPTH, SHAPE_WARMUP_STEPS,
 };
 pub use starvector::{

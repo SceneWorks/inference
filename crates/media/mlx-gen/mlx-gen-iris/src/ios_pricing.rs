@@ -46,7 +46,7 @@ use crate::dit::{
 };
 use crate::nn::{BackboneQuant, ProjectionLayout, QUANT_GROUP_SIZE};
 use crate::retention::allocated;
-use crate::stream::{largest_window, BlockRead, CastPolicy};
+use crate::stream::{largest_window, BlockRead, CastPolicy, SourcePrices};
 use crate::text_encoder::{quanta as te_q, LANGUAGE_TOWER_PREFIX};
 
 mod bounder;
@@ -1012,10 +1012,19 @@ fn header(name: String, dtype: Stored, shape: Vec<usize>, width: u64) -> Header 
 /// (`crate::packed`): every projection [`ProjectionLayout::of`] packs as its u32 codes over the
 /// padded input, bf16 scales and biases, and an `in_features` marker when padded; every other
 /// matrix at bf16; vectors and the text position table as released.
-fn emulate_packed_backbone(headers: &[Header], prefix: &str, quant: Quant) -> Result<Vec<Header>> {
+fn emulate_packed_backbone(
+    headers: &[Header],
+    prefix: &str,
+    quant: Quant,
+    prices: &SourcePrices,
+) -> Result<Vec<Header>> {
     let bq = BackboneQuant::for_load(Some(quant))?;
     let mut out = Vec::with_capacity(headers.len());
     for h in headers {
+        if prices.owns(&h.name) {
+            out.push(h.clone());
+            continue;
+        }
         let Some(name) = h.name.strip_prefix(prefix) else {
             // The converter copies out-of-backbone tensors verbatim (depth's reducer).
             out.push(h.clone());
@@ -1063,12 +1072,17 @@ fn emulate_packed_tower(
     headers: &[Header],
     cfg: &mlx_llm::ModelConfig,
     quant: Quant,
+    prices: &SourcePrices,
 ) -> Result<Vec<Header>> {
     let spec = crate::text_encoder::text_encoder_quant_spec(cfg, Some(quant))?
         .ok_or_else(|| Error::Msg("iris pricing: no tower quantization".into()))?;
     let embedding = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
     let mut out = Vec::with_capacity(headers.len());
     for h in headers {
+        if prices.owns(&h.name) {
+            out.push(h.clone());
+            continue;
+        }
         match h.shape.as_slice() {
             [rows, input] if h.name.ends_with(".weight") && h.name != embedding => {
                 let base = &h.name[..h.name.len() - ".weight".len()];
@@ -1184,6 +1198,7 @@ impl Backbone {
         prefix: &'static str,
         precision: Precision,
         input_channels: u64,
+        prices: &SourcePrices,
     ) -> Result<Self> {
         let inventory = StackInventory::from_headers(
             headers,
@@ -1192,6 +1207,7 @@ impl Backbone {
             CastPolicy::Backbone {
                 compute: compute_dtype(precision),
             },
+            prices,
         )?;
         Ok(Self {
             cfg: config.model.clone(),
@@ -2034,6 +2050,7 @@ impl Backbone {
 
 /// A backbone checkpoint priced for a load: its facts, its resident bytes and its load floor.
 struct PricedBackbone {
+    source_encoded: bool,
     facts: Backbone,
     resident: u64,
     floor: u64,
@@ -2058,6 +2075,7 @@ fn priced_backbone(
     opts: Pricing,
 ) -> Result<PricedBackbone> {
     let real = crate::stream::headers(path)?;
+    let prices = SourcePrices::compile(&[path.to_owned()], &real, |_| true)?;
     let artifact = crate::packed::artifact_tier(path)?;
     crate::packed::check_requested("the backbone", artifact, requested)?;
     priced_backbone_from_headers(
@@ -2072,7 +2090,32 @@ fn priced_backbone(
         },
         &real,
         artifact,
+        &prices,
     )
+}
+
+/// The cumulative forward recipe covers ordinary dense and affine operations. Only a
+/// source-specific operator allocation bound can qualify an encoded checkpoint's full cell.
+fn needs_codec_facts<'a>(headers: impl Iterator<Item = &'a Header> + Clone) -> bool {
+    headers.clone().any(|h| {
+        matches!(h.dtype, Stored::F8_E4M3 | Stored::F8_E5M2)
+            || h.name.ends_with(".comfy_quant")
+            || (h.dtype == Stored::I8
+                && h.name.strip_suffix(".weight").is_some_and(|base| {
+                    headers
+                        .clone()
+                        .any(|other| other.name.strip_suffix(".weight_scale") == Some(base))
+                }))
+    })
+}
+
+fn require_operator_facts(source_encoded: bool) -> Result<()> {
+    if source_encoded {
+        return Err(Error::Unsupported(
+            "Iris checkpoint codec operator allocation facts are unavailable".into(),
+        ));
+    }
+    Ok(())
 }
 
 struct BackbonePricingInput<'a> {
@@ -2089,6 +2132,7 @@ fn priced_backbone_from_headers(
     input: BackbonePricingInput<'_>,
     real: &[Header],
     artifact: Option<Quant>,
+    prices: &SourcePrices,
 ) -> Result<PricedBackbone> {
     let BackbonePricingInput {
         config,
@@ -2109,7 +2153,7 @@ fn priced_backbone_from_headers(
         )?;
     }
     let built = match (requantized, requested) {
-        (true, Some(quant)) => emulate_packed_backbone(real, prefix, quant)?,
+        (true, Some(quant)) => emulate_packed_backbone(real, prefix, quant, prices)?,
         _ => real.to_vec(),
     };
     let skeleton = |name: &str| {
@@ -2120,11 +2164,13 @@ fn priced_backbone_from_headers(
     // The load floor is the file the load reads: the packed export when one is assumed.
     let floor_headers = if opts.assume_packed { &built[..] } else { real };
     let floor = materialized_load_bytes(floor_headers, keep)?;
-    let load_view = floor_headers
+    let ordinary = prices.ordinary_rows(floor_headers);
+    let (source_upper, generated) = prices.load_extras(floor_headers, keep)?;
+    let load_view = ordinary
         .iter()
         .map(|h| (h.name.strip_prefix(prefix).unwrap_or(&h.name), h))
         .collect();
-    let load_constructors: std::collections::HashMap<_, _> = floor_headers
+    let load_constructors: std::collections::HashMap<_, _> = ordinary
         .iter()
         .map(|h| {
             (
@@ -2166,6 +2212,16 @@ fn priced_backbone_from_headers(
         compute_dtype(precision),
         |name| !streamed || Stack::of(name).is_none(),
     )?;
+    let read_sources_upper = read_sources_upper
+        .checked_add(
+            source_upper
+                .checked_sub(generated)
+                .ok_or_else(|| Error::Unsupported("Iris source load byte underflow".into()))?,
+        )
+        .ok_or_else(|| Error::Unsupported("Iris source load byte overflow".into()))?;
+    let constructor_outputs = constructor_outputs
+        .checked_add(generated)
+        .ok_or_else(|| Error::Unsupported("Iris source constructor byte overflow".into()))?;
     let evaluation_outputs = constructor_outputs
         .checked_add(eval_quantized)
         .ok_or_else(|| Error::Unsupported("Iris pending evaluation byte overflow".into()))?;
@@ -2180,11 +2236,11 @@ fn priced_backbone_from_headers(
     } else {
         None
     };
-    let facts = Backbone::new(config, &built, prefix, precision, input_channels)?;
-    let resident =
-        crate::memory_strategy::backbone_bytes_from_headers(real, precision, quant, keep)
-            .map_err(Error::from)?;
+    let facts = Backbone::new(config, &built, prefix, precision, input_channels, prices)?;
+    let resident = crate::memory_strategy::backbone_resident(real, precision, quant, keep, prices)
+        .map_err(Error::from)?;
     Ok(PricedBackbone {
+        source_encoded: prices.has_encoded(),
         facts,
         resident,
         floor,
@@ -2203,6 +2259,7 @@ struct PricedTower {
     floor: u64,
     load_owned_upper: u64,
     reads: Vec<BlockRead>,
+    source_encoded: bool,
 }
 
 fn priced_tower(
@@ -2217,12 +2274,11 @@ fn priced_tower(
     let files = crate::text_encoder::weight_shards(dir, untied)?;
     let mut real = Vec::new();
     for file in &files {
-        real.extend(
-            crate::stream::headers(file)?
-                .into_iter()
-                .filter(|h| crate::text_encoder::is_text_tower_tensor(&h.name, untied)),
-        );
+        real.extend(crate::stream::headers(file)?);
     }
+    let selected = |name: &str| crate::text_encoder::is_text_tower_tensor(name, untied);
+    let prices = SourcePrices::compile(&files, &real, selected)?;
+    real.retain(|h| selected(&h.name));
     let packed = cfg.quantization.is_some();
     let artifact = if packed {
         crate::packed::text_encoder_tier(dir)?
@@ -2240,19 +2296,21 @@ fn priced_tower(
         )?;
     }
     let built = match (requantized, requested) {
-        (true, Some(quant)) => emulate_packed_tower(&real, &cfg, quant)?,
+        (true, Some(quant)) => emulate_packed_tower(&real, &cfg, quant, &prices)?,
         _ => real.clone(),
     };
-    let embed = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
-    let norm = format!("{LANGUAGE_TOWER_PREFIX}norm.weight");
-    let skeleton = |name: &str| name == embed || name == norm;
+    let skeleton = crate::text_encoder::is_streamed_resident;
     let floor_headers = if opts.assume_packed { &built } else { &real };
     let resident = if streamed {
         built
             .iter()
-            .filter(|h| skeleton(&h.name))
-            .map(|h| allocated(elements(h) * 2))
-            .sum()
+            .filter(|h| skeleton(&h.name) && !prices.owns(&h.name))
+            .try_fold(prices.resident(skeleton)?, |n, h| {
+                n.checked_add(allocated(elements(h) * 2))
+            })
+            .ok_or_else(|| {
+                Error::Unsupported("Iris streamed tower resident byte overflow".into())
+            })?
     } else {
         crate::memory_strategy::text_encoder_bytes(dir, requested).map_err(Error::from)?
     };
@@ -2263,7 +2321,7 @@ fn priced_tower(
         .ok_or_else(|| Error::Unsupported("Iris tower resident byte arithmetic overflow".into()))?;
     // Return the checked logical floor and its same-owner target/rounding upper together;
     // a saturating source sum must never be treated as an exact subtraction identity.
-    let (floor, load_owned_upper) = tower_load_output_bytes(
+    let (floor, load_owned_upper) = prices.tower_load_output(
         floor_headers,
         |name| !streamed || skeleton(name),
         tower_rope_bytes(&cfg)?,
@@ -2275,26 +2333,17 @@ fn priced_tower(
     };
     let load_owned_upper = load_owned_upper
         .checked_add(crate::stream::tower_quantization_bytes(
-            floor_headers,
+            &prices.ordinary_rows(floor_headers),
             |name| !streamed || skeleton(name),
             load_quant,
         )?)
         .ok_or_else(|| {
             Error::Unsupported("Iris tower pending quantization byte overflow".into())
         })?;
-    let mut grouped: Vec<Vec<&Header>> = vec![Vec::new(); cfg.num_layers];
-    for h in &built {
-        if let Some(i) = crate::text_encoder::tower_layer_of(&h.name) {
-            if let Some(slot) = grouped.get_mut(i) {
-                slot.push(h);
-            }
-        }
-    }
-    let reads = grouped
-        .iter()
-        .map(|layer| crate::stream::block_read(layer, CastPolicy::Tower))
-        .collect();
+    let (_, reads) =
+        crate::text_encoder::tower_inventory_from_headers(&built, cfg.num_layers, &prices)?;
     Ok(PricedTower {
+        source_encoded: prices.has_encoded(),
         cfg,
         resident,
         floor,
@@ -2307,6 +2356,7 @@ fn priced_tower(
 /// and per-source allocator rounding beyond the logical-byte raw guard. Packed codes/scales/
 /// biases are used as stored. This does not claim to price dense-requantization intermediates;
 /// their separate cumulative native graph remains in native_ledger.
+#[cfg(test)]
 fn tower_load_output_bytes(
     headers: &[Header],
     keep: impl Fn(&str) -> bool,
@@ -2679,6 +2729,11 @@ fn guarded_pricing_facts<'a>(
         .into_iter()
         .map(|location| location.header)
         .collect();
+    // This guarded path has observed the headers only. Source descriptors and operator
+    // allocation bounds have no capacity-qualified facts in this replay.
+    if needs_codec_facts(real.iter()) {
+        return Err(native_ledger::codec_facts_refusal(req)?);
+    }
     let artifact =
         crate::packed::artifact_tier_from_headers(&export.weights_path(), &real, || {
             metadata.observe(
@@ -2734,6 +2789,7 @@ fn guarded_pricing_facts<'a>(
         },
         &real,
         artifact,
+        &SourcePrices::default(),
     )?;
     let empty = read(&export.empty_prompt_path(), &mut metadata, capacity)?;
     let empty_headers: Vec<_> = empty
@@ -3282,6 +3338,7 @@ fn generation(
         config.model.in_channels as u64,
         opts,
     )?;
+    require_operator_facts(bb.source_encoded)?;
     let base_bb_resident = bb.resident;
     let (adapter_inventory, packed_adapter_hosts, width_read_bytes) = if spec.adapters.is_empty() {
         (crate::adapters::AdapterHeaderInventory::default(), 0, 0)
@@ -3341,6 +3398,7 @@ fn generation(
         .ok_or_else(|| Error::Unsupported("Iris backbone/adapter resident sum overflow".into()))?;
     bb.facts.adapter_facts = adapter_inventory.projections.clone();
     let te = priced_tower(&resources.text_encoder_dir, spec.quantize, streamed, opts)?;
+    require_operator_facts(te.source_encoded)?;
     let te_cfg = &te.cfg;
     let max_length = config.text_encoder.max_length as u64;
     let layers = config.text_encoder.hidden_layers.len() as u64;
@@ -4449,6 +4507,7 @@ fn restoration_with_sources(
         )?;
         &owned_bb
     };
+    require_operator_facts(bb.source_encoded)?;
     let (states, prompt_floor) = if let Some(sources) = sources {
         (
             crate::stream::empty_prompt_upload_bytes(sources.metadata.empty_embedding_elements)?,
@@ -4802,6 +4861,7 @@ fn depth_with_sources(
         )?;
         &owned_bb
     };
+    require_operator_facts(bb.source_encoded)?;
     let (states, prompt_floor) = if let Some(sources) = sources {
         (
             crate::stream::empty_prompt_upload_bytes(sources.metadata.empty_embedding_elements)?,
@@ -6345,7 +6405,9 @@ mod depth_constructor_output_tests {
             h("depth_reducer.weight", Stored::F32, &[1, 3, 1, 1], 12),
             h("pixel.proj.weight", Stored::F32, &[64, 64], 16384),
         ];
-        let packed = emulate_packed_backbone(&source, "pixel.", Quant::Q4).unwrap();
+        let packed =
+            emulate_packed_backbone(&source, "pixel.", Quant::Q4, &SourcePrices::default())
+                .unwrap();
         let reducer = packed
             .iter()
             .find(|h| h.name == "depth_reducer.weight")

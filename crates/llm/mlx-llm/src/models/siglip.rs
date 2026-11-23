@@ -92,7 +92,7 @@ pub struct SiglipVisionOutput {
 pub struct SiglipVisionTower {
     patch_embedding: Array,
     patch_bias: Option<Array>,
-    position_embedding: Array,
+    position_embedding: Projection,
     layers: Vec<SiglipEncoderLayer>,
     post_ln_w: Array,
     post_ln_b: Array,
@@ -109,9 +109,8 @@ impl SiglipVisionTower {
             .require(&p("embeddings.patch_embedding.weight"))?
             .transpose_axes(&[0, 2, 3, 1])?;
         let patch_bias = w.get(&p("embeddings.patch_embedding.bias")).cloned();
-        let position_embedding = w
-            .require(&p("embeddings.position_embedding.weight"))?
-            .clone();
+        let position_embedding =
+            Projection::from_named(w, &p("embeddings.position_embedding.weight"), None, None)?;
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| SiglipEncoderLayer::from_weights(w, &p(&format!("encoder.layers.{i}")), &cfg))
             .collect::<Result<Vec<_>>>()?;
@@ -139,9 +138,12 @@ impl SiglipVisionTower {
             0,
         )?;
         let patches = patches.reshape(&[b, self.cfg.num_patches(), self.cfg.hidden_size])?;
-        let pos =
-            self.position_embedding
-                .reshape(&[1, self.cfg.num_patches(), self.cfg.hidden_size])?;
+        let n = self.cfg.num_patches();
+        let pos = match &self.position_embedding {
+            Projection::Dense { weight, .. } => weight.clone(),
+            native => native.rows(&Array::arange::<i32, i32>(0, n, None)?)?,
+        }
+        .reshape(&[1, n, self.cfg.hidden_size])?;
         Ok(add(&patches, &pos)?)
     }
 

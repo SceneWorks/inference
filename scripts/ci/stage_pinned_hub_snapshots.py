@@ -28,7 +28,7 @@ from contextlib import ExitStack, contextmanager
 import errno
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import stat
@@ -39,6 +39,13 @@ import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci.file_lock import (  # noqa: E402
+    MSVCRT_LOCK_BUSY,
+    POSIX_LOCK_BUSY,
+    exclusive_file_lock,
+    try_lock_handle,
+    unlock_handle,
+)
 from scripts.ci.pinned_hub_source import pinned_manifest, verify_pinned_hub_files  # noqa: E402
 
 GIB = 1024**3
@@ -48,10 +55,6 @@ HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
 LOCK_POLL_SECONDS = 5
 # A holder may be downloading tens of GiB; say so periodically rather than going silent.
 LOCK_LOG_SECONDS = 180
-# Only these mean "another holder has it"; any other lock error (ENOLCK/ENOTSUP on a network
-# hub, EBADF, EINVAL) is raised instead of spinning forever.
-POSIX_LOCK_BUSY = frozenset((errno.EWOULDBLOCK, errno.EAGAIN))
-MSVCRT_LOCK_BUSY = frozenset((errno.EACCES, errno.EDEADLK))
 
 
 def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
@@ -59,20 +62,7 @@ def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
 
 
 def _try_lock(handle) -> bool:
-    windows = os.name == "nt"
-    try:
-        if windows:
-            import msvcrt
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError as error:
-        if error.errno in (MSVCRT_LOCK_BUSY if windows else POSIX_LOCK_BUSY):
-            return False
-        raise
+    return try_lock_handle(handle, is_windows=(os.name == "nt"))
 
 
 def lock_path(hub: Path, repository: str, revision: str, file: str) -> Path:
@@ -135,34 +125,47 @@ def staging_lock(hub: Path, repository: str, revision: str, file: str, *, native
     """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
     path = lock_path(hub, repository, revision, file)
+    state = {"started": None, "logged": None}
+
+    def on_wait(wait_count: int) -> None:
+        now = time.monotonic()
+        if wait_count == 0:
+            state["started"] = state["logged"] = now
+            print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
+        elif now - state["logged"] >= LOCK_LOG_SECONDS:
+            state["logged"] = now
+            print(f"still waiting ({now - state['started']:.0f} s) for another job staging "
+                  f"{repository}@{revision}/{file}", flush=True)
+
     if native_home is None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        opened = open(path, "a+b")
-    else:
-        opened = native_lock_handle(native_home, path)
-    with opened as handle:
+        with exclusive_file_lock(
+            path,
+            poll_seconds=LOCK_POLL_SECONDS,
+            timeout_seconds=None,
+            remove_on_exit=False,
+            fallback_excl_on_notsup=False,
+            on_wait=on_wait,
+            try_lock=_try_lock,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+        ):
+            yield
+        return
+    # The SCAIL-2 native cache opens its lock through no-follow directory handles on the runner
+    # home volume, so it cannot use the path-based shared helper.
+    with native_lock_handle(native_home, path) as handle:
         if handle.seek(0, 2) == 0:
             handle.write(b"0")
             handle.flush()
-        if not _try_lock(handle):
-            started = logged = time.monotonic()
-            print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
-            while not _try_lock(handle):
-                time.sleep(LOCK_POLL_SECONDS)
-                if time.monotonic() - logged >= LOCK_LOG_SECONDS:
-                    logged = time.monotonic()
-                    print(f"still waiting ({logged - started:.0f} s) for another job staging "
-                          f"{repository}@{revision}/{file}", flush=True)
+        wait_count = 0
+        while not _try_lock(handle):
+            on_wait(wait_count)
+            wait_count += 1
+            time.sleep(LOCK_POLL_SECONDS)
         try:
             yield
         finally:
-            if os.name == "nt":
-                import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_handle(handle)
 
 
 def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:
@@ -174,6 +177,25 @@ def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:
     if any(type(size) is not int or size < 0 for size in files.values()):
         raise ValueError("Hub inventory lacks a file size")
     return files
+
+
+def resolve_hub_root(env: dict[str, str], *, platform: str | None = None) -> Path:
+    configured = env.get("MODEL_PROOF_HUB_ROOT", "").strip()
+    if not configured:
+        raise ValueError("MODEL_PROOF_HUB_ROOT (the runner model root variable) is unset")
+    expanded = os.path.expanduser(configured)
+    root = Path(expanded)
+    if not (root.is_absolute() or PureWindowsPath(expanded).is_absolute()):
+        raise ValueError("MODEL_PROOF_HUB_ROOT must be an absolute or ~ path")
+    # On macOS, repo variables point at an external volume (for example /Volumes/Models/...).
+    # When that external volume is not mounted on the runner, /Volumes is root-owned and mkdir
+    # fails with EACCES; fall back to the runner account's local macOS cache directory.
+    active_platform = sys.platform if platform is None else platform
+    if active_platform == "darwin" and len(root.parts) >= 3 and root.parts[:2] == ("/", "Volumes"):
+        if not Path("/", "Volumes", root.parts[2]).exists():
+            home = Path(os.path.expanduser(env.get("HOME") or "~"))
+            return home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
+    return root
 
 
 def runner_account_home() -> Path:
@@ -209,12 +231,7 @@ def hub_root(env: dict[str, str], plan: dict) -> Path:
             source.touch()
             os.link(source, Path(scratch) / "published")
         return hub
-    configured = env.get("MODEL_PROOF_HUB_ROOT", "")
-    if not configured:
-        raise ValueError("MODEL_PROOF_HUB_ROOT (the runner model root variable) is unset")
-    root = Path(os.path.expanduser(configured))
-    if not root.is_absolute():
-        raise ValueError("MODEL_PROOF_HUB_ROOT must be an absolute or ~ path")
+    root = resolve_hub_root(env)
     root.mkdir(parents=True, exist_ok=True)
     return Path(os.path.realpath(root))
 

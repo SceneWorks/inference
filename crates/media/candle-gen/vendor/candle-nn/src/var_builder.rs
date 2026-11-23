@@ -42,6 +42,38 @@ struct TensorData<B: Backend> {
     pub dtype: DType,
 }
 
+/// Logical tensor geometry and source-selected residency, available before any payload read.
+pub struct TensorInfo {
+    pub shape: Shape,
+    /// The source plan retains packed operands for this parameter.
+    pub source_packed: bool,
+    /// A source without declared matrix axes may describe its storage shape by padding model axes.
+    pub padded_shape: Option<fn([usize; 2]) -> [usize; 2]>,
+}
+
+impl TensorInfo {
+    pub fn matches(&self, logical: &Shape) -> bool {
+        match (self.padded_shape, logical.dims()) {
+            (Some(pad), &[rows, cols]) => {
+                rows > 0 && cols > 0 && pad([rows, cols]) == self.shape.dims()
+            }
+            _ => &self.shape == logical,
+        }
+    }
+    pub fn declared_matrix(&self) -> Result<Option<(usize, usize)>> {
+        let axes = self.shape.dims2()?;
+        Ok(self.padded_shape.is_none().then_some(axes))
+    }
+
+    pub fn dense(shape: Shape) -> Self {
+        Self {
+            shape,
+            source_packed: false,
+            padded_shape: None,
+        }
+    }
+}
+
 /// A trait that defines how tensor data is retrieved.
 ///
 /// Typically this would use disk storage in some specific format, or random initialization.
@@ -94,6 +126,10 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    /// Logical dimensions, when the backend can inspect the checkpoint without materializing it.
+    fn tensor_info(&self, _name: &str) -> Result<Option<TensorInfo>> {
+        Ok(None)
+    }
     fn contains_tensor(&self, name: &str) -> bool;
 }
 
@@ -141,6 +177,10 @@ pub trait SimpleBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Logical dimensions, when the backend can inspect the checkpoint without materializing it.
+    fn tensor_info(&self, _name: &str) -> Result<Option<TensorInfo>> {
+        Ok(None)
+    }
     fn contains_tensor(&self, name: &str) -> bool;
 }
 
@@ -191,6 +231,9 @@ impl Backend for Box<dyn SimpleBackend + '_> {
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
         self.as_ref()
             .native_linear_weight_flattened(name, shape, dtype, dev)
+    }
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        self.as_ref().tensor_info(name)
     }
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
@@ -329,6 +372,11 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         )
     }
 
+    /// Inspect the logical checkpoint geometry at this path, if supplied by the backend.
+    pub fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        self.data.backend.tensor_info(&self.path(name))
+    }
+
     /// This returns true only if a tensor with the passed in name is available. E.g. when passed
     /// `a`, true is returned if `prefix.a` exists but false is returned if only `prefix.a.b`
     /// exists.
@@ -442,6 +490,9 @@ impl SimpleBackend for Zeros {
 }
 
 impl SimpleBackend for HashMap<String, Tensor> {
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        Ok(self.get(name).map(|t| TensorInfo::dense(t.shape().clone())))
+    }
     fn get(
         &self,
         s: Shape,
@@ -655,6 +706,12 @@ impl SimpleBackend for candle::pickle::PthTensors {
 }
 
 impl SimpleBackend for candle::safetensors::MmapedSafetensors {
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        Ok(self
+            .get(name)
+            .ok()
+            .map(|t| TensorInfo::dense(t.shape().into())))
+    }
     fn get(
         &self,
         s: Shape,
@@ -1027,6 +1084,9 @@ pub struct Rename<'a, R: Renamer> {
 }
 
 impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        self.inner.tensor_info(&self.renamer.rename(name))
+    }
     fn get(
         &self,
         s: Shape,

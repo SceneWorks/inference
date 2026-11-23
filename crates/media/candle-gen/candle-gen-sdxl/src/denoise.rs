@@ -50,7 +50,19 @@ pub const LATENT_CHANNELS: usize = 4;
 /// original/crop/target sizes). `batch` rows, in `dtype` (so it concatenates with the f16 pooled text
 /// embeds inside the UNet/ControlNet `add_embedding`).
 pub fn text_time_ids(batch: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-    let row = [512.0f32, 512.0, 0.0, 0.0, 512.0, 512.0];
+    text_time_ids_for_size(batch, 512, 512, device, dtype)
+}
+
+/// SDXL layout: original H/W, crop Y/X, target H/W. The plain canvas is uncropped.
+pub(crate) fn text_time_ids_for_size(
+    batch: usize,
+    width: u32,
+    height: u32,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let (h, w) = (height as f32, width as f32);
+    let row = [h, w, 0.0, 0.0, h, w];
     let mut v = Vec::with_capacity(batch * 6);
     for _ in 0..batch {
         v.extend_from_slice(&row);

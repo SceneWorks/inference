@@ -43,8 +43,8 @@ pub struct MtpProposer<'a> {
     cache: Qwen35MtpCache,
     after_cur: Option<Qwen35MtpCache>,
     resume: Option<MtpBoundary>,
-    capture_at: Option<usize>,
-    captured: Option<MtpBoundary>,
+    capture_at: Vec<usize>,
+    captured: Vec<MtpBoundary>,
 }
 
 /// The MTP head's state at a prompt boundary `len` (story sc-24437): its cache after warming on
@@ -59,6 +59,21 @@ pub struct MtpBoundary {
 }
 
 impl MtpBoundary {
+    /// Dummy boundary carrying `len` positions for non-inference prefix-checkpoint tests.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(len: usize) -> Self {
+        Self {
+            cache: Qwen35MtpCache::empty_for_test(),
+            hidden: Tensor::zeros(
+                (1, 1, 2),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            len,
+        }
+    }
+
     /// The prompt positions the state covers.
     pub fn len(&self) -> usize {
         self.len
@@ -85,8 +100,8 @@ impl<'a> MtpProposer<'a> {
             cache: mtp.new_cache(),
             after_cur: None,
             resume: None,
-            capture_at: None,
-            captured: None,
+            capture_at: Vec::new(),
+            captured: Vec::new(),
         }
     }
 
@@ -101,13 +116,25 @@ impl<'a> MtpProposer<'a> {
     /// [`take_captured`](Self::take_captured)); ignored unless `len` falls strictly inside the
     /// warmed span.
     pub fn capture_at(mut self, len: Option<usize>) -> Self {
-        self.capture_at = len;
+        self.capture_at = len.into_iter().collect();
         self
     }
 
-    /// The state captured by [`capture_at`](Self::capture_at), once.
+    /// Record the head's state at all boundary positions in `lens` strictly inside the warmed span
+    /// (SW-F356; see [`take_captured_all`](Self::take_captured_all)).
+    pub fn capture_at_many(mut self, lens: &[usize]) -> Self {
+        self.capture_at = lens.to_vec();
+        self
+    }
+
+    /// The first state captured by [`capture_at`](Self::capture_at), once (clearing any remainder).
     pub fn take_captured(&mut self) -> Option<MtpBoundary> {
-        self.captured.take()
+        std::mem::take(&mut self.captured).into_iter().next()
+    }
+
+    /// All states captured during the last warm-up, in boundary order.
+    pub fn take_captured_all(&mut self) -> Vec<MtpBoundary> {
+        std::mem::take(&mut self.captured)
     }
 
     /// Warm the predictor from a **multimodal** prompt: the fused (vision-spliced) prompt
@@ -186,18 +213,23 @@ impl Proposer for MtpProposer<'_> {
             }
         };
         let first = offset.max(1);
-        let split = self
-            .capture_at
-            .take()
-            .filter(|&b| b > offset && b < prompt.len());
-        let mut segments = Vec::with_capacity(2);
+        self.captured.clear();
+        let mut splits: Vec<usize> = std::mem::take(&mut self.capture_at)
+            .into_iter()
+            .filter(|&b| b > offset && b < prompt.len())
+            .collect();
+        splits.sort_unstable();
+        splits.dedup();
+        let mut segments: Vec<(std::ops::Range<usize>, Option<usize>)> =
+            Vec::with_capacity(splits.len() + 1);
         let mut from = first;
-        if let Some(b) = split {
-            segments.push(from..b);
+        for b in splits {
+            let start = from.min(b);
+            segments.push((start..b, Some(b)));
             from = b;
         }
-        segments.push(from..prompt.len());
-        for segment in segments {
+        segments.push((from..prompt.len(), None));
+        for (segment, cap) in segments {
             if !segment.is_empty() {
                 let previous = target_rows(segment.start - 1, segment.len())?;
                 self.mtp.warm_sequence(
@@ -207,11 +239,11 @@ impl Proposer for MtpProposer<'_> {
                     &mut self.cache,
                 )?;
             }
-            if split == Some(segment.end) {
-                self.captured = Some(MtpBoundary {
+            if let Some(boundary_len) = cap {
+                self.captured.push(MtpBoundary {
                     cache: self.cache.clone(),
-                    hidden: target_rows(segment.end - 1, 1)?.copy()?,
-                    len: segment.end,
+                    hidden: target_rows(boundary_len - 1, 1)?.copy()?,
+                    len: boundary_len,
                 });
             }
         }
@@ -409,6 +441,11 @@ pub struct DraftModelProposer<'a, D: StepModel> {
     budget: usize,
     max_drafts: usize,
     base: i32,
+    /// Committed tokens not yet fed into the draft cache (queued during plain probes or while an
+    /// alternate adaptive proposer ran).
+    pending: Vec<i32>,
+    /// Whether `propose` ran on the current step (`false` when committing an inactive step).
+    proposed_this_step: bool,
     /// Leading draft ids a draft may be drawn from (the tokenizer's tokens the draft scores).
     proposable: usize,
     /// The target's logits width, which the draft's logits are shaped to.
@@ -428,6 +465,8 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
             budget: capacity,
             max_drafts,
             base: 0,
+            pending: Vec::new(),
+            proposed_this_step: false,
             proposable: draft.vocab_size(),
             width: draft.vocab_size(),
             draft_forwards: 0,
@@ -487,6 +526,8 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
             .forward_step(&mut cache, StepRequest::last(prompt).as_prefill())?;
         self.draft_forwards += 1;
         self.cache = Some(cache);
+        self.pending.clear();
+        self.proposed_this_step = false;
         Ok(())
     }
 
@@ -498,13 +539,33 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         let k = ctx.max_drafts;
         let device = self.draft.device().clone();
         let mut cache = self.take_cache()?;
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            let catchup = self
+                .draft
+                .forward_step(&mut cache, StepRequest::last(&pending));
+            self.draft_forwards += 1;
+            if let Err(err) = catchup {
+                self.cache = Some(cache);
+                return Err(err);
+            }
+        }
         self.base = cache.len();
+        self.proposed_this_step = true;
         let result = self.propose_into(&mut cache, ctx, sampler, k, &device);
         self.cache = Some(cache);
         result
     }
 
     fn commit(&mut self, cur: i32, accepted: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        if !self.proposed_this_step {
+            // Inactive step (plain probe, budget clamp, or alternate adaptive proposer): queue
+            // `[cur, accepted…]` with zero draft forwards until this proposer runs again.
+            self.pending.push(cur);
+            self.pending.extend_from_slice(accepted);
+            return Ok(());
+        }
+        self.proposed_this_step = false;
         let base = self.base;
         let mut cache = self.take_cache()?;
         // A host-sampled run stops drafting at a stop token without feeding it, so an accepted
@@ -524,6 +585,24 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
             }),
             Err(e) => Err(e),
         };
+        self.cache = Some(cache);
+        result
+    }
+
+    fn catch_up(&mut self, tokens: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        let replay = if !self.pending.is_empty() {
+            std::mem::take(&mut self.pending)
+        } else if !tokens.is_empty() {
+            tokens.to_vec()
+        } else {
+            return Ok(());
+        };
+        let mut cache = self.take_cache()?;
+        let result = self
+            .draft
+            .forward_step(&mut cache, StepRequest::last(&replay))
+            .map(|_| ());
+        self.draft_forwards += 1;
         self.cache = Some(cache);
         result
     }

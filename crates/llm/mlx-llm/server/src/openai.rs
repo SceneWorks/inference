@@ -208,6 +208,7 @@ impl ChatRequest {
             cancel: Default::default(),
             progress: None,
             kv_compression,
+            prefix_checkpoints: None,
         })
     }
 }
@@ -328,6 +329,25 @@ pub fn x_decode(report: &DecodeReport) -> Value {
             "host_synchronized_calls": draft.host_synchronized_calls,
             "total_ms": draft.total.as_secs_f64() * 1e3,
         });
+    }
+    if let Some(ref pc) = report.prefix_checkpoints {
+        v["prefix_checkpoints"] = json!({
+            "policy": pc.policy,
+            "reused_tokens": pc.reused_tokens,
+            "reread_tokens": pc.reread_tokens,
+            "matched_kind": pc.matched_kind,
+            "checkpoints_captured": pc.checkpoints_captured,
+            "captured_bytes": pc.captured_bytes,
+            "restore_time_ms": pc.restore_time.as_secs_f64() * 1e3,
+            "capture_time_ms": pc.capture_time.as_secs_f64() * 1e3,
+            "resident_bytes": pc.resident_bytes,
+            "protected_bytes": pc.protected_bytes,
+            "evicted_entries": pc.evicted_entries,
+            "fallbacks": pc.fallbacks,
+        });
+    }
+    if let Some(ref adaptive) = report.adaptive_speculative {
+        v["adaptive_speculative"] = adaptive.to_wire_json();
     }
     v
 }
@@ -679,5 +699,75 @@ mod tests {
         assert_eq!(v["usage"]["prompt_tokens"], 3);
         assert_eq!(v["usage"]["completion_tokens"], 2);
         assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn x_decode_serializes_adaptive_speculative_report() {
+        use mlx_llm::core_llm::{
+            AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent,
+            AdaptiveSpeculativeReport, ProposerKind,
+        };
+        let report = DecodeReport {
+            proposer: ProposerKind::Mtp,
+            draft_tokens: Some(3),
+            adaptive_speculative: Some(AdaptiveSpeculativeReport {
+                adaptive: true,
+                candidates: vec![
+                    ProposerKind::Mtp,
+                    ProposerKind::PromptLookup,
+                    ProposerKind::None,
+                ],
+                initial_proposer: ProposerKind::Mtp,
+                initial_depth: 2,
+                final_proposer: ProposerKind::PromptLookup,
+                final_depth: 4,
+                depth_changes: 1,
+                proposer_switches: 1,
+                plain_reason: None,
+                events: vec![AdaptiveSpeculativeEvent {
+                    token_offset: 48,
+                    verify_step: 16,
+                    kind: AdaptiveEventKind::ProposerSwitched,
+                    from_proposer: ProposerKind::Mtp,
+                    from_depth: 3,
+                    to_proposer: ProposerKind::PromptLookup,
+                    to_depth: 4,
+                    reason: "probe prompt_lookup beat mtp".into(),
+                }],
+                cost: Some(AdaptiveCostSummary {
+                    proposal_ns: 4_000_000,
+                    verify_ns: 20_000_000,
+                    rollback_ns: 500_000,
+                    sync_ns: 1_500_000,
+                    total_ns: 26_000_000,
+                    host_syncs: 8,
+                    committed_tokens: 26,
+                }),
+            }),
+            ..Default::default()
+        };
+        let v = x_decode(&report);
+        let a = &v["adaptive_speculative"];
+        assert_eq!(a["adaptive"], true);
+        assert_eq!(a["candidates"], json!(["mtp", "prompt_lookup", "none"]));
+        assert_eq!(a["initial_proposer"], "mtp");
+        assert_eq!(a["initial_depth"], 2);
+        assert_eq!(a["final_proposer"], "prompt_lookup");
+        assert_eq!(a["final_depth"], 4);
+        assert_eq!(a["depth_changes"], 1);
+        assert_eq!(a["proposer_switches"], 1);
+        assert_eq!(a["events"][0]["kind"], "proposer_switched");
+        assert_eq!(a["events"][0]["to_proposer"], "prompt_lookup");
+        let expected_cost = json!({
+            "proposal_ms": 4.0,
+            "verify_ms": 20.0,
+            "rollback_ms": 0.5,
+            "sync_ms": 1.5,
+            "total_ms": 26.0,
+            "host_syncs": 8,
+            "committed_tokens": 26,
+            "ms_per_committed_token": 1.0,
+        });
+        assert_eq!(a["cost"], expected_cost);
     }
 }

@@ -1271,6 +1271,8 @@ mod tests {
                             path: "hit".into(),
                             reason: Some("why".into()),
                         },
+                        prefix_checkpoints: None,
+                        adaptive_speculative: None,
                         fallbacks: vec!["speculative: x".into()],
                         tree_verify: None,
                         draft_time: Some(core_llm::DraftTime {

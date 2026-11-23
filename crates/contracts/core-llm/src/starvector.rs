@@ -758,6 +758,7 @@ pub mod starvector_8b {
                 speculative: Vec::new(),
                 supported_constraints: Vec::new(),
                 tree_verify: None,
+                prefix_checkpoints: None,
             },
         }
     }

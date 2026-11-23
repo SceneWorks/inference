@@ -16,6 +16,8 @@ timeout is reported as `unreachable`, never as absent. Other repositories that h
 the same name are ignored, so a role cannot be ambiguous.
 """
 import argparse
+import ctypes
+import errno
 import faulthandler
 import hashlib
 import json
@@ -32,6 +34,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci.file_lock import exclusive_file_lock
 from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 from scripts.ci.flux1_pair.fs_probe import Unreachable, probe
 
@@ -274,6 +277,9 @@ GEMMA_STAGE_FILES = ("config.json", "generation_config.json", "special_tokens_ma
 STAGE_CHUNK = 8 * 1024 * 1024
 STAGE_SOCKET_TIMEOUT = 120
 MAX_STAGE_SECONDS = 3_600
+_DARWIN_RENAME_EXCL = 0x00000004
+PLACE_LOCK_TIMEOUT_SECONDS = 30.0
+PLACE_LOCK_POLL_SECONDS = 0.02
 
 
 def pinned_path(hub, repo, revision, name):
@@ -304,6 +310,77 @@ def _same_bytes(path, size, sha):
         while chunk := stream.read(STAGE_CHUNK):
             state.update(chunk)
     return state.hexdigest() == sha
+
+
+def _renamex_excl(source, destination):
+    """Atomic no-overwrite rename on macOS (`renamex_np` with `RENAME_EXCL`).
+
+    Returns True when placed, False when unavailable or unsupported on the target filesystem
+    (e.g. SMB/exFAT), and raises `FileExistsError` when `destination` already exists.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = libc.renamex_np
+    except (OSError, AttributeError):
+        return False
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    rc = renamex_np(os.fsencode(source), os.fsencode(destination), _DARWIN_RENAME_EXCL)
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(err, os.strerror(err), str(destination))
+    if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+        return False
+    raise OSError(err, os.strerror(err), str(source), None, str(destination))
+
+
+def _locked_replace_if_absent(temporary, destination):
+    """Serialize `probe` + `os.replace` via a crash-safe OS file lock (`exclusive_file_lock`).
+
+    Used only when neither `os.link` nor an atomic no-overwrite rename is supported by the
+    filesystem (e.g. exFAT/SMB shares). Guarantees concurrent staging jobs never clobber an
+    already-placed `destination`, and recovers immediately if a previous publisher crashed or was
+    killed while holding the placement lock.
+    """
+    lock_path = destination.parent / f".{destination.name}.place.lock"
+
+    def check_absent(_wait_count):
+        if probe(destination)["exists"]:
+            raise FileExistsError(destination)
+
+    with exclusive_file_lock(
+        lock_path,
+        poll_seconds=PLACE_LOCK_POLL_SECONDS,
+        timeout_seconds=PLACE_LOCK_TIMEOUT_SECONDS,
+        remove_on_exit=True,
+        fallback_excl_on_notsup=True,
+        on_wait=check_absent,
+    ):
+        if probe(destination)["exists"]:
+            raise FileExistsError(destination)
+        os.replace(temporary, destination)
+
+
+def _place_without_overwrite(temporary, destination):
+    """Publish `temporary` at `destination`, raising `FileExistsError` if it already exists."""
+    if os.name == "nt":
+        os.rename(temporary, destination)
+        return
+    try:
+        os.link(temporary, destination)
+        temporary.unlink()
+        return
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+    if _renamex_excl(temporary, destination):
+        return
+    _locked_replace_if_absent(temporary, destination)
 
 
 def fetch_pinned(url, destination, token=None, opener=None):
@@ -348,11 +425,7 @@ def fetch_pinned(url, destination, token=None, opener=None):
         if re.fullmatch(r"[0-9a-f]{64}", etag) and etag != sha:
             raise ValueError(f"downloaded bytes for {url} differ from the Hub's LFS SHA-256")
         try:
-            if os.name == "nt":
-                os.rename(temporary, destination)
-            else:
-                os.link(temporary, destination)
-                temporary.unlink()
+            _place_without_overwrite(temporary, destination)
         except FileExistsError:
             if not _same_bytes(destination, size, sha):
                 raise ValueError(f"{destination} was placed concurrently with other bytes; not replaced")

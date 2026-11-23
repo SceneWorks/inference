@@ -841,6 +841,12 @@ pub struct AdaptableLinear {
     training_residual: bool,
 }
 
+impl From<Array> for AdaptableLinear {
+    fn from(weight: Array) -> Self {
+        Self::dense(weight, None)
+    }
+}
+
 impl AdaptableLinear {
     /// Build from a raw `[out, in]` weight (and optional bias) — the common path when
     /// loading dense (bf16/fp16/fp32) checkpoints via the `weights` module.
@@ -1101,14 +1107,29 @@ impl AdaptableLinear {
         self.materialize_adapters()
     }
 
+    /// Validate a reconstructed adapter against the native operator's logical output/input axes.
+    pub fn validate_native_delta(shape: &[i32], delta: &Array) -> Result<()> {
+        if delta.shape() != shape
+            || !matches!(
+                delta.dtype(),
+                Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+            )
+        {
+            return Err(
+                "native projection adapter delta must match the floating base shape".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Merge a precomputed `[out, in]` delta into the dense base weight (`W += δ`) — the in-place
     /// LoRA/LoKr *merge*, distinct from the forward-time [`Adapter::residual`] stack. The merge
     /// reproduces a reference's merged-weight forward (`(W+δ)·x`) bit-for-bit, where a residual
     /// (`W·x + δ·x`) differs by ~1 ULP; on a chaos-sensitive sampler (SDXL's ancestral) that 1-ULP
     /// cascades to a visible whole-image divergence, so the SDXL provider merges (matching the
     /// vendored `lora.py` `module.weight += delta`) rather than stacking residuals. `delta` is cast
-    /// to the base weight's dtype before the add. Errors on a quantized base — a LoRA must be merged
-    /// into the dense (e.g. f32) weight BEFORE quantization (the fork merges pre-quantize too).
+    /// to the base weight's dtype before the add. Native FP8/ConvRot keeps the floating delta as an
+    /// original-input residual. Affine and W4A8 callers must fold before packing or install an adapter.
     pub fn merge_dense_delta(&mut self, delta: &Array) -> Result<()> {
         match &mut self.base {
             LinearBase::Dense(l) => {
@@ -1117,16 +1138,7 @@ impl AdaptableLinear {
                 Ok(())
             }
             LinearBase::Fp8(_) | LinearBase::ConvRot(_) => {
-                if delta.shape() != self.base_shape()
-                    || !matches!(
-                        delta.dtype(),
-                        Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
-                    )
-                {
-                    return Err(
-                        "native projection adapter delta must match the floating base shape".into(),
-                    );
-                }
+                Self::validate_native_delta(&self.base_shape(), delta)?;
                 self.push(Adapter::Lokr {
                     delta: delta.clone(),
                     scale: 1.0,
@@ -1427,7 +1439,7 @@ impl AdaptableLinear {
                 weight: Param::new(weight),
                 bias: Param::new(bias),
             };
-            let q = QuantizedLinear::try_from_linear(
+            let q = crate::quantization_cache::quantize_linear_cached(
                 linear,
                 group_size.unwrap_or(crate::quant::DEFAULT_GROUP_SIZE),
                 bits,

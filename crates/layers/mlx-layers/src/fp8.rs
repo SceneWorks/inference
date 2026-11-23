@@ -1,5 +1,5 @@
-//! Projection over original Comfy E4M3FN, E5M2 or MXFP8 bytes. Scalar activation
-//! scales are fixed by the checkpoint. MXFP8 uses one E8M0 scale per 32 input channels.
+//! Projection over original Comfy E4M3FN, E5M2 or MXFP8 bytes. Scalar sources
+//! select floating or scaled FP8 activations. MXFP8 uses one E8M0 scale per 32 input channels.
 use crate::{Error, Result};
 use gen_core::comfy_quant::{validate_mxfp8_geometry, ComfyQuantFormat};
 use mlx_rs::{fast::MetalKernel, ops::indexing::IndexOp, Array, Dtype};
@@ -41,7 +41,10 @@ for (uint block = 0; block < (uint(K) + 31u)/32u; ++block) {
         float value = 0.0f;
         if (wr < uint(N) && k < uint(K)) {
             value = sc_decode_fp8(w[wr*uint(STRIDE)+k], E5);
-            if (MX) {
+            if (WEIGHT_ONLY) {
+                // Match a dense decode followed by a cast to the compute dtype before GEMM.
+                value = float(T(value * float(sw[0])));
+            } else if (MX) {
                 uint sr = wr + uint(SCALE_ROW);
                 uint atom = (sr/128u)*uint(SCALE_TILES) + block/4u;
                 uint index = atom*512u + (sr%32u)*16u + (sr%128u)/32u*4u + block%4u;
@@ -65,7 +68,7 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint i=tid; i < 256u; i+=128u) {
     uint row=row0+i/16u, col=col0+i%16u;
     if (row < uint(M) && col < uint(N)) {
-        float value = MX ? tile[i] : (tile[i]*float(sx[ROW ? row : 0]))*float(sw[ROW ? col : 0]);
+        float value = MX || WEIGHT_ONLY ? tile[i] : (tile[i]*float(sx[ROW ? row : 0]))*float(sw[ROW ? col : 0]);
         y[row*uint(N)+col] = T(value);
     }
 }
@@ -81,6 +84,7 @@ pub struct Fp8Linear {
     codes: Array,
     scales: Array,
     input_scale: Array,
+    weight_only: bool,
     bias: Option<Array>,
     shape: [i32; 2],
     scale_row: i32,
@@ -96,6 +100,29 @@ impl Fp8Linear {
         logical: &[usize],
         bias: Option<Array>,
     ) -> Result<Self> {
+        Self::from_source(format, codes, scale, input_scale, logical, bias, false)
+    }
+
+    /// Bind a source projection and honor its full-precision matrix multiply declaration. Scalar
+    /// FP8 keeps the original codes and scales and casts only the decoded weight tile to the
+    /// activation dtype. Any recorded input scale remains available for source accounting.
+    pub fn from_source(
+        format: ComfyQuantFormat,
+        codes: Array,
+        scale: Option<Array>,
+        input_scale: Option<Array>,
+        logical: &[usize],
+        bias: Option<Array>,
+        full_precision_matrix_mult: bool,
+    ) -> Result<Self> {
+        if full_precision_matrix_mult
+            && !matches!(
+                format,
+                ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Float8E5M2
+            )
+        {
+            return Err("weight-only FP8 projection requires scalar E4M3FN or E5M2".into());
+        }
         if codes.dtype() != Dtype::Uint8
             || codes.ndim() != 2
             || logical.len() != 2
@@ -151,6 +178,7 @@ impl Fp8Linear {
             codes,
             scales,
             input_scale: sx,
+            weight_only: full_precision_matrix_mult,
             bias: None,
             shape: [logical[0] as i32, logical[1] as i32],
             scale_row: 0,
@@ -175,6 +203,9 @@ impl Fp8Linear {
     }
     pub fn input_scale(&self) -> &Array {
         &self.input_scale
+    }
+    pub fn full_precision_matrix_mult(&self) -> bool {
+        self.weight_only
     }
     pub fn codes(&self) -> &Array {
         &self.codes
@@ -298,7 +329,7 @@ impl Fp8Linear {
                         false,
                     )?,
                     MetalKernel::with_options(
-                        "sc_fp8_project_v1",
+                        "sc_fp8_project_v2",
                         &["q", "w", "sw", "sx"],
                         &["y"],
                         PROJECT,
@@ -309,28 +340,32 @@ impl Fp8Linear {
                 ));
             }
             let (quant, project) = cache.as_ref().expect("initialized above");
-            let activation_dtype = if mx != 0 {
-                Dtype::Float32
+            let q = if self.weight_only {
+                input
             } else {
-                Dtype::Float16
+                let activation_dtype = if mx != 0 {
+                    Dtype::Float32
+                } else {
+                    Dtype::Float16
+                };
+                quant
+                    .apply()
+                    .inputs([&input, &sx])
+                    .output_shape([m, k], activation_dtype)
+                    .template_arg("T", activation_dtype)
+                    .template_arg("K", k)
+                    .template_arg("ROW", i32::from(rowwise))
+                    .template_arg("MX", mx)
+                    .template_arg("E5", e5)
+                    .grid(
+                        xb.checked_mul(32).ok_or("FP8 activation grid overflow")?,
+                        m,
+                        1,
+                    )
+                    .thread_group(32, 1, 1)
+                    .run()?
+                    .remove(0)
             };
-            let q = quant
-                .apply()
-                .inputs([&input, &sx])
-                .output_shape([m, k], activation_dtype)
-                .template_arg("T", activation_dtype)
-                .template_arg("K", k)
-                .template_arg("ROW", i32::from(rowwise))
-                .template_arg("MX", mx)
-                .template_arg("E5", e5)
-                .grid(
-                    xb.checked_mul(32).ok_or("FP8 activation grid overflow")?,
-                    m,
-                    1,
-                )
-                .thread_group(32, 1, 1)
-                .run()?
-                .remove(0);
             let tiles = if mx != 0 {
                 self.scales.shape()[1] / 4
             } else {
@@ -350,6 +385,7 @@ impl Fp8Linear {
                 .template_arg("ROW", i32::from(rowwise))
                 .template_arg("MX", mx)
                 .template_arg("E5", e5)
+                .template_arg("WEIGHT_ONLY", i32::from(self.weight_only))
                 .grid(ng, mg, 1)
                 .thread_group(128, 1, 1)
                 .run()?
