@@ -277,8 +277,13 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertEqual(job['runs-on'], ['self-hosted', 'windows', 'cuda'])
         self.assertEqual(job['timeout-minutes'], 5)
         self.assertEqual(job['env'], {'CUDA_VISIBLE_DEVICES': '-1'})
-        self.assertEqual(len(job['steps']), 5)
-        checkout, capture, interpreter, pdh, upload = job['steps']
+        self.assertEqual(len(job['steps']), 6)
+        # The owned-process exit regression runs on the reviewed interpreter before the GPU census.
+        checkout, interpreter, exit_race, capture, pdh, upload = job['steps']
+        self.assertEqual(exit_race['shell'], 'cmd')
+        self.assertEqual(exit_race['timeout-minutes'], 1)
+        self.assertEqual(exit_race['run'],
+                         '"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_wddm_process_memory.WindowsDedicatedMemoryTests -v')
         self.assertRegex(checkout['uses'], r'^actions/checkout@[0-9a-f]{40}$')
         self.assertEqual(capture['shell'], 'powershell')
         self.assertIn('.\\scripts\\ci\\windows-gpu1-diagnostic.ps1 -OutputDirectory $out', capture['run'])
