@@ -1,0 +1,216 @@
+"""Weights-free comparison protocol checks."""
+
+import hashlib
+import json
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from scripts.ci import sga_adapter_comparison as compare
+from scripts.ci import ltx_adapter_tier1_fixture as ltx
+from scripts.ci import wan_adapter_tier1_fixture as wan
+
+
+REQUEST = {"selection": "sga-adapter-tier1", "profile": wan.PROFILE,
+           "runner": "nax", "download_missing": True}
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_windows_comparison_uses_its_own_registered_dev_host_directory(self):
+        with tempfile.TemporaryDirectory() as stage:
+            dev_host = Path(stage).resolve()
+            work = dev_host / "t" / "ab123456"
+            work.mkdir(parents=True)
+            env = {"RUNNER_TEMP": str(dev_host / "artifacts"), "DEV_HOST_ROOT": str(dev_host),
+                   "DEV_HOST_JOB_ROOT": str(work), "GITHUB_REPOSITORY": "SceneWorks/inference",
+                   "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "explicit",
+                   "RUNNER_NAME": "cuda-windows"}
+            owner = {"repository": "SceneWorks/inference", "run": "123", "attempt": "1",
+                     "job": "explicit", "runner": "cuda-windows"}
+            (work / ".actions-owner.json").write_text(json.dumps(owner), encoding="utf-8")
+            self.assertEqual(compare.attempt_work_root(env, "candle-cuda"), work)
+            self.assertEqual(compare.attempt_work_root(env, "mlx"), dev_host / "artifacts")
+            with self.assertRaisesRegex(ValueError, "owned by a different Actions job"):
+                compare.attempt_work_root(dict(env, GITHUB_RUN_ATTEMPT="2"), "candle-cuda")
+            with self.assertRaisesRegex(ValueError, "requires the registered dev-host"):
+                compare.attempt_work_root(dict(env, DEV_HOST_JOB_ROOT=stage), "candle-cuda")
+
+    def test_only_source_owned_profile_and_secondary_runner(self):
+        self.assertIs(compare.request_value("mlx", REQUEST), wan)
+        for backend, supplied in (
+            ("candle-cuda", REQUEST), ("mlx", dict(REQUEST, profile="../wanted.py")),
+            ("mlx", dict(REQUEST, profile=[])), ("mlx", dict(REQUEST, runner="nax-primary")),
+            ("mlx", dict(REQUEST, download_missing=1)), ("mlx", dict(REQUEST, policy={})),
+            ("mlx", dict(REQUEST, download_missing=False)),
+        ):
+            with self.subTest(supplied=supplied), self.assertRaises(ValueError):
+                compare.request_value(backend, supplied)
+
+    def test_attempt_path_identity_is_numeric(self):
+        self.assertEqual(compare.attempt_identity({"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "3"}),
+                         {"run_id": "17", "run_attempt": "3"})
+        with self.assertRaises(ValueError):
+            compare.attempt_identity({"GITHUB_RUN_ID": "../17", "GITHUB_RUN_ATTEMPT": "3"})
+        with self.assertRaises(ValueError):
+            json.loads('{"profile":"a","profile":"b"}', object_pairs_hook=wan.unique_object)
+
+    def test_run_must_complete_within_unified_memory_guard(self):
+        result = {"pid": 17, "returncode": 0, "elapsed_seconds": 1, "peak_host_bytes": 1024,
+                  "peak_gpu_bytes": None}
+        compare.validate_guard(result)
+        for changes in ({"returncode": 1}, {"elapsed_seconds": float("nan")}, {"elapsed_seconds": 301},
+                        {"peak_host_bytes": 17 * compare.GIB}, {"peak_gpu_bytes": 1024}):
+            with self.assertRaises(ValueError):
+                compare.validate_guard(dict(result, **changes))
+
+    def test_evidence_must_distinguish_bare_and_both_experts(self):
+        marker = "SGA_ADAPTER_TIER1_BODY " + wan.PROFILE
+        row = {"device": {"kind": "mlx-metal", "index": 0}, "shape": wan.SHAPE, "order": wan.ORDER,
+               "applied": {"high": [1, 1, 1], "low": [1, 1, 1]},
+               "velocity_bits": {key: [index] * 768 for index, key in enumerate(("bare", "low", "high"))}}
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.json"
+            result.write_text(json.dumps(row), encoding="utf-8")
+            self.assertEqual(wan.observe(f"setup\n{marker}\n", result), row)
+            for log, data in (
+                (marker + "\n" + marker, row), (marker, dict(row, device="mlx-cpu")),
+                (marker, dict(row, order={"high": [0, 1, 3], "low": [1, 2, 3]})),
+                (marker, dict(row, velocity_bits=dict(row["velocity_bits"], low=[1] * 767))),
+                (marker, dict(row, velocity_bits=dict(row["velocity_bits"], low=[0x7F800000] * 768))),
+                (marker, dict(row, velocity_bits=dict(row["velocity_bits"], low=[0] * 768))),
+            ):
+                result.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    wan.observe(log, result)
+
+
+class HeaderTests(unittest.TestCase):
+    def test_only_https_hub_origins_allow_header_redirects(self):
+        wan.validate_hub_url("https://cas-bridge.xethub.hf.co/file")
+        for url in ("http://huggingface.co/file", "https://huggingface.co.invalid/file",
+                    "https://user@huggingface.co/file", "https://huggingface.co:8000/file"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                wan.validate_hub_url(url)
+
+    def test_header_request_checks_length_digest_and_agreement(self):
+        good = b"header"
+        digest = hashlib.sha256(good).hexdigest()
+        pin = {file: digest for file in wan.HEADERS}
+        with patch.object(wan, "HEADERS", pin), patch.object(wan, "retained_geometry", return_value={"w": [4, 4]}):
+            def transport(url, start, end):
+                self.assertTrue(url.startswith("https://huggingface.co/SceneWorks/"))
+                self.assertIn(wan.REVISION, url)
+                if start == 0:
+                    self.assertEqual(end, 7)
+                    return struct.pack("<Q", len(good))
+                self.assertEqual((start, end), (8, 7 + len(good)))
+                return good
+
+            self.assertEqual(wan.fetch_geometry(transport), {"w": [4, 4]})
+            with self.assertRaisesRegex(ValueError, "bounded"):
+                wan.fetch_geometry(lambda *_: struct.pack("<Q", wan.MAX_HEADER_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "snapshot pin"):
+                wan.fetch_geometry(lambda _, start, end: transport(_, start, end) if start == 0 else b"wrong!")
+            with patch.object(wan, "retained_geometry", side_effect=[{"w": [4, 4]}, {"w": [8, 4]}]):
+                with self.assertRaisesRegex(ValueError, "disagree"):
+                    wan.fetch_geometry(transport)
+
+    def test_unbounded_or_wrong_range_does_not_read_remote_body(self):
+        url = "https://huggingface.co/asset"
+        with patch.object(wan, "build_opener") as build:
+            response = MagicMock()
+            build.return_value.open.return_value.__enter__.return_value = response
+            for status, headers in ((200, {}), (206, {"Content-Range": "bytes 1-8/100"}),
+                                    (206, {"Content-Range": "bytes 0-7/7"})):
+                response.status, response.headers = status, headers
+                with self.assertRaisesRegex(ValueError, "exact bounded"):
+                    wan.fetch_range(url, 0, 7)
+            response.read.assert_not_called()
+            response.headers = {"Content-Range": "bytes 0-7/100"}
+            response.read.return_value = b"12345678"
+            self.assertEqual(wan.fetch_range(url, 0, 7), b"12345678")
+            response.read.assert_called_once_with(9)
+
+    def test_staging_cannot_overwrite_an_existing_file_or_accept_a_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            item = root / "transformer.safetensors"
+            item.write_bytes(b"existing")
+            with self.assertRaises(FileExistsError):
+                wan.fixture.write_component(item, {"w": [2, 2]})
+            self.assertEqual(item.read_bytes(), b"existing")
+            for other in sorted(wan.FIXTURE_FILES - {item.name}):
+                (root / other).symlink_to(item)
+            with self.assertRaises(ValueError):
+                wan.identify(root)
+
+
+class LtxTests(unittest.TestCase):
+    CUDA = {"selection": "sga-adapter-tier1", "profile": ltx.PROFILE, "download_missing": True,
+            "cuda_device_uuid": "GPU-a123bcde-4321-abcd-abcd-0123456789ab"}
+
+    def test_both_accelerator_lanes_have_explicit_device_authority(self):
+        self.assertIs(compare.request_value("mlx", dict(REQUEST, profile=ltx.PROFILE)), ltx)
+        self.assertIs(compare.request_value("candle-cuda", self.CUDA), ltx)
+        policy = compare.policy_value("candle-cuda", self.CUDA)
+        self.assertEqual((policy["cudaDeviceUuid"], policy["childGpuCapBytes"]),
+                         (self.CUDA["cuda_device_uuid"], 12 * compare.GIB))
+        for invalid in ("0", "../../gpu", None):
+            with self.assertRaises(ValueError):
+                compare.request_value("candle-cuda", dict(self.CUDA, cuda_device_uuid=invalid))
+
+    def test_candle_cuda_pool_is_owned_and_bound_to_device(self):
+        policy = compare.policy_value("candle-cuda", self.CUDA)
+        guard = {"pid": 17, "returncode": 0, "elapsed_seconds": 6, "peak_host_bytes": 20, "peak_gpu_bytes": 8}
+        compare.validate_guard(guard, policy)
+        with self.assertRaises(ValueError):
+            compare.validate_guard(dict(guard, peak_gpu_bytes=None), policy)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.json"
+            pool = {"pid": 17, "cudaDeviceUuid": policy["cudaDeviceUuid"], "poolUsedBytes": 1,
+                    "poolUsedHighBytes": 2, "poolReservedBytes": 3, "poolReservedHighBytes": 5}
+            path.write_text(json.dumps(pool), encoding="utf-8")
+            compare.validate_cuda_pool(path, guard, policy)
+            for changes in ({"pid": 28}, {"cudaDeviceUuid": "wrong"}, {"poolUsedBytes": 0}, {"poolUsedHighBytes": 7}):
+                path.write_text(json.dumps(dict(pool, **changes)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    compare.validate_cuda_pool(path, guard, policy)
+
+    def test_overlay_only_exposes_the_exact_private_forward(self):
+        signature = b"    pub(crate) fn forward_controlled_with_scales(\n"
+        profile = ltx.overlay(lambda _: signature, "head", "mlx", "probe")
+        path = "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/av_dit.rs"
+        self.assertEqual(profile[path], b"    pub fn forward_controlled_with_scales(\n")
+        self.assertEqual(set(profile), {path, "crates/media/mlx-gen/mlx-gen-ltx/src/bin/probe.rs"})
+        with self.assertRaises(ValueError):
+            ltx.overlay(lambda _: signature + signature, "head", "mlx", "probe")
+
+    def test_both_streams_change_only_for_the_later_pass(self):
+        trace = {name: [0] * count for name, count in (("video", 256), ("audio", 384))}
+        later = {name: [1] * len(bits) for name, bits in trace.items()}
+        row = {"device": {"kind": "mlx-metal", "index": 0}, "applied": 6, "shapes": ltx.SHAPES,
+               "passes": [0, 1, 0], "velocity_bits": {"bare": trace, "base": trace, "refine": later, "reused": trace}}
+        out = "SGA_ADAPTER_TIER1_BODY " + ltx.PROFILE
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(json.dumps(row), encoding="utf-8")
+            self.assertEqual(ltx.observe(out, path, "mlx"), row)
+            for stage, wrong in (("refine", dict(later, audio=trace["audio"])), ("reused", later), ("base", later)):
+                velocities = dict(row["velocity_bits"], **{stage: wrong})
+                path.write_text(json.dumps(dict(row, velocity_bits=velocities)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    ltx.observe(out, path, "mlx")
+            candle = dict(row, device={"kind": "candle-cuda", "index": 0})
+            path.write_text(json.dumps(candle), encoding="utf-8")
+            marker = f"SGA_LTX_CONSTRUCTOR_OK {ltx.CANDLE_TENSOR_COUNT} {ltx.CANDLE_HEADER_SHA256}\n"
+            self.assertEqual(ltx.observe(marker + out, path, "candle-cuda"), candle)
+            wrong_pin = f"SGA_LTX_CONSTRUCTOR_OK {ltx.CANDLE_TENSOR_COUNT} {'0' * 64}\n"
+            for evidence in (out, marker + marker + out, wrong_pin + out):
+                with self.assertRaisesRegex(ValueError, "constructor metadata check"):
+                    ltx.observe(evidence, path, "candle-cuda")
+
+
+if __name__ == "__main__":
+    unittest.main()

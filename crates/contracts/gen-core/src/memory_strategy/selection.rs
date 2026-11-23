@@ -21,7 +21,7 @@ pub struct MemorySelection {
 }
 
 /// Request geometry used by evidence and cache identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MemoryGeometry {
     pub width: u32,
     pub height: u32,

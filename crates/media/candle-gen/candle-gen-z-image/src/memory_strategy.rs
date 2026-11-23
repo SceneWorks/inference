@@ -283,9 +283,8 @@ fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PackedResidency {
     /// Repacked **once** into a GGML `Q4_1`/`Q8_0` [`candle_gen::candle_core::quantized::QTensor`]
-    /// — the transformer (`PackedDit`, whether resident or block-streamed from the device-format
-    /// cache) and the text encoder (`PackedTe`). The source triple is a transient host input and
-    /// the cache sidecar is a file-backed copy of the same bytes, so neither is priced beside it.
+    /// for both the shared DiT and the packed Z-Image text encoder. The source triple is a
+    /// transient host input. The cache sidecar holds a file-backed copy of the same bytes.
     Qtensor,
     /// Dequantized to a **dense** float matrix at `float_width` — the VAE's eight mid-block
     /// attention projections (`Pipeline::vae_vb_dequantized_on`), which the stock `AutoEncoderKL`
@@ -498,7 +497,7 @@ fn snapshot_component_group_size(root: &std::path::Path, sub: &str) -> gen_core:
 /// Bytes the transformer occupies once loaded from `root/transformer/`: a dense tier at the
 /// pipeline dtype; a packed tier as one GGML `Q4_1`/`Q8_0` QTensor per projection plus its dense
 /// residual (norms, embeddings, modulation) at the pipeline dtype. This is what both the resident
-/// `PackedDit::new` build and the block-streamed build hold on the device — the streamed build
+/// `DiT::new_inference` build and the block-streamed build hold on the device. The streamed build
 /// copies the same GGML bytes out of the device-format cache instead of repacking, so the cache is
 /// **not** a second copy to price. Before this, the on-disk sum recursed into that cache and priced
 /// the q4 transformer at 7.31 GB against a 3.47 GB checkpoint (SC-22667).

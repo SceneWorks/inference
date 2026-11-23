@@ -49,6 +49,7 @@ use mlx_gen::adapters::loader::{
 };
 use mlx_gen::adapters::{build_lokr_factors, read_scalar_alpha, AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::runtime::{select_expert_adapters, ExpertAdapterOrder};
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterApplyReport, AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;

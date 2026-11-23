@@ -175,6 +175,7 @@ impl TrainAttention {
             &self.to_k,
             &self.to_v,
             self.gate.lora(),
+            None,
         )?;
         candle_gen::train::profile::cohort_reuse(if self.packs.active() {
             "ltx23:actual-dense-pack"

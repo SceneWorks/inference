@@ -2,10 +2,22 @@
 from pathlib import Path
 import subprocess
 
+from scripts.ci.flux1_pair.fixture import ENG4B, ENG4B_REAL, ENG4B_TIERS
+
 HERE = Path(__file__).resolve().parent
 MLX = "crates/media/mlx-gen/"
 CANDLE = "crates/media/candle-gen/"
 BASE = "2b09938e33370915d4f853389961709b8bbf8bf9"
+ENG4B_BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
+ENG4B_BASE_TREE = "88e1369f11fbc1be2d2fb9b0063db8725463db92"
+ENG4B_TERMINAL_BASE = "be45bdf746c5d4a12d4db76f9653b8686e7f33f8"
+ENG4B_TERMINAL_BASE_TREE = "4d6eb59e08edcd257fd907247acd5e8f0cc5c545"
+
+
+def eng4b_baseline(tier):
+    if tier == ENG4B_REAL:
+        return ENG4B_TERMINAL_BASE, ENG4B_TERMINAL_BASE_TREE
+    return ENG4B_BASE, ENG4B_BASE_TREE
 
 
 def replace_once(root, path, old, new):
@@ -19,9 +31,20 @@ def replace_once(root, path, old, new):
 def install(root, backend, arm, tier):
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip():
         raise ValueError("overlay requires a fresh clean proof checkout")
+    eng4b = tier in ENG4B_TIERS
+    measured = tier == ENG4B_REAL
+    if eng4b:
+        if backend != "candle-cuda" or arm not in ("base", "head"):
+            raise ValueError("ENG-4b overlay requires the Candle CUDA comparison arms")
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True,
+                                       encoding="utf-8").strip()
+        baseline, _ = eng4b_baseline(tier)
+        if (head == baseline) != (arm == "base"):
+            raise ValueError("ENG-4b overlay received the wrong source revision for its arm")
     mlx = backend == "mlx"
+    planned = arm == "head" or eng4b
     family = MLX + "mlx-gen-flux" if mlx else CANDLE + "candle-gen-flux"
-    if tier == "tier1":
+    if tier in ("tier1", ENG4B):
         if mlx:
             path = family + "/src/transformer.rs"
             replace_once(root, path, "num_layers: 19,\n            num_single_layers: 38,",
@@ -30,7 +53,17 @@ def install(root, backend, arm, tier):
             replace_once(root, path, "for i in 0..12 {", "for i in 0..1 {")
             replace_once(root, path, "pub const T5_BLOCKS: usize = 24;", "pub const T5_BLOCKS: usize = 1;")
         else:
-            path = family + "/src/packed_te.rs"
+            text_encoder_sources = [
+                path for path in (
+                    family + "/src/packed_te.rs",
+                    CANDLE + "candle-gen/src/text_encoder.rs",
+                ) if (root / path).is_file()
+            ]
+            if len(text_encoder_sources) != 1:
+                raise ValueError("proof overlay requires exactly one Candle FLUX text encoder source")
+            path = text_encoder_sources[0]
+            if eng4b and (path.endswith("/packed_te.rs") != (arm == "base")):
+                raise ValueError("ENG-4b overlay did not bind the expected text encoder for its arm")
             replace_once(root, path, "num_hidden_layers: 12,", "num_hidden_layers: 1,")
             replace_once(root, path, "num_layers: 24,", "num_layers: 1,")
     path = (MLX if mlx else CANDLE + "candle-gen/") + "src/sampler.rs"
@@ -57,7 +90,7 @@ def install(root, backend, arm, tier):
 }
 """
     else:
-        if arm == "head":
+        if planned:
             start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n                if cancel.is_cancelled()"
             replace_once(root, path, start, start.replace("                if cancel.", "                pair_observe(x, sigma);\n                if cancel."))
             end = '''    if state.next_step() != sigmas.len().saturating_sub(1) {
@@ -96,12 +129,49 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     println!("FLUX1_PAIR_STATE {id:08x} {dtype} {device}");
 }
 """
+    if measured:
+        # No readbacks, hashes or output writes inside the measured sampler.
+        start = 'fn pair_observe(x: &Tensor, sigma: f32) {\n'
+        helper = helper.replace(start, start + """    static MEASURE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::args().nth(1).as_deref() == Some("--measure"));
+    if *MEASURE {
+        pair_measure_step(x, sigma);
+        return;
+    }
+""", 1)
+        helper += """thread_local! {
+    static PAIR_STEP_CLOCK: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static PAIR_STEP_SAMPLE: std::cell::Cell<Option<PairStepSample>> = const { std::cell::Cell::new(None) };
+}
+
+type PairStepSample = (std::time::Instant, std::time::Instant, candle_core::DType);
+
+fn pair_measure_step(x: &Tensor, sigma: f32) {
+    if sigma == 1.0 {
+        assert!(x.device().is_cuda());
+        assert_eq!(x.dims(), &[1, 256, 64]);
+        x.device().synchronize().unwrap();
+        PAIR_STEP_CLOCK.with(|clock| assert!(clock.replace(Some(std::time::Instant::now())).is_none()));
+    } else if sigma == 0.0 {
+        assert!(x.device().is_cuda());
+        x.device().synchronize().unwrap();
+        let ended = std::time::Instant::now();
+        let started = PAIR_STEP_CLOCK.with(|clock| clock.take().expect("started step clock"));
+        PAIR_STEP_SAMPLE.with(|sample| assert!(sample.replace(Some((started, ended, x.dtype()))).is_none()));
+    }
+}
+
+#[doc(hidden)]
+pub fn pair_take_step_sample() -> Option<PairStepSample> {
+    PAIR_STEP_SAMPLE.with(|sample| sample.take())
+}
+"""
     with (root / path).open("a", encoding="utf-8") as handle:
         handle.write("\n" + helper)
     engine = "mlx_gen" if mlx else "candle_gen"
     generate = """let generator = registry.load(&model, &spec)?;
     let output = generator.generate(&request, &mut progress)?;"""
-    if arm == "head":
+    if planned:
         generate = """let plan = registry.compile_render_plan(&model, &spec, &request)?.ok_or("unregistered plan")?;
     fs::write(dir.join("plan.json"), serde_json::to_vec(&plan)?)?;
     if std::env::args().nth(1).as_deref() == Some("--preflight") {
@@ -111,6 +181,40 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     let generator = registry.load(&model, &spec)?;
     let report = generator.generate_planned(&request, &plan, None, &mut progress)?;
     let output = report.output.ok_or("missing planned output")?;"""
+    if measured:
+        generate = generate.replace(
+            "    let report = generator.generate_planned(&request, &plan, None, &mut progress)?;",
+            """    let measure = std::env::args().nth(1).as_deref() == Some("--measure");
+    let warmed = if measure {
+        let mut warm_steps = Vec::new();
+        let warm = generator.generate_planned(&request, &plan, None, &mut |event| {
+            if let Progress::Step { current, total } = event {
+                warm_steps.push([current, total]);
+            }
+        })?;
+        if warm_steps != [[1, 3], [2, 3], [3, 3]] {
+            return Err("warmup did not complete three Euler steps".into());
+        }
+        let Some(GenerationOutput::Images(mut images)) = warm.output else {
+            return Err("warmup did not generate images".into());
+        };
+        if images.len() != 1 || (images[0].width, images[0].height) != (256, 256) {
+            return Err("wrong warmup render count or geometry".into());
+        }
+        emit_step_sample()?;
+        Some(images.remove(0).pixels)
+    } else {
+        None
+    };
+    let mut decode_started = None;
+    let started = std::time::Instant::now();
+    let report = generator.generate_planned(&request, &plan, None, &mut |event| {
+        if measure && matches!(&event, Progress::Decoding) {
+            assert!(decode_started.replace(std::time::Instant::now()).is_none());
+        }
+        progress(event);
+    })?;
+    let ended = std::time::Instant::now();""", 1)
     template = (HERE / "probe.rs.in").read_text(encoding="utf-8")
     cuda_proof = ""
     if not mlx:
@@ -141,6 +245,34 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     drop(generator);"""
     spec = "let spec = spec.with_quant(mlx_gen::gen_core::Quant::Q4);" if mlx and tier == "tier2" else ""
     body = template.replace("@ENGINE@", engine).replace("@PROVIDER@", engine + "_flux")
+    if eng4b:
+        # Permit compile-time and native plan-only validation without a CUDA
+        # toolchain. Rendering still refuses a non-CUDA build before any model load.
+        body = body.replace("    let model =", """    if !cfg!(feature = "cuda") && std::env::args().nth(1).as_deref() != Some("--preflight") {
+        return Err("FLUX.1 ENG-4b proof requires CUDA".into());
+    }
+    let model =""", 1)
+        cuda_proof = '#[cfg(feature = "cuda")] {\n' + cuda_proof + '\n}'
+    if measured:
+        body = body.replace("    @TIER_SPEC@\n", "", 1)
+        body = body.replace('    fs::write(dir.join("output.rgb")', '''    if let Some(warmed) = warmed {
+        if warmed != images[0].pixels {
+            return Err("resident warmup changed the seeded RGB8 result".into());
+        }
+        let (denoise_started, denoise_ended) = emit_step_sample()?;
+        let decode_started = decode_started.ok_or("missing measured decode phase")?;
+        if !(started <= denoise_started && denoise_ended <= decode_started && decode_started <= ended) {
+            return Err("invalid measured phase order".into());
+        }
+        let host_peak = peak_working_set()?;
+        println!("FLUX1_PAIR_PHASES {} {} {}",
+            (denoise_started - started).as_nanos(),
+            (decode_started - denoise_ended).as_nanos(),
+            (ended - decode_started).as_nanos());
+        println!("FLUX1_PAIR_TIMING {} {host_peak}", (ended - started).as_nanos());
+    }
+    fs::write(dir.join("output.rgb")''', 1)
+        body += (HERE / "performance.rs.in").read_text(encoding="utf-8")
     destination = root / family / "src/bin/flux1-pair.rs"
     destination.parent.mkdir(exist_ok=True)
     with destination.open("x", encoding="utf-8") as out:

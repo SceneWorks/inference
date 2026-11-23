@@ -128,6 +128,7 @@ impl Attention {
         mask: Option<&Array>,
         pe: Option<(&Array, &Array)>,
         k_pe: Option<(&Array, &Array)>,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<Array> {
         let ctx = context.unwrap_or(x);
 
@@ -146,11 +147,8 @@ impl Attention {
         // GPT-NeoX rotate-halves form over a **half**-width `[B, H, T, dim_head/2]` table through
         // the shared `nn::rope_rotate`, computed in f32 and cast back.
         //
-        // **Adapters.** LTX carries its LoRA on its OWN stack rather than the shared
-        // `AdaptableLinear` seam, so it is deliberately NOT routed through
-        // `qkv::FusedQkvProjection`: `to_q`/`to_k`/`to_v` stay three separate `forward` calls and
-        // every installed residual is applied exactly where it was before. The prologue below reads
-        // the three projection OUTPUTS, so it cannot observe — let alone drop — an adapter.
+        // Q, K and V remain separate adapter-aware projections. The shared attention prologue
+        // receives their results, so it never bypasses an adapter active only in a later pass.
         let spec = AttnPrepSpec::new(self.heads, self.dim_head)
             .with_qk_norm(QkNormSpec::full_dim_pre_split(
                 &self.q_norm,
@@ -176,9 +174,9 @@ impl Attention {
             .with_rotation_axes(RotationAxes::HeadMajor);
         let heads = qkv::prepare(
             QkvSource::Separate {
-                q: &self.to_q.forward(x)?,
-                k: &self.to_k.forward(ctx)?,
-                v: &self.to_v.forward(ctx)?,
+                q: &self.to_q.forward_with_scales(x, adapter_scales)?,
+                k: &self.to_k.forward_with_scales(ctx, adapter_scales)?,
+                v: &self.to_v.forward_with_scales(ctx, adapter_scales)?,
             },
             &spec,
         )?;
@@ -234,13 +232,13 @@ impl Attention {
 
         if let Some(gate) = &self.gate {
             // Per-head gate: 2·sigmoid(logits) (zero-init → identity), broadcast over head_dim.
-            let logits = gate.forward(x)?;
+            let logits = gate.forward_with_scales(x, adapter_scales)?;
             let gates = multiply(&sigmoid(&logits)?, scalar(2.0).as_dtype(logits.dtype())?)?;
             let gates = gates.reshape(&[b, s, self.heads, 1])?;
             out = multiply(&out.reshape(&[b, s, self.heads, self.dim_head])?, &gates)?
                 .reshape(&[b, s, inner])?;
         }
-        self.to_out.forward(&out)
+        self.to_out.forward_with_scales(&out, adapter_scales)
     }
 
     /// LoRA key→module map (diffusers/peft naming, post LTX normalization). `to_out.0`→`to_out`
@@ -294,8 +292,19 @@ impl FeedForward {
         self.proj_out.cast_weights(dtype)
     }
 
+    #[cfg(test)]
     pub(super) fn forward(&self, x: &Array) -> Result<Array> {
-        self.proj_out.forward(&gelu_ffn(&self.proj_in.forward(x)?)?)
+        self.forward_with_scales(x, None)
+    }
+
+    pub(super) fn forward_with_scales(
+        &self,
+        x: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
+        let hidden = self.proj_in.forward_with_scales(x, adapter_scales)?;
+        self.proj_out
+            .forward_with_scales(&gelu_ffn(&hidden)?, adapter_scales)
     }
 
     /// LoRA targets: `ff.net.0.proj`→`ff.proj_in`, `ff.net.2`→`ff.proj_out` (renamed by the loader).

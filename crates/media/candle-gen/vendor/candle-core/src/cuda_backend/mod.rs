@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub mod cudnn;
 mod device;
 mod error;
+mod im2col_launch;
 pub mod proof_pool;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
@@ -271,10 +272,11 @@ impl Map1 for Im2Col {
         let dims = shape.dims();
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
-        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let (launch_elements, kernel) = im2col_launch::plan(dst_el);
+        let cfg = LaunchConfig::for_num_elems(launch_elements);
         let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
-        let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
+        let func = dev.get_or_load_func(&kernel_name::<T>(kernel), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let dst = unsafe { dev.alloc::<T>(dst_el)? };
         let mut builder = func.builder();

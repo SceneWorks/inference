@@ -141,7 +141,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1197
+              "line": 1194
             }
           ],
           "creation": [
@@ -184,7 +184,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1197
+              "line": 1194
             }
           ],
           "creation": [
@@ -270,7 +270,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 607
+              "line": 605
             }
           ],
           "creation": [

@@ -264,6 +264,12 @@
         "reader-binding"
       ]
     },
+    "candle-gen-ltx::adapters::refinement::read_shipped/verified-weights": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
     "candle-gen-ltx::tier::TierPaths::packed_config/configuration": {
       "role": "configuration",
       "grades": [
@@ -401,6 +407,12 @@
       ]
     },
     "candle-gen::loader::mmap_var_builder": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::loader::remap_file_var_builder": {
       "role": "model-weights",
       "grades": [
         "reader-binding"

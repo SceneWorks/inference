@@ -9,19 +9,21 @@
 //! per-module scale. LyCORIS LoHa and full-rank diff patches are rejected explicitly because they
 //! have no truthful allocation-free representation on the packed host.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::{weightsmeta, AdapterKind, AdapterSpec};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::{weightsmeta, AdapterKind, AdapterSpec, CancelFlag};
 use candle_gen::quant::LokrFactors;
+use candle_gen::residency::check_cancel;
 use candle_gen::train::lora::{parse_lokr_metadata, LoraAdapterMeta};
 use candle_gen::train::merge::{
-    has_diff_patch_keys, parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, LoraTriple,
-    Role,
+    has_diff_patch_keys, parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, Role,
 };
 use candle_gen::{CandleError, Result};
 
 use crate::transformer::AvDiT;
+
+mod refinement;
 
 const PATH_PREFIXES: [&str; 6] = [
     "base_model.model.diffusion_model.",
@@ -81,6 +83,13 @@ enum AdapterFormat {
     Lora,
     Lokr,
     ThirdPartyLokr,
+}
+
+#[derive(Clone, Copy)]
+enum InstallPolicy<'a> {
+    Ltx23,
+    Ltx25,
+    Ltx25Dev(&'a CancelFlag),
 }
 
 fn classify_format(spec: &AdapterSpec, file: &AdapterFile) -> Result<AdapterFormat> {
@@ -208,18 +217,17 @@ fn effective_pass_scales(spec: &AdapterSpec) -> Result<Vec<f64>> {
     Ok(scales)
 }
 
-fn is_cond_safe(file: &AdapterFile) -> bool {
-    file.meta
-        .get(COND_SAFE_METADATA_KEY)
+fn is_cond_safe(meta: &HashMap<String, String>) -> bool {
+    meta.get(COND_SAFE_METADATA_KEY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn validate_cond_safe_completeness(
-    file: &AdapterFile,
+    meta: &HashMap<String, String>,
     lora_tensors: usize,
     targets: usize,
 ) -> Result<()> {
-    if is_cond_safe(file) && (lora_tensors != COND_SAFE_TENSORS || targets != COND_SAFE_TARGETS) {
+    if is_cond_safe(meta) && (lora_tensors != COND_SAFE_TENSORS || targets != COND_SAFE_TARGETS) {
         return Err(CandleError::Msg(format!(
             "ltx: cond_safe adapter declares {COND_SAFE_METADATA_KEY}=true but has {targets} LoRA \
              targets / {lora_tensors} LoRA tensors; expected the complete {COND_SAFE_TARGETS} targets \
@@ -238,9 +246,9 @@ struct Ltx25Scale {
     alpha: f32,
 }
 
-fn ltx25_scale(file: &AdapterFile, spec: &AdapterSpec) -> Result<Ltx25Scale> {
+fn ltx25_scale(meta: &HashMap<String, String>, spec: &AdapterSpec) -> Result<Ltx25Scale> {
     let required = |key: &str| -> Result<&str> {
-        file.meta.get(key).map(String::as_str).ok_or_else(|| {
+        meta.get(key).map(String::as_str).ok_or_else(|| {
             CandleError::Msg(format!(
                 "ltx_2_5 adapter {} is missing required `{key}` safetensors metadata",
                 spec.path.display()
@@ -287,127 +295,86 @@ fn ltx25_factor_rank(declared_rank: usize, in_features: usize, out_features: usi
     declared_rank.min(in_features).min(out_features)
 }
 
-/// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
-///
-/// A resolved module outside the exact training surface is an error, as is an incomplete or
-/// shape-mismatched pair. Thus a non-empty adapter can never silently render as the base model.
-pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
-    install_ltx_adapters_with_policy(dit, specs, false)
+fn prepare_lora_pair(
+    down: Tensor,
+    up: Tensor,
+    scale: f64,
+    device: &Device,
+    refinement_cancel: Option<&CancelFlag>,
+) -> Result<(Tensor, Tensor)> {
+    if let Some(cancel) = refinement_cancel {
+        check_cancel(cancel)?;
+    }
+    let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+    let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * scale)?;
+    // The authenticated Dev factors use the existing CPU conversion one pair at a time.
+    // Stage each pair on the destination to avoid a second full adapter copy on the host.
+    if let Some(cancel) = refinement_cancel {
+        check_cancel(cancel)?;
+        let a = a.to_device(device)?;
+        check_cancel(cancel)?;
+        return Ok((a, b.to_device(device)?));
+    }
+    Ok((a, b))
 }
 
-fn install_ltx_adapters_with_policy(
-    dit: &mut AvDiT,
-    specs: &[AdapterSpec],
-    strict_25: bool,
-) -> Result<AdditiveReport> {
-    let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
-    let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
-    let mut report = AdditiveReport::default();
+struct LoraFactors<F> {
+    down: Option<F>,
+    up: Option<F>,
+    alpha: Option<f32>,
+}
 
-    for (source, spec) in specs.iter().enumerate() {
-        ensure_no_diff_patch(spec)?;
-        let pass_scales = effective_pass_scales(spec)?;
-        let file = read_adapter(&spec.path)?;
-        let format = classify_format(spec, &file)?;
-        let strict_scale = if strict_25 {
-            if spec.kind != AdapterKind::Lora || format != AdapterFormat::Lora {
-                return Err(CandleError::Msg(format!(
-                    "ltx_2_5 adapter {} must be a LoRA file; LoKr/third-party LyCORIS are not supported by this route",
-                    spec.path.display()
-                )));
-            }
-            Some(ltx25_scale(&file, spec)?)
-        } else {
-            None
-        };
-        if format == AdapterFormat::Lokr {
-            let (rank, alpha) = parse_lokr_metadata(
-                file.meta.get("rank").map(String::as_str),
-                file.meta.get("alpha").map(String::as_str),
-            )?;
-            let factor_scale = alpha as f64 / rank as f64;
-            let mut groups: BTreeMap<String, LokrGroup> = BTreeMap::new();
-            for (key, tensor) in &file.tensors {
-                if let Some((path, factor)) = classify_lokr_key(key) {
-                    let group = groups.entry(path).or_default();
-                    match factor {
-                        "lokr_w1" => group.w1 = Some(tensor.clone()),
-                        "lokr_w1_a" => group.w1_a = Some(tensor.clone()),
-                        "lokr_w1_b" => group.w1_b = Some(tensor.clone()),
-                        "lokr_w2" => group.w2 = Some(tensor.clone()),
-                        "lokr_w2_a" => group.w2_a = Some(tensor.clone()),
-                        "lokr_w2_b" => group.w2_b = Some(tensor.clone()),
-                        _ => unreachable!(),
-                    }
-                } else {
-                    report.skipped_keys += 1;
-                }
-            }
-            for (path, factors) in groups {
-                pending_lokr.entry(path).or_default().push(PendingLokr {
-                    factors,
-                    factor_scale,
-                    pass_scales: pass_scales.clone(),
-                    source,
-                });
-            }
-            continue;
+impl<F> Default for LoraFactors<F> {
+    fn default() -> Self {
+        Self {
+            down: None,
+            up: None,
+            alpha: None,
         }
-        if format == AdapterFormat::ThirdPartyLokr {
-            for (raw_path, group) in parse_lokr_thirdparty(&file)? {
-                let path = normalize_ltx_adapter_path(&raw_path);
-                let lycoris_scale = if let Some(factor) = group.w1_a.as_ref() {
-                    let rank = factor.dims()[1] as f64;
-                    group.alpha.map_or(1.0, |alpha| alpha as f64 / rank)
-                } else if let Some(factor) = group.w2_a.as_ref() {
-                    let rank = factor.dims()[1] as f64;
-                    group.alpha.map_or(1.0, |alpha| alpha as f64 / rank)
-                } else {
-                    // When both Kronecker legs are full LyCORIS forces alpha=rank, hence scale one.
-                    1.0
-                };
-                pending_lokr.entry(path).or_default().push(PendingLokr {
-                    factors: LokrGroup {
-                        w1: group.w1,
-                        w1_a: group.w1_a,
-                        w1_b: group.w1_b,
-                        w2: group.w2,
-                        w2_a: group.w2_a,
-                        w2_b: group.w2_b,
-                    },
-                    factor_scale: lycoris_scale,
-                    pass_scales: pass_scales.clone(),
-                    source,
-                });
-            }
-            continue;
-        }
+    }
+}
 
-        let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+struct LoraPairStaging<'a> {
+    spec: &'a AdapterSpec,
+    strict_scale: Option<Ltx25Scale>,
+    device: &'a Device,
+    refinement_cancel: Option<&'a CancelFlag>,
+}
+
+impl LoraPairStaging<'_> {
+    fn stage<F>(
+        &self,
+        meta: &HashMap<String, String>,
+        factors: impl IntoIterator<Item = (String, F)>,
+        mut read_factor: impl FnMut(F) -> Result<Tensor>,
+        report: &mut AdditiveReport,
+    ) -> Result<Vec<(String, Tensor, Tensor)>> {
+        let mut triples: BTreeMap<String, LoraFactors<F>> = BTreeMap::new();
         let mut lora_tensors = 0;
-        for (key, tensor) in &file.tensors {
-            match classify_lora_key(key) {
+        for (key, factor) in factors {
+            match classify_lora_key(&key) {
                 Some((path, Role::Down)) => {
                     lora_tensors += 1;
-                    triples.entry(path).or_default().down = Some(tensor.clone())
+                    triples.entry(path).or_default().down = Some(factor)
                 }
                 Some((path, Role::Up)) => {
                     lora_tensors += 1;
-                    triples.entry(path).or_default().up = Some(tensor.clone())
+                    triples.entry(path).or_default().up = Some(factor)
                 }
                 Some((path, Role::Alpha)) => {
                     lora_tensors += 1;
                     triples.entry(path).or_default().alpha =
-                        Some(read_scalar(key, "alpha", tensor)?)
+                        Some(read_scalar(&key, "alpha", &read_factor(factor)?)?)
                 }
                 None => report.skipped_keys += 1,
             }
         }
-        validate_cond_safe_completeness(&file, lora_tensors, triples.len())?;
-        let metadata = LoraAdapterMeta::from_file_metadata(&file.meta);
+        validate_cond_safe_completeness(meta, lora_tensors, triples.len())?;
+        let metadata = LoraAdapterMeta::from_file_metadata(meta);
+        let mut staged = Vec::with_capacity(triples.len());
         for (path, triple) in triples {
             let (down, up) = match (triple.down, triple.up) {
-                (Some(down), Some(up)) => (down, up),
+                (Some(down), Some(up)) => (read_factor(down)?, read_factor(up)?),
                 _ => {
                     return Err(CandleError::Msg(format!(
                         "ltx: LoRA target `{path}` has an incomplete A/B factor pair"
@@ -430,13 +397,13 @@ fn install_ltx_adapters_with_policy(
             let (meta_alpha, meta_rank) = metadata
                 .as_ref()
                 .map_or((None, None), |meta| meta.effective(&path));
-            let (scale_rank, alpha) = match strict_scale {
+            let (scale_rank, alpha) = match self.strict_scale {
                 Some(scale) => {
                     let expected = ltx25_factor_rank(scale.rank, in_features, out_features);
                     if rank != expected {
                         return Err(CandleError::Msg(format!(
                             "ltx_2_5 adapter {} target `{path}` has factor rank {rank} but declares lora_rank {}; projection [{out_features}, {in_features}] requires factor rank {expected}",
-                            spec.path.display(),
+                            self.spec.path.display(),
                             scale.rank
                         )));
                     }
@@ -457,11 +424,152 @@ fn install_ltx_adapters_with_policy(
                     "ltx: LoRA target `{path}` has non-finite alpha"
                 )));
             }
-            let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
-            let b =
-                (up.to_dtype(DType::F32)?.t()?.contiguous()? * (alpha as f64 / scale_rank as f64))?;
+            let (a, b) = prepare_lora_pair(
+                down,
+                up,
+                alpha as f64 / scale_rank as f64,
+                self.device,
+                self.refinement_cancel,
+            )?;
             debug_assert_eq!(a.dims(), &[in_features, rank]);
             debug_assert_eq!(b.dims(), &[rank, out_features]);
+            staged.push((path, a, b));
+        }
+        Ok(staged)
+    }
+}
+
+/// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
+///
+/// A resolved module outside the exact training surface is an error, as is an incomplete or
+/// shape-mismatched pair. Thus a non-empty adapter can never silently render as the base model.
+pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx23)
+}
+
+fn install_ltx_adapters_with_policy(
+    dit: &mut AvDiT,
+    specs: &[AdapterSpec],
+    policy: InstallPolicy<'_>,
+) -> Result<AdditiveReport> {
+    let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
+    let mut report = AdditiveReport::default();
+    let mut used_refinement = false;
+    let device = dit.device().clone();
+
+    for (source, spec) in specs.iter().enumerate() {
+        let pass_scales = effective_pass_scales(spec)?;
+        let (refinement, refinement_cancel) = match policy {
+            InstallPolicy::Ltx25Dev(cancel) => (
+                refinement::read_shipped(spec, &mut used_refinement, cancel)?,
+                Some(cancel),
+            ),
+            _ => (None, None),
+        };
+        let pairs = if let Some(mut refinement) = refinement {
+            let (meta, factors) = refinement.take_layout();
+            let staging = LoraPairStaging {
+                spec,
+                strict_scale: Some(ltx25_scale(&meta, spec)?),
+                device: &device,
+                refinement_cancel,
+            };
+            let pairs = staging.stage(
+                &meta,
+                factors,
+                |factor| refinement.read_factor(factor),
+                &mut report,
+            )?;
+            refinement.finish()?;
+            pairs
+        } else {
+            ensure_no_diff_patch(spec)?;
+            let file = read_adapter(&spec.path)?;
+            let format = classify_format(spec, &file)?;
+            let strict_scale = if !matches!(policy, InstallPolicy::Ltx23) {
+                if spec.kind != AdapterKind::Lora || format != AdapterFormat::Lora {
+                    return Err(CandleError::Msg(format!(
+                        "ltx_2_5 adapter {} must be a LoRA file; LoKr/third-party LyCORIS are not supported by this route",
+                        spec.path.display()
+                    )));
+                }
+                Some(ltx25_scale(&file.meta, spec)?)
+            } else {
+                None
+            };
+            if format == AdapterFormat::Lokr {
+                let (rank, alpha) = parse_lokr_metadata(
+                    file.meta.get("rank").map(String::as_str),
+                    file.meta.get("alpha").map(String::as_str),
+                )?;
+                let factor_scale = alpha as f64 / rank as f64;
+                let mut groups: BTreeMap<String, LokrGroup> = BTreeMap::new();
+                for (key, tensor) in &file.tensors {
+                    if let Some((path, factor)) = classify_lokr_key(key) {
+                        let group = groups.entry(path).or_default();
+                        match factor {
+                            "lokr_w1" => group.w1 = Some(tensor.clone()),
+                            "lokr_w1_a" => group.w1_a = Some(tensor.clone()),
+                            "lokr_w1_b" => group.w1_b = Some(tensor.clone()),
+                            "lokr_w2" => group.w2 = Some(tensor.clone()),
+                            "lokr_w2_a" => group.w2_a = Some(tensor.clone()),
+                            "lokr_w2_b" => group.w2_b = Some(tensor.clone()),
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        report.skipped_keys += 1;
+                    }
+                }
+                for (path, factors) in groups {
+                    pending_lokr.entry(path).or_default().push(PendingLokr {
+                        factors,
+                        factor_scale,
+                        pass_scales: pass_scales.clone(),
+                        source,
+                    });
+                }
+                continue;
+            }
+            if format == AdapterFormat::ThirdPartyLokr {
+                for (raw_path, group) in parse_lokr_thirdparty(&file)? {
+                    let path = normalize_ltx_adapter_path(&raw_path);
+                    let lycoris_scale = if let Some(factor) = group.w1_a.as_ref() {
+                        let rank = factor.dims()[1] as f64;
+                        group.alpha.map_or(1.0, |alpha| alpha as f64 / rank)
+                    } else if let Some(factor) = group.w2_a.as_ref() {
+                        let rank = factor.dims()[1] as f64;
+                        group.alpha.map_or(1.0, |alpha| alpha as f64 / rank)
+                    } else {
+                        // When both Kronecker legs are full LyCORIS forces alpha=rank, hence scale one.
+                        1.0
+                    };
+                    pending_lokr.entry(path).or_default().push(PendingLokr {
+                        factors: LokrGroup {
+                            w1: group.w1,
+                            w1_a: group.w1_a,
+                            w1_b: group.w1_b,
+                            w2: group.w2,
+                            w2_a: group.w2_a,
+                            w2_b: group.w2_b,
+                        },
+                        factor_scale: lycoris_scale,
+                        pass_scales: pass_scales.clone(),
+                        source,
+                    });
+                }
+                continue;
+            }
+
+            LoraPairStaging {
+                spec,
+                strict_scale,
+                device: &device,
+                refinement_cancel: None,
+            }
+            .stage(&file.meta, file.tensors, Ok, &mut report)?
+        };
+        for (path, a, b) in pairs {
             pending.entry(path).or_default().push(PendingLora {
                 a,
                 b,
@@ -471,7 +579,6 @@ fn install_ltx_adapters_with_policy(
         }
     }
 
-    let device = dit.device().clone();
     let mut matched = HashSet::new();
     // Keep the originating selected spec through parsing and target installation. A stack-level
     // aggregate is insufficient: one valid Eros/distill adapter must not make a second, unrelated
@@ -479,7 +586,7 @@ fn install_ltx_adapters_with_policy(
     let mut applied_by_spec = vec![0usize; specs.len()];
     dit.visit_adaptable_mut(&mut |loaded_path, linear| {
         let path = strip_path_prefix(loaded_path);
-        if let Some(residuals) = pending.get(path) {
+        if let Some(residuals) = pending.get_mut(path) {
             let (out_features, in_features) = linear.base_shape();
             for residual in residuals {
                 if residual.a.dims()[0] != in_features
@@ -492,9 +599,12 @@ fn install_ltx_adapters_with_policy(
                         residual.b.dims()
                     )));
                 }
+                // Release each CPU factor as its device copy becomes resident.
+                residual.a = residual.a.to_device(&device)?;
+                residual.b = residual.b.to_device(&device)?;
                 linear.push_additive_lora_per_pass(
-                    residual.a.to_device(&device)?,
-                    residual.b.to_device(&device)?,
+                    residual.a.clone(),
+                    residual.b.clone(),
                     residual.pass_scales.clone(),
                 )?;
                 report.applied += 1;
@@ -569,7 +679,15 @@ fn install_ltx_adapters_with_policy(
 /// its source-scale fallback is disabled and unmatched targets remain fatal, so a selected adapter
 /// can never be accepted without affecting the split-provider DiT.
 pub fn install_ltx25_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
-    install_ltx_adapters_with_policy(dit, specs, true)
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25)
+}
+
+pub(crate) fn install_ltx25_dev_adapters(
+    dit: &mut AvDiT,
+    specs: &[AdapterSpec],
+    cancel: &CancelFlag,
+) -> Result<AdditiveReport> {
+    install_ltx_adapters_with_policy(dit, specs, InstallPolicy::Ltx25Dev(cancel))
 }
 
 #[cfg(test)]
@@ -577,7 +695,6 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
-    use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, Module};
     use candle_gen::train::lora::LoraLinear;
 
@@ -587,6 +704,87 @@ mod tests {
         assert_eq!(ltx25_factor_rank(450, 2048, 32), 32);
         assert_eq!(ltx25_factor_rank(450, 256, 2048), 256);
         assert_eq!(ltx25_factor_rank(450, 128, 4096), 128);
+    }
+
+    #[test]
+    fn canceled_refinement_pair_stops_before_factor_conversion() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let scalar = Tensor::new(1f32, &Device::Cpu).unwrap();
+        assert!(matches!(
+            prepare_lora_pair(scalar.clone(), scalar, 1.0, &Device::Cpu, Some(&cancel)),
+            Err(CandleError::Canceled)
+        ));
+    }
+
+    #[test]
+    fn deferred_factor_sources_use_the_same_order_and_scale_as_buffered_pairs() {
+        let device = Device::Cpu;
+        let cancel = CancelFlag::new();
+        let spec = AdapterSpec::new("fixture.safetensors".into(), 1.0, AdapterKind::Lora);
+        let meta = HashMap::from([
+            ("lora_rank".into(), "1".into()),
+            ("lora_alpha".into(), "3".into()),
+        ]);
+        let buffered = LoraPairStaging {
+            spec: &spec,
+            strict_scale: Some(ltx25_scale(&meta, &spec).unwrap()),
+            device: &device,
+            refinement_cancel: None,
+        };
+        let deferred = LoraPairStaging {
+            refinement_cancel: Some(&cancel),
+            ..buffered
+        };
+        let down = Tensor::new(&[[1.0f32, -2.0]], &device).unwrap();
+        let up = Tensor::new(&[[3.0f32], [4.0]], &device).unwrap();
+        let tensors = [down.clone(), up.clone(), down, up];
+        let keys = [
+            "a.lora_A.weight",
+            "a.lora_B.weight",
+            "z.lora_A.weight",
+            "z.lora_B.weight",
+        ];
+        let indices = [3, 1, 2, 0];
+        let mut buffered_report = AdditiveReport::default();
+        let buffered_pairs = buffered
+            .stage(
+                &meta,
+                indices.map(|index| (keys[index].into(), tensors[index].clone())),
+                Ok,
+                &mut buffered_report,
+            )
+            .unwrap();
+        let mut actual_order = Vec::new();
+        let mut deferred_report = AdditiveReport::default();
+        let pairs = deferred
+            .stage(
+                &meta,
+                indices.map(|index| (keys[index].into(), index)),
+                |index| {
+                    actual_order.push(index);
+                    Ok(tensors[index].clone())
+                },
+                &mut deferred_report,
+            )
+            .unwrap();
+        assert_eq!(actual_order, [0, 1, 2, 3]);
+        assert_eq!(buffered_report, deferred_report);
+        for ((name, a, b), (buffered_name, buffered_a, buffered_b)) in
+            pairs.into_iter().zip(buffered_pairs)
+        {
+            assert_eq!(name, buffered_name);
+            assert_eq!(a.to_vec2::<f32>().unwrap(), vec![vec![1.0], vec![-2.0]]);
+            assert_eq!(b.to_vec2::<f32>().unwrap(), vec![vec![9.0, 12.0]]);
+            assert_eq!(
+                a.to_vec2::<f32>().unwrap(),
+                buffered_a.to_vec2::<f32>().unwrap()
+            );
+            assert_eq!(
+                b.to_vec2::<f32>().unwrap(),
+                buffered_b.to_vec2::<f32>().unwrap()
+            );
+        }
     }
 
     #[test]
@@ -691,7 +889,7 @@ mod tests {
             tensors: HashMap::new(),
             meta: HashMap::from([(COND_SAFE_METADATA_KEY.into(), "true".into())]),
         };
-        let error = validate_cond_safe_completeness(&file, 768, 384)
+        let error = validate_cond_safe_completeness(&file.meta, 768, 384)
             .unwrap_err()
             .to_string();
         assert!(error.contains("384 LoRA targets / 768 LoRA tensors"));

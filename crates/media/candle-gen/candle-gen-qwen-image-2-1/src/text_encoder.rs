@@ -19,7 +19,7 @@
 //! For a text-only prompt the three mRoPE position streams (`mrope_section [24, 20, 20]`,
 //! interleaved) are all the plain token index, so the rotary embedding is exactly 1-D RoPE at
 //! `rope_theta = 5e6`. The MLX twin reuses `mlx_gen_z_image::text_encoder::EncoderLayer` for this;
-//! candle's Z-Image Qwen3 decoder is a private vendored module (`candle_gen_z_image::packed_te`,
+//! candle's Z-Image Qwen3 decoder is a private module (`candle_gen_z_image::text_encoder`,
 //! and its block is additionally pinned to Z-Image's layer[-2]/`model.` conventions), so the same
 //! pre-norm decoder block is ported here rather than reached across a crate boundary — the forward
 //! math is the stock Qwen3 one (per-head `q_norm`/`k_norm`, bias-free GQA, HF half-split RoPE,

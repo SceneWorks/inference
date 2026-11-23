@@ -1,0 +1,127 @@
+// Installed only into the disposable same-job real-weight comparison checkouts.
+use mlx_gen::gen_core::{
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Precision, Progress,
+    Quant, WeightsSource,
+};
+use mlx_gen_ltx::MODEL_25_ID;
+use mlx_rs::{DeviceType, Stream};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{env, fs, path::PathBuf, time::Instant};
+
+const PROMPT: &str =
+    "a red fox walking through snowy pines, slow cinematic dolly, detailed natural motion";
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn check_device() -> Result<()> {
+    let device = Stream::task_local_or_default().get_device()?;
+    assert!(matches!(device.get_type()?, DeviceType::Gpu));
+    assert_eq!(device.get_index()?, 0);
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let snapshot = PathBuf::from(env::var_os("PAIR_TIER2_SNAPSHOT").ok_or("missing LTX snapshot")?);
+    let variant = env::var("PAIR_TIER2_VARIANT")?;
+    let (case, steps) = match variant.as_str() {
+        "dev" => ("ltx25-packed-q4-mlx-dev-v1", 30),
+        "distilled" => ("ltx25-packed-q4-mlx-distilled-v1", 8),
+        _ => return Err("unknown native MLX LTX variant".into()),
+    };
+    let request = GenerationRequest {
+        prompt: PROMPT.into(),
+        width: 512,
+        height: 512,
+        frames: Some(17),
+        fps: Some(24),
+        count: 1,
+        seed: Some(18777),
+        steps: Some(steps),
+        // Leaving sampler unset selects each variant's native MLX Euler integrator.
+        ..Default::default()
+    };
+    let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot.join(&variant).join("q4")));
+    spec.precision = Precision::Bf16;
+    if variant == "dev" {
+        let adapter =
+            snapshot.join("distilled_lora/ltx-2.5-22b-distilled-lora-450-bf16.safetensors");
+        spec.adapters = vec![
+            AdapterSpec::new(adapter, 0.0, AdapterKind::Lora).with_pass_scales(vec![0.0, 1.0])
+        ];
+    }
+    spec.prepare_file_sources()?;
+    let tier = mlx_gen_ltx::resolved_video_memory_numeric_tier(MODEL_25_ID, &spec)?
+        .ok_or("missing MLX LTX memory tier")?;
+    assert_eq!(
+        (tier.quant, tier.precision),
+        (Some(Quant::Q4), Precision::Bf16)
+    );
+    let preflight = env::args().nth(1).as_deref() == Some("--preflight");
+    if !preflight {
+        check_device()?;
+    }
+    let started = Instant::now();
+    // This exact registration returns a metadata-only shell. The ordinary generate call below
+    // materializes the staged text encoder, DiT / refinement factors, and video/audio decoders.
+    let pipeline = mlx_gen_ltx::provider_registry()?.load(MODEL_25_ID, &spec)?;
+    assert_eq!(pipeline.descriptor().id, MODEL_25_ID);
+    let registered = &pipeline.descriptor().capabilities;
+    assert_eq!(registered.supports_negative_prompt, variant == "dev");
+    pipeline.validate(&request)?;
+    println!("SGA_LTX_NATIVE_CASE {case}");
+    if preflight {
+        return Ok(());
+    }
+
+    let mut progress = Vec::new();
+    let generated = pipeline.generate(&request, &mut |event| {
+        if let Progress::Step { current, total } = event {
+            progress.push([current, total]);
+        }
+    })?;
+    let e2e_ns = started.elapsed().as_nanos();
+    check_device()?;
+    let GenerationOutput::Video {
+        frames,
+        fps,
+        audio: Some(audio),
+    } = generated
+    else {
+        return Err("MLX LTX proof expected decoded video and audio".into());
+    };
+    assert_eq!((frames.len(), fps), (17, 24));
+    let mut rgb = Sha256::new();
+    let mut different_pixel_values = false;
+    let first_value = frames[0].pixels[0];
+    for frame in frames {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (512, 512, 512 * 512 * 3)
+        );
+        different_pixel_values |= frame.pixels.iter().any(|&value| value != first_value);
+        rgb.update(frame.pixels);
+    }
+    assert!(different_pixel_values);
+    assert!(audio.stems.is_empty() && audio.channels == 2 && audio.sample_rate > 0);
+    assert!(!audio.samples.is_empty() && audio.samples.len().is_multiple_of(2));
+    assert!(audio.samples.iter().all(|value| value.is_finite()));
+    assert!(audio.samples.iter().any(|value| *value != 0.0));
+    let mut pcm = Sha256::new();
+    for sample in &audio.samples {
+        pcm.update(sample.to_bits().to_le_bytes());
+    }
+    let receipt = json!({"case":case,"device":{"kind":"mlx-metal","index":0},"progress":progress,"e2e_ns":e2e_ns,
+                        "video":{"size":[512,512],"frames":17,"fps":24,"rgb_sha256":format!("{:x}",rgb.finalize())},
+                        "audio":{"channels":audio.channels,"sample_rate":audio.sample_rate,
+                                 "samples":audio.samples.len(),"f32_sha256":format!("{:x}",pcm.finalize())}});
+    let output =
+        PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing LTX proof output directory")?);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(file, &receipt)?;
+    println!("SGA_LTX_REAL_COMPLETE {case}");
+    Ok(())
+}

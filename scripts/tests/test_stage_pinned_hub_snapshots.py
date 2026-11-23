@@ -18,6 +18,7 @@ import yaml
 
 from scripts.ci import model_inference_proofs as proofs
 from scripts.ci import stage_pinned_hub_snapshots as staging
+from scripts.ci import flux1_conditional_asset_inventory as inventory
 from scripts.ci.pinned_hub_source import verify_pinned_hub_files
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -148,11 +149,13 @@ class Staging(unittest.TestCase):
         return "url", b"raw", {name: sibling(name, data) for name, data in self.FILES.items()}
 
     def fetcher(self, calls, placed_by_another_job=False):
-        def fetch(url, destination):
+        def fetch(url, destination, *, expected_bytes, expected_sha256, publish):
             self.assertFalse(destination.exists(), "an existing file is never replaced")
             calls.append(url)
             destination.parent.mkdir(parents=True, exist_ok=True)
             data = self.FILES[url.split(f"/resolve/{REV}/", 1)[1]]
+            self.assertEqual(expected_bytes, len(data))
+            self.assertEqual(expected_sha256, hashlib.sha256(data).hexdigest())
             destination.write_bytes(data)
             return len(data), hashlib.sha256(data).hexdigest(), None, placed_by_another_job
         return fetch
@@ -167,9 +170,20 @@ class Staging(unittest.TestCase):
         return staging.stage({"PLAIN": self.PIN}, hub, manifest=self.manifest, fetch=self.fetcher(calls),
                              verify=self.verify, free_bytes=lambda path: free)
 
+    def stage_downloads(self, hub, bodies, *, manifest=None):
+        def open_response(request, **_kwargs):
+            data = bodies[request.full_url.split(f"/resolve/{REV}/", 1)[1]]
+            reply = io.BytesIO(data)
+            reply.headers = {"Content-Length": str(len(data))}
+            return reply
+
+        with patch("urllib.request.build_opener", return_value=SimpleNamespace(open=open_response)):
+            return staging.stage({"PLAIN": self.PIN}, hub, manifest=manifest or self.manifest,
+                                 verify=self.verify, free_bytes=lambda _path: 10**15)["PLAIN"]
+
     def test_stages_only_absent_subfolder_files_keeps_existing_and_verifies_all(self):
         with tempfile.TemporaryDirectory() as temporary:
-            hub = Path(temporary)
+            hub = Path(temporary).resolve()
             base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
             (base / "q8").mkdir(parents=True)
             (base / "q8/config.json").write_bytes(b"{}")
@@ -194,6 +208,224 @@ class Staging(unittest.TestCase):
                 self.stage(hub, [])
             self.assertEqual((base / "q8/model.safetensors").read_bytes(), b"WEIGHTS")
 
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_unsupported_darwin_hardlink_publishes_a_verified_hub_blob(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary).resolve()
+            base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+            destination = base / "q8/model.safetensors"
+            destination.parent.mkdir(parents=True)
+            (base / "q8/config.json").write_bytes(b"{}")
+            blobs = base.parent.parent / "blobs"
+            symlink = os.symlink
+
+            def atomic(target, final):
+                self.assertEqual(final, destination)
+                self.assertFalse(Path(target).is_absolute())
+                blob = (final.parent / target).resolve(strict=True)
+                self.assertTrue(blob.is_relative_to(blobs))
+                self.assertEqual(blob.read_bytes(), b"weights")
+                self.assertFalse(final.exists())
+                symlink(target, final)
+
+            error = OSError(errno.ENOTSUP, "hard links unavailable")
+            with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                  patch.object(inventory, "_renamex_excl", return_value=False),
+                  patch("os.symlink", side_effect=atomic) as commit, patch("os.replace") as replace):
+                result = self.stage_downloads(hub, self.FILES)
+            commit.assert_called_once()
+            replace.assert_not_called()
+            self.assertEqual(result["fetched"], ["q8/model.safetensors"])
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(destination.read_bytes(), b"weights")
+            self.assertEqual(list(destination.parent.glob("*.partial")), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_unsupported_hardlink_preserves_and_reconciles_a_concurrent_file(self):
+        for peer_data in (b"weights", b"WEIGHTS"):
+            with self.subTest(peer_data=peer_data), tempfile.TemporaryDirectory() as temporary:
+                hub = Path(temporary).resolve()
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                destination = base / "q8/model.safetensors"
+                destination.parent.mkdir(parents=True)
+                (base / "q8/config.json").write_bytes(b"{}")
+
+                symlink = os.symlink
+
+                def placed(source, final):
+                    # Place the file after the final path guard, at the actual publication call.
+                    final.write_bytes(peer_data)
+                    symlink(source, final)
+
+                error = OSError(errno.ENOTSUP, "hard links unavailable")
+                with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
+                      patch("os.symlink", side_effect=placed), patch("os.replace") as replace):
+                    if peer_data == b"weights":
+                        result = self.stage_downloads(hub, self.FILES)
+                        self.assertEqual(result["placed_by_another_job"], ["q8/model.safetensors"])
+                        self.assertEqual(result["fetched"], [])
+                    else:
+                        with self.assertRaisesRegex(ValueError, "placed concurrently with other bytes"):
+                            self.stage_downloads(hub, self.FILES)
+                replace.assert_not_called()
+                self.assertFalse(destination.is_symlink())
+                self.assertEqual(destination.read_bytes(), peer_data)
+                self.assertEqual(list(destination.parent.glob("*.partial")), [])
+                self.assertEqual(list((base.parent.parent / "blobs").iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_unavailable_publication_primitive_leaves_no_snapshot_leaf_or_owned_blob(self):
+        for platform in ("darwin", "linux"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temporary:
+                hub = Path(temporary).resolve()
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                destination = base / "q8/model.safetensors"
+                destination.parent.mkdir(parents=True)
+                (base / "q8/config.json").write_bytes(b"{}")
+                error = OSError(errno.ENOTSUP, "publication unavailable")
+
+                with (patch.object(sys, "platform", platform), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
+                      patch("os.symlink", side_effect=error) as link, patch("os.replace") as replace):
+                    with self.assertRaises(OSError) as failure:
+                        self.stage_downloads(hub, self.FILES)
+                self.assertEqual(failure.exception.errno, errno.ENOTSUP)
+                replace.assert_not_called()
+                self.assertFalse(os.path.lexists(destination))
+                self.assertEqual(list(destination.parent.glob("*.partial")), [])
+                blobs = base.parent.parent / "blobs"
+                if platform == "darwin":
+                    link.assert_called_once()
+                    self.assertEqual(list(blobs.iterdir()), [])
+                else:
+                    link.assert_not_called()
+                    self.assertFalse(blobs.exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_darwin_fallback_rejects_a_redirected_blob_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            hub, outside = root / "hub", root / "outside"
+            hub.mkdir()
+            outside.mkdir()
+            base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+            destination = base / "q8/model.safetensors"
+            destination.parent.mkdir(parents=True)
+            (base / "q8/config.json").write_bytes(b"{}")
+            (base.parent.parent / "blobs").symlink_to(outside, target_is_directory=True)
+
+            error = OSError(errno.ENOTSUP, "hard links unavailable")
+            with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                  patch.object(inventory, "_renamex_excl", return_value=False),
+                  self.assertRaisesRegex(ValueError, "linked evidence ancestor")):
+                self.stage_downloads(hub, self.FILES)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertFalse(os.path.lexists(destination))
+            self.assertEqual(list(destination.parent.glob("*.partial")), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows publishes with no-replace rename")
+    def test_darwin_fallback_cleans_only_unpublished_blob_on_interruption(self):
+        for operation in ("rename", "symlink"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                hub = Path(temporary).resolve()
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                destination = base / "q8/model.safetensors"
+                destination.parent.mkdir(parents=True)
+                (base / "q8/config.json").write_bytes(b"{}")
+                system_call = getattr(os, operation)
+
+                def interrupted(*args):
+                    system_call(*args)
+                    raise KeyboardInterrupt()
+
+                error = OSError(errno.ENOTSUP, "hard links unavailable")
+                with (patch.object(sys, "platform", "darwin"), patch("os.link", side_effect=error),
+                      patch.object(inventory, "_renamex_excl", return_value=False),
+                      patch.object(os, operation, side_effect=interrupted),
+                      self.assertRaises(KeyboardInterrupt)):
+                    self.stage_downloads(hub, self.FILES)
+                self.assertEqual(list(destination.parent.glob("*.partial")), [])
+                blobs = base.parent.parent / "blobs"
+                if operation == "rename":
+                    self.assertFalse(os.path.lexists(destination))
+                    self.assertEqual(list(blobs.iterdir()), [])
+                else:
+                    self.assertTrue(destination.is_symlink())
+                    self.assertEqual(destination.read_bytes(), b"weights")
+                    self.assertEqual(list(blobs.iterdir()), [destination.resolve().parent])
+
+    def test_refuses_wrong_manifest_digest_before_publishing_lfs_or_git_bytes(self):
+        leaf = "q8/model.safetensors"
+        for kind in ("lfs", "git"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                hub = Path(temporary).resolve()
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                destination = base / leaf
+                destination.parent.mkdir(parents=True)
+                (base / "q8/config.json").write_bytes(b"{}")
+
+                def manifest(repository, revision):
+                    url, raw, defaults = self.manifest(repository, revision)
+                    if kind == "git":
+                        good = self.FILES[leaf]
+                        defaults[leaf] = {"size": len(good),
+                                          "blobId": hashlib.sha1(b"blob 7\0" + good).hexdigest()}
+                    return url, raw, defaults
+
+                with self.assertRaisesRegex(ValueError, "SHA-(256|1)"):
+                    self.stage_downloads(hub, {**self.FILES, leaf: b"WEIGHTS"}, manifest=manifest)
+                self.assertFalse(destination.exists())
+                self.assertEqual(list(destination.parent.glob("*.partial")), [])
+
+    def test_refuses_redirected_snapshot_and_lock_paths_before_fetching(self):
+        for location in ("snapshot-parent", "snapshot-leaf", "lock-parent", "lock-leaf"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                hub, outside = root / "hub", root / "outside"
+                hub.mkdir()
+                outside.mkdir()
+                target = outside / "target"
+                target.write_bytes(b"weights")
+                base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+                paths = {
+                    "snapshot-parent": base / "q8",
+                    "snapshot-leaf": base / "q8/model.safetensors",
+                    "lock-parent": hub / ".locks",
+                    "lock-leaf": staging.staging_lock_path(hub, self.PIN["repository"], REV,
+                                                          "q8/model.safetensors"),
+                }
+                link = paths[location]
+                link.parent.mkdir(parents=True, exist_ok=True)
+                directory = location.endswith("parent")
+                try:
+                    link.symlink_to(outside if directory else target, target_is_directory=directory)
+                except (NotImplementedError, PermissionError):
+                    self.skipTest("this host cannot create symlinks for the fixture")
+                calls = []
+                with self.assertRaisesRegex(ValueError, "linked evidence ancestor|escapes configured model hub"):
+                    self.stage(hub, calls)
+                self.assertEqual(calls, [])
+                self.assertEqual(list(outside.iterdir()), [target])
+                self.assertEqual(target.read_bytes(), b"weights")
+
+    def test_keeps_an_existing_hub_blob_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary).resolve()
+            base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+            blob = base.parent.parent / "blobs" / "existing"
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"weights")
+            existing = base / "q8/model.safetensors"
+            existing.parent.mkdir(parents=True)
+            try:
+                existing.symlink_to(blob)
+            except (NotImplementedError, PermissionError):
+                self.skipTest("this host cannot create symlinks for the fixture")
+            result = self.stage(hub, [])["PLAIN"]
+            self.assertEqual(result["kept_existing"], ["q8/model.safetensors"])
+            self.assertTrue(existing.is_symlink())
+
     def test_two_stagers_of_the_same_file_download_it_once(self):
         # Two runner listeners on one host stage the same snapshot; the second waits on the lock.
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,10 +437,10 @@ class Staging(unittest.TestCase):
             first_fetching, second_waiting = threading.Event(), threading.Event()
             fetch = self.fetcher(calls)
 
-            def slow_fetch(url, destination):
+            def slow_fetch(url, destination, **options):
                 first_fetching.set()
                 self.assertTrue(second_waiting.wait(10), "the second stager never waited on the lock")
-                return fetch(url, destination)
+                return fetch(url, destination, **options)
 
             real_try_lock = staging._try_lock
 
@@ -254,6 +486,18 @@ class Staging(unittest.TestCase):
                     / REV / "q8/model.safetensors.lock")
             self.assertTrue(lock.is_file())
             self.assertFalse(staging.snapshot_dir(hub, self.PIN["repository"], REV).exists())
+
+    def test_shared_locker_validates_the_opened_lock_before_seeding_or_waiting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary).resolve()
+            file = "q8/model.safetensors"
+            with (patch("os.path.samestat", return_value=False), patch.object(staging, "_try_lock") as attempt,
+                  self.assertRaisesRegex(ValueError, "staging lock changed during open")):
+                with staging.staging_lock(hub, self.PIN["repository"], REV, file):
+                    self.fail("an unbound lock should never be acquired")
+            attempt.assert_not_called()
+            lock = staging.staging_lock_path(hub, self.PIN["repository"], REV, file)
+            self.assertEqual(lock.read_bytes(), b"")
 
     def test_a_file_another_job_placed_mid_download_is_kept_not_fetched(self):
         with tempfile.TemporaryDirectory() as temporary:

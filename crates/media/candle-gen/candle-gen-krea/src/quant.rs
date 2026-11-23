@@ -212,6 +212,26 @@ impl QLinear {
         }
     }
 
+    /// Evaluate this projection using the phase's explicitly selected source slots. The phase
+    /// may select no adapters, even when the resident base has an ordinary default stack.
+    pub(crate) fn forward_phase(
+        &self,
+        x: &Tensor,
+        phase: Option<&crate::adapters::PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
+        let Some(phase) = phase else {
+            return self.forward(x);
+        };
+        match self {
+            Self::Adapt(linear) => __model_proof_output!(phase.forward_linear(self, linear, x)),
+            Self::Nvfp4(projection) => __model_proof_output!(
+                projection.forward_with(x, |linear| phase.forward_linear(self, linear, x))
+            ),
+            // Probes are not part of the adapter-install surface.
+            Self::Probed(linear) => __model_proof_output!(linear.forward(x)),
+        }
+    }
+
     /// [`Self::forward`] for the Qwen3-VL TE's **bf16-store / f32-compute** regime (sc-12828): the
     /// `Adapt` dense base upcasts its weight to `x`'s dtype per matmul, so the bf16-resident projection
     /// runs against the f32 hidden state bit-identically to an f32 store — at half the resident TE
@@ -603,6 +623,9 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_applies_lora_and_lokr_without_replacing_int8_base() -> Result<()> {
+        use candle_gen::quant::Adapter;
+        use std::borrow::Cow;
+
         let dev = Device::new_cuda(0)?;
         let (out_dim, in_dim, group) = (16usize, 64usize, 64usize);
         let canonical = Tensor::ones((out_dim, in_dim), DType::F32, &dev)?;
@@ -618,7 +641,8 @@ mod tests {
         let b = Tensor::ones((1, out_dim), DType::F32, &dev)?;
         lora.push_additive_lora(a.clone(), b.clone(), 0.75)?;
         let lora_actual = (lora.forward(&x)? - bare.forward(&x)?)?;
-        let lora_expected = (x.matmul(&a)?.matmul(&b)? * 0.75)?;
+        let unscaled_lora = x.matmul(&a)?.matmul(&b)?;
+        let lora_expected = (&unscaled_lora * 0.75)?;
         let lora_max = (lora_actual - lora_expected)?
             .abs()?
             .max_all()?
@@ -645,9 +669,9 @@ mod tests {
         .expect("4x8 Kronecker factors fit a 16x64 projection");
         let expected = factors.residual(&x)?;
         let mut lokr = build()?;
-        lokr.push_additive_lokr(factors)?;
+        lokr.push_additive_lokr(factors.clone())?;
         let lokr_actual = (lokr.forward(&x)? - bare.forward(&x)?)?;
-        let lokr_max = (lokr_actual - expected)?
+        let lokr_max = (lokr_actual - &expected)?
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
@@ -656,6 +680,61 @@ mod tests {
             "ConvRot LoKr residual drifted ({lokr_max})"
         );
         assert!(lora.is_convrot_int8() && lokr.is_convrot_int8());
+        lora.push_additive_lokr(factors.clone())?;
+        let host = lora
+            .as_adapt_mut()
+            .expect("ConvRot uses the shared adapter host");
+        let [lora, lokr] = host.adapters.as_slice() else {
+            panic!("expected the default LoRA followed by LoKr");
+        };
+        let bare_output = bare.forward(&x)?;
+        let default_before = host.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+        let scoped = __model_proof_output!(host.forward_with_selected_adapters(
+            &x,
+            [
+                Ok((Cow::Borrowed(lora), -0.25)),
+                Ok((Cow::Borrowed(lokr), 0.0))
+            ],
+        ))?;
+        let want = (&bare_output + (&unscaled_lora * -0.25)?)?;
+        let scoped_max = (scoped - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            scoped_max < 1e-5,
+            "scoped ConvRot LoRA drifted ({scoped_max})"
+        );
+
+        let zero = __model_proof_output!(
+            host.forward_with_selected_adapters(&x, [Ok((Cow::Borrowed(lokr), 0.0))])
+        )?;
+        assert_eq!(
+            zero.flatten_all()?.to_vec1::<f32>()?,
+            bare_output.flatten_all()?.to_vec1::<f32>()?,
+            "a zero-only scope must return the bare base"
+        );
+
+        // A phase re-bakes an absolute LoKr scale from the normalized right factor.
+        let override_factors = factors.with_scaled_right(&w2.to_device(&Device::Cpu)?, -0.125)?;
+        let scoped_lokr = __model_proof_output!(host.forward_with_selected_adapters(
+            &x,
+            [Ok((
+                Cow::Owned(Adapter::LokrStructured {
+                    factors: override_factors
+                }),
+                -0.125
+            ))],
+        ))?;
+        let want = (&bare_output + (&expected * -0.25)?)?;
+        let scoped_lokr_max = (scoped_lokr - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            scoped_lokr_max < 1e-5,
+            "scoped ConvRot LoKr drifted ({scoped_lokr_max})"
+        );
+        assert_eq!(
+            host.forward(&x)?.flatten_all()?.to_vec1::<f32>()?,
+            default_before,
+            "scoped selection must leave the installed stack unchanged"
+        );
+        assert!(host.is_convrot_int8());
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base");
         Ok(())

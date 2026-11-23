@@ -57,6 +57,9 @@ impl Generator for ReceiptGenerator {
     fn retained_weight_bytes(&self) -> Option<u64> {
         self.inner.retained_weight_bytes()
     }
+    fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
+        self.inner.retained_component_state()
+    }
     fn adapter_apply_reports(&self) -> Vec<crate::AdapterApplyReport> {
         self.inner.adapter_apply_reports()
     }
@@ -93,6 +96,17 @@ impl Generator for ReceiptGenerator {
     ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
         self.scope
             .with_prepared(|| self.inner.begin_memory_strategy_request(context))
+    }
+    fn begin_planned_memory_strategy_request(
+        &self,
+        request: &GenerationRequest,
+        plan: &crate::RenderPlan,
+        context: &MemoryRunContext,
+    ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
+        self.scope.with_prepared(|| {
+            self.inner
+                .begin_planned_memory_strategy_request(request, plan, context)
+        })
     }
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
         self.inner.validate(req)

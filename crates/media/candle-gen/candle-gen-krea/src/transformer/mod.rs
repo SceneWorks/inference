@@ -27,6 +27,7 @@ use candle_gen::BlockPlan;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::adapters::{PhaseAdapterBindings, PhaseAdapterSelection, PhaseAdapterTopology};
 use crate::config::Krea2Config;
 use crate::loader::{linear_detect, linear_detect_planned, Weights};
 use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
@@ -61,6 +62,7 @@ pub struct Krea2Transformer {
     final_norm: RmsScale,
     final_linear: QLinear,
     final_sstable: Tensor, // [1, 2, hidden]
+    phase_adapters: PhaseAdapterBindings,
     /// Per-render RoPE-table cache (sc-8992 / F-012, made multi-entry in sc-11201 / F-089). The joint
     /// `(cos, sin)` table depends only on the fixed geometry `(cap_len, ht, wt, n_refs)` — not on the
     /// flow time / the current latent — so it is identical across every denoise step. Keyed on that
@@ -76,6 +78,7 @@ pub struct Krea2Transformer {
 /// The latent itself deliberately remains outside this value: its image tokens and timestep modulation
 /// change at every step.  `forward_prepared*` validates that those changing inputs still match the
 /// request geometry that admitted this state before doing any denoise work.
+#[derive(Clone)]
 pub(crate) struct PreparedConditioning {
     context: Tensor,
     cap_len: usize,
@@ -346,6 +349,7 @@ impl Krea2Transformer {
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
             final_linear: linear_detect_planned(w, "final_layer.linear", true, plan)?,
             final_sstable,
+            phase_adapters: PhaseAdapterBindings::default(),
             rope_cache: RopeCache::new(ROPE_CACHE_CAP),
         })
     }
@@ -372,6 +376,42 @@ impl Krea2Transformer {
         }
         v.push(("final_layer.linear".to_string(), &self.final_linear));
         v
+    }
+
+    pub(crate) fn set_phase_adapters(&mut self, bindings: PhaseAdapterBindings) {
+        self.phase_adapters = bindings;
+    }
+
+    pub(crate) fn phase_topology(&self) -> candle_gen::Result<PhaseAdapterTopology<'_>> {
+        let mut projections = self.planned_projections();
+        // The NVFP4 footprint traversal excludes these intentionally dense front-end leaves.
+        projections.extend([
+            ("time_embed.linear_1".into(), &self.time_embed_l1),
+            ("time_embed.linear_2".into(), &self.time_embed_l2),
+            ("time_mod_proj".into(), &self.time_mod_proj),
+        ]);
+        self.phase_adapters.bind(projections)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase_projection_scales(
+        &self,
+        path: &str,
+        selection: &PhaseAdapterSelection<'_>,
+    ) -> Vec<f64> {
+        let (_, projection) = self
+            .planned_projections()
+            .into_iter()
+            .find(|(key, _)| key == path)
+            .unwrap();
+        selection
+            .selected(projection)
+            .map(|(_, scale, _)| scale)
+            .collect()
+    }
+
+    pub(crate) fn verify_phase_sources(&self) -> candle_gen::Result<()> {
+        self.phase_adapters.ensure_unchanged()
     }
 
     /// **Model-level NVFP4 accounting** over the built trunk (sc-12110 SC#6 / SC#4).
@@ -441,6 +481,7 @@ impl Krea2Transformer {
     /// toggle that a concurrency-safe multi-phase driver runs only on a job-local DiT — never the shared
     /// resident. The candle twin of mlx-gen-krea's `Krea2Transformer::clear_adapters`.
     pub fn clear_adapters(&mut self) -> candle_gen::Result<()> {
+        self.phase_adapters = PhaseAdapterBindings::default();
         self.visit_adaptable_mut(&mut |_, projection| {
             projection.clear_adapters();
             Ok(())
@@ -495,47 +536,6 @@ impl Krea2Transformer {
         Ok(())
     }
 
-    /// Count projections that currently own additive residual tensors. Test-only introspection for
-    /// proving the production multi-phase driver releases a live final subset, not merely that it
-    /// emits a release callback. This walks the same complete surface as [`Self::clear_adapters`].
-    #[cfg(test)]
-    pub(crate) fn adapted_projection_count(&mut self) -> candle_gen::Result<usize> {
-        let mut count = 0_usize;
-        // sc-18477 widened `visit_adaptable_mut` to yield the whole `QLinear` (so the ConvRot int8
-        // projections are visitable too), so reach the additive residual through `as_adapt_mut`
-        // exactly as the front-end leaves below already do. A projection with no adapt form owns no
-        // residual and therefore does not count.
-        self.visit_adaptable_mut(&mut |_, projection| {
-            count += usize::from(
-                projection
-                    .as_adapt_mut()
-                    .is_some_and(|adapter| adapter.is_adapted()),
-            );
-            Ok(())
-        })?;
-        for projection in [
-            &mut self.img_in,
-            &mut self.time_embed_l1,
-            &mut self.time_embed_l2,
-            &mut self.time_mod_proj,
-            &mut self.txt_in_l1,
-            &mut self.txt_in_l2,
-            &mut self.final_linear,
-        ] {
-            count += usize::from(
-                projection
-                    .as_adapt_mut()
-                    .is_some_and(|adapter| adapter.is_adapted()),
-            );
-        }
-        Ok(count)
-    }
-
-    /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
-    /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
-    /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it
-    /// inline); `n_refs > 0` builds the edit `[text, refs…, target]` table (sc-10877). Since
-    /// `build_edit(n_refs = 0) ≡ build_t2i`, the t2i call stays on the exact `build_t2i` path.
     fn rope_tables(
         &self,
         cap_len: usize,
@@ -558,10 +558,18 @@ impl Krea2Transformer {
     /// `[b, img_len, hidden]`. Shared by the target-latent embed and the edit reference-latent embeds
     /// (sc-10877) so every image token — noise or reference — goes through the identical projection.
     fn embed_image(&self, latent: &Tensor) -> Result<Tensor> {
-        self.img_in.forward(&patchify(
-            &latent.to_dtype(self.dtype)?,
-            self.cfg.patch_size,
-        )?)
+        self.embed_image_phase(latent, None)
+    }
+
+    fn embed_image_phase(
+        &self,
+        latent: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
+        self.img_in.forward_phase(
+            &patchify(&latent.to_dtype(self.dtype)?, self.cfg.patch_size)?,
+            phase,
+        )
     }
 
     /// Build request-owned t2i conditioning. This is intentionally separate from the denoise forward:
@@ -572,7 +580,17 @@ impl Krea2Transformer {
         width: u32,
         height: u32,
     ) -> candle_gen::Result<PreparedConditioning> {
-        self.prepare_conditioning_with_refs(context, &[], width, height)
+        self.prepare_conditioning_with_refs(context, &[], width, height, None)
+    }
+
+    pub(crate) fn prepare_phase_conditioning(
+        &self,
+        context: &Tensor,
+        width: u32,
+        height: u32,
+        phase: &PhaseAdapterSelection<'_>,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        self.prepare_conditioning_with_refs(context, &[], width, height, Some(phase))
     }
 
     /// Edit twin of [`Self::prepare_conditioning`]. Reference image tokens are patch-embedded once and
@@ -584,7 +602,7 @@ impl Krea2Transformer {
         width: u32,
         height: u32,
     ) -> candle_gen::Result<PreparedConditioning> {
-        self.prepare_conditioning_with_refs(context, refs, width, height)
+        self.prepare_conditioning_with_refs(context, refs, width, height, None)
     }
 
     fn prepare_conditioning_with_refs(
@@ -593,6 +611,7 @@ impl Krea2Transformer {
         refs: &[Tensor],
         width: u32,
         height: u32,
+        phase: Option<&PhaseAdapterSelection<'_>>,
     ) -> candle_gen::Result<PreparedConditioning> {
         if width == 0
             || height == 0
@@ -608,11 +627,12 @@ impl Krea2Transformer {
         let wt = width as usize / (self.cfg.patch_size * 8);
         let cap_len = context.dim(1)?;
         let context = context.to_dtype(self.dtype)?;
-        let context = self.text_fusion.forward(&context)?;
+        let context = self.text_fusion.forward_phase(&context, phase)?;
         let context = self.txt_in_norm.forward(&context)?;
-        let context = self
-            .txt_in_l2
-            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)?;
+        let context = self.txt_in_l2.forward_phase(
+            &self.txt_in_l1.forward_phase(&context, phase)?.gelu()?,
+            phase,
+        )?;
         let mut ref_tokens = Vec::with_capacity(refs.len());
         for (index, reference) in refs.iter().enumerate() {
             let (_, _, h, w) = reference.dims4()?;
@@ -668,15 +688,24 @@ impl Krea2Transformer {
 
     /// The changing timestep front-end. The text side was already prepared once for this request.
     fn prepared_time_front_end(&self, timestep: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.phase_time_front_end(timestep, None)
+    }
+
+    fn phase_time_front_end(
+        &self,
+        timestep: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<(Tensor, Tensor)> {
         let cfg = &self.cfg;
         let dt = self.dtype;
 
         // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
         let t_sin = temb(timestep, cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?; // [b, 1, tdim]
-        let t = self
-            .time_embed_l2
-            .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?; // [b, 1, hidden]
-        let tvec = self.time_mod_proj.forward(&t.gelu()?)?; // [b, 1, 6·hidden]
+        let t = self.time_embed_l2.forward_phase(
+            &self.time_embed_l1.forward_phase(&t_sin, phase)?.gelu()?,
+            phase,
+        )?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward_phase(&t.gelu()?, phase)?; // [b, 1, 6·hidden]
         Ok((t, tvec))
     }
 
@@ -790,6 +819,30 @@ impl Krea2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_phase(
+            latent,
+            timestep,
+            prepared,
+            perturbed_layers,
+            attention_scores_budget,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_phase(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedConditioning,
+        perturbed_layers: &[u32],
+        attention_scores_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> candle_gen::Result<Tensor> {
         self.validate_prepared(latent, prepared)?;
         let cfg = &self.cfg;
         let p = cfg.patch_size;
@@ -802,9 +855,9 @@ impl Krea2Transformer {
         };
 
         // Image patch embed + changing timestep front-end; text projection/RoPE are request-owned.
-        let img = self.embed_image(latent)?; // [b, img_len, hidden]
+        let img = self.embed_image_phase(latent, phase)?; // [b, img_len, hidden]
         candle_gen::execution::component_runtime("krea/transformer", img.device(), img.dtype());
-        let (t, tvec) = self.prepared_time_front_end(timestep)?;
+        let (t, tvec) = self.phase_time_front_end(timestep, phase)?;
 
         // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
         let mut combined = Tensor::cat(&[&prepared.context, &img], 1)?; // [b, cap+img_len, hidden]
@@ -812,13 +865,14 @@ impl Krea2Transformer {
             TransformerBlocks::Resident(blocks) => {
                 for (index, blk) in blocks.iter().enumerate() {
                     candle_gen::check_cancel(cancel)?;
-                    combined = blk.forward_with_attention_plan_and_pag(
+                    combined = blk.forward_with_attention_and_phase(
                         &combined,
                         &tvec,
                         &prepared.rcos,
                         &prepared.rsin,
                         attention_plan,
                         perturb(index),
+                        phase,
                     )?;
                 }
             }
@@ -856,13 +910,14 @@ impl Krea2Transformer {
                             // grace the worker's bounded wind-down does not have. At the shipped
                             // window of 1 the two coincide; this keeps that true if it ever widens.
                             candle_gen::check_cancel(cancel)?;
-                            state = block.forward_with_attention_plan_and_pag(
+                            state = block.forward_with_attention_and_phase(
                                 &state,
                                 &tvec,
                                 &prepared.rcos,
                                 &prepared.rsin,
                                 attention_plan,
                                 perturb(window_start + offset),
+                                phase,
                             )?;
                         }
                         Ok(state)
@@ -872,7 +927,7 @@ impl Krea2Transformer {
         }
 
         // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
-        let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
+        let out = self.final_layer_phase(&combined, &t, phase)?; // [b, cap+img_len, in_channels]
         let img_out = out.narrow(1, prepared.cap_len, prepared.img_len)?;
         Ok(unpatchify(
             &img_out,
@@ -1036,6 +1091,15 @@ impl Krea2Transformer {
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
     /// `Linear((1+scale)·RMSNorm(x) + shift)`.
     fn final_layer(&self, x: &Tensor, t: &Tensor) -> Result<Tensor> {
+        self.final_layer_phase(x, t, None)
+    }
+
+    fn final_layer_phase(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
         let m = t.broadcast_add(&self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
         let scale = m.narrow(1, 0, 1)?; // [b, 1, hidden]
         let shift = m.narrow(1, 1, 1)?;
@@ -1044,7 +1108,7 @@ impl Krea2Transformer {
             .forward(x)?
             .broadcast_mul(&(scale + 1.0)?)?
             .broadcast_add(&shift)?;
-        self.final_linear.forward(&normed)
+        self.final_linear.forward_phase(&normed, phase)
     }
 }
 

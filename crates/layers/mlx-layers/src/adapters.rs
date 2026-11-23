@@ -29,69 +29,8 @@ pub mod facts;
 /// Canonical backend linear projection type alias on the shared `mlx-layers` spine (`BACK-1`, `BACK-4`).
 pub type Linear = AdaptableLinear;
 
-/// Request-scoped / per-pass adapter scale overrides (`PIPE-14`, `BACK-1`, `BACK-4`).
-///
-/// Shared resident modules remain immutable during a run; callers pass `ScaleContext` into
-/// [`AdaptableLinear::forward_with_scales`], [`AdaptableLinear::forward_split_with_scales`], or
-/// [`AdaptableLinear::forward_upcast_with_scales`] to override or modulate adapter scales per
-/// request or per pass without mutating `&self`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ScaleContext<'a> {
-    /// Optional per-adapter scale overrides indexed by adapter position in [`AdaptableLinear::adapters`].
-    pub adapter_scales: Option<&'a [f32]>,
-    /// Optional uniform scale multiplier applied across all adapters (defaults to `1.0` when `None`).
-    pub uniform_scale: Option<f32>,
-    /// Pass index for multi-pass pipelines (e.g., conditional / unconditional / guidance passes).
-    pub pass: usize,
-}
-
-impl<'a> ScaleContext<'a> {
-    /// Default pass-0 context with no scale overrides.
-    pub const fn new() -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Override per-adapter scales by position.
-    pub const fn with_adapter_scales(adapter_scales: &'a [f32]) -> Self {
-        Self {
-            adapter_scales: Some(adapter_scales),
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Apply a uniform scale multiplier across all installed adapters for this request/pass.
-    pub const fn with_uniform_scale(scale: f32) -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: Some(scale),
-            pass: 0,
-        }
-    }
-
-    /// Attach a pass index to this scale context.
-    pub const fn with_pass(mut self, pass: usize) -> Self {
-        self.pass = pass;
-        self
-    }
-
-    /// Resolve the effective scale for adapter at `index` with installed `default_scale`.
-    #[inline]
-    pub fn scale_for(&self, index: usize, default_scale: f32) -> f32 {
-        let base = self
-            .adapter_scales
-            .and_then(|s| s.get(index).copied())
-            .unwrap_or(default_scale);
-        match self.uniform_scale {
-            Some(mult) => base * mult,
-            None => base,
-        }
-    }
-}
+use gen_core::phase::PhaseAdapterScale;
+pub use gen_core::phase::ScaleContext;
 
 /// Affine Q4/Q8 matmul over an already-packed `[out, in]` weight, with an optional dense output
 /// bias. With P3 selected, the biased case first attempts the strict exact native epilogue. Any
@@ -821,12 +760,36 @@ impl LinearBase {
     }
 }
 
+type PhaseAdapterBinding = (PhaseAdapterScale, std::ops::Range<usize>);
+
+/// Frozen inference residuals and their optional phase bindings for a re-opened projection.
+#[derive(Clone)]
+pub struct AdapterStack {
+    adapters: Vec<Adapter>,
+    phase_bindings: Vec<PhaseAdapterBinding>,
+}
+
+fn selected_adapter_indices<'a>(
+    bindings: &'a [PhaseAdapterBinding],
+    selection: &'a [PhaseAdapterScale],
+) -> impl Iterator<Item = usize> + 'a {
+    selection.iter().flat_map(|key| {
+        bindings
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, range)| range.clone())
+            .into_iter()
+            .flatten()
+    })
+}
+
 /// A linear base plus a stack of adapters, applied as `base(x) + Σ adapter.residual(x)`.
 /// Quantized-safe: the base weight is never mutated.
 #[derive(Clone)]
 pub struct AdaptableLinear {
     pub base: LinearBase,
     adapters: Vec<Adapter>,
+    phase_bindings: Vec<PhaseAdapterBinding>,
     /// Optional per-adapter pass-scale schedule (one entry per adapter in `adapters`).
     /// When `Some(scales)` is present for an adapter, its effective base scale at the active
     /// pass (`ScaleContext::pass`, or `active_pass` when `ScaleContext` is `None`) is
@@ -848,6 +811,17 @@ impl From<Array> for AdaptableLinear {
 }
 
 impl AdaptableLinear {
+    fn from_base(base: LinearBase) -> Self {
+        Self {
+            base,
+            adapters: Vec::new(),
+            phase_bindings: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
+            training_residual: false,
+        }
+    }
+
     /// Build from a raw `[out, in]` weight (and optional bias) — the common path when
     /// loading dense (bf16/fp16/fp32) checkpoints via the `weights` module.
     pub fn dense(weight: Array, bias: Option<Array>) -> Self {
@@ -859,36 +833,18 @@ impl AdaptableLinear {
 
     /// Wrap an existing dense `nn::Linear`.
     pub fn from_linear(linear: MlxLinear) -> Self {
-        Self {
-            base: LinearBase::Dense(linear),
-            adapters: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::Dense(linear))
     }
 
     /// Wrap an existing `nn::QuantizedLinear` (sc-2342 quantized weights).
     pub fn from_quantized(q: QuantizedLinear) -> Self {
-        Self {
-            base: LinearBase::Quantized(q),
-            adapters: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::Quantized(q))
     }
-    /// Wrap a validated, native signed INT8 base without a floating weight copy.
+    /// Wrap a validated native projection without a floating weight copy.
     pub fn from_native(p: crate::NativeProjection) -> Self {
         match p {
             crate::NativeProjection::ConvRot(p) => Self::from_convrot(p),
-            crate::NativeProjection::Fp8(p) => Self {
-                base: LinearBase::Fp8(p),
-                adapters: Vec::new(),
-                pass_scales: Vec::new(),
-                active_pass: Default::default(),
-                training_residual: false,
-            },
+            crate::NativeProjection::Fp8(p) => Self::from_base(LinearBase::Fp8(p)),
         }
     }
 
@@ -901,24 +857,12 @@ impl AdaptableLinear {
     }
 
     pub fn from_convrot(q: crate::convrot_int8::ConvRotLinear) -> Self {
-        Self {
-            base: LinearBase::ConvRot(q),
-            adapters: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::ConvRot(q))
     }
 
     /// Wrap a validated, native packed W4A8 base without a dense weight copy.
     pub fn from_w4a8(q: crate::w4a8_int8::W4A8Linear) -> Self {
-        Self {
-            base: LinearBase::W4A8(q),
-            adapters: Vec::new(),
-            pass_scales: Vec::new(),
-            active_pass: std::cell::Cell::new(0),
-            training_residual: false,
-        }
+        Self::from_base(LinearBase::W4A8(q))
     }
 
     /// Native INT8 resident base facts; affine Q8 is intentionally not reported here.
@@ -995,6 +939,7 @@ impl AdaptableLinear {
     pub fn set_adapters(&mut self, adapters: Vec<Adapter>) {
         self.pass_scales = vec![None; adapters.len()];
         self.adapters = adapters;
+        self.phase_bindings.clear();
         self.active_pass.set(0);
         self.training_residual = false;
     }
@@ -1002,6 +947,7 @@ impl AdaptableLinear {
     /// Clear all installed adapters and reset pass state back to the bare frozen base.
     pub fn clear_adapters(&mut self) {
         self.adapters.clear();
+        self.phase_bindings.clear();
         self.pass_scales.clear();
         self.active_pass.set(0);
         self.training_residual = false;
@@ -1063,12 +1009,37 @@ impl AdaptableLinear {
     pub fn set_training_adapters(&mut self, adapters: Vec<Adapter>) {
         self.pass_scales = vec![None; adapters.len()];
         self.adapters = adapters;
+        self.phase_bindings.clear();
         self.active_pass.set(0);
         self.training_residual = true;
     }
 
     pub fn adapters(&self) -> &[Adapter] {
         &self.adapters
+    }
+
+    /// Bind newly appended inference residuals to a loaded slot and exact user scale. The loader
+    /// starts with an empty stack and calls this once per distinct key, even on sparse targets.
+    pub fn bind_phase_adapters(&mut self, key: PhaseAdapterScale) {
+        let start = self.phase_bindings.last().map_or(0, |(_, range)| range.end);
+        let end = self.adapters.len();
+        if start < end {
+            self.phase_bindings.push((key, start..end));
+        }
+    }
+
+    /// Capture immutable inference residuals without retaining base weights for windowed execution.
+    pub fn snapshot_adapter_stack(&self) -> AdapterStack {
+        AdapterStack {
+            adapters: self.adapters.clone(),
+            phase_bindings: self.phase_bindings.clone(),
+        }
+    }
+
+    /// Restore inference residuals on a reopened base, retaining their slot bindings.
+    pub fn restore_adapter_stack(&mut self, stack: &AdapterStack) {
+        self.set_adapters(stack.adapters.clone());
+        self.phase_bindings.clone_from(&stack.phase_bindings);
     }
 
     /// Evaluate every adapter residual attached to this Linear without touching its base weight.
@@ -1585,20 +1556,49 @@ impl AdaptableLinear {
                 None => adapter.default_scale(),
             };
             let eff_scale = scales.map_or(base_scale, |ctx| ctx.scale_for(idx, base_scale));
-            if self.training_residual {
-                out = add(&out, &adapter.residual_with_scale(x, eff_scale)?)?;
-                continue;
-            }
-            if eff_scale == 0.0 {
-                continue;
-            }
-            let residual = adapter.residual_with_scale(x, eff_scale)?;
-            let residual = if residual.dtype() == out.dtype() {
-                residual
-            } else {
-                residual.as_dtype(out.dtype())?
-            };
-            out = add(&out, &residual)?;
+            out = self.accumulate_residual(x, out, adapter, eff_scale)?;
+        }
+        Ok(out)
+    }
+
+    fn accumulate_residual(
+        &self,
+        x: &Array,
+        out: Array,
+        adapter: &Adapter,
+        scale: f32,
+    ) -> Result<Array> {
+        if self.training_residual {
+            return Ok(add(&out, &adapter.residual_with_scale(x, scale)?)?);
+        }
+        if scale == 0.0 {
+            return Ok(out);
+        }
+        let residual = adapter.residual_with_scale(x, scale)?;
+        let residual = if residual.dtype() == out.dtype() {
+            residual
+        } else {
+            residual.as_dtype(out.dtype())?
+        };
+        Ok(add(&out, &residual)?)
+    }
+
+    /// Evaluate the explicitly ordered phase selection against immutable installed factors.
+    /// The scale key selects factors prepared with the original loader arithmetic, including
+    /// any low-precision structured scale bake. Repeated slots replay their residuals in
+    /// order, and a sparse projection skips slots for which it has no factors.
+    pub fn forward_with_phase(
+        &self,
+        x: &Array,
+        selection: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
+        let Some(selection) = selection else {
+            return self.forward(x);
+        };
+        let mut out = self.base.forward(x)?;
+        for index in selected_adapter_indices(&self.phase_bindings, selection) {
+            let adapter = &self.adapters[index];
+            out = self.accumulate_residual(x, out, adapter, adapter.default_scale())?;
         }
         Ok(out)
     }
@@ -1942,6 +1942,21 @@ pub fn install_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_bindings_follow_sparse_selection_order_and_duplicate_slots() {
+        let first = PhaseAdapterScale::new(0, 0.5);
+        let later = PhaseAdapterScale::new(4, 0.75);
+        let other_scale = PhaseAdapterScale::new(0, 1.25);
+        let sparse = PhaseAdapterScale::new(2, 1.0);
+        let bindings = [(first, 0..2), (other_scale, 2..3), (later, 3..4)];
+        let selected = [later, sparse, first, later, other_scale];
+        assert_eq!(
+            selected_adapter_indices(&bindings, &selected).collect::<Vec<_>>(),
+            [3, 0, 1, 3, 2],
+        );
+        assert!(selected_adapter_indices(&bindings, &[]).next().is_none());
+    }
 
     #[test]
     fn scale_context_resolves_per_adapter_and_uniform_overrides_without_mutation() {

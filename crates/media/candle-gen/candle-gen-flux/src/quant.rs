@@ -1,92 +1,14 @@
-//! FLUX.1 [schnell] packed-load seam (sc-9407, sc-9089 umbrella) — the candle twin of the flux2-dev
-//! conversion (sc-9087) and the z-image conversion (sc-9408), built on the shared
-//! [`candle_gen::quant`] packed-load module (sc-9086).
-//!
-//! FLUX.1 [schnell] ships a **pre-quantized** MLX tier (`SceneWorks/flux1-schnell-mlx`, epic 8506)
-//! whose q4/q8 snapshots store each quantized `Linear` / token embedding as the MLX packed triple
-//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. [`QLinear::linear_detect`] /
-//! [`QEmbedding::detect`] packed-**detect** the `.scales` sibling and build the quantized weight
-//! **straight from the packed parts** on the target device via the shared [`candle_gen::quant::lin`] /
-//! `embedding` loaders (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0` requant). **No dense bf16 weight is
-//! ever materialized** on the packed path — the q4 DiT lands ~6.3 GB directly rather than staging a
-//! ~24 GB dense DiT in RAM first.
-//!
-//! Absent `.scales` (a dense bf16 tier — the stock black-forest-labs `FLUX.1-schnell` BFL snapshot)
-//! the loader falls back to the **stock** BFL-layout `candle-transformers` path unchanged (see
-//! [`crate::pipeline`]), so one crate serves both a dense BFL snapshot and a packed diffusers snapshot.
-//!
-//! **The packed forward dequantizes the weight into a dense matmul (sc-7702)** — it does *not* take
-//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. The whole
-//! `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005): FLUX.1's packed
-//! projections load through the shared [`candle_gen::quant::QLinear`]'s
-//! [`MatmulStrategy::DequantDense`](candle_gen::quant::MatmulStrategy::DequantDense) arm, which owns
-//! that behavior. This module re-exports that shared `QLinear` under the crate-local name every vendored
-//! diffusers DiT / T5 / CLIP builds its projections from, and keeps the thin dense-or-packed
-//! [`QEmbedding`] wrapper + the [`candle_gen::quant::dequant_packed_to_dense`] VAE helper the packed loaders need.
-//!
-//! FLUX.1 has no *dense-tier on-the-fly* quant path (the only quantized tier is the pre-packed MLX
-//! one), so — like the z-image seam and unlike the flux2 seam — this crate never folds a dense weight;
-//! it only packed-detects. The [`QLinear::quantize`] / `quantize_onto` folds on the shared type are
-//! simply never called here.
+//! FLUX.1 projections use the shared additive Linear for dense, native and packed weights.
 
-use candle_gen::candle_core::{Result, Tensor};
-use candle_gen::candle_nn::{Embedding, Module, VarBuilder};
-use candle_gen::quant as shared;
-
-// The `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005). FLUX.1's packed
-// projections take the shared [`MatmulStrategy::DequantDense`] arm (sc-7702-safe, no int8 activation
-// quant), built by `QLinear::linear_detect` on an MLX tier. Re-export the shared type under the
-// crate-local `QLinear` name the vendored DiT / T5 / CLIP reference.
 pub use candle_gen::quant::AdaptLinear as QLinear;
-
-/// A token embedding that is **dense** (`candle_nn::Embedding`) or **packed** (loaded straight from an
-/// MLX-packed tier's embedding triple via the shared [`candle_gen::quant::QEmbedding`], sc-9407). The
-/// FLUX packed tier packs the CLIP `token_embedding`/`position_embedding`, the T5 `shared` token table,
-/// and the T5 per-block `relative_attention_bias` table, so this closes the packed-detect surface over
-/// every embedding table too (no dense table materialized on the packed path).
-pub enum QEmbedding {
-    Dense(Embedding),
-    Packed(shared::QEmbedding),
-}
-
-impl QEmbedding {
-    /// **Packed-detecting** `[vocab, hidden]` embedding loader (sc-9407): packed when `{base}.scales`
-    /// is present in `vb` (build straight from the packed parts via the shared
-    /// [`candle_gen::quant::embedding`], dequantized to `vb.dtype()` — dtype parity with the dense
-    /// table), else dense (`{base}.weight`, path unchanged). `base` is the full dotted key prefix.
-    pub fn detect(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::embedding(vb, base, vocab, hidden)?));
-        }
-        Ok(Self::Dense(candle_gen::candle_nn::embedding(
-            vocab,
-            hidden,
-            vb.pp(base),
-        )?))
-    }
-
-    /// Index-select the embedding rows for `indexes`.
-    pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
-            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
-        }
-    }
-
-    /// Whether this embedding loaded directly from an MLX-packed tier — used by the loaders/tests to
-    /// assert a packed tier fired the packed path (and did not silently fall back to dense).
-    #[cfg(test)]
-    pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
-    use candle_gen::candle_core::{DType, Device};
-    use candle_gen::candle_nn::Linear;
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::{Linear, VarBuilder};
+    use candle_gen::quant as shared;
     use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
@@ -209,14 +131,20 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
-        let emb = QEmbedding::detect(&vb, "shared", vocab, hidden)?;
-        assert!(emb.is_packed(), "`.scales` ⇒ packed embedding");
-        let dense = QEmbedding::detect(&vb, "dense", vocab, hidden)?;
-        assert!(!dense.is_packed(), "no `.scales` ⇒ dense embedding");
+        let emb = shared::embedding(&vb, "shared", vocab, hidden)?;
+        assert!(
+            emb.resident_storage().is_some(),
+            "`.scales` ⇒ packed embedding"
+        );
+        let dense = shared::embedding(&vb, "dense", vocab, hidden)?;
+        assert!(
+            dense.resident_storage().is_none(),
+            "no `.scales` ⇒ dense embedding"
+        );
 
         let idx = Tensor::from_vec(vec![0u32, 5, 31, 12, 5], (5,), &dev)?;
-        let p = emb.forward(&idx)?;
-        let d = dense.forward(&idx)?;
+        let p = __model_proof_output!(emb.forward(&idx))?;
+        let d = __model_proof_output!(dense.forward(&idx))?;
         let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(
             dev_max, 0.0,

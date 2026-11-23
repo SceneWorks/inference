@@ -43,81 +43,7 @@ use gen_core::Quant;
 /// Canonical backend linear projection type alias on the shared `candle-layers` spine (`BACK-1`, `BACK-4`).
 pub type Linear = AdaptLinear;
 
-/// Request-scoped / per-pass adapter scale overrides (`PIPE-14`, `BACK-1`, `BACK-4`).
-///
-/// Shared resident modules remain immutable during a run; callers pass `ScaleContext` into
-/// [`AdaptLinear::forward_with_scales`] or [`AdaptLinear::apply_residuals_with_scales`] to override
-/// or modulate adapter scales per request or per pass without mutating `&self`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ScaleContext<'a> {
-    /// Optional per-adapter scale overrides indexed by adapter position.
-    pub adapter_scales: Option<&'a [f32]>,
-    /// Optional uniform scale multiplier applied across all adapters (defaults to `1.0` when `None`).
-    pub uniform_scale: Option<f32>,
-    /// Pass index for multi-pass pipelines (e.g., conditional / unconditional / guidance passes).
-    pub pass: usize,
-}
-
-impl<'a> ScaleContext<'a> {
-    /// Default pass-0 context with no scale overrides.
-    pub const fn new() -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Override per-adapter scales by position.
-    pub const fn with_adapter_scales(adapter_scales: &'a [f32]) -> Self {
-        Self {
-            adapter_scales: Some(adapter_scales),
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Apply a uniform scale multiplier across all installed adapters for this request/pass.
-    pub const fn with_uniform_scale(scale: f32) -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: Some(scale),
-            pass: 0,
-        }
-    }
-
-    /// Attach a pass index to this scale context.
-    pub const fn with_pass(mut self, pass: usize) -> Self {
-        self.pass = pass;
-        self
-    }
-
-    /// Resolve the effective `f32` scale for adapter at `index` with installed `default_scale`.
-    #[inline]
-    pub fn scale_for(&self, index: usize, default_scale: f32) -> f32 {
-        let base = self
-            .adapter_scales
-            .and_then(|s| s.get(index).copied())
-            .unwrap_or(default_scale);
-        match self.uniform_scale {
-            Some(mult) => base * mult,
-            None => base,
-        }
-    }
-
-    /// Resolve the effective `f64` scale for adapter at `index` with installed `default_scale`.
-    #[inline]
-    pub fn scale_for_f64(&self, index: usize, default_scale: f64) -> f64 {
-        let base = self
-            .adapter_scales
-            .and_then(|s| s.get(index).copied().map(f64::from))
-            .unwrap_or(default_scale);
-        match self.uniform_scale {
-            Some(mult) => base * f64::from(mult),
-            None => base,
-        }
-    }
-}
+pub use gen_core::phase::ScaleContext;
 
 struct ReferenceMathHooks {
     on_apply_factor: fn() -> bool,
@@ -495,6 +421,15 @@ impl MatrixDelta {
     pub fn nbytes(&self) -> usize {
         tensor_bytes(&self.weight)
     }
+
+    pub fn forward_with_scale(&self, x: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
+        let output = self.forward(x)?;
+        if scale == 1.0 {
+            Ok(output)
+        } else {
+            output * scale
+        }
+    }
 }
 
 impl Module for MatrixDelta {
@@ -616,14 +551,7 @@ impl Adapter {
         override_scale: f64,
     ) -> candle_core::Result<Tensor> {
         match self {
-            Adapter::MatrixDelta(delta) => {
-                let y = delta.forward(x)?;
-                if override_scale == 1.0 {
-                    Ok(y)
-                } else {
-                    y * override_scale
-                }
-            }
+            Adapter::MatrixDelta(delta) => delta.forward_with_scale(x, override_scale),
             Adapter::Lora { a, b, prepared, .. } => {
                 let xd = x.dtype();
                 let (a, b) = prepared.factors(a, b, xd)?;
@@ -810,6 +738,26 @@ impl LokrFactors {
         )
     }
 
+    /// Re-bake a request's absolute scale against the F32 right factor from this installation.
+    pub fn with_scaled_right(
+        &self,
+        unscaled_right: &Tensor,
+        scale: f64,
+    ) -> candle_core::Result<Self> {
+        if !scale.is_finite() {
+            candle_core::bail!("lokr: derived scale must be finite, got {scale}");
+        }
+        let w2 = (unscaled_right * scale)?
+            .contiguous()?
+            .to_device(self.w2.device())?;
+        Ok(Self {
+            w2,
+            scale,
+            prepared: Arc::default(),
+            ..self.clone()
+        })
+    }
+
     /// Build factors for a fused source projection and retain only `output_slice` in the residual.
     /// This routes BFL/ComfyUI fused FLUX QKV LoKr onto split q/k/v host projections without ever
     /// materializing the fused `[out,in]` weight delta.
@@ -906,7 +854,7 @@ impl LokrFactors {
             return Ok(None);
         }
         // Bake the full scale into `w2` (keeps `w1` a clean copy); hold f32, contiguous for the matmuls.
-        let w2 = (factor2 * scale)?.contiguous()?;
+        let w2 = (&factor2 * scale)?.contiguous()?;
         let w1 = factor1.contiguous()?;
         Ok(Some(Self {
             w1,
@@ -1433,6 +1381,24 @@ impl AdaptLinear {
         scales: Option<&ScaleContext<'_>>,
     ) -> candle_core::Result<Tensor> {
         self.apply_residuals_with_scales(x, self.base.forward(x)?, scales)
+    }
+
+    /// Evaluate an explicitly selected stack in caller order over the same frozen base. The
+    /// provider resolves sparse source slots to this projection's residuals before calling.
+    pub fn forward_with_selected_adapters<'a>(
+        &self,
+        x: &Tensor,
+        selected: impl IntoIterator<Item = candle_core::Result<(std::borrow::Cow<'a, Adapter>, f64)>>,
+    ) -> candle_core::Result<Tensor> {
+        let mut y = self.base.forward(x)?;
+        for adapter in selected {
+            let (adapter, scale) = adapter?;
+            if scale != 0.0 {
+                let residual = adapter.residual_with_scale(x, scale)?.to_dtype(y.dtype())?;
+                y = (y + residual)?;
+            }
+        }
+        Ok(y)
     }
 
     /// Dense base inspection without dequantization. Preparation refuses tracked weights.

@@ -381,6 +381,7 @@ impl Pipeline {
                 adapters,
                 with_vae_encoder,
                 memory_strategy_2_5::TransformerExecution::default(),
+                &gen_core::CancelFlag::new(),
             );
         }
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
@@ -468,6 +469,7 @@ impl Pipeline {
         adapters: &[AdapterSpec],
         with_vae_encoder: bool,
         execution: memory_strategy_2_5::TransformerExecution,
+        cancel: &gen_core::CancelFlag,
     ) -> CResult<Components> {
         let bundle = self.split_bundle.as_ref().expect("split route has bundle");
         let transformer = bundle
@@ -546,7 +548,13 @@ impl Pipeline {
                 AvDiT::new(dit_vb.clone(), &self.av_cfg)
             })?
         };
-        adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        if self.transformer_variant.is_dev() {
+            // Resident blocks own their tensors. The streamed path retains its own builder.
+            drop(dit_vb);
+            adapters::install_ltx25_dev_adapters(&mut avdit, adapters, cancel)?;
+        } else {
+            adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        }
         if let Some(chunk) = execution.attention_chunk_size {
             avdit.set_attention_budget(chunk as usize);
         }
@@ -1182,10 +1190,8 @@ impl Pipeline {
         let stage2_keyframes =
             self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
         let clips = self.build_clips(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
-        let stage_seeds =
-            orchestration.stage1_setup(!keyframes.is_empty(), !clips.is_empty(), |pass| {
-                comps.avdit.set_adapter_pass(pass)
-            });
+        let (stage_seeds, stage1_scales) =
+            orchestration.stage1_setup(!keyframes.is_empty(), !clips.is_empty());
         let vnoise =
             pipeline::create_noise(stage_seeds.video_stage1, t_lat, h_lat, w_lat, &self.device)?;
         let anoise = pipeline::create_audio_noise(stage_seeds.audio_stage1, af, &self.device)?;
@@ -1257,7 +1263,7 @@ impl Pipeline {
                 .iter()
                 .map(|&block| block as usize)
                 .collect();
-            let (state, audio) = pipeline::denoise_av_dev_conditioned(
+            let (state, audio) = pipeline::denoise_av_dev_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &anoise,
@@ -1271,6 +1277,7 @@ impl Pipeline {
                 &stage1_stg_blocks,
                 crate::params::LTX_2_5_PARAMS.video_guider,
                 crate::params::LTX_2_5_PARAMS.audio_guider,
+                &stage1_scales,
                 &req.cancel,
                 &mut stage1_forward,
                 &mut stage1_progress,
@@ -1307,7 +1314,7 @@ impl Pipeline {
                 )?;
             }
             let mut stage1_forward = || Ok(());
-            let (state, audio) = pipeline::denoise_av_conditioned(
+            let (state, audio) = pipeline::denoise_av_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &anoise,
@@ -1316,6 +1323,7 @@ impl Pipeline {
                 af,
                 &audio_grid,
                 &STAGE1_SIGMAS,
+                &stage1_scales,
                 &req.cancel,
                 &mut stage1_forward,
                 &mut stage1_progress,
@@ -1356,6 +1364,7 @@ impl Pipeline {
                         &video_grid,
                         &audio_grid,
                         &stage1_rope,
+                        &stage1_scales,
                     )?;
                     Ok(AvLatents {
                         video: pipeline::unflatten_latent(
@@ -1398,16 +1407,13 @@ impl Pipeline {
             fps as f32,
             &self.device,
         )?;
-        let stage2_initial = orchestration.stage2_renoise(
-            STAGE2_SIGMAS[0],
-            || {
+        let (stage2_initial, stage2_scales) =
+            orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
                 Ok(AvLatents {
                     video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
                     audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
                 })
-            },
-            |pass| comps.avdit.set_adapter_pass(pass),
-        )?;
+            })?;
         let mut stage2_fold = pipeline::StageProgressFold::new(stage1_steps, 3, total_steps);
         let mut stage2_progress = |event: Progress| {
             if let Some(event) = stage2_fold.fold(event) {
@@ -1443,6 +1449,7 @@ impl Pipeline {
                             &stage2_grid,
                             &audio_grid,
                             &stage2_rope,
+                            &stage2_scales,
                         )?;
                         Ok(AvLatents {
                             video: pipeline::unflatten_latent(
@@ -1481,7 +1488,7 @@ impl Pipeline {
                     .stage2_forward(|| Ok(()))
                     .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
             };
-            let (state, audio) = pipeline::denoise_av_conditioned(
+            let (state, audio) = pipeline::denoise_av_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &stage2_initial.audio,
@@ -1490,6 +1497,7 @@ impl Pipeline {
                 af,
                 &audio_grid,
                 &STAGE2_SIGMAS,
+                &stage2_scales,
                 &req.cancel,
                 &mut stage2_forward,
                 &mut stage2_progress,
@@ -2590,11 +2598,20 @@ impl Generator for Ltx25Generator {
             .as_ref()
             .is_none_or(|(cached_key, _)| *cached_key != key)
         {
+            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
             *slot = None;
-            *slot = Some((
-                key,
-                pipe.load_components_split(&self.adapters, key.with_vae_encoder, execution)?,
-            ));
+            let components = pipe.load_components_split(
+                &self.adapters,
+                key.with_vae_encoder,
+                execution,
+                &req.cancel,
+            )?;
+            if self.transformer_variant.is_dev() {
+                candle_gen::residency::check_cancel(&req.cancel)?;
+            }
+            *slot = Some((key, components));
         }
         let components = slot.as_ref().expect("split components populated").1.clone();
         drop(slot);
@@ -3019,7 +3036,7 @@ mod tests {
             .expect("ordinary renderer exists");
         assert!(renderer.contains("resolve_request_num_frames("));
         assert!(renderer.contains("self.render_dfr("));
-        assert!(renderer.contains("denoise_av_dev_conditioned("));
+        assert!(renderer.contains("denoise_av_dev_conditioned_with_scales("));
         assert!(renderer.contains("negative_context"));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
     }

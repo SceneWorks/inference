@@ -50,7 +50,7 @@ def validate_plan(plan, variant, backend):
             raise ValueError("preload schedule is not the native variant's schedule")
 
 
-def read_arm(output, stdout, arm, variant, backend, artifact):
+def read_arm(output, stdout, arm, variant, backend, artifact, *, planned=None):
     model = "flux1_" + variant
     if stdout.splitlines().count("FLUX1_PAIR_COMPLETE " + model) != 1:
         raise ValueError("missing completed provider body")
@@ -76,7 +76,9 @@ def read_arm(output, stdout, arm, variant, backend, artifact):
     if len({s["sha256"] for s in states}) != 4:
         raise ValueError("trajectory did not advance at every outer step")
     plan = None
-    if arm == "head":
+    if planned is None:
+        planned = arm == "head"
+    if planned:
         plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
         validate_plan(plan, variant, backend)
         if [struct.pack(">f", f).hex() for f in plan["pass"]["sigmas"]] != [x[0] for x in rows]:

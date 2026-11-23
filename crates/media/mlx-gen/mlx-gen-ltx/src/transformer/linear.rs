@@ -90,7 +90,15 @@ impl Linear {
     }
 
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-        self.inner.forward(x)
+        self.forward_with_scales(x, None)
+    }
+
+    pub(super) fn forward_with_scales(
+        &self,
+        x: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
+        self.inner.forward_with_scales(x, adapter_scales)
     }
 
     /// Stack a LoRA residual (the loader installs one per resolved target). `a`/`b` are the raw

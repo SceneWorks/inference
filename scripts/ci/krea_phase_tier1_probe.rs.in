@@ -1,0 +1,420 @@
+// Compiled only inside the disposable, explicitly dispatched comparison checkouts.
+use super::*;
+use gen_core::{
+    AdapterKind, GenerationPhase, ImportedModelOperation, ImportedModelSource, LoadSpec,
+    PhaseAdapter, PinnedWeightsFile, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+};
+use serde_json::json;
+use std::cell::RefCell;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+const SEED: u64 = 0x5eed;
+const PROVIDER: &str = crate::KREA_2_RAW_ID;
+const CAPTION_TOKENS: usize = 3;
+
+#[derive(Default)]
+struct Trace {
+    prepare: Vec<String>,
+    velocity: Vec<String>,
+    latent: Vec<String>,
+}
+
+thread_local! {
+    static TRACE: RefCell<Trace> = RefCell::new(Trace::default());
+}
+
+fn fail(error: impl std::fmt::Display) -> CandleError {
+    CandleError::Msg(error.to_string())
+}
+
+pub(crate) fn tensor(kind: &str, value: &Tensor) -> Result<()> {
+    assert!(
+        value.device().is_cuda(),
+        "{kind} must be on the selected device"
+    );
+    match kind {
+        "prepare" => assert_eq!(value.dims(), &[1, CAPTION_TOKENS, 6144]),
+        "velocity" | "latent" => assert_eq!(value.dims(), &[1, 16, 32, 32]),
+        _ => panic!("unknown traced tensor {kind}"),
+    }
+    let values = value
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert!(!values.is_empty() && values.iter().all(|value| value.is_finite()));
+    let path = PathBuf::from(std::env::var_os("PAIR_OUT").unwrap()).join("tensor.pending");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(fail)?;
+    let mut out = std::io::BufWriter::new(file);
+    for value in values {
+        out.write_all(&value.to_bits().to_le_bytes())
+            .map_err(fail)?;
+    }
+    out.flush().map_err(fail)?;
+    drop(out);
+    let digest = gen_core::snapshot_inventory::sha256_file(&path)?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::remove_file(path).map_err(fail)?;
+    TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        match kind {
+            "prepare" => &mut trace.prepare,
+            "velocity" => &mut trace.velocity,
+            "latent" => &mut trace.latent,
+            _ => panic!("unknown traced tensor {kind}"),
+        }
+        .push(digest);
+    });
+    Ok(())
+}
+
+fn request(selected: bool) -> GenerationRequest {
+    let middle = if selected {
+        [(1, -0.5), (0, 1.5), (1, 0.25)]
+            .into_iter()
+            .map(|(adapter, weight)| PhaseAdapter {
+                adapter,
+                weight: Some(weight),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    GenerationRequest {
+        prompt: "red kite".into(),
+        negative_prompt: Some("blue".into()),
+        width: 256,
+        height: 256,
+        seed: Some(SEED),
+        sampler: Some("dpmpp_2m_sde".into()),
+        phases: Some(vec![
+            GenerationPhase {
+                steps: 2,
+                guidance: Some(0.0),
+                adapters: vec![],
+            },
+            GenerationPhase {
+                steps: 3,
+                guidance: Some(2.0),
+                adapters: middle,
+            },
+            GenerationPhase {
+                steps: 2,
+                guidance: Some(0.0),
+                adapters: vec![],
+            },
+        ]),
+        ..Default::default()
+    }
+}
+
+fn invalid(error: gen_core::Error, reason: &str) {
+    assert!(matches!(
+        error,
+        gen_core::Error::Msg(_) | gen_core::Error::Unsupported(_)
+    ));
+    assert!(error.to_string().contains(reason), "{error}");
+}
+
+fn verify_route(registry: &gen_core::ProviderRegistry, root: &Path) -> Result<()> {
+    let descriptor = registry
+        .imported_model_descriptor(
+            "krea_2",
+            ImportedModelSource::TransformerFile,
+            ImportedModelOperation::MultiPhase,
+        )
+        .expect("registry must route native imports to Raw");
+    assert_eq!(descriptor.id, PROVIDER);
+    assert!(descriptor.capabilities.supports_phases);
+    let mut req = request(true);
+    descriptor.capabilities.validate_request(PROVIDER, &req)?;
+    crate::validate_phases(PROVIDER, &req)?;
+    req.use_pid = true;
+    invalid(crate::validate_phases(PROVIDER, &req).unwrap_err(), "PiD");
+    req.use_pid = false;
+    invalid(
+        crate::validate_phases(crate::KREA_2_TURBO_ID, &req).unwrap_err(),
+        PROVIDER,
+    );
+    let folded = AdapterSpec::new(root.join("fold-only.safetensors"), 1.0, AdapterKind::Lora);
+    assert!(crate::adapters::any_diff_patch(&[folded]));
+    invalid(
+        crate::ensure_multiphase_allowed_for(PROVIDER, true, &req).unwrap_err(),
+        "diff-patch",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn retain_cuda_pool(out: &Path, uuid: &str) -> Result<()> {
+    use candle_gen::candle_core::cuda_backend::proof_pool;
+    let pool =
+        proof_pool::snapshot(0)?.ok_or_else(|| fail("CUDA scoped proof pool not installed"))?;
+    assert!(pool.used_bytes > 0 && pool.reserved_bytes > 0);
+    let row = json!({"pid": std::process::id(), "cudaDeviceUuid": uuid,
+                     "poolUsedBytes": pool.used_bytes, "poolUsedHighBytes": pool.used_high_bytes,
+                     "poolReservedBytes": pool.reserved_bytes, "poolReservedHighBytes": pool.reserved_high_bytes});
+    let pending = out.join("cuda-pool.pending");
+    let target = out.join("cuda-pool.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)
+        .map_err(fail)?;
+    serde_json::to_writer(&mut file, &row).map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    drop(file);
+    assert!(!target.exists());
+    std::fs::rename(pending, target).map_err(fail)?;
+    // Hold the real CUDA context across the supervisor's bounded sampling ticks.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn retain_cuda_pool(_: &Path, _: &str) -> Result<()> {
+    Err(fail("CUDA proof requires a CUDA build"))
+}
+
+pub fn compare_native_phases() -> Result<()> {
+    let root = PathBuf::from(std::env::var_os("PAIR_SGA_FIXTURE").expect("fixture path"));
+    let out = PathBuf::from(std::env::var_os("PAIR_OUT").expect("proof output path"));
+    let uuid = std::env::var("CUDA_VISIBLE_DEVICES").expect("selected CUDA UUID");
+    assert!(uuid.starts_with("GPU-") && !uuid.contains(','));
+    let device = Device::new_cuda(0)?;
+    assert_eq!(
+        device.location(),
+        candle_gen::candle_core::DeviceLocation::Cuda { gpu_id: 0 }
+    );
+    let source = root.join("native.safetensors");
+    assert!(!root.join("transformer/model.safetensors").exists());
+    let cfg = Krea2Config::from_snapshot(&root)?;
+    assert_eq!(
+        cfg,
+        Krea2Config {
+            num_layers: 1,
+            ..Krea2Config::turbo()
+        }
+    );
+    assert_eq!(DIT_DTYPE, DType::BF16);
+    let mut spec = LoadSpec::new(WeightsSource::File(source.clone()))
+        .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()))
+        .with_adapters(vec![
+            AdapterSpec::new(root.join("text.safetensors"), 0.625, AdapterKind::Lora),
+            AdapterSpec::new(root.join("trunk.safetensors"), 0.875, AdapterKind::Lora),
+        ]);
+    spec.prepare_file_sources()?;
+    let native = spec.file_pin_for(source)?;
+    let registry = crate::provider_registry()?;
+    verify_route(&registry, &root)?;
+    let make_context = |offset: i32| -> Result<Tensor> {
+        let values = (0..CAPTION_TOKENS * cfg.num_text_layers * cfg.text_hidden_dim)
+            .map(|index| (((index as i32 + offset) * 17 % 37) - 18) as f32 / 32.0)
+            .collect::<Vec<_>>();
+        Ok(Tensor::from_vec(
+            values,
+            (1, CAPTION_TOKENS, cfg.num_text_layers, cfg.text_hidden_dim),
+            &device,
+        )?)
+    };
+    let positive = make_context(1)?;
+    let negative = make_context(23)?;
+    let mut cases = Vec::new();
+    for (staged, placement) in [(false, "resident"), (true, "staged")] {
+        let (load_root, load_pin, load_spec, load_device) =
+            (root.clone(), native.clone(), spec.clone(), device.clone());
+        let residency = candle_gen::Residency::<(), Krea2Transformer>::request_scoped(
+            |_| Ok(()),
+            move |_, _| load(&load_root, &load_pin, &load_spec, &load_device),
+        );
+        for (selected, arm) in [(true, "selected"), (false, "base")] {
+            let req = request(selected);
+            let mut progress = Vec::new();
+            let mut on_progress = |event| match event {
+                Progress::Step { current, total } => progress.push([current, total]),
+                Progress::Decoding => progress.push([0, 0]),
+                _ => {}
+            };
+            let rendered = residency.run_request_scoped(
+                staged,
+                false,
+                &req.cancel,
+                false,
+                &mut on_progress,
+                |_| Ok(()),
+                |_| Ok(()),
+                |dit, (), progress| {
+                    run(
+                        dit, &registry, &root, &native, &spec, &positive, &negative, &req, progress,
+                    )
+                },
+            )?;
+            assert_eq!(rendered.len(), 1);
+            let trace = TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()));
+            cases.push(json!({"case": format!("{placement}-{arm}"), "prepare": trace.prepare,
+                              "velocity": trace.velocity, "latent": trace.latent, "progress": progress}));
+        }
+    }
+    native.verify_unchanged()?;
+    retain_cuda_pool(&out, &uuid)?;
+    let result = json!({"device": uuid, "cases": cases});
+    let report = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out.join("result.json"))
+        .map_err(fail)?;
+    serde_json::to_writer(report, &result).map_err(fail)?;
+    println!("KREA_NATIVE_PHASE_TIER1_COMPLETED");
+    Ok(())
+}
+
+fn identity_decode(latent: &Tensor) -> Result<()> {
+    assert_eq!(latent.dims(), &[1, 16, 32, 32]);
+    assert_eq!(latent.dtype(), DType::F32);
+    tensor("latent", latent)
+}
+
+// --- baseline arm ---
+fn load(
+    root: &Path,
+    native: &PinnedWeightsFile,
+    spec: &LoadSpec,
+    device: &Device,
+) -> Result<Krea2Transformer> {
+    load_native_dit_at_dtype(
+        root,
+        native,
+        device,
+        &spec.adapters,
+        None,
+        false,
+        DIT_DTYPE,
+        &gen_core::CheckpointFactsSink::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    dit: &Krea2Transformer,
+    _: &gen_core::ProviderRegistry,
+    root: &Path,
+    native: &PinnedWeightsFile,
+    spec: &LoadSpec,
+    positive: &Tensor,
+    negative: &Tensor,
+    req: &GenerationRequest,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<()>> {
+    let requested = req.phases.as_deref().unwrap();
+    let resolved =
+        crate::multiphase::resolve_phases(requested, RAW_GUIDANCE, spec.adapters.len(), PROVIDER)?;
+    let mut invalid_phases = requested.to_vec();
+    invalid_phases[0].adapters.push(PhaseAdapter {
+        adapter: spec.adapters.len(),
+        weight: None,
+    });
+    invalid(
+        crate::multiphase::resolve_phases(
+            &invalid_phases,
+            RAW_GUIDANCE,
+            spec.adapters.len(),
+            PROVIDER,
+        )
+        .unwrap_err(),
+        "out of range",
+    );
+    render_multiphase_driver(
+        root,
+        Some(native),
+        None,
+        dit.device(),
+        &resolved,
+        &spec.adapters,
+        positive,
+        Some(negative),
+        req,
+        progress,
+        DIT_DTYPE,
+        &mut |phase, specs, report, _| {
+            if phase == Some(1) && !specs.is_empty() {
+                assert_eq!(specs.len(), 3);
+                assert_eq!(report.applied, 3);
+            } else {
+                assert!(specs.is_empty());
+                assert_eq!(report.applied, 0);
+            }
+        },
+        &mut identity_decode,
+    )
+}
+// --- current arm ---
+fn load(
+    root: &Path,
+    native: &PinnedWeightsFile,
+    spec: &LoadSpec,
+    device: &Device,
+) -> Result<Krea2Transformer> {
+    load_native_dit_at_dtype(
+        root,
+        native,
+        device,
+        AdapterLoad {
+            specs: &spec.adapters,
+            phase_source: Some(spec),
+        },
+        None,
+        false,
+        DIT_DTYPE,
+        &gen_core::CheckpointFactsSink::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    dit: &Krea2Transformer,
+    registry: &gen_core::ProviderRegistry,
+    _: &Path,
+    _: &PinnedWeightsFile,
+    spec: &LoadSpec,
+    positive: &Tensor,
+    negative: &Tensor,
+    req: &GenerationRequest,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<()>> {
+    let plan = registry
+        .compile_render_plan(PROVIDER, spec, req)?
+        .expect("registered Raw plan");
+    assert_eq!(plan.denoise_spans(), [0..2, 2..5, 5..7]);
+    assert_eq!(plan.sampler(), "dpmpp_2m_sde");
+    let mut bad = req.clone();
+    bad.phases.as_mut().unwrap()[0].adapters.push(PhaseAdapter {
+        adapter: spec.adapters.len(),
+        weight: None,
+    });
+    invalid(
+        registry
+            .compile_render_plan(PROVIDER, spec, &bad)
+            .unwrap_err(),
+        "out of range",
+    );
+    plan.check_request(&crate::raw_descriptor(), req)?;
+    plan.check_load_spec(spec)?;
+    let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+    run.encode(|| Ok::<_, CandleError>(()))?;
+    render_multiphase_driver(
+        dit,
+        &run,
+        positive,
+        Some(negative),
+        req,
+        progress,
+        |_, _, _| {},
+        identity_decode,
+    )
+}

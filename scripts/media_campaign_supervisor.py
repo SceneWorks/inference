@@ -533,6 +533,7 @@ class SystemProbe:
         self.policy = policy
         # {pid: bytes} behind the most recent tree_footprint total (POSIX backends only).
         self.last_tree_breakdown: dict[int, int] = {}
+        self.last_windows_footprint_details: dict[str, object] | None = None
         # {pid: lifetime peak bytes} from the kernel's own per-process high-water mark: macOS
         # ri_lifetime_max_phys_footprint, Linux VmHWM. Windows has no per-process ledger here.
         self.lifetime_peaks: dict[int, int] = {}
@@ -585,9 +586,11 @@ class SystemProbe:
         """The owned tree's footprint, or None when every owned process vanished mid-sample."""
         if self.policy.backend in {"windows-cpu", "windows-cuda"}:
             try:
-                return owner.footprint_bytes()
+                footprint = owner.footprint_bytes()
             except windows.WindowsJobError as error:
                 raise SupervisionError("probe-failure", str(error)) from error
+            self.last_windows_footprint_details = getattr(owner, "last_footprint_details", None)
+            return footprint
         pids = owner.members()
         self.last_tree_breakdown = {}
         if not pids:
@@ -1579,8 +1582,9 @@ def _run_admitted(
                             failed_footprint_ticks.succeeded()
                     if footprint is not None:
                         peak_host = max(peak_host, footprint)
+                        sampled_at = time.time_ns()
                         samples.append({"phase": "process-sample", "sample_kind": "process",
-                                        "peak_bytes": footprint, "at_ns": time.time_ns()})
+                                        "peak_bytes": footprint, "at_ns": sampled_at})
                         trajectory.append((int((clock() - started) * 1000), footprint))
                         if len(samples) * 160 > policy.event_cap_bytes:
                             raise SupervisionError("event-cap", "process sample spool exceeded cap")
@@ -1589,6 +1593,11 @@ def _run_admitted(
                             error.watchdog_child_footprint = child_footprint_breach(
                                 footprint, policy.child_footprint_cap_bytes, trajectory,
                                 getattr(probe, "last_tree_breakdown", None))
+                            details = getattr(probe, "last_windows_footprint_details", None)
+                            if details is not None:
+                                error.watchdog_child_footprint["windowsSample"] = {
+                                    **details, "sampledAtUnixNs": sampled_at,
+                                }
                             raise error
                     for state in devices:
                         if (multi_cuda or claim_deadline_monotonic is not None) and deadline_reached():

@@ -1,7 +1,7 @@
 //! Ordered multi-pass image plans whose later passes consume an earlier pass's output.
 //!
 //! Hires.fix renders a base pass, stretches its image to the target size and renders a second,
-//! noise-start pass that conditions on it. Every pass is an ordinary [`RenderPlan`] compiled by
+//! refinement pass that consumes it. Every pass is an ordinary [`RenderPlan`] compiled by
 //! the provider's own pre-load compiler, so pass geometry, steps and refusal rules are checked
 //! before load exactly as for a single-pass request. A produced reference is bound by its declared
 //! geometry and strength instead of a pixel digest, because its bytes exist only after the earlier
@@ -9,7 +9,7 @@
 //! [`crate::Generator::generate_planned`] with `plan.passes()[i]`.
 
 use super::{RenderPlan, Serialize};
-use crate::{Conditioning, Error, GenerationRequest, Image, Result};
+use crate::{Conditioning, Error, GenerationRequest, Image, LoadSpec, Result};
 
 /// Largest produced-reference placeholder the compiler allocates (4096² RGB). Providers refuse
 /// larger sizes themselves; this only bounds the stand-in buffer used for compilation.
@@ -70,7 +70,8 @@ impl MultiPassRenderPlan {
                             produced.from_pass
                         )));
                     }
-                    if !pass.request.conditioning.is_empty() {
+                    if !pass.request.conditioning.is_empty() || pass.request.source_image.is_some()
+                    {
                         return Err(Error::Unsupported(format!(
                             "pass {index} declares a produced reference and must carry no other \
                              conditioning"
@@ -78,7 +79,7 @@ impl MultiPassRenderPlan {
                     }
                     let request = with_placeholder_reference(pass.request, produced)?;
                     compile(&request)?
-                        .map(|plan| plan.into_produced_reference(produced.from_pass))
+                        .map(|plan| plan.into_produced_reference(produced))
                         .transpose()?
                 }
             };
@@ -102,6 +103,7 @@ impl MultiPassRenderPlan {
             if pass.provider != first.provider
                 || pass.backend != first.backend
                 || pass.preparation() != first.preparation()
+                || pass.exact_load != first.exact_load
             {
                 return Err(Error::Unsupported(format!(
                     "pass {index} belongs to a different provider or load contract"
@@ -130,7 +132,8 @@ impl MultiPassRenderPlan {
         &self.passes
     }
 
-    /// Executed denoise steps summed over every pass: the progress total of the whole render.
+    /// Executed denoise steps summed over every pass. A caller's authored progress budget may
+    /// differ when a refinement starts partway through its authored schedule.
     pub fn total_executed_steps(&self) -> usize {
         self.passes.iter().map(RenderPlan::executed_steps).sum()
     }
@@ -141,12 +144,37 @@ impl MultiPassRenderPlan {
             .iter()
             .try_for_each(|pass| pass.check_load(loaded))
     }
+
+    /// Check all passes against the exact loaded spec, including prepared sources when sealed.
+    pub fn check_load_spec(&self, spec: &LoadSpec) -> Result<()> {
+        self.passes
+            .iter()
+            .try_for_each(|pass| pass.check_load_spec(spec))
+    }
+
+    /// Update the placement of all exactly bound passes, keeping the compiled source contract.
+    pub fn rebind_load_placement(mut self, spec: &LoadSpec) -> Result<Self> {
+        self.passes = self
+            .passes
+            .into_iter()
+            .map(|pass| pass.rebind_load_placement(spec))
+            .collect::<Result<_>>()?;
+        Ok(self)
+    }
 }
 
 fn with_placeholder_reference(
     request: &GenerationRequest,
     produced: ProducedReference,
 ) -> Result<GenerationRequest> {
+    if produced
+        .strength
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(Error::Unsupported(
+            "produced reference strength must be finite and lie in 0.0..=1.0".into(),
+        ));
+    }
     let pixels = u64::from(produced.width) * u64::from(produced.height);
     if pixels == 0 || pixels > MAX_PRODUCED_REFERENCE_PIXELS {
         return Err(Error::Unsupported(format!(
@@ -157,7 +185,6 @@ fn with_placeholder_reference(
     let mut request = request.clone();
     // Target pass for low_res_start is the first denoising pass (pass 0) only (FEAT-1, PIPE-2).
     request.low_res_start = None;
-    request.source_image = None;
     request.conditioning = vec![Conditioning::Reference {
         image: Image {
             width: produced.width,

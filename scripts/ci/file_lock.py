@@ -141,17 +141,24 @@ def exclusive_file_lock(
     try_lock=None,
     monotonic=None,
     sleep=None,
+    open_persistent=None,
 ):
-    """Acquire a process-death-safe exclusive lock on `path`."""
+    """Acquire a process-death-safe exclusive lock on `path`.
+
+    A persistent-lock caller may supply a guarded opener that also creates its parent.
+    """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if open_persistent is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif remove_on_exit or fallback_excl_on_notsup:
+        raise ValueError("a guarded opener requires a persistent OS lock")
     lock_fn = try_lock_handle if try_lock is None else try_lock
     clock = time.monotonic if monotonic is None else monotonic
     sleeper = time.sleep if sleep is None else sleep
     deadline = None if timeout_seconds is None else (clock() + timeout_seconds)
 
     if not remove_on_exit and not fallback_excl_on_notsup:
-        with open(path, "a+b") as handle:
+        with (open(path, "a+b") if open_persistent is None else open_persistent(path)) as handle:
             if handle.seek(0, 2) == 0:
                 handle.write(b"0")
                 handle.flush()

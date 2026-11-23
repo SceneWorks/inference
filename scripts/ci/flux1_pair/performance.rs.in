@@ -1,0 +1,48 @@
+
+fn emit_step_sample() -> Result<(std::time::Instant, std::time::Instant), Box<dyn std::error::Error>> {
+    let (started, ended, dtype) = candle_gen::sampler::pair_take_step_sample().ok_or("missing measured sampler body")?;
+    println!("FLUX1_PAIR_DENOISE {} {dtype:?} candle-cuda", (ended - started).as_nanos());
+    Ok((started, ended))
+}
+
+// Use the Windows kernel-maintained peak resident set for this process. The
+// external Job still enforces its aggregate private/working-set bound.
+#[cfg(windows)]
+fn peak_working_set() -> Result<usize, std::io::Error> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(process: *mut c_void, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+    }
+    let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+    // SAFETY: All fields are integers. GetProcessMemoryInfo writes the stated
+    // buffer length and accepts the current-process pseudo-handle.
+    let mut counters: ProcessMemoryCounters = unsafe { std::mem::zeroed() };
+    counters.cb = cb;
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(counters.peak_working_set_size)
+}
+
+#[cfg(not(windows))]
+fn peak_working_set() -> Result<usize, std::io::Error> {
+    Err(std::io::Error::other("measured FLUX.1 ENG-4b proof requires Windows CUDA"))
+}

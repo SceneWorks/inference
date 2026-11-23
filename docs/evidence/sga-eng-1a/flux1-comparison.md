@@ -73,3 +73,87 @@ Only select Tier 2 for the feature-end real-weight campaign. A mismatch, skipped
 body, timeout, asset or setup error leaves the comparison unaccepted and retains
 the failure receipt where available. The two probe checkouts and generated
 weights are private temporary job files.
+
+## ENG-4b terminal real-weight comparison
+
+Select `eng4b-tier2` and request `flux1-eng4b-pair` on `candle-cuda`.
+Both arms use locked Cargo release builds and the planned route. The reference
+is the frozen native-format revision `be45bdf746c5d4a12d4db76f9653b8686e7f33f8`.
+Both arms include the shared native checkpoint loaders. The head is the exact
+dispatched revision and tree. Both use the full Q4 Dev and Schnell
+snapshots and the request settings above. The controller verifies the
+published file hashes before and after the comparison. One instrumented
+pair per variant checks bit-exact states and RGB8 before the performance
+samples start.
+
+The SGA PERF-1 and PERF-2 contract uses six fixed pairs per variant. Each
+pair uses fresh processes and alternates which revision goes first. Each
+measured process loads once, completes one identical warm-up, then times
+one warm resident generation. Its end-to-end timer covers planned generation
+through materialized host RGB. Its seconds per outer step come from the
+synchronized interval from the first Euler evaluation through the terminal
+state, divided by three. Evidence writes occur outside the timed intervals.
+Every measured run completes the frozen plan and produces the fidelity
+pair's RGB8. One physical CUDA claim covers the entire comparison.
+
+The timing statistic is the median of the six paired head/base ratios.
+The smallest and largest observed ratios bound the population median with
+96.875% coverage for independent pairs. Each two-sided interval passes
+when its upper bound is at most 1.02 and fails when its lower bound exceeds
+1.02. Crossing the ceiling is inconclusive. A result at the fixed sample
+budget requires a decision before any new run. Host memory uses the Windows
+process peak working set. Device memory uses the CUDA allocator's continuous
+live and driver-reserved pool high-water counters. These matched process
+peaks cover load, warm-up and generation. The head maximum for each domain
+must be at most 1.02 times the base maximum. External guard samples and the
+driver-wide allocation bound remain diagnostics and safety controls.
+
+The fixed budget is two builds, four model-free preflights, four fidelity
+renders, and 24 measured processes, each with one warm-up and one timed
+render. Set the child deadline to at most 360 seconds and keep the existing
+one-second guard poll, 24 GiB child host cap and 18 GiB child GPU cap. At the
+360-second limit the physical claim allows 198 minutes plus the existing
+release reserve. The existing six-hour job timeout also covers builds and
+asset verification. By default the workflow requires provisioned cache entries.
+Set `"download_missing": true` in the `flux1-eng4b-pair` request to stage absent
+files from the exact pinned Hub snapshots before verification.
+The profile measures CUDA resident Q4 Dev and Schnell. FLUX.1 conditional
+modes use `conditional-tier1` and its separate immutable asset bindings.
+Native BFL and the ControlNet and PuLID injection routes retain their
+own model proof cases. Their evidence applies to those cases' settings.
+
+### ENG-4b conditional fidelity
+
+Select `eng4b-conditional-tier1` on Candle CUDA and use the
+`flux1-eng4b-conditional-pair` request. The controller builds the exact merged
+ENG-4a baseline and dispatched head in private Git worktrees. Both arms compile
+and use the same plan. The profile covers ControlNet pose, XLabs IP Dev and
+PuLID fake CFG. It binds the historical shape-faithful BF16 fixture, source
+image bytes and real overlay inputs from the accepted
+[ControlNet](https://github.com/SceneWorks/inference/actions/runs/42462655901),
+[XLabs IP](https://github.com/SceneWorks/inference/actions/runs/43558292122)
+and [PuLID](https://github.com/SceneWorks/inference/actions/runs/42460488791)
+receipts. The profile compares current outputs within each new pair with
+bit-exact state, event and RGB8 requirements.
+
+For each case, reuse its archived receipt's `request`, set `selection` to
+`flux1-eng4b-conditional-pair` and use the existing 250 ms guard poll.
+Each dispatch builds twice and runs two model-free preflights and two renders.
+The child deadline is at most 20 minutes. At that limit, the claim budgets
+100 minutes plus its normal release reserve. The 24 GiB host and 18 GiB device
+caps apply. This comparison covers conditional fidelity on the fixed fixture.
+The complete real-Q4 Dev and Schnell timing and memory comparison uses the
+separate `eng4b-tier2` profile.
+
+If the target Windows listener lacks these inputs, dispatch the existing
+asset inventory once with `backend=candle-cuda`, `flux1_pair=none`,
+`stage_pinned_assets=true` and this request for the affected listener.
+
+```json
+{"selection":"flux1-asset-inventory","runner":"cuda-windows-2","mode":"hash","cases":["control-pose","ip-dev","pulid-fake"]}
+```
+
+This setup stages only absent files from the union of the selected cases.
+It checks the sealed SHA-256 before publishing each download and hashes all
+selected installed files before reporting the cases ready. A digest mismatch
+leaves the existing file in place and fails the setup with an inventory receipt.

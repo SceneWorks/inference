@@ -62,6 +62,7 @@ use super::{
 use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
 use crate::{Error, Result};
+use gen_core::phase::PhaseAdapterScale;
 
 // The format predicates, factor-suffix tables, rank/alpha parsing, and key-alias resolution are
 // backend-neutral string/metadata logic and live in gen-core (sc-3722); this module supplies the
@@ -536,41 +537,7 @@ fn apply_adapter_specs_autoprefix_reported(
         // iOS: header-only floor of the adapter file before it is eagerly read (no-op elsewhere).
         crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;
         let w = Weights::from_file(&spec.path)?;
-        let report = match classify_adapter_format(&w, spec.kind, host, &mut tables) {
-            AdapterFormat::ThirdpartyLokrBfl => {
-                let map = tables.bfl_lyc(host);
-                apply_lokr_thirdparty_bfl(host, &w, spec.scale, map)?
-            }
-            AdapterFormat::ThirdpartyLokr => apply_lokr_thirdparty(host, &w, spec.scale)?,
-            AdapterFormat::ThirdpartyLohaBfl => {
-                let map = tables.bfl_lyc(host);
-                apply_loha_thirdparty_bfl(host, &w, spec.scale, map)?
-            }
-            AdapterFormat::ThirdpartyLoha => apply_loha_thirdparty(host, &w, spec.scale)?,
-            AdapterFormat::BflLora => {
-                let targets = tables.bfl(host);
-                apply_lora_bfl(host, &w, spec.scale, targets)?
-            }
-            AdapterFormat::KohyaLora => {
-                let table = tables.kohya(host);
-                apply_lora_kohya(host, &w, spec.scale, table)?
-            }
-            AdapterFormat::PeftLokrBfl => {
-                let map = tables.bfl_lyc(host);
-                apply_lokr_bfl(host, &w, spec.scale, map)?
-            }
-            AdapterFormat::PeftLokr => apply_lokr(host, &w, spec.scale)?,
-            AdapterFormat::PeftLora => {
-                apply_lora_peft(host, &w, spec.scale, detect_lora_prefix(&w))?
-            }
-            AdapterFormat::LoraKindMismatch => {
-                return Err(format!(
-                    "adapter {} declared Lora but its metadata says networkType=lokr",
-                    spec.path.display()
-                )
-                .into());
-            }
-        };
+        let report = apply_loaded_adapter(host, &mut tables, &w, spec, spec.scale)?;
         // Materialize the factors this file contributed at load (sc-24245): left lazy, the first
         // forward's command buffers wait on the safetensors reads — past the GPU watchdog on a
         // cold page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`).
@@ -578,6 +545,93 @@ fn apply_adapter_specs_autoprefix_reported(
         reports.push(report);
     }
     Ok(reports)
+}
+
+fn apply_loaded_adapter(
+    host: &mut impl AdaptableHost,
+    tables: &mut HostTables,
+    w: &Weights,
+    spec: &AdapterSpec,
+    scale: f32,
+) -> Result<ApplyReport> {
+    let report = match classify_adapter_format(w, spec.kind, host, tables) {
+        AdapterFormat::ThirdpartyLokrBfl => {
+            let map = tables.bfl_lyc(host);
+            apply_lokr_thirdparty_bfl(host, w, scale, map)?
+        }
+        AdapterFormat::ThirdpartyLokr => apply_lokr_thirdparty(host, w, scale)?,
+        AdapterFormat::ThirdpartyLohaBfl => {
+            let map = tables.bfl_lyc(host);
+            apply_loha_thirdparty_bfl(host, w, scale, map)?
+        }
+        AdapterFormat::ThirdpartyLoha => apply_loha_thirdparty(host, w, scale)?,
+        AdapterFormat::BflLora => {
+            let targets = tables.bfl(host);
+            apply_lora_bfl(host, w, scale, targets)?
+        }
+        AdapterFormat::KohyaLora => {
+            let table = tables.kohya(host);
+            apply_lora_kohya(host, w, scale, table)?
+        }
+        AdapterFormat::PeftLokrBfl => {
+            let map = tables.bfl_lyc(host);
+            apply_lokr_bfl(host, w, scale, map)?
+        }
+        AdapterFormat::PeftLokr => apply_lokr(host, w, scale)?,
+        AdapterFormat::PeftLora => apply_lora_peft(host, w, scale, detect_lora_prefix(w))?,
+        AdapterFormat::LoraKindMismatch => {
+            return Err(format!(
+                "adapter {} declared Lora but its metadata says networkType=lokr",
+                spec.path.display()
+            )
+            .into());
+        }
+    };
+    Ok(report)
+}
+
+/// One immutable, source-sealed adapter payload. Providers may reconstruct exact phase variants
+/// without reopening the file or keeping every derived LoHa/LoKr matrix resident.
+pub struct PhaseAdapterSource {
+    weights: Weights,
+    pin: gen_core::PinnedWeightsFile,
+}
+
+impl PhaseAdapterSource {
+    pub fn load(pin: gen_core::PinnedWeightsFile) -> Result<Self> {
+        let weights = pin.read_unchanged(|path| {
+            crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, &[path.to_path_buf()])?;
+            Weights::from_file(path)
+        })?;
+        Ok(Self { weights, pin })
+    }
+
+    /// Install the given strengths from this source. The caller binds each newly installed range
+    /// and enforces the same per-phase aggregate zero-match guard as a strict batch.
+    pub fn install_variants<H: AdaptableHost>(
+        &self,
+        host: &mut H,
+        spec: &AdapterSpec,
+        variants: &[PhaseAdapterScale],
+        model: &str,
+        mut bind: impl FnMut(&mut H, PhaseAdapterScale),
+    ) -> Result<Vec<usize>> {
+        self.pin.read_unchanged(|_| {
+            let mut tables = HostTables::default();
+            let mut applied = Vec::with_capacity(variants.len());
+            for &key in variants {
+                let report =
+                    apply_loaded_adapter(host, &mut tables, &self.weights, spec, key.scale())?;
+                validate_strict_report(0, model, 0, &report)?;
+                applied.push(report.applied);
+                bind(host, key);
+            }
+            // The selected file data becomes resident under its original seal. Unrelated tensors
+            // are never evaluated, just as in the normal strict adapter loader.
+            self.weights.materialize_accessed()?;
+            Ok(applied)
+        })
+    }
 }
 
 /// Provider-facing load-time adapter install: [`apply_adapter_specs_autoprefix`] plus a strict
@@ -711,13 +765,23 @@ fn apply_adapters_strict_inner(
     pre_applied: usize,
 ) -> Result<ApplyReport> {
     let report = apply_adapter_specs_autoprefix(host, specs)?;
-    if !specs.is_empty() && report.applied == 0 && pre_applied == 0 {
+    validate_strict_report(specs.len(), model, pre_applied, &report)?;
+    Ok(report)
+}
+
+fn validate_strict_report(
+    spec_count: usize,
+    model: &str,
+    pre_applied: usize,
+    report: &ApplyReport,
+) -> Result<()> {
+    if spec_count != 0 && report.applied == 0 && pre_applied == 0 {
         return Err(format!(
             "{model} adapters: no target modules matched across {} adapter file(s) — check the \
              format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, BFL/ComfyUI \
              fused→split LoRA — for a host with a BFL surface — LoKr keys, or a ComfyUI/lightx2v \
              `<module>.diff`/`.diff_b` diff-patch)",
-            specs.len()
+            spec_count
         )
         .into());
     }
@@ -730,7 +794,7 @@ fn apply_adapters_strict_inner(
         )
         .into());
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]

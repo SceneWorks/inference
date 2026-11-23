@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -286,6 +287,15 @@ class ConditionalAssetInventory(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     assets.fetch_pinned("https://example/x", other, opener=opener)
                 self.assertFalse(other.exists())
+            with self.assertRaisesRegex(ValueError, "sealed SHA-256"):
+                assets.fetch_pinned("https://example/x", other, opener=Opener(b"bad", etag=hashlib.sha256(b"bad").hexdigest()),
+                                    expected_sha256="c" * 64)
+            self.assertFalse(other.exists())
+            for opener, message in ((Opener(b"oversized"), "response length differs"),
+                                    (Opener(b"oversized", length=3), "exceeds the sealed byte count")):
+                with self.assertRaisesRegex(ValueError, message):
+                    assets.fetch_pinned("https://example/x", other, opener=opener, expected_bytes=3)
+                self.assertFalse(other.exists())
             self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
 
     def test_fetch_accepts_a_concurrently_placed_identical_file_and_refuses_other_bytes(self):
@@ -456,6 +466,78 @@ class ConditionalAssetInventory(unittest.TestCase):
                                                          "runner": "cuda-windows-2"}, sha, "none")
             self.assertIn("cuda-windows-2", windows["runner"])
             self.assertIn("real-weights", windows["runner"])
+
+    def test_sealed_case_inventory_stages_only_selected_missing_roles_and_refuses_drift(self):
+        cases = ["control-pose", "ip-dev", "pulid-fake"]
+        sealed = assets.sealed_case_assets(cases, "cuda-windows-2")
+        self.assertEqual(set(sealed), {"control", "ip_adapter", "image_encoder", "pulid", "eva",
+                                       "arcface", "scrfd", "bisenet"})
+        request = {"selection": "flux1-asset-inventory", "runner": "cuda-windows-2", "mode": "hash",
+                   "cases": cases}
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True,
+                                      encoding="utf-8").strip()
+        plan = assets.plan_request("candle-cuda", request, sha, "none")
+        self.assertEqual(plan["selected_cases"], cases)
+        self.assertEqual(plan["runner"], assets.LANES["cuda-windows-2"])
+        for invalid in ([], ["control-pose", "control-pose"], ["pulid-pid"]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "sealed|distinct"):
+                assets.plan_request("candle-cuda", dict(request, cases=invalid), sha, "none")
+        with self.assertRaisesRegex(ValueError, "exact Windows"):
+            assets.plan_request("mlx", dict(request, runner="nax"), sha, "none")
+
+        tiny = {role: dict(pin, sha256=hashlib.sha256(role.encode()).hexdigest())
+                for role, pin in sealed.items()}
+        real_stage = assets.stage_pinned_assets
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            install(hub, "scrfd")
+            output = hub.parent / "receipt.json"
+            by_destination = {assets.pinned_path(hub, *assets.stage_files(role, hub)[0]): role for role in tiny}
+            fetched = []
+
+            def fetch(url, path, token=None, *, expected_sha256):
+                role = by_destination[path]
+                fetched.append(role)
+                self.assertEqual(expected_sha256, tiny[role]["sha256"])
+                body = io.BytesIO(role.encode())
+                body.headers = {"Content-Length": str(len(role))}
+                return assets.fetch_pinned(url, path, token=token,
+                                           opener=SimpleNamespace(open=lambda *_args, **_kwargs: body),
+                                           expected_sha256=expected_sha256)
+
+            argv = [str(Path(assets.__file__)), "--backend", "candle-cuda", "--request-env", "INVENTORY_REQUEST",
+                    "--expected-sha", sha, "--stage-pinned-assets", "--output", str(output)]
+            env = dict(RUNNER_NAME="cuda-windows-2", FLUX1_HUB=str(hub), FLUX1_PAIR_TIER="none",
+                       INVENTORY_REQUEST=json.dumps(request))
+            with (patch.object(assets, "sealed_case_assets", return_value=tiny),
+                  patch.object(assets, "stage_pinned_assets",
+                               side_effect=lambda *args, **kwargs: real_stage(*args, fetch=fetch, **kwargs)),
+                  patch.object(assets.faulthandler, "dump_traceback_later"),
+                  patch.object(assets.faulthandler, "cancel_dump_traceback_later"),
+                  patch.object(assets.signal, "signal"),
+                  patch.object(sys, "argv", argv), patch.dict(os.environ, env), redirect_stderr(StringIO())):
+                assets.main()
+                receipt = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["source_sha"], sha)
+                self.assertEqual(receipt["runner_name"], "cuda-windows-2")
+                self.assertEqual(set(receipt["roles"]), set(tiny))
+                self.assertTrue(all(row["ready"] for row in receipt["cases"].values()))
+                self.assertEqual(sorted(fetched), sorted(set(tiny) - {"scrfd"}))
+                self.assertFalse(snapshot(hub, "pid_gemma").exists())
+                self.assertFalse(snapshot(hub, "pid_decoder").exists())
+
+                installed = install(hub, "control", b"off-seal")
+                fetched.clear()
+                with self.assertRaises(SystemExit) as exit_info:
+                    assets.main()
+                self.assertEqual(exit_info.exception.code, 2)
+                self.assertEqual(installed.read_bytes(), b"off-seal")
+                self.assertEqual(fetched, [])
+                receipt = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["digest_mismatch_roles"], ["control"])
+                self.assertFalse(receipt["cases"]["control-pose"]["ready"])
+                self.assertTrue(receipt["cases"]["ip-dev"]["ready"])
 
     def test_inventoried_gemma_stages_by_exact_name_without_listing(self):
         with TemporaryDirectory() as tmp:
@@ -687,6 +769,28 @@ class ConditionalAssetInventory(unittest.TestCase):
                         self.assertTrue(all(r[0] == "ok" for r in results), results)
                         placed_flags = sorted(r[2][3] for r in results)
                         self.assertEqual(placed_flags, [False, True])
+
+    @unittest.skipIf(os.name == "nt", "Windows uses no-replace rename")
+    def test_fallback_refuses_to_replace_a_dangling_destination(self):
+        import errno
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            dest, missing = root / "asset.safetensors", root / "missing.safetensors"
+            dest.symlink_to(missing.name)
+            body = io.BytesIO(b"weights")
+            body.headers = {"Content-Length": "7"}
+            opener = SimpleNamespace(open=lambda *_args, **_kwargs: body)
+            with (patch("os.link", side_effect=OSError(errno.ENOTSUP, "hard links unavailable")),
+                  patch.object(assets, "_renamex_excl", return_value=False) as rename,
+                  patch("os.replace") as replace,
+                  self.assertRaisesRegex(ValueError, "refusing to replace linked asset")):
+                assets.fetch_pinned("https://example/asset", dest, opener=opener)
+            rename.assert_called_once()
+            replace.assert_not_called()
+            self.assertEqual(os.readlink(dest), missing.name)
+            self.assertFalse(missing.exists())
+            self.assertEqual(list(root.iterdir()), [dest])
 
     @unittest.skipIf(os.name == "nt", "POSIX flock and dead-PID lock recovery test")
     def test_fetch_pinned_recovers_placement_lock_after_publisher_death(self):

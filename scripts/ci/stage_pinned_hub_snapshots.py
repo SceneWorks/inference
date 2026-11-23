@@ -25,24 +25,24 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
+from functools import partial
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import sys
+import tempfile
 import time
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.ci.file_lock import (  # noqa: E402
-    MSVCRT_LOCK_BUSY,
-    POSIX_LOCK_BUSY,
-    exclusive_file_lock,
-    try_lock_handle,
-)
-from scripts.ci.pinned_hub_source import pinned_manifest, verify_pinned_hub_files  # noqa: E402
+from scripts.ci.file_lock import exclusive_file_lock, try_lock_handle  # noqa: E402
+from scripts.ci.flux1_conditional_asset_inventory import confined, publish_download  # noqa: E402
+from scripts.ci.model_inference_proofs import unlinked_path  # noqa: E402
+from scripts.ci.pinned_hub_source import pinned_file_identity, pinned_manifest, verify_pinned_hub_files  # noqa: E402
 
 GIB = 1024**3
 # Free space a staging run must leave on the model root's volume.
@@ -61,35 +61,124 @@ def _try_lock(handle) -> bool:
     return try_lock_handle(handle, is_windows=(os.name == "nt"))
 
 
+def staging_lock_path(hub: Path, repository: str, revision: str, file: str) -> Path:
+    return (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
+            / revision / (file + ".lock"))
+
+
+def _guard_lock(path: Path, hub: Path) -> None:
+    unlinked_path(path, hub)
+    if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+        raise ValueError(f"staging lock must be a regular unshared file: {path}")
+
+
+def _guard_directory(path: Path, hub: Path) -> None:
+    unlinked_path(path, hub)
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"snapshot asset parent is not a directory: {path}")
+
+
+def _asset_present(path: Path, hub: Path) -> bool:
+    # Hugging Face uses symlink leaves to in-hub blobs. Writes and directory
+    # creation must always use real, unlinked ancestors inside the hub.
+    _guard_directory(path.parent, hub)
+    if not os.path.lexists(path):
+        return False
+    try:
+        resolved = confined(path.resolve(strict=True), hub, path)
+    except FileNotFoundError as error:
+        raise ValueError(f"snapshot asset has a dangling link: {path}") from error
+    if not resolved.is_file():
+        raise ValueError(f"snapshot asset is not a regular file: {path}")
+    return True
+
+
+def _publish_verified_symlink(temporary: Path, destination: Path, *, hub: Path, blobs: Path) -> None:
+    """Place a verified payload in private Hub storage, then create a no-clobber snapshot leaf."""
+    _guard_directory(blobs, hub)
+    blobs.mkdir(parents=True, exist_ok=True)
+    _guard_directory(blobs, hub)
+    identity = temporary.lstat()
+    owned = Path(tempfile.mkdtemp(prefix=".model-proof-", dir=blobs))
+    blob = owned / destination.name
+    target = os.path.relpath(blob, destination.parent)
+    try:
+        # This job exclusively created the private directory. The payload was already fsynced
+        # and authenticated before publication, and the move leaves its bytes untouched.
+        _guard_directory(owned, hub)
+        os.rename(temporary, blob)
+        _guard_directory(owned, hub)
+        _asset_present(destination, hub)
+        # Creating a link fails if any writer has published this leaf, even after the guard.
+        os.symlink(target, destination)
+    except BaseException:
+        try:
+            _discard_unpublished_blob(blob, identity, destination, hub)
+        except (OSError, ValueError):
+            # Preserve ambiguous state and the original failure.
+            pass
+        raise
+
+
+def _discard_unpublished_blob(blob, identity, destination, hub):
+    _guard_directory(blob.parent, hub)
+    _guard_directory(destination.parent, hub)
+    try:
+        target = os.readlink(destination)
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.EINVAL):
+            raise
+    else:
+        if os.path.abspath(destination.parent / target) == str(blob):
+            return  # Publication may have completed before Python received the interruption.
+    try:
+        current = blob.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if os.path.samestat(identity, current):
+            blob.unlink()
+    blob.parent.rmdir()
+
+
 @contextmanager
 def staging_lock(hub: Path, repository: str, revision: str, file: str):
     """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
-    path = (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
-            / revision / (file + ".lock"))
-    state = {"started": None, "logged": None}
+    hub = hub.resolve(strict=True)
+    path = staging_lock_path(hub, repository, revision, file)
 
-    def on_wait(wait_count: int) -> None:
+    def open_lock(name, flags):
+        return os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
+
+    @contextmanager
+    def open_guarded(path):
+        _guard_lock(path, hub)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _guard_lock(path, hub)
+        with open(path, "a+b", opener=open_lock) as handle:
+            _guard_lock(path, hub)
+            opened = os.fstat(handle.fileno())
+            if opened.st_nlink != 1 or not os.path.samestat(opened, path.lstat()):
+                raise ValueError(f"staging lock changed during open: {path}")
+            yield handle
+
+    started = logged = 0.0
+
+    def on_wait(wait_count):
+        nonlocal started, logged
         now = time.monotonic()
         if wait_count == 0:
-            state["started"] = state["logged"] = now
+            started = logged = now
             print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
-        elif now - state["logged"] >= LOCK_LOG_SECONDS:
-            state["logged"] = now
-            print(f"still waiting ({now - state['started']:.0f} s) for another job staging "
+        elif now - logged >= LOCK_LOG_SECONDS:
+            logged = now
+            print(f"still waiting ({logged - started:.0f} s) for another job staging "
                   f"{repository}@{revision}/{file}", flush=True)
 
-    with exclusive_file_lock(
-        path,
-        poll_seconds=LOCK_POLL_SECONDS,
-        timeout_seconds=None,
-        remove_on_exit=False,
-        fallback_excl_on_notsup=False,
-        on_wait=on_wait,
-        try_lock=_try_lock,
-        monotonic=time.monotonic,
-        sleep=time.sleep,
-    ):
+    with exclusive_file_lock(path, poll_seconds=LOCK_POLL_SECONDS, on_wait=on_wait,
+                             try_lock=_try_lock, monotonic=time.monotonic, sleep=time.sleep,
+                             open_persistent=open_guarded):
         yield
 
 
@@ -134,6 +223,7 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
     """Fetch every absent pinned file, then authenticate every pinned file; return the receipt."""
     if fetch is None:
         from scripts.ci.flux1_conditional_asset_inventory import fetch_pinned as fetch
+    hub = hub.resolve(strict=True)
     free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
     plans = []
     for name, pin in sorted(snapshots.items()):
@@ -141,9 +231,16 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
         _, _, inventory = manifest(repository, revision)
         files = pinned_files(inventory, subfolder)
         base = snapshot_dir(hub, repository, revision)
-        absent = {file: size for file, size in files.items() if not (base / file).exists()}
+        absent = {}
+        for file in files:
+            if ("\\" in file or ":" in file or any(part in ("", ".", "..") for part in file.split("/"))):
+                raise ValueError(f"unsafe pinned snapshot asset path: {file}")
+            identity = pinned_file_identity(file, inventory[file])
+            if not _asset_present(base / file, hub):
+                _guard_lock(staging_lock_path(hub, repository, revision, file), hub)
+                absent[file] = identity
         plans.append((name, pin, base, files, absent))
-    needed = sum(size for *_, absent in plans for size in absent.values())
+    needed = sum(identity["bytes"] for *_, absent in plans for identity in absent.values())
     free = free_bytes(hub)
     if needed + DISK_RESERVE_BYTES > free:
         raise ValueError(f"staging needs {needed / GIB:.1f} GiB plus a {DISK_RESERVE_BYTES / GIB:.0f} GiB reserve "
@@ -152,14 +249,31 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
     for name, pin, base, files, absent in plans:
         fetched, placed_by_another_job = [], []
         for file in sorted(absent):
+            destination = base / file
             with staging_lock(hub, pin["repository"], pin["revision"], file):
                 # Staged for an earlier slot of the same revision, or by another job on this host.
-                if (base / file).exists():
+                if _asset_present(destination, hub):
                     continue
                 url = HF_RESOLVE.format(repo=pin["repository"], revision=pin["revision"], name=urllib.parse.quote(file))
-                print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
-                _, _, _, placed = fetch(url, base / file)
+                identity = absent[file]
+                size = identity["bytes"]
+                print(f"staging {pin['repository']}@{pin['revision']}/{file} ({size / GIB:.2f} GiB)", flush=True)
+                digest_arg = "expected_sha256" if identity["kind"] == "lfs_sha256" else "expected_git_blob"
+                publish = partial(publish_download, guard=partial(_asset_present, hub=hub),
+                                  without_hardlinks=partial(_publish_verified_symlink, hub=hub,
+                                                            blobs=base.parent.parent / "blobs"))
+                try:
+                    _, _, _, placed = fetch(url, destination, expected_bytes=size, publish=publish,
+                                            **{digest_arg: identity["digest"]})
+                except FileExistsError:
+                    # A peer using the Hub outside this stager can win before the
+                    # transfer starts. The whole-snapshot check below authenticates it.
+                    if not _asset_present(destination, hub):
+                        raise
+                    placed = True
                 (placed_by_another_job if placed else fetched).append(file)
+        for file in files:
+            _asset_present(base / file, hub)
         verified = verify(pin["repository"], pin["revision"], base, tuple(sorted(files)))
         path = base / pin["subfolder"] if pin["subfolder"] else base
         receipt[name] = {**pin, "path": str(path), "status": verified["status"], "fetched": fetched,

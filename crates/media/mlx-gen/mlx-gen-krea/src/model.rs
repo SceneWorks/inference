@@ -8,6 +8,7 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
+use mlx_gen::gen_core::{self, MemoryRequestScope, RenderPlan, RenderRun};
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
@@ -23,7 +24,6 @@ use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use mlx_rs::Array;
 use std::path::Path;
 
-use crate::multiphase::{self, ResolvedPhase};
 use crate::pipeline::{
     base_schedule, maybe_apply_style_gain, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy,
     KreaText, T2iPlan, TurboOptions,
@@ -1249,6 +1249,34 @@ impl Generator for Krea {
         })
     }
 
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_impl(req, Some(plan), scope, on_progress)
+            .map_err(Into::into)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
+        )
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
@@ -1258,16 +1286,7 @@ impl Generator for Krea {
             self.descriptor(),
             &req.cancel,
             || {
-                mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
-                mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
-                mlx_gen::image_execution::policy_debug(
-                    "Krea.applied_adapter_controls",
-                    &applied_adapter_controls(&self.adapters),
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "Krea.loaded_sequential_residency",
-                    &self.residency.is_sequential(),
-                );
+                self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_report_observed(req, &mut progress)
@@ -1277,12 +1296,26 @@ impl Generator for Krea {
 }
 
 impl Krea {
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
+        mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
+        mlx_gen::image_execution::policy_debug(
+            "Krea.applied_adapter_controls",
+            &applied_adapter_controls(&self.adapters),
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Krea.loaded_sequential_residency",
+            &self.residency.is_sequential(),
+        );
+    }
+
     fn generate_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl(req, None, None, on_progress)
+            .map_err(Into::into)
     }
 }
 
@@ -1352,13 +1385,44 @@ impl Krea {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        admitted_plan: Option<&RenderPlan>,
+        scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<mlx_gen::gen_core::GenerationReport> {
         validate_request(&self.descriptor, req)?;
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
-        let request = self.resolve_request(req)?;
+        let compiled;
+        let plan = match admitted_plan {
+            Some(plan) => {
+                plan.check_request(&self.descriptor, req)?;
+                plan.check_load_spec(&self.file_pin_spec)?;
+                match self.descriptor.id {
+                    KREA_2_RAW_ID if !plan.adapter_phases().is_empty() => {}
+                    KREA_2_TURBO_ID if plan.adapter_phases().is_empty() => {}
+                    id => {
+                        return Err(Error::Unsupported(format!(
+                            "{id}: compiled plan does not match a Krea render route"
+                        )));
+                    }
+                }
+                Some(plan)
+            }
+            None if req.phases.is_some() => {
+                compiled = compile_multiphase_plan(&self.descriptor, &self.file_pin_spec, req)?;
+                Some(&compiled)
+            }
+            None if self.descriptor.id == KREA_2_TURBO_ID => {
+                // This plan stays inside the loaded generator. In particular, a
+                // direct caller may have omitted file pins for its PiD or adapters.
+                compiled = compile_turbo_plan(&self.descriptor, req, None)?;
+                Some(&compiled)
+            }
+            None => None,
+        };
+        let run = plan.map(|plan| RenderRun::new(plan, &req.cancel, scope));
+        let request = self.resolve_request(req, plan)?;
         let pag_report = request.pag_execution_report();
 
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
@@ -1369,10 +1433,32 @@ impl Krea {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &KreaText| self.encode_phase(text, &request),
+            |text: &KreaText| {
+                let encode = || {
+                    let ctx = self.encode_phase(text, &request)?;
+                    match &ctx.neg {
+                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                        None => mlx_rs::transforms::eval([&ctx.pos])?,
+                    }
+                    Ok(ctx)
+                };
+                match &run {
+                    Some(run) if run.plan().adapter_phases().is_empty() => {
+                        // Turbo also prepares its clean reference latent in Conditioning, after
+                        // Sequential residency has released the text encoder.
+                        run.begin_conditioning()?;
+                        encode()
+                    }
+                    Some(run) => run.encode(encode),
+                    None => self.encode_phase(text, &request),
+                }
+            },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
             |ctx: Option<&KreaContexts>| {
+                if run.is_some() {
+                    return Ok(());
+                }
                 let Some(ctx) = ctx else { return Ok(()) };
                 match &ctx.neg {
                     Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
@@ -1383,7 +1469,13 @@ impl Krea {
             // Phase B: heavy render components (DiT + VAE + PiD). The render dispatch runs
             // identically for both residencies.
             |heavy_owned, ctx, on_progress| {
-                self.render_phase(heavy_owned.as_ref(), &ctx, &request, on_progress)
+                self.render_phase(
+                    heavy_owned.as_ref(),
+                    &ctx,
+                    &request,
+                    run.as_ref(),
+                    on_progress,
+                )
             },
         )?;
         let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
@@ -1393,13 +1485,20 @@ impl Krea {
 
     /// Everything the request resolves before the residency lifecycle: the variant's render path,
     /// steps, schedule and PiD capture, the reference roles, the CFG knobs and the multi-phase plan.
-    fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<KreaRequest<'r>> {
+    fn resolve_request<'r>(
+        &self,
+        req: &'r GenerationRequest,
+        plan: Option<&'r RenderPlan>,
+    ) -> Result<KreaRequest<'r>> {
         let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         mlx_gen::image_execution::policy_debug(
             "krea.transformer_window_size",
             &transformer_window_size,
         );
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = plan.map_or_else(
+            || req.seed.unwrap_or_else(default_seed),
+            RenderPlan::base_seed,
+        );
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
         // variant (epic 10871) shares Raw's full-CFG sampler — an edit denoises from noise under true CFG
@@ -1413,85 +1512,49 @@ impl Krea {
         // `is_raw` gates the full-CFG sampler (52-step, dynamic-mu `base_schedule`, guidance) — Raw and
         // the full-CFG `krea_2_edit`, but NOT `krea_2_turbo_edit` (distilled few-step, CFG-free).
         let is_raw = self.descriptor.id == KREA_2_RAW_ID || (is_edit && !is_turbo_edit);
-        let steps = req.steps.unwrap_or(if is_raw {
-            DEFAULT_RAW_STEPS
+        let steps = krea_steps(req, is_raw);
+        // Edits ground on the ordered images. Ordinary img2img seeds from one reference latent.
+        let (edit_sources, img2img) = if is_edit {
+            (edit_references(req)?, None)
         } else {
-            DEFAULT_STEPS
-        }) as usize;
-        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): resolve the achieved degrade σ + the
-        // truncation `keep` from the (seed-independent) schedule; the PiD decoder itself is built in
-        // the render phase (it needs the heavy phase's PiD engine). Raw/edit use the
-        // resolution-dynamic schedule.
-        let sigmas = if is_raw {
-            base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
-        } else {
-            turbo_schedule(steps, req.scheduler.as_deref())
-        };
-        let native_mu = if is_raw {
-            crate::schedule::dynamic_mu((req.width as f64 / 16.0) * (req.height as f64 / 16.0))
-                as f32
-        } else {
-            crate::schedule::TURBO_MU as f32
-        };
-        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            native_mu,
-            steps,
-            &sigmas,
-        )?;
-        // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
-        // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
-        // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
-        // Reference" img2img guard, and an img2img job still can't smuggle in two references.
-        let edit_sources = if is_edit {
-            edit_references(req)?
-        } else {
-            Vec::new()
-        };
-        let reference = if is_edit {
-            None
-        } else {
-            single_reference(self.descriptor.id, req)?
-        };
-        // img2img resolves the PiD `from_ldm` capture against the SLICED window it actually denoises
-        // (sc-10121). An img2img job seeds the denoise at `start = init_time_step(strength)` and runs
-        // `sigmas[start..]`, so the capture index and its degrade σ MUST be resolved with that `start`
-        // or the decoder's σ desyncs from the truncated latent. `flow_capture_for_request`'s
-        // `start_step` does exactly that: it drops a capture whose ceiling would land at/before `start`
-        // (no benefit) and otherwise returns a `keep` (into the full schedule) whose `sigmas[keep-1]`
-        // matches the `render_*_img2img_from` truncation `sigmas[start..keep]` — so `capture_sigma`
-        // always names the σ of the latent actually handed to PiD. t2i / edit / control denoise the
-        // whole schedule from pure noise → `start = 0` (the reference-less default). The init image
-        // and its strength are carried together so the render can never see one without the other.
-        let img2img = reference.map(|(init, ref_strength)| {
             (
-                init,
-                ref_strength
-                    .or(req.strength)
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
+                Vec::new(),
+                resolve_img2img_reference(self.descriptor.id, req)?,
             )
-        });
-        let start_step = img2img
-            .map(|(_, s)| init_time_step(steps, Some(s)).min(sigmas.len().saturating_sub(1)))
-            .unwrap_or(0);
-        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
+        };
+        let schedule = match plan {
+            Some(plan) => KreaSchedule::Compiled(plan),
+            None => KreaSchedule::Local(resolve_krea_trajectory(
+                req,
+                is_raw,
+                steps,
+                img2img.map(|(_, strength)| strength),
+            )?),
+        };
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
         // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) t2i/img2img path.
         // FORCED to 0 for `krea_2_turbo_edit` so the edit runs a single conditional forward — its
         // descriptor advertises no guidance, so `req.guidance` is already rejected upstream; this just
         // pins the CFG-free default that makes `encode` skip the unconditional grounded context.
-        let guidance = req
-            .guidance
-            .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 });
+        let guidance = plan.map_or_else(
+            || {
+                req.guidance
+                    .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 })
+            },
+            RenderPlan::guidance,
+        );
         let negative = req.negative_prompt.clone().unwrap_or_default();
-        let multiphase = self.resolve_multiphase(req, guidance)?;
         let pag = self
             .descriptor
             .capabilities
             .resolve_pag(self.descriptor.id, req)?;
         mlx_gen::image_execution::scalar("krea.guidance", guidance);
-        mlx_gen::image_execution::policy_debug("krea.resolved_phases", &multiphase.phases);
+        mlx_gen::image_execution::policy_debug(
+            "krea.resolved_phases",
+            &schedule
+                .adapter_phase_plan()
+                .map(RenderPlan::adapter_phases),
+        );
         mlx_gen::image_execution::policy_debug("krea.pag", &pag);
         Ok(KreaRequest {
             req,
@@ -1499,67 +1562,13 @@ impl Krea {
             base_seed,
             is_turbo_edit,
             is_edit,
-            is_raw,
             steps,
             edit_sources,
             img2img,
-            capture_sigma,
-            sigmas,
-            keep,
+            schedule,
             guidance,
             negative,
-            multiphase,
             pag,
-        })
-    }
-
-    /// Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
-    /// text-encode phase (whether the unconditional context is needed) and the render phase drive
-    /// from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
-    /// reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
-    /// guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). The
-    /// multi-phase schedule is ONE global Raw schedule for the TOTAL step budget (the sum of the
-    /// phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
-    /// trajectory continuous across boundaries (no per-phase recompute / reset).
-    ///
-    /// `encode_neg` gates the text encode's unconditional context: built iff ANY phase runs CFG
-    /// (`crate::pipeline::krea_uses_cfg`). `None` phases ⇒ the ordinary single-phase render.
-    fn resolve_multiphase(&self, req: &GenerationRequest, guidance: f32) -> Result<KreaMultiphase> {
-        let resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
-            Some(list) if !list.is_empty() => {
-                let default_guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
-                Some(multiphase::resolve_phases(
-                    list,
-                    default_guidance,
-                    self.adapters.len(),
-                    self.descriptor.id,
-                )?)
-            }
-            _ => None,
-        };
-        let sigmas = resolved
-            .as_ref()
-            .map(|resolved| -> Result<Vec<f32>> {
-                let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
-                let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
-                Ok(mlx_gen::resolve_flow_schedule_with_shift(
-                    req.scheduler.as_deref(),
-                    req.scheduler_shift,
-                    crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
-                    total,
-                    &native,
-                )?)
-            })
-            .transpose()?;
-        let encode_neg = match &resolved {
-            Some(resolved) => resolved
-                .iter()
-                .any(|p| crate::pipeline::krea_uses_cfg(p.guidance)),
-            None => crate::pipeline::krea_uses_cfg(guidance),
-        };
-        Ok(KreaMultiphase {
-            phases: resolved.zip(sigmas),
-            encode_neg,
         })
     }
 
@@ -1570,7 +1579,10 @@ impl Krea {
             text,
             req,
             request.is_edit,
-            request.multiphase.encode_neg,
+            request.schedule.adapter_phase_plan().map_or_else(
+                || crate::pipeline::krea_uses_cfg(request.guidance),
+                RenderPlan::adapter_phases_need_negative,
+            ),
             &request.negative,
             &request.edit_sources,
         )?;
@@ -1602,6 +1614,7 @@ impl Krea {
         heavy: KreaHeavyRef<'_>,
         ctx: &KreaContexts,
         request: &KreaRequest<'_>,
+        run: Option<&RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let req = request.req;
@@ -1613,7 +1626,7 @@ impl Krea {
             req,
             request.base_seed,
             self.descriptor.id,
-            request.capture_sigma,
+            request.schedule.capture_sigma(),
         )?;
         let decoder = pid_decoder
             .as_ref()
@@ -1624,32 +1637,54 @@ impl Krea {
                     .map(|decoder| decoder as &dyn LatentDecoder)
             });
 
-        if let Some((resolved, full)) = &request.multiphase.phases {
-            return self.render_multiphase(
-                &heavy,
-                ctx,
-                request,
-                resolved,
-                full,
-                decoder,
-                on_progress,
-            );
+        if let Some(run) = run {
+            let mut opts = self.turbo_options(request, run.plan().executed_steps(), 0);
+            let images = if run.plan().adapter_phases().is_empty() {
+                opts.sampler = Some(run.plan().sampler().to_owned());
+                heavy.heavy.render_turbo_planned(
+                    run,
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
+                    request.img2img.map(|(image, _)| image),
+                    &opts,
+                    decoder,
+                    request.pag.as_ref(),
+                    req,
+                    on_progress,
+                )?
+            } else {
+                heavy.heavy.render_multiphase_planned(
+                    run,
+                    &self.file_pin_spec,
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
+                    &opts,
+                    decoder,
+                    request.pag.as_ref(),
+                    req,
+                    on_progress,
+                )?
+            };
+            return Ok(GenerationOutput::Images(images));
         }
 
+        let KreaSchedule::Local(trajectory) = &request.schedule else {
+            unreachable!("compiled trajectories use their RenderRun");
+        };
         let mut plan = self.build_render_plan(&heavy, ctx, request)?;
         match &mut plan {
-            KreaRenderPlan::Turbo(plan) | KreaRenderPlan::BaseCfg(plan) => {
+            KreaRenderPlan::BaseCfg(plan) => {
                 plan.guidance = request.guidance;
-                plan.sigmas = Some(request.sigmas.clone());
+                plan.sigmas = Some(trajectory.sigmas.clone());
                 plan.pag = request.pag.clone();
             }
-            KreaRenderPlan::Img2ImgRaw { plan, .. } | KreaRenderPlan::Img2ImgTurbo { plan, .. } => {
-                plan.guidance = request.guidance;
-                plan.sigmas = Some(request.sigmas.clone());
-                plan.pag = request.pag.clone();
+            KreaRenderPlan::Img2ImgRaw { plan, .. } => {
+                plan.denoise.guidance = request.guidance;
+                plan.denoise.sigmas = Some(trajectory.sigmas.clone());
+                plan.denoise.pag = request.pag.clone();
             }
             KreaRenderPlan::Edit(plan) => {
-                plan.sigmas = Some(request.sigmas.clone());
+                plan.sigmas = Some(trajectory.sigmas.clone());
                 plan.pag = request.pag.clone();
             }
         }
@@ -1664,64 +1699,14 @@ impl Krea {
             // already dropped) is byte-identical to Resident.
             images.push(mlx_gen::image_execution::with_output_index(
                 n as usize,
-                || render_one(heavy.heavy, &plan, request, &opts, decoder, on_progress),
-            )?);
-        }
-        Ok(GenerationOutput::Images(images))
-    }
-
-    /// Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE global
-    /// schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
-    /// (single-forward) body, AND per-phase adapters toggled on that phase's own job-local DiT clone
-    /// — sharing the latent + sigma trajectory across every boundary. The per-phase plans (clone +
-    /// adapters + prep) are built ONCE here (`prep_neg` present per phase iff that phase uses CFG,
-    /// backed by the encode-guidance neg-context gate) and reused across the count loop (one image
-    /// per seed).
-    #[allow(clippy::too_many_arguments)]
-    fn render_multiphase(
-        &self,
-        heavy: &KreaHeavyRef<'_>,
-        ctx: &KreaContexts,
-        request: &KreaRequest<'_>,
-        resolved: &[ResolvedPhase],
-        full: &[f32],
-        decoder: Option<&dyn LatentDecoder>,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
-        let req = request.req;
-        let mut plans = self.file_pin_spec.read_files_unchanged(
-            self.adapters.iter().map(|adapter| &adapter.path),
-            || {
-                heavy.heavy.prepare_multiphase(
-                    resolved,
-                    &self.adapters,
-                    &ctx.pos,
-                    ctx.neg.as_ref(),
-                    req.width,
-                    req.height,
-                )
-            },
-        )?;
-        for phase_plan in &mut plans {
-            phase_plan.plan.pag = request.pag.clone();
-        }
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            let opts = self.turbo_options(request, full.len().saturating_sub(1), n);
-            // sc-22738: the Denoise + Decode phase EXITS live inside the render body
-            // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and decoded image
-            // actually exist; `opts` above carries the request-scoped `memory` + `provider_id` those
-            // hooks read.
-            images.push(mlx_gen::image_execution::with_output_index(
-                n as usize,
                 || {
-                    heavy.heavy.render_multiphase(
-                        &plans,
-                        full,
+                    render_one(
+                        heavy.heavy,
+                        &plan,
+                        request,
                         &opts,
                         decoder,
-                        &req.cancel,
-                        &req.preview,
+                        trajectory.keep,
                         on_progress,
                     )
                 },
@@ -1766,29 +1751,12 @@ impl Krea {
                 req.width,
                 req.height,
             )?;
-            // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
-            // negative prompt honored, sc-10224); Turbo the CFG-free distilled one (sc-10135).
-            if request.is_raw {
-                KreaRenderPlan::Img2ImgRaw {
-                    plan: img2img,
-                    strength,
-                }
-            } else {
-                KreaRenderPlan::Img2ImgTurbo {
-                    plan: img2img,
-                    strength,
-                }
+            KreaRenderPlan::Img2ImgRaw {
+                plan: img2img,
+                strength,
             }
-        } else if request.is_raw {
-            KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
-                &ctx.pos,
-                ctx.neg.as_ref(),
-                req.width,
-                req.height,
-            )?)
         } else {
-            // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
-            KreaRenderPlan::Turbo(heavy.heavy.prepare_t2i(
+            KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
                 &ctx.pos,
                 ctx.neg.as_ref(),
                 req.width,
@@ -1821,50 +1789,51 @@ struct KreaRequest<'r> {
     base_seed: u64,
     is_turbo_edit: bool,
     is_edit: bool,
-    is_raw: bool,
     steps: usize,
     edit_sources: Vec<&'r Image>,
     /// The img2img init image and its resolved fidelity strength.
     img2img: Option<(&'r Image, f32)>,
-    capture_sigma: f32,
-    sigmas: Vec<f32>,
-    keep: usize,
+    schedule: KreaSchedule<'r>,
     guidance: f32,
     negative: String,
-    multiphase: KreaMultiphase,
     pag: Option<mlx_gen::gen_core::PagResolved>,
 }
 
-impl KreaRequest<'_> {
-    /// Executed step count across all Krea routes (single-phase, PiD-truncated, img2img-sliced,
-    /// and multi-phase global schedule), feeding [`mlx_gen::gen_core::PagResolved::execution_report`].
-    fn executed_steps(&self) -> u32 {
-        let steps = if let Some((_, full)) = &self.multiphase.phases {
-            full.len().saturating_sub(1)
-        } else if let Some((_, strength)) = self.img2img {
-            let start =
-                init_time_step(self.steps, Some(strength)).min(self.sigmas.len().saturating_sub(1));
-            let end = self.keep.min(self.sigmas.len());
-            end.saturating_sub(start).saturating_sub(1)
-        } else {
-            let end = self.keep.min(self.sigmas.len());
-            end.saturating_sub(1)
-        };
-        steps as u32
+enum KreaSchedule<'r> {
+    Compiled(&'r RenderPlan),
+    Local(KreaTrajectory),
+}
+
+impl KreaSchedule<'_> {
+    fn capture_sigma(&self) -> f32 {
+        match self {
+            Self::Compiled(plan) => plan.capture_sigma(),
+            Self::Local(trajectory) => trajectory.capture_sigma,
+        }
     }
 
-    fn pag_execution_report(&self) -> Option<mlx_gen::gen_core::PagExecutionReport> {
-        self.pag
-            .as_ref()
-            .map(|pag| pag.execution_report(self.executed_steps()))
+    fn adapter_phase_plan(&self) -> Option<&RenderPlan> {
+        match self {
+            Self::Compiled(plan) if !plan.adapter_phases().is_empty() => Some(plan),
+            _ => None,
+        }
     }
 }
 
-/// The multi-phase plan (epic 13879): the resolved phases with their one global schedule, and
-/// whether any phase requires an unconditional CFG context.
-struct KreaMultiphase {
-    phases: Option<(Vec<ResolvedPhase>, Vec<f32>)>,
-    encode_neg: bool,
+impl KreaRequest<'_> {
+    fn pag_execution_report(&self) -> Option<mlx_gen::gen_core::PagExecutionReport> {
+        self.pag.as_ref().map(|pag| match &self.schedule {
+            KreaSchedule::Compiled(plan) if !plan.adapter_phases().is_empty() => pag
+                .execution_report_for_prefix(
+                    plan.executed_steps() as u32,
+                    plan.sigmas().len().saturating_sub(1) as u32,
+                ),
+            KreaSchedule::Compiled(plan) => pag.execution_report(plan.executed_steps() as u32),
+            KreaSchedule::Local(trajectory) => {
+                pag.execution_report(trajectory.executed_steps() as u32)
+            }
+        })
+    }
 }
 
 /// One image through the single-phase plan's render body.
@@ -1874,10 +1843,11 @@ fn render_one(
     request: &KreaRequest<'_>,
     opts: &TurboOptions,
     decoder: Option<&dyn LatentDecoder>,
+    keep: usize,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Image> {
     let req = request.req;
-    let (guidance, keep) = (request.guidance, request.keep);
+    let guidance = request.guidance;
     match plan {
         KreaRenderPlan::Edit(p) => heavy.render_edit_from(
             p,
@@ -1909,29 +1879,9 @@ fn render_one(
             &req.preview,
             on_progress,
         ),
-        KreaRenderPlan::Img2ImgTurbo { plan, strength } => heavy.render_turbo_img2img_from(
-            plan,
-            *strength,
-            opts,
-            decoder,
-            // from_ldm early-stop (sc-10121): see the Raw arm above.
-            keep,
-            &req.cancel,
-            &req.preview,
-            on_progress,
-        ),
         KreaRenderPlan::BaseCfg(p) => heavy.render_base_from(
             p,
             guidance,
-            opts,
-            decoder,
-            keep,
-            &req.cancel,
-            &req.preview,
-            on_progress,
-        ),
-        KreaRenderPlan::Turbo(p) => heavy.render_turbo_from(
-            p,
             opts,
             decoder,
             keep,
@@ -2026,6 +1976,168 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
     }
 }
 
+fn krea_steps(req: &GenerationRequest, is_raw: bool) -> usize {
+    req.steps.unwrap_or(if is_raw {
+        DEFAULT_RAW_STEPS
+    } else {
+        DEFAULT_STEPS
+    }) as usize
+}
+
+fn resolve_img2img_reference<'a>(
+    provider_id: &str,
+    req: &'a GenerationRequest,
+) -> Result<Option<(&'a Image, f32)>> {
+    Ok(
+        single_reference(provider_id, req)?.map(|(image, reference_strength)| {
+            (
+                image,
+                reference_strength
+                    .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
+            )
+        }),
+    )
+}
+
+struct KreaTrajectory {
+    sigmas: Vec<f32>,
+    start_step: usize,
+    keep: usize,
+    capture_sigma: f32,
+}
+
+impl KreaTrajectory {
+    fn executed_steps(&self) -> usize {
+        self.keep.saturating_sub(self.start_step).saturating_sub(1)
+    }
+}
+
+fn resolve_krea_trajectory(
+    req: &GenerationRequest,
+    is_raw: bool,
+    steps: usize,
+    reference_strength: Option<f32>,
+) -> Result<KreaTrajectory> {
+    let (native, native_mu) = if is_raw {
+        (
+            base_schedule(steps, req.width, req.height, req.scheduler.as_deref()),
+            crate::schedule::dynamic_mu((req.width as f64 / 16.0) * (req.height as f64 / 16.0))
+                as f32,
+        )
+    } else {
+        (
+            turbo_schedule(steps, req.scheduler.as_deref()),
+            crate::schedule::TURBO_MU as f32,
+        )
+    };
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        native_mu,
+        steps,
+        &native,
+    )?;
+    let start_step = init_time_step(steps, reference_strength).min(sigmas.len().saturating_sub(1));
+    // PiD capture is relative to this exact img2img window, including a terminal reference no-op.
+    let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
+    Ok(KreaTrajectory {
+        sigmas,
+        start_step,
+        keep,
+        capture_sigma,
+    })
+}
+
+fn compile_turbo_plan(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+    admitted_load: Option<&LoadSpec>,
+) -> Result<RenderPlan> {
+    let reference_strength =
+        resolve_img2img_reference(descriptor.id, req)?.map(|(_, strength)| strength);
+    let trajectory =
+        resolve_krea_trajectory(req, false, krea_steps(req, false), reference_strength)?;
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: RES_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance: req.guidance.unwrap_or(0.0),
+        sigmas: trajectory.sigmas[trajectory.start_step..].to_vec(),
+        executed_steps: trajectory.executed_steps(),
+        capture_sigma: trajectory.capture_sigma,
+    };
+    let plan = match admitted_load {
+        Some(spec) => {
+            RenderPlan::packed_image_trajectory_with_exact_load(descriptor, spec, req, pass)
+        }
+        None => RenderPlan::packed_image_trajectory(descriptor, req, pass),
+    }?;
+    Ok(plan)
+}
+
+pub(crate) fn compile_turbo_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    let descriptor = descriptor();
+    validate_request(&descriptor, req)?;
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        validate_native_krea_spec(spec, descriptor.id)?;
+    } else {
+        validate_base_krea_load_axes(spec, descriptor.id)?;
+        mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor)?;
+    }
+    Ok(Some(compile_turbo_plan(&descriptor, req, Some(spec))?))
+}
+
+fn compile_multiphase_plan(
+    descriptor: &ModelDescriptor,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<RenderPlan> {
+    let total = req.phases.as_ref().map_or(0, |phases| {
+        phases.iter().map(|phase| phase.steps as usize).sum()
+    });
+    let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+        total,
+        &native,
+    )?;
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    Ok(RenderPlan::krea_multiphase(
+        descriptor,
+        spec,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: crate::RES_MULTIPLE,
+            token_width: 64,
+            sampler: solver.name(),
+            guidance: req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE),
+            sigmas,
+            executed_steps: total,
+            capture_sigma: 0.0,
+        },
+    )?)
+}
+
+pub(crate) fn compile_raw_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    if req.phases.is_none() {
+        return Ok(None);
+    }
+    let descriptor = raw_descriptor();
+    validate_request(&descriptor, req)?;
+    ensure_multiphase_allowed_for(descriptor.id, adapters_have_diff_patch_for_spec(spec)?, req)?;
+    Ok(Some(compile_multiphase_plan(&descriptor, spec, req)?))
+}
+
 /// Multi-phase request validation (epic 13879, sc-13884). Multi-phase is the **Raw t2i** variant only:
 /// an ordered phase list run from pure noise over ONE global schedule, each phase a contiguous step
 /// slice with its own guidance (per-phase CFG on/off) AND its own adapter set (per-phase LoRA/LoKr
@@ -2035,7 +2147,7 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
 /// - an empty phase list or a 0-step phase (a malformed trajectory).
 ///
 /// Per-phase **adapter index bounds** (against the model's loaded adapter set) are checked at
-/// `generate` time by [`crate::multiphase::resolve_phases`] (the count isn't on the descriptor). A
+/// plan compilation time (the count isn't on the descriptor). A
 /// no-op when `req.phases` is `None` (the ordinary single-phase render).
 fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
     let Some(phases) = req.phases.as_ref() else {
@@ -2122,9 +2234,7 @@ fn single_reference<'a>(
 enum KreaRenderPlan {
     Edit(EditPlan),
     Img2ImgRaw { plan: Img2ImgPlan, strength: f32 },
-    Img2ImgTurbo { plan: Img2ImgPlan, strength: f32 },
     BaseCfg(T2iPlan),
-    Turbo(T2iPlan),
 }
 
 /// The most reference images a Krea edit accepts (epic 10871 P1.3): scene = image 1, person = image 2.
@@ -2396,6 +2506,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_turbo_generation_preserves_unprepared_file_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = footprint_snapshot(&dir);
+        let adapter = dir.path().join("adapter.safetensors");
+        write_minimal_safetensors(&adapter);
+        let pid = dir.path().join("pid.safetensors");
+        write_minimal_safetensors(&pid);
+        let base =
+            LoadSpec::new(WeightsSource::Dir(root)).with_offload_policy(OffloadPolicy::Sequential);
+        let with_adapter = base.clone().with_adapters(vec![AdapterSpec::new(
+            adapter,
+            0.75,
+            mlx_gen::AdapterKind::Lora,
+        )]);
+        let with_pid = base.with_pid(
+            WeightsSource::File(pid),
+            WeightsSource::Dir(dir.path().join("gemma")),
+        );
+        let registry = crate::provider_registry().unwrap();
+        let request = GenerationRequest {
+            prompt: "a canceled Turbo render".into(),
+            width: 256,
+            height: 256,
+            seed: Some(5),
+            ..Default::default()
+        };
+        // The ordinary request must cross planning and reach cancellation before
+        // the deferred residency touches text, transformer, VAE or PiD weights.
+        request.cancel.cancel();
+        let mut progress = |_| panic!("canceled request must not start loading weights");
+        for spec in [with_adapter, with_pid] {
+            let generator = load(&spec).unwrap();
+            assert!(matches!(
+                generator.generate(&request, &mut progress),
+                Err(gen_core::Error::Canceled)
+            ));
+            let error = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &spec, &request)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("require finalized file source pins"));
+
+            let mut prepared = spec;
+            prepared.prepare_file_sources().unwrap();
+            let plan = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &prepared, &request)
+                .unwrap()
+                .unwrap();
+            assert!(generator
+                .generate_planned(&request, &plan, None, &mut progress)
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("different model or adapter stack")));
+            let generator = load(&prepared).unwrap();
+            assert!(matches!(
+                generator.generate_planned(&request, &plan, None, &mut progress),
+                Err(gen_core::Error::Canceled)
+            ));
+        }
+    }
+
+    #[test]
+    fn turbo_plans_bind_native_sources_and_use_the_resolved_img2img_tail() {
+        use gen_core::render::{PlannedPassRequest, ProducedReference};
+
+        let registry = crate::provider_registry().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = dir.path().join("adapter.safetensors");
+        write_minimal_safetensors(&adapter);
+        let mut spec = complete_native_file_spec(&dir).with_adapters(vec![AdapterSpec::new(
+            adapter,
+            0.75,
+            mlx_gen::AdapterKind::Lora,
+        )]);
+        spec.prepare_file_sources().unwrap();
+        let request = GenerationRequest {
+            prompt: "a weights-free Turbo plan".into(),
+            width: 256,
+            height: 256,
+            seed: Some(5),
+            sampler: Some("heun".into()),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(KREA_2_TURBO_ID, &spec, &request)
+            .unwrap()
+            .unwrap();
+        let native = turbo_schedule(DEFAULT_STEPS as usize, None);
+        assert_eq!(plan.denoise_sigmas(), native);
+        assert_eq!(plan.base_seed(), 5);
+        assert_eq!(plan.sampler(), "heun");
+        assert_eq!(plan.guidance(), 0.0);
+        assert!(!plan.has_conditioning());
+        plan.check_load_spec(&spec).unwrap();
+        let mut different_stack = spec.clone();
+        different_stack.adapters[0].scale = 0.5;
+        assert!(plan.check_load_spec(&different_stack).is_err());
+
+        let fitted = Image {
+            width: 512,
+            height: 512,
+            pixels: vec![170; 512 * 512 * 3],
+        };
+        let refinement = GenerationRequest {
+            width: fitted.width,
+            height: fitted.height,
+            strength: Some(0.25),
+            ..request.clone()
+        };
+        let mut sourced = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: fitted.clone(),
+                strength: Some(1.0 - 0.5),
+            }],
+            ..refinement.clone()
+        };
+        let sourced_plan = registry
+            .compile_render_plan(KREA_2_TURBO_ID, &spec, &sourced)
+            .unwrap()
+            .unwrap();
+        assert!(sourced_plan.has_conditioning());
+        assert_eq!(sourced_plan.denoise_sigmas(), &native[4..]);
+        assert_eq!(sourced_plan.executed_steps(), 4);
+        sourced_plan.check_request(&descriptor(), &sourced).unwrap();
+        if let Conditioning::Reference { image, .. } = &mut sourced.conditioning[0] {
+            image.pixels[0] = 0;
+        }
+        assert!(sourced_plan.check_request(&descriptor(), &sourced).is_err());
+
+        // denoising = 0 gives fidelity 1. The fitted reference remains an input to VAE encode and
+        // decode even though there are no denoiser evaluations.
+        let produced = ProducedReference {
+            from_pass: 0,
+            width: fitted.width,
+            height: fitted.height,
+            strength: Some(1.0),
+        };
+        let hires = registry
+            .compile_multi_pass_render_plan(
+                KREA_2_TURBO_ID,
+                &spec,
+                &[
+                    PlannedPassRequest {
+                        request: &request,
+                        produced_reference: None,
+                    },
+                    PlannedPassRequest {
+                        request: &refinement,
+                        produced_reference: Some(produced),
+                    },
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let refinement_plan = &hires.passes()[1];
+        assert_eq!(refinement_plan.produced_reference(), Some(produced));
+        assert_eq!(refinement_plan.denoise_sigmas(), &[0.0]);
+        assert_eq!(refinement_plan.executed_steps(), 0);
+        sourced.conditioning = vec![Conditioning::Reference {
+            image: fitted,
+            strength: produced.strength,
+        }];
+        refinement_plan
+            .check_request(&descriptor(), &sourced)
+            .unwrap();
+        refinement_plan.check_load_spec(&spec).unwrap();
+        assert!(validate_request(&turbo_edit_descriptor(), &sourced).is_err());
+    }
+
+    #[test]
+    fn raw_multiphase_compiler_is_weights_free_and_binds_declared_solver_and_branches() {
+        let spec = LoadSpec::new(WeightsSource::Dir("unused-krea-snapshot".into()));
+        let mut request = GenerationRequest {
+            prompt: "A weights-free plan".into(),
+            width: 256,
+            height: 256,
+            sampler: Some("heun".into()),
+            phases: Some(vec![
+                gen_core::GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    ..Default::default()
+                },
+                gen_core::GenerationPhase {
+                    steps: 2,
+                    guidance: Some(2.5),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let plan = compile_raw_render_plan(&spec, &request).unwrap().unwrap();
+        assert_eq!(plan.sampler(), "heun");
+        assert_eq!(plan.executed_steps(), 3);
+        assert_eq!(plan.adapter_phases()[0].span(), 0..1);
+        assert_eq!(plan.adapter_phases()[1].span(), 1..3);
+        assert!(!plan.adapter_phases()[0]
+            .arguments()
+            .uses_classifier_free_guidance());
+        assert!(plan.adapter_phases()[1]
+            .arguments()
+            .uses_classifier_free_guidance());
+        assert!(plan.adapter_phases_need_negative());
+        request.phases = None;
+        assert!(compile_raw_render_plan(&spec, &request).unwrap().is_none());
+    }
+
     /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
     /// The calibration-fault boundaries are structural claims about *where* in this body the fault
     /// fires; a weights-free test cannot drive the real DiT, so the placement is pinned here and the
@@ -2511,12 +2830,10 @@ mod tests {
                 "a TurboOptions literal drops the provider id: {region}"
             );
         }
-        for dispatch in ["render_phase", "render_multiphase"] {
-            assert!(
-                fn_source(dispatch).contains("self.turbo_options("),
-                "{dispatch} must build its options through `turbo_options`"
-            );
-        }
+        assert!(
+            fn_source("render_phase").contains("self.turbo_options("),
+            "render_phase must build its options through `turbo_options`"
+        );
     }
 
     #[test]

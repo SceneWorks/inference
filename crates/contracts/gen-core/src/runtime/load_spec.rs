@@ -194,7 +194,7 @@ pub struct PidWeights {
 /// field is a **load-time** error (epic 13657, sc-13664). There is no env-var or cache fallback:
 /// the old "optional field ⇒ provider `PULID_*` env / HF-cache-derived default" convention was
 /// deleted, so a `None` a provider needs fails fast at load rather than silently scanning the disk.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdentityWeights {
     /// The identity-encoder checkpoint — a single `.safetensors` (PuLID's
     /// `pulid_flux_v0.9.1.safetensors`). Required by the PuLID-FLUX loader (`None` ⇒ load-time error).
@@ -209,6 +209,72 @@ pub struct IdentityWeights {
 }
 
 impl LoadSpec {
+    /// Compare immutable plan inputs while allowing the cache to report its actual placement.
+    /// Keep this exhaustive so a new load input cannot silently become a placement override.
+    pub(crate) fn same_load_except_placement(&self, other: &Self) -> bool {
+        let Self {
+            weights,
+            resolved_route,
+            decode_geometry_policies,
+            decode_geometry_policy_authoritative,
+            decode_quality_runtime_identity,
+            prepared_file_pins,
+            prepared_receipt_paths,
+            prepared_encoder_receipt,
+            source_inventory,
+            quantize,
+            precision,
+            yue2_ar_mode,
+            yue2_compute_policy,
+            control,
+            extra_controls,
+            ip_adapter,
+            adapters,
+            pid,
+            identity,
+            text_encoder,
+            offload_policy: _,
+            load_shape: _,
+            load_shape_declaration_result: _,
+            components,
+        } = self;
+        weights == &other.weights
+            && resolved_route == &other.resolved_route
+            && decode_geometry_policies == &other.decode_geometry_policies
+            && *decode_geometry_policy_authoritative == other.decode_geometry_policy_authoritative
+            && decode_quality_runtime_identity == &other.decode_quality_runtime_identity
+            && prepared_file_pins == &other.prepared_file_pins
+            && prepared_receipt_paths == &other.prepared_receipt_paths
+            && prepared_encoder_receipt == &other.prepared_encoder_receipt
+            && source_inventory == &other.source_inventory
+            && *quantize == other.quantize
+            && *precision == other.precision
+            && *yue2_ar_mode == other.yue2_ar_mode
+            && *yue2_compute_policy == other.yue2_compute_policy
+            && control == &other.control
+            && extra_controls == &other.extra_controls
+            && ip_adapter == &other.ip_adapter
+            && adapters.len() == other.adapters.len()
+            && adapters.iter().zip(&other.adapters).all(|(left, right)| {
+                left.path == right.path
+                    && left.kind == right.kind
+                    && left.moe_expert == right.moe_expert
+                    && left.scale.to_bits() == right.scale.to_bits()
+                    && match (&left.pass_scales, &right.pass_scales) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => left
+                            .iter()
+                            .map(|scale| scale.to_bits())
+                            .eq(right.iter().map(|scale| scale.to_bits())),
+                        _ => false,
+                    }
+            })
+            && pid == &other.pid
+            && identity == &other.identity
+            && text_encoder == &other.text_encoder
+            && components == &other.components
+    }
+
     pub(crate) fn has_source_guard(&self) -> bool {
         self.prepared_file_pins.is_prepared() || self.source_inventory.is_some()
     }
