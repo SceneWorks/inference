@@ -419,7 +419,7 @@ impl Sources {
             .map(|asset| asset.pin.target_fingerprint().size)
             .max()
             .unwrap_or(0)
-            .max(5_362_224_248))
+            .max(crate::memory_strategy::PUBLISHED_SOURCE_STAGING_BYTES))
     }
     pub(crate) fn working_set_budget(&self) -> Result<Option<u64>> {
         #[cfg(feature = "test-support")]
