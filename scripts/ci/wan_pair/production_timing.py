@@ -5,9 +5,9 @@ from scripts.ci import video_tier1_evidence as evidence
 
 NAME = "sw-6954-gpu0-wan-production-timing-v1"
 CASE = "cuda-ti2v5b-t2v-heun"
-# Current-source comparison after inference #1492: the baseline is current inference main
-# (shared Linear spine, pre-migration sampler) and the head is this feature merged with that main.
-BASE = "71090e3ac22d9e9eeaa7319e9eaf5987a8b07943"
+# Current-source comparison after inference #1492 and #1494: the baseline is current inference
+# main (shared Linear spine, pre-migration sampler) and the head is this feature merged with that main.
+BASE = "e0ede894a07a60f512a02d912b01a8f09297a93a"
 FEATURE = "f5c9ff80acd00334fd668e4ecc8d56be3347affd"
 PRIOR = {
     "run": "44940165866", "attempt": 1, "artifact": 14722437756,
