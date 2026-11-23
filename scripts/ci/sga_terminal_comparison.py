@@ -32,6 +32,8 @@ SELECTION = "sga-terminal-tier2"
 BASE = "481a982db44b58937c15c2d3f0cbf918b116d04d"
 WINDOWS_DEV_DIAGNOSTIC = "windows-dev-memory"
 WINDOWS_DEV_GPU = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+WINDOWS_DEV_PROCESS_CAP_REQUEST = "windows_dev_process_cap_gib"
+WINDOWS_DEV_PROCESS_CAP_GIB = 64
 WINDOWS_DEV_REPAIR = "713e73daf3af2ac0012a6606e750e90ae644091e"
 DIAGNOSTIC_SAMPLES = (("warmup-base", "base"),)
 APPLE_DEV_DIAGNOSTIC = "apple-dev-step-timing"
@@ -60,8 +62,11 @@ def profile_for(backend, request):
     binding = DEVICE_KEY.get(backend)
     keys = {"selection", "profile", "variant", binding, "download_missing"}
     diagnostic = isinstance(request, dict) and "diagnostic" in request
+    dev_process_cap = isinstance(request, dict) and WINDOWS_DEV_PROCESS_CAP_REQUEST in request
     if diagnostic:
         keys.add("diagnostic")
+    if dev_process_cap:
+        keys.add(WINDOWS_DEV_PROCESS_CAP_REQUEST)
     if (binding is None or not isinstance(request, dict)
             or set(request) != keys
             or request["selection"] != SELECTION or request["download_missing"] is not True
@@ -71,6 +76,12 @@ def profile_for(backend, request):
     if (backend == "mlx" and request[binding] != "nax") or (backend == "candle-cuda" and not
             re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request[binding])):
         raise ValueError("terminal route requires the secondary Mac or an exact physical CUDA UUID")
+    if dev_process_cap:
+        cap = request[WINDOWS_DEV_PROCESS_CAP_REQUEST]
+        if (diagnostic or type(cap) is not int or cap != WINDOWS_DEV_PROCESS_CAP_GIB
+                or (backend, request["profile"], request["variant"], request[binding]) !=
+                ("candle-cuda", "ltx25", "dev", WINDOWS_DEV_GPU)):
+            raise ValueError("64 GiB process cap requires the scored Windows Candle LTX Dev route on its exact GPU")
     if request.get("diagnostic") == APPLE_DEV_DIAGNOSTIC:
         if (backend, request["profile"], request["variant"], request[binding]) != ("mlx", "ltx25", "dev", "nax"):
             raise ValueError("Apple Dev timing diagnostic requires the registered MLX LTX Dev nax route")
@@ -137,6 +148,8 @@ def plan(backend, request, head):
         raise ValueError("terminal head must descend from the pinned native-format main baseline")
     binding = request[DEVICE_KEY[backend]]
     policy = profile.policy(request["variant"], binding)
+    if WINDOWS_DEV_PROCESS_CAP_REQUEST in request:
+        policy["childFootprintCapBytes"] = WINDOWS_DEV_PROCESS_CAP_GIB * 1024**3
     with TemporaryDirectory(prefix="sga-terminal-policy-") as directory:
         checked_policy = Path(directory) / "policy.json"
         proof.write_json(checked_policy, policy)

@@ -251,6 +251,32 @@ class TerminalTests(unittest.TestCase):
         mac_limits = comparison.sample_limits(ltx, dict(ltx.policy("dev", UUID), backend="darwin-mlx"))
         self.assertNotIn("cuda-pool.json", mac_limits)
 
+    def test_approved_windows_dev_process_cap_changes_only_the_scored_host_limit(self):
+        request = dict(REQUEST, cuda_device_uuid=comparison.WINDOWS_DEV_GPU)
+        field = comparison.WINDOWS_DEV_PROCESS_CAP_REQUEST
+        approved = {**request, field: 64}
+        self.assertIs(comparison.profile_for("candle-cuda", approved), ltx)
+        for overrides in ({field: 64.0}, {field: 65}, {field: 56}, {field: True},
+                          {"cuda_device_uuid": UUID}, {"variant": "distilled"},
+                          {"profile": "z-image"}, {"diagnostic": comparison.WINDOWS_DEV_DIAGNOSTIC}):
+            with self.assertRaisesRegex(ValueError, "64 GiB process cap"):
+                comparison.profile_for("candle-cuda", {**approved, **overrides})
+        mlx = {key: value for key, value in approved.items() if key != "cuda_device_uuid"}
+        with self.assertRaisesRegex(ValueError, "64 GiB process cap"):
+            comparison.profile_for("mlx", dict(mlx, runner="nax"))
+
+        revision = "1" * 40
+        with (patch.object(comparison.proof, "repository_identity", return_value={"revision": revision}),
+              patch.object(comparison.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+              patch.object(comparison.paired, "git", return_value="2" * 40),
+              patch.object(comparison, "terminal_overlay", return_value=(lambda *_: {}, {}))):
+            original = comparison.plan("candle-cuda", request, revision)
+            scoped = comparison.plan("candle-cuda", approved, revision)
+        self.assertEqual(original["policy"]["childFootprintCapBytes"], 56 * 1024**3)
+        self.assertEqual(scoped, {**original, "request": approved, "policy": {
+            **original["policy"], "childFootprintCapBytes": 64 * 1024**3,
+        }})
+
     def test_pair_order_and_exact_decisions(self):
         base = {"identity": {"v": "same", "a": "same"}, "timing": {"e2e_ns": 1000}, "peaks": {"device": 1000}}
         samples = {name: base for name, _ in comparison.SAMPLES}
