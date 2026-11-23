@@ -3,7 +3,7 @@ import hashlib
 
 from scripts.ci import video_tier1_evidence as evidence
 
-NAME = "sw-6954-gpu0-wan-production-timing-v1"
+NAME = "sw-6954-gpu0-wan-production-timing-v2"
 CASE = "cuda-ti2v5b-t2v-heun"
 # Current-source comparison after inference #1492 and #1494: the baseline is current inference
 # main (shared Linear spine, pre-migration sampler) and the head is this feature merged with that main.
