@@ -15,6 +15,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
+use mlx_gen::gen_core::phase::PhaseAdapterScale;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -191,21 +192,36 @@ impl GatedAttention {
         attention: AttentionPlan<'_>,
         perturb_after_prefix: Option<i32>,
     ) -> Result<Array> {
+        self.forward_with_phase(x, rope, attention, perturb_after_prefix, None)
+    }
+
+    fn forward_with_phase(
+        &self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+        attention: AttentionPlan<'_>,
+        perturb_after_prefix: Option<i32>,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
-        let q = self
-            .q
-            .forward(x)?
-            .reshape(&[b, s, self.heads, self.head_dim])?;
-        let k = self
-            .k
-            .forward(x)?
-            .reshape(&[b, s, self.kv_heads, self.head_dim])?;
-        let v = self
-            .v
-            .forward(x)?
-            .reshape(&[b, s, self.kv_heads, self.head_dim])?;
-        let gate = self.gate.forward(x)?; // [b, s, hidden]
+        let q =
+            self.q
+                .forward_with_phase(x, adapters)?
+                .reshape(&[b, s, self.heads, self.head_dim])?;
+        let k = self.k.forward_with_phase(x, adapters)?.reshape(&[
+            b,
+            s,
+            self.kv_heads,
+            self.head_dim,
+        ])?;
+        let v = self.v.forward_with_phase(x, adapters)?.reshape(&[
+            b,
+            s,
+            self.kv_heads,
+            self.head_dim,
+        ])?;
+        let gate = self.gate.forward_with_phase(x, adapters)?; // [b, s, hidden]
 
         let q = self.norm_q.forward(&q)?;
         let k = self.norm_k.forward(&k)?;
@@ -248,7 +264,7 @@ impl GatedAttention {
 
         // Sigmoid gate the attention output, then the shared output projection.
         let gated = multiply(&o, &sigmoid(&gate)?)?;
-        self.o.forward(&gated)
+        self.o.forward_with_phase(&gated, adapters)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -315,8 +331,19 @@ impl SwiGlu {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        self.forward_with_phase(x, None)
+    }
+
+    fn forward_with_phase(
+        &self,
+        x: &Array,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
+        let gated = multiply(
+            &silu(&self.gate.forward_with_phase(x, adapters)?)?,
+            &self.up.forward_with_phase(x, adapters)?,
+        )?;
+        self.down.forward_with_phase(&gated, adapters)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -395,8 +422,28 @@ impl TextFusionBlock {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let x = add(x, &self.attn.forward(&self.prenorm.forward(x)?, None)?)?;
-        Ok(add(&x, &self.mlp.forward(&self.postnorm.forward(&x)?)?)?)
+        self.forward_with_phase(x, None)
+    }
+
+    fn forward_with_phase(
+        &self,
+        x: &Array,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
+        let attn = self.attn.forward_with_phase(
+            &self.prenorm.forward(x)?,
+            None,
+            AttentionPlan::UNBOUNDED,
+            None,
+            adapters,
+        )?;
+        let x = add(x, &attn)?;
+        Ok(add(
+            &x,
+            &self
+                .mlp
+                .forward_with_phase(&self.postnorm.forward(&x)?, adapters)?,
+        )?)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -541,6 +588,20 @@ impl SingleStreamBlock {
         attention: AttentionPlan<'_>,
         perturb_after_prefix: Option<i32>,
     ) -> Result<Array> {
+        self.forward_with_phase(x, tvec, cos, sin, attention, perturb_after_prefix, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_phase(
+        &self,
+        x: &Array,
+        tvec: &Array,
+        cos: &Array,
+        sin: &Array,
+        attention: AttentionPlan<'_>,
+        perturb_after_prefix: Option<i32>,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
         let m = add(tvec, &self.scale_shift_table)?; // [b, 1, 6·hidden]
         let m = split(&m, 6, 2)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&m[0], &m[1], &m[2]);
@@ -550,11 +611,12 @@ impl SingleStreamBlock {
             &multiply(&self.prenorm.forward(x)?, &plus1(prescale)?)?,
             preshift,
         )?;
-        let attn = self.attn.forward_budgeted_with_pag(
+        let attn = self.attn.forward_with_phase(
             &pre,
             Some((cos, sin)),
             attention,
             perturb_after_prefix,
+            adapters,
         )?;
         let x = add(x, &multiply(pregate, &attn)?)?;
 
@@ -562,7 +624,7 @@ impl SingleStreamBlock {
             &multiply(&self.postnorm.forward(&x)?, &plus1(postscale)?)?,
             postshift,
         )?;
-        let mlp = self.mlp.forward(&post)?;
+        let mlp = self.mlp.forward_with_phase(&post, adapters)?;
         Ok(add(&x, &multiply(postgate, &mlp)?)?)
     }
 
@@ -660,13 +722,21 @@ impl TextFusionTransformer {
     /// `x`: `[b, n_tokens, num_layers, txt_dim]` (the stacked select-layer hidden states). Returns the
     /// fused conditioning `[b, n_tokens, txt_dim]`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_with_phase(x, None)
+    }
+
+    pub(crate) fn forward_with_phase(
+        &self,
+        x: &Array,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, n_tok, n_layers, d) = (sh[0], sh[1], sh[2], sh[3]);
 
         // Layerwise attention: each token's `num_layers` stack is a sequence (batch = b·n_tokens).
         let mut h = x.reshape(&[b * n_tok, n_layers, d])?;
         for blk in &self.layerwise {
-            h = blk.forward(&h)?;
+            h = blk.forward_with_phase(&h, adapters)?;
         }
 
         // `(b n_tok) n_layers d -> b n_tok d n_layers`, project `num_layers → 1`, drop the axis.
@@ -675,12 +745,12 @@ impl TextFusionTransformer {
             .transpose_axes(&[0, 1, 3, 2])?; // [b, n_tok, d, n_layers]
         let h = self
             .projector
-            .forward(&h.reshape(&[b * n_tok * d, n_layers])?)?; // [b·n_tok·d, 1]
+            .forward_with_phase(&h.reshape(&[b * n_tok * d, n_layers])?, adapters)?; // [b·n_tok·d, 1]
         let mut h = h.reshape(&[b, n_tok, d])?;
 
         // Token-axis refinement.
         for blk in &self.refiner {
-            h = blk.forward(&h)?;
+            h = blk.forward_with_phase(&h, adapters)?;
         }
         Ok(h)
     }

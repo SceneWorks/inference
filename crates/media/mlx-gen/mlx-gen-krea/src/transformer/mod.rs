@@ -20,6 +20,10 @@
 pub mod block;
 pub mod rope;
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{concatenate_axis, cos, divide, exp, multiply, sin, split, sum};
 use mlx_rs::transforms::checkpoint;
@@ -33,20 +37,17 @@ use mlx_gen::Result;
 use crate::config::Krea2Config;
 use crate::quant::lin;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use mlx_gen::adapters::loader::PhaseAdapterSource;
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::attention::AttentionPlan;
+use mlx_gen::gen_core::phase::{PhaseAdapterScale, PhaseArguments};
 use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
 /// The Krea 2 single-stream DiT.
 ///
-/// `Clone` is a **shallow, refcounted** copy: MLX `Array`s are handles into shared device buffers,
-/// so cloning duplicates only the thin module/adapter-stack structs while the (large) weight tensors
-/// stay shared. This is what makes a **job-local DiT clone** cheap enough for the multi-phase render
-/// (epic 13879, sc-13884) to toggle its adapter stacks per phase (`clear_adapters` + a low-rank
-/// re-apply) without touching the shared resident DiT — the base weights are never mutated (adapters
-/// are forward-time residuals), so concurrent generates on the resident model are unaffected. The
-/// training path already relies on this shallow block clone (`SingleStreamBlock::clone` per step).
+/// `Clone` shares the weight storage. Multi-phase requests build a phase-local residual bank
+/// over the same base, and training can clone a block for checkpoint recomputation.
 #[derive(Clone)]
 pub struct Krea2Transformer {
     cfg: Krea2Config,
@@ -275,12 +276,77 @@ impl Krea2Transformer {
         result
     }
 
-    /// Build the job-local DiT clone used by one multi-phase slice, with exactly that slice's
-    /// low-rank adapter subset. Deferred clones keep no resident block proxies after replay.
-    pub(crate) fn clone_for_multiphase(&self, specs: &[mlx_gen::AdapterSpec]) -> Result<Self> {
+    /// Build an immutable bank for the selected phase arguments over the same frozen base.
+    /// The production caller releases this derived bank at phase exit and keeps only raw sources.
+    pub(crate) fn clone_for_phase_adapters<'a>(
+        &self,
+        specs: &[mlx_gen::AdapterSpec],
+        sources: &BTreeMap<PathBuf, PhaseAdapterSource>,
+        phases: impl IntoIterator<Item = &'a PhaseArguments>,
+    ) -> Result<Self> {
+        let phases: Vec<_> = phases.into_iter().collect();
+        let mut variants = vec![Vec::new(); specs.len()];
+        let mut seen = HashSet::new();
+        for key in phases.iter().flat_map(|phase| phase.adapters()) {
+            let slot = variants.get_mut(key.slot()).ok_or_else(|| {
+                mlx_gen::Error::Unsupported(format!(
+                    "krea: phase adapter slot {} is outside the installed stack",
+                    key.slot()
+                ))
+            })?;
+            if seen.insert(*key) {
+                slot.push(*key);
+            }
+        }
         clone_for_multiphase_with(self, Krea2Transformer::clear_adapters, |dit| {
-            if !specs.is_empty() {
-                dit.apply_adapters_strict(specs, false)?;
+            if seen.is_empty() {
+                return Ok(());
+            }
+            let deferred = dit.blocks.is_empty() && dit.block_stream.is_some();
+            if deferred {
+                dit.blocks = dit
+                    .block_stream
+                    .as_ref()
+                    .expect("checked above")
+                    .adapter_proxy_blocks()?;
+            }
+            let paths = dit.residual_projection_paths();
+            let mut applied_by_key = HashMap::new();
+            for (spec, variants) in specs
+                .iter()
+                .zip(&variants)
+                .filter(|(_, variants)| !variants.is_empty())
+            {
+                let source = sources.get(&spec.path).ok_or_else(|| {
+                    mlx_gen::Error::Unsupported(format!(
+                        "krea: missing pinned phase adapter source {}",
+                        spec.path.display()
+                    ))
+                })?;
+                let applied =
+                    source.install_variants(dit, spec, variants, "krea_2", |dit, key| {
+                        for path in &paths {
+                            let parts: Vec<_> = path.split('.').collect();
+                            if let Some(linear) = dit.adaptable_mut(&parts) {
+                                linear.bind_phase_adapters(key);
+                            }
+                        }
+                    })?;
+                applied_by_key.extend(variants.iter().copied().zip(applied));
+            }
+            for phase in phases {
+                if !phase.adapters().is_empty()
+                    && !phase.adapters().iter().any(|key| applied_by_key[key] > 0)
+                {
+                    return Err(mlx_gen::Error::Msg(
+                        "krea_2 adapters: no target modules matched across the phase adapter selection".into(),
+                    ));
+                }
+            }
+            dit.materialize_adapter_payloads()?;
+            dit.capture_block_adapters();
+            if deferred {
+                dit.blocks.clear();
             }
             Ok(())
         })
@@ -347,6 +413,16 @@ impl Krea2Transformer {
         mask: Option<&Array>,
         latent: &Array,
     ) -> Result<JointPrep> {
+        self.prepare_with_phase(context, mask, latent, None)
+    }
+
+    pub(crate) fn prepare_with_phase(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        latent: &Array,
+        adapters: Option<Arc<[PhaseAdapterScale]>>,
+    ) -> Result<JointPrep> {
         let cfg = &self.cfg;
         let p = cfg.patch_size as i32;
         let sh = latent.shape();
@@ -355,7 +431,7 @@ impl Krea2Transformer {
         let latent_ch = cfg.in_channels as i32 / (p * p);
 
         // Trim + fuse + project the text stream (step-invariant), shared with the edit path.
-        let (ctx, cap_len) = self.text_stream(context, mask)?;
+        let (ctx, cap_len) = self.text_stream(context, mask, adapters.as_deref())?;
 
         // Joint RoPE tables (also step-invariant: depend only on cap_len + image grid).
         let rope = RopeTables::build_t2i(
@@ -367,6 +443,7 @@ impl Krea2Transformer {
         );
         let (rcos, rsin) = rope.joint();
         Ok(JointPrep {
+            adapters,
             ctx,
             rcos,
             rsin,
@@ -383,7 +460,12 @@ impl Krea2Transformer {
     /// (depends only on `context`/`mask`), so both [`prepare`](Self::prepare) and
     /// [`prepare_edit`](Self::prepare_edit) hoist it out of the denoise loop. Factored out so the two
     /// paths share one text-stream implementation.
-    fn text_stream(&self, context: &Array, mask: Option<&Array>) -> Result<(Array, i32)> {
+    fn text_stream(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<(Array, i32)> {
         let dt = self.dtype;
         let n_tok = context.shape()[1];
         let cap_len = match mask {
@@ -392,11 +474,12 @@ impl Krea2Transformer {
         };
         // Contiguous head slice `[0, cap_len)` via a split boundary, not an arange-gather (F-114).
         let context = split_axis1(context, cap_len)?.swap_remove(0).as_dtype(dt)?;
-        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.text_fusion.forward_with_phase(&context, adapters)?; // [b, cap, text_hidden]
         let ctx = self.txt_in_norm.forward(&ctx)?;
-        let ctx = self
-            .txt_in_l2
-            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
+        let ctx = self.txt_in_l2.forward_with_phase(
+            &gelu_tanh(&self.txt_in_l1.forward_with_phase(&ctx, adapters)?)?,
+            adapters,
+        )?; // [b, cap, hidden]
         Ok((ctx, cap_len))
     }
 
@@ -424,7 +507,7 @@ impl Krea2Transformer {
         let (ht, wt) = (h / p, w / p);
         let latent_ch = cfg.in_channels as i32 / (p * p);
 
-        let (ctx, cap_len) = self.text_stream(context, mask)?;
+        let (ctx, cap_len) = self.text_stream(context, mask, None)?;
 
         // Embed each clean reference latent through the SAME `img_in` as the noise (adapters included);
         // the reference tokens are step-invariant, so this hoist mirrors the text-stream one.
@@ -535,6 +618,7 @@ impl Krea2Transformer {
             &j.rsin,
             None,
             AttentionPlan::UNBOUNDED,
+            j.adapters.as_deref(),
         )?;
         self.finalize(&combined, &j.t, &j)
     }
@@ -573,6 +657,7 @@ impl Krea2Transformer {
             &j.rsin,
             window,
             attention,
+            j.adapters.as_deref(),
         )?;
         self.finalize(&combined, &j.t, &j)
     }
@@ -608,6 +693,11 @@ impl Krea2Transformer {
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
+        if positive.adapters != negative.adapters {
+            return Err(mlx_gen::Error::Unsupported(
+                "krea: CFG branches must share the same phase adapters".into(),
+            ));
+        }
         let positive = self.joint_inputs(latent, timestep, positive)?;
         let negative = self.joint_inputs(latent, timestep, negative)?;
         let (positive_combined, negative_combined) = self.run_blocks_paired(
@@ -616,6 +706,7 @@ impl Krea2Transformer {
             (&negative.tvec, &negative.rcos, &negative.rsin),
             window,
             attention,
+            positive.adapters.as_deref(),
         )?;
         Ok((
             self.finalize(&positive_combined, &positive.t, &positive)?,
@@ -643,6 +734,7 @@ impl Krea2Transformer {
             perturbed_layers,
             window,
             attention,
+            positive.adapters.as_deref(),
         )?;
         Ok((
             self.finalize(&cond_combined, &positive.t, &positive)?,
@@ -663,6 +755,11 @@ impl Krea2Transformer {
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array, Array)> {
+        if positive.adapters != negative.adapters {
+            return Err(mlx_gen::Error::Unsupported(
+                "krea: CFG branches must share the same phase adapters".into(),
+            ));
+        }
         let positive = self.joint_inputs(latent, timestep, positive)?;
         let negative = self.joint_inputs(latent, timestep, negative)?;
         let (cond_combined, uncond_combined, pag_combined) = self.run_blocks_cfg_and_perturbed(
@@ -677,6 +774,7 @@ impl Krea2Transformer {
             perturbed_layers,
             window,
             attention,
+            positive.adapters.as_deref(),
         )?;
         Ok((
             self.finalize(&cond_combined, &positive.t, &positive)?,
@@ -712,8 +810,10 @@ impl Krea2Transformer {
         attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let (mut combined, t, tvec) = self.edit_joint_inputs(latent, timestep, prep)?;
-        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window, attention)?;
-        let out = self.final_layer(&combined, &t)?;
+        combined = self.run_blocks(
+            combined, &tvec, &prep.rcos, &prep.rsin, window, attention, None,
+        )?;
+        let out = self.final_layer(&combined, &t, None)?;
         let img_len = prep.ht * prep.wt;
         let head = prep.cap_len + prep.n_refs * img_len;
         let img_out = split_axis1(&out, head)?.swap_remove(1);
@@ -759,9 +859,10 @@ impl Krea2Transformer {
             (&negative_tvec, &negative.rcos, &negative.rsin),
             window,
             attention,
+            None,
         )?;
         let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
-            let out = self.final_layer(combined, t)?;
+            let out = self.final_layer(combined, t, None)?;
             let img_len = prep.ht * prep.wt;
             let head = prep.cap_len + prep.n_refs * img_len;
             let img_out = split_axis1(&out, head)?.swap_remove(1);
@@ -796,9 +897,10 @@ impl Krea2Transformer {
             perturbed_layers,
             window,
             attention,
+            None,
         )?;
         let finish = |combined: &Array| -> Result<Array> {
-            let out = self.final_layer(combined, &positive_t)?;
+            let out = self.final_layer(combined, &positive_t, None)?;
             let img_out = split_axis1(&out, head)?.swap_remove(1);
             unpatchify(
                 &img_out,
@@ -841,9 +943,10 @@ impl Krea2Transformer {
             perturbed_layers,
             window,
             attention,
+            None,
         )?;
         let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
-            let out = self.final_layer(combined, t)?;
+            let out = self.final_layer(combined, t, None)?;
             let img_len = prep.ht * prep.wt;
             let head = prep.cap_len + prep.n_refs * img_len;
             let img_out = split_axis1(&out, head)?.swap_remove(1);
@@ -882,6 +985,7 @@ impl Krea2Transformer {
         self.finalize(&combined, &j.t, &j)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks_paired(
         &self,
         mut states: (Array, Array),
@@ -889,14 +993,17 @@ impl Krea2Transformer {
         negative: (&Array, &Array, &Array),
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
+        adapters: Option<&[PhaseAdapterScale]>,
     ) -> Result<(Array, Array)> {
         let Some(window) = window else {
             self.require_resident_blocks()?;
             for block in &self.blocks {
-                states.0 = block
-                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
-                states.1 = block
-                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
+                states.0 = block.forward_with_phase(
+                    &states.0, positive.0, positive.1, positive.2, attention, None, adapters,
+                )?;
+                states.1 = block.forward_with_phase(
+                    &states.1, negative.0, negative.1, negative.2, attention, None, adapters,
+                )?;
             }
             return Ok(states);
         };
@@ -926,12 +1033,14 @@ impl Krea2Transformer {
                     range,
                     |index| stream.materialize(view, index),
                     |block, state| {
-                        block
-                            .forward_budgeted(&state, positive.0, positive.1, positive.2, attention)
+                        block.forward_with_phase(
+                            &state, positive.0, positive.1, positive.2, attention, None, adapters,
+                        )
                     },
                     |block, state| {
-                        block
-                            .forward_budgeted(&state, negative.0, negative.1, negative.2, attention)
+                        block.forward_with_phase(
+                            &state, negative.0, negative.1, negative.2, attention, None, adapters,
+                        )
                     },
                 )
             },
@@ -941,6 +1050,7 @@ impl Krea2Transformer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks_cond_and_perturbed(
         &self,
         mut states: (Array, Array),
@@ -949,6 +1059,7 @@ impl Krea2Transformer {
         perturbed_layers: &[u32],
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
+        adapters: Option<&[PhaseAdapterScale]>,
     ) -> Result<(Array, Array)> {
         let perturb = |index: usize| {
             perturbed_layers
@@ -959,20 +1070,22 @@ impl Krea2Transformer {
         let Some(window) = window else {
             self.require_resident_blocks()?;
             for block in &self.blocks {
-                states.0 = block
-                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+                states.0 = block.forward_with_phase(
+                    &states.0, positive.0, positive.1, positive.2, attention, None, adapters,
+                )?;
             }
             // Materialize the conditional pass before constructing the 28-block perturbed graph
             // so two full-trunk lazy MLX graphs are never retained simultaneously in GPU memory.
             mlx_rs::transforms::eval([&states.0])?;
             for (index, block) in self.blocks.iter().enumerate() {
-                states.1 = block.forward_budgeted_with_pag(
+                states.1 = block.forward_with_phase(
                     &states.1,
                     positive.0,
                     positive.1,
                     positive.2,
                     attention,
                     perturb(index),
+                    adapters,
                 )?;
             }
             return Ok(states);
@@ -1000,16 +1113,17 @@ impl Krea2Transformer {
             |mut states, view, range| {
                 for index in range {
                     let block = stream.materialize(view, index)?;
-                    states.0 = block.forward_budgeted(
-                        &states.0, positive.0, positive.1, positive.2, attention,
+                    states.0 = block.forward_with_phase(
+                        &states.0, positive.0, positive.1, positive.2, attention, None, adapters,
                     )?;
-                    states.1 = block.forward_budgeted_with_pag(
+                    states.1 = block.forward_with_phase(
                         &states.1,
                         positive.0,
                         positive.1,
                         positive.2,
                         attention,
                         perturb(index),
+                        adapters,
                     )?;
                 }
                 Ok(states)
@@ -1028,6 +1142,7 @@ impl Krea2Transformer {
         perturbed_layers: &[u32],
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
+        adapters: Option<&[PhaseAdapterScale]>,
     ) -> Result<(Array, Array, Array)> {
         let perturb = |index: usize| {
             perturbed_layers
@@ -1038,25 +1153,28 @@ impl Krea2Transformer {
         let Some(window) = window else {
             self.require_resident_blocks()?;
             for block in &self.blocks {
-                states.0 = block
-                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+                states.0 = block.forward_with_phase(
+                    &states.0, positive.0, positive.1, positive.2, attention, None, adapters,
+                )?;
             }
             // Materialize each 28-block pass before constructing the next so multiple full-trunk
             // lazy MLX graphs are never retained simultaneously in GPU memory.
             mlx_rs::transforms::eval([&states.0])?;
             for block in &self.blocks {
-                states.1 = block
-                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
+                states.1 = block.forward_with_phase(
+                    &states.1, negative.0, negative.1, negative.2, attention, None, adapters,
+                )?;
             }
             mlx_rs::transforms::eval([&states.1])?;
             for (index, block) in self.blocks.iter().enumerate() {
-                states.2 = block.forward_budgeted_with_pag(
+                states.2 = block.forward_with_phase(
                     &states.2,
                     positive.0,
                     positive.1,
                     positive.2,
                     attention,
                     perturb(index),
+                    adapters,
                 )?;
             }
             return Ok(states);
@@ -1084,19 +1202,20 @@ impl Krea2Transformer {
             |mut states, view, range| {
                 for index in range {
                     let block = stream.materialize(view, index)?;
-                    states.0 = block.forward_budgeted(
-                        &states.0, positive.0, positive.1, positive.2, attention,
+                    states.0 = block.forward_with_phase(
+                        &states.0, positive.0, positive.1, positive.2, attention, None, adapters,
                     )?;
-                    states.1 = block.forward_budgeted(
-                        &states.1, negative.0, negative.1, negative.2, attention,
+                    states.1 = block.forward_with_phase(
+                        &states.1, negative.0, negative.1, negative.2, attention, None, adapters,
                     )?;
-                    states.2 = block.forward_budgeted_with_pag(
+                    states.2 = block.forward_with_phase(
                         &states.2,
                         positive.0,
                         positive.1,
                         positive.2,
                         attention,
                         perturb(index),
+                        adapters,
                     )?;
                 }
                 Ok(states)
@@ -1107,6 +1226,7 @@ impl Krea2Transformer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks(
         &self,
         mut combined: Array,
@@ -1115,11 +1235,13 @@ impl Krea2Transformer {
         rsin: &Array,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: AttentionPlan<'_>,
+        adapters: Option<&[PhaseAdapterScale]>,
     ) -> Result<Array> {
         let Some(window) = window else {
             self.require_resident_blocks()?;
             for block in &self.blocks {
-                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+                combined = block
+                    .forward_with_phase(&combined, tvec, rcos, rsin, attention, None, adapters)?;
             }
             return Ok(combined);
         };
@@ -1147,7 +1269,9 @@ impl Krea2Transformer {
                 let mut current = state;
                 for index in range {
                     let block = stream.materialize(view, index)?;
-                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                    current = block.forward_with_phase(
+                        &current, tvec, rcos, rsin, attention, None, adapters,
+                    )?;
                 }
                 Ok(current)
             },
@@ -1328,22 +1452,27 @@ impl Krea2Transformer {
     ) -> Result<JointInputs> {
         let cfg = &self.cfg;
         let dt = self.dtype;
+        let adapters = prep.adapters.as_deref();
 
         // Image patch embed.
         let img = self
             .img_in
-            .forward(&patchify(&latent.as_dtype(dt)?, prep.p)?)?; // [b, img_len, hidden]
+            .forward_with_phase(&patchify(&latent.as_dtype(dt)?, prep.p)?, adapters)?; // [b, img_len, hidden]
 
         // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
         let t_sin = temb(timestep, cfg.timestep_embed_dim as i32)?.as_dtype(dt)?; // [b, 1, tdim]
-        let t = self
-            .time_embed_l2
-            .forward(&gelu_tanh(&self.time_embed_l1.forward(&t_sin)?)?)?; // [b, 1, hidden]
-        let tvec = self.time_mod_proj.forward(&gelu_tanh(&t)?)?; // [b, 1, 6·hidden]
+        let t = self.time_embed_l2.forward_with_phase(
+            &gelu_tanh(&self.time_embed_l1.forward_with_phase(&t_sin, adapters)?)?,
+            adapters,
+        )?; // [b, 1, hidden]
+        let tvec = self
+            .time_mod_proj
+            .forward_with_phase(&gelu_tanh(&t)?, adapters)?; // [b, 1, 6·hidden]
 
         // Fuse the (precomputed) text stream to the joint sequence.
         let combined = concatenate_axis(&[&prep.ctx, &img], 1)?; // [b, cap+img_len, hidden]
         Ok(JointInputs {
+            adapters: prep.adapters.clone(),
             combined,
             t,
             tvec,
@@ -1359,9 +1488,9 @@ impl Krea2Transformer {
 
     /// Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
     pub(crate) fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
-        let out = self.final_layer(combined, t)?; // [b, cap+img_len, in_channels]
-                                                  // The image tokens are the contiguous tail `[cap_len, cap_len+img_len)` — split at the caption
-                                                  // boundary rather than gathering an arange (F-114). `out` has length exactly `cap+img_len`.
+        let out = self.final_layer(combined, t, j.adapters.as_deref())?; // [b, cap+img_len, in_channels]
+                                                                         // The image tokens are the contiguous tail `[cap_len, cap_len+img_len)` — split at the caption
+                                                                         // boundary rather than gathering an arange (F-114). `out` has length exactly `cap+img_len`.
         let img_out = split_axis1(&out, j.cap_len)?.swap_remove(1);
         unpatchify(&img_out, j.ht, j.wt, j.p, j.latent_ch)
     }
@@ -1430,7 +1559,12 @@ impl Krea2Transformer {
 
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
     /// `Linear((1+scale)·RMSNorm(x) + shift)`.
-    fn final_layer(&self, x: &Array, t: &Array) -> Result<Array> {
+    fn final_layer(
+        &self,
+        x: &Array,
+        t: &Array,
+        adapters: Option<&[PhaseAdapterScale]>,
+    ) -> Result<Array> {
         let m = mlx_rs::ops::add(t, &self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
         let parts = split(&m, 2, 1)?;
         let (scale, shift) = (&parts[0], &parts[1]); // each [b, 1, hidden]
@@ -1441,7 +1575,7 @@ impl Krea2Transformer {
             )?,
             shift,
         )?;
-        self.final_linear.forward(&normed)
+        self.final_linear.forward_with_phase(&normed, adapters)
     }
 
     /// Quantize the DiT's Linear projections — the attn/FFN of every single-stream and text-fusion
@@ -1483,34 +1617,33 @@ impl Krea2Transformer {
         Ok(())
     }
 
-    /// Clear **every** adapter stack on the DiT — the global projections, the single-stream blocks, and
-    /// the text-fusion aggregator — back to the bare frozen base (epic 13879, sc-13884). The forward-time
-    /// counterpart to a `set_adapters(vec![])` per module, used by the multi-phase driver to reset before
-    /// re-installing a phase's adapters (a base-only phase is exactly this reset with nothing re-applied).
-    /// Leaves the base weights (dense or packed) untouched — only the low-rank residual stacks are
-    /// dropped, so it is the exact inverse of a low-rank `apply_adapters_strict` install (a `.diff`
-    /// diff-patch, which mutates the dense base, is NOT installed on the multi-phase swap path, so this
-    /// stays a faithful reset there).
+    fn residual_projection_paths(&self) -> Vec<String> {
+        let mut paths = self.adaptable_paths();
+        paths.extend(
+            [
+                "img_in",
+                "time_embed.linear_1",
+                "time_embed.linear_2",
+                "time_mod_proj",
+                "txt_in.linear_1",
+                "txt_in.linear_2",
+                "text_fusion.projector",
+                "final_layer.linear",
+            ]
+            .map(str::to_owned),
+        );
+        paths
+    }
+
+    /// Clear every forward-time residual while leaving the frozen base weights intact.
     pub fn clear_adapters(&mut self) {
-        // The global projections are reachable via `adaptable_mut` but excluded from `adaptable_paths`
-        // (they are not part of the default training surface), so clear them explicitly.
-        self.img_in.set_adapters(Vec::new());
-        self.time_embed_l1.set_adapters(Vec::new());
-        self.time_embed_l2.set_adapters(Vec::new());
-        self.time_mod_proj.set_adapters(Vec::new());
-        self.txt_in_l1.set_adapters(Vec::new());
-        self.txt_in_l2.set_adapters(Vec::new());
-        self.final_linear.set_adapters(Vec::new());
         if let Some(stream) = self.block_stream.as_mut() {
             stream.clear_adapters();
         }
-        // The per-block + text-fusion targets, via the enumerated adapter paths (each resolves through
-        // `adaptable_mut`, per the `AdaptableHost` contract). `adaptable_paths` borrows `&self` and
-        // returns owned strings, so the subsequent `&mut self` resolves are unencumbered.
-        for path in self.adaptable_paths() {
-            let parts: Vec<&str> = path.split('.').collect();
+        for path in self.residual_projection_paths() {
+            let parts: Vec<_> = path.split('.').collect();
             if let Some(linear) = self.adaptable_mut(&parts) {
-                linear.set_adapters(Vec::new());
+                linear.clear_adapters();
             }
         }
     }
@@ -1640,6 +1773,7 @@ fn run_paired_range<S, B>(
 /// run the frozen block stack itself — injecting a residual before selected blocks — instead of the
 /// straight-through [`Krea2Transformer::forward_prepared`] loop.
 pub(crate) struct JointInputs {
+    adapters: Option<Arc<[PhaseAdapterScale]>>,
     pub(crate) combined: Array,
     pub(crate) t: Array,
     pub(crate) tvec: Array,
@@ -1656,7 +1790,9 @@ pub(crate) struct JointInputs {
 /// fused + projected text stream (`ctx`), the joint RoPE tables, and the patchify/slice geometry.
 /// None of it depends on the noise-latent values or the timestep, so it is reused across every step
 /// (F-079).
+#[derive(Clone)]
 pub struct JointPrep {
+    adapters: Option<Arc<[PhaseAdapterScale]>>,
     ctx: Array,
     rcos: Array,
     rsin: Array,
@@ -1665,6 +1801,13 @@ pub struct JointPrep {
     wt: i32,
     latent_ch: i32,
     p: i32,
+}
+
+impl JointPrep {
+    /// Arrays that must be evaluated before the conditioning scope can leave.
+    pub(crate) fn conditioning_arrays(&self) -> [&Array; 3] {
+        [&self.ctx, &self.rcos, &self.rsin]
+    }
 }
 
 /// The **step-invariant** conditioning for a Kontext-style edit forward ([`Krea2Transformer::prepare_edit`]):
@@ -2330,8 +2473,188 @@ mod tests {
         }
     }
 
-    /// A native path that is NOT one of the aliased global projections still resolves to nothing — the
-    /// aliases are exact, not a blanket accept (guards against a future over-broad match arm).
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn phase_projector_and_sparse_adapters_match_independent_oracles() {
+        use mlx_gen::gen_core::phase::ConditioningBranches;
+        use mlx_gen::{AdapterKind, AdapterSpec, PinnedWeightsFile};
+
+        let (weights, cfg) = executable_test_weights();
+        let raw = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let projector_path = dir.path().join("projector.safetensors");
+        let block_path = dir.path().join("block.safetensors");
+        let projector_factor = Array::from_slice(&[1.0_f32], &[1, 1]);
+        Array::save_safetensors(
+            vec![
+                ("text_fusion.projector.lora_A.weight", &projector_factor),
+                ("text_fusion.projector.lora_B.weight", &projector_factor),
+            ],
+            None,
+            &projector_path,
+        )
+        .unwrap();
+        let down = Array::from_slice(&[0.6_f32, -0.4, 0.3, 0.1, 0.7, -0.5, 0.2, 0.8], &[1, 8]);
+        let up = Array::from_slice(&[0.3_f32, 0.6, -0.8, 0.7, 0.1, 0.4, -0.2, 0.5], &[8, 1]);
+        let alpha = Array::from_slice(&[0.5_f32], &[1]);
+        Array::save_safetensors(
+            vec![
+                ("transformer_blocks.0.attn.to_v.lora_A.weight", &down),
+                ("transformer_blocks.0.attn.to_v.lora_B.weight", &up),
+                ("transformer_blocks.0.attn.to_v.alpha", &alpha),
+            ],
+            None,
+            &block_path,
+        )
+        .unwrap();
+        let specs = [
+            AdapterSpec::new(projector_path, 0.5, AdapterKind::Lora),
+            AdapterSpec::new(block_path, 0.25, AdapterKind::Lora),
+        ];
+        let sources = specs
+            .iter()
+            .map(|spec| {
+                let pin = PinnedWeightsFile::pin(&spec.path).unwrap();
+                (spec.path.clone(), PhaseAdapterSource::load(pin).unwrap())
+            })
+            .collect();
+        let install_legacy = |specs: &[AdapterSpec]| {
+            let mut model = raw.clone();
+            model.apply_adapters_strict(specs, false).unwrap();
+            model
+        };
+        // The resident model starts with active defaults, including the routable projector.
+        let resident = install_legacy(&specs);
+        let context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let evaluate = |model: &Krea2Transformer, args: Option<&PhaseArguments>| {
+            let prep = model
+                .prepare_with_phase(
+                    &context,
+                    None,
+                    &latent,
+                    args.map(|args| Arc::from(args.adapters())),
+                )
+                .unwrap();
+            let output = model.forward_prepared(&latent, &timestep, &prep).unwrap();
+            mlx_rs::transforms::eval([&prep.ctx, &output]).unwrap();
+            (prep.ctx, output)
+        };
+        let phase = |keys| PhaseArguments::new(keys, 1.0, ConditioningBranches::Positive);
+        let bare = phase(vec![]);
+        let block_only = phase(vec![PhaseAdapterScale::new(1, 0.625)]);
+        let ordered = [
+            PhaseAdapterScale::new(1, 0.625),
+            PhaseAdapterScale::new(0, 0.75),
+            PhaseAdapterScale::new(1, -0.375),
+            PhaseAdapterScale::new(1, 0.625),
+        ];
+        let selected = phase(ordered.to_vec());
+        let evaluate_phase = |args: &PhaseArguments| {
+            let model = resident
+                .clone_for_phase_adapters(&specs, &sources, [args])
+                .unwrap();
+            evaluate(&model, Some(args))
+        };
+        let expected = |order: &[PhaseAdapterScale]| {
+            let phased: Vec<_> = order
+                .iter()
+                .map(|key| {
+                    let mut spec = specs[key.slot()].clone();
+                    spec.scale = key.scale();
+                    spec
+                })
+                .collect();
+            evaluate(&install_legacy(&phased), None)
+        };
+        let assert_pair = |actual: &(Array, Array), expected: &(Array, Array)| {
+            assert_exact(&actual.0, &expected.0);
+            assert_exact(&actual.1, &expected.1);
+        };
+
+        let raw_base = evaluate(&raw, None);
+        assert_ne!(
+            evaluate(&resident, None).0.as_slice::<f32>(),
+            raw_base.0.as_slice::<f32>()
+        );
+        assert_pair(&evaluate_phase(&bare), &raw_base);
+
+        let actual = evaluate_phase(&selected);
+        assert_pair(&actual, &expected(&ordered));
+        assert_ne!(actual.0.as_slice::<f32>(), raw_base.0.as_slice::<f32>());
+        assert_ne!(actual.1.as_slice::<f32>(), raw_base.1.as_slice::<f32>());
+        let without_repeat = expected(&ordered[..3]);
+        assert_exact(&actual.0, &without_repeat.0);
+        assert_ne!(
+            actual.1.as_slice::<f32>(),
+            without_repeat.1.as_slice::<f32>()
+        );
+        let mut with_default = ordered;
+        with_default[2] = PhaseAdapterScale::new(1, specs[1].scale);
+        assert_ne!(
+            actual.1.as_slice::<f32>(),
+            expected(&with_default).1.as_slice::<f32>()
+        );
+
+        // A cancelling pair makes the original left-to-right rounding observable on the projector.
+        let mut cancelling = [
+            PhaseAdapterScale::new(0, 1.0e8),
+            PhaseAdapterScale::new(0, -1.0e8),
+            PhaseAdapterScale::new(0, 0.75),
+        ];
+        let in_order = evaluate_phase(&phase(cancelling.to_vec()));
+        assert_pair(&in_order, &expected(&cancelling));
+        cancelling.rotate_right(1);
+        let reordered = evaluate_phase(&phase(cancelling.to_vec()));
+        assert_pair(&reordered, &expected(&cancelling));
+        assert_ne!(in_order.0.as_slice::<f32>(), reordered.0.as_slice::<f32>());
+
+        let sparse = evaluate_phase(&block_only);
+        assert_pair(&sparse, &expected(block_only.adapters()));
+        assert_exact(&sparse.0, &raw_base.0);
+        assert_ne!(sparse.1.as_slice::<f32>(), raw_base.1.as_slice::<f32>());
+        assert_pair(&evaluate_phase(&bare), &raw_base);
+        assert_pair(&evaluate_phase(&selected), &actual);
+
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::phase_projector_and_sparse_adapters_match_independent_oracles");
+    }
+
+    #[test]
+    fn phase_bank_clears_the_routable_projector_even_outside_training_targets() {
+        let (weights, cfg) = executable_test_weights();
+        let mut dit = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let path = ["text_fusion", "projector"];
+        assert!(!dit
+            .adaptable_paths()
+            .iter()
+            .any(|name| name == "text_fusion.projector"));
+        assert!(dit
+            .residual_projection_paths()
+            .iter()
+            .any(|name| name == "text_fusion.projector"));
+        dit.adaptable_mut(&path).unwrap().push(Adapter::Lora {
+            a: Array::from_slice(&[1.0f32], &[1, 1]),
+            b: Array::from_slice(&[1.0f32], &[1, 1]),
+            scale: 1.0,
+        });
+        assert!(dit.adaptable_mut(&path).unwrap().has_adapters());
+        dit.clear_adapters();
+        assert!(!dit.adaptable_mut(&path).unwrap().has_adapters());
+    }
+
+    /// Native aliases are exact. Unrelated paths must not resolve to an adaptable projection.
     #[test]
     fn adaptable_mut_rejects_unknown_native_global_path() {
         let mut t = tiny_transformer();

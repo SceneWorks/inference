@@ -11,7 +11,7 @@ NAME = "sw-6954-targeted-cuda-v1"
 MANIFEST = "scripts/ci/video_tier1_cuda_diagnostic_retained.json"
 MANIFEST_SHA256 = "8fc228aa249af227b66ae969e4d6f764ef77ecd69e4c0b00bd4be75b772ae24c"
 ROOT_HANDLE_SOURCE = {
-    "scripts/media_campaign_windows.py": "2ac50fe9388ee434c6e88743c35d388c1cf6ae92e41a211601dafe15b38423fe",
+    "scripts/media_campaign_windows.py": "a980a1a9b88fa26232e482a7768a5454cb26990957a17e2095677c6ed9ae87e1",
     "scripts/ci/wddm_process_memory.py": "a2f1c1fb67675e45d67360b21e0804a9f2818238105412c92928fe5b4cd5a644",
 }
 TIMING_PAIRS = 20

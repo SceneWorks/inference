@@ -34,13 +34,7 @@ pub(super) fn apply_additive_into(
     normalize: fn(&str) -> String,
 ) -> Result<WanLoraReport> {
     let mut report = WanLoraReport::default();
-    let indexed = || specs.iter().enumerate();
-    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert.is_none()) {
-        apply_recorded(&mut report, index, |r| {
-            install_one_additive(host, spec, normalize, r)
-        })?;
-    }
-    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
+    for (index, spec) in select_expert_adapters(specs, expert, ExpertAdapterOrder::SharedFirst) {
         apply_recorded(&mut report, index, |r| {
             install_one_additive(host, spec, normalize, r)
         })?;

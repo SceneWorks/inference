@@ -88,7 +88,7 @@ def validate_plan(plan, case, backend):
             raise ValueError("identity plan lost its fixed reference controls")
 
 
-def read_arm(output, stdout, arm, case, backend, artifact):
+def read_arm(output, stdout, arm, case, backend, artifact, *, planned=None):
     if stdout.splitlines().count("FLUX1_CONDITIONAL_COMPLETE " + case) != 1:
         raise ValueError("missing completed conditional provider body")
     rgb = (output / "output.rgb").read_bytes()
@@ -115,7 +115,9 @@ def read_arm(output, stdout, arm, case, backend, artifact):
     if len({row["sha256"] for row in observed}) != 4:
         raise ValueError("conditional trajectory did not advance")
     plan = None
-    if arm == "head":
+    if planned is None:
+        planned = arm == "head"
+    if planned:
         plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
         validate_plan(plan, case, backend)
         if [struct.pack(">f", value).hex() for value in plan["pass"]["sigmas"]] != [row[0] for row in states]:

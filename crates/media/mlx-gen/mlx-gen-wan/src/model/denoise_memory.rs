@@ -226,10 +226,19 @@ pub(super) fn wan14b_adapter_bytes_per_expert(
             if bytes == 0 {
                 return None;
             }
-            Some(match adapter.moe_expert {
-                None => (low.saturating_add(bytes), high.saturating_add(bytes)),
-                Some(MoeExpert::Low) => (low.saturating_add(bytes), high),
-                Some(MoeExpert::High) => (low, high.saturating_add(bytes)),
-            })
+            let low_bytes = if adapter.applies_to_expert(MoeExpert::Low) {
+                bytes
+            } else {
+                0
+            };
+            let high_bytes = if adapter.applies_to_expert(MoeExpert::High) {
+                bytes
+            } else {
+                0
+            };
+            Some((
+                low.saturating_add(low_bytes),
+                high.saturating_add(high_bytes),
+            ))
         })
 }

@@ -1,0 +1,174 @@
+// Installed only in each source-bound disposable real-weight proof checkout.
+#[cfg(feature = "cuda")]
+use candle_gen::candle_core::Device;
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationOutput, Progress, Quant};
+use candle_gen_ltx::{
+    bundle, config::STAGE2_SIGMAS, dev_sampler::ExecutionPlan, load_25, quant_eval,
+    quant_measurement, sga_ltx25_schedule_hash, tier::Ltx25Tier,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[cfg(feature = "cuda")]
+fn retain_pool(output: &Path) -> Result<String> {
+    use candle_gen::candle_core::cuda_backend::proof_pool;
+    let device = Device::new_cuda(0)?;
+    let cuda = device.as_cuda_device()?;
+    let id = cuda.cuda_stream().context().uuid()?;
+    let hex: String = id
+        .bytes
+        .iter()
+        .map(|byte| format!("{:02x}", *byte as u8))
+        .collect();
+    let uuid = format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    assert!(uuid.eq_ignore_ascii_case(&env::var("CUDA_VISIBLE_DEVICES")?));
+    let pool = proof_pool::snapshot(0)?.ok_or("CUDA scoped proof pool was not installed")?;
+    assert_eq!(
+        (pool.logical_ordinal, pool.cap_bytes),
+        (0, 80 * 2_u64.pow(30))
+    );
+    let row = json!({"pid":std::process::id(), "cudaDeviceUuid":uuid,
+                     "poolUsedBytes":pool.used_bytes,"poolUsedHighBytes":pool.used_high_bytes,
+                     "poolReservedBytes":pool.reserved_bytes,"poolReservedHighBytes":pool.reserved_high_bytes});
+    let pending = output.join("cuda-pool.pending");
+    let target = output.join("cuda-pool.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    serde_json::to_writer(&mut file, &row)?;
+    file.sync_all()?;
+    drop(file);
+    assert!(!target.exists());
+    fs::rename(pending, target)?;
+    // Keep actual allocations present for the supervised Windows GPU sampler.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Ok(uuid)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn retain_pool(_: &Path) -> Result<String> {
+    Err("real-weight LTX comparison requires a compiled CUDA lane".into())
+}
+
+fn main() -> Result<()> {
+    let snapshot = PathBuf::from(env::var_os("PAIR_TIER2_SNAPSHOT").ok_or("missing LTX snapshot")?);
+    let variant = env::var("PAIR_TIER2_VARIANT")?;
+    let case_id = match variant.as_str() {
+        "dev" => "ltx25-packed-q4-blackwell-dev-v1",
+        "distilled" => "ltx25-packed-q4-blackwell-v1",
+        _ => return Err("unknown native LTX variant".into()),
+    };
+    let case = quant_eval::measurement_case(case_id).ok_or("missing native campaign case")?;
+    let subdir = PathBuf::from(&variant).join("q4");
+    let request = quant_measurement::terminal_generation_request(case);
+    assert_eq!(
+        (
+            request.width,
+            request.height,
+            request.frames,
+            request.fps,
+            request.seed
+        ),
+        (512, 512, Some(17), Some(24), Some(18777))
+    );
+    assert_eq!(
+        request.sampler.as_deref(),
+        (variant == "distilled").then_some("rectified-flow")
+    );
+    assert!(request.conditioning.is_empty() && request.duration.is_none());
+    let (mut spec, _) = bundle::select_snapshot_bundle(&snapshot, &subdir)?;
+    spec.quantize = Some(Quant::Q4);
+    assert!(spec.components.contains_key("diffusion_video_vae"));
+    let tier = Ltx25Tier::detect(&snapshot.join(&subdir))?.ok_or("missing converted LTX tier")?;
+    tier.validate()?;
+    let resolved = bundle::resolve_split_bundle(&spec)?;
+    bundle::assert_gemma_version(&resolved)?;
+    if variant == "dev" {
+        let adapter =
+            snapshot.join("distilled_lora/ltx-2.5-22b-distilled-lora-450-bf16.safetensors");
+        assert!(adapter.is_file());
+        spec.adapters = vec![
+            AdapterSpec::new(adapter, 1.0, AdapterKind::Lora).with_pass_scales(vec![0.0, 1.0])
+        ];
+    }
+    let stage1 = ExecutionPlan::for_variant(case.transformer_variant);
+    println!(
+        "SGA_LTX_NATIVE_CASE {case_id} {} {}",
+        sga_ltx25_schedule_hash(&stage1.sigmas),
+        sga_ltx25_schedule_hash(&STAGE2_SIGMAS)
+    );
+    if env::args().nth(1).as_deref() == Some("--preflight") {
+        return Ok(());
+    }
+    // The worker model admission is separately tracked. This is the normal native Candle provider.
+    let output =
+        PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing LTX proof output directory")?);
+    let started = Instant::now();
+    let pipeline = load_25(&spec)?;
+    let mut progress = Vec::new();
+    let generated = pipeline.generate(&request, &mut |event| {
+        if let Progress::Step { current, total } = event {
+            progress.push([current, total]);
+        }
+    })?;
+    let e2e_ns = started.elapsed().as_nanos();
+    let GenerationOutput::Video {
+        frames,
+        fps,
+        audio: Some(audio),
+    } = generated
+    else {
+        return Err("LTX proof expected decoded video and audio".into());
+    };
+    assert_eq!((frames.len(), fps), (17, 24));
+    let mut rgb = Sha256::new();
+    let mut different_pixel_values = false;
+    let first_value = frames[0].pixels[0];
+    for frame in frames {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (512, 512, 512 * 512 * 3)
+        );
+        different_pixel_values |= frame.pixels.iter().any(|&value| value != first_value);
+        rgb.update(frame.pixels);
+    }
+    assert!(different_pixel_values);
+    assert!(audio.stems.is_empty() && audio.channels == 2 && audio.sample_rate > 0);
+    assert!(!audio.samples.is_empty() && audio.samples.len().is_multiple_of(2));
+    assert!(
+        audio.samples.iter().all(|value| value.is_finite())
+            && audio.samples.iter().any(|value| *value != 0.0)
+    );
+    let mut pcm = Sha256::new();
+    for sample in &audio.samples {
+        pcm.update(sample.to_bits().to_le_bytes());
+    }
+    let uuid = retain_pool(&output)?;
+    let receipt = json!({"case":case_id,"cuda_device_uuid":uuid,"progress":progress,"e2e_ns":e2e_ns,
+                        "video":{"size":[512,512],"frames":17,"fps":24,"rgb_sha256":format!("{:x}",rgb.finalize())},
+                        "audio":{"channels":audio.channels,"sample_rate":audio.sample_rate,
+                                 "samples":audio.samples.len(),"f32_sha256":format!("{:x}",pcm.finalize())}});
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(file, &receipt)?;
+    drop(pipeline);
+    println!("SGA_LTX_REAL_COMPLETE {case_id}");
+    Ok(())
+}

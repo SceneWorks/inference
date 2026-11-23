@@ -36,6 +36,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::array::scalar;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::block_residency::BlockPlan;
+use mlx_gen::gen_core::phase::ScaleContext;
 
 /// sc-18797's rung-4 loader-identity and bit-identity suite. A `#[path]` submodule rather than a
 /// `tests/` file because it observes the private loader surface (`AvBlocks`, `AvBlock`'s attentions)

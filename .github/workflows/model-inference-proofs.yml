@@ -13,14 +13,14 @@ on:
       flux1_pair:
         description: Compare the FLUX.1 batch against its pre-migration source in this same job
         type: choice
-        options: [none, tier1, tier2, conditional-tier1]
+        options: [none, tier1, tier2, conditional-tier1, eng4b-tier1, eng4b-tier2, eng4b-conditional-tier1]
         default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
         type: string
         required: true
       stage_pinned_assets:
-        description: 'Asset inventory only: first fetch every product-pinned file the inventory reports missing, off-pin or incomplete into the runner Hub cache (stdlib HTTPS; never overwrites; setup, no model load)'
+        description: 'Asset inventory only: stage absent product-pinned files into the runner cache. A request with cases limits staging to those sealed Windows FLUX.1 cases.'
         type: boolean
         default: false
 
@@ -34,7 +34,16 @@ env:
   CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
-  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'scail2-plural-fit' && 'scail2_plural_fit.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'wan-curated-tier1' && 'wan_tier1_comparison.py' || inputs.flux1_pair == 'none' && contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection) && 'video_tier1_comparison.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
+  MODEL_PROOF_SCRIPT: >-
+    ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'scail2-plural-fit' && 'scail2_plural_fit.py'
+    || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'wan-curated-tier1' && 'wan_tier1_comparison.py'
+    || inputs.flux1_pair == 'none' && contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection) && 'video_tier1_comparison.py'
+    || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'sga-terminal-tier2' && 'sga_terminal_comparison.py'
+    || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'sga-adapter-tier1' && 'sga_adapter_comparison.py'
+    || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py'
+    || (inputs.flux1_pair == 'conditional-tier1' || inputs.flux1_pair == 'eng4b-conditional-tier1') && 'flux1_conditional_comparison.py'
+    || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2' || inputs.flux1_pair == 'eng4b-tier1' || inputs.flux1_pair == 'eng4b-tier2') && 'flux1_comparison.py'
+    || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -51,8 +60,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
-          # Paired video proofs verify their migration base as an ancestor before building.
-          fetch-depth: ${{ (fromJSON(inputs.request).selection == 'wan-curated-tier1' || contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection)) && '0' || '1' }}
+          # Paired video proofs verify their migration base as an ancestor before building; the
+          # adapter and terminal pairs verify their exact ENG-4a ancestor with bounded history.
+          fetch-depth: ${{ (fromJSON(inputs.request).selection == 'wan-curated-tier1' || contains(fromJSON('["mochi-svd-tier1","scail2-tier1"]'), fromJSON(inputs.request).selection)) && '0' || (env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' || env.MODEL_PROOF_SCRIPT == 'sga_terminal_comparison.py') && '128' || '1' }}
           persist-credentials: false
       - name: Install pinned uv on Linux
         if: runner.os == 'Linux'
@@ -137,7 +147,7 @@ jobs:
           path: ${{ env.MODEL_PROOF_CWD }}
           ref: ${{ github.sha }}
           # Paired video proofs verify their migration base as an ancestor before building.
-          fetch-depth: ${{ matrix.paired_source && '0' || '1' }}
+          fetch-depth: ${{ matrix.paired_source && '0' || (env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' || env.MODEL_PROOF_SCRIPT == 'sga_terminal_comparison.py') && '128' || '1' }}
           persist-credentials: false
       - name: Own disposable Windows proof storage
         if: runner.os == 'Windows'
@@ -149,6 +159,34 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: 2b09938e33370915d4f853389961709b8bbf8bf9
+          path: flux1-baseline
+          persist-credentials: false
+      - name: Check out the exact adapter comparison baseline
+        if: matrix.asset_setup == 'sga-adapter-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: e86b8d5fc493c16b2d9d852e0c9ecbdefee58294
+          path: sga-adapter-baseline
+          persist-credentials: false
+      - name: Check out the exact terminal comparison baseline
+        if: matrix.asset_setup == 'sga-terminal-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 481a982db44b58937c15c2d3f0cbf918b116d04d
+          path: sga-terminal-baseline
+          persist-credentials: false
+      - name: Check out the merged ENG-4a engine for the FLUX.1 ENG-4b proof
+        if: matrix.asset_setup == 'flux1-eng4b-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: e86b8d5fc493c16b2d9d852e0c9ecbdefee58294
+          path: flux1-baseline
+          persist-credentials: false
+      - name: Check out the merged main engine for terminal FLUX.1 comparison
+        if: matrix.asset_setup == 'flux1-eng4b-terminal-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: be45bdf746c5d4a12d4db76f9653b8686e7f33f8
           path: flux1-baseline
           persist-credentials: false
       - name: Install pinned uv on Windows
@@ -299,6 +337,8 @@ jobs:
         working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
           "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" \
@@ -308,6 +348,9 @@ jobs:
         working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os == 'Windows'
         shell: cmd
+        env:
+          MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+          LTX25_PROOF_HUB_ROOT: ${{ vars.CANDLE_LTX25_HF_CACHE_ROOT }}
         run: |
           call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b %ERRORLEVEL%
@@ -393,12 +436,14 @@ jobs:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
         run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py "$STAGE_FLAG" --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$INVENTORY_OUTPUT"
       - name: Inventory installed assets on Windows (no model load)
+        id: windows_inventory
         if: runner.os == 'Windows'
         shell: cmd
         env:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
         run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py %STAGE_FLAG% --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%INVENTORY_OUTPUT%"'
       - name: Upload candidate paths and hashes only
+        if: success() || (failure() && steps.windows_inventory.outcome == 'failure' && fromJSON(inputs.request).cases != null)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flux1-conditional-asset-inventory-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}

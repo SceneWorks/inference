@@ -467,15 +467,13 @@ mod tests {
     /// silently shows nothing, and no weights-free test can otherwise reach the routes that need a
     /// 12B DiT — so this pins the wiring at the source level, the way `mlx-gen-krea` does.
     ///
-    /// The seven `pipeline.rs` sites are: Turbo t2i three-stage (`render_three_stage`), Turbo t2i
-    /// (`render_from_context`), Turbo img2img (`render_img2img_from_context`), Raw t2i
-    /// (`render_base_from_contexts`), multi-phase Raw (`render_multiphase`), Raw img2img
-    /// (`render_base_img2img_from_contexts`), and edit — Turbo **and** Raw, which share
-    /// `render_edit_from_context`. `control_provider.rs` adds the pose-control route.
+    /// The six `pipeline.rs` sampler sites are the Turbo three-stage path, the shared Turbo
+    /// t2i/img2img path, Raw t2i, multi-phase Raw, Raw img2img, and shared Turbo/Raw edit.
+    /// `control_provider.rs` adds the pose-control route.
     #[test]
     fn every_krea_render_route_passes_a_preview_hook() {
         for (file, source, expected) in [
-            ("pipeline.rs", include_str!("pipeline.rs"), 7usize),
+            ("pipeline.rs", include_str!("pipeline.rs"), 6usize),
             (
                 "control_provider.rs",
                 include_str!("control_provider.rs"),

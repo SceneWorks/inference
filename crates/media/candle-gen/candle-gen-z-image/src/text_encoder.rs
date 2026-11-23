@@ -1,32 +1,67 @@
-//! Vendored **inference** Z-Image Qwen3 text encoder with a packed-load seam (sc-9408).
+//! Z-Image Qwen3 text encoder shared by dense and packed checkpoints.
 //!
-//! A faithful copy of the stock `candle-transformers` `z_image::text_encoder` (Qwen3 adapter) at the
-//! workspace candle pin (`c1e6756`), vendored because its `Attention` / `Mlp` / `embed_tokens` build
-//! frozen `candle_nn::Linear` / `Embedding` with no seam, so they cannot load the pre-quantized
-//! MLX-packed TE tier (`model.embed_tokens` + every `self_attn.{q,k,v,o}_proj` / `mlp.{gate,up,down}_proj`
-//! is packed as `{base}.weight` u32 + `.scales` + `.biases`). Every packed projection is a
-//! [`crate::quant::QLinear`] / the embedding a [`crate::quant::QEmbedding`], both packed-**detecting**
-//! the `.scales` sibling; the RMSNorms (`input_layernorm`, `post_attention_layernorm`, per-head
-//! `q_norm`/`k_norm`) stay dense.
-//!
-//! **The dense path is byte-identical to the stock encoder** (`parity_tests` pins it: no `.scales`
-//! present ⇒ every projection takes the dense arm, and the forward matches the stock forward). The
-//! forward math is the stock Qwen3: per-head q/k RMSNorm, RoPE, GQA `repeat_kv`, and the Z-Image quirk
-//! — return the **second-to-last** layer hidden state (`num_hidden_layers - 2`) with **no final norm**.
-//! Used only when the snapshot is a packed tier ([`crate::pipeline`]); a dense snapshot keeps the stock
-//! `ZImageTextEncoder`.
+//! The graph follows Candle's Z-Image Qwen3 encoder. It returns the raw second-to-last
+//! decoder layer with no final normalization. Dense sources use Candle's normal projection
+//! layout. Packed sources use the shared Candle spine for projections and token embeddings,
+//! retaining packed weights and dequantizing only the selected embedding rows.
 
 use std::sync::Arc;
 
+use candle_gen::attention::repeat_kv;
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor};
 use candle_gen::candle_nn::{Activation, RmsNorm, VarBuilder};
-use candle_transformers::models::z_image::text_encoder::TextEncoderConfig;
-
-use crate::quant::{QEmbedding, QLinear};
-use candle_gen::attention::repeat_kv;
 use candle_gen::grounding::Rotary;
+use candle_gen::quant::{self, QEmbedding, QLinear};
 
-// ==================== Rotary Embedding (no weights) ====================
+pub(crate) use candle_transformers::models::z_image::text_encoder::TextEncoderConfig;
+
+#[derive(Clone, Copy)]
+enum WeightStorage {
+    Dense,
+    DetectPacked,
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn combined_fp8_qwen3_q_projection(vb: &VarBuilder) -> Result<QLinear> {
+    let cfg = TextEncoderConfig::z_image();
+    WeightStorage::Dense.linear(
+        vb,
+        "q_proj",
+        cfg.hidden_size,
+        cfg.num_attention_heads * cfg.head_dim,
+        cfg.attention_bias,
+    )
+}
+
+impl WeightStorage {
+    fn linear(
+        self,
+        vb: &VarBuilder,
+        name: &str,
+        input: usize,
+        output: usize,
+        bias: bool,
+    ) -> Result<QLinear> {
+        match self {
+            Self::Dense if bias => QLinear::linear(input, output, vb.pp(name)),
+            Self::Dense => QLinear::linear_no_bias(input, output, vb.pp(name)),
+            Self::DetectPacked => QLinear::linear_detect(input, output, vb, name, bias),
+        }
+    }
+
+    fn embedding(
+        self,
+        vb: &VarBuilder,
+        name: &str,
+        vocab: usize,
+        hidden: usize,
+    ) -> Result<QEmbedding> {
+        match self {
+            Self::Dense => QEmbedding::embedding(vocab, hidden, vb.pp(name)),
+            Self::DetectPacked => quant::embedding(vb, name, vocab, hidden),
+        }
+    }
+}
 
 /// The text tower's RoPE tables. `inv_freq` is derived in **f64** (`rope_theta.powf(i / dim)` then
 /// cast) — unlike [`Rotary::new`]'s f32 power — so the tables are built here and only the application
@@ -50,7 +85,6 @@ fn rotary_embedding(dtype: DType, cfg: &TextEncoderConfig, dev: &Device) -> Resu
     ))
 }
 
-// ==================== MLP (packed seam) ====================
 struct Mlp {
     gate_proj: QLinear,
     up_proj: QLinear,
@@ -59,27 +93,27 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TextEncoderConfig, vb: VarBuilder, storage: WeightStorage) -> Result<Self> {
         Ok(Self {
-            gate_proj: QLinear::linear_detect(
-                cfg.hidden_size,
-                cfg.intermediate_size,
+            gate_proj: storage.linear(
                 &vb,
                 "gate_proj",
-                false,
-            )?,
-            up_proj: QLinear::linear_detect(
                 cfg.hidden_size,
                 cfg.intermediate_size,
+                false,
+            )?,
+            up_proj: storage.linear(
                 &vb,
                 "up_proj",
+                cfg.hidden_size,
+                cfg.intermediate_size,
                 false,
             )?,
-            down_proj: QLinear::linear_detect(
-                cfg.intermediate_size,
-                cfg.hidden_size,
+            down_proj: storage.linear(
                 &vb,
                 "down_proj",
+                cfg.intermediate_size,
+                cfg.hidden_size,
                 false,
             )?,
             act_fn: cfg.hidden_act,
@@ -92,8 +126,6 @@ impl Mlp {
         self.down_proj.forward(&(lhs * rhs)?)
     }
 }
-
-// ==================== Attention (packed seam) ====================
 
 struct Attention {
     q_proj: QLinear,
@@ -111,7 +143,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &TextEncoderConfig, rotary_emb: Arc<Rotary>, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &TextEncoderConfig,
+        rotary_emb: Arc<Rotary>,
+        vb: VarBuilder,
+        storage: WeightStorage,
+    ) -> Result<Self> {
         let head_dim = cfg.head_dim;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -119,24 +156,22 @@ impl Attention {
 
         // Qwen3 attention is bias-less (`cfg.attention_bias == false`).
         let bias = cfg.attention_bias;
-        let q_proj =
-            QLinear::linear_detect(cfg.hidden_size, num_heads * head_dim, &vb, "q_proj", bias)?;
-        let k_proj = QLinear::linear_detect(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
+        let q_proj = storage.linear(&vb, "q_proj", cfg.hidden_size, num_heads * head_dim, bias)?;
+        let k_proj = storage.linear(
             &vb,
             "k_proj",
-            bias,
-        )?;
-        let v_proj = QLinear::linear_detect(
             cfg.hidden_size,
             num_kv_heads * head_dim,
-            &vb,
-            "v_proj",
             bias,
         )?;
-        let o_proj =
-            QLinear::linear_detect(num_heads * head_dim, cfg.hidden_size, &vb, "o_proj", bias)?;
+        let v_proj = storage.linear(
+            &vb,
+            "v_proj",
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            bias,
+        )?;
+        let o_proj = storage.linear(&vb, "o_proj", num_heads * head_dim, cfg.hidden_size, bias)?;
 
         let q_norm = candle_gen::candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = candle_gen::candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
@@ -202,7 +237,6 @@ impl Attention {
     }
 }
 
-// ==================== Decoder Layer ====================
 struct DecoderLayer {
     self_attn: Attention,
     mlp: Mlp,
@@ -211,9 +245,14 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &TextEncoderConfig, rotary: Arc<Rotary>, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(cfg, rotary, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
+    fn new(
+        cfg: &TextEncoderConfig,
+        rotary: Arc<Rotary>,
+        vb: VarBuilder,
+        storage: WeightStorage,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(cfg, rotary, vb.pp("self_attn"), storage)?;
+        let mlp = Mlp::new(cfg, vb.pp("mlp"), storage)?;
         let ln1 = candle_gen::candle_nn::rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -242,12 +281,8 @@ impl DecoderLayer {
     }
 }
 
-// ==================== ZImageTextEncoder (packed seam) ====================
-
-/// Z-Image Qwen3 text encoder. Returns the second-to-last layer hidden state without a final RMSNorm.
-/// Built from the *same* `model.*` keys as the stock encoder; on a dense tier (no `.scales`) the
-/// forward is byte-identical to the stock encoder (`parity_tests`).
-pub struct ZImageTextEncoder {
+/// Qwen3 conditioning from the checkpoint's `model.*` keys.
+pub(crate) struct ZImageTextEncoder {
     embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     num_hidden_layers: usize,
@@ -256,19 +291,32 @@ pub struct ZImageTextEncoder {
 }
 
 impl ZImageTextEncoder {
-    pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
-        // Weights live under the `model.` prefix.
-        let vb_model = vb.pp("model");
+    /// Load a dense snapshot, normalized import, or training checkpoint.
+    pub(crate) fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(cfg, vb, WeightStorage::Dense)
+    }
 
+    /// Load a packed snapshot, retaining dense tensors at keys without affine triples.
+    pub(crate) fn new_packed(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(cfg, vb, WeightStorage::DetectPacked)
+    }
+
+    fn load(cfg: &TextEncoderConfig, vb: VarBuilder, storage: WeightStorage) -> Result<Self> {
+        let vb_model = vb.pp("model");
         let embed_tokens =
-            QEmbedding::detect(&vb_model, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?;
+            storage.embedding(&vb_model, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?;
 
         let rotary = Arc::new(rotary_embedding(vb.dtype(), cfg, vb.device())?);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb_model.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_layers.pp(i))?);
+            layers.push(DecoderLayer::new(
+                cfg,
+                rotary.clone(),
+                vb_layers.pp(i),
+                storage,
+            )?);
         }
         // The final norm (`model.norm.weight`) is intentionally NOT loaded — the encoder returns the
         // second-to-last layer output without the final norm.
@@ -294,7 +342,7 @@ impl ZImageTextEncoder {
 
     /// Encode `input_ids` `(B, seq_len)` → the layer[-2] hidden states `(B, seq_len, hidden)`, WITHOUT
     /// the final RMSNorm (the Z-Image convention the pipeline's `cap_feats` relies on).
-    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, l) = input_ids.dims2()?;
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
@@ -317,13 +365,51 @@ impl ZImageTextEncoder {
 
 #[cfg(test)]
 mod parity_tests {
-    //! Pin the vendored DENSE path to the stock Qwen3 encoder: same `VarMap` weights (no `.scales`),
-    //! identical layer[-2] output — the guard that the packed-seam vendoring changed nothing on a dense
-    //! tier.
+    //! Check both dense loading paths against the stock encoder with shared `VarMap` weights.
     use super::*;
     use candle_gen::candle_core::{Device, Tensor};
     use candle_gen::candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::z_image::text_encoder::ZImageTextEncoder as StockTe;
+
+    #[test]
+    fn dense_loading_ignores_affine_siblings() -> Result<()> {
+        let dev = Device::Cpu;
+        let weights = [
+            (
+                "tokens.weight".into(),
+                Tensor::zeros((4, 64), DType::F32, &dev)?,
+            ),
+            (
+                "tokens.scales".into(),
+                Tensor::ones((4, 1), DType::F32, &dev)?,
+            ),
+            (
+                "proj.weight".into(),
+                Tensor::zeros((4, 64), DType::F32, &dev)?,
+            ),
+            (
+                "proj.scales".into(),
+                Tensor::ones((4, 1), DType::F32, &dev)?,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &dev);
+        assert!(WeightStorage::Dense
+            .embedding(&vb, "tokens", 4, 64)?
+            .resident_storage()
+            .is_none());
+        assert!(!WeightStorage::Dense
+            .linear(&vb, "proj", 64, 4, false)?
+            .is_quantized());
+        assert!(WeightStorage::DetectPacked
+            .embedding(&vb, "tokens", 4, 64)
+            .is_err());
+        assert!(WeightStorage::DetectPacked
+            .linear(&vb, "proj", 64, 4, false)
+            .is_err());
+        Ok(())
+    }
 
     /// A tiny Qwen3 config: hidden 32, 4 heads / 2 kv-heads, head_dim 8, 4 layers — enough to exercise
     /// GQA repeat + per-head norm + the layer[-2] return cheaply on CPU.
@@ -346,29 +432,29 @@ mod parity_tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        // Vendored built first (populates the VarMap); stock reads the same params — no `.scales`, so
-        // every projection is Dense.
-        let vendored = ZImageTextEncoder::new(&cfg, vb.clone()).unwrap();
+        // The dense constructor populates the VarMap. Both the packed loader's dense fallback
+        // and the stock encoder read those same weights.
+        let dense = ZImageTextEncoder::new(&cfg, vb.clone()).unwrap();
+        let packed_fallback = ZImageTextEncoder::new_packed(&cfg, vb.clone()).unwrap();
         let stock = StockTe::new(&cfg, vb).unwrap();
 
         let ids = Tensor::from_vec(vec![1u32, 5, 12, 0, 3, 7], (1, 6), &dev).unwrap();
-        let y_v = __model_proof_output!(vendored.forward(&ids)).unwrap();
         let y_s = __model_proof_output!(stock.forward(&ids)).unwrap();
-        assert_eq!(y_v.dims(), y_s.dims());
-        let diff = (y_v - y_s)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(
-            diff < 1e-5,
-            "vendored dense TE diverged from stock by {diff}"
-        );
+        for encoder in [dense, packed_fallback] {
+            let y_v = __model_proof_output!(encoder.forward(&ids)).unwrap();
+            assert_eq!(y_v.dims(), y_s.dims());
+            let diff = (y_v - &y_s)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff < 1e-5, "dense TE diverged from stock by {diff}");
+        }
 
         #[cfg(feature = "model-inference-proof")]
-        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_te::parity_tests::vendored_dense_te_matches_stock_forward");
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::parity_tests::vendored_dense_te_matches_stock_forward");
     }
 }

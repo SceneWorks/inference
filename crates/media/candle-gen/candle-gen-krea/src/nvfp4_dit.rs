@@ -945,10 +945,18 @@ impl Nvfp4Proj {
     /// `y = x·Wᵀ (+ b)` through the NVFP4 path. Records the input activation first when a probe is
     /// attached, then runs the forward (through the NaN guard when the plan asked for it).
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with(x, |linear| linear.forward(x))
+    }
+
+    pub(crate) fn forward_with(
+        &self,
+        x: &Tensor,
+        forward: impl FnOnce(&AdaptLinear) -> Result<Tensor>,
+    ) -> Result<Tensor> {
         if let Some(p) = &self.probe {
             p.record(&self.name, self.act, x)?;
         }
-        let y = self.inner.forward(x)?;
+        let y = forward(&self.inner)?;
         if self.checked {
             // The sc-11044 NaN guard, applied to the projection's FULL output — base plus any
             // additive residual — so an adapter that collapses the signal fails just as loud as a

@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Device components the generator's cache actually owns between requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GeneratorComponentResidency {
+    pub base_components: bool,
+    pub reference_encoder: bool,
+}
+
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
 /// `on_progress` streams step/decode progress.
@@ -89,6 +96,12 @@ pub trait Generator {
     /// gross cold price when its committed snapshot already contains those same bytes.
     fn video_plan_resident_weight_bytes(&self, _plan: &crate::VideoRenderPlan) -> Option<u64> {
         None
+    }
+
+    /// Snapshot retained base and optional reference components without opening weights. Call
+    /// within the serialized cache transaction. Missing information grants no retained credit.
+    fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
+        Ok(None)
     }
 
     /// Actual per-adapter install outcomes from the most recent successful generation.
@@ -198,6 +211,21 @@ pub trait Generator {
         }
         let _ = context;
         Ok(None)
+    }
+
+    /// Open the admitted lifecycle for an exact planned pass. Providers with no plan-specific
+    /// routes reuse the same safety check and scope as ordinary generation.
+    fn begin_planned_memory_strategy_request(
+        &self,
+        _request: &GenerationRequest,
+        _plan: &crate::RenderPlan,
+        context: &MemoryRunContext,
+    ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
+        if let MemorySafetyDecision::Reject { reason } = self.memory_strategy_safety_check(context)
+        {
+            return Err(Error::Unsupported(reason));
+        }
+        self.begin_memory_strategy_request(context)
     }
 
     /// Reject a request this model cannot serve (unsupported conditioning, guidance on a

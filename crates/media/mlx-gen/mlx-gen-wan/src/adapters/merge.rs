@@ -257,11 +257,7 @@ pub(super) fn merge_adapters_into(
     normalize: fn(&str) -> String,
 ) -> Result<WanLoraReport> {
     let mut report = WanLoraReport::default();
-    let indexed = || specs.iter().enumerate();
-    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert.is_none()) {
-        apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
-    }
-    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
+    for (index, spec) in select_expert_adapters(specs, expert, ExpertAdapterOrder::SharedFirst) {
         apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
     }
     let mode = match report.native_residuals {

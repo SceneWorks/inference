@@ -26,7 +26,12 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::adapters::loader::PhaseAdapterSource;
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::phase::{
+    prepare_phases, PhaseArguments, PhasePreparationCache, PrepareArguments, PreparedPhase,
+};
+use mlx_gen::gen_core::{MemoryGeometry, RenderRun};
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
@@ -37,9 +42,11 @@ use mlx_gen::{
     Progress, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 
-use std::path::Path;
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::control::Krea2ControlBranch;
 use crate::loader::{
@@ -115,6 +122,7 @@ where
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
+#[derive(Clone)]
 pub struct TurboOptions {
     pub width: u32,
     pub height: u32,
@@ -310,6 +318,7 @@ pub struct KreaHeavy {
 /// Count-invariant t2i render state (F-073): the step-invariant prep(s) — the positive prep and, on the
 /// Raw CFG path, the unconditional one. Built once per request by [`KreaHeavy::prepare_t2i`], reused for
 /// every seed in the count loop.
+#[derive(Clone)]
 pub struct T2iPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
     pub(crate) guidance: f32,
@@ -319,26 +328,43 @@ pub struct T2iPlan {
 }
 
 /// One phase's job-local render state for a multi-phase Raw job (epic 13879, sc-13884): the phase's
-/// **own DiT clone** (adapter stack set to the phase's adapters — a shallow, refcounted clone that
-/// shares the resident weight tensors), its step-invariant [`T2iPlan`] (built from that clone), its
-/// guidance, and its contiguous slice of the ONE shared global schedule. Built once per request by
+/// adapted DiT (a shallow clone that shares the resident weight tensors), the step-invariant
+/// [`T2iPlan`] built from it, and the phase arguments and schedule slice. Built once per request by
 /// [`KreaHeavy::prepare_multiphase`] and reused across the seed/count loop; [`KreaHeavy::render_multiphase`]
 /// drives the phases in order, threading the latent across the shared-boundary sigmas.
 pub struct MultiPhasePlan {
-    dit: Krea2Transformer,
-    pub(crate) plan: T2iPlan,
-    guidance: f32,
+    bank: Arc<Mutex<Krea2Transformer>>,
+    prepared: PreparedPhase<T2iPlan>,
+    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     slice: PhaseSlice,
+}
+
+/// Owner-local immutable residual bank and conditioning for one compiled request.
+pub(crate) struct MultiPhaseRun {
+    dit: Krea2Transformer,
+    phases: Vec<PreparedPhase<T2iPlan>>,
+}
+
+// Preserve the public plan's ability to move to a new owner by value.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MultiPhasePlan>();
+};
+
+#[cfg(test)]
+fn phase_arguments_for_test(guidance: f32) -> PhaseArguments {
+    ResolvedPhase {
+        guidance,
+        slice: PhaseSlice { start: 0, end: 1 },
+        adapters: Vec::new(),
+    }
+    .arguments(&[])
 }
 
 /// Count-invariant img2img render state (F-073): the seed-independent clean reference latent (VAE-encoded
 /// once) plus the step-invariant prep(s). Built once by [`KreaHeavy::prepare_img2img`].
 pub struct Img2ImgPlan {
-    pub(crate) sigmas: Option<Vec<f32>>,
-    pub(crate) guidance: f32,
-    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
-    prep_pos: JointPrep,
-    prep_neg: Option<JointPrep>,
+    pub(crate) denoise: T2iPlan,
     clean: Array,
 }
 
@@ -390,6 +416,26 @@ pub struct ControlPlan {
     guidance: f32,
     sigmas: Option<Vec<f32>>,
     ctrl_tokens: Array,
+}
+
+fn load_phase_adapter_sources<'a>(
+    sources: &mut BTreeMap<PathBuf, PhaseAdapterSource>,
+    specs: &[AdapterSpec],
+    phases: impl IntoIterator<Item = &'a PhaseArguments>,
+    mut pin: impl FnMut(&Path) -> mlx_gen::gen_core::Result<mlx_gen::PinnedWeightsFile>,
+) -> Result<()> {
+    for key in phases.into_iter().flat_map(PhaseArguments::adapters) {
+        let spec = specs.get(key.slot()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "krea: phase adapter slot {} is outside the installed stack",
+                key.slot()
+            ))
+        })?;
+        if let Entry::Vacant(entry) = sources.entry(spec.path.clone()) {
+            entry.insert(PhaseAdapterSource::load(pin(&spec.path)?)?);
+        }
+    }
+    Ok(())
 }
 
 impl KreaHeavy {
@@ -489,7 +535,7 @@ impl KreaHeavy {
             latent,
             timestep,
             plan,
-            guidance,
+            &phase_arguments_for_test(guidance),
             None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -502,12 +548,12 @@ impl KreaHeavy {
         latent: &Array,
         timestep: &Array,
         plan: &T2iPlan,
-        guidance: f32,
+        arguments: &PhaseArguments,
         pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let negative = if krea_uses_cfg(guidance) {
+        let negative = if arguments.uses_classifier_free_guidance() {
             Some(plan.prep_neg.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "krea_2 multi-phase: a CFG phase requires the \
@@ -524,7 +570,7 @@ impl KreaHeavy {
             timestep,
             &plan.prep_pos,
             negative,
-            guidance,
+            arguments.guidance(),
             pag_step,
             window,
             attention,
@@ -567,8 +613,8 @@ impl KreaHeavy {
             dit,
             latent,
             timestep,
-            &plan.prep_pos,
-            plan.prep_neg.as_ref(),
+            &plan.denoise.prep_pos,
+            plan.denoise.prep_neg.as_ref(),
             guidance,
             pag_step,
             window,
@@ -761,6 +807,32 @@ impl KreaHeavy {
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let sigmas = &full[..keep.min(full.len())];
+        let lat = self.denoise_turbo_from(
+            plan,
+            sigmas,
+            noise,
+            opts,
+            opts.seed,
+            cancel,
+            preview,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder, opts, cancel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_turbo_from(
+        &self,
+        plan: &T2iPlan,
+        sigmas: &[f32],
+        latent: Array,
+        opts: &TurboOptions,
+        seed: u64,
+        cancel: &CancelFlag,
+        preview: &PreviewSink,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
@@ -771,11 +843,11 @@ impl KreaHeavy {
         let canonical_solver =
             mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
         let mut eval_idx = 0usize;
-        let lat = run_krea_sampler(
+        run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
-            noise,
-            opts.seed,
+            latent,
+            seed,
             cancel,
             &previews,
             on_progress,
@@ -802,9 +874,106 @@ impl KreaHeavy {
                 )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
-        )?;
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder, opts, cancel)
+        )
+    }
+
+    /// Run the ordinary Turbo body with the compiled schedule and seed sequence. Reference
+    /// encoding and text prep are shared across the count loop, including a zero-step reference.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_turbo_planned(
+        &self,
+        run: &RenderRun<'_, '_>,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        reference: Option<&Image>,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let (mut prep, clean) = match reference {
+            Some(image) => {
+                let Img2ImgPlan { denoise, clean } =
+                    self.prepare_img2img(ctx_pos, ctx_neg, image, opts.width, opts.height)?;
+                (denoise, Some(clean))
+            }
+            None => (
+                self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?,
+                None,
+            ),
+        };
+        prep.guidance = run.plan().guidance();
+        prep.pag = pag.cloned();
+        let denoise = run.plan().executed_steps() > 0;
+        if denoise {
+            mlx_rs::transforms::eval(
+                prep.prep_pos
+                    .conditioning_arrays()
+                    .into_iter()
+                    .chain(
+                        prep.prep_neg
+                            .iter()
+                            .flat_map(JointPrep::conditioning_arrays),
+                    )
+                    .chain(clean.iter()),
+            )?;
+        } else if let Some(clean) = &clean {
+            // A terminal reference pass still encodes the source and skips unused DiT text fusion.
+            mlx_rs::transforms::eval([clean])?;
+        }
+        run.end_conditioning()?;
+
+        let sigmas = run.plan().denoise_sigmas();
+        let output_index = Cell::new(0usize);
+        run.images(
+            on_progress,
+            |seed| {
+                let noise = init_noise(opts.height, opts.width, seed)?;
+                match &clean {
+                    Some(clean) => add_noise_by_interpolation(clean, &noise, sigmas[0]),
+                    None => Ok(noise),
+                }
+            },
+            |seed, initial, progress| {
+                if !denoise {
+                    return Ok(initial);
+                }
+                mlx_gen::image_execution::with_output_index(output_index.get(), || {
+                    let latent = self.denoise_turbo_from(
+                        &prep,
+                        sigmas,
+                        initial,
+                        opts,
+                        seed,
+                        &req.cancel,
+                        &req.preview,
+                        progress,
+                    )?;
+                    run.with_active_scope(|_| {
+                        mlx_rs::transforms::eval([&latent]).map_err(Error::from)?;
+                        Ok(())
+                    })?;
+                    denoise_exit_fault(&latent, opts)?;
+                    Ok(latent)
+                })
+            },
+            |_, latent, progress| {
+                let index = output_index.get();
+                output_index.set(index + 1);
+                mlx_gen::image_execution::with_output_index(index, || {
+                    progress(Progress::Decoding);
+                    let image = self.decode_latents_with_tiling(
+                        &latent,
+                        decoder,
+                        opts.decode_tiling()?.as_ref(),
+                        &req.cancel,
+                    )?;
+                    decode_exit_fault(opts)?;
+                    Ok(image)
+                })
+            },
+        )
     }
 
     /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
@@ -1072,19 +1241,8 @@ impl KreaHeavy {
         // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
         let image_nchw = preprocess_init_image(init, width, height)?;
         let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
-        // Preps built from the geometry latent (shape-identical to the per-seed blended `x_start`).
-        let geom = Self::geom_latent(width, height)?;
-        let prep_pos = self.dit.prepare(ctx_pos, None, &geom)?;
-        let prep_neg = match ctx_neg {
-            Some(nc) => Some(self.dit.prepare(nc, None, &geom)?),
-            None => None,
-        };
         Ok(Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos,
-            prep_neg,
+            denoise: self.prepare_t2i(ctx_pos, ctx_neg, width, height)?,
             clean,
         })
     }
@@ -1108,7 +1266,7 @@ impl KreaHeavy {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         // Start step from strength; blend the clean latent with noise at σ_k, then denoise the window.
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
+        let full = plan.denoise.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): the caller resolved `keep` against THIS full schedule
         // with THIS `start` (via `flow_capture_for_request`'s `start_step`), so truncating the img2img
@@ -1118,49 +1276,16 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
-        let block_window = self
-            .dit
-            .block_window(opts.transformer_window_size, cancel)?;
-        let attention = opts.attention_plan(cancel);
-        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
-        let previews = KreaPreview::new(preview, sigmas);
-        let total_steps = sigmas.len().saturating_sub(1);
-        let canonical_solver =
-            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
-        let mut eval_idx = 0usize;
-        let lat = run_krea_sampler(
-            opts.sampler.as_deref(),
+        let lat = self.denoise_turbo_from(
+            &plan.denoise,
             sigmas,
             x_start,
+            opts,
             opts.seed,
             cancel,
-            &previews,
+            preview,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let current_eval = eval_idx;
-                eval_idx += 1;
-                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
-                    canonical_solver,
-                    current_eval,
-                    total_steps,
-                );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
-                let v = Self::prepared_cfg_velocity(
-                    &self.dit,
-                    x,
-                    &t,
-                    &plan.prep_pos,
-                    plan.prep_neg.as_ref(),
-                    plan.guidance,
-                    pag_step,
-                    block_window,
-                    attention,
-                )?;
-                Ok(v.as_dtype(Dtype::Float32)?)
-            },
         )?;
-
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder, opts, cancel)
     }
@@ -1288,7 +1413,8 @@ impl KreaHeavy {
     fn denoise_phase_from(
         dit: &Krea2Transformer,
         plan: &T2iPlan,
-        guidance: f32,
+        arguments: &PhaseArguments,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
         phase_step_offset: usize,
         full_total_steps: usize,
         sub_sigmas: &[f32],
@@ -1323,13 +1449,13 @@ impl KreaHeavy {
                         current_eval,
                         phase_steps,
                     );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, full_total_steps);
+                let pag_step = PagStep::for_step(pag, step_idx, full_total_steps);
                 let v = Self::multiphase_velocity_budgeted(
                     dit,
                     x,
                     &t,
                     plan,
-                    guidance,
+                    arguments,
                     pag_step,
                     block_window,
                     attention,
@@ -1339,25 +1465,8 @@ impl KreaHeavy {
         )
     }
 
-    /// Build the **count-invariant** per-phase render state for a multi-phase Raw job (epic 13879,
-    /// sc-13884): for each phase, a **job-local DiT clone** whose adapter stack is set to that phase's
-    /// adapters, plus the step-invariant [`T2iPlan`] (prep_pos, and prep_neg iff the phase uses CFG)
-    /// built from that clone. Built ONCE per request and reused across the seed/count loop.
-    ///
-    /// **Why per-phase clones + why job-safe.** The resident DiT ([`Self`]) is shared read-only across
-    /// concurrent generates and its adapters are load-time-baked (immutable at runtime). To *toggle*
-    /// adapters between phases without racing that shared DiT, each phase gets its OWN cheap clone
-    /// ([`Krea2Transformer`] `Clone` is a shallow, refcounted copy — the weight tensors stay shared, only
-    /// the adapter-stack structs are duplicated). On the clone we `clear_adapters` (drop the baked stack)
-    /// then re-install the phase's subset via the low-rank strict loader — so the phase's adapter set is
-    /// authoritative regardless of what was baked, and the base weights (shared with the resident) are
-    /// never mutated (adapters are forward-time residuals). Uses the low-rank strict path, not the
-    /// diff-patch variant, since a `.diff` fold would mutate the shared dense base.
-    ///
-    /// The prep is built from *this phase's* clone (not the shared DiT) because an adapter may target the
-    /// text-fusion aggregator that `prepare` runs, so a base-only phase and a LoRA phase can produce
-    /// different fused contexts. `ctx_neg` must be `Some` whenever any phase uses CFG (the caller encodes
-    /// it under exactly that condition).
+    /// Prepare the public phase helpers over a single request-local factor bank. Callers can move
+    /// an exclusive phase handle to another owner. The shared bank is Send but not Sync.
     pub fn prepare_multiphase(
         &self,
         phases: &[ResolvedPhase],
@@ -1367,48 +1476,206 @@ impl KreaHeavy {
         width: u32,
         height: u32,
     ) -> Result<Vec<MultiPhasePlan>> {
-        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
-        let geom = Self::geom_latent(width, height)?;
-        let mut plans = Vec::with_capacity(phases.len());
-        for phase in phases {
-            // A cheap (refcounted) job-local clone whose adapter stack we own for this job.
-            let specs = crate::multiphase::phase_spec_subset(phase, all_specs);
-            let dit = self.dit.clone_for_multiphase(&specs)?;
-            // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
-            let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
-            let prep_neg = if krea_uses_cfg(phase.guidance) {
-                let neg = ctx_neg.ok_or_else(|| {
-                    mlx_gen::Error::Msg(
-                        "krea_2 multi-phase: a CFG phase needs a negative context, \
-                         but none was encoded"
-                            .into(),
-                    )
-                })?;
-                Some(dit.prepare(neg, None, &geom)?)
-            } else {
-                None
-            };
-            plans.push(MultiPhasePlan {
-                dit,
-                plan: T2iPlan {
-                    sigmas: None,
-                    guidance: 0.0,
-                    pag: None,
-                    prep_pos,
-                    prep_neg,
-                },
-                guidance: phase.guidance,
+        let run = self.prepare_phased_render(
+            phases
+                .iter()
+                .map(|phase| phase.arguments(all_specs))
+                .collect(),
+            all_specs,
+            ctx_pos,
+            ctx_neg,
+            width,
+            height,
+        )?;
+        let bank = Arc::new(Mutex::new(run.dit));
+        Ok(phases
+            .iter()
+            .zip(run.phases)
+            .map(|(phase, prepared)| MultiPhasePlan {
+                bank: Arc::clone(&bank),
+                prepared,
+                pag: None,
                 slice: phase.slice,
-            });
-        }
-        Ok(plans)
+            })
+            .collect())
+    }
+
+    /// Materialize phase-selected factors once and prepare conditioning using the same selection
+    /// each DiT evaluation reads from its prepared branch. No shared resident weights are changed.
+    pub(crate) fn prepare_phased_render(
+        &self,
+        arguments: Vec<PhaseArguments>,
+        all_specs: &[AdapterSpec],
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        width: u32,
+        height: u32,
+    ) -> Result<MultiPhaseRun> {
+        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
+        let mut sources = BTreeMap::new();
+        load_phase_adapter_sources(&mut sources, all_specs, arguments.iter(), |path| {
+            mlx_gen::PinnedWeightsFile::pin(path)
+        })?;
+        let dit = self
+            .dit
+            .clone_for_phase_adapters(all_specs, &sources, arguments.iter())?;
+        let geometry = MemoryGeometry {
+            width,
+            height,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let phases = prepare_phases(
+            arguments.into_iter().map(|arguments| (arguments, geometry)),
+            |arguments, geometry| {
+                Self::prepare_phase_conditioning(&dit, arguments, geometry, ctx_pos, ctx_neg)
+            },
+        )?;
+        Ok(MultiPhaseRun { dit, phases })
+    }
+
+    fn prepare_phase_conditioning(
+        dit: &Krea2Transformer,
+        arguments: PrepareArguments<'_>,
+        geometry: MemoryGeometry,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+    ) -> Result<T2iPlan> {
+        let geom = Self::geom_latent(geometry.width, geometry.height)?;
+        let adapters: Arc<[_]> = Arc::from(arguments.adapters());
+        let prep_pos = dit.prepare_with_phase(ctx_pos, None, &geom, Some(adapters.clone()))?;
+        let prep_neg = if arguments.uses_classifier_free_guidance() {
+            let neg = ctx_neg.ok_or_else(|| {
+                Error::Msg(
+                    "krea_2 multi-phase: a CFG phase needs a negative context, \
+                     but none was encoded"
+                        .into(),
+                )
+            })?;
+            Some(dit.prepare_with_phase(neg, None, &geom, Some(adapters))?)
+        } else {
+            None
+        };
+        Ok(T2iPlan {
+            sigmas: None,
+            guidance: 0.0,
+            pag: None,
+            prep_pos,
+            prep_neg,
+        })
+    }
+
+    /// Execute the shared phase runner with the existing Krea sampler, guidance and preview.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_multiphase_planned(
+        &self,
+        run: &RenderRun<'_, '_>,
+        file_pin_spec: &mlx_gen::LoadSpec,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let plan = run.plan();
+        let all_specs = &file_pin_spec.adapters;
+        let mut sources = BTreeMap::new();
+        let image_index = Cell::new(0usize);
+        let geometry = MemoryGeometry {
+            width: opts.width,
+            height: opts.height,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let attention = opts.attention_plan(&req.cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| init_noise(opts.height, opts.width, seed),
+            |seed, latent, progress| {
+                mlx_gen::image_execution::with_output_index(image_index.get(), || {
+                    let previews = KreaPreview::new(&req.preview, plan.sigmas());
+                    run.denoise_adapter_phases(seed, latent, |phase, sigmas, seed, latent| {
+                        load_phase_adapter_sources(
+                            &mut sources,
+                            all_specs,
+                            [phase.arguments()],
+                            |path| file_pin_spec.file_pin_for(path),
+                        )?;
+                        let dit = self.dit.clone_for_phase_adapters(
+                            all_specs,
+                            &sources,
+                            [phase.arguments()],
+                        )?;
+                        // Do not extend the live-set reservation with stored fused conditioning.
+                        // Prepare under the active Denoise scope and release it at phase exit.
+                        let mut preparation = PhasePreparationCache::new();
+                        let conditioning = preparation.get_or_prepare(
+                            phase.arguments(),
+                            geometry,
+                            |arguments, geometry| {
+                                Self::prepare_phase_conditioning(
+                                    &dit, arguments, geometry, ctx_pos, ctx_neg,
+                                )
+                            },
+                        )?;
+                        let latent = Self::denoise_phase_from(
+                            &dit,
+                            conditioning,
+                            phase.arguments(),
+                            pag,
+                            phase.span().start,
+                            plan.sigmas().len().saturating_sub(1),
+                            sigmas,
+                            opts.sampler.as_deref(),
+                            opts.transformer_window_size,
+                            attention,
+                            latent,
+                            seed,
+                            &req.cancel,
+                            &previews,
+                            progress,
+                        )?;
+                        mlx_rs::transforms::eval([&latent])?;
+                        if phase.index() + 1 == plan.adapter_phases().len() {
+                            denoise_exit_fault(&latent, opts)?;
+                            if image_index.get() + 1 == plan.image_count() as usize {
+                                sources.clear();
+                            }
+                        }
+                        Ok(latent)
+                    })
+                })
+            },
+            |seed, latent, progress| {
+                let mut opts = opts.clone();
+                opts.seed = seed;
+                let index = image_index.get();
+                image_index.set(index + 1);
+                mlx_gen::image_execution::with_output_index(index, || {
+                    progress(Progress::Decoding);
+                    let image = self.decode_latents_with_tiling(
+                        &latent,
+                        decoder,
+                        opts.decode_tiling()?.as_ref(),
+                        &req.cancel,
+                    )?;
+                    decode_exit_fault(&opts)?;
+                    Ok(image)
+                })
+            },
+        )
     }
 
     /// **Multi-phase Raw render** (epic 13879, sc-13884) — drive the ordered per-phase plans (from
     /// [`Self::prepare_multiphase`]) within ONE denoise trajectory over ONE coherent global schedule,
     /// then decode once. The `full` schedule is built ONCE for the TOTAL step budget (the sum of the
-    /// phases' steps); each phase runs the shared `denoise_phase_from` primitive through its OWN
-    /// job-local DiT clone (its adapter set) over its contiguous slice `full[start..=end]` from the
+    /// phases' steps); each phase runs `denoise_phase_from` through its matching residual selection
+    /// over its contiguous slice `full[start..=end]` from the
     /// running latent — so the latent and sigma flow continuously across every boundary (the crux: no
     /// per-phase schedule, hence no seam/reset), while the ACTIVE ADAPTERS and GUIDANCE change per phase.
     /// This is the full "*N* steps Raw (CFG on) + *M* steps Raw+turbo-LoRA (CFG off)" workflow.
@@ -1434,10 +1701,15 @@ impl KreaHeavy {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
             let sub = &full[start..=end];
+            let (arguments, plan) = mp.prepared.parts();
+            let dit = mp.bank.lock().map_err(|_| {
+                Error::ProcessPoisoned("krea: phase adapter bank owner panicked".into())
+            })?;
             latent = Self::denoise_phase_from(
-                &mp.dit,
-                &mp.plan,
-                mp.guidance,
+                &dit,
+                plan,
+                arguments,
+                mp.pag.as_ref(),
                 start,
                 full_total_steps,
                 sub,
@@ -1519,7 +1791,7 @@ impl KreaHeavy {
             opts.height,
             opts.scheduler.as_deref(),
         );
-        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
+        let full = plan.denoise.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): `keep` was resolved against THIS schedule + `start`, so
         // `full[start..keep]` exits at `full[keep-1]` — the decoder's degrade σ. `keep == full.len()`
@@ -1555,7 +1827,7 @@ impl KreaHeavy {
                     current_eval,
                     total_steps,
                 );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
+                let pag_step = PagStep::for_step(plan.denoise.pag.as_ref(), step_idx, total_steps);
                 let v = Self::base_img2img_velocity_budgeted(
                     &self.dit,
                     x,
@@ -2567,6 +2839,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planned_turbo_prepares_reference_and_records_actual_phase_exits() {
+        let (_, body) = include_str!("pipeline.rs")
+            .split_once("    pub(crate) fn render_turbo_planned(")
+            .expect("planned Turbo production route");
+        let (body, _) = body.split_once("\n    }\n").expect("function end");
+        let offset = |token: &str| {
+            body.find(token)
+                .unwrap_or_else(|| panic!("missing {token}"))
+        };
+        let active = offset("if denoise {");
+        assert!(offset("let denoise = run.plan().executed_steps() > 0;") < active);
+        let zero = offset("else if let Some(clean) = &clean");
+        let end_conditioning = offset("run.end_conditioning()");
+        assert!(offset("self.prepare_img2img(") < active);
+        assert!(offset("self.prepare_t2i(") < active);
+        for prepared in [
+            "transforms::eval(",
+            "prep.prep_pos",
+            "prep.prep_neg",
+            ".chain(clean.iter())",
+        ] {
+            assert!((active..zero).contains(&offset(prepared)));
+        }
+        assert!((zero..end_conditioning).contains(&offset("eval([clean])")));
+        let run_images = offset("run.images(");
+        let identity = offset("if !denoise {\n                    return Ok(initial);");
+        let sample = offset("self.denoise_turbo_from(");
+        assert!(end_conditioning < run_images);
+        assert!(run_images < identity && identity < sample);
+        assert!(sample < offset("denoise_exit_fault("));
+        assert!(offset("self.decode_latents_with_tiling(") < offset("decode_exit_fault("));
+    }
+
     /// sc-22738: every non-control route reaches the exit pair, because each one calls the sampler
     /// and then hands the produced latent straight to `decode_latents` — nothing between them.
     #[test]
@@ -2594,8 +2900,11 @@ mod tests {
             // occurrence count of the sampler call in this file, so these probes must not add to it.
             let sampler = concat!("run_krea_sampler", "(");
             let phase = concat!("Self::denoise_phase_from", "(");
+            let turbo = concat!("self.denoise_turbo_from", "(");
             assert!(
-                body[..decode].contains(sampler) || body[..decode].contains(phase),
+                [sampler, phase, turbo]
+                    .iter()
+                    .any(|seam| body[..decode].contains(seam)),
                 "{route} must denoise before it reaches the exit pair"
             );
         }
@@ -2715,19 +3024,11 @@ mod tests {
         let cfg_t2i = t2i_plan(true).unwrap();
         let plain_t2i = t2i_plan(false).unwrap();
         let cfg_img2img = Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
-            prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
+            denoise: cfg_t2i.clone(),
             clean: latent.clone(),
         };
         let plain_img2img = Img2ImgPlan {
-            sigmas: None,
-            guidance: 0.0,
-            pag: None,
-            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
-            prep_neg: None,
+            denoise: plain_t2i.clone(),
             clean: latent.clone(),
         };
         let reference = Array::from_slice(
@@ -2981,7 +3282,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 pag_step,
                 None,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -2991,7 +3292,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 pag_step,
                 window,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3029,7 +3330,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                1.0,
+                &phase_arguments_for_test(1.0),
                 pag_step,
                 None,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3039,7 +3340,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                1.0,
+                &phase_arguments_for_test(1.0),
                 pag_step,
                 window,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3169,7 +3470,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                guidance,
+                &phase_arguments_for_test(guidance),
                 None,
                 None,
                 bounded_attention(),
@@ -3182,7 +3483,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &plain_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 None,
                 None,
                 bounded_attention(),
@@ -3391,8 +3692,8 @@ mod tests {
         );
         assert_eq!(
             source.matches("run_krea_sampler(").count(),
-            13,
-            "seven production sites, five weight-free test calls, and this literal"
+            12,
+            "six production sites, five weight-free test calls, and this literal"
         );
     }
 

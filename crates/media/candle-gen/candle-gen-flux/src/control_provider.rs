@@ -7,7 +7,7 @@
 //! **How it conditions:** the pose/canny/depth control image is VAE-encoded + 2×2-packed into the
 //! packed transformer latent `[1, seq, 64]` (the same pack as the noise latents, so it aligns 1:1 with
 //! the base image tokens), constant across the denoise. [`crate::FluxControlTransformer`] runs the
-//! parity-proven dev DiT ([`crate::ip_dit::IpFlux`]) plus the control branch
+//! parity-proven dev DiT ([`crate::transformer::FluxDit`]) plus the control branch
 //! ([`crate::control::FluxControlNet`]): 6 per-block residuals are computed once and added into the base
 //! image stream after base double blocks at `interval = ceil(19/6) = 4`, scaled by `control_scale`
 //! (Shakker README sweet spot ≈ 0.7; absent → that default, an explicit `Some(0.0)` = control off).
@@ -15,7 +15,7 @@
 //! no true-CFG / negative pass.
 //!
 //! **Compose-readiness:** the denoise routes through [`crate::FluxControlTransformer::forward_composed`], which
-//! threads an optional identity injector ([`crate::ip_dit::DitImageInjector`] — PuLID / XLabs
+//! threads an optional identity injector ([`crate::transformer::DitImageInjector`] — PuLID / XLabs
 //! IP-Adapter) into the SAME base double-block stream as the control residuals. This provider wires the
 //! seam (and exposes [`Flux1DevControl::generate_with_injector_planned`]); a follow-on epic stacks identity +
 //! control in one denoise step by passing `Some(injector)`.
@@ -132,9 +132,9 @@ use candle_gen::{CandleError, Result};
 
 use crate::control::{accepts_control_kind, FluxControlNet, FluxControlNetConfig};
 use crate::flux1_load;
-use crate::ip_dit::{control_residual_interval, DitImageInjector};
 use crate::pipeline::flux_config;
 use crate::ref_backbone::{FluxRefBackbone, FluxRefHeavy};
+use crate::transformer::{control_residual_interval, DitImageInjector};
 use crate::Variant;
 
 /// FLUX runs at bf16.
@@ -452,7 +452,7 @@ pub fn compile_control_plan(
 }
 
 impl Flux1DevControl {
-    /// Load the dev base (the forked [`crate::IpFlux`] DiT — the only FLUX DiT with the compose-ready injector
+    /// Load the dev base (the forked [`crate::FluxDit`] DiT — the only FLUX DiT with the compose-ready injector
     /// seam) + the reused text encoders + VAE + the Shakker control overlay, assembling the
     /// [`crate::FluxControlTransformer`].
     pub fn load(paths: &Flux1ControlPaths) -> Result<Self> {
@@ -1001,7 +1001,7 @@ impl Flux1DevControl {
                     &state.txt_ids,
                     &t_vec,
                     Some(&guidance_t),
-                    prepared.conditioning(),
+                    &prepared,
                     plan,
                     cancel,
                 )?;

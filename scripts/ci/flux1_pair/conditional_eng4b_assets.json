@@ -1,0 +1,55 @@
+{
+  "cases": {
+    "control-pose": {
+      "assets": {
+        "control": {
+          "revision": "5d700aaad96c5ddcdf8a38ef9b22a82aac2c38e5",
+          "sha256": "9d03f63f36206bab2f36aed5cfedc8693c2881397534e9d5f9ae9a0a41362517"
+        }
+      },
+      "historical_run": 42462655901,
+      "source_sha256": "8547f6c74e23f3e9b4dba7cc3a0002966524f47b96ddc1c2c264acb7554a9dee"
+    },
+    "ip-dev": {
+      "assets": {
+        "image_encoder": {
+          "revision": "32bd64288804d66eefd0ccbe215aa642df71cc41",
+          "sha256": "a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb"
+        },
+        "ip_adapter": {
+          "revision": "18f6940238ab5dc3744df7a8e30315892279d5f9",
+          "sha256": "750f912149b84bbb0c2a6ce90ffa7e78afd1795821407718724ebcd36372dc2d"
+        }
+      },
+      "historical_run": 43558292122,
+      "source_sha256": "3995f2e856346748588e76a5557516d0218f44f5663701c5a50139d50c86a7be"
+    },
+    "pulid-fake": {
+      "assets": {
+        "arcface": {
+          "revision": "bca0cacf8e5e04529bb2b326a521361b02be84fd",
+          "sha256": "9deff2fef8fe1b3e357a99c01f28cc478dd8acbeab0d3749d252f6d69990ee39"
+        },
+        "bisenet": {
+          "revision": "78ef91f977eae16d66fb191caf003154b7a0a0b8",
+          "sha256": "c6b6f092ab266b13593ae0fbbc21c4546877577f6b1d2ae707f25d62ee767cac"
+        },
+        "eva": {
+          "revision": "78ef91f977eae16d66fb191caf003154b7a0a0b8",
+          "sha256": "69417ca25d214f5e93704475f3e2a7e235fd1f1bf4a5acdf3f39ec69b51513cd"
+        },
+        "pulid": {
+          "revision": "492b1451255dc9d9bc3c857259690b5f8b998d4a",
+          "sha256": "92c41c3af322b02e58e1b32842e4601e08c8f16ec1fe80089dbe957df510f51d"
+        },
+        "scrfd": {
+          "revision": "bca0cacf8e5e04529bb2b326a521361b02be84fd",
+          "sha256": "7b40147a85771139e70a8d9fe6be27ffcf32f4c911770ef24b5b05c29f534eda"
+        }
+      },
+      "historical_run": 42460488791,
+      "source_sha256": "3995f2e856346748588e76a5557516d0218f44f5663701c5a50139d50c86a7be"
+    }
+  },
+  "dev_fixture_inventory_sha256": "4b91c5e10188217804b7e3124154f164a514020b532fe140988ce27cd01df72b"
+}

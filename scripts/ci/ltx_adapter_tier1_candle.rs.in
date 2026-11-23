@@ -1,0 +1,267 @@
+// Installed only into each disposable same-job checkout by sga_adapter_comparison.py.
+use candle_gen::candle_core::{safetensors, DType, Device, DeviceLocation, Result, Shape, Tensor};
+use candle_gen::candle_nn::{var_builder::SimpleBackend, Init, VarBuilder};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen_ltx::{
+    adapters::install_ltx25_adapters,
+    config::AvConfig,
+    tier::{ltx25_transformer_vb, remap_transformer_key, rename_vb},
+    transformer::{AvDiT, PreparedAvRope},
+};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+const HEADER_SHA256: &str = "__SGA_LTX_CONSTRUCTOR_HEADER_SHA256__";
+
+#[derive(Deserialize)]
+struct TensorHeader {
+    shape: Vec<usize>,
+}
+
+struct HeaderBackend {
+    headers: BTreeMap<String, TensorHeader>,
+    read: Arc<Mutex<BTreeSet<String>>>,
+    scalar: Tensor,
+}
+
+impl SimpleBackend for HeaderBackend {
+    fn get(
+        &self,
+        shape: Shape,
+        name: &str,
+        _: Init,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let tensor = self.get_unchecked(name, dtype, device)?;
+        if tensor.shape() != &shape {
+            candle_gen::candle_core::bail!(
+                "fixture shape mismatch for {name}: {:?} != {shape:?}",
+                tensor.shape()
+            );
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
+        assert_eq!(dtype, DType::BF16);
+        assert_eq!(device.location(), DeviceLocation::Cpu);
+        let header = self.headers.get(name).ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "missing converted-tier fixture tensor {name}"
+            ))
+        })?;
+        self.read.lock().unwrap().insert(name.to_owned());
+        self.scalar.broadcast_as(header.shape.as_slice())
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.headers.contains_key(name)
+    }
+}
+
+fn verify_constructor(
+    path: &Path,
+    config: &AvConfig,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut source = fs::File::open(path)?;
+    let mut length = [0; 8];
+    source.read_exact(&mut length)?;
+    let length = u64::from_le_bytes(length);
+    if !(1..=64 * 1024).contains(&length) {
+        return Err("LTX fixture header length is outside the metadata budget".into());
+    }
+    let mut raw = vec![0; length as usize];
+    source.read_exact(&mut raw)?;
+    // Pin every key, shape, dtype, and offset in the one-block header derived from the shipping tier.
+    if format!("{:x}", Sha256::digest(&raw)) != HEADER_SHA256 {
+        return Err(
+            "LTX fixture constructor header differs from the pinned one-block geometry".into(),
+        );
+    }
+    let headers: BTreeMap<String, TensorHeader> = serde_json::from_slice(&raw)?;
+    let expected = headers.keys().cloned().collect::<BTreeSet<_>>();
+    let read = Arc::new(Mutex::new(BTreeSet::new()));
+    let dtype = DType::BF16;
+    let device = Device::Cpu;
+    // Broadcasted scalar views give AvDiT the exact shapes without reading weights or running a forward.
+    let backend = HeaderBackend {
+        headers,
+        read: read.clone(),
+        scalar: Tensor::zeros((), dtype, &device)?,
+    };
+    let inner = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
+    let builder =
+        rename_vb(inner, dtype, &device, remap_transformer_key).pp("model.diffusion_model");
+    let dit = AvDiT::new(builder, config)?;
+    assert_eq!(dit.num_blocks(), 1);
+    let seen = read.lock().unwrap();
+    if *seen != expected {
+        return Err(format!(
+            "LTX fixture constructor did not read {:?}",
+            expected.difference(&seen)
+        )
+        .into());
+    }
+    println!("SGA_LTX_CONSTRUCTOR_OK {} {HEADER_SHA256}", seen.len());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_pass(
+    dit: &AvDiT,
+    pass: usize,
+    rope: &PreparedAvRope,
+    v: &Tensor,
+    a: &Tensor,
+    vt: &Tensor,
+    vc: &Tensor,
+    ac: &Tensor,
+    vp: &Tensor,
+    ap: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    unreachable!("install the source-bound pass bridge")
+}
+
+fn read_bits(tensor: &Tensor, shape: &[usize]) -> Result<Vec<u32>> {
+    assert_eq!(tensor.dims(), shape);
+    assert_eq!(
+        tensor.device().location(),
+        DeviceLocation::Cuda { gpu_id: 0 }
+    );
+    Ok(tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|value| value.to_bits())
+        .collect())
+}
+
+#[cfg(feature = "cuda")]
+fn retain_cuda_pool(
+    output: &Path,
+    device: &Device,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use candle_gen::candle_core::cuda_backend::proof_pool;
+    let cuda = device.as_cuda_device()?;
+    let id = cuda.cuda_stream().context().uuid()?;
+    let hex: String = id
+        .bytes
+        .iter()
+        .map(|byte| format!("{:02x}", *byte as u8))
+        .collect();
+    let uuid = format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    assert!(uuid.eq_ignore_ascii_case(&env::var("CUDA_VISIBLE_DEVICES")?));
+    let pool = proof_pool::snapshot(0)?.ok_or("CUDA scoped proof pool was not installed")?;
+    assert_eq!(
+        (pool.logical_ordinal, pool.cap_bytes),
+        (0, 10 * 2_u64.pow(30))
+    );
+    assert!(pool.used_bytes > 0 && pool.reserved_bytes > 0);
+    let row = json!({"pid":std::process::id(), "cudaDeviceUuid":uuid,
+                     "poolUsedBytes":pool.used_bytes,"poolUsedHighBytes":pool.used_high_bytes,
+                     "poolReservedBytes":pool.reserved_bytes,"poolReservedHighBytes":pool.reserved_high_bytes});
+    let pending = output.join("cuda-pool.pending");
+    let target = output.join("cuda-pool.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    serde_json::to_writer(&mut file, &row)?;
+    file.sync_all()?;
+    drop(file);
+    assert!(!target.exists());
+    fs::rename(pending, target)?;
+    // Keep the actual GPU allocations in the supervised Job for WDDM's bounded sampler.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn retain_cuda_pool(
+    _output: &Path,
+    _device: &Device,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    Err("CUDA proof requires its compiled cuda feature".into())
+}
+
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(env::var_os("PAIR_SGA_FIXTURE").ok_or("missing fixture")?);
+    let config = AvConfig::from_transformer_config(&serde_json::from_slice(&fs::read(
+        root.join("config.json"),
+    )?)?)?;
+    assert_eq!(config.video.num_layers, 1);
+    let checkpoint = root.join("transformer.safetensors");
+    verify_constructor(&checkpoint, &config)?;
+    match env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => (),
+        [flag] if flag == "--check-constructor" => return Ok(()),
+        _ => return Err("unexpected LTX comparison option".into()),
+    }
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing proof output")?);
+    let device = Device::new_cuda(0)?;
+    assert_eq!(device.location(), DeviceLocation::Cuda { gpu_id: 0 });
+    let builder =
+        ltx25_transformer_vb(&checkpoint, DType::BF16, &device)?.pp("model.diffusion_model");
+    let mut dit = AvDiT::new(builder, &config)?;
+    assert_eq!(dit.num_blocks(), 1);
+    let inputs = safetensors::load(root.join("inputs.safetensors"), &device)?;
+    let v = &inputs["video"];
+    let a = &inputs["audio"];
+    let vc = &inputs["video_text"];
+    let ac = &inputs["audio_text"];
+    let vt = Tensor::from_slice(&[0.5_f32; 2], (1, 2), &device)?;
+    let vp = Tensor::from_slice(
+        &[0_f32, 1., 0., 1., 0., 32., 0., 32., 0., 32., 32., 64.],
+        (1, 3, 2, 2),
+        &device,
+    )?;
+    let ap = Tensor::from_slice(
+        &[0_f32, 0.04, 0.04, 0.08, 0.08, 0.12],
+        (1, 1, 3, 2),
+        &device,
+    )?;
+    let measure = |dit: &AvDiT, pass, rope: &PreparedAvRope| -> Result<Value> {
+        let (video, audio) = forward_pass(dit, pass, rope, v, a, &vt, vc, ac, &vp, &ap)?;
+        device.synchronize()?;
+        Ok(json!({"video":read_bits(&video, &[1,2,128])?, "audio":read_bits(&audio, &[1,3,128])?}))
+    };
+    let mut results = Map::new();
+    let pass_zero = dit.prepare_rope(v, a, &vp, &ap)?;
+    results.insert("bare".to_owned(), measure(&dit, 0, &pass_zero)?);
+    let adapter = AdapterSpec::new(root.join("adapter.safetensors"), 1.0, AdapterKind::Lora)
+        .with_pass_scales(vec![0.0, 0.75]);
+    let report = install_ltx25_adapters(&mut dit, &[adapter])?;
+    assert_eq!(report.applied, 6);
+    assert_eq!(report.skipped_keys, 0);
+    for (label, pass) in [("base", 0), ("refine", 1), ("reused", 0)] {
+        results.insert(label.to_owned(), measure(&dit, pass, &pass_zero)?);
+    }
+    let result = json!({"device":{"kind":"candle-cuda","index":0}, "applied":report.applied,
+                        "shapes":{"video":[1,2,128],"audio":[1,3,128]}, "passes":[0,1,0], "velocity_bits":results});
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(file, &result)?;
+    retain_cuda_pool(&output, &device)?;
+    drop(dit);
+    println!("SGA_ADAPTER_TIER1_BODY ltx25-av-pass-scales");
+    Ok(())
+}

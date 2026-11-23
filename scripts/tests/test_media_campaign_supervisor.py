@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import media_campaign_supervisor as safety
@@ -1530,6 +1531,40 @@ class OperatorStopTests(unittest.TestCase):
                     with self.assertRaises(type(error)) as caught:
                         safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
                     self.assertIs(caught.exception, error)
+
+
+class WindowsJobFootprintTests(unittest.TestCase):
+    def test_retains_separate_counters_without_changing_the_guarded_total(self):
+        from scripts import media_campaign_windows as windows
+
+        readings = {22: (12, 8), 33: (4, 7)}
+
+        def read_process(handle, output, size):
+            output._obj.WorkingSetSize, output._obj.PrivateUsage = readings[handle]
+            return True
+
+        for peak in (11, 20):
+            with self.subTest(peak=peak):
+                def read_job(handle, info_class, output, size, returned):
+                    output._obj.PeakJobMemoryUsed = peak
+                    return True
+
+                job = windows.WindowsJob.__new__(windows.WindowsJob)
+                job.handle = 10
+                job.members = lambda: set(readings)
+                job.kernel = SimpleNamespace(OpenProcess=lambda access, inherit, pid: pid,
+                                             CloseHandle=lambda handle: True,
+                                             QueryInformationJobObject=read_job)
+                job.psapi = SimpleNamespace(GetProcessMemoryInfo=read_process)
+                probe = safety.SystemProbe.__new__(safety.SystemProbe)
+                probe.policy = SimpleNamespace(backend="windows-cuda")
+                self.assertEqual(probe.tree_footprint(job), max(peak, 19))
+                self.assertEqual(probe.last_windows_footprint_details, {
+                    "processContributionBytes": 19, "jobPeakMemoryUsedBytes": peak,
+                    "sampledProcessCount": 2,
+                    "processes": [{"pid": 22, "workingSetBytes": 12, "privateUsageBytes": 8},
+                                  {"pid": 33, "workingSetBytes": 4, "privateUsageBytes": 7}],
+                })
 
 
 class WindowsJobCleanupTests(unittest.TestCase):

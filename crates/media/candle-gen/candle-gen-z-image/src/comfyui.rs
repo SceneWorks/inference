@@ -593,6 +593,176 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device, Tensor};
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn combined_fp8_native_projection_owners() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        use candle_gen::candle_core::DeviceLocation;
+        use candle_gen::gen_core::{LoadSpec, WeightsSource};
+        use candle_gen::quant::{DenseLinear, QLinear};
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+        // Shipping physical keys and widths: SeeSee21/Z-Image-Turbo-AIO at
+        // c9cab2ab0d2403d3795e8f23a36c3510e312ae72, z-image-turbo-fp8-aio.safetensors.
+        // Header SHA-256: 203c881eeb7b4493049abf3f65092b6f331317c54d68b9f5d931bab8de9a508e.
+        // The plain case has no companion scales. The scaled case adds explicit scalar controls.
+        const QKV: &str = "model.diffusion_model.layers.0.attention.qkv.weight";
+        const Q_PROJ: &str =
+            "text_encoders.qwen3_4b.transformer.model.layers.0.self_attn.q_proj.weight";
+        const TEXT_ATTENTION: &str = "model.layers.0.self_attn";
+        const VAE: &str = "decoder.conv_in.weight";
+        const TEXT_HIDDEN: usize = 2560;
+        const TEXT_QUERIES: usize = 4096;
+        const PROBES: usize = 4;
+
+        fn codes(bands: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+            let mut data = vec![0_u8; bands.len() * rows * cols];
+            for (band, &value) in bands.iter().enumerate() {
+                for row in 0..rows {
+                    let column = (row / 2 + band) % PROBES;
+                    let code = if row.is_multiple_of(2) {
+                        value
+                    } else {
+                        value | 0x80
+                    };
+                    data[(band * rows + row) * cols + column] = code;
+                }
+            }
+            data
+        }
+
+        fn one_hot(width: usize, device: &Device) -> candle_gen::candle_core::Result<Tensor> {
+            let mut data = vec![0_f32; PROBES * width];
+            for i in 0..PROBES {
+                data[i * width + i] = 1.0;
+            }
+            Tensor::from_vec(data, (PROBES, width), device)?.to_dtype(DType::BF16)
+        }
+
+        fn assert_native(linear: &QLinear, rows: usize, cols: usize, device: &Device) {
+            let QLinear::Dense(DenseLinear::Linear(linear)) = linear else {
+                panic!("projection constructor lost its native Candle Linear");
+            };
+            let operand = linear.native_weight().expect("retained source operand");
+            assert_eq!(operand.format_id(), "fp8-e4m3-scalar-v1");
+            assert_eq!(operand.dims(), (rows, cols));
+            assert!(operand.device().same_device(device));
+        }
+
+        fn assert_product(
+            output: Tensor,
+            device: &Device,
+            rows: usize,
+            band: usize,
+            coefficient: f32,
+        ) -> candle_gen::candle_core::Result<()> {
+            assert_eq!(output.dims(), &[PROBES, rows]);
+            assert_eq!(output.dtype(), DType::BF16);
+            assert!(output.device().same_device(device));
+            // Independent coefficient oracle. Each input is a basis vector, so the
+            // selected dyadic coefficient is exactly representable, including in BF16.
+            let output = output
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for (i, value) in output.into_iter().enumerate() {
+                let row = i % rows;
+                let selected = ((row / 2 + band) % PROBES) * rows + row;
+                let expected = if i != selected {
+                    0.0
+                } else if row.is_multiple_of(2) {
+                    coefficient
+                } else {
+                    -coefficient
+                };
+                assert_eq!(value, expected, "band {band}, element {i}");
+            }
+            Ok(())
+        }
+
+        let device = Device::new_cuda(0)?;
+        assert_eq!(device.location(), DeviceLocation::Cuda { gpu_id: 0 });
+        let temp = tempfile::tempdir()?;
+        let qkv = codes(&[0x38, 0x40, 0x44], DIT_DIM, DIT_DIM);
+        let text = codes(&[0x48], TEXT_QUERIES, TEXT_HIDDEN);
+        let dit_input = one_hot(DIT_DIM, &device)?;
+        let text_input = one_hot(TEXT_HIDDEN, &device)?;
+        for (name, scales) in [("plain", None), ("scaled", Some((0.5_f32, 2.0_f32)))] {
+            eprintln!("Checking {name} combined FP8 source");
+            let path = temp.path().join(format!("{name}.safetensors"));
+            let (dit_scale, text_scale) = scales.unwrap_or((1.0, 1.0));
+            let ds = dit_scale.to_le_bytes();
+            let ts = text_scale.to_le_bytes();
+            let mut entries = vec![
+                (
+                    QKV,
+                    TensorView::new(Dtype::F8_E4M3, vec![3 * DIT_DIM, DIT_DIM], &qkv)?,
+                ),
+                (
+                    Q_PROJ,
+                    TensorView::new(Dtype::F8_E4M3, vec![TEXT_QUERIES, TEXT_HIDDEN], &text)?,
+                ),
+                (
+                    "vae.decoder.conv_in.weight",
+                    TensorView::new(Dtype::BF16, vec![1], &[0, 0])?,
+                ),
+            ];
+            if scales.is_some() {
+                entries.extend([
+                    ("model.diffusion_model.layers.0.attention.qkv.scale_weight",
+                     TensorView::new(Dtype::F32, vec![], &ds)?),
+                    ("text_encoders.qwen3_4b.transformer.model.layers.0.self_attn.q_proj.weight_scale",
+                     TensorView::new(Dtype::F32, vec![], &ts)?),
+                ]);
+            }
+            serialize_to_file(entries, None, &path)?;
+            let spec = LoadSpec::new(WeightsSource::File(path.clone()));
+            let source = ComfyuiSources::combined(spec.file_pin_for(&path)?, temp.path().into())?;
+            let dit = source.builder(CombinedComponent::Transformer, DType::BF16, &device)?;
+            let te = source.builder(CombinedComponent::TextEncoder, DType::BF16, &device)?;
+            let vae = source.builder(CombinedComponent::Vae, DType::BF16, &device)?;
+            assert!(vae.contains_tensor(VAE));
+            assert!(!dit.contains_tensor(VAE) && !te.contains_tensor(VAE));
+            let dit_projection = "layers.0.attention.to_q.weight";
+            let text_projection = "model.layers.0.self_attn.q_proj.weight";
+            assert!(dit.contains_tensor(dit_projection) && te.contains_tensor(text_projection));
+            assert!(!dit.contains_tensor(text_projection) && !te.contains_tensor(dit_projection));
+            assert!(!vae.contains_tensor(dit_projection) && !vae.contains_tensor(text_projection));
+
+            let attention = dit.pp("layers.0.attention");
+            assert!(!attention.contains_tensor("qkv.weight"));
+            for (band, key) in ["to_q", "to_k", "to_v"].into_iter().enumerate() {
+                let proj = crate::dit::combined_fp8_attention_projection(&attention, key)?;
+                assert_native(
+                    proj.base_qlinear().expect("shared projection storage"),
+                    DIT_DIM,
+                    DIT_DIM,
+                    &device,
+                );
+                let actual = __model_proof_output!(proj.forward(&dit_input))?;
+                assert_product(
+                    actual,
+                    &device,
+                    DIT_DIM,
+                    band,
+                    (band + 1) as f32 * dit_scale,
+                )?;
+            }
+            let proj =
+                crate::text_encoder::combined_fp8_qwen3_q_projection(&te.pp(TEXT_ATTENTION))?;
+            assert_native(&proj, TEXT_QUERIES, TEXT_HIDDEN, &device);
+            let actual = __model_proof_output!(proj.forward(&text_input))?;
+            assert_product(actual, &device, TEXT_QUERIES, 0, 4.0 * text_scale)?;
+            device.synchronize()?;
+            source.ensure_unchanged()?;
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED comfyui::tests::combined_fp8_native_projection_owners");
+        Ok(())
+    }
+
     fn w(dims: &[usize]) -> Tensor {
         Tensor::zeros(dims, DType::F32, &Device::Cpu).unwrap()
     }

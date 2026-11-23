@@ -1185,10 +1185,9 @@ mod tests {
             ("common.rs", include_str!("common.rs")),
             ("dit.rs", include_str!("dit.rs")),
             ("memory_strategy.rs", include_str!("memory_strategy.rs")),
-            ("packed_dit.rs", include_str!("packed_dit.rs")),
-            ("packed_te.rs", include_str!("packed_te.rs")),
             ("preview.rs", include_str!("preview.rs")),
             ("quant.rs", include_str!("quant.rs")),
+            ("text_encoder.rs", include_str!("text_encoder.rs")),
             ("training_adapter.rs", include_str!("training_adapter.rs")),
         ] {
             assert!(
@@ -1238,11 +1237,10 @@ mod tests {
                 "edit_validate.rs", // #[cfg(test)] mod — not shipped code
                 "lib.rs",
                 "memory_strategy.rs",
-                "packed_dit.rs",
-                "packed_te.rs",
                 "pipeline.rs",
                 "preview.rs",
                 "quant.rs",
+                "text_encoder.rs",
                 "training.rs",
                 "training_adapter.rs",
                 "turbo_img2img_validate.rs", // #[cfg(test)] mod — not shipped code

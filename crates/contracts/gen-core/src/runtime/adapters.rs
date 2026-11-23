@@ -69,6 +69,11 @@ impl AdapterSpec {
         self.moe_expert = Some(expert);
         self
     }
+
+    /// Shared adapters apply to either expert; tagged adapters apply only to their target.
+    pub fn applies_to_expert(&self, expert: MoeExpert) -> bool {
+        self.moe_expert.is_none() || self.moe_expert == Some(expert)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -85,4 +90,69 @@ pub enum AdapterKind {
 pub enum MoeExpert {
     High,
     Low,
+}
+
+/// The adapter application order declared by an expert route. Keep this independent of the
+/// adapter format: reordering a fold can change its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertAdapterOrder {
+    /// Keep the original request order, with shared and expert-specific adapters interleaved.
+    Request,
+    /// Apply the shared stack first, then this expert's stack, keeping order within each group.
+    SharedFirst,
+}
+
+/// Select an expert's adapters without changing strengths or replacing their request-slot
+/// identities. The original slots let install reports correlate with the request even when two
+/// entries name the same file or a route changes their application order.
+pub fn select_expert_adapters(
+    adapters: &[AdapterSpec],
+    expert: MoeExpert,
+    order: ExpertAdapterOrder,
+) -> impl Iterator<Item = (usize, &AdapterSpec)> {
+    let indexed = adapters.iter().enumerate();
+    let request_order = order == ExpertAdapterOrder::Request;
+    indexed
+        .clone()
+        .filter(move |(_, spec)| {
+            if request_order {
+                spec.applies_to_expert(expert)
+            } else {
+                spec.moe_expert.is_none()
+            }
+        })
+        .chain(indexed.filter(move |(_, spec)| !request_order && spec.moe_expert == Some(expert)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expert_adapter_selection_preserves_slots_strengths_and_route_order() {
+        let specs = [
+            AdapterSpec::new("high.safetensors".into(), 0.25, AdapterKind::Lokr)
+                .with_moe_expert(MoeExpert::High),
+            AdapterSpec::new("shared.safetensors".into(), 0.5, AdapterKind::Lora),
+            AdapterSpec::new("low.safetensors".into(), 0.75, AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::Low),
+            AdapterSpec::new("shared.safetensors".into(), -0.0, AdapterKind::Lora),
+        ];
+
+        for (expert, order, expected) in [
+            (MoeExpert::High, ExpertAdapterOrder::Request, [0, 1, 3]),
+            (MoeExpert::Low, ExpertAdapterOrder::Request, [1, 2, 3]),
+            (MoeExpert::High, ExpertAdapterOrder::SharedFirst, [1, 3, 0]),
+            (MoeExpert::Low, ExpertAdapterOrder::SharedFirst, [1, 3, 2]),
+        ] {
+            let selected: Vec<_> = select_expert_adapters(&specs, expert, order).collect();
+            assert_eq!(
+                selected.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+                expected
+            );
+            for (slot, spec) in selected {
+                assert!(std::ptr::eq(spec, &specs[slot]));
+            }
+        }
+    }
 }

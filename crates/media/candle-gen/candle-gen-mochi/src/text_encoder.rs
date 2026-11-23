@@ -3,7 +3,7 @@
 //! Mochi's `MochiPipeline._get_t5_prompt_embeds` runs the T5 encoder **with** the tokenizer padding
 //! mask (`self.text_encoder(input_ids, attention_mask=prompt_attention_mask)`), so padded tokens don't
 //! pollute the real-token embeddings — the same masked path Chroma uses (and unlike FLUX, which runs T5
-//! unmasked). We reuse [`candle_gen_flux::packed_te::PackedT5Encoder`] (t5-v1.1-xxl: 24 blocks, 64×64
+//! unmasked). We reuse [`candle_gen::text_encoder::T5Encoder`] (t5-v1.1-xxl: 24 blocks, 64×64
 //! heads, gated-GELU FFN) through its `forward_masked` seam, feeding an additive key-padding mask built
 //! from the tokenizer's 0/1 mask.
 //!
@@ -22,8 +22,8 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::safetensors_shards::{
     resolve_directory_safetensors_shards, resolve_indexed_safetensors_shards, snapshot_shard_roots,
 };
+use candle_gen::text_encoder::{T5Config, T5Encoder};
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::packed_te::{PackedT5Encoder, T5Config};
 use tokenizers::Tokenizer;
 
 use crate::tokenizer::{EOS_TOKEN_ID, MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
@@ -44,7 +44,7 @@ pub struct MochiTextConditioning {
 
 /// The reused T5-XXL encoder loaded at a fixed compute dtype (bf16 for Mochi).
 pub struct MochiT5 {
-    enc: PackedT5Encoder,
+    enc: T5Encoder,
     dtype: DType,
 }
 
@@ -53,7 +53,7 @@ impl MochiT5 {
     /// [`load_indexed_var_builder`]) at `dtype` — weights **and** activations at `dtype`.
     pub fn load(dir: &Path, dtype: DType, device: &Device) -> Result<Self> {
         let vb = load_indexed_var_builder(dir, dtype, device)?;
-        let enc = PackedT5Encoder::new(&T5Config::xxl(), vb)?;
+        let enc = T5Encoder::new(&T5Config::xxl(), vb)?;
         Ok(Self { enc, dtype })
     }
 
@@ -73,7 +73,7 @@ impl MochiT5 {
     /// identical to the f32 load at bf16's footprint — only the one weight in flight is transient.
     pub fn load_reference_regime(dir: &Path, device: &Device) -> Result<Self> {
         let vb = load_indexed_var_builder(dir, DType::BF16, device)?;
-        let enc = PackedT5Encoder::new(&T5Config::xxl(), vb)?;
+        let enc = T5Encoder::new(&T5Config::xxl(), vb)?;
         Ok(Self {
             enc,
             dtype: DType::F32,

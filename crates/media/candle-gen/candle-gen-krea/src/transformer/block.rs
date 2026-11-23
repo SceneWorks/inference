@@ -12,6 +12,7 @@ use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
 
 use super::rope::apply_interleaved_rope;
+use crate::adapters::PhaseAdapterSelection;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::{BlockLeaf, DitPlan};
 use crate::quant::QLinear;
@@ -293,13 +294,24 @@ impl GatedAttention {
         attention_plan: AttentionPlan<'_>,
         perturb_after_prefix: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_and_phase(x, rope, attention_plan, perturb_after_prefix, None)
+    }
+
+    fn forward_with_attention_and_phase(
+        &self,
+        x: &Tensor,
+        rope: Option<(&Tensor, &Tensor)>,
+        attention_plan: AttentionPlan<'_>,
+        perturb_after_prefix: Option<usize>,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
-        let q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let k = self.k.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v.forward(x)?.reshape((b, s, nkv, hd))?;
-        let gate = self.gate.forward(x)?; // [b, s, hidden]
+        let q = self.q.forward_phase(x, phase)?.reshape((b, s, nh, hd))?;
+        let k = self.k.forward_phase(x, phase)?.reshape((b, s, nkv, hd))?;
+        let v = self.v.forward_phase(x, phase)?.reshape((b, s, nkv, hd))?;
+        let gate = self.gate.forward_phase(x, phase)?; // [b, s, hidden]
 
         let q = self.norm_q.forward(&q)?;
         let k = self.norm_k.forward(&k)?;
@@ -328,7 +340,7 @@ impl GatedAttention {
 
         // Sigmoid gate the attention output, then the shared output projection.
         let gated = (o * sigmoid(&gate)?)?;
-        Ok(self.o.forward(&gated)?)
+        Ok(self.o.forward_phase(&gated, phase)?)
     }
 
     /// Visit the five gated-attention projections under `{prefix}` (`to_q/to_k/to_v/to_gate/to_out.0`) —
@@ -416,8 +428,17 @@ impl SwiGlu {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gated = (self.gate.forward(x)?.silu()? * self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        self.forward_phase(x, None)
+    }
+
+    fn forward_phase(
+        &self,
+        x: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
+        let gated =
+            (self.gate.forward_phase(x, phase)?.silu()? * self.up.forward_phase(x, phase)?)?;
+        self.down.forward_phase(&gated, phase)
     }
 
     /// Visit the three SwiGLU projections under `{prefix}` (`gate/up/down`) — sc-11105.
@@ -525,8 +546,23 @@ impl TextFusionBlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = (x + self.attn.forward(&self.prenorm.forward(x)?, None)?)?;
-        &x + self.mlp.forward(&self.postnorm.forward(&x)?)?
+        self.forward_phase(x, None)
+    }
+
+    fn forward_phase(
+        &self,
+        x: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
+        let attn = into_candle_core(self.attn.forward_with_attention_and_phase(
+            &self.prenorm.forward(x)?,
+            None,
+            plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+            None,
+            phase,
+        ))?;
+        let x = (x + attn)?;
+        &x + self.mlp.forward_phase(&self.postnorm.forward(&x)?, phase)?
     }
 
     /// Visit the block's attention + SwiGLU projections under `{prefix}.attn` / `{prefix}.ff` — sc-11105.
@@ -722,6 +758,28 @@ impl SingleStreamBlock {
         attention_plan: AttentionPlan<'_>,
         perturb_after_prefix: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_and_phase(
+            x,
+            tvec,
+            cos,
+            sin,
+            attention_plan,
+            perturb_after_prefix,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_attention_and_phase(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        perturb_after_prefix: Option<usize>,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> candle_gen::Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -732,11 +790,12 @@ impl SingleStreamBlock {
             .forward(x)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn = self.attn.forward_with_attention_plan_and_pag(
+        let attn = self.attn.forward_with_attention_and_phase(
             &pre,
             Some((cos, sin)),
             attention_plan,
             perturb_after_prefix,
+            phase,
         )?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
@@ -745,7 +804,7 @@ impl SingleStreamBlock {
             .forward(&x)?
             .broadcast_mul(&(postscale + 1.0)?)?
             .broadcast_add(postshift)?;
-        let mlp = self.mlp.forward(&post)?;
+        let mlp = self.mlp.forward_phase(&post, phase)?;
         Ok((&x + mlp.broadcast_mul(postgate)?)?)
     }
 
@@ -875,12 +934,20 @@ impl TextFusionTransformer {
     /// `x`: `[b, n_tokens, num_layers, txt_dim]` (the stacked select-layer hidden states). Returns the
     /// fused conditioning `[b, n_tokens, txt_dim]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_phase(x, None)
+    }
+
+    pub(crate) fn forward_phase(
+        &self,
+        x: &Tensor,
+        phase: Option<&PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
         let (b, n_tok, n_layers, d) = x.dims4()?;
 
         // Layerwise attention: each token's `num_layers` stack is a sequence (batch = b·n_tokens).
         let mut h = x.reshape((b * n_tok, n_layers, d))?;
         for blk in &self.layerwise {
-            h = blk.forward(&h)?;
+            h = blk.forward_phase(&h, phase)?;
         }
 
         // `(b n_tok) n_layers d -> b n_tok d n_layers`, project `num_layers → 1`, drop the axis.
@@ -895,7 +962,7 @@ impl TextFusionTransformer {
 
         // Token-axis refinement.
         for blk in &self.refiner {
-            h = blk.forward(&h)?;
+            h = blk.forward_phase(&h, phase)?;
         }
         Ok(h)
     }

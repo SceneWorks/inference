@@ -300,11 +300,15 @@ class WindowsJob:
         return result
 
     def footprint_bytes(self) -> int:
+        """Keep the counters behind the same conservative, guarded total."""
+        self.last_footprint_details = None
         pids = self.members()
         if not pids:
             raise WindowsJobError("owned Job disappeared during memory sample")
         total = working_peak = private_peak = 0
-        for pid in pids:
+        count = 0
+        readings = []
+        for pid in sorted(pids):
             process = self.kernel.OpenProcess(0x0400 | 0x0010, False, pid)  # QUERY_INFO|VM_READ
             if not process:
                 if pid not in self.members():
@@ -321,6 +325,10 @@ class WindowsJob:
                 total += max(counters.WorkingSetSize, counters.PrivateUsage)
                 working_peak += counters.PeakWorkingSetSize
                 private_peak += counters.PeakPagefileUsage
+                count += 1
+                if len(readings) < 32:
+                    readings.append({"pid": pid, "workingSetBytes": counters.WorkingSetSize,
+                                     "privateUsageBytes": counters.PrivateUsage})
             finally:
                 self.kernel.CloseHandle(process)
         limits = _ExtendedLimits()
@@ -331,6 +339,9 @@ class WindowsJob:
             "owned_process_count": len(pids), "peak_working_set_bytes": working_peak,
             "peak_private_commit_bytes": private_peak, "peak_job_commit_bytes": limits.PeakJobMemoryUsed,
         }
+        self.last_footprint_details = {"processContributionBytes": total,
+                                       "jobPeakMemoryUsedBytes": limits.PeakJobMemoryUsed,
+                                       "sampledProcessCount": count, "processes": readings}
         return max(total, limits.PeakJobMemoryUsed)
 
     def _accounting(self) -> dict[str, int]:

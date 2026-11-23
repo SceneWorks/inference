@@ -1,5 +1,6 @@
 """Weights-free checks for the manual conditional comparison contract."""
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -10,10 +11,43 @@ import unittest
 from unittest.mock import patch
 
 from scripts.ci import flux1_conditional_comparison as comparison
-from scripts.ci.flux1_pair import conditional, conditional_evidence, conditional_probe
+from scripts.ci.flux1_pair import conditional, conditional_evidence, conditional_probe, fixture, overlay
 
 
 class ConditionalComparison(unittest.TestCase):
+    def test_eng4b_uses_both_plans_and_sealed_receipt_inputs(self):
+        pins = json.loads((fixture.HERE / "conditional_eng4b_assets.json").read_text(encoding="utf-8"))
+        policy = json.loads((comparison.ROOT / "docs/evidence/sga-eng-1a/cuda-route-plan.json")
+                            .read_text(encoding="utf-8"))["request"]["policy"]
+        policy["pollMillis"] = 250
+        with patch.object(comparison.proof, "repository_identity",
+                          return_value={"revision": "f" * 40, "tree": "a" * 40}):
+            for case, case_pins in pins["cases"].items():
+                with self.subTest(case=case):
+                    assets = {role: dict(row, path=rf"C:\models\{role}.safetensors")
+                              for role, row in case_pins["assets"].items()}
+                    request = dict(selection="flux1-eng4b-conditional-pair", case=case, assets=assets, policy=policy)
+                    result = comparison.plan("candle-cuda", request, "f" * 40, comparison.ENG4B_PROFILE)
+                    self.assertEqual(result["base"], overlay.ENG4B_BASE)
+                    self.assertEqual(result["base_tree"], overlay.ENG4B_BASE_TREE)
+                    self.assertEqual(result["conditional_pins"], case_pins)
+                    self.assertEqual(result["asset_setup"], "flux1-eng4b-comparison")
+                    self.assertEqual(comparison.phases(result["tier"]),
+                                     ("base-preflight", "head-preflight", "base-run", "head-run"))
+                    self.assertEqual(result["cuda_claim_budget_seconds"], 6035.25)
+                    for arm in ("base", "head"):
+                        source = conditional_probe.generate_source("candle-cuda", arm, case, fixture.ENG4B)
+                        self.assertIn("::load_with_memory_spec(", source)
+                        self.assertIn("FLUX1_CONDITIONAL_PREFLIGHT", source)
+                        self.assertIn("ENG-4b conditional proof requires CUDA", source)
+                    role = next(iter(assets))
+                    assets[role]["sha256"] = "0" * 64
+                    with self.assertRaisesRegex(ValueError, "sealed input"):
+                        comparison.plan("candle-cuda", request, "f" * 40, comparison.ENG4B_PROFILE)
+            self.assertEqual(comparison.phases("tier1"), ("preflight", "base-run", "head-run"))
+            self.assertNotIn("FLUX1_CONDITIONAL_PREFLIGHT",
+                             conditional_probe.generate_source("candle-cuda", "base", "control-pose"))
+
     def test_probe_install_fetches_the_locked_graph_before_offline_steps(self):
         import subprocess
         calls = []
@@ -33,6 +67,18 @@ class ConditionalComparison(unittest.TestCase):
             with patch.object(conditional_probe.subprocess, "run", side_effect=failure):
                 with self.assertRaisesRegex(ValueError, message):
                     conditional_probe.fetch_locked(Path("."), timeout=1)
+
+    def test_wrong_linked_source_tree_refuses_before_overlay(self):
+        expected = {"base": overlay.ENG4B_BASE, "base_tree": overlay.ENG4B_BASE_TREE,
+                    "tier": fixture.ENG4B, "case": "control-pose"}
+        source, work = Path("/source"), Path("/work")
+        wrong = {"revision": expected["base"], "tree": "0" * 40}
+        with patch.object(comparison.base, "add_source_worktree", return_value=wrong) as checkout, \
+                patch.object(conditional_probe, "install") as install:
+            with self.assertRaisesRegex(ValueError, "expected source tree"):
+                comparison.build(work, {"base": source}, "base", "candle-cuda", expected, {})
+            checkout.assert_called_once_with(source, work / "base", expected["base"])
+            install.assert_not_called()
 
     def test_child_caps_are_explicit_per_case(self):
         from types import SimpleNamespace

@@ -144,6 +144,7 @@ pub mod gpu;
 // load the hosted MLX quant tiers (epic 8506) directly — no dense staging, no second artifact
 // matrix. Provider crates' packed-detect loaders build on this.
 pub mod quant;
+pub mod text_encoder;
 
 // Shared per-step latent preview machinery (epic 16948 / sc-16949) — the candle twin of
 // `mlx_gen::preview`. Numbers schedule positions (deduping the repeat a multi-eval solver produces),

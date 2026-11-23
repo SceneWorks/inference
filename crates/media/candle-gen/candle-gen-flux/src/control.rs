@@ -4,7 +4,7 @@
 //! FLUX.1 MMDiT (the checkpoint ships `num_layers = 6` double blocks and `num_single_layers = 0`) that
 //! ingests the VAE-encoded control image (a pose skeleton / canny / depth map — **input-agnostic**, no
 //! discrete mode index in 2.0) and emits one per-block residual, injected into the frozen base 19-layer
-//! double stream at `interval = ceil(19 / 6) = 4` (see [`crate::ip_dit::IpFlux::forward_control`]).
+//! double stream at `interval = ceil(19 / 6) = 4` (see [`crate::transformer::FluxDit::forward_control`]).
 //!
 //! This follows the standard diffusers ControlNet shape: an **independent** mini-transformer with its
 //! own `x_embedder` / `context_embedder` / `time_text_embed` and a zero-init `controlnet_x_embedder`
@@ -13,14 +13,14 @@
 //! for the base transformer to add.
 //!
 //! ## Diffusers vs BFL key layout (why this is a self-contained block)
-//! The candle base FLUX DiT ([`crate::ip_dit::IpFlux`] / the stock `candle-transformers` `Flux`) is the
+//! The candle base FLUX DiT ([`crate::transformer::FluxDit`] / the stock `candle-transformers` `Flux`) is the
 //! **original BFL** key layout (`img_in`/`txt_in`, fused `img_attn.qkv`, single `img_mod`). The Shakker
 //! control checkpoint is the **diffusers** layout (`x_embedder`/`context_embedder`, split `attn.to_q`/
 //! `to_k`/`to_v` + `add_*_proj`, `norm1.linear` AdaLN-Zero, `ff.net.0.proj`). The two are
 //! computationally equivalent but key-incompatible, so the control branch ports the diffusers
-//! `JointBlock` here rather than reusing the BFL `crate::ip_dit` block — matching the mlx port
+//! `JointBlock` here rather than reusing the BFL `crate::transformer` block — matching the mlx port
 //! (where base + control happen to *share* the diffusers block because the mlx base is diffusers-layout
-//! too). The control RoPE is the **same** FLUX RoPE the base uses (`crate::ip_dit::EmbedNd` over
+//! too). The control RoPE is the **same** FLUX RoPE the base uses (`crate::transformer::EmbedNd` over
 //! `cat(txt_ids, img_ids)`), so the residuals align 1:1 with the base image tokens.
 //!
 //! Adapters (LoRA/LoKr) target the **base** transformer only — the control branch is never an adapter
@@ -30,10 +30,10 @@ use candle_core::{DType, Result, Tensor, D};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 
-use crate::ip_dit::{
+use crate::transformer::{
     apply_rope, control_residual_interval, scaled_dot_product_attention,
     scaled_dot_product_attention_planned, timestep_embedding, Config, DitImageInjector, EmbedNd,
-    IpFlux, PreparedConditioning,
+    FluxDit, PreparedConditioning,
 };
 
 /// The diffusers LayerNorm / RMS epsilons (FLUX defaults).
@@ -500,7 +500,7 @@ impl TimeTextEmbed {
 
 /// The FLUX.1 ControlNet control transformer (the trainable branch). Holds its own input projections +
 /// N double blocks + N zero-init residual projections; emits the per-block residuals for the base
-/// transformer ([`IpFlux::forward_control`]).
+/// transformer ([`FluxDit::forward_control`]).
 pub struct FluxControlNet {
     x_embedder: Linear,
     context_embedder: Linear,
@@ -523,18 +523,13 @@ impl FluxControlNet {
     ) -> candle_gen::Result<PreparedConditioning> {
         let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
         let pe = ids.apply(&self.pe_embedder)?;
-        Ok(PreparedConditioning {
-            img_shape: hidden_states.dims().to_vec(),
-            img_ids_shape: img_ids.dims().to_vec(),
-            txt_shape: prompt_embeds.dims().to_vec(),
-            txt_ids_shape: txt_ids.dims().to_vec(),
-            dtype: hidden_states.dtype(),
-            img_ids_dtype: img_ids.dtype(),
-            txt_dtype: prompt_embeds.dtype(),
-            txt_ids_dtype: txt_ids.dtype(),
-            device: hidden_states.device().location(),
+        Ok(PreparedConditioning::from_positions(
+            hidden_states,
+            img_ids,
+            prompt_embeds,
+            txt_ids,
             pe,
-        })
+        ))
     }
 
     /// Load from the Shakker Union-Pro-2.0 checkpoint (standard diffusers layout — un-prefixed keys for
@@ -688,21 +683,21 @@ impl FluxControlNet {
 }
 
 /// The FLUX.1-dev base MMDiT + its Fun-Controlnet-Union control branch (sc-8412). Composes the
-/// parity-proven [`IpFlux`] base with a [`FluxControlNet`]; [`forward`](Self::forward) computes the
+/// parity-proven [`FluxDit`] base with a [`FluxControlNet`]; [`forward`](Self::forward) computes the
 /// control residuals once and threads them (+ an optional identity injector — compose-ready) into the
 /// base double stream.
 pub struct FluxControlTransformer {
-    base: IpFlux,
+    base: FluxDit,
     branch: FluxControlNet,
 }
 
 impl FluxControlTransformer {
-    pub fn new(base: IpFlux, branch: FluxControlNet) -> Self {
+    pub fn new(base: FluxDit, branch: FluxControlNet) -> Self {
         Self { base, branch }
     }
 
     /// Read-only access to the base DiT.
-    pub fn base(&self) -> &IpFlux {
+    pub fn base(&self) -> &FluxDit {
         &self.base
     }
 
@@ -746,7 +741,7 @@ impl FluxControlTransformer {
 
     /// Control forward THAT ALSO threads an optional identity injector (PuLID / XLabs IP-Adapter) — the
     /// **compose-ready** entry. The control residuals are computed once from the branch, then injected
-    /// into the base double stream alongside the injector seam in [`IpFlux::forward_control`]. With
+    /// into the base double stream alongside the injector seam in [`FluxDit::forward_control`]. With
     /// `injector = None` this is the plain control forward.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_composed(

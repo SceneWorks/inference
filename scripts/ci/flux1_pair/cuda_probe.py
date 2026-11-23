@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 
 from scripts.ci.wddm_process_memory import DedicatedSamples, sampled_peak
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
@@ -65,7 +66,7 @@ class RejectedPoolSample(SupervisionError):
 
 
 class PairCudaProbe:
-    def __init__(self, policy, proof_path: Path, *, dedicated_adapter=None):
+    def __init__(self, policy, proof_path: Path, *, dedicated_adapter=None, retain_windows_footprint=False):
         self.policy = policy
         self.proof_path = proof_path
         self.system = SystemProbe(policy)
@@ -77,9 +78,40 @@ class PairCudaProbe:
         self.global_upper_bytes = 0
         self.pool_fallback_peak_bytes = 0
         self.gpu_usage_basis = "owned-process-attributed"
+        self.windows_footprint_peaks = {} if retain_windows_footprint else None
 
     def __getattr__(self, name):
         return getattr(self.system, name)
+
+    def tree_footprint(self, owner):
+        footprint = self.system.tree_footprint(owner)
+        peaks = self.windows_footprint_peaks
+        if peaks is None or footprint is None:
+            return footprint
+        details = self.system.last_windows_footprint_details
+        if details is None:
+            return footprint
+        rows = details["processes"]
+        if len(rows) not in (0, 1) or details["sampledProcessCount"] != len(rows):
+            return footprint
+        # Windows can still read the owned Job's peak if the child exits while opening its PID.
+        counters = [("job_peak", details["jobPeakMemoryUsedBytes"])]
+        if rows:
+            row, = rows
+            if peaks.get("pid", row["pid"]) != row["pid"]:
+                return footprint
+            counters.extend((("working_set", row["workingSetBytes"]), ("private_usage", row["privateUsageBytes"])))
+        if footprint <= 0 or max(value for _, value in counters) != footprint:
+            return footprint
+        if rows:
+            peaks["pid"] = row["pid"]
+            peaks["pid_sample_count"] = peaks.get("pid_sample_count", 0) + 1
+        peaks["sample_count"] = peaks.get("sample_count", 0) + 1
+        at = time.time_ns()
+        for field, value in counters:
+            if field not in peaks or value > peaks[field]["bytes"]:
+                peaks[field] = {"bytes": value, "at_unix_ns": at}
+        return footprint
 
     def gpu_free_and_tree_bytes(self, owner):
         try:

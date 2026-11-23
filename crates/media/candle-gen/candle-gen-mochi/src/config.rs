@@ -10,7 +10,7 @@ use candle_gen::{CandleError, Result};
 
 /// T5-XXL (google/t5-v1.1-xxl) conditioning geometry — identical to the encoder FLUX/Chroma reuse.
 /// The structural constants (24 layers, 64 heads × 64 head-dim → 4096 model dim, gated-GELU FFN) are
-/// baked into [`candle_gen_flux::packed_te::T5Config::xxl`], so this type carries them for
+/// baked into [`candle_gen::text_encoder::T5Config::xxl`], so this type carries them for
 /// documentation + the `text_len` padding policy Mochi's `_get_t5_prompt_embeds` applies
 /// (`max_sequence_length=256`).
 #[derive(Debug, Clone, Copy)]

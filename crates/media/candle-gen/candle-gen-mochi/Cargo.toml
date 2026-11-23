@@ -12,13 +12,6 @@ autotests = false
 [dependencies]
 sceneworks-gen-core-family = { workspace = true }
 candle-gen = { path = "../candle-gen" }
-# Mochi conditions on the same google/t5-v1.1-xxl encoder FLUX reuses; the masked T5 encode is run
-# through the shared `candle_gen_flux::PackedT5Encoder` stack (packed-detect QLinear/QEmbedding → dense
-# bf16 diffusers shards load unchanged), extended here with the tokenizer key-padding mask Mochi's
-# `_get_t5_prompt_embeds` applies. Everything Mochi-specific (learned 3-D RoPE, dual-stream AsymmDiT,
-# linear-quadratic scheduler, AsymmVAE causal-conv decoder) is ported here on candle-core/candle-nn
-# (candle ships no conv3d — see `conv3d`).
-candle-gen-flux = { path = "../candle-gen-flux" }
 # The vendored fast-tokenizer JSON (google t5-v1.1-xxl) is loaded from memory.
 tokenizers = { workspace = true }
 # Read the T5 `model.safetensors.index.json` weight_map (the index-filtered shard load) + `vae/config.json`.
@@ -29,12 +22,11 @@ rand = { workspace = true }
 image = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-flux/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof"]
 default = []
-# Pass the backend selection through to the core crate AND the reused flux stack so a downstream
-# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
-metal = ["candle-gen/metal", "candle-gen-flux/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-flux/cuda"]
+# Forward backend selection to Candle's shared media crate.
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

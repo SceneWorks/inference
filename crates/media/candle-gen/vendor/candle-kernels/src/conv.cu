@@ -141,7 +141,7 @@ __device__ void col2im1d(
   }
 }
 
-template <typename T>
+template <typename T, bool LARGE_GRID>
 __device__ void im2col(
     const size_t dst_numel,
     const size_t h_out,
@@ -155,7 +155,9 @@ __device__ void im2col(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t dst_i = LARGE_GRID
+    ? static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x
+    : blockIdx.x * blockDim.x + threadIdx.x;
   // dst: (b_size, h_out, w_out, c_in, h_k, w_k)
   // src: (b_size, c_in, h_in, w_in)
   if (dst_i >= dst_numel) {
@@ -173,36 +175,42 @@ __device__ void im2col(
   const size_t dst_s1 = w_out * dst_s2;
   const size_t dst_s0 = h_out * dst_s1;
 
-  size_t tmp_dst_i = dst_i;
-  const size_t b_idx = tmp_dst_i / dst_s0;
-  tmp_dst_i -= b_idx * dst_s0;
-  const size_t h_idx = tmp_dst_i / dst_s1;
-  tmp_dst_i -= h_idx * dst_s1;
-  const size_t w_idx = tmp_dst_i / dst_s2;
-  tmp_dst_i -= w_idx * dst_s2;
-  const size_t c_idx = tmp_dst_i / dst_s3;
-  tmp_dst_i -= c_idx * dst_s3;
-  const size_t h_k_idx = tmp_dst_i / dst_s4;
-  tmp_dst_i -= h_k_idx * dst_s4;
-  const size_t w_k_idx = tmp_dst_i;
-  size_t src_h_idx = h_idx * stride + h_k_idx * dilation;
-  size_t src_w_idx = w_idx * stride + w_k_idx * dilation;
-  if (src_h_idx < padding || src_h_idx >= h_in + padding) {
-    dst[dst_i] = static_cast<T>(0);
-  }
-  else if (src_w_idx < padding || src_w_idx >= w_in + padding) {
-    dst[dst_i] = static_cast<T>(0);
-  }
-  else {
-    src_h_idx -= padding;
-    src_w_idx -= padding;
-    const size_t src_i =
-      b_idx * src_s[0]
-      + c_idx * src_s[1]
-      + src_h_idx * src_s[2]
-      + src_w_idx * src_s[3];
-    dst[dst_i] = src[src_i];
-  }
+  const size_t grid_stride = LARGE_GRID
+    ? static_cast<size_t>(gridDim.x) * blockDim.x
+    : 0;
+  do {
+    size_t tmp_dst_i = dst_i;
+    const size_t b_idx = tmp_dst_i / dst_s0;
+    tmp_dst_i -= b_idx * dst_s0;
+    const size_t h_idx = tmp_dst_i / dst_s1;
+    tmp_dst_i -= h_idx * dst_s1;
+    const size_t w_idx = tmp_dst_i / dst_s2;
+    tmp_dst_i -= w_idx * dst_s2;
+    const size_t c_idx = tmp_dst_i / dst_s3;
+    tmp_dst_i -= c_idx * dst_s3;
+    const size_t h_k_idx = tmp_dst_i / dst_s4;
+    tmp_dst_i -= h_k_idx * dst_s4;
+    const size_t w_k_idx = tmp_dst_i;
+    size_t src_h_idx = h_idx * stride + h_k_idx * dilation;
+    size_t src_w_idx = w_idx * stride + w_k_idx * dilation;
+    if (src_h_idx < padding || src_h_idx >= h_in + padding) {
+      dst[dst_i] = static_cast<T>(0);
+    }
+    else if (src_w_idx < padding || src_w_idx >= w_in + padding) {
+      dst[dst_i] = static_cast<T>(0);
+    }
+    else {
+      src_h_idx -= padding;
+      src_w_idx -= padding;
+      const size_t src_i =
+        b_idx * src_s[0]
+        + c_idx * src_s[1]
+        + src_h_idx * src_s[2]
+        + src_w_idx * src_s[3];
+      dst[dst_i] = src[src_i];
+    }
+    dst_i += grid_stride;
+  } while (LARGE_GRID && dst_i < dst_numel);
 }
 
 // Naive implementation of conv2d.
@@ -693,7 +701,7 @@ extern "C" __global__ void FN_NAME(  \
   col2im1d<TYPENAME>(dst_el, l_out, l_in, c_out, k_size, stride, src, dst); \
 } \
 
-#define IM2COL_OP(TYPENAME, FN_NAME) \
+#define IM2COL_ENTRY(TYPENAME, FN_NAME, LARGE_GRID) \
 extern "C" __global__ void FN_NAME(  \
     const size_t dst_numel, \
     const size_t h_out, \
@@ -707,8 +715,12 @@ extern "C" __global__ void FN_NAME(  \
     const TYPENAME *src, \
     TYPENAME *dst \
 ) {  \
-  im2col<TYPENAME>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info, src, dst); \
+  im2col<TYPENAME, LARGE_GRID>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info, src, dst); \
 } \
+
+#define IM2COL_OP(TYPENAME, SUFFIX) \
+IM2COL_ENTRY(TYPENAME, im2col_##SUFFIX, false) \
+IM2COL_ENTRY(TYPENAME, im2col_large_##SUFFIX, true)
 
 #define CONVT1D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
@@ -809,7 +821,7 @@ AVG_POOL2D_OP(__nv_bfloat16, float, avg_pool2d_bf16)
 MAX_POOL2D_OP(__nv_bfloat16, max_pool2d_bf16)
 UPSAMPLE_NEAREST2D_OP(__nv_bfloat16, upsample_nearest2d_bf16)
 UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, upsample_bilinear2d_bf16)
-IM2COL_OP(__nv_bfloat16, im2col_bf16)
+IM2COL_OP(__nv_bfloat16, bf16)
 IM2COL1D_OP(__nv_bfloat16, im2col1d_bf16)
 COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 
@@ -821,7 +833,7 @@ COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 // AVG_POOL2D_OP(__nv_fp8_e4m3, float, avg_pool2d_f8_e5m)
 // MAX_POOL2D_OP(__nv_fp8_e4m3, max_pool2d_f8_e5m)
 // UPSAMPLE_NEAREST2D_OP(__nv_fp8_e4m3, upsample_nearest2d_f8_e5m)
-// IM2COL_OP(__nv_fp8_e4m3, im2col_f8_e5m)
+// IM2COL_OP(__nv_fp8_e4m3, f8_e5m)
 // IM2COL1D_OP(__nv_fp8_e4m3, im2col1d_f8_e5m)
 // COL2IM1D_OP(__nv_fp8_e4m3, col2im1d_f8_e5m)
 #endif
@@ -835,7 +847,7 @@ AVG_POOL2D_OP(__half, float, avg_pool2d_f16)
 MAX_POOL2D_OP(__half, max_pool2d_f16)
 UPSAMPLE_NEAREST2D_OP(__half, upsample_nearest2d_f16)
 UPSAMPLE_BILINEAR2D_OP(__half, upsample_bilinear2d_f16)
-IM2COL_OP(__half, im2col_f16)
+IM2COL_OP(__half, f16)
 IM2COL1D_OP(__half, im2col1d_f16)
 COL2IM1D_OP(__half, col2im1d_f16)
 #endif
@@ -880,10 +892,10 @@ UPSAMPLE_BILINEAR2D_OP(double, upsample_bilinear2d_f64)
 UPSAMPLE_BILINEAR2D_OP(uint8_t, upsample_bilinear2d_u8)
 UPSAMPLE_BILINEAR2D_OP(uint32_t, upsample_bilinear2d_u32)
 
-IM2COL_OP(float, im2col_f32)
-IM2COL_OP(double, im2col_f64)
-IM2COL_OP(uint8_t, im2col_u8)
-IM2COL_OP(uint32_t, im2col_u32)
+IM2COL_OP(float, f32)
+IM2COL_OP(double, f64)
+IM2COL_OP(uint8_t, u8)
+IM2COL_OP(uint32_t, u32)
 
 IM2COL1D_OP(float, im2col1d_f32)
 IM2COL1D_OP(double, im2col1d_f64)

@@ -1,0 +1,87 @@
+// Installed only into each disposable same-job checkout by sga_adapter_comparison.py.
+use mlx_gen::array::contiguous;
+use mlx_gen::weights::Weights;
+use mlx_gen::{AdapterKind, AdapterSpec, MoeExpert};
+use mlx_gen_wan::{merge_wan_adapters, WanModelConfig, WanTransformer};
+use mlx_rs::{transforms::eval, DeviceType, Dtype, Stream};
+use serde_json::{json, Map, Value};
+use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = PathBuf::from(env::var_os("PAIR_SGA_FIXTURE").ok_or("missing staged fixture")?);
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing owned proof output")?);
+    let stream = Stream::task_local_or_default();
+    let device = stream.get_device()?;
+    assert!(matches!(device.get_type()?, DeviceType::Gpu));
+    let device_index = device.get_index()?;
+    assert_eq!(device_index, 0);
+    let mut config = WanModelConfig::wan22_t2v_14b();
+    assert_eq!(
+        (config.dim, config.num_heads, config.text_dim),
+        (5120, 40, 4096)
+    );
+    config.num_layers = 1;
+
+    use MoeExpert::{High, Low};
+    let specs = [
+        ("high", 0.75, Some(High)),
+        ("shared-a", 0.5, None),
+        ("low", -0.625, Some(Low)),
+        ("shared-b", 1.25, None),
+    ]
+    .map(|(name, scale, expert)| AdapterSpec {
+        path: fixture.join(format!("{name}.safetensors")),
+        kind: AdapterKind::Lora,
+        scale,
+        pass_scales: None,
+        moe_expert: expert,
+    });
+
+    let input = Weights::from_file(fixture.join("inputs.safetensors"))?;
+    let latent = input.require("latent")?.as_dtype(Dtype::Float32)?;
+    let text = input.require("text")?;
+    assert_eq!(latent.shape(), [16, 2, 4, 6]);
+    assert_eq!(text.shape(), [64, 4096]);
+    eval([&latent, text])?;
+    let mut order = Map::new();
+    let mut applied = Map::new();
+    let mut velocity = Map::new();
+    for (name, expert) in [("bare", None), ("high", Some(High)), ("low", Some(Low))] {
+        let mut weights = Weights::from_file(fixture.join("transformer.safetensors"))?;
+        if let Some(expert) = expert {
+            let report = merge_wan_adapters(&mut weights, &specs, expert)?;
+            assert_eq!((report.applied, report.applicable), (3, 3));
+            assert!(report.skipped.is_empty());
+            let slots: Vec<_> = report.per_spec.iter().map(|spec| spec.spec_index).collect();
+            let counts: Vec<_> = report.per_spec.iter().map(|spec| spec.applied).collect();
+            order.insert(name.to_string(), json!(slots));
+            applied.insert(name.to_string(), json!(counts));
+        }
+        let dit = WanTransformer::from_weights(&weights, &config)?;
+        let prepared = dit.embed_text(text)?;
+        let output = contiguous(&dit.forward(&latent, 900.0, &prepared)?)?;
+        assert_eq!(output.shape(), latent.shape());
+        assert_eq!(output.dtype(), Dtype::Float32);
+        eval([&output])?;
+        let actual = Stream::task_local_or_default().get_device()?;
+        assert!(matches!(actual.get_type()?, DeviceType::Gpu));
+        assert_eq!(actual.get_index()?, device_index);
+        let bits: Vec<_> = output
+            .as_slice::<f32>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        velocity.insert(name.to_string(), json!(bits));
+    }
+    let result: Value = json!({"device": {"kind": "mlx-metal", "index": device_index},
+                              "shape": latent.shape(), "order": order,
+                              "applied": applied, "velocity_bits": velocity});
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(&mut file, &result)?;
+    file.flush()?;
+    println!("SGA_ADAPTER_TIER1_BODY wan-a14b-t2v-dense-fold");
+    Ok(())
+}

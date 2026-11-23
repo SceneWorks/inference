@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import struct
 import subprocess
 import sys
@@ -22,8 +23,9 @@ from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejec
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = overlay.BASE
+BASE_TREE = "97568d541e94ac4ff5e7572b5d22a8ea2a671936"
 LANES = base.LANES
-PHASES = ("preflight", "base-run", "head-run")
+ENG4B_PROFILE = "eng4b-conditional-tier1"
 GIB = 1024**3
 MAX_DEADLINE_SECONDS = 1200
 # Explicit per-case child caps. Every case shares the frozen 24 GiB host-footprint / 18 GiB CUDA
@@ -79,14 +81,29 @@ def case_caps(backend, case, policy):
 
 
 def plan(backend, value, head, tier):
-    if tier != "conditional-tier1" or backend not in LANES or head == BASE:
+    eng4b = tier == ENG4B_PROFILE
+    baseline = overlay.ENG4B_BASE if eng4b else BASE
+    if tier not in ("conditional-tier1", ENG4B_PROFILE) or backend not in LANES or head == baseline:
         raise ValueError("select a distinct head and a conditional Tier 1 backend")
+    if eng4b and backend != "candle-cuda":
+        raise ValueError("ENG-4b conditional comparison requires Candle CUDA")
+    selection = "flux1-eng4b-conditional-pair" if eng4b else "flux1-conditional-pair"
     if type(value) is not dict or set(value) != ({"selection", "case", "assets", "policy"}
-            | ({"runner"} if backend == "mlx" else set())) or value["selection"] != "flux1-conditional-pair":
+            | ({"runner"} if backend == "mlx" else set())) or value["selection"] != selection:
         raise ValueError("comparison needs exact conditional selection, case, assets and policy")
     if backend == "mlx" and value.get("runner") != "nax":
         raise ValueError("conditional MLX proof needs the secondary runner")
     variant, assets = conditional.case_metadata(value["case"], backend, value["assets"])
+    bindings = {}
+    if eng4b:
+        pins = json.loads((fixture.HERE / "conditional_eng4b_assets.json").read_text(encoding="utf-8"))
+        case_pins = pins["cases"].get(value["case"])
+        if case_pins is None:
+            raise ValueError("ENG-4b conditional case must have archived pinned input evidence")
+        if {role: {key: row[key] for key in ("revision", "sha256")} for role, row in assets.items()} != case_pins["assets"]:
+            raise ValueError("ENG-4b conditional assets differ from the sealed input revisions or hashes")
+        bindings = {"base_tree": overlay.ENG4B_BASE_TREE, "conditional_pins": case_pins,
+                    "fixture_inventory_sha256": pins["dev_fixture_inventory_sha256"]}
     if value["policy"]["backend"] != proof.POLICY_BACKENDS[backend]:
         raise ValueError("resource policy differs from conditional lane")
     with TemporaryDirectory() as tmp:
@@ -98,31 +115,57 @@ def plan(backend, value, head, tier):
     fixture.geometry(variant)
     case = value["case"]
     request = dict(value, assets=assets)
-    return {"runner": LANES[backend], "asset_setup": "flux1-comparison", "backend": backend,
-            "base": BASE, "head": source["revision"], "head_tree": source["tree"],
-            "tier": "tier1", "case": case, "variant": variant, "request": request,
+    settings = dict(evidence.SETTINGS, case=case, variant=variant,
+                    guidance=3.5 if variant == "dev" else None)
+    revision_provenance = "caller-declared repository/model revision; SHA-256 of staged bytes is authoritative"
+    if eng4b:
+        settings["execution"] = "both arms compile and use the same plan"
+        revision_provenance = "accepted historical receipt and exact staged SHA-256"
+    return {"runner": LANES[backend], "asset_setup": "flux1-eng4b-comparison" if eng4b else "flux1-comparison",
+            "backend": backend, "base": baseline, "head": source["revision"], "head_tree": source["tree"],
+            "tier": fixture.ENG4B if eng4b else "tier1", "case": case, "variant": variant, "request": request,
             "geometry_sha256": fixture.sha(fixture.HERE / "geometry.tsv"),
             "reference_sha256": conditional.REFERENCE_SHA256,
-            "asset_revision_provenance": "caller-declared repository/model revision; SHA-256 of staged bytes is authoritative",
-            "settings": dict(evidence.SETTINGS, case=case, variant=variant,
-                             guidance=3.5 if variant == "dev" else None),
+            "asset_revision_provenance": revision_provenance, "settings": settings,
             "tolerance": {"class": "AP13(a)", "states": "bit-exact", "events": "exact",
                           "rgb8": "bit-exact", "provenance": "SGA implementation plan §7.3; no adjustable limit"},
-            "child_caps": caps,
-            "cuda_claim_budget_seconds": cuda_claim_budget(policy)[0] if backend == "candle-cuda" else None}
+            "child_caps": caps, **bindings,
+            "cuda_claim_budget_seconds": cuda_claim_budget(policy, fixture.ENG4B if eng4b else "tier1")[0]
+            if backend == "candle-cuda" else None}
 
 
-def build(work, sources, arm, backend, case, env):
+def preflight_sites(tier):
+    return ((("base", "base-preflight"), ("head", "head-preflight")) if tier == fixture.ENG4B
+            else (("head", "preflight"),))
+
+
+def phases(tier):
+    return tuple(label for _, label in preflight_sites(tier)) + ("base-run", "head-run")
+
+
+def expected_source(contract, arm):
+    tree = contract.get("base_tree", BASE_TREE) if arm == "base" else contract["head_tree"]
+    return {"revision": contract[arm], "tree": tree}
+
+
+def build(work, sources, arm, backend, contract, env):
     root = work / arm
-    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(sources[arm]), str(root)], check=True)
-    sha = base.git(sources[arm], "rev-parse", "HEAD")
-    subprocess.run(["git", "checkout", "--quiet", "--detach", sha], cwd=root, check=True)
-    if base.git(root, "rev-parse", "HEAD") != sha:
-        raise ValueError("conditional source revision changed")
-    package = conditional_probe.install(root, backend, arm, "tier1", case)
+    expected = expected_source(contract, arm)
+    source = base.add_source_worktree(sources[arm], root, expected["revision"])
+    if source != expected:
+        raise ValueError("conditional checkout does not match the expected source tree")
+    package = conditional_probe.install(root, backend, arm, contract["tier"], contract["case"])
     family = "mlx-gen" if backend == "mlx" else "candle-gen"
     path = f"crates/media/{family}/{package}/src/bin/flux1-pair.rs"
     base.git(root, "add", "-N", path)
+    if contract["tier"] == fixture.ENG4B:
+        common = "crates/media/candle-gen/"
+        text = "candle-gen-flux/src/packed_te.rs" if arm == "base" else "candle-gen/src/text_encoder.rs"
+        required = {path, common + text, common + "candle-gen/src/sampler.rs",
+                    f"crates/media/{family}/{package}/Cargo.toml"}
+        changed = set(base.git(root, "diff", "--name-only", "HEAD").splitlines())
+        if not required <= changed <= required | {"Cargo.lock"}:
+            raise ValueError("conditional ENG-4b overlay did not bind the expected source paths")
     delta = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=root)
     tc = proof.verified_toolchain(env, root=root)
     target = work / (arm + "-target")
@@ -132,22 +175,21 @@ def build(work, sources, arm, backend, case, env):
         command += ["--features", "cuda"]
     subprocess.run(command, env=env, cwd=root, check=True)
     binary = target / "debug" / ("flux1-pair.exe" if os.name == "nt" else "flux1-pair")
-    return binary, {"revision": sha, "tree": base.git(root, "rev-parse", "HEAD^{tree}"),
-                    "overlay_sha256": hashlib.sha256(delta).hexdigest(), "toolchain": tc,
+    return binary, {**source, "overlay_sha256": hashlib.sha256(delta).hexdigest(), "toolchain": tc,
                     "binary_sha256": fixture.sha(binary), "build_command": command,
                     "macos_deployment_target": env.get("MACOSX_DEPLOYMENT_TARGET") if backend == "mlx" else None}
 
 
-def cuda_claim_budget(policy):
+def cuda_claim_budget(policy, tier="tier1"):
     reserve = base.RELEASE_RESERVE_SECONDS + policy.term_grace_millis / 1000 + policy.poll_millis / 1000
-    return (len(PHASES) + 1) * policy.deadline_seconds + reserve, reserve
+    return (len(phases(tier)) + 1) * policy.deadline_seconds + reserve, reserve
 
 
 def retain_logs(work, artifact, receipt):
     errors = []
-    for phase in PHASES:
+    for phase in phases(receipt["tier"]):
         limits = base.retained_log_limits(receipt["request"]["policy"])
-        if receipt["request"]["policy"]["backend"] == "windows-cuda" and phase != "preflight":
+        if receipt["request"]["policy"]["backend"] == "windows-cuda" and phase.endswith("-run"):
             limits["cuda-pool.json"] = 4096
         for suffix, cap in limits.items():
             source = work / phase / suffix
@@ -164,8 +206,16 @@ def retain_logs(work, artifact, receipt):
     return errors
 
 
+def verify_pinned_inputs(receipt, contract):
+    files = json.dumps(receipt["fixture"]["files"], sort_keys=True, separators=(",", ":")).encode()
+    if (hashlib.sha256(files).hexdigest() != contract["fixture_inventory_sha256"]
+            or receipt["source"]["sha256"] != contract["conditional_pins"]["source_sha256"]):
+        raise ValueError("ENG-4b fixture or source image differs from the sealed input bytes")
+
+
 def execute(args, contract):
     backend, case, variant = args.backend, contract["case"], contract["variant"]
+    eng4b = contract["tier"] == fixture.ENG4B
     proof.require_host(backend, dict(os.environ), "nax" if backend == "mlx" else "hosted")
     tmp = Path(os.environ["RUNNER_TEMP"])
     artifact = proof.owned_output(args.output, tmp)
@@ -174,15 +224,15 @@ def execute(args, contract):
                "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "host": platform.platform(),
                "runner_name": os.environ["RUNNER_NAME"], "arms": {}, "logs": {}}
     work = tmp / f"f1c-{receipt['run_id']}-{receipt['run_attempt']}"
+    sources = {"head": ROOT, "base": ROOT / "flux1-baseline"}
     created_work = False
     primary_error = None
     try:
         proof.unlinked_path(work, tmp)
         work.mkdir()
         created_work = True
-        sources = {"head": ROOT, "base": ROOT / "flux1-baseline"}
-        if base.git(sources["base"], "rev-parse", "HEAD") != BASE:
-            raise ValueError("conditional baseline is not the pre-migration engine")
+        if base.git(sources["base"], "rev-parse", "HEAD") != contract["base"]:
+            raise ValueError("conditional baseline is not the profile's reviewed engine")
         staged, receipt["assets"] = conditional.prepare_assets(work, ROOT, contract["request"]["assets"])
         if case.startswith("control-"):
             source_path, source_sha = conditional.write_control_source(work, case)
@@ -193,6 +243,8 @@ def execute(args, contract):
         snapshot = work / ("random-" + variant)
         fixture.make_snapshot(snapshot, variant)
         receipt["fixture"] = fixture.snapshot_identity(snapshot, variant, "tier1")
+        if eng4b:
+            verify_pinned_inputs(receipt, contract)
         policy_path = work / "policy.json"
         base.write(policy_path, contract["request"]["policy"])
         policy = load_policy(policy_path)
@@ -206,7 +258,7 @@ def execute(args, contract):
                 env["MACOSX_DEPLOYMENT_TARGET"] = "26.2"
             else:
                 env.update(CUDA_VISIBLE_DEVICES=policy.cuda_device_uuid, CUDA_DEVICE_ORDER="PCI_BUS_ID")
-            binary, info = build(work, sources, arm, backend, case, env)
+            binary, info = build(work, sources, arm, backend, contract, env)
             exes[arm], environments[arm] = binary, env
             receipt["arms"][arm] = {"build": info, "renders": {}}
         receipt["allocator"] = {"scope": "fresh process per revision/case on the same physical device",
@@ -218,7 +270,7 @@ def execute(args, contract):
         claim_policy = policy
         claim_deadline = last_child_start = None
         if backend == "candle-cuda":
-            budget, reserve = cuda_claim_budget(policy)
+            budget, reserve = cuda_claim_budget(policy, contract["tier"])
             base.write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
             claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
@@ -231,23 +283,28 @@ def execute(args, contract):
                       "PAIR_SOURCE": str(source_path)}
             if "pid_gemma" in receipt["assets"]:
                 shared["PAIR_PID_GEMMA"] = receipt["assets"]["pid_gemma"]["staged"]
-            preflight = work / "preflight"
-            env = dict(environments["head"], **shared)
-            _, stdout = base.invoke(exes["head"], work / "head", preflight, env, policy, lease_env,
-                                    preflight=True, last_child_start=last_child_start)
-            plan_data = json.loads((preflight / "plan.json").read_text(encoding="utf-8"))
-            evidence.validate_plan(plan_data, case, backend)
-            if stdout.splitlines().count("FLUX1_CONDITIONAL_PREFLIGHT " + case) != 1:
-                raise ValueError("missing conditional pre-load preflight")
-            receipt["preflight"] = plan_data
+            plans = {}
+            for arm, label in preflight_sites(contract["tier"]):
+                preflight = work / label
+                env = dict(environments[arm], **shared)
+                _, stdout = base.invoke(exes[arm], work / arm, preflight, env, policy, lease_env,
+                                        preflight=True, last_child_start=last_child_start)
+                plan_data = json.loads((preflight / "plan.json").read_text(encoding="utf-8"))
+                evidence.validate_plan(plan_data, case, backend)
+                if stdout.splitlines().count("FLUX1_CONDITIONAL_PREFLIGHT " + case) != 1:
+                    raise ValueError("missing conditional pre-load preflight")
+                plans[arm] = plan_data
+            if eng4b and plans["base"] != plans["head"]:
+                raise ValueError("ENG-4b conditional base and head plans differ")
+            receipt["preflight"] = plans if eng4b else plans["head"]
             base.write(artifact / "receipt.json", receipt)
             for arm in evidence.ARMS:
                 out = work / (arm + "-run")
                 env = dict(environments[arm], **shared)
                 guard, stdout = base.invoke(exes[arm], work / arm, out, env, policy, lease_env,
                                             last_child_start=last_child_start)
-                observed = evidence.read_arm(out, stdout, arm, case, backend, artifact)
-                if arm == "head" and observed["planned_route"] != plan_data:
+                observed = evidence.read_arm(out, stdout, arm, case, backend, artifact, planned=arm in plans)
+                if arm in plans and observed["planned_route"] != plans[arm]:
                     raise ValueError("conditional render plan differs from preflight")
                 receipt["arms"][arm]["renders"][case] = dict(observed, guard=asdict(guard))
             evidence.compare(*(receipt["arms"][arm]["renders"][case] for arm in evidence.ARMS))
@@ -281,8 +338,9 @@ def execute(args, contract):
         base.write(artifact / "receipt.json", receipt)
         if created_work:
             try:
+                base.remove_source_worktrees(work, sources)
                 base.remove_work(work, tmp)
-            except (OSError, ValueError) as cleanup_error:
+            except (OSError, ValueError, subprocess.SubprocessError) as cleanup_error:
                 receipt["cleanup_failure"] = str(cleanup_error)
                 receipt["accepted"] = False
                 base.write(artifact / "receipt.json", receipt)
@@ -321,11 +379,24 @@ def verify(args, contract):
         if (actual_assets["reference_image"].get("sha256") != conditional.REFERENCE_SHA256
                 or actual_assets["reference_image"].get("staging") != "copy"):
             raise ValueError("conditional receipt lost reference provenance")
-        evidence.validate_plan(receipt["preflight"], contract["case"], contract["backend"])
-        if receipt["arms"]["head"]["renders"][contract["case"]]["planned_route"] != receipt["preflight"]:
-            raise ValueError("conditional receipt preflight and render plans differ")
+        eng4b = contract["tier"] == fixture.ENG4B
+        plans = receipt["preflight"] if eng4b else {"head": receipt["preflight"]}
+        if eng4b:
+            verify_pinned_inputs(receipt, contract)
+            if plans.keys() != set(evidence.ARMS) or plans["base"] != plans["head"]:
+                raise ValueError("ENG-4b conditional receipt lacks equivalent planned arms")
+        for arm, _ in preflight_sites(contract["tier"]):
+            evidence.validate_plan(plans[arm], contract["case"], contract["backend"])
+            if receipt["arms"][arm]["renders"][contract["case"]]["planned_route"] != plans[arm]:
+                raise ValueError("conditional receipt preflight and render plans differ")
+        for arm in evidence.ARMS:
+            build = receipt["arms"][arm]["build"]
+            if (any(build[key] != value for key, value in expected_source(contract, arm).items())
+                    or not all(re.fullmatch(r"[0-9a-f]{64}", build[key])
+                               for key in ("overlay_sha256", "binary_sha256"))):
+                raise ValueError("conditional receipt source, overlay or executable identity mismatch")
     allowed = {"receipt.json"}
-    limits = {phase + "." + suffix: cap for phase in PHASES
+    limits = {phase + "." + suffix: cap for phase in phases(contract["tier"])
               for suffix, cap in base.retained_log_limits(contract["request"]["policy"]).items()}
     if contract["request"]["policy"]["backend"] == "windows-cuda":
         limits.update({phase + ".cuda-pool.json": 4096 for phase in ("base-run", "head-run")})
@@ -338,7 +409,7 @@ def verify(args, contract):
                 or log.stat().st_size != item["bytes"] or fixture.sha(log) != item["sha256"]):
             raise ValueError("invalid conditional log: " + name)
         allowed.add(name)
-    required = {phase + "." + suffix for phase in PHASES
+    required = {phase + "." + suffix for phase in phases(contract["tier"])
                 for suffix in ("stdout.log", "stderr.log", "supervisor.json")}
     if contract["request"]["policy"]["backend"] == "windows-cuda":
         required.update(phase + ".cuda-pool.json" for phase in ("base-run", "head-run"))

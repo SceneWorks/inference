@@ -84,6 +84,7 @@ impl StreamPrep {
 impl Stream {
     /// `latent` `(B, S, in)`, per-token `timestep` `(B, S)`, text `context`, `positions` grid.
     /// Reproduces `TransformerArgsPreprocessor.prepare` + the multimodal cross-PE / cross-timesteps.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         &self,
         latent: &Array,
@@ -92,12 +93,15 @@ impl Stream {
         positions: &Array,
         keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<StreamPrep> {
         let dt = self.prec.dtype();
         let b = latent.shape()[0];
         let (inner, coeff) = (self.inner, self.coeff);
 
-        let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
+        let x = self
+            .patchify
+            .forward_with_scales(&latent.as_dtype(dt)?, adapter_scales)?;
         // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only;
         // `self.keyframes_embedding` is always `None` for the audio stream). The DFR token loops
         // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
@@ -108,7 +112,7 @@ impl Stream {
         // video-only path's note — bf16 must round `bf16(σ·1000)` first).
         let mult = scalar(self.ts_mult as f32).as_dtype(timestep.dtype())?;
         let ts_flat = multiply(timestep, &mult)?.reshape(&[-1])?;
-        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt)?;
+        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt, adapter_scales)?;
         let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
         let emb_ts = emb_ts.reshape(&[b, -1, inner])?;
 
@@ -119,17 +123,19 @@ impl Stream {
             timestep.clone()
         };
         let src = multiply(&src, &mult)?.reshape(&[-1])?;
-        let (pts, _) = self.prompt_adaln.forward(&src, dt)?;
+        let (pts, _) = self.prompt_adaln.forward(&src, dt, adapter_scales)?;
         let prompt_ts = pts.reshape(&[b, -1, 2 * inner])?;
 
         // Cross-modal scale-shift (4·dim) + gate (1·dim) timesteps. The gate timestep carries the
         // extra `av_ca_factor = av_ca_ts_mult / ts_mult` (1.0 for 2.3, an exact f32 no-op).
-        let (cross_ss, _) = self.cross_ss_adaln.forward(&ts_flat, dt)?;
+        let (cross_ss, _) = self.cross_ss_adaln.forward(&ts_flat, dt, adapter_scales)?;
         let cross_ss_ts = cross_ss.reshape(&[b, -1, 4 * inner])?;
         let factor =
             scalar(self.av_ca_ts_mult as f32 / self.ts_mult as f32).as_dtype(ts_flat.dtype())?;
         let gate_in = multiply(&ts_flat, &factor)?;
-        let (cross_gate, _) = self.cross_gate_adaln.forward(&gate_in, dt)?;
+        let (cross_gate, _) = self
+            .cross_gate_adaln
+            .forward(&gate_in, dt, adapter_scales)?;
         let cross_gate_ts = cross_gate.reshape(&[b, -1, inner])?;
 
         // caption_projection = Identity (2.3): context enters cross-attn as-is.
@@ -180,14 +186,20 @@ impl Stream {
 
     /// Output head (LayerNorm-affine-false → final 2-row scale-shift → proj_out). Mirrors
     /// `LTXModel._process_output`.
-    pub(super) fn output_head(&self, h: &Array, emb_ts: &Array) -> Result<Array> {
+    pub(super) fn output_head(
+        &self,
+        h: &Array,
+        emb_ts: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
         let b = h.shape()[0];
         let table = self.scale_shift_table.reshape(&[1, 1, 2, self.inner])?;
         let ss = add(&table, &emb_ts.reshape(&[b, -1, 1, self.inner])?)?;
         let shift = ss.index_axis(0, 2)?;
         let scale = ss.index_axis(1, 2)?;
         let normed = layer_norm(h, None, None, self.eps)?;
-        self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
+        self.proj_out
+            .forward_with_scales(&modulate(&normed, &scale, &shift)?, adapter_scales)
     }
 
     /// Select the active denoise pass for this stream's LoRA-targetable Linears (the patchify/out
@@ -402,12 +414,20 @@ impl AvBlock {
         pst: &Array,
         a: &StreamArgs,
         run_self: bool,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<Array> {
         let mut x = x.clone();
         if run_self {
             let msa = ada_values(sst, a.ts_emb, 0, 3)?;
             let norm = modulate(&rms_norm_noweight(&x, self.eps)?, &msa[1], &msa[0])?;
-            let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
+            let attn = attn1.forward(
+                &norm,
+                None,
+                None,
+                Some((a.cos, a.sin)),
+                None,
+                adapter_scales,
+            )?;
             x = gated(&x, &attn, &msa[2])?;
         }
 
@@ -416,7 +436,7 @@ impl AvBlock {
 
         let ca = ada_values(sst, a.ts_emb, 6, 9)?;
         let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = attn2.forward(&norm_ca, Some(&context), a.mask, None, None)?;
+        let cross = attn2.forward(&norm_ca, Some(&context), a.mask, None, None, adapter_scales)?;
         x = gated(&x, &cross, &ca[2])?;
         Ok(x)
     }
@@ -428,10 +448,11 @@ impl AvBlock {
         ff: &FeedForward,
         sst: &Array,
         ts_emb: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<Array> {
         let mlp = ada_values(sst, ts_emb, 3, 6)?;
         let norm = modulate(&rms_norm_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
-        let ff_out = ff.forward(&norm)?;
+        let ff_out = ff.forward_with_scales(&norm, adapter_scales)?;
         gated(x, &ff_out, &mlp[2])
     }
 
@@ -444,6 +465,7 @@ impl AvBlock {
         v: &StreamArgs,
         a: &StreamArgs,
         control: AvAttentionPlan,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<(Array, Array)> {
         // Video / audio self-attention + text cross-attention.
         let mut vx = self.self_and_text(
@@ -454,6 +476,7 @@ impl AvBlock {
             &self.v_pst,
             v,
             control.run_self,
+            adapter_scales,
         )?;
         let mut ax = self.self_and_text(
             ax,
@@ -463,6 +486,7 @@ impl AvBlock {
             &self.a_pst,
             a,
             control.run_self,
+            adapter_scales,
         )?;
 
         if control.run_cross_modal {
@@ -489,6 +513,7 @@ impl AvBlock {
                 None,
                 Some((v.cross_cos, v.cross_sin)),
                 Some((a.cross_cos, a.cross_sin)),
+                adapter_scales,
             )?;
             vx = gated(&vx, &a2v, &gate_a2v)?;
 
@@ -499,13 +524,14 @@ impl AvBlock {
                 None,
                 Some((a.cross_cos, a.cross_sin)),
                 Some((v.cross_cos, v.cross_sin)),
+                adapter_scales,
             )?;
             ax = gated(&ax, &v2a, &gate_v2a)?;
         }
 
         // FeedForward.
-        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
-        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
+        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb, adapter_scales)?;
+        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb, adapter_scales)?;
         Ok((vx, ax))
     }
 
@@ -518,6 +544,7 @@ impl AvBlock {
         vx: &Array,
         v: &StreamArgs,
         run_self: bool,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<Array> {
         let vx = self.self_and_text(
             vx,
@@ -527,13 +554,19 @@ impl AvBlock {
             &self.v_pst,
             v,
             run_self,
+            adapter_scales,
         )?;
-        self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
+        self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb, adapter_scales)
     }
 
     /// Audio-only sibling of [`Self::forward_video_only_controlled`]. With no video modality the cross-modal
     /// attentions are absent, while audio self/text attention and audio FF remain executable.
-    pub(super) fn forward_audio_only(&self, ax: &Array, a: &StreamArgs) -> Result<Array> {
+    pub(super) fn forward_audio_only(
+        &self,
+        ax: &Array,
+        a: &StreamArgs,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
         let ax = self.self_and_text(
             ax,
             &self.a_attn1,
@@ -542,8 +575,9 @@ impl AvBlock {
             &self.a_pst,
             a,
             true,
+            adapter_scales,
         )?;
-        self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)
+        self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb, adapter_scales)
     }
 
     /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and

@@ -44,7 +44,12 @@ ROUTES = {
     "supra2": ("dit:candle_gen::Weights::from_file(", "dit:w.linear("),
     "svd": ("lib:mmap_var_builder(", "transformer:linear_no_bias("),
     "wan": ("text_encode:mmap_var_builder(", "quant:AdaptLinear as QLinear"),
-    "z_image": ("comfyui:remap_file_var_builder(", "quant:candle_gen::quant::QLinear"),
+    "z_image": (
+        "comfyui:remap_file_var_builder(",
+        "dit:Execution::Inference => AdaptLinear::linear_detect(",
+        "text_encoder:Self::Dense => QLinear::linear_no_bias(",
+        "text_encoder:Self::DetectPacked => QLinear::linear_detect(",
+    ),
 }
 
 # These library APIs are composed by other registered routes or by the product worker itself.

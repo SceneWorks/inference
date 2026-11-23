@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::{select_expert_adapters, ExpertAdapterOrder};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
@@ -87,12 +88,9 @@ struct ExpertComponents {
     low: Arc<WanVaceTransformer>,
 }
 
-#[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
 fn selected_adapters(adapters: &[AdapterSpec], expert: MoeExpert) -> Vec<AdapterSpec> {
-    adapters
-        .iter()
-        .filter(|adapter| adapter.moe_expert.map_or(true, |target| target == expert))
-        .cloned()
+    select_expert_adapters(adapters, expert, ExpertAdapterOrder::Request)
+        .map(|(_, spec)| spec.clone())
         .collect()
 }
 
@@ -1136,17 +1134,12 @@ mod tests {
             .with_moe_expert(MoeExpert::High);
         let low = AdapterSpec::new("low.safetensors".into(), 1.0, AdapterKind::Lora)
             .with_moe_expert(MoeExpert::Low);
-        let adapters = vec![shared, high, low];
-        let high = selected_adapters(&adapters, MoeExpert::High);
-        let low = selected_adapters(&adapters, MoeExpert::Low);
-        assert_eq!(high.len(), 2);
-        assert_eq!(low.len(), 2);
-        assert!(high
-            .iter()
-            .any(|adapter| adapter.moe_expert == Some(MoeExpert::High)));
-        assert!(low
-            .iter()
-            .any(|adapter| adapter.moe_expert == Some(MoeExpert::Low)));
+        let adapters = [high.clone(), shared.clone(), low.clone()];
+        assert_eq!(
+            selected_adapters(&adapters, MoeExpert::High),
+            [high, shared.clone()]
+        );
+        assert_eq!(selected_adapters(&adapters, MoeExpert::Low), [shared, low]);
     }
 
     struct LiveExperts {

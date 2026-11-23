@@ -2,7 +2,7 @@
 //! conditioned/native joint denoise, latent token flatten/unflatten, and frames → `gen_core::Image`.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::{AudioTrack, Image, Progress};
+use candle_gen::gen_core::{phase::ScaleContext, AudioTrack, Image, Progress};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -16,6 +16,10 @@ use crate::{
     params::GuiderParams,
     transformer::{AvDiT, AvPerturbation},
 };
+
+pub(crate) const BASE_DENOISE_SCALES: ScaleContext<'static> = ScaleContext::new();
+pub(crate) const REFINEMENT_DENOISE_SCALES: ScaleContext<'static> =
+    ScaleContext::new().with_pass(1);
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`: temporal `(F-1)/8 + 1`, spatial
 /// `/32`.
@@ -94,16 +98,16 @@ impl TwoStageOrchestration {
         &mut self,
         has_stage1_keyframes: bool,
         has_clips: bool,
-        set_adapter_pass: impl FnOnce(usize),
-    ) -> TwoStageSeeds {
+    ) -> (TwoStageSeeds, ScaleContext<'static>) {
         assert_eq!(
             self.phase,
             StagePhase::Start,
             "stage one may begin only once"
         );
         self.phase = StagePhase::Stage1;
-        set_adapter_pass(0);
-        self.operations.push(StageOperation::AdapterPass(0));
+        let scales = BASE_DENOISE_SCALES;
+        self.operations
+            .push(StageOperation::AdapterPass(scales.pass));
         self.operations
             .push(StageOperation::Stage1Noise(self.seeds));
         if has_stage1_keyframes {
@@ -112,7 +116,7 @@ impl TwoStageOrchestration {
         if has_clips {
             self.operations.push(StageOperation::ClipsStage1);
         }
-        self.seeds
+        (self.seeds, scales)
     }
 
     /// Execute the learned component as the stage boundary. This is a real
@@ -137,20 +141,20 @@ impl TwoStageOrchestration {
         &mut self,
         sigma: f32,
         op: impl FnOnce() -> candle_gen::Result<T>,
-        set_adapter_pass: impl FnOnce(usize),
-    ) -> candle_gen::Result<T> {
+    ) -> candle_gen::Result<(T, ScaleContext<'static>)> {
         if self.phase != StagePhase::Upsampled {
             return Err(candle_gen::CandleError::Msg(
                 "ltx two-stage: stage-two re-noise requires learned upsample output".into(),
             ));
         }
         let result = op()?;
-        set_adapter_pass(1);
+        let scales = REFINEMENT_DENOISE_SCALES;
         self.operations
             .push(StageOperation::Stage2Renoise { sigma });
-        self.operations.push(StageOperation::AdapterPass(1));
+        self.operations
+            .push(StageOperation::AdapterPass(scales.pass));
         self.phase = StagePhase::Stage2;
-        Ok(result)
+        Ok((result, scales))
     }
 
     /// Apply full-resolution keyframes only after learned upsample and fresh
@@ -341,6 +345,37 @@ pub fn denoise_av_conditioned(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    denoise_av_conditioned_with_scales(
+        dit,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        audio_frames,
+        audio_grid,
+        sigmas,
+        &BASE_DENOISE_SCALES,
+        cancel,
+        on_model_forward,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_av_conditioned_with_scales(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    audio: &Tensor,
+    video_ctx: &Tensor,
+    audio_ctx: &Tensor,
+    audio_frames: usize,
+    audio_grid: &Tensor,
+    sigmas: &[f32],
+    scales: &ScaleContext<'_>,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
     candle_gen::execution::schedule("ltx_conditioned_euler_v1", sigmas, "flow_velocity");
     let mut state = video.clone();
     let mut alat = audio.clone();
@@ -369,6 +404,7 @@ pub fn denoise_av_conditioned(
             audio_grid,
             state.keyframes_mask.as_ref(),
             &prepared_rope,
+            scales,
         )?;
         let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
         let vden = conditioning::apply_denoise_mask(
@@ -450,6 +486,7 @@ pub fn denoise_video_dev_conditioned(
                 &state.positions,
                 state.keyframes_mask.as_ref(),
                 &perturbation,
+                &BASE_DENOISE_SCALES,
             )
         };
         let conditional = forward(video_ctx, AvPerturbation::none())?;
@@ -509,6 +546,47 @@ pub fn denoise_av_dev_conditioned(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    denoise_av_dev_conditioned_with_scales(
+        dit,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        negative_video_ctx,
+        negative_audio_ctx,
+        audio_frames,
+        audio_grid,
+        sigmas,
+        stg_blocks,
+        video_guider,
+        audio_guider,
+        &BASE_DENOISE_SCALES,
+        cancel,
+        on_model_forward,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_av_dev_conditioned_with_scales(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    audio: &Tensor,
+    video_ctx: &Tensor,
+    audio_ctx: &Tensor,
+    negative_video_ctx: &Tensor,
+    negative_audio_ctx: &Tensor,
+    audio_frames: usize,
+    audio_grid: &Tensor,
+    sigmas: &[f32],
+    stg_blocks: &[usize],
+    video_guider: GuiderParams,
+    audio_guider: GuiderParams,
+    scales: &ScaleContext<'_>,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
     candle_gen::execution::schedule("ltx_dev_euler_v1", sigmas, "flow_velocity");
     candle_gen::execution::policy(
         "ltx_dev_guidance",
@@ -550,6 +628,7 @@ pub fn denoise_av_dev_conditioned(
                 state.keyframes_mask.as_ref(),
                 &prepared_rope,
                 &perturbation,
+                scales,
             )
         };
         let (conditional_video, conditional_audio) =
@@ -689,7 +768,8 @@ pub fn denoise_tokens_rf_ancestral(
         let (vvel, avel) = match (&alat, &audio) {
             (Some(al), Some(a)) => {
                 let aflat = flatten_audio_latent(al)?;
-                let (vv, av) = dit.forward_conditioned(
+                // Temporal tiles use the base pass, independently of the detailing pass.
+                let (vv, av) = dit.forward_conditioned_with_scales(
                     &state.latent,
                     &aflat,
                     &timesteps,
@@ -699,17 +779,20 @@ pub fn denoise_tokens_rf_ancestral(
                     &state.positions,
                     a.grid,
                     state.keyframes_mask.as_ref(),
+                    &BASE_DENOISE_SCALES,
                 )?;
                 let av = unflatten_audio_latent(&av.to_dtype(DType::F32)?, a.audio_frames)?;
                 (vv, Some(av))
             }
             _ => (
-                dit.forward_video_only_conditioned(
+                dit.forward_video_only_conditioned_controlled(
                     &state.latent,
                     &timesteps,
                     video_ctx,
                     &state.positions,
                     state.keyframes_mask.as_ref(),
+                    &AvPerturbation::none(),
+                    &BASE_DENOISE_SCALES,
                 )?,
                 None,
             ),
@@ -903,11 +986,9 @@ mod tests {
     #[test]
     fn production_two_stage_orchestration_cannot_skip_the_learned_refinement_path() {
         let mut flow = TwoStageOrchestration::new(41);
-        let pass = std::cell::Cell::new(None);
-        let seeds = flow.stage1_setup(true, true, |selected| pass.set(Some(selected)));
+        let (seeds, stage1_scales) = flow.stage1_setup(true, true);
         assert_eq!(
-            pass.get(),
-            Some(0),
+            stage1_scales.pass, 0,
             "stage one selected the real adapter pass"
         );
         assert_eq!(
@@ -929,17 +1010,16 @@ mod tests {
         let device = Device::Cpu;
         let latent = Tensor::zeros((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
         let fresh_noise = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
-        let stage2 = flow
-            .stage2_renoise(
-                0.909375,
-                || Ok(renoise(&latent, &fresh_noise, 0.909375)?),
-                |selected| pass.set(Some(selected)),
-            )
+        let (stage2, stage2_scales) = flow
+            .stage2_renoise(0.909375, || Ok(renoise(&latent, &fresh_noise, 0.909375)?))
             .unwrap();
         assert_eq!(
-            pass.get(),
-            Some(1),
+            stage2_scales.pass, 1,
             "stage two selected the real adapter pass"
+        );
+        assert_eq!(
+            stage1_scales.pass, 0,
+            "refinement leaves base arguments unchanged"
         );
         assert!(
             stage2.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] > 0.9,
