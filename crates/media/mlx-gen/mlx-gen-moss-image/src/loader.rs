@@ -1095,23 +1095,29 @@ mod cpu_tests {
             MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
             WeightsSource::Dir(tmp.path().join("shared")),
         );
-        // Use the prepared-pin boundary so missing-path diagnostics are deterministic.
-        spec.prepare_with_file_pins([]).unwrap();
+        // Stop at the first source-preparation callback after component validation. This
+        // exercises the Base guard without depending on native filesystem error wording.
+        let mut checks = 0;
         let error = Sources::prepare_inner(
             MossImageVariant::Base,
             &spec,
             Some(MossImageAcceleration::Off),
-            &mut || Ok(()),
+            &mut || {
+                checks += 1;
+                if checks == 2 {
+                    Err(mlx_gen::gen_core::Error::Unsupported(
+                        "reached-source-preparation".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
         )
         .err()
         .unwrap()
         .to_string();
-        assert!(
-            error
-                .replace('\\', "/")
-                .contains("shared/text_encoder/config.json"),
-            "{error}"
-        );
+        assert_eq!(checks, 2);
+        assert!(error.contains("reached-source-preparation"), "{error}");
         spec.components.insert(
             DMD_LORA_COMPONENT.into(),
             WeightsSource::File(tmp.path().join("dmd.safetensors")),
