@@ -6,6 +6,7 @@ use super::*;
 pub const KREA_2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
     CheckpointAdapterRegistration {
         adapter_id: "krea-2-v1",
+        loader_reuse: None,
         family: "krea_2",
         compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
             family: "krea_2",
@@ -114,6 +115,7 @@ pub const KREA_2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
 /// Portable SDXL fused-checkpoint adapter metadata shared by both platform bindings.
 pub const SDXL_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
     adapter_id: "sdxl-fused-v1",
+    loader_reuse: None,
     family: "sdxl",
     compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "sdxl" },
     signatures: &[CheckpointSignatureRegistration {
@@ -182,6 +184,7 @@ pub const SDXL_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAda
 pub const MAGE_FLOW_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
     CheckpointAdapterRegistration {
         adapter_id: "mage-flow-diffusers-v1",
+        loader_reuse: None,
         family: "mage_flow",
         compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
             family: "mage-flow",
@@ -235,6 +238,7 @@ pub const MAGE_FLOW_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
 pub const Z_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
     CheckpointAdapterRegistration {
         adapter_id: "z-image-comfyui-v1",
+        loader_reuse: None,
         family: "z-image",
         compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
             family: "z-image",
@@ -288,6 +292,7 @@ pub const Z_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
 pub const QWEN_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
     CheckpointAdapterRegistration {
         adapter_id: "qwen-image-comfyui-v1",
+        loader_reuse: None,
         family: "qwen-image",
         compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
             family: "qwen-image",
@@ -340,6 +345,7 @@ pub const QWEN_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
 /// Portable FLUX.2 ComfyUI adapter metadata.
 pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
     adapter_id: "flux2-comfyui-v1",
+    loader_reuse: None,
     family: "flux2",
     compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "flux2" },
     signatures: &[
@@ -462,6 +468,7 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
 /// what the enum means.
 pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
     adapter_id: "wan-comfyui-v1",
+    loader_reuse: None,
     // The PORTABLE family is the generator's own (`wan`) — the registry build refuses an adapter
     // whose family does not match the generator it binds. The PROJECTION is `wan-video`, which is
     // what `checkpoint_inspector::normalize_family` records in a compiled plan and what SceneWorks
@@ -528,3 +535,99 @@ pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdap
         supports_adapter_inheritance: false,
     }],
 };
+
+/// MOSS native DiT: replace the transformer while retaining the Base model's architecture
+/// configuration and explicitly staged SFT text encoder/tokenizer/VAE companions.
+pub const MOSS_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
+    CheckpointAdapterRegistration {
+        adapter_id: "moss-image-v1",
+        family: "moss_image",
+        loader_reuse: Some(CheckpointLoaderReuseRegistration {
+            provider_id: "moss_image_base",
+            component_role: "transformer",
+            base_component_role: "base-snapshot",
+            supported_source_codecs: &[
+                crate::DENSE_BF16_CODEC.codec_id,
+                crate::convrot_int8::CODEC_ID,
+            ],
+        }),
+        compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+            family: "moss-image",
+        },
+        signatures: &[
+            CheckpointSignatureRegistration {
+                id: "moss-image-native-fused-v1",
+                dialect: "moss-native",
+                required_tensor_names: &[
+                    "video_embedder.weight",
+                    "shared_block_modulation.weight",
+                    "layers.0.proj.qkv.weight",
+                    "final_linear_video.weight",
+                    "text_embedder.proj.weight",
+                ],
+            },
+            CheckpointSignatureRegistration {
+                id: "moss-image-native-split-v1",
+                dialect: "moss-native",
+                required_tensor_names: &[
+                    "video_embedder.weight",
+                    "shared_block_modulation.weight",
+                    "layers.0.proj.q.weight",
+                    "layers.0.proj.k.weight",
+                    "layers.0.proj.v.weight",
+                    "final_linear_video.weight",
+                    "text_embedder.proj.weight",
+                ],
+            },
+        ],
+        dialects: &[CheckpointDialectRegistration {
+            id: "moss-native",
+            source: ImportedModelSource::TransformerFile,
+        }],
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["moss_image", "moss-image"],
+        }],
+        canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+            dialect: "moss-native",
+            mapping_id: "moss-native-v1",
+            plan_driven_backends: &[],
+        }],
+        config_recovery: &[CheckpointConfigRecoveryRegistration {
+            field: "architecture",
+            recovery_id: "base-snapshot-config-v1",
+        }],
+        eligible_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+        backend_bindings: &[],
+        operations: &[ImportedModelOperation::Generate],
+        capabilities: &[CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: false,
+        }],
+    };
+
+/// Portable checkpoint contracts, independent of which platform bindings are linked.
+/// Consumers inspect these signatures and declarations instead of maintaining family lists.
+pub const CHECKPOINT_ADAPTERS: &[CheckpointAdapterRegistration] = &[
+    KREA_2_CHECKPOINT_ADAPTER,
+    SDXL_CHECKPOINT_ADAPTER,
+    MAGE_FLOW_CHECKPOINT_ADAPTER,
+    Z_IMAGE_CHECKPOINT_ADAPTER,
+    QWEN_IMAGE_CHECKPOINT_ADAPTER,
+    FLUX2_CHECKPOINT_ADAPTER,
+    WAN_CHECKPOINT_ADAPTER,
+    MOSS_IMAGE_CHECKPOINT_ADAPTER,
+];

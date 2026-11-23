@@ -24,7 +24,16 @@ pub fn selected_asset_facts_with_check(
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<MemoryAssetFacts> {
     let sources = Sources::selected_with_check(variant, spec, mode, check).map_err(Error::from)?;
-    let mut facts = selected_facts_with(&sources, mode, |asset| {
+    selected_source_facts_with_check(&sources, spec, mode, check)
+}
+
+fn selected_source_facts_with_check(
+    sources: &Sources,
+    spec: &LoadSpec,
+    mode: moss_image::MossImageAcceleration,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<MemoryAssetFacts> {
+    let mut facts = selected_facts_with(sources, mode, |asset| {
         asset.headers_with_check(check).map_err(Error::from)
     })?;
     for adapter in &spec.adapters {
@@ -61,14 +70,18 @@ pub fn edit_request_peak(
             .map_err(Error::from)?;
     let edit = crate::edit::extra_peak(inputs, &request).map_err(Error::from)?;
     crate::edit::EditAssets::prepare(spec).map_err(Error::from)?;
-    let assets = selected_asset_facts(variant, spec, resolved.acceleration)?;
-    let workspace = request_workspace_bytes(
-        request.width,
-        request.height,
-        count,
-        resolved.max_sequence_length,
-        1 + u32::from(resolved.guidance != 1.0),
-    )?;
+    let sources = Sources::selected(variant, spec, resolved.acceleration).map_err(Error::from)?;
+    let assets =
+        selected_source_facts_with_check(&sources, spec, resolved.acceleration, &mut || Ok(()))?;
+    let workspace = sources
+        .request_workspace_bytes(
+            request.width,
+            request.height,
+            count,
+            resolved.max_sequence_length,
+            1 + u32::from(resolved.guidance != 1.0),
+        )
+        .map_err(Error::from)?;
     workspace
         .checked_add(assets.base_bytes)
         .and_then(|n| n.checked_add(assets.overlay_bytes))
@@ -253,6 +266,8 @@ pub(crate) fn fixture(v: MossImageVariant, _: &LoadSpec) -> Result<MemoryProvide
     // The frozen Base/SFT geometry is known without a snapshot; only byte facts are absent.
     Ok(contract_with_facts(v, MemoryAssetFacts::default()))
 }
+pub(crate) const PUBLISHED_SOURCE_STAGING_BYTES: u64 = 5_362_224_248;
+
 /// Conservative structural workspace, including expanded outputs, context and sequential branches.
 /// This is an estimate, not a measured calibration rung.
 pub fn request_workspace_bytes(
@@ -262,10 +277,17 @@ pub fn request_workspace_bytes(
     context: u32,
     branches: u32,
 ) -> Result<u64> {
-    request_workspace_bytes_with_staging(width, height, expanded, context, branches, 5_362_224_248)
+    request_workspace_bytes_with_staging(
+        width,
+        height,
+        expanded,
+        context,
+        branches,
+        PUBLISHED_SOURCE_STAGING_BYTES,
+    )
 }
 /// Internal source-staging adjunction. The public released-model estimate remains byte-for-byte
-/// equivalent; only a verified private fixture supplies its existing header-derived staging bound.
+/// equivalent; imported sources and verified fixtures supply their selected staging bound.
 pub(crate) fn request_workspace_bytes_with_staging(
     width: u32,
     height: u32,
@@ -652,6 +674,23 @@ mod cpu_tests {
         assert_eq!(f.conditioning_bytes, norm_source_bytes * 2 + 3 * 128 * 2);
         assert_eq!(f.base_bytes, f.conditioning_bytes);
         assert_eq!(f.overlay_bytes, 0);
+    }
+
+    #[test]
+    fn imported_staging_above_the_published_bound_is_charged_in_shared_workspace() {
+        let imported_bytes = 6 * 1024 * 1024 * 1024;
+        assert!(imported_bytes > PUBLISHED_SOURCE_STAGING_BYTES);
+        for branches in [1, 2] {
+            let published = request_workspace_bytes(256, 256, 2, 4096, branches).unwrap();
+            let imported =
+                request_workspace_bytes_with_staging(256, 256, 2, 4096, branches, imported_bytes)
+                    .unwrap();
+            assert_eq!(
+                imported - published,
+                imported_bytes - PUBLISHED_SOURCE_STAGING_BYTES
+            );
+        }
+        assert!(request_workspace_bytes_with_staging(256, 256, 1, 8, 1, u64::MAX).is_err());
     }
 
     #[test]

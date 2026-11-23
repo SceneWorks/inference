@@ -1397,6 +1397,16 @@ impl LoadSpec {
         self
     }
 
+    /// Replace a declared architecture component while retaining the ordinary snapshot root.
+    /// The reserved named component participates in the existing pin, inventory, and cache keys.
+    pub fn with_checkpoint_component(self, role: &str, source: WeightsSource) -> Self {
+        self.with_component(format!("checkpoint-{role}"), source)
+    }
+
+    pub fn checkpoint_component(&self, role: &str) -> Option<&WeightsSource> {
+        self.components.get(&format!("checkpoint-{role}"))
+    }
+
     /// Builder-style **additional** ControlNet checkpoint for MultiControlNet (sc-3378) — appends to
     /// [`extra_controls`](Self::extra_controls). Call after [`with_control`](Self::with_control); each
     /// extra branch pairs, in order, with the request's `Conditioning::Control` images. Supported by
