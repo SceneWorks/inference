@@ -1095,6 +1095,8 @@ mod cpu_tests {
             MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
             WeightsSource::Dir(tmp.path().join("shared")),
         );
+        // Use the prepared-pin boundary so missing-path diagnostics are deterministic.
+        spec.prepare_with_file_pins([]).unwrap();
         let error = Sources::prepare_inner(
             MossImageVariant::Base,
             &spec,
