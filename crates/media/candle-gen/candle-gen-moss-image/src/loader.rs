@@ -71,7 +71,9 @@ impl Asset {
             ));
         }
         check()?;
-        verify_moss_image_asset(&pin, repo, revision, relative)?;
+        if repo != IMPORTED_TRANSFORMER_REPOSITORY {
+            verify_moss_image_asset(&pin, repo, revision, relative)?;
+        }
         check()?;
         Ok(Self {
             #[cfg(feature = "test-support")]
@@ -84,6 +86,9 @@ impl Asset {
         })
     }
     pub fn receipt(&self) -> gen_core::Result<MossImageAssetReceipt> {
+        if self.repo == IMPORTED_TRANSFORMER_REPOSITORY {
+            return MossImageAssetReceipt::from_imported_transformer(&self.pin);
+        }
         #[cfg(feature = "test-support")]
         if self.fixture_digest.is_some() {
             self.pin.verify_unchanged()?;
@@ -117,6 +122,16 @@ impl Asset {
         })
     }
     pub(crate) fn verify_owned_bytes(&self, bytes: &[u8]) -> gen_core::Result<()> {
+        if self.repo == IMPORTED_TRANSFORMER_REPOSITORY {
+            if bytes.len() as u64 != self.pin.target_fingerprint().size
+                || Sha256::digest(bytes)[..] != self.pin.content_sha256()[..]
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "imported transformer bytes changed".into(),
+                ));
+            }
+            return Ok(());
+        }
         #[cfg(feature = "test-support")]
         if let Some(expected) = self.fixture_digest {
             let actual = Sha256::digest(bytes);
@@ -275,6 +290,22 @@ impl Sources {
                 variant.provider_id(),
                 hash.finalize()
             )
+        } else if let Some(asset) = self
+            .ordinary
+            .iter()
+            .find(|asset| asset.repo == IMPORTED_TRANSFORMER_REPOSITORY)
+        {
+            let digest = asset
+                .pin
+                .content_sha256()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "moss-image-import@{digest};config@{};shared@{}",
+                variant.revision(),
+                SFT_REVISION
+            )
         } else {
             format!(
                 "{}@{};shared@{}",
@@ -285,7 +316,12 @@ impl Sources {
         }
     }
     pub fn new(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Self> {
-        Self::prepare(variant, spec, None, &mut || Ok(()))
+        // A replacement must contribute to the ordinary provider's footprint and memory
+        // contract before load; selecting it authenticates headers, never model tensors.
+        let selection = spec
+            .checkpoint_component("transformer")
+            .map(|_| MossImageAcceleration::Off);
+        Self::prepare(variant, spec, selection, &mut || Ok(()))
     }
     pub fn selected(
         variant: MossImageVariant,
@@ -321,6 +357,12 @@ impl Sources {
         check: &mut dyn FnMut() -> gen_core::Result<()>,
     ) -> gen_core::Result<Self> {
         check()?;
+        let imported = spec.checkpoint_component("transformer");
+        if imported.is_some() && selection.is_some_and(|mode| mode != MossImageAcceleration::Off) {
+            return Err(gen_core::Error::Unsupported(
+                "imported MOSS transformer does not support published DMD replacement modes".into(),
+            ));
+        }
         let shared_only = selection.is_none();
         let mode = selection.unwrap_or(MossImageAcceleration::Off);
         let full_fp32 = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
@@ -357,6 +399,7 @@ impl Sources {
             ));
         }
         let allowed = [
+            "checkpoint-transformer",
             gen_core::moss_image_edit::EDIT_COMPONENT,
             MOSS_SHARED_SNAPSHOT_COMPONENT,
             DMD_LORA_COMPONENT,
@@ -391,7 +434,11 @@ impl Sources {
             }
         };
         let mut ordinary = Vec::new();
-        for relative in snapshot_files(selection) {
+        for relative in snapshot_files(selection).filter(|relative| {
+            imported.is_none()
+                || !relative.starts_with("transformer/")
+                || *relative == "transformer/config.json"
+        }) {
             check()?;
             let tr = relative.starts_with("transformer/");
             let role = if tr {
@@ -418,6 +465,24 @@ impl Sources {
                 relative,
                 check,
             )?);
+        }
+        if selection.is_some() {
+            if let Some(source) = imported {
+                let WeightsSource::File(path) = source else {
+                    return Err(gen_core::Error::Unsupported(
+                        "MOSS transformer override requires one safetensors file".into(),
+                    ));
+                };
+                ordinary.push(Asset::new_with_check(
+                    spec,
+                    path.clone(),
+                    MossImageAssetRole::Transformer,
+                    IMPORTED_TRANSFORMER_REPOSITORY,
+                    IMPORTED_TRANSFORMER_REVISION,
+                    IMPORTED_TRANSFORMER_PATH,
+                    check,
+                )?);
+            }
         }
         let config = transformer_config_with_check(selection, spec, &ordinary, check)?;
         let text_config = Qwen35Config::from_json(
@@ -466,7 +531,9 @@ impl Sources {
                 MossImageAssetRole::TextEncoder,
             ),
         ] {
-            if !((shared_only || full_fp32) && role == MossImageAssetRole::Transformer) {
+            if !((shared_only || full_fp32 || imported.is_some())
+                && role == MossImageAssetRole::Transformer)
+            {
                 validate_shards(&dir, index, &ordinary, role)?;
             }
         }
@@ -874,6 +941,32 @@ fn asset_headers(
 ) -> gen_core::Result<HeaderFacts> {
     static CACHE: OnceLock<HeaderCache> = OnceLock::new();
     check()?;
+    if a.repo == IMPORTED_TRANSFORMER_REPOSITORY {
+        let bytes = a.pin.target_fingerprint().size;
+        let key = (
+            IMPORTED_TRANSFORMER_REPOSITORY,
+            IMPORTED_TRANSFORMER_REVISION,
+            IMPORTED_TRANSFORMER_PATH,
+            bytes,
+            *a.pin.content_sha256(),
+        );
+        return cached_headers_with_check(
+            CACHE.get_or_init(Mutex::default),
+            key,
+            &a.pin,
+            check,
+            |check| {
+                a.pin.read_unchanged(|path| {
+                    stream_headers_with_check(
+                        std::fs::File::open(path)?,
+                        bytes,
+                        a.pin.content_sha256(),
+                        check,
+                    )
+                })
+            },
+        );
+    }
     verify_moss_image_asset(&a.pin, a.repo, a.revision, &a.relative)?;
     check()?;
     let identity = moss_image_asset(a.repo, a.revision, &a.relative)
@@ -927,11 +1020,13 @@ fn validate_source_dtypes(
             weightsmeta::Dtype::BF16
         };
         let headers = asset_headers(a, check)?;
-        if headers.iter().any(|h| {
-            h.dtype != expected
-                && !h.name.ends_with("num_batches_tracked")
-                && h.name != "rope.bands"
-        }) {
+        if a.repo != IMPORTED_TRANSFORMER_REPOSITORY
+            && headers.iter().any(|h| {
+                h.dtype != expected
+                    && !h.name.ends_with("num_batches_tracked")
+                    && h.name != "rope.bands"
+            })
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "MOSS source dtype differs from frozen policy {}",
                 a.relative
@@ -1114,7 +1209,8 @@ pub(crate) fn load_weights_cancellable(
                     view.dtype(),
                     safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
                 ) || name.ends_with(".comfy_quant")
-                    || name.ends_with(".weight_scale"))
+                    || name.ends_with(".weight_scale")
+                    || name.ends_with(".comfy_attention.config"))
         }) {
             drop(map);
             let mut current = Some(bytes);

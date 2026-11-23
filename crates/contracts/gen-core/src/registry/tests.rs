@@ -1612,6 +1612,7 @@ fn fixture_adapter(
 ) -> CheckpointAdapterRegistration {
     CheckpointAdapterRegistration {
         adapter_id: "fixture-family-v1",
+        loader_reuse: None,
         family: "test",
         compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
             family: "test",
@@ -4129,4 +4130,78 @@ fn per_component_bytes_from_root_subdirs_handles_flat_files() {
             vae: 500,
         }
     );
+}
+
+#[test]
+fn reused_import_loader_requires_declared_component_and_uses_ordinary_registration() {
+    const REUSE: CheckpointLoaderReuseRegistration = CheckpointLoaderReuseRegistration {
+        provider_id: "dummy_test_model",
+        component_role: "transformer",
+        base_component_role: "base-snapshot",
+        supported_source_codecs: &[crate::DENSE_BF16_CODEC.codec_id],
+    };
+    let adapter = CheckpointAdapterRegistration {
+        loader_reuse: Some(REUSE),
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["test"],
+        }],
+        ..fixture_adapter(FIXTURE_MLX_BINDINGS)
+    };
+    let registry = ProviderRegistryBuilder::new()
+        .register_generator(DUMMY_GENERATOR_REGISTRATION)
+        .register_checkpoint_adapter(adapter)
+        .build()
+        .unwrap();
+    let missing = LoadSpec::new(WeightsSource::Dir("snapshot".into()));
+    let load = |spec: &LoadSpec| {
+        registry.load_imported(
+            "test",
+            ImportedModelSource::TransformerFile,
+            ImportedModelOperation::Generate,
+            spec,
+        )
+    };
+    assert!(load(&missing)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("missing imported"));
+    let directory = missing
+        .clone()
+        .with_checkpoint_component("transformer", WeightsSource::Dir("wrong-shape".into()));
+    assert!(load(&directory).is_err());
+    let replacement = missing.with_checkpoint_component(
+        "transformer",
+        WeightsSource::File("caller-owned.safetensors".into()),
+    );
+    assert_eq!(
+        load(&replacement).unwrap().descriptor().id,
+        "dummy_test_model"
+    );
+    let unknown = replacement
+        .with_checkpoint_component("vae", WeightsSource::File("ignored.safetensors".into()));
+    assert!(load(&unknown).is_err());
+    let mut invalid = adapter;
+    invalid.loader_reuse = Some(CheckpointLoaderReuseRegistration {
+        provider_id: "unregistered",
+        ..REUSE
+    });
+    assert!(ProviderRegistryBuilder::new()
+        .register_generator(DUMMY_GENERATOR_REGISTRATION)
+        .register_checkpoint_adapter(invalid)
+        .build()
+        .is_err());
 }

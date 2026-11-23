@@ -21,6 +21,17 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     use mlx_gen::gen_core::{moss_image::MossImageVariant, MemoryContractFixtureRegistration};
     registry
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+                operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                provider_id: "moss_image_base",
+                required_components: None,
+                inherit_adapters: false,
+            }],
+            ..mlx_gen::gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER
+        })
         .register_trainer(training::BASE_REGISTRATION)
         .register_trainer(training::SFT_REGISTRATION)
         .register_generator(model::BASE_REGISTRATION)

@@ -70,6 +70,17 @@ impl Asset {
         // Refuse identity drift without a callbackless full-file drift audit. The seal already
         // authenticates content; metadata admission checks its frozen digest and exact size.
         check_pin(&pin, check)?;
+        if repo == IMPORTED_TRANSFORMER_REPOSITORY {
+            return Ok(Self {
+                #[cfg(feature = "test-support")]
+                fixture_digest: None,
+                role,
+                repo,
+                revision,
+                relative: relative.into(),
+                pin,
+            });
+        }
         let expected = moss_image_asset(repo, revision, relative)
             .ok_or_else(|| Error::Unsupported("unknown frozen MOSS asset".into()))?;
         let digest = pin
@@ -113,6 +124,16 @@ impl Asset {
                 if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
                     return Err(Error::Unsupported(
                         "synthetic fixture consumed bytes changed".into(),
+                    ));
+                }
+                return Ok(bytes);
+            }
+            if self.repo == IMPORTED_TRANSFORMER_REPOSITORY {
+                if bytes.len() as u64 != self.pin.target_fingerprint().size
+                    || actual[..] != self.pin.content_sha256()[..]
+                {
+                    return Err(Error::Unsupported(
+                        "imported transformer bytes changed".into(),
                     ));
                 }
                 return Ok(bytes);
@@ -358,6 +379,22 @@ impl Sources {
                 )?,
             );
         }
+        if self
+            .ordinary
+            .iter()
+            .any(|asset| asset.repo == IMPORTED_TRANSFORMER_REPOSITORY)
+        {
+            return Ok(
+                crate::memory_strategy::request_workspace_bytes_with_staging(
+                    width,
+                    height,
+                    expanded,
+                    context,
+                    branches,
+                    self.load_staging_bytes()?,
+                )?,
+            );
+        }
         Ok(crate::memory_strategy::request_workspace_bytes(
             width, height, expanded, context, branches,
         )?)
@@ -373,7 +410,16 @@ impl Sources {
                 .checked_add(facts.largest_source_shard)
                 .ok_or_else(|| Error::Unsupported("fixture load workspace overflow".into()));
         }
-        Ok(5_362_224_248)
+        // A caller-owned single file may exceed the published package's largest shard.
+        Ok(self
+            .ordinary
+            .iter()
+            .chain(&self.optional)
+            .filter(|asset| asset.relative.ends_with(".safetensors"))
+            .map(|asset| asset.pin.target_fingerprint().size)
+            .max()
+            .unwrap_or(0)
+            .max(5_362_224_248))
     }
     pub(crate) fn working_set_budget(&self) -> Result<Option<u64>> {
         #[cfg(feature = "test-support")]
@@ -409,6 +455,22 @@ impl Sources {
                 variant.provider_id(),
                 hash.finalize()
             )
+        } else if let Some(asset) = self
+            .ordinary
+            .iter()
+            .find(|asset| asset.repo == IMPORTED_TRANSFORMER_REPOSITORY)
+        {
+            let digest = asset
+                .pin
+                .content_sha256()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "moss-image-import@{digest};config@{};shared@{}",
+                variant.revision(),
+                SFT_REVISION
+            )
         } else {
             format!(
                 "{}@{};shared@{}",
@@ -419,7 +481,12 @@ impl Sources {
         }
     }
     pub(crate) fn prepare(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
-        Self::prepare_inner(variant, spec, None, &mut || Ok(()))
+        // Price the exact selected replacement in the ordinary footprint/contract seam,
+        // while preserving shared-only construction for the frozen built-in snapshots.
+        let selection = spec
+            .checkpoint_component("transformer")
+            .map(|_| MossImageAcceleration::Off);
+        Self::prepare_inner(variant, spec, selection, &mut || Ok(()))
     }
     pub(crate) fn selected(
         variant: MossImageVariant,
@@ -443,6 +510,12 @@ impl Sources {
         check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
     ) -> Result<Self> {
         check()?;
+        let imported = spec.checkpoint_component("transformer");
+        if imported.is_some() && selection.is_some_and(|mode| mode != MossImageAcceleration::Off) {
+            return Err(Error::Unsupported(
+                "imported MOSS transformer does not support published DMD replacement modes".into(),
+            ));
+        }
         let mode = selection.unwrap_or(MossImageAcceleration::Off);
         let full = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
         if variant == MossImageVariant::Base && mode != MossImageAcceleration::Off {
@@ -480,6 +553,7 @@ impl Sources {
         }
         for key in spec.components.keys() {
             if ![
+                "checkpoint-transformer",
                 MOSS_SHARED_SNAPSHOT_COMPONENT,
                 mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT,
                 DMD_LORA_COMPONENT,
@@ -511,7 +585,11 @@ impl Sources {
             }
         };
         let mut ordinary = Vec::new();
-        for relative in snapshot_files(selection) {
+        for relative in snapshot_files(selection).filter(|relative| {
+            imported.is_none()
+                || !relative.starts_with("transformer/")
+                || *relative == "transformer/config.json"
+        }) {
             let transformer = relative.starts_with("transformer/");
             let (base, repo, rev) = if transformer {
                 (root, variant.repository(), variant.revision())
@@ -527,6 +605,24 @@ impl Sources {
                 role(relative),
                 check,
             )?);
+        }
+        if selection.is_some() {
+            if let Some(source) = imported {
+                let WeightsSource::File(path) = source else {
+                    return Err(Error::Unsupported(
+                        "MOSS transformer override requires one safetensors file".into(),
+                    ));
+                };
+                ordinary.push(Asset::capture_with_check(
+                    spec,
+                    path.clone(),
+                    IMPORTED_TRANSFORMER_REPOSITORY,
+                    IMPORTED_TRANSFORMER_REVISION,
+                    IMPORTED_TRANSFORMER_PATH,
+                    MossImageAssetRole::Transformer,
+                    check,
+                )?);
+            }
         }
         // Licence identity is independently verified without inventing a receipt tensor role.
         Asset::capture_with_check(
@@ -621,7 +717,7 @@ impl Sources {
             ordinary,
             optional,
         };
-        if selection.is_some() && !full {
+        if selection.is_some() && !full && imported.is_none() {
             sources.verify_index(
                 false,
                 "transformer/diffusion_pytorch_model.safetensors.index.json",
@@ -765,6 +861,41 @@ impl Sources {
             |_| true,
             cancel,
         )?;
+        for i in 0..self.config.num_layers {
+            let key = format!("layers.{i}.proj.qkv.weight");
+            if weights.peek(&key).is_none() {
+                continue;
+            }
+            let targets = ["q", "k", "v"].map(|part| format!("layers.{i}.proj.{part}.weight"));
+            if targets.iter().any(|target| weights.peek(target).is_some()) {
+                return Err(Error::Unsupported(
+                    "MOSS checkpoint mixes fused and split QKV".into(),
+                ));
+            }
+            if let Some(projection) = weights.source_projection(&key)? {
+                weights.insert_split_projection(&key, projection, &targets)?;
+            } else {
+                use mlx_rs::ops::indexing::IndexOp;
+                let fused = weights.require(&key)?.clone();
+                if fused.shape() != [3 * self.config.dim as i32, self.config.dim as i32] {
+                    return Err(Error::Unsupported("MOSS fused QKV shape mismatch".into()));
+                }
+                let width = self.config.dim as i32;
+                for (part, target) in targets.iter().enumerate() {
+                    let start = part as i32 * width;
+                    weights.insert(target, fused.index((start..start + width, ..)));
+                }
+            }
+            let base = key.trim_end_matches(".weight");
+            for suffix in [".weight", ".weight_scale", ".comfy_quant", ".input_scale"] {
+                weights.remove(&format!("{base}{suffix}"));
+            }
+        }
+        let native_keys = weights.native_tensor_keys();
+        // These companions are consumed by shared native projections, not model modules.
+        for key in native_keys.iter().filter(|key| !key.ends_with(".weight")) {
+            let _ = weights.get(key);
+        }
         let dtype = if mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32) {
             Dtype::Float32
         } else {
@@ -772,14 +903,15 @@ impl Sources {
         };
         let checks = weights.clone();
         if checks.keys().any(|k| {
-            checks.get(k).is_some_and(|a| {
-                a.dtype()
-                    != if k == "rope.bands" {
-                        Dtype::Float32
-                    } else {
-                        dtype
-                    }
-            })
+            !native_keys.contains(k)
+                && checks.get(k).is_some_and(|a| {
+                    a.dtype()
+                        != if k == "rope.bands" {
+                            Dtype::Float32
+                        } else {
+                            dtype
+                        }
+                })
         }) {
             return Err(Error::Unsupported(
                 "MOSS transformer source dtype mismatch".into(),
@@ -878,6 +1010,14 @@ pub(crate) fn read_weights<'a>(
             let t = meta
                 .tensor(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?;
+            if mlx_gen::gen_core::checkpoint_codec::checkpoint_execution_metadata(
+                key,
+                &format!("{:?}", t.dtype),
+                t.shape,
+                t.data,
+            )? {
+                continue;
+            }
             let dtype = match t.dtype {
                 mlx_gen::gen_core::weightsmeta::Dtype::BF16 => Dtype::Bfloat16,
                 mlx_gen::gen_core::weightsmeta::Dtype::F32 => Dtype::Float32,

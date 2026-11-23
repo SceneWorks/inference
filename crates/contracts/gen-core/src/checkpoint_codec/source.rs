@@ -308,6 +308,7 @@ pub fn plan_projection_source_headers(
 }
 
 /// Validated physical rows and sidecars, reusable on relocation without rescanning shard headers.
+#[derive(Clone)]
 pub struct ProjectionSourceHeaders {
     headers: Vec<SafetensorsTensorHeader>,
     descriptors: BTreeMap<String, Vec<u8>>,
@@ -1047,5 +1048,62 @@ mod tests {
             &SourceCodecResidency
         )
         .is_err());
+    }
+}
+
+/// Recognize bounded, typed non-parameter execution hints emitted by ComfyUI ModelSave.
+/// These describe the exporting runtime's kernel selection, not trained model operands.
+/// A consuming provider retains ownership of its supported execution implementation.
+/// Unknown keys are not filtered; malformed or unknown declarations under this known key refuse.
+pub fn checkpoint_execution_metadata(
+    name: &str,
+    dtype: &str,
+    shape: &[usize],
+    bytes: &[u8],
+) -> crate::Result<bool> {
+    if !name.ends_with(".comfy_attention.config") {
+        return Ok(false);
+    }
+    if dtype != "U8" || shape != [bytes.len()] || bytes.len() > 65_536 {
+        return Err(format!("{name}: attention metadata must be a bounded U8 vector").into());
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AttentionMetadata {
+        attention: String,
+    }
+    let metadata: AttentionMetadata = serde_json::from_slice(bytes).map_err(|error| {
+        crate::Error::Msg(format!("{name}: invalid attention metadata: {error}"))
+    })?;
+    if metadata.attention != "comfy_kitchen_int8" {
+        return Err(format!(
+            "{name}: unknown attention metadata implementation {:?}",
+            metadata.attention
+        )
+        .into());
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod execution_metadata_tests {
+    use super::*;
+    #[test]
+    fn recognizes_only_well_formed_comfy_attention_configuration() {
+        let payload = br#"{"attention": "comfy_kitchen_int8"}"#;
+        let key = "layers.0.comfy_attention.config";
+        assert!(checkpoint_execution_metadata(key, "U8", &[35], payload).unwrap());
+        assert!(!checkpoint_execution_metadata("layers.0.weight", "U8", &[35], payload).unwrap());
+        assert!(checkpoint_execution_metadata(key, "BF16", &[35], payload).is_err());
+        assert!(checkpoint_execution_metadata(key, "U8", &[1, 35], payload).is_err());
+        for malformed in [
+            br#"{"attention":"unknown"}"#.as_slice(),
+            br#"{"attention":"comfy_kitchen_int8","weights":true}"#,
+            br#"{}"#,
+        ] {
+            assert!(
+                checkpoint_execution_metadata(key, "U8", &[malformed.len()], malformed).is_err()
+            );
+        }
     }
 }

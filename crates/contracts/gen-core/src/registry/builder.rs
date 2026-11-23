@@ -245,6 +245,35 @@ pub(super) fn validate_checkpoint_adapters(
             }
         }
 
+        if let Some(reuse) = adapter.loader_reuse {
+            if !is_registry_ident(reuse.provider_id)
+                || !component_roles.contains(reuse.component_role)
+                || !base_roles.contains(reuse.base_component_role)
+                || reuse.component_role == reuse.base_component_role
+                || reuse.supported_source_codecs.is_empty()
+                || reuse
+                    .supported_source_codecs
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != reuse.supported_source_codecs.len()
+                || reuse.supported_source_codecs.iter().any(|id| {
+                    !crate::checkpoint_codec::BASELINE_CHECKPOINT_CODECS
+                        .iter()
+                        .any(|codec| codec.codec_id == *id)
+                })
+                || adapter
+                    .backend_bindings
+                    .iter()
+                    .any(|binding| binding.provider_id != reuse.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has invalid loader reuse metadata",
+                    adapter.adapter_id
+                )));
+            }
+        }
+
         let mut mapped_dialects = std::collections::BTreeSet::new();
         for mapping in adapter.canonical_mappings {
             if !dialect_ids.contains(mapping.dialect)

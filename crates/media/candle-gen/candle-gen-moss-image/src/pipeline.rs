@@ -36,13 +36,20 @@ impl Renderer {
         } else {
             DType::BF16
         };
-        let base = load_weights(
+        let mut base = load_weights(
             &assets,
             MossImageAssetRole::Transformer,
             device,
             dtype,
             &[""],
         )?;
+        for i in 0..sources.config.num_layers {
+            let key = format!("layers.{i}.proj.qkv.weight");
+            if base.contains(&key) {
+                let targets = ["q", "k", "v"].map(|part| format!("layers.{i}.proj.{part}.weight"));
+                base.split_projection_rows(&key, &targets)?;
+            }
+        }
         let mixed = mode == MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16);
         let adapter = if mixed {
             Some(load_weights(

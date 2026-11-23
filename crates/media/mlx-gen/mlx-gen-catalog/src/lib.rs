@@ -356,6 +356,7 @@ mod tests {
         let registry = super::provider_registry().unwrap();
         let expected = [
             &KREA_2_CHECKPOINT_ADAPTER,
+            &mlx_gen::gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER,
             &MAGE_FLOW_CHECKPOINT_ADAPTER,
             &SDXL_CHECKPOINT_ADAPTER,
         ];
@@ -467,6 +468,14 @@ mod tests {
                 operation: ImportedModelOperation::Generate,
                 provider_id: "mage_flow_base",
                 required_components: Some(mlx_gen_mage::REQUIRED_COMPONENTS),
+                inherit_adapters: false,
+            },
+            ImportedModelRegistration {
+                family: "moss-image",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "moss_image_base",
+                required_components: None,
                 inherit_adapters: false,
             },
             ImportedModelRegistration {

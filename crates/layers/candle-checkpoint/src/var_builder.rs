@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SourceMapping {
     legacy_convrot: bool,
     transforms: BTreeMap<String, gen_core::checkpoint_codec::LogicalTransformDeclaration>,
@@ -87,6 +87,48 @@ impl ProjectionSource {
             dtype,
             dev.clone(),
         )
+    }
+
+    /// Declare a fused matrix's contiguous row partition before any projection is materialized.
+    /// Reuses the existing logical transform compiler for every codec, including ConvRot.
+    pub fn split_projection_rows(&self, key: &str, targets: &[String]) -> Result<Self> {
+        use gen_core::checkpoint_codec::{LogicalTransformDeclaration, LogicalTransformOutput};
+        let shape = self
+            .reader()
+            .planned(key)
+            .ok_or_else(|| Error::Msg(format!("missing source projection {key}")))?
+            .shape
+            .clone();
+        let [rows, _] = shape.as_slice() else {
+            candle_core::bail!("{key}: projection must be rank two");
+        };
+        if targets.is_empty() || !rows.is_multiple_of(targets.len()) {
+            candle_core::bail!(
+                "{key}: row count cannot be partitioned into {} projections",
+                targets.len()
+            );
+        }
+        let width = rows / targets.len();
+        let mut mapping = self.1.mapping.clone();
+        mapping.transforms.insert(
+            key.to_owned(),
+            LogicalTransformDeclaration::new(
+                targets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, target)| LogicalTransformOutput::row_slice(target, i * width, width))
+                    .collect(),
+            )
+            .with_source_logical_shape(shape),
+        );
+        let definition = Arc::new(SourcePlan {
+            mapping,
+            files: self.1.files.clone(),
+            headers: self.1.headers.clone(),
+            other_devices: Default::default(),
+        });
+        let reader = definition.open(self.0.st.clone(), self.reader().device())?;
+        Ok(Self(reader, definition))
     }
 
     pub fn reader(&self) -> &LogicalWeightReader {
@@ -1061,6 +1103,50 @@ pub fn mmap_var_builder_with_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Header/plan transformation only: no tensor materialization or inference executes.
+    #[test]
+    fn source_row_partition_preserves_codec_and_refuses_invalid_outputs() {
+        use safetensors::tensor::{serialize, TensorView};
+        let codes = [0u8; 12];
+        let bytes = serialize(
+            [(
+                "qkv.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![6, 2], &codes).unwrap(),
+            )],
+            None,
+        )
+        .unwrap();
+        let st = MmapedSafetensors::from_buffers([Ok(bytes)]).unwrap();
+        let source =
+            ProjectionSource::from_mapped(st, &["memory.safetensors".into()], &Device::Cpu)
+                .unwrap()
+                .ok()
+                .unwrap();
+        let targets = ["q.weight".into(), "k.weight".into(), "v.weight".into()];
+        let split = source
+            .split_projection_rows("qkv.weight", &targets)
+            .unwrap();
+        assert!(split.reader().planned("qkv.weight").is_none());
+        for (index, key) in targets.iter().enumerate() {
+            let row = split.reader().planned(key).unwrap();
+            assert_eq!(row.physical_key, "qkv.weight");
+            assert_eq!(row.shape, [2, 2]);
+            assert_eq!(
+                row.codec_id,
+                source.reader().planned("qkv.weight").unwrap().codec_id
+            );
+            assert_eq!(row.transform.as_ref().unwrap().rows.start, index * 2);
+            assert!(split.reader().materialized_bytes(key).is_none());
+        }
+        assert!(source.split_projection_rows("qkv.weight", &[]).is_err());
+        assert!(source
+            .split_projection_rows("qkv.weight", &vec!["q".into(); 4])
+            .is_err());
+        assert!(source
+            .split_projection_rows("qkv.weight", &["q".into(), "q".into(), "v".into()])
+            .is_err());
+    }
+
     #[test]
     fn file_builder_recognizes_metadata_only_convrot_on_underscore_projection() {
         use safetensors::tensor::{serialize_to_file, TensorView};

@@ -518,6 +518,73 @@ impl ProviderRegistry {
         Some(descriptor)
     }
 
+    /// Load an imported component through its registered ordinary provider.
+    pub fn load_imported(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+        spec: &LoadSpec,
+    ) -> Result<Box<dyn Generator>> {
+        let adapter = self
+            .checkpoint_adapters
+            .iter()
+            .find(|adapter| {
+                adapter.family == family || adapter.compatibility_projection.family == family
+            })
+            .ok_or_else(|| Error::Unsupported(format!("no checkpoint adapter for {family}")))?;
+        if let Some(reuse) = adapter.loader_reuse {
+            let replacement = spec
+                .checkpoint_component(reuse.component_role)
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "{family}: missing imported {} replacement",
+                        reuse.component_role
+                    ))
+                })?;
+            let shape_matches = matches!(
+                (source, replacement),
+                (ImportedModelSource::TransformerFile, WeightsSource::File(_))
+                    | (
+                        ImportedModelSource::TransformerDirectory,
+                        WeightsSource::Dir(_)
+                    )
+            );
+            if !shape_matches
+                || !matches!(spec.weights, WeightsSource::Dir(_))
+                || spec.components.keys().any(|key| {
+                    key.starts_with("checkpoint-")
+                        && key != &format!("checkpoint-{}", reuse.component_role)
+                })
+            {
+                return Err(Error::Unsupported(format!(
+                    "{family}: imported component shape does not match registered loader reuse"
+                )));
+            }
+        } else if spec
+            .components
+            .keys()
+            .any(|key| key.starts_with("checkpoint-"))
+        {
+            return Err(Error::Unsupported(format!(
+                "{family}: this loader does not declare component replacement"
+            )));
+        }
+        let descriptor = self
+            .imported_model_descriptor(adapter.compatibility_projection.family, source, operation)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "no imported provider for {family}/{source:?}/{operation:?}"
+                ))
+            })?;
+        crate::reject_unsupported_adapters(
+            descriptor.id,
+            &descriptor.capabilities,
+            spec.adapters.len(),
+        )?;
+        self.load(descriptor.id, spec)
+    }
+
     /// Provider-owned warm 1024² activation transient for `id`.
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
