@@ -288,11 +288,14 @@ def runner_account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
 
 
-def uses_native_hub(plan: dict) -> bool:
-    return plan.get("protocol") == "scail2-plural-fit-v1" and plan.get("backend") == "mlx"
+def uses_native_hub(plan: dict | None) -> bool:
+    # Only the SCAIL-2 MLX plural-fit plan stages into the runner's native home cache.
+    return (plan is not None and plan.get("protocol") == "scail2-plural-fit-v1"
+            and plan.get("backend") == "mlx")
 
 
-def hub_root(env: dict[str, str], plan: dict) -> Path:
+def hub_root(env: dict[str, str], plan: dict | None = None) -> Path:
+    """Resolve the staging hub; callers without a staging plan use the configured model root."""
     if uses_native_hub(plan):
         from scripts.ci.scail_plural import contract as plural
 
