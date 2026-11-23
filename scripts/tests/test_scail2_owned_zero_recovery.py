@@ -72,6 +72,46 @@ class OwnedZeroRecovery(unittest.TestCase):
         self.assertEqual((result["dedicated_missing_after_output"], result["shared_missing_after_output"]), (1, 1))
         self.assertEqual(before, json.dumps(guard))
 
+    def _exited_between_gauges(self):
+        # Run 45265278792 count 6: the final attempt read the card (993 MB used card-wide,
+        # recorded dedicated peak 57 GB), missed the live dedicated PDH read, then found the
+        # root gone from the Job (invalid allocation), so the shared gauge had nothing to read.
+        guard, pool, claim = fixture()
+        raw = guard["fit_observation"]
+        final = raw["cuda_render_end"]["rejected_growth"][-1]
+        final.update(detail=stage.RejectedPoolSample.INVALID_ALLOCATION, at_ns=330, global_used_upper_bytes=40)
+        raw["wddm_retry"]["shared"] = {"attempts": 0, "events": []}
+        raw["wddm_shared"]["missing_active_polls"] = 0
+        return guard, pool, claim
+
+    def test_dedicated_gap_before_a_bounded_job_exit_is_located(self):
+        guard, pool, claim = self._exited_between_gauges()
+        result = scope(guard, pool, claim, archived=False, fresh=True)
+        self.assertEqual((result["terminal_rejected_read_ns"], result["terminal_rejected_at_ns"]), (325, 330))
+        self.assertEqual((result["dedicated_missing_after_output"], result["shared_missing_after_output"]), (1, 0))
+        self.assertEqual(result, scope(guard, pool, claim))
+
+    def test_dedicated_gap_that_could_hide_a_peak_or_misplace_the_exit_is_rejected(self):
+        for problem in ("unbounded", "shared-gap", "shared-after-gap", "still-member", "late-gap"):
+            with self.subTest(problem=problem):
+                guard, pool, claim = self._exited_between_gauges()
+                raw = guard["fit_observation"]
+                final = raw["cuda_render_end"]["rejected_growth"][-1]
+                if problem == "unbounded":
+                    # The card-wide bound at the missed tick exceeds every recorded dedicated sample.
+                    final["global_used_upper_bytes"] = 51
+                elif problem == "shared-gap":
+                    raw["wddm_shared"]["missing_active_polls"] = 1
+                elif problem == "shared-after-gap":
+                    raw["wddm_shared"]["samples"].append([181, 6])
+                elif problem == "still-member":
+                    final["detail"] = stage.RejectedPoolSample.EXCEEDS_CURRENT_USAGE
+                else:
+                    raw["wddm_retry"]["dedicated"]["events"][0]["end_ns"] = 335
+                self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
+                with self.assertRaises(ValueError):
+                    scope(guard, pool, claim)
+
     def test_other_reads_earlier_gaps_or_unverified_release_do_not_qualify(self):
         problems = ("ordinary-card-tie", "previous-rejection", "zero-last-growth", "gauge-overlap",
                     "filetime-crossing", "dedicated-filetime-length", "shared-filetime-length",

@@ -157,9 +157,13 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
         raise UnverifiedOrderedZero("unverified terminal CUDA attempt, Job, or physical release")
     validate_guard_samples(guard, end, card)
     final = events[-1]
+    # PairCudaProbe polls dedicated before it checks Job membership. An invalid
+    # allocation with an exited Job means the root left between those reads, so
+    # the shared gauge that follows had no process left to read.
+    exited_mid_attempt = not last_rejection_live and final["detail"] == RejectedPoolSample.INVALID_ALLOCATION
     if not (
         final["before"] == "live" and final["after"] == before_zero
-        and final["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE
+        and (final["detail"] == RejectedPoolSample.EXCEEDS_CURRENT_USAGE or exited_mid_attempt)
         and final["child_growth_bytes"] > 0
         and mark["at_ns"] < events[-2]["at_ns"] < final["read_ns"] == last_used
         and final["at_ns"] < zero["at_ns"]
@@ -171,6 +175,11 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
     tick_ns = guard["admission"]["pollMillis"] * 1_000_000
     for key, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]), ("shared", raw["wddm_shared"])):
         diagnostics = raw["wddm_retry"][key]
+        if key == "shared" and exited_mid_attempt:
+            if not (series["error"] is None and series["missing_active_polls"] == diagnostics["attempts"] == 0
+                    and not diagnostics["events"]):
+                raise UnverifiedOrderedZero("shared gauge has a gap after its root left the Job")
+            continue
         if not (series["error"] is None and series["missing_active_polls"] == diagnostics["attempts"] == 1
                 and len(diagnostics["events"]) == 1):
             raise UnverifiedOrderedZero("expected exactly one located terminal WDDM gap per gauge")
@@ -185,6 +194,19 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
         ):
             raise UnverifiedOrderedZero("WDDM retry does not fall inside its final rejected CUDA attempt")
         gaps.append(gap)
+    if exited_mid_attempt:
+        dedicated, = gaps
+        shared_last = raw["wddm_shared"]["samples"][-1][0] if raw["wddm_shared"]["samples"] else None
+        # The missed dedicated read shares its tick with the attempt's card-wide
+        # upper bound. That bound must sit below the recorded dedicated peak, and
+        # the shared gauge must have no reading after the gap began.
+        peak = max(value for _, value in guard["cuda_attribution"]["wddm_dedicated"]["samples"])
+        if not (dedicated["start_ns"] == final["read_ns"] and dedicated["end_ns"] <= final["at_ns"]
+                and shared_last is not None
+                and dedicated["previous"][0] <= shared_last < dedicated["local_filetime_before"]
+                and final["global_used_upper_bytes"] <= peak):
+            raise UnverifiedOrderedZero("dedicated gap before the Job exit is unbounded or out of order")
+        return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])
     dedicated, shared = gaps
     # KeepSystemGrowth reads first. PairCudaProbe polls dedicated before it rejects
     # the pool. The observer then polls shared before recording the rejected attempt.
