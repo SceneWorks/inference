@@ -457,10 +457,17 @@ WAIT_NOTICE_SECONDS = 60
 
 
 def _wait_notice(observation: dict, reason: str) -> None:
-    """Print the current refusal reason to the job log at most once per minute; never wait silently."""
+    """Log every refusal: a new kind of reason at once, a repeated one at most once per minute.
+
+    Numbers inside a reason (free MiB, utilization percent) do not make it a new kind, so a
+    steady refusal cannot flood the log, and a wait is never silent.
+    """
     now = time.monotonic()
-    if now - observation.get('_last_notice', float('-inf')) >= WAIT_NOTICE_SECONDS:
+    kind = re.sub(r'\d+', 'N', reason)
+    if (kind != observation.get('_last_kind')
+            or now - observation.get('_last_notice', float('-inf')) >= WAIT_NOTICE_SECONDS):
         observation['_last_notice'] = now
+        observation['_last_kind'] = kind
         print('CUDA admission waiting: ' + reason, file=sys.stderr, flush=True)
 
 
@@ -479,6 +486,20 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
                 'admission_wait': dict(observation)})
         try:
             devices, processes = reader(output, 'model-proof-claimed-device', deadline)
+        except (subprocess.TimeoutExpired, TimeoutError) as error:
+            # A slow driver query is an inventory failure, not a refusal: log it and retry within
+            # the claim deadline. Every other inventory error still refuses at once.
+            observation['inventory_timeouts'] = observation.get('inventory_timeouts', 0) + 1
+            observation['last_inventory_timeout'] = str(error)[:512]
+            observation['last_refusal'] = 'nvidia-smi inventory query timed out'
+            _wait_notice(notice, f'{uuid}: nvidia-smi inventory query timed out; retrying')
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                pause = min(policy.poll_millis / 1000, remaining)
+                pause_unlocked(pause)
+                observation['inventory_timeout_wait_seconds'] = (
+                    observation.get('inventory_timeout_wait_seconds', 0.) + pause)
+            continue
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': str(error),
                                      'admission_wait': dict(observation)}) from error
@@ -506,9 +527,11 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
         observation['headroom_shortfalls'] += 1
         observation.setdefault('first_shortfall', diagnostic)
         card = diagnostic.get('selected_card') or {}
-        _wait_notice(notice, f"{uuid}: {card.get('free_mib')} MiB free < "
-                             f"{-(-(policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes) // 1024**2)} MiB "
-                             'required (reserve + child cap); foreign activity is not a refusal reason')
+        reason = (f"{card.get('free_mib')} MiB free < "
+                  f"{-(-(policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes) // 1024**2)} MiB "
+                  'required (reserve + child cap); foreign activity is not a refusal reason')
+        observation['last_refusal'] = reason
+        _wait_notice(notice, f'{uuid}: {reason}')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             continue
@@ -553,6 +576,7 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
             else:
                 raise
             observation['stable_sample_restarts'] += 1
+            observation['last_refusal'] = reason
             _wait_notice(notice, f'{uuid}: restarting stable sampling: {reason}')
             remaining = deadline - time.monotonic()
             if remaining > 0:
@@ -586,6 +610,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
     `require_owned_completion` makes the release seal also require the supervisor's owned-Job
     completion record (the registry runner retains it); other callers' supervisors reap their
     own trees before the claim exits.
+
+    A busy or short card is a queueing condition: the lock, headroom and quiet-window waits
+    continue until the claim deadline, logging each refusal reason, and the deadline refusal
+    records the last one.
 
     A hosted Mac/Linux worker is an isolated Actions execution environment. The provisioned
     Mac route claims the shared host-global cooperative POSIX lease in addition to its runner
