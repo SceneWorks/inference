@@ -197,20 +197,23 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
     if exited_mid_attempt:
         dedicated, = gaps
         shared_last = raw["wddm_shared"]["samples"][-1][0] if raw["wddm_shared"]["samples"] else None
-        # The missed dedicated read shares its tick with the attempt's card-wide
-        # upper bound. That bound must sit below the recorded dedicated peak, and
-        # the shared gauge must have no reading after the gap began.
+        # The attempt's card-wide upper bound must sit at or below the recorded
+        # dedicated peak, and the whole attempt (card read, missed dedicated read
+        # and retry, failed membership check) must fit in one poll interval, the
+        # resolution of every other sample. The shared gauge must have no reading
+        # after the gap began.
         peak = max(value for _, value in guard["cuda_attribution"]["wddm_dedicated"]["samples"])
-        if not (dedicated["start_ns"] == final["read_ns"] and dedicated["end_ns"] <= final["at_ns"]
+        if not (final["at_ns"] - final["read_ns"] <= tick_ns
                 and shared_last is not None
                 and dedicated["previous"][0] <= shared_last < dedicated["local_filetime_before"]
                 and final["global_used_upper_bytes"] <= peak):
             raise UnverifiedOrderedZero("dedicated gap before the Job exit is unbounded or out of order")
         return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])
     dedicated, shared = gaps
-    # KeepSystemGrowth reads first. PairCudaProbe polls dedicated before it rejects
+    # KeepSystemGrowth reads first (the loop bounds both gaps by its read_ns).
+    # PairCudaProbe polls dedicated before it rejects
     # the pool. The observer then polls shared before recording the rejected attempt.
-    if not (dedicated["start_ns"] == final["read_ns"] and dedicated["end_ns"] <= shared["start_ns"]
+    if not (dedicated["end_ns"] <= shared["start_ns"]
             and dedicated["local_filetime_after"] <= shared["local_filetime_before"]
             and shared["end_ns"] == final["at_ns"]):
         raise UnverifiedOrderedZero("terminal gauge timestamps contradict the original synchronous read order")

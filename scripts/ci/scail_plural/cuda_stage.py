@@ -440,11 +440,13 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         "dedicated_missing_after_output": ded["missing_active_polls"],
         "shared_missing_after_output": shared["missing_active_polls"],
     }
-    # On Windows the source read and the first unavailable PDH reading can
-    # share a monotonic tick. Only the serialized final attempt and actual Job
-    # exit establish their order; the ordinary strict interval still applies otherwise.
-    tied = fresh_cuda and end.get("rejected_growth") and any(
-        not e["recovered"] and e["start_ns"] == last_used
+    # A dedicated gap inside the final rejected attempt (from its source read,
+    # which can share a monotonic tick, through its record) is ordered only by
+    # the serialized attempt and the actual Job exit. The ordinary strict
+    # interval applies to gaps outside it.
+    final = (end.get("rejected_growth") or [None])[-1]
+    tied = fresh_cuda and final is not None and any(
+        not e["recovered"] and final["read_ns"] <= e["start_ns"] <= final["at_ns"]
         for e in raw["wddm_retry"]["dedicated"]["events"]
     )
     if archived_owned_zero or tied:

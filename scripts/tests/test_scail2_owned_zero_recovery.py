@@ -90,26 +90,53 @@ class OwnedZeroRecovery(unittest.TestCase):
         self.assertEqual((result["terminal_rejected_read_ns"], result["terminal_rejected_at_ns"]), (325, 330))
         self.assertEqual((result["dedicated_missing_after_output"], result["shared_missing_after_output"]), (1, 0))
         self.assertEqual(result, scope(guard, pool, claim))
+        # The card-wide bound may equal the recorded peak, and the missed read may
+        # start after the source read within the same attempt.
+        final = guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]
+        final["global_used_upper_bytes"] = 50
+        guard["fit_observation"]["wddm_retry"]["dedicated"]["events"][0]["start_ns"] = 326
+        self.assertEqual(scope(guard, pool, claim, archived=False, fresh=True), scope(guard, pool, claim))
 
     def test_dedicated_gap_that_could_hide_a_peak_or_misplace_the_exit_is_rejected(self):
-        for problem in ("unbounded", "shared-gap", "shared-after-gap", "still-member", "late-gap"):
+        for problem in ("unbounded", "unbounded-later-gap", "shared-gap", "shared-after-gap", "shared-lagging",
+                        "shared-events-without-attempts", "still-member", "late-gap", "slow-attempt"):
             with self.subTest(problem=problem):
                 guard, pool, claim = self._exited_between_gauges()
                 raw = guard["fit_observation"]
                 final = raw["cuda_render_end"]["rejected_growth"][-1]
+                gap = raw["wddm_retry"]["dedicated"]["events"][0]
+                reason = "."
                 if problem == "unbounded":
                     # The card-wide bound at the missed tick exceeds every recorded dedicated sample.
                     final["global_used_upper_bytes"] = 51
+                elif problem == "unbounded-later-gap":
+                    # A missed read one nanosecond after the source read is still in the final
+                    # attempt and must meet the same bound on the fresh path.
+                    final["global_used_upper_bytes"] = 51
+                    gap["start_ns"] = 326
                 elif problem == "shared-gap":
                     raw["wddm_shared"]["missing_active_polls"] = 1
                 elif problem == "shared-after-gap":
                     raw["wddm_shared"]["samples"].append([181, 6])
+                elif problem == "shared-lagging":
+                    # The shared gauge's last reading predates the dedicated gauge's previous one.
+                    raw["wddm_shared"]["samples"][-1][0] = 169
+                elif problem == "shared-events-without-attempts":
+                    raw["wddm_retry"]["shared"]["events"].append(dict(gap, start_ns=330, end_ns=330))
                 elif problem == "still-member":
+                    # The membership check passed, so the root was still a Job member after the
+                    # missed dedicated read. The shared gauge then needs its own located gap.
                     final["detail"] = stage.RejectedPoolSample.EXCEEDS_CURRENT_USAGE
+                    reason = "exactly one located terminal WDDM gap per gauge"
+                elif problem == "slow-attempt":
+                    # The attempt outlasts one poll interval, so usage could grow unobserved. A
+                    # zero interval keeps the gap's own clocks valid and isolates the attempt bound.
+                    guard["admission"]["pollMillis"] = 0
+                    gap.update(start_ns=330, end_ns=330, local_filetime_after=gap["local_filetime_before"])
                 else:
-                    raw["wddm_retry"]["dedicated"]["events"][0]["end_ns"] = 335
+                    gap["end_ns"] = 335
                 self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, reason):
                     scope(guard, pool, claim)
 
     def test_other_reads_earlier_gaps_or_unverified_release_do_not_qualify(self):
