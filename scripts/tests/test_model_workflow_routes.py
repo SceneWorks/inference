@@ -147,7 +147,9 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertIn("matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
         self.assertEqual(source["with"]["path"], "${{ env.MODEL_PROOF_CWD }}")
         self.assertEqual(source["with"]["ref"], "${{ github.sha }}")
-        self.assertEqual(source["with"]["fetch-depth"], "${{ matrix.paired_source && '0' || '1' }}")
+        self.assertEqual(source["with"]["fetch-depth"],
+                         "${{ matrix.paired_source && '0' || (env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py'"
+                         " || env.MODEL_PROOF_SCRIPT == 'sga_terminal_comparison.py') && '128' || '1' }}")
         self.assertIs(source["with"]["persist-credentials"], False)
         self.assertLess(steps.index(create), steps.index(source))
         self.assertEqual(cleanup["if"], "always() && steps.fresh_checkout.outcome == 'success'")
