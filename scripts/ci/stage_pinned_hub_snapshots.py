@@ -296,10 +296,10 @@ def hub_root(env: dict[str, str], plan: dict) -> Path:
     if uses_native_hub(plan):
         from scripts.ci.scail_plural import contract as plural
 
-        if (plan["request"]["selection"] != plural.SELECTION
-                or env.get("RUNNER_NAME") != "nax-macos-2" or env.get("RUNNER_OS") != "macOS"
+        # The runs-on labels choose the Mac; either self-hosted Mac stages into its own home cache.
+        if (plan["request"]["selection"] != plural.SELECTION or env.get("RUNNER_OS") != "macOS"
                 or env.get("MODEL_PROOF_RUNNER_ENVIRONMENT") != "self-hosted"):
-            raise ValueError("SCAIL-2 MLX qualification requires the secondary nax-macos-2 runner")
+            raise ValueError("SCAIL-2 MLX qualification requires the self-hosted macOS proof route")
         home = runner_account_home()
         hub = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
         tier = snapshot_dir(hub, plural.REPO, plural.REV) / "q4"

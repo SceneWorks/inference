@@ -611,19 +611,22 @@ class ScailPluralCache(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.home = Path(directory.name).resolve()
-        self.env = {"RUNNER_NAME": "nax-macos-2", "RUNNER_OS": "macOS",
+        self.env = {"RUNNER_NAME": "secondary-mac", "RUNNER_OS": "macOS",
                     "MODEL_PROOF_RUNNER_ENVIRONMENT": "self-hosted",
                     "MODEL_PROOF_HUB_ROOT": str(self.home / "configured")}
         self.cache = self.home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
 
-    def test_only_exact_secondary_mac_plan_uses_the_persistent_cache(self):
+    def test_only_the_self_hosted_mac_plan_uses_the_persistent_cache(self):
         with patch.object(staging, "runner_account_home", return_value=self.home):
             for _ in range(2):
                 self.assertEqual(staging.hub_root(self.env, self.plan), self.cache)
             self.assertEqual(list(self.cache.rglob(".publish-check-*")), [])
-            for name, value in (("RUNNER_NAME", "nax-macos"), ("RUNNER_OS", "Linux"),
-                                ("MODEL_PROOF_RUNNER_ENVIRONMENT", "github-hosted")):
-                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "nax-macos-2"):
+            # Labels choose the Mac (SW-7218): the runner name is never a placement rule.
+            for runner in ("nax-macos", "any-relabelled-mac"):
+                with self.subTest(runner=runner):
+                    self.assertEqual(staging.hub_root(dict(self.env, RUNNER_NAME=runner), self.plan), self.cache)
+            for name, value in (("RUNNER_OS", "Linux"), ("MODEL_PROOF_RUNNER_ENVIRONMENT", "github-hosted")):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "self-hosted macOS proof route"):
                     staging.hub_root(dict(self.env, **{name: value}), self.plan)
         for other in (dict(self.plan, backend="candle-cuda"), {"asset_setup": "hub-snapshots"}):
             self.assertEqual(staging.hub_root(self.env, other), Path(self.env["MODEL_PROOF_HUB_ROOT"]))

@@ -289,10 +289,9 @@ def execute(args, contract):
         adapter = receipt["adapter"] = (
             tier1.cuda_adapter(approved) if backend == "candle-cuda" else None
         )
-        if backend == "mlx" and (
-            receipt["runner"] != "nax-macos-2" or hw["chip"] != "Apple M5 Max"
-        ):
-            raise ValueError("wrong secondary Mac")
+        # The runs-on labels choose the Mac; RUNNER_NAME is recorded provenance only.
+        if backend == "mlx" and hw["chip"] != "Apple M5 Max":
+            raise ValueError("wrong proof Mac hardware")
         if backend == "candle-cuda":
             c.validate_cuda_hardware(hw, approved.cuda_device_uuid)
         expected_device = c.cuda_identity(hw, adapter) if approved.cuda_device_uuid == c.GPU0 else None
