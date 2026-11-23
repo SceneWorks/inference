@@ -2698,9 +2698,12 @@ impl FeatureRouteStructure {
             && has_packed_latent_space
             && pixel_stride.is_some_and(|stride| stride > 0)
             && token_width.is_some_and(|width| width > 0);
-        let supports_clean_estimate_renoise_transition = has_render_plan
-            && supports_spatial_unpack_repack
-            && default_executed_steps.is_some_and(|steps| steps >= 2);
+        // The driver must explicitly support resizing and re-noising the packed trajectory.
+        let supports_clean_estimate_renoise_transition =
+            descriptor.capabilities.supports_low_res_start
+                && has_render_plan
+                && supports_spatial_unpack_repack
+                && default_executed_steps.is_some_and(|steps| steps >= 2);
         let supports_multiphase_denoise = descriptor.capabilities.supports_phases;
         let supports_produced_reference_multipass = has_render_plan
             && has_packed_image_trajectory
@@ -5410,6 +5413,7 @@ mod tests {
                     min_size: 256,
                     max_size: 2048,
                     max_count: 1,
+                    supports_low_res_start: true,
                     ..Default::default()
                 },
             }
@@ -5429,6 +5433,17 @@ mod tests {
         );
         assert_eq!(full_app.to_json()["applicable"], true);
         assert_eq!(full_app.to_json()["parameter_schema"]["k"]["max"], 3);
+
+        let mut without_transition = full_desc.clone();
+        without_transition.capabilities.supports_low_res_start = false;
+        let ordinary_route =
+            FeatureRouteStructure::from_descriptor_and_plan(&without_transition, Some(&planner));
+        assert!(ordinary_route.has_render_plan);
+        assert!(ordinary_route.supports_spatial_unpack_repack);
+        let ordinary_app = LowResStartFeature.applicability(&ordinary_route);
+        assert!(!ordinary_app.applicable);
+        assert!(ordinary_app.reasons.iter().any(|reason| reason.code
+            == FeatureInapplicabilityCode::MissingCleanEstimateRenoiseTransition));
 
         // 1. Remove the RenderPlanRegistration -> flips to false with `missing_render_plan`.
         let without_plan = FeatureRouteStructure::from_descriptor_and_plan(&full_desc, None);
@@ -5532,6 +5547,7 @@ mod tests {
                     min_size: 256,
                     max_size: 2048,
                     max_count: 1,
+                    supports_low_res_start: true,
                     ..Default::default()
                 },
             }
