@@ -136,6 +136,48 @@ class ModelWorkflowRoutes(unittest.TestCase):
                 self.assertEqual(row["video_plan_sha256"], digest if fresh else "")
         self.assertEqual(workflow["jobs"]["prove"]["env"]["VIDEO_TIER1_PLAN_SHA256"], "${{ matrix.video_plan_sha256 }}")
 
+    def test_local_proof_actions_resolve_from_an_exact_checkout_on_a_clean_windows_workspace(self):
+        # `uses: ./...` resolves against GITHUB_WORKSPACE, not MODEL_PROOF_CWD. On a clean
+        # workspace only directories that an earlier checkout of this exact revision created exist.
+        from scripts.tests.test_ci_workflow_policy import evaluate_condition
+
+        job = document("model-inference-proofs.yml")["jobs"]["prove"]
+        cwd = job["env"]["MODEL_PROOF_CWD"]
+        self.assertEqual(cwd, "${{ matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, "
+                              "github.run_attempt) || '.' }}")
+        for fresh in (True, False):
+            for os_name in ("Windows", "macOS", "Linux"):
+                with self.subTest(fresh_source=fresh, os=os_name):
+                    values = {"runner.os": os_name, "matrix.fresh_source": fresh,
+                              "matrix.paired_source": fresh, "matrix.asset_setup": "hub-snapshots"}
+                    model_cwd = "paired-src-7-1" if fresh else "."
+                    checkouts, actions = [], []
+                    for step in job["steps"]:
+                        uses = step.get("uses", "")
+                        if not (uses.startswith("actions/checkout@") or uses.startswith("./")):
+                            continue
+                        if "if" in step and not evaluate_condition(step["if"], values):
+                            continue
+                        if uses.startswith("./"):
+                            actions.append(uses)
+                            top = posixpath.normpath(uses).split("/")[0]
+                            exact = [path for path, ref in checkouts if ref == "${{ github.sha }}"]
+                            root = "." if top.startswith(".") else top
+                            self.assertIn(root, exact, f"{uses} has no exact checkout at {root}")
+                            continue
+                        path = step.get("with", {}).get("path", ".")
+                        path = model_cwd if path == "${{ env.MODEL_PROOF_CWD }}" else path
+                        checkouts.append((posixpath.normpath(path), step.get("with", {}).get("ref")))
+                    windows = os_name == "Windows"
+                    self.assertEqual(len(actions), int(windows))
+                    if windows and fresh:
+                        self.assertEqual(actions, ["./proof-storage-action/.github/actions/cleanup-runner-storage"])
+                        sparse = next(s for s in job["steps"] if s.get("with", {}).get("path") == "proof-storage-action")
+                        self.assertEqual(sparse["with"]["sparse-checkout"], ".github/actions/cleanup-runner-storage")
+                        self.assertIs(sparse["with"]["persist-credentials"], False)
+                    elif windows:
+                        self.assertEqual(actions, ["./.github/actions/cleanup-runner-storage"])
+
     @unittest.skipUnless(os.name == "posix", "uses local Git and Bash; does not contact Actions")
     def test_paired_and_scail_checkouts_survive_a_reused_promisor_repository(self):
         job = document("model-inference-proofs.yml")["jobs"]["prove"]

@@ -150,8 +150,26 @@ jobs:
           fetch-depth: ${{ matrix.paired_source && '0' || (env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py' || env.MODEL_PROOF_SCRIPT == 'sga_terminal_comparison.py') && '128' || '1' }}
           persist-credentials: false
       - name: Own disposable Windows proof storage
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !matrix.fresh_source
         uses: ./.github/actions/cleanup-runner-storage
+        with:
+          dev-host: 'true'
+      # A fresh-source checkout lives under MODEL_PROOF_CWD, but `uses: ./...` always resolves
+      # against GITHUB_WORKSPACE and cannot take an expression. Check out only the storage action
+      # at this exact revision into a fixed path, so a clean workspace has it and a reused one
+      # cannot run a stale copy.
+      - name: Check out the storage action for the fresh proof checkout
+        if: runner.os == 'Windows' && matrix.fresh_source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: proof-storage-action
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: .github/actions/cleanup-runner-storage
+          persist-credentials: false
+      - name: Own disposable Windows proof storage for the fresh proof checkout
+        if: runner.os == 'Windows' && matrix.fresh_source
+        uses: ./proof-storage-action/.github/actions/cleanup-runner-storage
         with:
           dev-host: 'true'
       - name: Check out the exact pre-migration engine for the paired proof
