@@ -98,7 +98,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1205
+              "line": 1168
             }
           ],
           "creation": [
@@ -468,7 +468,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/ti2v.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 205
+              "line": 208
             }
           ],
           "product_residency": "sequential",
@@ -517,7 +517,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 12
+              "line": 13
             }
           ],
           "product_residency": "sequential",
@@ -575,7 +575,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 12
+              "line": 13
             }
           ],
           "product_residency": "sequential",
