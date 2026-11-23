@@ -4,7 +4,8 @@
 //! `QuantizedEmbedding`, and `quantize_on_stored_grid` below both media and LLM runtimes while
 //! preserving `Projection::{Dense, Quantized, Prism}`'s exact operation order (`AP13 class (a)`).
 
-use mlx_rs::ops::{add, dequantize, matmul, quantize, quantized_matmul};
+use crate::quantization_cache::quantize_cached as quantize;
+use mlx_rs::ops::{add, dequantize, matmul, quantized_matmul};
 use mlx_rs::{Array, Dtype};
 use thiserror::Error;
 

@@ -696,6 +696,24 @@ fn bind_layout_with_dtypes(
     Ok(())
 }
 
+/// Make a row-major weight view before exposing its bytes to a persistent cache key.
+pub fn contiguous_weight(x: &mlx_rs::Array) -> crate::Result<mlx_rs::Array> {
+    let stream = mlx_rs::StreamOrDevice::default();
+    // SAFETY: MLX initializes an owned handle on success; the empty handle is released on failure.
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status =
+            mlx_sys::mlx_contiguous(&mut result, x.as_ptr(), false, stream.as_ref().as_ptr());
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(crate::Error::Msg(
+                "mlx_contiguous failed while making a row-major copy".into(),
+            ));
+        }
+        Ok(mlx_rs::Array::from_ptr(result))
+    }
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;

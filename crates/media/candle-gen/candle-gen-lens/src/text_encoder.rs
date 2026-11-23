@@ -37,7 +37,7 @@
 //! are parity-gated against the bf16 floor.
 
 use candle_gen::attention::repeat_kv;
-use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_gen::candle_core::quantized::{GgmlDType, QMatMul};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::candle_nn::{
     embedding, linear, linear_no_bias, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding,
@@ -636,13 +636,13 @@ impl SparseMoe {
                         .reshape((h, i))?;
                         Ok(Expert {
                             gate_up_proj: ExpertProj::Quant {
-                                w: QMatMul::from_qtensor(QTensor::quantize_onto(
+                                w: QMatMul::from_qtensor(candle_gen::quant::quantize_cached(
                                     &guw, ggml, &dev,
                                 )?)?,
                                 bias: gate_up_b.i(x)?.contiguous()?,
                             },
                             down_proj: ExpertProj::Quant {
-                                w: QMatMul::from_qtensor(QTensor::quantize_onto(
+                                w: QMatMul::from_qtensor(candle_gen::quant::quantize_cached(
                                     &dnw, ggml, &dev,
                                 )?)?,
                                 bias: down_b.i(x)?.contiguous()?,
@@ -1431,6 +1431,7 @@ fn check_reasoner_cancel(cancel: &CancelFlag) -> candle_gen::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::quantized::QTensor;
     use candle_gen::testkit::tensor_cosine;
 
     fn streamable_encoder_without_layer_files() -> GptOssTextEncoder {

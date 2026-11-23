@@ -24,12 +24,13 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::ops::{
     add, argsort_axis, broadcast_to, concatenate_axis, cos as cos_op, divide, floor_divide,
-    gather_mm, gather_qmm, matmul, max_axes, maximum, minimum, multiply, quantize, sigmoid,
-    sin as sin_op, softmax_axis, split, split_sections, subtract, sum_axes,
+    gather_mm, gather_qmm, matmul, max_axes, maximum, minimum, multiply, sigmoid, sin as sin_op,
+    softmax_axis, split, split_sections, subtract, sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::quant::quantize_cached as quantize;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 

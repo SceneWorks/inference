@@ -289,3 +289,7 @@ impl NativeProjection {
         }
     }
 }
+
+pub mod quantization_cache;
+
+pub use source::contiguous_weight;

@@ -948,11 +948,11 @@ impl QLinear {
             // `Quant::Nvfp4` (no GGUF representation), so a stray `quantize(Nvfp4)` bails here rather
             // than mis-quantizing to `Q4_0`/`Q8_0`.
             MatmulStrategy::DequantDense => {
-                let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant)?, &device)?;
+                let qtensor = crate::quantization_cache::quantize_cached(&w_cpu, ggml_dtype(quant)?, &device)?;
                 QuantWeight::Dequant(std::sync::Arc::new(qtensor))
             }
             MatmulStrategy::Int8Fast => {
-                let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant)?, &device)?;
+                let qtensor = crate::quantization_cache::quantize_cached(&w_cpu, ggml_dtype(quant)?, &device)?;
                 QuantWeight::Matmul(QMatMul::from_qtensor(qtensor)?)
             }
             // NVFP4 is not a GGUF `QTensor` fold target — its weight comes from the offline packer
@@ -1389,7 +1389,7 @@ pub fn repack_packed_weight(
         8 => {
             let grid = dequant_mlx_q8_gs(wq, scales, biases, group_size)?;
             // `quantize_onto` needs a CPU source; `dequant_mlx_q8_gs` already returns on the CPU.
-            QTensor::quantize_onto(&grid, GgmlDType::Q8_0, device)
+            crate::quantization_cache::quantize_cached(&grid, GgmlDType::Q8_0, device)
         }
         b => candle_core::bail!(
             "unsupported MLX packed bit-width {b} (wq {wq_cols}, scales {s_cols}, group {group_size})"

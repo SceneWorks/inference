@@ -4,7 +4,8 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path};
 
-use mlx_rs::ops::{dequantize, quantize};
+use crate::quantization_cache::quantize_cached as quantize;
+use mlx_rs::ops::dequantize;
 use mlx_rs::{Array, Dtype};
 
 use crate::adapters::AdaptableLinear;
