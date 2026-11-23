@@ -13,6 +13,10 @@
 //! [`crate::generate::Scail2Job::additional`] in caller order. The generic
 //! [`Conditioning::MultiReference`] image vector is advertised for routing but is deliberately refused:
 //! it cannot carry the mandatory per-character masks.
+//!
+//! [`Conditioning::Reference`]: gen_core::Conditioning::Reference
+//! [`Conditioning::Mask`]: gen_core::Conditioning::Mask
+//! [`Conditioning::MultiReference`]: gen_core::Conditioning::MultiReference
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
