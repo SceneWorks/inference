@@ -18,6 +18,8 @@ def fixture():
     raw = guard["fit_observation"]
     end = raw["cuda_render_end"]
     end["rejected_growth"][-1]["after"] = end["zero"]["before"] = "exited_empty"
+    # The final attempt's card-wide bound stays within the recorded dedicated peak (50).
+    end["rejected_growth"][-1]["global_used_upper_bytes"] = 50
     gaps = [raw["wddm_retry"][k]["events"][0] for k in ("dedicated", "shared")]
     gaps[0].update(start_ns=325, end_ns=330)
     gaps[1].update(start_ns=330, end_ns=340, local_filetime_before=185, local_filetime_after=190)
@@ -52,6 +54,13 @@ class OwnedZeroRecovery(unittest.TestCase):
         guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]["free_bytes"] = 1
         with self.assertRaises(ValueError):
             scope(guard, pool, claim, archived=False, fresh=True)
+
+    def test_fresh_terminal_gap_above_its_card_bound_is_not_located(self):
+        guard, pool, claim = fixture()
+        guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]["global_used_upper_bytes"] = 51
+        self.assertIsNone(scope(guard, pool, claim, archived=False, fresh=True))
+        # The authenticated archives keep their original pinned contract.
+        self.assertIsNotNone(scope(guard, pool, claim))
 
     def test_fresh_strict_post_output_gap_validates_both_clocks(self):
         for gauge in ("dedicated", "shared"):

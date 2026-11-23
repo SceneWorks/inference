@@ -69,6 +69,28 @@ def unsampled_launch_reads(card, samples):
     return 1 if 0 < leading < len(card) and before_allocation == leading - 1 else 0
 
 
+def bounded_terminal_gap(guard, attempt):
+    """A WDDM read missed in the final attempt is bounded by that attempt's own card read.
+
+    Windows removes a process's GPU Process Memory instance when the process
+    closes its last adapter handle, which precedes its exit. A teardown read in
+    that window finds no instance however it is retried. The attempt's card-wide
+    upper bound covers the missed read only when it sits at or below the recorded
+    dedicated peak and the attempt fits in one poll interval.
+    """
+    peak = max(value for _, value in guard["cuda_attribution"]["wddm_dedicated"]["samples"])
+    return (attempt["at_ns"] - attempt["read_ns"] <= guard["admission"]["pollMillis"] * 1_000_000
+            and attempt["global_used_upper_bytes"] <= peak)
+
+
+def paired_gauges(guard):
+    """Every attempt that read dedicated memory read shared memory next, and no other."""
+    ded = guard["cuda_attribution"]["wddm_dedicated"]["samples"]
+    shared = guard["fit_observation"]["wddm_shared"]["samples"]
+    return (len(ded) == len(shared) and all(d[0] <= s[0] for d, s in zip(ded, shared))
+            and all(s[0] < d[0] for s, d in zip(shared, ded[1:])))
+
+
 def validate_guard_samples(guard, end, card):
     admission = guard["admission"]
     reserve, cap = admission["gpuFreeReserveBytes"], admission["childGpuCapBytes"]
@@ -82,6 +104,7 @@ def validate_guard_samples(guard, end, card):
 
 def terminal_scope(guard, end, pool, card, claim, basis):
     from scripts.ci.scail_plural.cuda_stage import validate_rejected_growth
+    from scripts.ci.flux1_pair.cuda_probe import RejectedPoolSample
 
     mark = end["pool"]
     events = end["rejected_growth"]
@@ -102,11 +125,19 @@ def terminal_scope(guard, end, pool, card, claim, basis):
     tick_ns = guard["admission"]["pollMillis"] * 1_000_000
     counts = {}
     gaps = {}
+    # PairCudaProbe reads dedicated memory, then checks Job membership. An invalid
+    # allocation with an exited Job means the root left before that check, so the
+    # shared read that follows, and a dedicated read without a located gap, had no
+    # process to observe. Paired gauge timestamps rule out a sample from that attempt.
+    exited = final[-1]["detail"] == RejectedPoolSample.INVALID_ALLOCATION and final[-1]["after"] == "exited_empty"
+    if exited and not paired_gauges(guard):
+        raise ValueError("unlocated WDDM gap during render")
     for key, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]), ("shared", raw["wddm_shared"])):
         unresolved = [e for e in raw["wddm_retry"][key]["events"] if not e["recovered"]]
+        unobservable = int(exited and not unresolved)
         if (len(unresolved) != series["missing_active_polls"] or len(unresolved) > 1
                 or len(series["samples"]) + len(unresolved)
-                != len(card) + len(events) - unsampled_launch_reads(card, series["samples"])):
+                != len(card) + len(events) - unsampled_launch_reads(card, series["samples"]) - unobservable):
             # Each actual card attempt polled both gauges. A missing live
             # observation anywhere else would make this narrower witness unsafe.
             raise ValueError("unlocated WDDM gap during render")
@@ -122,6 +153,8 @@ def terminal_scope(guard, end, pool, card, claim, basis):
                     and gap["local_filetime_before"] >= series["samples"][-1][0]):
                 raise ValueError("WDDM gap is outside the final post-output CUDA attempt")
         counts[key+"_missing_after_output"] = len(unresolved)
+    if gaps and basis == "owned-job-completion" and not bounded_terminal_gap(guard, final[-1]):
+        raise ValueError("WDDM gap in the final CUDA attempt is not bounded by its card read")
     if ("dedicated" in gaps and "shared" in gaps
             and (gaps["dedicated"]["end_ns"] > gaps["shared"]["start_ns"]
                  or gaps["dedicated"]["local_filetime_after"] > gaps["shared"]["local_filetime_before"])):
@@ -197,16 +230,9 @@ def ordered_owned_zero(guard, end, card, claim, last_used, *, last_rejection_liv
     if exited_mid_attempt:
         dedicated, = gaps
         shared_last = raw["wddm_shared"]["samples"][-1][0] if raw["wddm_shared"]["samples"] else None
-        # The attempt's card-wide upper bound must sit at or below the recorded
-        # dedicated peak, and the whole attempt (card read, missed dedicated read
-        # and retry, failed membership check) must fit in one poll interval, the
-        # resolution of every other sample. The shared gauge must have no reading
-        # after the gap began.
-        peak = max(value for _, value in guard["cuda_attribution"]["wddm_dedicated"]["samples"])
-        if not (final["at_ns"] - final["read_ns"] <= tick_ns
-                and shared_last is not None
-                and dedicated["previous"][0] <= shared_last < dedicated["local_filetime_before"]
-                and final["global_used_upper_bytes"] <= peak):
+        # The shared gauge must have no reading after the gap began.
+        if not (bounded_terminal_gap(guard, final) and shared_last is not None
+                and dedicated["previous"][0] <= shared_last < dedicated["local_filetime_before"]):
             raise UnverifiedOrderedZero("dedicated gap before the Job exit is unbounded or out of order")
         return dict(terminal_rejected_read_ns=final["read_ns"], terminal_rejected_at_ns=final["at_ns"])
     dedicated, shared = gaps

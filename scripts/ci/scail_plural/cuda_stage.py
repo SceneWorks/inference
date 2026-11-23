@@ -450,7 +450,8 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         for e in raw["wddm_retry"]["dedicated"]["events"]
     )
     if archived_owned_zero or tied:
-        from scripts.ci.scail_plural.completed_job import ordered_owned_zero, UnverifiedOrderedZero
+        from scripts.ci.scail_plural.completed_job import (
+            UnverifiedOrderedZero, bounded_terminal_gap, ordered_owned_zero)
         claim, _ = completed_job
         try:
             scope.update(ordered_owned_zero(guard, end, card, claim, last_used,
@@ -458,6 +459,9 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=N
         except UnverifiedOrderedZero:
             if archived_owned_zero:
                 raise
+            return None
+        # A fresh run also prices the missed teardown read by the attempt's card read.
+        if tied and not archived_owned_zero and not bounded_terminal_gap(guard, final):
             return None
         return scope
     for key, series in (("dedicated", ded), ("shared", shared)):

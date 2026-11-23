@@ -25,7 +25,9 @@ def completed_fixture():
     end = raw["cuda_render_end"]
     end["zero"] = None
     tail = end["rejected_growth"]
-    tail.extend((dict(tail[-1], read_ns=345, at_ns=355), dict(tail[-1], read_ns=375, at_ns=390)))
+    # The final attempt's card-wide bound (50) stays within the recorded dedicated peak (50).
+    tail.extend((dict(tail[-1], read_ns=345, at_ns=355),
+                 dict(tail[-1], read_ns=375, at_ns=390, global_used_upper_bytes=50)))
     guard["cuda_attribution"]["unknown_pid_polls"] += 2
     for series, name in ((guard["cuda_attribution"]["wddm_dedicated"], "dedicated"), (raw["wddm_shared"], "shared")):
         series["samples"] = [[i, 10] for i in range(100, 104)] + series["samples"]
@@ -174,6 +176,49 @@ class CompletedJob(unittest.TestCase):
         guard, pool, claim = completed_fixture()
         guard["cuda_attribution"]["wddm_dedicated"]["samples"].pop(-2)
         with self.assertRaises(ValueError):
+            scope(guard, pool, claim)
+
+    def _exited_before_final_reads(self):
+        # Run 45281400027 count 4: the final attempt's card read saw 1 MiB of child growth, then
+        # the root had left the Job before either WDDM gauge read it (invalid allocation, Job
+        # exited empty). Neither gauge could observe that attempt, and none recorded a gap.
+        guard, pool, claim = completed_fixture()
+        raw = guard["fit_observation"]
+        raw["cuda_render_end"]["rejected_growth"][-1].update(
+            detail=cuda_stage.RejectedPoolSample.INVALID_ALLOCATION, after="exited_empty")
+        for name, series in (("dedicated", guard["cuda_attribution"]["wddm_dedicated"]),
+                             ("shared", raw["wddm_shared"])):
+            raw["wddm_retry"][name] = {"attempts": 0, "events": []}
+            series["missing_active_polls"] = 0
+        return guard, pool, claim
+
+    def test_final_attempt_after_the_job_exit_needs_no_wddm_reading(self):
+        guard, pool, claim = self._exited_before_final_reads()
+        result = scope(guard, pool, claim)
+        self.assertEqual((result["dedicated_missing_after_output"], result["shared_missing_after_output"]), (0, 0))
+        for problem in ("unpaired", "missing-earlier", "still-member"):
+            with self.subTest(problem=problem):
+                guard, pool, claim = self._exited_before_final_reads()
+                raw = guard["fit_observation"]
+                ded = guard["cuda_attribution"]["wddm_dedicated"]["samples"]
+                if problem == "unpaired":
+                    # A shared reading before its dedicated pair: the gauges did not read the same attempts.
+                    raw["wddm_shared"]["samples"][-1][0] = ded[-1][0] - 1
+                elif problem == "missing-earlier":
+                    # A silently absent read during the render cannot hide behind the exit attempt.
+                    ded.pop(1)
+                    raw["wddm_shared"]["samples"].pop(1)
+                else:
+                    raw["cuda_render_end"]["rejected_growth"][-1]["detail"] = (
+                        cuda_stage.RejectedPoolSample.EXCEEDS_CURRENT_USAGE)
+                with self.assertRaises(ValueError):
+                    scope(guard, pool, claim)
+
+    def test_terminal_gap_must_be_bounded_by_its_attempts_card_read(self):
+        scope(*completed_fixture())  # bound equal to the recorded dedicated peak
+        guard, pool, claim = completed_fixture()
+        guard["fit_observation"]["cuda_render_end"]["rejected_growth"][-1]["global_used_upper_bytes"] = 51
+        with self.assertRaisesRegex(ValueError, "not bounded by its card read"):
             scope(guard, pool, claim)
 
     def test_only_exact_gpu0_continuation_adds_the_archived_pointer(self):
