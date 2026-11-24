@@ -15,8 +15,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as paired, model_inference_proofs as proof
 from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as evidence
 from scripts.ci import wddm_process_memory as wddm
-from scripts.ci.model_proof_resources import (CARD_SELECTION_RULE, CudaCardTaken, card_switcher, choose_card,
-                                              executed_card_policy,
+from scripts.ci.model_proof_resources import (CARD_SELECTION_RULE, choose_card, claim_chosen_card,
+                                              executed_card_policy, require_claimed_card,
                                               execution_claim, proof_cuda_shared_release,
                                               validate_shared_release_record)
 from scripts.ci.scail_plural import contract as c
@@ -206,7 +206,8 @@ def build(work, contract, policy):
     )
 
 
-def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved, head, *, completed_job=None, fresh_cuda=False):
+def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved, head, *, completed_job=None, fresh_cuda=False,
+                     card_free=False):
     if fresh_cuda and (completed_job is None or completed_job[1] != "owned-job-completion"):
         raise ValueError("fresh GPU 0 qualification requires the supervised Windows Job")
     if completed_job is not None:
@@ -216,7 +217,7 @@ def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved,
             raise ValueError("completed Job proof requires its registered physical GPU")
         if fresh_cuda and "cuda_device" not in native:
             raise ValueError("fresh qualification lacks the native CUDA identity")
-        require_release(claim, backend, hw, approved, fresh=fresh_cuda)
+        require_release(claim, backend, hw, approved, fresh=fresh_cuda, card_free=card_free)
         if basis == "owned-job-completion" and count in (c.COUNTS["candle-cuda"] if fresh_cuda else (2, 3, 4, 5)):
             validate_shared_release_record(claim, [{"supervision": guard}],
                 dict(backend=backend, **c.cuda_constraints(approved.cuda_device_uuid)))
@@ -231,7 +232,7 @@ def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved,
     return {"accepted": True, "candidate_row_pending_physical_review": candidate}
 
 
-def require_release(claim, backend, hardware, policy, *, fresh=False):
+def require_release(claim, backend, hardware, policy, *, fresh=False, card_free=False):
     if claim.get("post_execution_verified") is not True or (
         backend == "candle-cuda" and claim.get("lease_released") is not True
     ):
@@ -242,6 +243,11 @@ def require_release(claim, backend, hardware, policy, *, fresh=False):
             claim["physical_index"] != c.CUDA_INDICES[policy.cuda_device_uuid]
         ):
             raise ValueError("release belongs to a different physical CUDA device")
+        # The claim stated this campaign's device estimate (a claim from before claims recorded
+        # one carries none; a card-free campaign's claims always do).
+        if card_free and claim.get("claim_gpu_estimate") is None:
+            raise ValueError("card-free claim lacks its stated device estimate")
+        require_claimed_card(claim, {"cudaDeviceUuid": policy.cuda_device_uuid}, CARD_ESTIMATE)
         # Replay the prospective GPU 0 (or fresh either-card) admission and release samples.
         # Earlier GPU 1 archives keep their original release contract.
         if policy.cuda_device_uuid == c.GPU0 or fresh:
@@ -270,7 +276,8 @@ CARD_ESTIMATE = (c.CUDA_DEVICE_ESTIMATE_SOURCE, c.CUDA_DEVICE_ESTIMATE_BYTES)
 
 def select_card(backend, work, **selector):
     """No named card: every count runs on the registered card with the most free memory covering
-    the SCAIL device estimate plus reserve, chosen once so all counts share one card's hardware."""
+    the SCAIL device estimate plus reserve, chosen once so all counts share one card's hardware
+    (a card taken before the first count is claimed is switched; see claim_chosen_card)."""
     payload, record = choose_card(c.policy(backend), work, estimate=CARD_ESTIMATE, **selector)
     return payload["cudaDeviceUuid"], record
 
@@ -350,59 +357,67 @@ def execute(args, contract):
 
     try:
         policy_payload = contract["request"]["policy"]
-        if card_free:
-            chosen, receipt["cuda_card_selection"] = select_card(backend, work)
-            policy_payload = c.policy(backend, cuda_uuid=chosen)
-        approved, hw, adapter, expected_device = bind(policy_payload)
         stage = json.loads(Path(os.environ["MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"]).read_text(encoding="utf-8"))[
             "snapshots"
         ][c.SLOT]
         snapshot = Path(os.environ[c.SLOT])
         c.validate_stage(stage, snapshot)
         receipt["stage"] = stage
-        root, binary, build_env, receipt["build"] = build(work, contract, approved)
-        attempt = 0
+        # The build never touches a GPU; a card-free campaign builds before choosing its card so
+        # the selection and the first claim share one admission window.
+        build_payload = c.policy(backend, cuda_uuid=next(iter(c.CUDA_INDICES))) if card_free else policy_payload
+        root, binary, build_env, receipt["build"] = build(
+            work, contract, tier1.read_policy(work, "build-policy.json", build_payload))
+        first_deadline = time.monotonic() + 2520
+        if card_free:
+            # A child may start until 2430 s before its claim deadline; selection shares that window.
+            chosen, receipt["cuda_card_selection"] = select_card(backend, work, deadline_monotonic=first_deadline - 2430)
+            policy_payload = c.policy(backend, cuda_uuid=chosen)
+        approved, hw, adapter, expected_device = bind(policy_payload)
+        if backend == "candle-cuda":
+            build_env.update(CUDA_VISIBLE_DEVICES=approved.cuda_device_uuid)
+        bound = {"payload": policy_payload, "approved": approved, "hw": hw, "adapter": adapter,
+                 "expected_device": expected_device}
+
+        def rebind(payload):
+            """A card taken before the first count: run on the switched card's hardware instead."""
+            bound["payload"] = payload
+            bound["approved"], bound["hw"], bound["adapter"], bound["expected_device"] = bind(payload)
+            build_env.update(CUDA_VISIBLE_DEVICES=bound["approved"].cuda_device_uuid)
+
         for count, name in zip(contract["counts"], phases):
-            while True:
-                attempt += 1
-                claim_dir = work / (name + "-claim" + ("" if attempt == 1 else f"-{attempt}"))
-                claim_dir.mkdir()
-                claim_policy = tier1.read_policy(
-                    claim_dir, "policy.json", dict(policy_payload, deadlineSeconds=2520)
-                )
-                if backend == "candle-cuda":
-                    claim_policy = c.claim_estimate(claim_policy)
-                record = receipt["counts"][str(count)] = {"accepted": False}
-                deadline = time.monotonic() + 2520
-                # Until the first count holds its card, a taken card is swapped for the other one
-                # when that fits now; afterwards every count stays on that card (shared hardware).
-                abandon, switched = (card_switcher(contract["request"]["policy"], work,
-                                                   receipt["cuda_card_selection"], estimate=CARD_ESTIMATE)
-                                     if card_free and count == contract["counts"][0] else (None, None))
-                try:
-                    with execution_claim(
-                        backend, claim_policy, claim_dir, build_env, original_deadline_monotonic=deadline,
-                        require_owned_completion=require_job,
-                        constraints=c.cuda_constraints(approved.cuda_device_uuid) if backend == "candle-cuda" else None,
-                        abandon_wait=abandon,
-                    ) as claim:
-                        record["claim"] = claim
-                        native, stdout, guard, pool = run_count(
-                            binary, root, work / name, build_env, snapshot, count, expected_device,
-                            approved, adapter, claim, require_job, deadline)
-                        record["native"] = native
-                        record["body"] = proof.verify_execution(contract["case"], stdout)
-                except CudaCardTaken:
-                    receipt["cuda_card_selection"] = switched["selection"]
-                    policy_payload = c.policy(backend, cuda_uuid=switched["selection"]["chosen_uuid"])
-                    approved, hw, adapter, expected_device = bind(policy_payload)
-                    build_env.update(CUDA_VISIBLE_DEVICES=approved.cuda_device_uuid)
-                    continue
-                break
-            require_release(claim, backend, hw, approved, fresh=fresh_cuda)
+            claim_dir = work / (name + "-claim")
+            claim_dir.mkdir()
+            record = receipt["counts"][str(count)] = {"accepted": False}
+            deadline = first_deadline if count == contract["counts"][0] else time.monotonic() + 2520
+
+            def claim_policy(payload, claim_dir=claim_dir):
+                held = tier1.read_policy(claim_dir, "policy.json", dict(payload, deadlineSeconds=2520))
+                return c.claim_estimate(held) if backend == "candle-cuda" else held
+
+            # Until the first count holds its card, a taken card is swapped for the other one when
+            # that fits now; afterwards every count stays on that card (shared hardware).
+            first = card_free and count == contract["counts"][0]
+            with claim_chosen_card(
+                backend, contract["request"]["policy"], bound["payload"],
+                receipt["cuda_card_selection"] if first else None, claim_dir, build_env,
+                claim_policy=claim_policy, rebind=rebind, record=receipt, estimate=CARD_ESTIMATE,
+                constraints=(lambda payload: c.cuda_constraints(payload["cudaDeviceUuid"]))
+                if backend == "candle-cuda" else None,
+                original_deadline_monotonic=deadline, require_owned_completion=require_job,
+            ) as claim:
+                approved, hw, adapter = bound["approved"], bound["hw"], bound["adapter"]
+                record["claim"] = claim
+                native, stdout, guard, pool = run_count(
+                    binary, root, work / name, build_env, snapshot, count, bound["expected_device"],
+                    approved, adapter, claim, require_job, deadline)
+                record["native"] = native
+                record["body"] = proof.verify_execution(contract["case"], stdout)
+            require_release(claim, backend, hw, approved, fresh=fresh_cuda, card_free=card_free)
             record.update(measured_outcome(
                 native, guard, pool, adapter, hw, backend, count, approved, contract["head"],
                 completed_job=(claim, "owned-job-completion") if require_job else None, fresh_cuda=fresh_cuda,
+                card_free=card_free,
             ))
         receipt["accepted"] = all(record["accepted"] for record in receipt["counts"].values())
         if not receipt["accepted"]:
@@ -499,7 +514,8 @@ def verify(args, contract):
         required = {f"{name}.{suffix}" for suffix in limits if suffix != "guard.jsonl"}
         if not required.issubset(receipt["logs"]):
             raise ValueError("missing completed child evidence")
-        require_release(record["claim"], backend, receipt["hardware"], approved, fresh=fresh_cuda)
+        require_release(record["claim"], backend, receipt["hardware"], approved, fresh=fresh_cuda,
+                        card_free="cuda_card_selection" in contract)
         guard = json.loads((dest / (name + ".supervisor.json")).read_bytes())
         pool = (
             json.loads((dest / (name + ".cuda-pool.json")).read_bytes())
@@ -510,7 +526,7 @@ def verify(args, contract):
         actual = measured_outcome(
             record["native"], guard, pool, receipt["adapter"], receipt["hardware"],
             backend, count, approved, contract["head"], completed_job=(record["claim"], "owned-job-completion")
-            if require_job else None, fresh_cuda=fresh_cuda,
+            if require_job else None, fresh_cuda=fresh_cuda, card_free="cuda_card_selection" in contract,
         )
         stored = {key: record[key] for key in (
             "accepted", "telemetry_failure", "candidate_row_pending_physical_review"

@@ -182,7 +182,7 @@ class PluralQualification(unittest.TestCase):
         self.assertEqual(c.admission_estimate("mlx"), {
             "static_floor_host_bytes": 32 * c.GIB,
             "host_estimate_source": "scail2-plural-reviewed-unified-peak-v1"})
-        self.assertEqual(c.admission_estimate("candle-cuda")["static_floor_gpu_bytes"], 60 * c.GIB)
+        self.assertEqual(c.admission_estimate("candle-cuda")["static_floor_gpu_bytes"], 62 * c.GIB)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "policy.json").write_text(json.dumps(c.policy("mlx")), encoding="utf-8")
@@ -231,7 +231,7 @@ class PluralQualification(unittest.TestCase):
             chosen, selection = runner.select_card("candle-cuda", Path(directory), reader=reader)
         self.assertEqual((chosen, selection["chosen_index"]), (c.GPU, 1))
         self.assertEqual([card.get("refusal", "")[:30] for card in selection["cards"]],
-                         ["57887 MiB free < 67584 MiB req", ""])
+                         ["57887 MiB free < 69632 MiB req", ""])
         receipt = {"cuda_card_selection": selection, "hardware": {"uuid": c.GPU, "index": "1"}}
         contract = dict(plan, backend="candle-cuda")
         self.assertEqual(runner.executed_policy(contract, receipt), c.policy("candle-cuda", cuda_uuid=c.GPU))
@@ -252,16 +252,49 @@ class PluralQualification(unittest.TestCase):
         estimate = c.admission_estimate("candle-cuda")
         self.assertEqual(estimate, {
             "static_floor_host_bytes": 58 * c.GIB, "host_estimate_source": "scail2-plural-reviewed-host-peak-v1",
-            "static_floor_gpu_bytes": 60 * c.GIB, "gpu_estimate_source": "scail2-plural-reviewed-device-peak-v1"})
+            "static_floor_gpu_bytes": 62 * c.GIB, "gpu_estimate_source": "scail2-plural-reviewed-device-peak-v1"})
         with TemporaryDirectory() as directory:
             loaded = runner.tier1.read_policy(Path(directory), "policy.json", c.policy("candle-cuda", cuda_uuid=c.GPU0))
         claimed = c.claim_estimate(loaded)
         self.assertEqual(claimed.sha256, loaded.sha256)
         from scripts.ci.model_proof_resources import claim_required_free_bytes
-        self.assertEqual(claim_required_free_bytes(claimed), 66 * c.GIB)
+        self.assertEqual(claim_required_free_bytes(claimed), 68 * c.GIB)
         from scripts import media_campaign_supervisor as safety
         admission = safety.runtime_guarded_admission(loaded, **estimate)
-        self.assertEqual((admission["hostEstimateBytes"], admission["gpuEstimateBytes"]), (58 * c.GIB, 60 * c.GIB))
+        self.assertEqual((admission["hostEstimateBytes"], admission["gpuEstimateBytes"]), (58 * c.GIB, 62 * c.GIB))
+
+    def test_a_count_priced_at_another_estimate_is_rejected_and_old_cap_records_still_verify(self):
+        from scripts import media_campaign_supervisor as safety
+        for backend in ("mlx", "candle-cuda"):
+            with TemporaryDirectory() as directory:
+                uuid = {"cuda_uuid": c.GPU0} if backend == "candle-cuda" else {}
+                loaded = runner.tier1.read_policy(Path(directory), "policy.json", c.policy(backend, **uuid))
+            stated = safety.runtime_guarded_admission(loaded, **c.admission_estimate(backend))
+            c.validate_stated_admission(stated, backend)
+            # The accepted GPU 0 and MLX runs were admitted at the caps (no stated estimate).
+            c.validate_stated_admission(safety.runtime_guarded_admission(loaded), backend)
+            wrong = dict(c.admission_estimate(backend))
+            for floor, source in (("static_floor_host_bytes", "host_estimate_source"),
+                                  ("static_floor_gpu_bytes", "gpu_estimate_source")):
+                if floor not in wrong:
+                    continue
+                bad = dict(wrong, **{floor: wrong[floor] - c.GIB})
+                with self.subTest(backend=backend, floor=floor), self.assertRaisesRegex(ValueError, "different estimate"):
+                    c.validate_stated_admission(safety.runtime_guarded_admission(loaded, **bad), backend)
+                renamed = dict(wrong, **{source: "other-estimate"})
+                with self.subTest(backend=backend, source=source), self.assertRaisesRegex(ValueError, "different estimate"):
+                    c.validate_stated_admission(safety.runtime_guarded_admission(loaded, **renamed), backend)
+        # The claim's recorded device estimate must be the campaign's too.
+        from scripts.ci.model_proof_resources import require_claimed_card
+        executed = c.policy("candle-cuda", cuda_uuid=c.GPU0)
+        claim = {"device_uuid": c.GPU0, "claim_gpu_estimate": {"source": c.CUDA_DEVICE_ESTIMATE_SOURCE,
+                                                               "estimate_bytes": c.CUDA_DEVICE_ESTIMATE_BYTES}}
+        require_claimed_card(claim, executed, runner.CARD_ESTIMATE)
+        require_claimed_card({"device_uuid": c.GPU0}, executed, runner.CARD_ESTIMATE)
+        for bad in (dict(claim, device_uuid=c.GPU),
+                    dict(claim, claim_gpu_estimate={"source": c.CUDA_DEVICE_ESTIMATE_SOURCE, "estimate_bytes": 60 * c.GIB})):
+            with self.assertRaises(ValueError):
+                require_claimed_card(bad, executed, runner.CARD_ESTIMATE)
 
     def test_all_counts_both_backend_shapes_and_mutated_native_results(self):
         for backend, counts in c.COUNTS.items():
@@ -527,7 +560,8 @@ class PluralQualification(unittest.TestCase):
         approved = SimpleNamespace(
             cuda_device_uuid=c.GPU, sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000, poll_millis=250
         )
-        with patch.object(c, "validate_admission"):
+        # The stated-estimate check has its own test; this fixture's admission is partial.
+        with patch.object(c, "validate_admission"), patch.object(c, "validate_stated_admission"):
             row = c.measured_row(
                 data, guard, pool, adapter, machine, "candle-cuda", 6, approved, "f" * 40
             )

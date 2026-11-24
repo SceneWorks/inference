@@ -23,7 +23,8 @@ from scripts.ci.flux1_conditional_asset_inventory import confined, fetch_pinned
 from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
-                                              executed_card_policy, execution_claim, planned_card_policy)
+                                              claim_chosen_card, executed_card_policy, execution_claim,
+                                              planned_card_policy, require_claimed_card)
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
@@ -455,14 +456,12 @@ def execute(args, contract):
             raise ValueError("ENG-4b baseline tree differs from the reviewed merge")
         paths, receipt["fixtures"] = snapshots(
             work, tier, download_missing=contract["request"].get("download_missing", False))
-        # A request that names no card runs on the registered card with the most free memory that fits.
-        payload, selection = choose_card(contract["request"]["policy"], work)
-        if selection is not None:
-            receipt["cuda_card_selection"] = selection
+        request_policy = contract["request"]["policy"]
+        # Builds never touch a GPU: a request that names no card builds first, then chooses (and if
+        # need be switches) its card in the claim's own admission window.
         policy_path = work / "policy.json"
-        write(policy_path, payload)
+        write(policy_path, planned_card_policy(request_policy))
         policy = load_policy(policy_path)
-        receipt["hardware"] = hardware(backend, policy)
         # Both executables finish linking before either arm's first render.
         exes, environments = {}, {}
         for arm in evidence.ARMS:
@@ -490,16 +489,37 @@ def execute(args, contract):
         claim_dir = work / "claim"
         claim_dir.mkdir()
         lease_env = environments["base"]
-        claim_policy = policy
-        claim_deadline = last_child_start = None
+        claim_deadline = last_child_start = budget = None
         if backend == "candle-cuda":
             budget, reserve = cuda_claim_budget(policy, tier)
-            write(claim_dir / "policy.json", dict(payload, deadlineSeconds=budget))
-            claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
-        with execution_claim(backend, claim_policy, claim_dir, lease_env,
-                             original_deadline_monotonic=claim_deadline) as claim:
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(request_policy, work, deadline_monotonic=last_child_start)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
+        bound = {}
+
+        def bind(chosen):
+            """Bind the run to the card in force: its policy, hardware and child visibility."""
+            write(policy_path, chosen)
+            bound["policy"] = load_policy(policy_path)
+            receipt["hardware"] = hardware(backend, bound["policy"])
+            if backend == "candle-cuda":
+                for arm_env in environments.values():
+                    arm_env["CUDA_VISIBLE_DEVICES"] = chosen["cudaDeviceUuid"]
+
+        def claim_policy(chosen):
+            if budget is None:
+                return bound["policy"]
+            write(claim_dir / "policy.json", dict(chosen, deadlineSeconds=budget))
+            return load_policy(claim_dir / "policy.json")
+
+        bind(payload)
+        with claim_chosen_card(backend, request_policy, payload, selection, claim_dir, lease_env,
+                               claim_policy=claim_policy, rebind=bind, record=receipt, claim_with=execution_claim,
+                               original_deadline_monotonic=claim_deadline) as claim:
+            policy = bound["policy"]
             receipt["physical_claim"] = claim
             receipt["preflight"] = {}
             for arm in planned_arms(tier):
@@ -627,8 +647,11 @@ def verify(args, contract):
             allowed.add(name)
     if {p.name for p in args.output.iterdir()} != allowed:
         raise ValueError("unexpected upload file")
-    # A card-free request ran on the card its recorded selection chose; a named card records none.
-    executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"))
+    # A card-free request ran on the card its recorded selection chose (and claimed); a named card
+    # records no selection and verifies as before.
+    executed = executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"))
+    if "cuda_card_selection" in r and "physical_claim" in r:
+        require_claimed_card(r["physical_claim"], executed)
     if completed:
         if not r["physical_claim"]["post_execution_verified"]:
             raise ValueError("unreleased accepted comparison")

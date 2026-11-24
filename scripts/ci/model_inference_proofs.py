@@ -695,15 +695,23 @@ def request(raw: str, backend: str) -> dict:
     return value
 
 
-def executed_policy(receipt: dict, value: dict) -> dict:
+def executed_policy(receipt: dict, value: dict, rows=()) -> dict:
     """The resource policy a proof ran under: the request's own, or for a card-free request the
-    request's policy with the registered card the producer selected (and recorded)."""
-    from scripts.ci.model_proof_resources import card_free_policy, executed_card_policy
+    request's policy with the registered card the producer selected (and recorded), which every
+    executed case's claim must hold."""
+    from scripts.ci.model_proof_resources import card_free_policy, executed_card_policy, require_claimed_card
     if card_free_policy(value['policy']) and receipt.get('request_resource_policy') != value['policy']:
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
     if not card_free_policy(value['policy']) and 'request_resource_policy' in receipt:
         raise ValueError('a named-card proof records no card selection')
-    return executed_card_policy(value['policy'], receipt.get('cuda_card_selection'))
+    named = next(iter({row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}), None)
+    executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'), named=named)
+    if card_free_policy(value['policy']):
+        for case in receipt.get('cases', []):
+            physical = case.get('physical_execution') if isinstance(case, dict) else None
+            if isinstance(physical, dict) and 'device_uuid' in physical:
+                require_claimed_card(physical, executed)
+    return executed
 
 
 def command(row: dict, discover: bool) -> list[str]:
@@ -1281,7 +1289,8 @@ def verified_windows_toolchain(env: dict[str, str], root: Path, declaration: byt
 
 
 def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path,
-        *, comparison_work: Path | None = None, comparison_deadline_monotonic: float | None = None) -> int:
+        *, comparison_work: Path | None = None, comparison_deadline_monotonic: float | None = None,
+        abandon_wait=None) -> int:
     if comparison_deadline_monotonic is not None and (backend != 'candle-cuda'
             or not all(row.get('training_comparison_stage') for row in rows)
             or type(comparison_deadline_monotonic) not in (int, float) or not math.isfinite(comparison_deadline_monotonic)):
@@ -1303,20 +1312,23 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     work.mkdir()
     sys.path.insert(0, str(ROOT))
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
-    from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, metadata_policy_payload,
-                                                  execution_claim, card_free_policy, choose_card)
-    policy_payload, card_selection = value['policy'], None
-    if card_free_policy(policy_payload):
-        # The request names no card: run on the registered card with the most free memory that
-        # covers the estimate plus reserve. A case that names a card keeps it (and may wait).
+    from scripts.ci.model_proof_resources import (CudaCardTaken, CudaClaimRejected, CudaReleaseRejected,
+                                                  metadata_policy_payload, execution_claim, card_free_policy,
+                                                  choose_card, claim_chosen_card, planned_card_policy)
+    card_free = card_free_policy(value['policy'])
+    named_card = None
+    if card_free:
+        # The request names no card: just before the first body claim, run on the registered card
+        # with the most free memory that covers the estimate plus reserve (switching if it is
+        # taken before that claim). A case that names a card keeps it (and may wait).
         if multi_cuda.FIELDS.intersection(value):
             raise ValueError('a multi-GPU proof names every card in its policies')
         named = {row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}
         if len(named) > 1:
             raise ValueError('selected cases name different CUDA cards; request one card explicitly')
-        policy_payload, card_selection = choose_card(policy_payload, work, named=next(iter(named), None))
+        named_card = next(iter(named), None)
     policy_path = work / 'policy.json'
-    write_json(policy_path, policy_payload)
+    write_json(policy_path, planned_card_policy(value['policy']))
     policy = load_policy(policy_path)
     approved_uuids = multi_cuda.bind_rows(rows, value, backend)
     # The request's Hub bindings are validated once against the complete selection; each case
@@ -1339,9 +1351,18 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         'request_selection': value['selection'], 'completed': 0,
         'accepted': False, 'cases': []}
     receipt.update(receipt_claims([], False))
-    if card_selection is not None:
-        receipt['request_resource_policy'] = value['policy']
-        receipt['cuda_card_selection'] = card_selection
+    card = {'selection': None, 'pending': card_free, 'env': None}
+
+    def bind_card(chosen):
+        """Run every remaining phase on the card in force (chosen, or switched before the claim)."""
+        nonlocal policy
+        write_json(policy_path, chosen)
+        policy = load_policy(policy_path)
+        receipt.update(resource_policy=json.loads(policy.canonical_bytes), policy_sha256=policy.sha256,
+                       request_resource_policy=value['policy'])
+        if card['env'] is not None:
+            card['env']['CUDA_VISIBLE_DEVICES'] = policy.cuda_device_uuid
+
     if approved_uuids:
         receipt['approved_cuda_uuid_roles'] = list(approved_uuids)
         receipt['additional_resource_policies'] = [json.loads(item.canonical_bytes) for item in additional_policies]
@@ -1435,13 +1456,34 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                             options['require_owned_completion'] = True
                         if comparison_deadline_monotonic is not None:
                             options['original_deadline_monotonic'] = comparison_deadline_monotonic
-                        claim = execution_claim(backend, policy, case_work, env, **options)
+                        first_claim = index == 0
+                        if first_claim and abandon_wait is not None:
+                            # A comparison stage whose parent may switch its card before this claim.
+                            options['abandon_wait'] = abandon_wait
+                        switchable = None
+                        if card['pending']:
+                            card['env'] = env
+                            # Selection and this claim share one wait budget.
+                            budget_end = comparison_deadline_monotonic or time.monotonic() + policy.deadline_seconds
+                            options.setdefault('original_deadline_monotonic', budget_end)
+                            chosen, card['selection'] = choose_card(
+                                value['policy'], work, named=named_card, deadline_monotonic=budget_end)
+                            receipt['cuda_card_selection'] = card['selection']
+                            bind_card(chosen)
+                            card['pending'], switchable = False, card['selection']
+                        claim = claim_chosen_card(
+                            backend, value['policy'] if card_free else json.loads(policy.canonical_bytes),
+                            json.loads(policy.canonical_bytes), switchable, case_work, env,
+                            claim_policy=lambda _chosen: policy, rebind=bind_card, record=receipt,
+                            claim_with=execution_claim, **options)
                     supervision = {}
                     if approved_uuids and not discover:
                         probes = tuple(SystemProbe(item) for item in cuda_policies)
                         supervision = {'probe': probes[0], 'additional_cuda_policies': tuple(additional_policies),
                                        'additional_cuda_probes': probes[1:]}
                     with claim as physical:
+                        if not discover:
+                            phase_policy = policy  # the card in force after any switch
                         result['physical_execution'] = physical
                         shared_completion = (not discover and backend == 'candle-cuda'
                                              and physical.get('activity_profile') == SHARED_CUDA_HEADROOM_PROFILE)
@@ -1542,6 +1584,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 result['accepted'] = True
                 receipt['completed'] += 1
             except (ValueError, OSError, SupervisionError) as error:
+                if isinstance(error, CudaCardTaken):
+                    raise  # the parent comparison switches its card and reruns this stage
                 result['error'] = redact(str(error), env)
                 if isinstance(error, CudaClaimRejected):
                     result['cuda_claim_diagnostic'] = error.diagnostic
@@ -1735,7 +1779,7 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
                 or receipt.get('additional_resource_policies') != value['additional_cuda_policies']):
             raise ValueError('evidence differs from explicit ordered multi-GPU authorization and per-UUID policies')
     if (type(receipt.get('selected')) is not int or receipt.get('selected_bindings') != approved_bindings or receipt.get('selected') != len(approved_rows)
-            or receipt.get('request_selection') != value['selection'] or receipt.get('resource_policy') != executed_policy(receipt, value)):
+            or receipt.get('request_selection') != value['selection'] or receipt.get('resource_policy') != executed_policy(receipt, value, approved_rows)):
         raise ValueError('evidence differs from its approved source selection/resource policy')
     if any('selected_configuration' in row for row in approved_rows) and receipt.get('request_configuration') != value.get('configuration'):
         raise ValueError('evidence differs from its approved fixed configuration selection')

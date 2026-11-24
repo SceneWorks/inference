@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -85,9 +86,10 @@ class SharedHeadroom(unittest.TestCase):
                                   'gpu_free_reserve_bytes': 6 * 1024**3, 'deadline_seconds': 20})
         fits = SimpleNamespace(**{**vars(base), 'claim_gpu_estimate': ('test-stated-estimate', 40 * 1024**3)})
         too_big = SimpleNamespace(**{**vars(base), 'claim_gpu_estimate': ('test-stated-estimate', 60 * 1024**3)})
-        # No stated estimate: the shared 16 GiB default, never the 84 GiB cap.
-        self.assertEqual(resources.claim_required_free_bytes(base), 22 * 1024**3)
-        for policy in (base, fits):
+        # No stated estimate: the job may fill its 84 GiB cap, so it needs cap plus reserve free.
+        self.assertEqual(resources.claim_required_free_bytes(base), 90 * 1024**3)
+        self.assertFalse(resources.proof_cuda_idle(shared, [], base, activity_profile=PROFILE))
+        for policy in (fits,):
             self.assertTrue(resources.proof_cuda_idle(shared, [], policy, activity_profile=PROFILE))
             receipt, _ = self.claim([([shared], [])] * 11, policy=policy, clock=FakeClock())
             self.assertEqual(receipt['claim_gpu_estimate']['required_free_bytes'],
@@ -796,6 +798,85 @@ class CardSelection(unittest.TestCase):
                 resources.executed_card_policy(request, bad, estimate=estimate)
         with self.assertRaisesRegex(ValueError, 'different estimate'):
             resources.executed_card_policy(request, switched, estimate=('other', 1))
+
+    def test_a_switch_reads_the_other_card_with_its_own_driver_budget(self):
+        # The real reader (veda_cuda_guard.command) refuses before running nvidia-smi once its
+        # deadline has passed; a switch must still read the other card.
+        request = {'schemaVersion': 1, 'backend': 'windows-cuda', 'deadlineSeconds': 60, 'pollMillis': 250,
+                   'termGraceMillis': 2000, 'stdoutCapBytes': 4096, 'stderrCapBytes': 4096, 'eventCapBytes': 4096,
+                   'childFootprintCapBytes': 64 * 1024**3, 'hostFreeReserveBytes': 8 * 1024**3,
+                   'childGpuCapBytes': 84 * 1024**3, 'gpuFreeReserveBytes': 6 * 1024**3}
+        estimate = ('test-stated-estimate', 60 * 1024**3)
+        free = {GPU0_UUID: self.card(GPU0_UUID, 1000), GPU1_UUID: self.card(GPU1_UUID, 3000)}
+        budgets = []
+
+        def reader(uuid, deadline):
+            budgets.append(deadline - time.monotonic())
+            if deadline <= time.monotonic():
+                raise TimeoutError('GPU inventory sampling deadline exhausted')
+            return [free[uuid]]
+
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stderr(io.StringIO()) as log:
+            _, selection = resources.choose_card(request, Path(temporary), estimate=estimate, reader=reader)
+            abandon, state = resources.card_switcher(request, Path(temporary), selection, estimate=estimate, reader=reader)
+            budgets.clear()
+            self.assertTrue(abandon(f'{GPU0_UUID}: UUID lock held by another CI job'))
+            self.assertEqual(len(budgets), 1)
+            self.assertGreater(budgets[0], resources.SWITCH_READ_SECONDS - 5)
+            # No card fits: one read, no polling, and the repeated refusal is logged once a minute.
+            free[GPU0_UUID] = self.card(GPU0_UUID, 90000)
+            budgets.clear()
+            self.assertFalse(abandon(f'{GPU1_UUID}: lock held'))
+            self.assertFalse(abandon(f'{GPU1_UUID}: lock held'))
+            self.assertEqual(len(budgets), 2)
+        self.assertEqual(log.getvalue().count(f'card 0 {GPU0_UUID} refused'), 1)
+        self.assertEqual(state['selection']['chosen_uuid'], GPU1_UUID)
+
+    def test_every_card_free_caller_switches_through_the_shared_claim_and_a_named_card_waits(self):
+        request = {'schemaVersion': 1, 'backend': 'windows-cuda', 'deadlineSeconds': 60, 'pollMillis': 250,
+                   'termGraceMillis': 2000, 'stdoutCapBytes': 4096, 'stderrCapBytes': 4096, 'eventCapBytes': 4096,
+                   'childFootprintCapBytes': 64 * 1024**3, 'hostFreeReserveBytes': 8 * 1024**3,
+                   'childGpuCapBytes': 12 * 1024**3, 'gpuFreeReserveBytes': 2 * 1024**3}
+        free = {GPU0_UUID: self.card(GPU0_UUID, 1000), GPU1_UUID: self.card(GPU1_UUID, 3000)}
+        reader = lambda uuid, _deadline: [free[uuid]]
+        attempts, rebound = [], []
+
+        @contextlib.contextmanager
+        def claim_with(backend, policy, output, env, *, abandon_wait=None, **_options):
+            attempts.append((policy.cuda_device_uuid, output.name, abandon_wait is not None))
+            if len(attempts) == 1 and abandon_wait is not None and abandon_wait(f'{policy.cuda_device_uuid}: lock held'):
+                raise resources.CudaCardTaken({'abandoned_wait': 'lock held'})
+            yield {'device_uuid': policy.cuda_device_uuid}
+
+        from scripts.media_campaign_supervisor import load_policy
+
+        def claim_policy(chosen, root):
+            path = root / 'claim-policy.json'
+            path.write_text(json.dumps(chosen), encoding='utf-8')
+            return load_policy(path)
+
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stderr(io.StringIO()):
+            root = Path(temporary)
+            payload, selection = resources.choose_card(request, root, reader=reader)
+            record = {'cuda_card_selection': selection}
+            with resources.claim_chosen_card(
+                    'candle-cuda', request, payload, selection, root, {}, claim_policy=lambda c: claim_policy(c, root),
+                    rebind=rebound.append, record=record, claim_with=claim_with, selector={'reader': reader}) as held:
+                pass
+        self.assertEqual(attempts[0][0], GPU0_UUID)
+        self.assertEqual((held['device_uuid'], attempts[1][1]), (GPU1_UUID, 'switch-2'))
+        self.assertEqual(rebound[0]['cudaDeviceUuid'], GPU1_UUID)
+        self.assertEqual(record['cuda_card_selection']['superseded'][0]['left_uuid'], GPU0_UUID)
+        self.assertEqual(resources.executed_card_policy(request, record['cuda_card_selection'])['cudaDeviceUuid'], GPU1_UUID)
+        # A named card is never switched: no abandon hook reaches its claim.
+        attempts.clear()
+        with tempfile.TemporaryDirectory() as temporary:
+            named = dict(request, cudaDeviceUuid=GPU0_UUID)
+            with resources.claim_chosen_card('candle-cuda', named, named, None, Path(temporary), {},
+                                             claim_policy=lambda c: claim_policy(c, Path(temporary)),
+                                             claim_with=claim_with) as held:
+                pass
+        self.assertEqual(attempts, [(GPU0_UUID, Path(temporary).name, False)])
 
     def test_the_claim_gives_up_its_card_only_when_the_caller_can_switch(self):
         short = {'uuid': UUID, 'index': 1, 'total_mib': 97887, 'used_mib': 60000, 'free_mib': 37887,

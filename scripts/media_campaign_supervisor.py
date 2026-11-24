@@ -40,13 +40,6 @@ RUNTIME_GUARDED_ADMISSION = "runtime-guarded"
 ESTIMATE_PLUS_RESERVE_RULE = "estimate-plus-reserve-v1"
 CAP_FALLBACK_ESTIMATE_SOURCE = "child-footprint-cap-fallback"
 MEASURED_PEAK_ESTIMATE_SOURCE = "measured-peak-of-completed-identical-unit"
-# A CUDA row with no stated device estimate needs this much free on its card (never more than its
-# own cap) plus the reserve, not cap plus reserve: no CUDA job may require an idle GPU. It mirrors
-# SceneWorks scripts/ci/windows_cuda_execution.py DEFAULT_MIN_FREE_MIB (16384), a floor that
-# refuses a nearly full card rather than a measured need; a job that knows its peak states it.
-# The child GPU cap and the live free-reserve watchdog still bound the run.
-DEFAULT_GPU_ESTIMATE_SOURCE = "shared-default-gpu-free-floor-v1"
-DEFAULT_GPU_ESTIMATE_BYTES = 16 * 1024**3
 UNKNOWN_PEAK_REASON = (
     "whole-process transient peak (loader, lazy graphs, allocator/driver headroom, output "
     "coexistence) is not statically derivable; the row is admitted by the runtime watchdog "
@@ -103,14 +96,6 @@ class SafetyPolicy:
     canonical_bytes: bytes
     # The CUDA claim's stated device estimate (source, bytes); not part of the signed policy.
     claim_gpu_estimate: tuple[str, int] | None = field(default=None, compare=False, kw_only=True)
-
-
-def default_gpu_estimate(cap: int) -> tuple[str, int]:
-    """The device estimate of a CUDA row that states none: the shared free floor, or its cap when
-    the cap is smaller (recorded as the cap fallback, exactly as before the floor existed)."""
-    if cap <= DEFAULT_GPU_ESTIMATE_BYTES:
-        return CAP_FALLBACK_ESTIMATE_SOURCE, cap
-    return DEFAULT_GPU_ESTIMATE_SOURCE, DEFAULT_GPU_ESTIMATE_BYTES
 
 
 def load_policy(path: Path) -> SafetyPolicy:
@@ -863,13 +848,12 @@ def _positive(value: object) -> bool:
 
 def admission_estimate(static_bytes: int | None, source: str | None, measured_peak_bytes: int | None,
                        cap: int, label: str) -> tuple[str, int]:
-    """max(static estimate, measured peak of an already-completed identical unit). Without a static
-    estimate a host row falls back to its cap and a CUDA row to the shared default GPU estimate.
-    An estimate above the cap refuses before spawn."""
+    """max(static estimate, measured peak of an already-completed identical unit), or the cap
+    when the row has no static estimate. An estimate above the cap refuses before spawn."""
     if static_bytes is None:
         if source is not None:
             raise SupervisionError("invalid-admission", f"{label} estimate source names no estimate")
-        estimate = default_gpu_estimate(cap) if label == "CUDA" else (CAP_FALLBACK_ESTIMATE_SOURCE, cap)
+        estimate = (CAP_FALLBACK_ESTIMATE_SOURCE, cap)
     else:
         if type(static_bytes) is not int or static_bytes <= 0 or not isinstance(source, str) or not source:
             raise SupervisionError("invalid-admission", f"{label} static estimate is malformed")
@@ -954,14 +938,10 @@ def _validate_estimate(value: dict, label: str, source_key: str, bytes_key: str,
             or type(cap) is not int or not 0 < estimate <= cap):
         raise SupervisionError("invalid-admission", f"record lacks a valid {label} estimate-plus-reserve estimate")
     if floor is None:
-        # Records from before the shared default GPU estimate priced a CUDA row at its cap.
-        valid = ((source == CAP_FALLBACK_ESTIMATE_SOURCE and estimate == cap)
-                 or (label == "CUDA" and ((source, estimate) == default_gpu_estimate(cap)
-                                          or (source == MEASURED_PEAK_ESTIMATE_SOURCE
-                                              and estimate > default_gpu_estimate(cap)[1]))))
+        valid = source == CAP_FALLBACK_ESTIMATE_SOURCE and estimate == cap
     else:
         valid = (type(floor) is int and 0 < floor <= estimate
-                 and source not in (CAP_FALLBACK_ESTIMATE_SOURCE, DEFAULT_GPU_ESTIMATE_SOURCE))
+                 and source != CAP_FALLBACK_ESTIMATE_SOURCE)
     if not valid:
         raise SupervisionError("invalid-admission", f"recorded {label} estimate contradicts its floor or cap fallback")
     available = value.get(available_key)

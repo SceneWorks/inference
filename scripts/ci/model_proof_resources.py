@@ -1,7 +1,7 @@
 """Reuse existing execution coordination and supervisor policies; never submission/job-count gates."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import math
@@ -29,22 +29,22 @@ RELEASE_QUERY_ATTEMPTS = 3
 RELEASE_SAMPLING_SECONDS = 5 * (RELEASE_QUERY_SECONDS * RELEASE_QUERY_ATTEMPTS + 1)
 
 
-# Records written before claims stated a device estimate priced the card at the policy's child cap.
+# A job that states no device estimate needs its child cap free (plus the reserve), as before
+# claims stated estimates; claims recorded before then carry no estimate and replay the same way.
 LEGACY_CAP_CLAIM_ESTIMATE_SOURCE = 'child-gpu-cap'
 
 
 def claim_gpu_estimate(policy) -> tuple[str, int]:
     """The device estimate a CUDA claim needs free beyond the reserve.
 
-    The caller's stated estimate (`policy.claim_gpu_estimate`), else the supervisor's shared
-    default free floor (never above the child cap). No claim requires cap plus reserve, so no
-    CUDA job needs an idle card; the child cap and live reserve watchdog still bound the run.
+    The caller's stated estimate (`policy.claim_gpu_estimate`, from reviewed peaks of that lane),
+    else the child cap: a job with no recorded peak may really fill its cap. A small-cap job still
+    admits on a busy card; the child cap and live reserve watchdog bound every run.
     """
-    from scripts.media_campaign_supervisor import default_gpu_estimate
     cap = policy.child_gpu_cap_bytes
     stated = getattr(policy, 'claim_gpu_estimate', None)
     if stated is None:
-        return default_gpu_estimate(cap)
+        return LEGACY_CAP_CLAIM_ESTIMATE_SOURCE, cap
     source, value = stated
     if (not isinstance(source, str) or not source or type(value) is not int
             or type(cap) is not int or not 0 < value <= cap):
@@ -543,15 +543,21 @@ def card_free_policy(payload: dict) -> bool:
     return isinstance(payload, dict) and payload.get('backend') == 'windows-cuda' and 'cudaDeviceUuid' not in payload
 
 
+# The single driver read a switch makes before giving up its card (no polling, its own budget).
+SWITCH_READ_SECONDS = 30
+
+
 def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time.sleep,
-                     clock=time.monotonic) -> tuple[str, dict]:
+                     clock=time.monotonic, single_read: bool = False, notice: dict | None = None) -> tuple[str, dict]:
     """Choose the card a proof that names none runs on, from `policies` ({UUID: its policy}).
 
-    Each poll reads every candidate's free memory. A card is refused (and the reason logged) when
-    it is absent, has moved index, or has less free than its reserve plus the claim estimate.
-    Among the cards that fit, the one with the most free memory is chosen at once: the proof never
-    waits on a short card while another fits. Only when no card fits does it wait, polling every
-    card, until `deadline`. The chosen card is then claimed normally (lock, stable window).
+    Each poll reads every candidate's free memory. A card is refused (and the reason logged, at most
+    once a minute per kind) when it is absent, has moved index, or has less free than its reserve
+    plus the claim estimate. Among the cards that fit, the one with the most free memory is chosen
+    at once: the proof never waits on a short card while another fits. Only when no card fits does
+    it wait, polling every card, until `deadline`. `single_read` makes one read with its own
+    SWITCH_READ_SECONDS driver budget and refuses at once when nothing fits (a switch never waits).
+    The chosen card is then claimed normally (lock, stable window).
     """
     from scripts.release import veda_cuda_guard
     if not policies or any(uuid not in REGISTERED_CUDA_CARDS or policy.cuda_device_uuid != uuid
@@ -559,10 +565,12 @@ def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time
         raise ValueError('CUDA card selection is limited to the registered host cards')
     reader = reader or (lambda uuid, until: veda_cuda_guard.inventory(
         None, 'model-proof-card-selection', until, selected_uuid=uuid)[0])
-    notice, polls, started = {}, 0, clock()
+    notice = {} if notice is None else notice
+    polls, started = 0, clock()
     while True:
         polls += 1
         cards = []
+        read_until = time.monotonic() + SWITCH_READ_SECONDS if single_read else deadline
         for uuid in sorted(policies, key=REGISTERED_CUDA_CARDS.get):
             policy = policies[uuid]
             source, estimate = claim_gpu_estimate(policy)
@@ -570,7 +578,7 @@ def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time
             entry = {'uuid': uuid, 'index': REGISTERED_CUDA_CARDS[uuid], 'estimate_source': source,
                      'estimate_bytes': estimate, 'required_free_bytes': required}
             try:
-                devices = reader(uuid, deadline)
+                devices = reader(uuid, read_until)
             except (RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as error:
                 devices, entry['refusal'] = [], f'inventory failed: {str(error)[:200]}'
             matched = [device for device in devices if device.get('uuid') == uuid]
@@ -592,7 +600,7 @@ def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time
         for entry in cards:
             if 'refusal' in entry:
                 _wait_notice(notice, f"card {entry['index']} {entry['uuid']} refused: {entry['refusal']}"
-                             + ('' if fits else '; no card fits, waiting'))
+                             + ('' if fits else '; no card fits' + ('' if single_read else ', waiting')))
         if fits:
             chosen = max(fits, key=lambda entry: (entry['free_mib'], -entry['index']))
             print(f"CUDA card selected: index {chosen['index']} {chosen['uuid']} "
@@ -602,9 +610,9 @@ def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time
                                     'chosen_index': chosen['index'], 'polls': polls,
                                     'wait_seconds': clock() - started, 'cards': cards}
         remaining = deadline - clock()
-        if remaining <= 0:
+        if single_read or remaining <= 0:
             raise CudaClaimRejected({'rule': CARD_SELECTION_RULE, 'polls': polls, 'cards': cards,
-                                     'admission_error': 'no registered CUDA card had estimate plus reserve free before the deadline'},
+                                     'admission_error': 'no registered CUDA card had estimate plus reserve free'},
                                     'no registered CUDA card fits this proof; no model execution')
         pause(min(max(min(policy.poll_millis for policy in policies.values()) / 1000, 1.0), remaining))
 
@@ -614,27 +622,36 @@ def planned_card_policy(payload: dict) -> dict:
     return dict(payload, cudaDeviceUuid=next(iter(REGISTERED_CUDA_CARDS))) if card_free_policy(payload) else payload
 
 
-def choose_card(payload: dict, work: Path, *, named=None, estimate=None, deadline_seconds=None,
-                cards=None, **selector) -> tuple[dict, dict | None]:
-    """Resolve a request policy to the policy a proof runs under.
-
-    A policy that names a card is returned unchanged (no selection). A card-free policy runs on
-    the registered card (or the one card `named` by its case) with the most free memory covering
-    reserve plus `estimate` (source, bytes; default the shared floor); the record is the receipt's
-    `cuda_card_selection`.
-    """
+def card_candidates(payload: dict, work: Path, uuids, estimate=None) -> dict:
+    """The policy each candidate card would run under (with the stated claim estimate, if any)."""
     import dataclasses
     from scripts.media_campaign_supervisor import load_policy
-    if not card_free_policy(payload):
-        return payload, None
     candidates = {}
-    for uuid in sorted(cards or ([named] if named else REGISTERED_CUDA_CARDS), key=lambda u: REGISTERED_CUDA_CARDS.get(u, -1)):
+    for uuid in sorted(uuids, key=lambda u: REGISTERED_CUDA_CARDS.get(u, -1)):
+        if uuid not in REGISTERED_CUDA_CARDS:
+            raise ValueError(f'unregistered CUDA card {uuid}')
         path = work / f'card-candidate-{uuid}.json'
         path.write_text(json.dumps(dict(payload, cudaDeviceUuid=uuid), sort_keys=True), encoding='utf-8')
         policy = load_policy(path)
         candidates[uuid] = dataclasses.replace(policy, claim_gpu_estimate=estimate) if estimate else policy
-    seconds = payload['deadlineSeconds'] if deadline_seconds is None else deadline_seconds
-    chosen, record = select_cuda_card(candidates, time.monotonic() + seconds, **selector)
+    return candidates
+
+
+def choose_card(payload: dict, work: Path, *, named=None, estimate=None, deadline_monotonic=None,
+                **selector) -> tuple[dict, dict | None]:
+    """Resolve a request policy to the policy a proof runs under.
+
+    A policy that names a card is returned unchanged (no selection). A card-free policy runs on the
+    registered card (or the one card `named` by its case) with the most free memory covering
+    reserve plus `estimate` (source, bytes; default the child cap); the record is the receipt's
+    `cuda_card_selection`. Selection waits at most until `deadline_monotonic` (default: the
+    policy's deadline from now), the same budget the following claim then uses.
+    """
+    if not card_free_policy(payload):
+        return payload, None
+    deadline = time.monotonic() + payload['deadlineSeconds'] if deadline_monotonic is None else deadline_monotonic
+    candidates = card_candidates(payload, work, [named] if named else REGISTERED_CUDA_CARDS, estimate)
+    chosen, record = select_cuda_card(candidates, deadline, **selector)
     return dict(payload, cudaDeviceUuid=chosen), record
 
 
@@ -642,12 +659,12 @@ MAX_CARD_SWITCHES = 4
 
 
 def card_switcher(payload: dict, work: Path, selection: dict, *, estimate=None, **selector):
-    """An `abandon_wait` for a card-free proof's first claim: when its card is taken, run the
-    selection again over the other registered card(s) without waiting. If one fits now, the
-    switch is recorded (`superseded`) in a new selection and the claim gives up its card; if
-    none fits, the claim keeps waiting for its card. Returns (abandon_wait, state) where
-    state['selection'] is the selection now in force."""
-    state = {'selection': selection}
+    """An `abandon_wait` for a card-free proof's first claim: when its card is taken, read the other
+    registered card(s) once (own driver budget, no waiting). If one fits now, the switch is recorded
+    (`superseded`) in a new selection and the claim gives up its card; if none fits, the claim keeps
+    waiting for its card. Refusals are logged at most once a minute per kind across polls. Returns
+    (abandon_wait, state) where state['selection'] is the selection now in force."""
+    state = {'selection': selection, 'notice': {}}
 
     def abandon(reason: str) -> bool:
         current = state['selection']
@@ -656,8 +673,9 @@ def card_switcher(payload: dict, work: Path, selection: dict, *, estimate=None, 
             return False
         left = current['chosen_uuid']
         try:
-            _, record = choose_card(payload, work, estimate=estimate, deadline_seconds=0,
-                                    cards=[uuid for uuid in REGISTERED_CUDA_CARDS if uuid != left], **selector)
+            candidates = card_candidates(payload, work, [uuid for uuid in REGISTERED_CUDA_CARDS if uuid != left], estimate)
+            _, record = select_cuda_card(candidates, time.monotonic(), single_read=True,
+                                         notice=state['notice'], **selector)
         except CudaClaimRejected:
             return False
         earlier = {key: value for key, value in current.items() if key != 'superseded'}
@@ -671,52 +689,115 @@ def card_switcher(payload: dict, work: Path, selection: dict, *, estimate=None, 
     return abandon, state
 
 
-def _valid_selection(record, payload: dict) -> str:
-    """The card one selection record chose, after checking it is the most free fitting card it read."""
+@contextmanager
+def claim_chosen_card(backend: str, request_payload: dict, payload: dict, selection, output: Path, env: dict,
+                      *, claim_policy, rebind=None, record=None, estimate=None, constraints=None,
+                      claim_with=None, selector=None, **claim):
+    """Claim the card a proof chose and yield the claim record.
+
+    For a card-free request (a recorded `selection`), a card taken before the claim holds it (lock
+    held by another job, or short of estimate plus reserve) is switched for another registered card
+    that fits now: `rebind(new_payload)` re-binds the caller's policy, hardware and environment, and
+    `record['cuda_card_selection']` takes the new selection. A named card (no selection) waits as
+    before. `claim_policy(payload)` and `constraints(payload)` give the claim's policy and
+    constraints for the card in force; each switched attempt claims in its own subdirectory.
+    `claim_with` is the caller's execution_claim (default this module's); `selector` passes
+    select_cuda_card options (a test's driver reader) to the switch.
+    """
+    claim_with = execution_claim if claim_with is None else claim_with
+    abandon, state = (card_switcher(request_payload, output, selection, estimate=estimate, **(selector or {}))
+                      if selection is not None and backend == 'candle-cuda' else (None, None))
+    attempt = 1
+    while True:
+        stack = ExitStack()
+        target = output if attempt == 1 else output / f'switch-{attempt}'
+        target.mkdir(exist_ok=True)
+        try:
+            options = dict(claim)
+            if abandon is not None:
+                options['abandon_wait'] = abandon
+            bound = constraints(payload) if callable(constraints) else constraints
+            if bound is not None:
+                options['constraints'] = bound
+            held = stack.enter_context(claim_with(backend, claim_policy(payload), target, env, **options))
+        except CudaCardTaken:
+            stack.close()
+            if state is None:
+                raise  # the caller's own abandon_wait: it switches
+            payload = dict(request_payload, cudaDeviceUuid=state['selection']['chosen_uuid'])
+            if record is not None:
+                record['cuda_card_selection'] = state['selection']
+            if rebind is not None:
+                rebind(payload)
+            attempt += 1
+            continue
+        break
+    with stack:
+        yield held
+
+
+def _cards_read(record, payload: dict, expected) -> str:
+    """The card one selection chose, after checking it read exactly `expected` and chose the most
+    free card that fit."""
     if not isinstance(record, dict) or record.get('rule') != CARD_SELECTION_RULE:
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
     cards, chosen = record.get('cards'), record.get('chosen_uuid')
     uuids = [card.get('uuid') for card in cards] if isinstance(cards, list) else None
     fitting = [card for card in cards if 'refusal' not in card] if uuids else []
     reserve = payload.get('gpuFreeReserveBytes')
-    if (not uuids or uuids != sorted(set(uuids), key=lambda u: REGISTERED_CUDA_CARDS.get(u, -1))
-            or any(uuid not in REGISTERED_CUDA_CARDS for uuid in uuids)
+    if (uuids != sorted(expected, key=REGISTERED_CUDA_CARDS.get)
             or chosen not in uuids or record.get('chosen_index') != REGISTERED_CUDA_CARDS[chosen]
             or any(card.get('index') != REGISTERED_CUDA_CARDS[card['uuid']]
                    or type(card.get('estimate_bytes')) is not int
                    or not 0 < card['estimate_bytes'] <= payload.get('childGpuCapBytes', 0)
                    or card.get('required_free_bytes') != reserve + card['estimate_bytes'] for card in cards)
-            or not fitting or any(type(card.get('free_mib')) is not int
-                                  or card['free_mib'] * 1024**2 < card['required_free_bytes'] for card in fitting)
+            or any(type(card.get('free_mib')) is not int
+                   or card['free_mib'] * 1024**2 < card['required_free_bytes'] for card in fitting)
             or chosen != max(fitting, key=lambda card: (card['free_mib'], -card['index']))['uuid']):
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
     return chosen
 
 
-def executed_card_policy(payload: dict, selection, *, estimate=None) -> dict:
+def executed_card_policy(payload: dict, selection, *, named=None, estimate=None) -> dict:
     """The policy a verified proof ran under: the request's own when it names a card (and then no
     selection may be recorded), else the request's policy with the card its recorded selection
-    chose. A selection superseded before the first claim (`superseded`) must name the card it left
-    and a valid earlier selection; the final record is the one the proof ran on."""
+    chose. The first selection must have read every registered card (or exactly the one card its
+    case names); each switch (`superseded`) must have read only the other card(s), chosen one that
+    fit, and been made from the card the previous selection chose."""
     if not card_free_policy(payload):
         if selection is not None:
             raise ValueError('a named-card proof records no card selection')
         return payload
-    chosen = _valid_selection(selection, payload)
-    superseded = selection.get('superseded', [])
-    if not isinstance(superseded, list):
+    superseded = selection.get('superseded', []) if isinstance(selection, dict) else None
+    if not isinstance(superseded, list) or (named and superseded):
         raise ValueError('card-free proof records an invalid card re-selection')
+    first = [named] if named else list(REGISTERED_CUDA_CARDS)
+    previous, expected = None, first
     for earlier in superseded:
         if (not isinstance(earlier, dict) or not isinstance(earlier.get('reason'), str) or not earlier['reason']
-                or _valid_selection(earlier.get('selection'), payload) != earlier.get('left_uuid')
+                or _cards_read(earlier.get('selection'), payload, expected) != earlier.get('left_uuid')
                 or earlier['left_uuid'] == earlier.get('switched_to')):
             raise ValueError('card-free proof records an invalid card re-selection')
-    if superseded and superseded[-1].get('switched_to') != chosen:
+        previous = earlier
+        expected = [uuid for uuid in REGISTERED_CUDA_CARDS if uuid != earlier['left_uuid']]
+    chosen = _cards_read(selection, payload, expected)
+    if previous is not None and previous['switched_to'] != chosen:
         raise ValueError('card-free proof records an invalid card re-selection')
-    if estimate is not None and any((card['estimate_source'], card['estimate_bytes']) != estimate
-                                    for card in selection['cards']):
+    every = [selection, *(earlier['selection'] for earlier in superseded)]
+    if estimate is not None and any((card['estimate_source'], card['estimate_bytes']) != tuple(estimate)
+                                    for record in every for card in record['cards']):
         raise ValueError('card-free proof selected on a different estimate than it states')
     return dict(payload, cudaDeviceUuid=chosen)
+
+
+def require_claimed_card(claim, executed: dict, estimate=None) -> None:
+    """A claim record must hold the card the verified policy names, and (when the lane states an
+    estimate) record that estimate; a claim from before claims recorded one carries none."""
+    if not isinstance(claim, dict) or claim.get('device_uuid') != executed.get('cudaDeviceUuid'):
+        raise ValueError('claim holds a different card than the verified policy or selection')
+    recorded = claim.get('claim_gpu_estimate')
+    if estimate is not None and recorded is not None and (recorded.get('source'), recorded.get('estimate_bytes')) != tuple(estimate):
+        raise ValueError('claim recorded a different device estimate than its lane states')
 
 
 def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int | None,

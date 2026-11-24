@@ -123,23 +123,24 @@ def policy(backend, *, cuda_uuid=None):
 # Pre-spawn estimate-plus-reserve-v1 admission for the MLX arm. Without one the supervisor
 # prices the row at its 80 GiB child cap and requires cap plus reserve (92 GiB) free, which
 # an idle 128 GB Mac does not have. The largest reviewed Darwin lifetime footprint of a packaged
-# plural count is 30,355,858,720 bytes (6 references, M5 Max; SceneWorks
+# plural count is 30,356,514,056 bytes (6 references, M5 Max, inference db90739be; SceneWorks
 # config/scail2-plural-memory.json); 32 GiB rounds that up. The policy, its 80 GiB kill cap
 # and its 12 GiB live free-memory reserve are unchanged.
 MLX_HOST_ESTIMATE_SOURCE = "scail2-plural-reviewed-unified-peak-v1"
 MLX_HOST_ESTIMATE_BYTES = 32 * GIB
 
 
-# CUDA: the reviewed Windows counts (RTX PRO 6000 Blackwell Max-Q, 97,887 MiB; SceneWorks
-# config/scail2-plural-memory.json) peak at 58,836,885,504 host bytes and 57,048,903,680
-# classified device bytes (6 references). Host 58 GiB (62.3 GB) covers the host peak by 3.4 GB.
-# Device 60 GiB (64.4 GB) covers the device peak by 7.4 GB; with the 6 GiB reserve a card needs
-# 70.9 GB free, which also covers the review's between-sample allowance for the 6-reference count
-# (66.3 GB). The policy's 64/84 GiB kill caps and live reserves are unchanged.
+# CUDA: the reviewed Windows counts (RTX PRO 6000 Blackwell Max-Q, 97,887 MiB; inference
+# db90739be; SceneWorks config/scail2-plural-memory.json). Host: the largest classified peak plus
+# its uncertainty allowance is 58,910,965,760 bytes (6 references); 58 GiB (62.3 GB) covers it by
+# 3.4 GB. Device: the largest classified peak plus its between-sample allowance is 72,888,811,520
+# bytes (5 references: 56,679,800,832 + 16,209,010,688). 62 GiB plus the 6 GiB reserve is
+# 73,014,444,032 bytes, so a card admitted with the estimate plus reserve free holds that whole
+# bound. The policy's 64/84 GiB kill caps and live reserves are unchanged.
 CUDA_HOST_ESTIMATE_SOURCE = "scail2-plural-reviewed-host-peak-v1"
 CUDA_HOST_ESTIMATE_BYTES = 58 * GIB
 CUDA_DEVICE_ESTIMATE_SOURCE = "scail2-plural-reviewed-device-peak-v1"
-CUDA_DEVICE_ESTIMATE_BYTES = 60 * GIB
+CUDA_DEVICE_ESTIMATE_BYTES = 62 * GIB
 
 
 def admission_estimate(backend):
@@ -153,6 +154,23 @@ def admission_estimate(backend):
                 "static_floor_gpu_bytes": CUDA_DEVICE_ESTIMATE_BYTES,
                 "gpu_estimate_source": CUDA_DEVICE_ESTIMATE_SOURCE}
     raise ValueError("unregistered plural SCAIL backend")
+
+
+def validate_stated_admission(admission, backend):
+    """A count's supervisor admission priced it at this campaign's stated estimates, or (a record
+    from before the campaign stated them) at the child caps."""
+    stated = admission_estimate(backend)
+    for label, floor_key, source_key, bytes_key, cap_key, floor, source in (
+            ("host", "staticFloorHostBytes", "hostEstimateSource", "hostEstimateBytes", "childFootprintCapBytes",
+             stated.get("static_floor_host_bytes"), stated.get("host_estimate_source")),
+            ("device", "staticFloorGpuBytes", "gpuEstimateSource", "gpuEstimateBytes", "childGpuCapBytes",
+             stated.get("static_floor_gpu_bytes"), stated.get("gpu_estimate_source"))):
+        if backend == "mlx" and label == "device":
+            continue
+        legacy = (admission.get(floor_key) is None and admission.get(source_key) == "child-footprint-cap-fallback"
+                  and admission.get(bytes_key) == admission.get(cap_key))
+        if not legacy and (admission.get(floor_key), admission.get(source_key), admission.get(bytes_key)) != (floor, source, floor):
+            raise ValueError(f"count admission priced the {label} at a different estimate than the campaign states")
 
 
 def claim_estimate(policy_object):
@@ -266,6 +284,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             raise ValueError("unexpected source for archived owned-zero evidence")
     validate_native(data, backend, count)
     validate_admission(guard["admission"], policy_sha256=approved.sha256)
+    validate_stated_admission(guard["admission"], backend)
     if (
         guard["pid"] != data["pid"]
         or guard["returncode"] != 0

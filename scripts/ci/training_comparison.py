@@ -16,6 +16,8 @@ import re
 import statistics
 import time
 
+from scripts.ci import model_proof_resources
+
 PROTOCOL = 'conditional-v1'
 STAGES = ('legacy', 'current', 'minus-e1', 'minus-e2', 'minus-e3',
           'minus-reference-owner', 'plus-streaming')
@@ -573,11 +575,15 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                'terminal_model_evidence': False}
     receipt['comparison_started_monotonic'] = started
     receipt['comparison_deadline_monotonic'] = started + value['policy']['deadlineSeconds']
+    request_value, abandon, switched = value, None, None
     if is_card_free(value):
-        # Run every stage on the registered card with the most free memory that fits, under
-        # that card's own registered recipe.
-        from scripts.ci.model_proof_resources import choose_card
-        chosen, receipt['cuda_card_selection'] = choose_card(value['policy'], work)
+        # Run every stage on the registered card with the most free memory that fits, under that
+        # card's own registered recipe. If that card is taken before the first stage's claim, the
+        # first stage switches to the other card when it fits (see card_switcher).
+        from scripts.ci.model_proof_resources import card_switcher, choose_card
+        chosen, receipt['cuda_card_selection'] = choose_card(
+            value['policy'], work, deadline_monotonic=receipt['comparison_deadline_monotonic'])
+        abandon, switched = card_switcher(value['policy'], work, receipt['cuda_card_selection'])
         value = concrete_request(value, chosen['cudaDeviceUuid'])
         rows = rows_for(chosen['cudaDeviceUuid'])
         validate_request(rows, value, backend)
@@ -588,7 +594,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     # no cross-listener rebuild can replace it between bounded stages.
     os.environ['CARGO_TARGET_DIR'] = str(work / 'cargo-target')
     try:
-        for stage in plan['execution_order']:
+        queue = list(plan['execution_order'])
+        while queue:
+            stage = queue[0]
             elapsed = time.monotonic() - started
             remaining = value['policy']['deadlineSeconds'] - elapsed
             if remaining <= max(value['policy']['pollMillis'], value['policy']['termGraceMillis']) / 1000:
@@ -602,9 +610,25 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                       'elapsed_before_stage_seconds': elapsed,
                       'remaining_original_deadline_seconds': remaining}
             receipt['stage_records'].append(record)
-            code = proof.run((selected,), backend, child_value, expected, destination,
-                             comparison_work=work / stage,
-                             comparison_deadline_monotonic=receipt['comparison_deadline_monotonic'])
+            first = not results and len(receipt['stage_records']) == 1
+            try:
+                switch = {'abandon_wait': abandon} if first and abandon is not None else {}
+                code = proof.run((selected,), backend, child_value, expected, destination,
+                                 comparison_work=work / stage,
+                                 comparison_deadline_monotonic=receipt['comparison_deadline_monotonic'],
+                                 **switch)
+            except model_proof_resources.CudaCardTaken:
+                # The first stage's card was taken before its claim and the other card fits now:
+                # discard the unstarted stage and rerun it on the other card's recipe.
+                import shutil
+                receipt['stage_records'].pop()
+                shutil.rmtree(destination)
+                shutil.rmtree(work / stage)
+                receipt['cuda_card_selection'] = switched['selection']
+                value = concrete_request(request_value, switched['selection']['chosen_uuid'])
+                rows = rows_for(switched['selection']['chosen_uuid'])
+                validate_request(rows, value, backend)
+                continue
             record['returncode'] = code
             child_receipt = json.loads((destination / 'receipt.json').read_text(encoding='utf-8'))
             case = child_receipt.get('cases', [{}])[0]
@@ -621,6 +645,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             results.append(case['training_comparison'])
             if len({x['executable_sha256'] for x in receipt['stage_records']}) != 1:
                 raise ValueError('stage compiled native executable identity changed')
+            queue.pop(0)
         receipt['measurement'] = aggregate(plan, results)
         receipt['accepted'] = True
     except (ValueError, OSError, KeyError, IndexError) as error:

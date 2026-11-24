@@ -24,7 +24,9 @@ from scripts.ci import video_tier1_followup as followup
 from scripts.ci import video_tier1_cuda_diagnostic as targeted
 from scripts.ci.wan_pair import production_timing
 from scripts.ci.flux1_pair.fixture import sha
-from scripts.ci.model_proof_resources import choose_card, executed_card_policy, execution_claim, planned_card_policy
+from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, choose_card, claim_chosen_card,
+                                              executed_card_policy, execution_claim, planned_card_policy,
+                                              require_claimed_card)
 from scripts.media_campaign_supervisor import load_policy, runtime_guarded_admission, validate_admission
 
 BASE = "38dab65f5d9640396cf2946cd4ee866ce46630c6"
@@ -530,20 +532,16 @@ def execute(args, contract):
     proof.unlinked_path(work, temporary)
     work.mkdir()
     try:
-        # A request that names no card runs on the registered card with the most free memory that
-        # fits (GPU 0 when its follow-up is bound to GPU 0).
-        payload, selection = choose_card(
-            contract["request"]["policy"], work,
-            named=targeted.GPU0_HARDWARE["uuid"] if contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS else None)
-        if selection is not None:
-            receipt["cuda_card_selection"] = selection
-        policy = read_policy(work, "policy.json", payload)
-        receipt["hardware"] = paired.hardware(backend, policy)
-        adapter = None
+        request_policy = contract["request"]["policy"]
+        gpu0_bound = contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS
+        # Builds never touch a GPU: a request that names no card builds first, then chooses (and if
+        # need be switches) its card in the claim's own admission window.
+        policy = read_policy(work, "policy.json", planned_card_policy(request_policy))
         if backend == "candle-cuda":
-            adapter = receipt["dedicated_adapter"] = cuda_adapter(policy)
-        if contract.get("followup"):
-            check_followup_device(contract["followup"], receipt["hardware"], adapter)
+            # Fail before any fixture or build when a card this run may use lacks its WDDM counter.
+            for uuid in ([request_policy["cudaDeviceUuid"]] if "cudaDeviceUuid" in request_policy
+                         else [targeted.GPU0_HARDWARE["uuid"]] if gpu0_bound else list(REGISTERED_CUDA_CARDS)):
+                cuda_adapter(read_policy(work, "counter-policy.json", dict(request_policy, cudaDeviceUuid=uuid)))
         paths = {}
         for case in contract["cases"]:
             descriptor = cohorts.BY_NAME[case]
@@ -564,15 +562,40 @@ def execute(args, contract):
         claim_dir = work / "claim"
         claim_dir.mkdir()
         budget = contract["claim_budget_seconds"]
-        claim_policy = read_policy(claim_dir, "policy.json", dict(payload, deadlineSeconds=budget))
         deadline = time.monotonic() + budget
         last_start = deadline - policy.deadline_seconds - contract["release_reserve_seconds"]
         lease_env = builds["base"][2]
         constraints = None
-        if contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS:
+        if gpu0_bound:
             constraints = {"required_cuda_device_uuid": targeted.GPU0_HARDWARE["uuid"], "required_cuda_physical_index": 0}
-        with execution_claim(backend, claim_policy, claim_dir, lease_env, constraints=constraints,
-                             original_deadline_monotonic=deadline) as claim:
+        # A request that names no card runs on the registered card with the most free memory that
+        # fits (GPU 0 when its follow-up is bound to GPU 0).
+        payload, card_selection = choose_card(
+            request_policy, work, named=targeted.GPU0_HARDWARE["uuid"] if gpu0_bound else None,
+            deadline_monotonic=last_start)
+        if card_selection is not None:
+            receipt["cuda_card_selection"] = card_selection
+        bound = {}
+
+        def bind(chosen):
+            """Bind the run to the card in force: policy, hardware, WDDM adapter, child visibility."""
+            bound["policy"] = read_policy(work, "policy.json", chosen)
+            receipt["hardware"] = paired.hardware(backend, bound["policy"])
+            bound["adapter"] = None
+            if backend == "candle-cuda":
+                bound["adapter"] = receipt["dedicated_adapter"] = cuda_adapter(bound["policy"])
+                for _, _, build_environment in builds.values():
+                    build_environment["CUDA_VISIBLE_DEVICES"] = chosen["cudaDeviceUuid"]
+            if contract.get("followup"):
+                check_followup_device(contract["followup"], receipt["hardware"], bound["adapter"])
+
+        bind(payload)
+        with claim_chosen_card(backend, request_policy, payload, card_selection, claim_dir, lease_env,
+                               claim_policy=lambda chosen: read_policy(claim_dir, "policy.json",
+                                                                       dict(chosen, deadlineSeconds=budget)),
+                               rebind=bind, record=receipt, constraints=constraints, claim_with=execution_claim,
+                               original_deadline_monotonic=deadline) as claim:
+            policy, adapter = bound["policy"], bound["adapter"]
             receipt["physical_claim"] = claim
             for case in contract["cases"]:
                 results = {}
@@ -890,8 +913,12 @@ def verify(args, contract):
             or receipt.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
         raise ValueError("video comparison artifact contract/run mismatch")
     # Replay against the policy the comparison ran under: the request's, or for a card-free
-    # request the card its recorded selection chose.
-    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"))
+    # request the card its recorded selection chose (and claimed).
+    gpu0_bound = contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS
+    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"),
+                                    named=targeted.GPU0_HARDWARE["uuid"] if gpu0_bound else None)
+    if "cuda_card_selection" in receipt and "physical_claim" in receipt:
+        require_claimed_card(receipt["physical_claim"], executed)
     contract = dict(contract, request=dict(contract["request"], policy=executed))
     backend = contract["backend"]
     entries = log_entries(contract)

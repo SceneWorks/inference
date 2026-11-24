@@ -72,5 +72,63 @@ class CardFreeComparisons(unittest.TestCase):
         self.assertIs(resources.planned_card_policy(named), named)
 
 
+    def test_a_selection_must_read_every_registered_card_or_exactly_the_named_one(self):
+        policy = {"backend": "windows-cuda", "deadlineSeconds": 60, "gpuFreeReserveBytes": 2 * 1024**3,
+                  "childGpuCapBytes": 12 * 1024**3, "schemaVersion": 1, "pollMillis": 250, "termGraceMillis": 2000,
+                  "stdoutCapBytes": 4096, "stderrCapBytes": 4096, "eventCapBytes": 4096,
+                  "childFootprintCapBytes": 8 * 1024**3, "hostFreeReserveBytes": 1024**3}
+        _, selection = select(policy, {GPU0: 1000, GPU1: 3000})
+        self.assertEqual(resources.executed_card_policy(policy, selection)["cudaDeviceUuid"], GPU0)
+        # A record that read only the less-free card is not a most-free selection.
+        partial = dict(selection, cards=[selection["cards"][1]], chosen_uuid=GPU1, chosen_index=1)
+        with self.assertRaisesRegex(ValueError, "most-free"):
+            resources.executed_card_policy(policy, partial)
+        # A case that names one card reads exactly that card.
+        with TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+            _, named = resources.choose_card(policy, Path(directory), named=GPU1,
+                                             reader=lambda uuid, _deadline: [card(uuid, 3000)])
+        self.assertEqual(resources.executed_card_policy(policy, named, named=GPU1)["cudaDeviceUuid"], GPU1)
+        with self.assertRaisesRegex(ValueError, "most-free"):
+            resources.executed_card_policy(policy, named)
+
+    def test_claim_and_spawn_estimates_are_checked_against_the_lane(self):
+        from scripts.ci import flux1_conditional_comparison as conditional
+        estimate = conditional.CASE_DEVICE_ESTIMATES["pulid-pid"]
+        conditional.check_spawn_estimate({"staticFloorGpuBytes": estimate[1], "gpuEstimateSource": estimate[0]}, estimate)
+        conditional.check_spawn_estimate({"staticFloorGpuBytes": None,
+                                          "gpuEstimateSource": "child-footprint-cap-fallback"}, estimate)
+        conditional.check_spawn_estimate({"staticFloorGpuBytes": None,
+                                          "gpuEstimateSource": "child-footprint-cap-fallback"}, None)
+        for bad in ({"staticFloorGpuBytes": estimate[1] - 1, "gpuEstimateSource": estimate[0]},
+                    {"staticFloorGpuBytes": estimate[1], "gpuEstimateSource": "other"}):
+            with self.assertRaisesRegex(ValueError, "different device estimate"):
+                conditional.check_spawn_estimate(bad, estimate)
+        executed = {"cudaDeviceUuid": GPU1}
+        resources.require_claimed_card({"device_uuid": GPU1}, executed)
+        with self.assertRaisesRegex(ValueError, "different card"):
+            resources.require_claimed_card({"device_uuid": GPU0}, executed)
+        with self.assertRaisesRegex(ValueError, "different device estimate"):
+            resources.require_claimed_card({"device_uuid": GPU1, "claim_gpu_estimate": {
+                "source": estimate[0], "estimate_bytes": estimate[1] + 1}}, executed, estimate)
+
+    def test_sensenova_refuses_unregistered_cards_and_verifies_its_native_card(self):
+        from scripts.ci import sensenova_loop_assets as assets, sensenova_loop_seal as seal
+        self.assertEqual(assets.registered_index(GPU1), 1)
+        with self.assertRaisesRegex(ValueError, "unregistered card"):
+            assets.registered_index("GPU-12345678-1234-1234-1234-123456789abc")
+        policy = {"backend": "windows-cuda", "deadlineSeconds": 60, "gpuFreeReserveBytes": 2 * 1024**3,
+                  "childGpuCapBytes": 12 * 1024**3, "schemaVersion": 1, "pollMillis": 250, "termGraceMillis": 2000,
+                  "stdoutCapBytes": 4096, "stderrCapBytes": 4096, "eventCapBytes": 4096,
+                  "childFootprintCapBytes": 8 * 1024**3, "hostFreeReserveBytes": 1024**3}
+        _, selection = select(policy, {GPU0: 90000, GPU1: 3000})
+        claims = {"q8": {"supervision": {"device_claim": {"device_uuid": GPU1}}},
+                  "q4": {"supervision": {"device_claim": {"device_uuid": GPU1}}}}
+        seal.verify_native_card({"backend": "candle-cuda", "tiers": claims, "cuda_card_selection": selection}, policy)
+        # A named-card native run (the accepted GPU 1 records) carries no selection.
+        seal.verify_native_card({"backend": "candle-cuda", "tiers": claims}, dict(policy, cudaDeviceUuid=GPU1))
+        claims["q4"]["supervision"]["device_claim"]["device_uuid"] = GPU0
+        with self.assertRaisesRegex(ValueError, "different card"):
+            seal.verify_native_card({"backend": "candle-cuda", "tiers": claims, "cuda_card_selection": selection}, policy)
+
 if __name__ == "__main__":
     unittest.main()
