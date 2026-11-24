@@ -232,6 +232,21 @@ pub fn cfg<G: GuidanceOps>(
     g.axpy(1.0, uncond, scale, &diff)
 }
 
+/// Linearly-weighted classifier-free guidance combine (`PIPE-8`):
+/// `scale·cond + (1 − scale)·uncond`.
+///
+/// Algebraically equivalent to [`cfg`] (`uncond + scale·(cond − uncond)`), but preserves the
+/// exact `scale·cond + (1 − scale)·uncond` floating-point evaluation order required for
+/// bit-exact parity (`AP13 class (a)`) on families such as Ideogram 4's asymmetric two-DiT CFG.
+pub fn cfg_linear_blend<L: LatentOps>(
+    ops: &L,
+    cond: &L::Latent,
+    uncond: &L::Latent,
+    scale: f32,
+) -> Result<L::Latent> {
+    ops.axpy(scale, cond, 1.0 - scale, uncond)
+}
+
 // =================================================================================================
 // Perturbed-Attention Guidance (PAG) combine (SW-7173).
 // =================================================================================================
@@ -1002,5 +1017,22 @@ mod tests {
 
     fn expected_ungated_check(v: &[f32]) -> Vec<f32> {
         v.to_vec()
+    }
+
+    #[test]
+    fn cfg_linear_blend_matches_direct_linear_combination_bit_exact() {
+        let cond = vec![1.25_f32, -0.75, 0.333_333_34, 4.5];
+        let uncond = vec![-0.5_f32, 2.125, -1.75, 0.125];
+        for scale in [1.0_f32, 3.0, 7.0] {
+            let out = cfg_linear_blend(&OPS, &cond, &uncond, scale).unwrap();
+            let expected: Vec<f32> = cond
+                .iter()
+                .zip(&uncond)
+                .map(|(&c, &u)| scale * c + (1.0 - scale) * u)
+                .collect();
+            for (got, want) in out.iter().zip(&expected) {
+                assert_eq!(got.to_bits(), want.to_bits(), "scale={scale}");
+            }
+        }
     }
 }

@@ -17,6 +17,7 @@ pub mod sampling;
 
 pub use dit::SupraDit;
 pub use model::{descriptor, load, Supra2Image, Supra2Output, Supra2Sources, TextConditioning};
+pub use sampling::{Supra2EulerDriver, Supra2VelocityForward};
 
 /// Compose the Supra2 generator and its memory surfaces into an explicit registry.
 pub fn register_providers(

@@ -35,6 +35,7 @@ pub use model::{
     descriptor, encode_tokens, load, CompletedSupra2Output, Supra2Image, Supra2Output,
     TextConditioning,
 };
+pub use sampling::{Supra2EulerDriver, Supra2VelocityForward};
 
 /// Compose the Supra2 generator, its memory strategy and its resident-only contract witness into
 /// an explicit registry. The loader is resident-only (no quantization, staging or deferred
