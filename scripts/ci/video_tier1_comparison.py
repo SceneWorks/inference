@@ -691,7 +691,7 @@ def verify_target(build, backend, model, arm):
 
 
 def verify_cuda_claim(claim, hardware, policy):
-    from scripts.ci.model_proof_resources import bound_cuda_activity_profile, proof_cuda_idle
+    from scripts.ci.model_proof_resources import bound_cuda_activity_profile, proof_cuda_idle, replay_claim_policy
     from scripts.release.veda_cuda_guard import BASELINE_SAMPLES, stable_window
 
     # execution_claim uses the default source-bound profile for paired proofs.
@@ -712,7 +712,10 @@ def verify_cuda_claim(claim, hardware, policy):
             or samples.get("status") != "retained-existing-samples" or samples.get("sample_count") != BASELINE_SAMPLES
             or len(samples["samples"]) != BASELINE_SAMPLES):
         raise ValueError("missing exact CUDA headroom claim, admission samples or device release")
-    check, state = stable_window(lambda card, rows: proof_cuda_idle(card, rows, policy, activity_profile=profile))
+    # Replay under the estimate the claim recorded; a claim from before claims stated one is
+    # replayed at the child cap it was admitted on.
+    replay = replay_claim_policy(policy, claim)
+    check, state = stable_window(lambda card, rows: proof_cuda_idle(card, rows, replay, activity_profile=profile))
     for number, observation in enumerate(samples["samples"], 1):
         card = observation["selected_card"]
         if (observation["sample_number"] != number or observation["predicates"].get("unique_uuid") is not True

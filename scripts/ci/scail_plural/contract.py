@@ -29,6 +29,11 @@ GPU = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
 GPU0 = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
 GPU0_PCI = "00000000:21:00.0"
 CUDA_INDICES = {GPU: 1, GPU0: 0}
+# Only GPU 0's PCI address is recorded; GPU 1's identity is bound by NVML, WDDM and the native
+# ordinal agreeing on its observed address.
+CUDA_PCI = {GPU0: GPU0_PCI}
+# Request policies that name no card: the campaign runs on whichever registered card fits.
+ANY_CARD = "most-free-registered-card"
 SLOT = "SCAIL_PLURAL_Q4"
 FILES = {
     "clip.safetensors": (
@@ -71,12 +76,13 @@ def validate_cuda_hardware(hardware, uuid):
         raise ValueError("wrong Windows GPU")
 
 
-def cuda_identity(hardware, adapter):
-    validate_cuda_hardware(hardware, GPU0)
-    if hardware.get("pci.bus_id", "").lower() != GPU0_PCI:
-        raise ValueError("wrong PCI address for SCAIL GPU 0")
-    wddm.validate_adapter(adapter, GPU0)
-    return dict(ordinal=0, visible_count=1, uuid=GPU0, pci_bus_id=GPU0_PCI,
+def cuda_identity(hardware, adapter, uuid=GPU0):
+    validate_cuda_hardware(hardware, uuid)
+    pci = hardware.get("pci.bus_id", "").lower()
+    if not re.fullmatch(r"[0-9a-f]{8}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci) or pci != CUDA_PCI.get(uuid, pci):
+        raise ValueError("wrong PCI address for the selected SCAIL GPU")
+    wddm.validate_adapter(adapter, uuid)
+    return dict(ordinal=0, visible_count=1, uuid=uuid, pci_bus_id=pci,
                 luid=adapter["luid"], node_mask=adapter["node_mask"])
 
 
@@ -98,14 +104,16 @@ def policy(backend, *, cuda_uuid=None):
             hostFreeReserveBytes=12 * GIB,
         )
     if backend == "candle-cuda":
-        uuid = GPU if cuda_uuid is None else cuda_uuid
-        cuda_constraints(uuid)
+        # No named card is the default: the campaign selects the card with the most free memory.
+        named = {} if cuda_uuid is None else {"cudaDeviceUuid": cuda_uuid}
+        if cuda_uuid is not None:
+            cuda_constraints(cuda_uuid)
         return dict(
             settings,
             backend="windows-cuda",
             childFootprintCapBytes=64 * GIB,
             hostFreeReserveBytes=8 * GIB,
-            cudaDeviceUuid=uuid,
+            **named,
             childGpuCapBytes=84 * GIB,
             gpuFreeReserveBytes=6 * GIB,
         )
@@ -122,12 +130,36 @@ MLX_HOST_ESTIMATE_SOURCE = "scail2-plural-reviewed-unified-peak-v1"
 MLX_HOST_ESTIMATE_BYTES = 32 * GIB
 
 
+# CUDA: the reviewed Windows counts (RTX PRO 6000 Blackwell Max-Q, 97,887 MiB; SceneWorks
+# config/scail2-plural-memory.json) peak at 58,836,885,504 host bytes and 57,048,903,680
+# classified device bytes (6 references). Host 58 GiB (62.3 GB) covers the host peak by 3.4 GB.
+# Device 60 GiB (64.4 GB) covers the device peak by 7.4 GB; with the 6 GiB reserve a card needs
+# 70.9 GB free, which also covers the review's between-sample allowance for the 6-reference count
+# (66.3 GB). The policy's 64/84 GiB kill caps and live reserves are unchanged.
+CUDA_HOST_ESTIMATE_SOURCE = "scail2-plural-reviewed-host-peak-v1"
+CUDA_HOST_ESTIMATE_BYTES = 58 * GIB
+CUDA_DEVICE_ESTIMATE_SOURCE = "scail2-plural-reviewed-device-peak-v1"
+CUDA_DEVICE_ESTIMATE_BYTES = 60 * GIB
+
+
 def admission_estimate(backend):
-    """The run_guarded estimate arguments for one plural count (none: the cap fallback)."""
+    """The run_guarded estimate arguments for one plural count."""
     if backend == "mlx":
         return {"static_floor_host_bytes": MLX_HOST_ESTIMATE_BYTES,
                 "host_estimate_source": MLX_HOST_ESTIMATE_SOURCE}
-    return {}
+    if backend == "candle-cuda":
+        return {"static_floor_host_bytes": CUDA_HOST_ESTIMATE_BYTES,
+                "host_estimate_source": CUDA_HOST_ESTIMATE_SOURCE,
+                "static_floor_gpu_bytes": CUDA_DEVICE_ESTIMATE_BYTES,
+                "gpu_estimate_source": CUDA_DEVICE_ESTIMATE_SOURCE}
+    raise ValueError("unregistered plural SCAIL backend")
+
+
+def claim_estimate(policy_object):
+    """The SCAIL device estimate stated to the CUDA claim (and its card selection)."""
+    import dataclasses
+    return dataclasses.replace(policy_object, claim_gpu_estimate=(CUDA_DEVICE_ESTIMATE_SOURCE,
+                                                                    CUDA_DEVICE_ESTIMATE_BYTES))
 
 
 def validate_stage(stage, root):
@@ -271,7 +303,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
     else:
         uuid = approved.cuda_device_uuid
         validate_cuda_hardware(hardware, uuid)
-        if uuid == GPU0 and digest_json(data.get("cuda_device")) != digest_json(cuda_identity(hardware, adapter)):
+        if (uuid == GPU0 or "cuda_device" in data) and digest_json(data.get("cuda_device")) != digest_json(
+                cuda_identity(hardware, adapter, uuid)):
             raise ValueError("native CUDA ordinal zero differs from NVML or WDDM")
         if guard["admission"]["cudaDeviceUuid"] != uuid:
             raise ValueError("CUDA admission belongs to a different physical device")

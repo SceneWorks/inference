@@ -23,7 +23,9 @@ from scripts.release import veda_cuda_guard as guard
 APPROVED = 'GPU-12345678-1234-5678-1234-567812345678'
 OTHER = 'GPU-87654321-4321-8765-4321-876543218765'
 GPU_POLICY = SimpleNamespace(cuda_device_uuid=APPROVED, deadline_seconds=5, poll_millis=1,
-                             gpu_free_reserve_bytes=16 * 1024**3, child_gpu_cap_bytes=64 * 1024**3)
+                             gpu_free_reserve_bytes=16 * 1024**3, child_gpu_cap_bytes=64 * 1024**3,
+                             # A job that states its 64 GiB device estimate: the card needs 80 GiB free.
+                             claim_gpu_estimate=('test-stated-estimate', 64 * 1024**3))
 
 
 def case():

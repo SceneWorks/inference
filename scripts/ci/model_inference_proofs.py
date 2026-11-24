@@ -695,6 +695,25 @@ def request(raw: str, backend: str) -> dict:
     return value
 
 
+def executed_policy(receipt: dict, value: dict) -> dict:
+    """The resource policy a proof ran under: the request's own, or for a card-free request the
+    request's policy with the registered card the producer selected (and recorded)."""
+    from scripts.ci.model_proof_resources import card_free_policy, REGISTERED_CUDA_CARDS, CARD_SELECTION_RULE
+    if not card_free_policy(value['policy']):
+        if 'cuda_card_selection' in receipt or 'request_resource_policy' in receipt:
+            raise ValueError('a named-card proof records no card selection')
+        return value['policy']
+    selection = receipt.get('cuda_card_selection')
+    chosen = selection.get('chosen_uuid') if isinstance(selection, dict) else None
+    fitting = [card for card in selection.get('cards', []) if 'refusal' not in card] if isinstance(selection, dict) else []
+    if (receipt.get('request_resource_policy') != value['policy'] or chosen not in REGISTERED_CUDA_CARDS
+            or selection.get('rule') != CARD_SELECTION_RULE
+            or selection.get('chosen_index') != REGISTERED_CUDA_CARDS[chosen]
+            or not fitting or chosen != max(fitting, key=lambda card: (card['free_mib'], -card['index']))['uuid']):
+        raise ValueError('card-free proof lacks its recorded most-free registered card selection')
+    return dict(value['policy'], cudaDeviceUuid=chosen)
+
+
 def command(row: dict, discover: bool) -> list[str]:
     kind = row.get('target_kind', 'lib' if row['target'] == 'lib' else 'test')
     args = ['cargo', 'test', '--locked']
@@ -1292,9 +1311,28 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     work.mkdir()
     sys.path.insert(0, str(ROOT))
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
-    from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, metadata_policy_payload, execution_claim
+    from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, metadata_policy_payload,
+                                                  execution_claim, card_free_policy, select_cuda_card,
+                                                  REGISTERED_CUDA_CARDS)
+    policy_payload, card_selection = value['policy'], None
+    if card_free_policy(policy_payload):
+        # The request names no card: run on the registered card with the most free memory that
+        # covers the estimate plus reserve. A case that names a card keeps it (and may wait).
+        if multi_cuda.FIELDS.intersection(value):
+            raise ValueError('a multi-GPU proof names every card in its policies')
+        named = {row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}
+        if len(named) > 1:
+            raise ValueError('selected cases name different CUDA cards; request one card explicitly')
+        candidates = {}
+        for uuid in sorted(named or REGISTERED_CUDA_CARDS):
+            candidate_path = work / f'candidate-policy-{uuid}.json'
+            write_json(candidate_path, dict(policy_payload, cudaDeviceUuid=uuid))
+            candidates[uuid] = load_policy(candidate_path)
+        chosen, card_selection = select_cuda_card(
+            candidates, time.monotonic() + next(iter(candidates.values())).deadline_seconds)
+        policy_payload = dict(policy_payload, cudaDeviceUuid=chosen)
     policy_path = work / 'policy.json'
-    write_json(policy_path, value['policy'])
+    write_json(policy_path, policy_payload)
     policy = load_policy(policy_path)
     approved_uuids = multi_cuda.bind_rows(rows, value, backend)
     # The request's Hub bindings are validated once against the complete selection; each case
@@ -1317,6 +1355,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         'request_selection': value['selection'], 'completed': 0,
         'accepted': False, 'cases': []}
     receipt.update(receipt_claims([], False))
+    if card_selection is not None:
+        receipt['request_resource_policy'] = value['policy']
+        receipt['cuda_card_selection'] = card_selection
     if approved_uuids:
         receipt['approved_cuda_uuid_roles'] = list(approved_uuids)
         receipt['additional_resource_policies'] = [json.loads(item.canonical_bytes) for item in additional_policies]
@@ -1710,7 +1751,7 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
                 or receipt.get('additional_resource_policies') != value['additional_cuda_policies']):
             raise ValueError('evidence differs from explicit ordered multi-GPU authorization and per-UUID policies')
     if (type(receipt.get('selected')) is not int or receipt.get('selected_bindings') != approved_bindings or receipt.get('selected') != len(approved_rows)
-            or receipt.get('request_selection') != value['selection'] or receipt.get('resource_policy') != value['policy']):
+            or receipt.get('request_selection') != value['selection'] or receipt.get('resource_policy') != executed_policy(receipt, value)):
         raise ValueError('evidence differs from its approved source selection/resource policy')
     if any('selected_configuration' in row for row in approved_rows) and receipt.get('request_configuration') != value.get('configuration'):
         raise ValueError('evidence differs from its approved fixed configuration selection')
@@ -1878,10 +1919,15 @@ def main() -> int:
             repository_identity(args.expected_sha)
             sys.path.insert(0, str(ROOT))
             from scripts.media_campaign_supervisor import load_policy
+            from scripts.ci.model_proof_resources import card_free_policy, REGISTERED_CUDA_CARDS
             with tempfile.TemporaryDirectory(prefix='model-proof-policy-') as directory:
                 path = Path(directory) / 'policy.json'
-                write_json(path, value['policy'])
+                # A card-free request is checked as it will run: with a registered card filled in.
+                write_json(path, dict(value['policy'], cudaDeviceUuid=next(iter(REGISTERED_CUDA_CARDS)))
+                           if card_free_policy(value['policy']) else value['policy'])
                 load_policy(path)
+                if card_free_policy(value['policy']) and multi_cuda.FIELDS.intersection(value):
+                    raise ValueError('a multi-GPU proof names every card in its policies')
                 for role, secondary in enumerate(value.get('additional_cuda_policies', []), 1):
                     extra_path = Path(directory) / f'cuda-policy-role-{role}.json'
                     write_json(extra_path, secondary)

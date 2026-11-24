@@ -101,7 +101,7 @@ class PluralQualification(unittest.TestCase):
 
     def test_gpu0_must_be_explicit_and_keeps_all_counts_guards_and_native_code(self):
         with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
-            request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda")}
+            request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda", cuda_uuid=c.GPU)}
             previous = runner.plan("candle-cuda", request, "head")
             selected = dict(request, policy=c.policy("candle-cuda", cuda_uuid=c.GPU0))
             plan = runner.plan("candle-cuda", selected, "head")
@@ -182,7 +182,7 @@ class PluralQualification(unittest.TestCase):
         self.assertEqual(c.admission_estimate("mlx"), {
             "static_floor_host_bytes": 32 * c.GIB,
             "host_estimate_source": "scail2-plural-reviewed-unified-peak-v1"})
-        self.assertEqual(c.admission_estimate("candle-cuda"), {})
+        self.assertEqual(c.admission_estimate("candle-cuda")["static_floor_gpu_bytes"], 60 * c.GIB)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "policy.json").write_text(json.dumps(c.policy("mlx")), encoding="utf-8")
@@ -210,6 +210,58 @@ class PluralQualification(unittest.TestCase):
                 run(needed - 4096, c.admission_estimate("mlx"))
             self.assertIn(c.MLX_HOST_ESTIMATE_SOURCE, caught.exception.detail)
             run(needed, c.admission_estimate("mlx"))
+
+    def test_cuda_default_names_no_card_and_runs_on_whichever_registered_card_fits(self):
+        request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda")}
+        self.assertNotIn("cudaDeviceUuid", request["policy"])
+        with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
+            plan = runner.plan("candle-cuda", request, "head")
+            gpu0 = runner.plan("candle-cuda", {"selection": c.SELECTION,
+                                               "policy": c.policy("candle-cuda", cuda_uuid=c.GPU0)}, "head")
+        self.assertEqual(plan["cuda_card_selection"], runner.CARD_SELECTION_RULE)
+        self.assertEqual((plan["counts"], plan["cuda_completion"]), (c.COUNTS["candle-cuda"], "supervisor-owned-windows-job"))
+        self.assertNotIn("cuda_card_selection", gpu0)
+        self.assertIn("cuda_identity()", runner.source("candle-cuda", c.ANY_CARD))
+        # GPU 0 is short (another process holds 40 GB) and GPU 1 is free: the campaign takes GPU 1.
+        def reader(uuid, _deadline):
+            used = 40000 if uuid == c.GPU0 else 3000
+            return [{"uuid": uuid, "index": c.CUDA_INDICES[uuid], "total_mib": 97887,
+                     "used_mib": used, "free_mib": 97887 - used, "utilization_percent": 0}]
+        with TemporaryDirectory() as directory:
+            chosen, selection = runner.select_card("candle-cuda", Path(directory), reader=reader)
+        self.assertEqual((chosen, selection["chosen_index"]), (c.GPU, 1))
+        self.assertEqual([card.get("refusal", "")[:30] for card in selection["cards"]],
+                         ["57887 MiB free < 67584 MiB req", ""])
+        receipt = {"cuda_card_selection": selection, "hardware": {"uuid": c.GPU, "index": "1"}}
+        contract = dict(plan, backend="candle-cuda")
+        self.assertEqual(runner.executed_policy(contract, receipt), c.policy("candle-cuda", cuda_uuid=c.GPU))
+        for mutate in (lambda r: r["cuda_card_selection"].update(chosen_uuid=c.GPU0, chosen_index=0),
+                       lambda r: r["hardware"].update(uuid=c.GPU0),
+                       lambda r: r["cuda_card_selection"]["cards"].reverse(),
+                       lambda r: r["cuda_card_selection"]["cards"][1].update(required_free_bytes=1)):
+            bad = copy.deepcopy(receipt)
+            mutate(bad)
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "most-free registered card"):
+                runner.executed_policy(contract, bad)
+        # A named-card campaign (both accepted GPU 0 runs) records no selection and keeps its policy.
+        self.assertEqual(runner.executed_policy(gpu0, {}), c.policy("candle-cuda", cuda_uuid=c.GPU0))
+        with self.assertRaises(ValueError):
+            runner.executed_policy(gpu0, receipt)
+
+    def test_cuda_counts_state_the_reviewed_device_estimate_to_the_claim_and_supervisor(self):
+        estimate = c.admission_estimate("candle-cuda")
+        self.assertEqual(estimate, {
+            "static_floor_host_bytes": 58 * c.GIB, "host_estimate_source": "scail2-plural-reviewed-host-peak-v1",
+            "static_floor_gpu_bytes": 60 * c.GIB, "gpu_estimate_source": "scail2-plural-reviewed-device-peak-v1"})
+        with TemporaryDirectory() as directory:
+            loaded = runner.tier1.read_policy(Path(directory), "policy.json", c.policy("candle-cuda", cuda_uuid=c.GPU0))
+        claimed = c.claim_estimate(loaded)
+        self.assertEqual(claimed.sha256, loaded.sha256)
+        from scripts.ci.model_proof_resources import claim_required_free_bytes
+        self.assertEqual(claim_required_free_bytes(claimed), 66 * c.GIB)
+        from scripts import media_campaign_supervisor as safety
+        admission = safety.runtime_guarded_admission(loaded, **estimate)
+        self.assertEqual((admission["hostEstimateBytes"], admission["gpuEstimateBytes"]), (58 * c.GIB, 60 * c.GIB))
 
     def test_all_counts_both_backend_shapes_and_mutated_native_results(self):
         for backend, counts in c.COUNTS.items():
@@ -351,7 +403,7 @@ class PluralQualification(unittest.TestCase):
         with TemporaryDirectory() as directory:
             dest = Path(directory) / "evidence"
             dest.mkdir()
-            contract = {"request": {"policy": c.policy("candle-cuda")}, "head": "head",
+            contract = {"request": {"policy": c.policy("candle-cuda", cuda_uuid=c.GPU)}, "head": "head",
                         "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}}
             receipt = {"contract": contract, "request": contract["request"], "run_id": "1",
                        "run_attempt": "1", "accepted": False, "failure": "incomplete campaign",

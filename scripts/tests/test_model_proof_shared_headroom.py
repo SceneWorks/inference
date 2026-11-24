@@ -1,6 +1,8 @@
 """Shared CUDA admission contracts with synthetic snapshots only; no driver/model work."""
 import copy
 import contextlib
+import dataclasses
+import io
 import itertools
 import json
 import os
@@ -75,6 +77,56 @@ class SharedHeadroom(unittest.TestCase):
                 self.assertTrue(all(call.kwargs.get('selected_uuid') == UUID for call in inventory.call_args_list))
                 return receipt, inventory.call_count
 
+    def test_a_card_another_process_holds_40_gb_of_admits_a_fitting_estimate_and_refuses_one_that_does_not(self):
+        # SCAIL's guard: 6 GiB reserve, 84 GiB cap. Another process holds 38,147 MiB (40 GB),
+        # leaving 59,740 MiB free on the 97,887 MiB card.
+        shared = self.card(4, used_mib=38147, free_mib=59740)
+        base = SimpleNamespace(**{**vars(POLICY), 'child_gpu_cap_bytes': 84 * 1024**3,
+                                  'gpu_free_reserve_bytes': 6 * 1024**3, 'deadline_seconds': 20})
+        fits = SimpleNamespace(**{**vars(base), 'claim_gpu_estimate': ('test-stated-estimate', 40 * 1024**3)})
+        too_big = SimpleNamespace(**{**vars(base), 'claim_gpu_estimate': ('test-stated-estimate', 60 * 1024**3)})
+        # No stated estimate: the shared 16 GiB default, never the 84 GiB cap.
+        self.assertEqual(resources.claim_required_free_bytes(base), 22 * 1024**3)
+        for policy in (base, fits):
+            self.assertTrue(resources.proof_cuda_idle(shared, [], policy, activity_profile=PROFILE))
+            receipt, _ = self.claim([([shared], [])] * 11, policy=policy, clock=FakeClock())
+            self.assertEqual(receipt['claim_gpu_estimate']['required_free_bytes'],
+                             resources.claim_required_free_bytes(policy))
+            self.assertEqual(receipt['admission_wait']['headroom_shortfalls'], 0)
+        self.assertFalse(resources.proof_cuda_idle(shared, [], too_big, activity_profile=PROFILE))
+        short = SimpleNamespace(**{**vars(too_big), 'deadline_seconds': .003})
+        stderr = io.StringIO()
+        with self.assertRaises(resources.CudaClaimRejected) as caught, contextlib.redirect_stderr(stderr):
+            self.claim(itertools.repeat(([shared], [])), policy=short, clock=FakeClock(),
+                       body=lambda _: self.fail('a card without estimate plus reserve free reached the body'))
+        reason = caught.exception.diagnostic['admission_wait']['last_refusal']
+        self.assertIn('59740 MiB free < 67584 MiB required', reason)
+        self.assertIn('test-stated-estimate', reason)
+        self.assertIn('59740 MiB free', stderr.getvalue())
+
+    def test_a_claim_record_replays_under_its_recorded_estimate_or_the_legacy_cap(self):
+        from scripts.media_campaign_supervisor import load_policy
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'policy.json'
+            path.write_text(json.dumps({
+                'schemaVersion': 1, 'backend': 'windows-cuda', 'deadlineSeconds': 2400, 'pollMillis': 250,
+                'termGraceMillis': 2000, 'stdoutCapBytes': 4096, 'stderrCapBytes': 4096, 'eventCapBytes': 4096,
+                'childFootprintCapBytes': 64 * 1024**3, 'hostFreeReserveBytes': 8 * 1024**3,
+                'cudaDeviceUuid': UUID, 'childGpuCapBytes': 84 * 1024**3, 'gpuFreeReserveBytes': 6 * 1024**3}),
+                encoding='utf-8')
+            loaded = load_policy(path)
+        legacy = resources.replay_claim_policy(loaded, {})
+        self.assertEqual(resources.claim_required_free_bytes(legacy), 90 * 1024**3)
+        stated = resources.claim_estimate_record(dataclasses.replace(
+            loaded, claim_gpu_estimate=('scail2-plural-reviewed-device-peak-v1', 60 * 1024**3)))
+        replay = resources.replay_claim_policy(loaded, {'claim_gpu_estimate': stated})
+        self.assertEqual(resources.claim_required_free_bytes(replay), 66 * 1024**3)
+        self.assertEqual(replay.sha256, loaded.sha256)
+        for bad in (dict(stated, required_free_bytes=1), dict(stated, estimate_bytes=85 * 1024**3),
+                    dict(stated, reserve_bytes=1), {'source': 'x'}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                resources.replay_claim_policy(loaded, {'claim_gpu_estimate': bad})
+
     def test_comparison_absolute_deadline_survives_slow_discovery_before_claim(self):
         # Metadata-only clock: global100+1000 budget, discovery ended402;
         # body claim must not refresh to402+998 despite its entry policy.
@@ -86,7 +138,9 @@ class SharedHeadroom(unittest.TestCase):
         self.assertTrue(receipt['lease_released'])
 
     def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
-        policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
+        # This job states a 91 GiB device estimate (its cap), so the card needs 93 GiB free.
+        policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20,
+                                    'claim_gpu_estimate':('test-stated-estimate',91*1024**3)})
         busy = self.card(10, used_mib=20875, free_mib=76564)
         ready = self.card(10, used_mib=2186, free_mib=95253)
         observations = [([busy], [])]*2 + [([ready], [])]*11
@@ -356,7 +410,8 @@ class SharedHeadroom(unittest.TestCase):
 
     def test_actual_moss_release_shape_passes_after_owned_exit_without_readmitting_91gib(self):
         # CI_IMPACT: immutable audit scalars copied into synthetic snapshots; no NVML/NN calls.
-        policy = SimpleNamespace(**{**vars(POLICY), 'child_gpu_cap_bytes': 91 * 1024**3})
+        policy = SimpleNamespace(**{**vars(POLICY), 'child_gpu_cap_bytes': 91 * 1024**3,
+                                    'claim_gpu_estimate': ('test-stated-estimate', 91 * 1024**3)})
         admission = self.card(0, used_mib=2186, free_mib=95253,
                               process_inventory_status='unknown/not-collected-diagnostic-only')
         release = self.card(100, used_mib=24531, free_mib=72908,
@@ -614,6 +669,107 @@ class SharedHeadroom(unittest.TestCase):
         self.assertFalse(resources.proof_cuda_idle(card, rows, POLICY,
                                                  activity_profile=resources.IRIS_CUDA_CORRECTNESS_ACTIVITY))
 
+
+
+GPU0_UUID, GPU1_UUID = sorted(resources.REGISTERED_CUDA_CARDS, key=resources.REGISTERED_CUDA_CARDS.get)
+
+
+class CardSelection(unittest.TestCase):
+    """A proof that names no card runs on whichever registered card fits; no driver is touched."""
+
+    def policies(self, *uuids):
+        return {uuid: SimpleNamespace(cuda_device_uuid=uuid, poll_millis=250, gpu_free_reserve_bytes=6 * 1024**3,
+                                      child_gpu_cap_bytes=84 * 1024**3,
+                                      claim_gpu_estimate=('test-stated-estimate', 60 * 1024**3))
+                for uuid in uuids}
+
+    def card(self, uuid, used_mib):
+        return {'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid], 'total_mib': 97887,
+                'used_mib': used_mib, 'free_mib': 97887 - used_mib, 'utilization_percent': 5}
+
+    def select(self, polls, policies, deadline=100.):
+        clock = FakeClock()
+        script = iter(polls)
+        state = {}
+        def reader(uuid, _deadline):
+            if uuid == GPU0_UUID or GPU0_UUID not in policies:
+                state['poll'] = next(script)
+            value = state['poll'][uuid]
+            if isinstance(value, Exception):
+                raise value
+            return [value]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = resources.select_cuda_card(policies, deadline, reader=reader, pause=clock.sleep,
+                                                clock=clock.monotonic)
+        return result, stderr.getvalue(), clock.now
+
+    def test_gpu0_busy_or_short_selects_gpu1_at_once(self):
+        both = self.policies(GPU0_UUID, GPU1_UUID)
+        for gpu0 in (self.card(GPU0_UUID, 40000), self.card(GPU0_UUID, 97000),
+                     RuntimeError('MOCK GPU 0 inventory failed')):
+            with self.subTest(gpu0=gpu0):
+                (chosen, record), log, waited = self.select(
+                    [{GPU0_UUID: gpu0, GPU1_UUID: self.card(GPU1_UUID, 3000)}], both)
+                self.assertEqual((chosen, record['chosen_index'], record['polls'], waited), (GPU1_UUID, 1, 1, 0.))
+                self.assertEqual(record['rule'], resources.CARD_SELECTION_RULE)
+                refused = record['cards'][0]
+                self.assertEqual(refused['uuid'], GPU0_UUID)
+                self.assertIn('refusal', refused)
+                self.assertIn(f'card 0 {GPU0_UUID} refused', log)
+                self.assertIn(f'CUDA card selected: index 1 {GPU1_UUID}', log)
+
+    def test_the_card_with_the_most_free_memory_wins_when_both_fit(self):
+        (chosen, record), _, _ = self.select(
+            [{GPU0_UUID: self.card(GPU0_UUID, 9000), GPU1_UUID: self.card(GPU1_UUID, 3000)}],
+            self.policies(GPU0_UUID, GPU1_UUID))
+        self.assertEqual(chosen, GPU1_UUID)
+        (chosen, _), _, _ = self.select(
+            [{GPU0_UUID: self.card(GPU0_UUID, 2000), GPU1_UUID: self.card(GPU1_UUID, 3000)}],
+            self.policies(GPU0_UUID, GPU1_UUID))
+        self.assertEqual(chosen, GPU0_UUID)
+
+    def test_waits_only_while_no_card_fits_and_logs_each_refusal(self):
+        short = {GPU0_UUID: self.card(GPU0_UUID, 40000), GPU1_UUID: self.card(GPU1_UUID, 45000)}
+        freed = {GPU0_UUID: self.card(GPU0_UUID, 40000), GPU1_UUID: self.card(GPU1_UUID, 3000)}
+        (chosen, record), log, waited = self.select([short, short, freed], self.policies(GPU0_UUID, GPU1_UUID))
+        self.assertEqual((chosen, record['polls'], waited), (GPU1_UUID, 3, 2.))
+        self.assertIn('no card fits, waiting', log)
+        self.assertIn(f'card 1 {GPU1_UUID} refused: 52887 MiB free < 67584 MiB required', log)
+        with self.assertRaises(resources.CudaClaimRejected) as caught, contextlib.redirect_stderr(io.StringIO()):
+            clock = FakeClock()
+            resources.select_cuda_card(self.policies(GPU0_UUID, GPU1_UUID), 3.,
+                                       reader=lambda uuid, _: [short[uuid]], pause=clock.sleep, clock=clock.monotonic)
+        self.assertEqual([card['uuid'] for card in caught.exception.diagnostic['cards']], [GPU0_UUID, GPU1_UUID])
+
+    def test_a_card_free_proof_verifies_against_the_card_it_recorded_selecting(self):
+        request = {'backend': 'windows-cuda', 'deadlineSeconds': 60, 'gpuFreeReserveBytes': 6 * 1024**3}
+        (chosen, record), _, _ = self.select(
+            [{GPU0_UUID: self.card(GPU0_UUID, 40000), GPU1_UUID: self.card(GPU1_UUID, 3000)}],
+            self.policies(GPU0_UUID, GPU1_UUID))
+        receipt = {'request_resource_policy': request, 'cuda_card_selection': record}
+        self.assertEqual(proof.executed_policy(receipt, {'policy': request}), dict(request, cudaDeviceUuid=GPU1_UUID))
+        swapped = copy.deepcopy(receipt)
+        swapped['cuda_card_selection'].update(chosen_uuid=GPU0_UUID, chosen_index=0)
+        for bad in (swapped, {'cuda_card_selection': record}, {}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'most-free registered card'):
+                proof.executed_policy(bad, {'policy': request})
+        named = dict(request, cudaDeviceUuid=GPU0_UUID)
+        self.assertEqual(proof.executed_policy({}, {'policy': named}), named)
+        with self.assertRaises(ValueError):
+            proof.executed_policy(receipt, {'policy': named})
+
+    def test_a_named_card_waits_for_itself_and_unregistered_cards_are_refused(self):
+        short = {GPU0_UUID: self.card(GPU0_UUID, 40000)}
+        ready = {GPU0_UUID: self.card(GPU0_UUID, 1000)}
+        (chosen, record), log, waited = self.select([short, ready], self.policies(GPU0_UUID))
+        self.assertEqual((chosen, waited), (GPU0_UUID, 1.))
+        self.assertIn('no card fits, waiting', log)
+        with self.assertRaises(ValueError):
+            resources.select_cuda_card(self.policies(OTHER), 1.)
+        moved = {GPU0_UUID: dict(self.card(GPU0_UUID, 1000), index=1), GPU1_UUID: self.card(GPU1_UUID, 3000)}
+        (chosen, record), _, _ = self.select([moved], self.policies(GPU0_UUID, GPU1_UUID))
+        self.assertEqual((chosen, record['cards'][0]['refusal']), (GPU1_UUID, 'card moved to index 1'))
 
 if __name__ == '__main__':
     unittest.main()

@@ -29,6 +29,59 @@ RELEASE_QUERY_ATTEMPTS = 3
 RELEASE_SAMPLING_SECONDS = 5 * (RELEASE_QUERY_SECONDS * RELEASE_QUERY_ATTEMPTS + 1)
 
 
+# Records written before claims stated a device estimate priced the card at the policy's child cap.
+LEGACY_CAP_CLAIM_ESTIMATE_SOURCE = 'child-gpu-cap'
+
+
+def claim_gpu_estimate(policy) -> tuple[str, int]:
+    """The device estimate a CUDA claim needs free beyond the reserve.
+
+    The caller's stated estimate (`policy.claim_gpu_estimate`), else the supervisor's shared
+    default free floor (never above the child cap). No claim requires cap plus reserve, so no
+    CUDA job needs an idle card; the child cap and live reserve watchdog still bound the run.
+    """
+    from scripts.media_campaign_supervisor import default_gpu_estimate
+    cap = policy.child_gpu_cap_bytes
+    stated = getattr(policy, 'claim_gpu_estimate', None)
+    if stated is None:
+        return default_gpu_estimate(cap)
+    source, value = stated
+    if (not isinstance(source, str) or not source or type(value) is not int
+            or type(cap) is not int or not 0 < value <= cap):
+        raise ValueError('CUDA claim estimate must name its source and fit under the child GPU cap')
+    return source, value
+
+
+def claim_required_free_bytes(policy) -> int:
+    return policy.gpu_free_reserve_bytes + claim_gpu_estimate(policy)[1]
+
+
+def claim_estimate_record(policy) -> dict:
+    source, value = claim_gpu_estimate(policy)
+    return {'source': source, 'estimate_bytes': value, 'reserve_bytes': policy.gpu_free_reserve_bytes,
+            'required_free_bytes': policy.gpu_free_reserve_bytes + value}
+
+
+def replay_claim_policy(policy, claim: dict):
+    """The policy a verifier replays a claim's headroom checks under: the estimate the claim
+    recorded, or the child cap for a claim recorded before claims stated one."""
+    import dataclasses
+    recorded = claim.get('claim_gpu_estimate')
+    if recorded is None:
+        stated = (LEGACY_CAP_CLAIM_ESTIMATE_SOURCE, policy.child_gpu_cap_bytes)
+    else:
+        if (not isinstance(recorded, dict)
+                or set(recorded) != {'source', 'estimate_bytes', 'reserve_bytes', 'required_free_bytes'}
+                or recorded['reserve_bytes'] != policy.gpu_free_reserve_bytes):
+            raise ValueError('malformed recorded CUDA claim estimate')
+        stated = (recorded['source'], recorded['estimate_bytes'])
+    replay = (dataclasses.replace(policy, claim_gpu_estimate=stated) if dataclasses.is_dataclass(policy)
+              else type(policy)(**{**vars(policy), 'claim_gpu_estimate': stated}))
+    if recorded is not None and claim_estimate_record(replay) != recorded:
+        raise ValueError('recorded CUDA claim estimate contradicts its reserve or cap')
+    return replay
+
+
 class CudaClaimRejected(ValueError):
     def __init__(self, diagnostic: dict, message='claimed CUDA UUID is absent or occupied; no model execution'):
         super().__init__(message)
@@ -59,18 +112,19 @@ def proof_cuda_idle(device: dict, processes: list[list[str]], policy,
     total, used, free, utilization = (device.get(key) for key in
                                       ('total_mib', 'used_mib', 'free_mib', 'utilization_percent'))
     reserve, cap = policy.gpu_free_reserve_bytes, policy.child_gpu_cap_bytes
+    required = claim_required_free_bytes(policy)
     if activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY:
         # Foreign utilization/contexts are observations, not ownership or safety prerequisites.
         return (all(type(value) is int for value in (total, used, free, reserve, cap))
                 and total > 0 and 0 <= used <= total and 0 <= free <= total
                 and used + free <= total + 2 and reserve > 0 and cap > 0
-                and free * mib >= reserve + cap)
+                and free * mib >= required)
     limit = (MAX_BASELINE_UTILIZATION_PERCENT if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY
              else 1 if activity_profile == STRICT_CUDA_ACTIVITY else None)
     if (limit is None or any(type(value) is not int for value in (total, used, free, utilization, reserve, cap))
             or total <= 0 or used < 0 or free < 0 or used > total or free > total
             or used + free > total + 2 or utilization < 0 or utilization >= limit or reserve <= 0 or cap <= 0
-            or free * mib < reserve + cap or any(len(row) != 4 for row in processes)):
+            or free * mib < required or any(len(row) != 4 for row in processes)):
         return False
     selected = [row for row in processes if row and row[0] == device['uuid']]
     allowed_types = ('G', 'C+G') if utilization > 0 else ('G', 'C+G', 'C')
@@ -202,14 +256,14 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
             'observed_gpu_count': len(devices),
             'selected_card': (None if selected is None else {
                 key: selected.get(key) for key in ('index', 'total_mib', 'used_mib', 'free_mib', 'utilization_percent')}),
-            **({'headroom_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+            **({'headroom_limits': {'minimum_free_bytes': claim_required_free_bytes(policy),
                                     'background_activity_is_diagnostic': True}}
                if shared_headroom else
-               {'activity_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+               {'activity_limits': {'minimum_free_bytes': claim_required_free_bytes(policy),
                                     'selected_utilization_percent_exclusive': MAX_BASELINE_UTILIZATION_PERCENT,
                                     'allowed_process_types_at_observed_utilization': list(allowed_types)}}
                if low_activity else
-               {'idle_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+               {'idle_limits': {'minimum_free_bytes': claim_required_free_bytes(policy),
                                 'selected_utilization_percent': 0,
                                 'allowed_process_types': ['G', 'C+G', 'C']}}),
             'process_inventory_status': 'unknown/not-collected-diagnostic-only' if processes_unknown else 'observed',
@@ -223,7 +277,7 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
                                selected, processes, policy, activity_profile=activity_profile),
                            'free_memory_above_policy_headroom': selected is not None and
                                type(selected.get('free_mib')) is int and
-                               selected['free_mib'] * 1024**2 >= policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+                               selected['free_mib'] * 1024**2 >= claim_required_free_bytes(policy),
                            **({} if shared_headroom else {
                            ('selected_gpu_below_profile_utilization_limit' if low_activity else 'selected_gpu_zero_utilization'):
                                type(utilization) is int and 0 <= utilization < (MAX_BASELINE_UTILIZATION_PERCENT if low_activity else 1),
@@ -471,10 +525,90 @@ def _wait_notice(observation: dict, reason: str) -> None:
         print('CUDA admission waiting: ' + reason, file=sys.stderr, flush=True)
 
 
+# The Windows CUDA host's two RTX PRO 6000 cards: UUID -> nvidia-smi physical index. GPU 1 also
+# drives the display. A proof that names neither card may run on whichever one fits.
+REGISTERED_CUDA_CARDS = {
+    'GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0': 0,
+    'GPU-e4b79931-7be6-f216-460a-f5405cfafffe': 1,
+}
+CARD_SELECTION_RULE = 'most-free-card-covering-estimate-plus-reserve-v1'
+
+
+def card_free_policy(payload: dict) -> bool:
+    """A Windows CUDA request policy that names no card: the proof runs on whichever card fits."""
+    return isinstance(payload, dict) and payload.get('backend') == 'windows-cuda' and 'cudaDeviceUuid' not in payload
+
+
+def select_cuda_card(policies: dict, deadline: float, *, reader=None, pause=time.sleep,
+                     clock=time.monotonic) -> tuple[str, dict]:
+    """Choose the card a proof that names none runs on, from `policies` ({UUID: its policy}).
+
+    Each poll reads every candidate's free memory. A card is refused (and the reason logged) when
+    it is absent, has moved index, or has less free than its reserve plus the claim estimate.
+    Among the cards that fit, the one with the most free memory is chosen at once: the proof never
+    waits on a short card while another fits. Only when no card fits does it wait, polling every
+    card, until `deadline`. The chosen card is then claimed normally (lock, stable window).
+    """
+    from scripts.release import veda_cuda_guard
+    if not policies or any(uuid not in REGISTERED_CUDA_CARDS or policy.cuda_device_uuid != uuid
+                           for uuid, policy in policies.items()):
+        raise ValueError('CUDA card selection is limited to the registered host cards')
+    reader = reader or (lambda uuid, until: veda_cuda_guard.inventory(
+        None, 'model-proof-card-selection', until, selected_uuid=uuid)[0])
+    notice, polls, started = {}, 0, clock()
+    while True:
+        polls += 1
+        cards = []
+        for uuid in sorted(policies, key=REGISTERED_CUDA_CARDS.get):
+            policy = policies[uuid]
+            source, estimate = claim_gpu_estimate(policy)
+            required = claim_required_free_bytes(policy)
+            entry = {'uuid': uuid, 'index': REGISTERED_CUDA_CARDS[uuid], 'estimate_source': source,
+                     'estimate_bytes': estimate, 'required_free_bytes': required}
+            try:
+                devices = reader(uuid, deadline)
+            except (RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as error:
+                devices, entry['refusal'] = [], f'inventory failed: {str(error)[:200]}'
+            matched = [device for device in devices if device.get('uuid') == uuid]
+            if 'refusal' in entry:
+                pass
+            elif len(matched) != 1:
+                entry['refusal'] = 'card absent from the driver inventory'
+            elif matched[0].get('index') != REGISTERED_CUDA_CARDS[uuid]:
+                entry['refusal'] = f"card moved to index {matched[0].get('index')}"
+            else:
+                card = matched[0]
+                entry.update({key: card.get(key) for key in ('total_mib', 'used_mib', 'free_mib')})
+                if type(card.get('free_mib')) is not int or card['free_mib'] * 1024**2 < required:
+                    entry['refusal'] = (f"{card.get('free_mib')} MiB free < {-(-required // 1024**2)} MiB "
+                                        f"required (reserve {policy.gpu_free_reserve_bytes} + estimate "
+                                        f'{estimate} bytes, {source})')
+            cards.append(entry)
+        fits = [entry for entry in cards if 'refusal' not in entry]
+        for entry in cards:
+            if 'refusal' in entry:
+                _wait_notice(notice, f"card {entry['index']} {entry['uuid']} refused: {entry['refusal']}"
+                             + ('' if fits else '; no card fits, waiting'))
+        if fits:
+            chosen = max(fits, key=lambda entry: (entry['free_mib'], -entry['index']))
+            print(f"CUDA card selected: index {chosen['index']} {chosen['uuid']} "
+                  f"({chosen['free_mib']} MiB free, the most of {len(fits)} fitting card(s))",
+                  file=sys.stderr, flush=True)
+            return chosen['uuid'], {'rule': CARD_SELECTION_RULE, 'chosen_uuid': chosen['uuid'],
+                                    'chosen_index': chosen['index'], 'polls': polls,
+                                    'wait_seconds': clock() - started, 'cards': cards}
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise CudaClaimRejected({'rule': CARD_SELECTION_RULE, 'polls': polls, 'cards': cards,
+                                     'admission_error': 'no registered CUDA card had estimate plus reserve free before the deadline'},
+                                    'no registered CUDA card fits this proof; no model execution')
+        pause(min(max(min(policy.poll_millis for policy in policies.values()) / 1000, 1.0), remaining))
+
+
 def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int | None,
                            policy, deadline: float, observation: dict, notice: dict | None = None,
                            pause_unlocked=time.sleep):
-    """Wait only for valid selected-card cap+reserve headroom before any body exists.
+    """Wait only for valid selected-card estimate-plus-reserve headroom before any body exists.
 
     `pause_unlocked` releases the UUID lock while waiting so other CI jobs that fit can run.
     """
@@ -527,9 +661,11 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
         observation['headroom_shortfalls'] += 1
         observation.setdefault('first_shortfall', diagnostic)
         card = diagnostic.get('selected_card') or {}
+        source, estimate = claim_gpu_estimate(policy)
         reason = (f"{card.get('free_mib')} MiB free < "
-                  f"{-(-(policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes) // 1024**2)} MiB "
-                  'required (reserve + child cap); foreign activity is not a refusal reason')
+                  f"{-(-claim_required_free_bytes(policy) // 1024**2)} MiB required (reserve "
+                  f"{policy.gpu_free_reserve_bytes} + estimate {estimate} bytes, {source}); "
+                  'foreign activity is not a refusal reason')
         observation['last_refusal'] = reason
         _wait_notice(notice, f'{uuid}: {reason}')
         remaining = deadline - time.monotonic()
@@ -572,7 +708,7 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
                     raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': message,
                         'admission_samples': facts, 'admission_wait': dict(observation)}, message) from error
             elif str(error) == 'physical GPU occupied during model-proof-admission' and samples and valid_identity(samples[-1]):
-                reason = window_reason() or 'free memory fell below reserve + child cap'
+                reason = window_reason() or 'free memory fell below reserve + estimate'
             else:
                 raise
             observation['stable_sample_restarts'] += 1
@@ -605,7 +741,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                     original_deadline_monotonic: float | None = None, require_owned_completion: bool = False):
     """Claim only during execution. CUDA reuses Veda's host-global UUID lock namespace.
 
-    CUDA admission: the policy's reserve plus child cap free on the exact UUID in five stable
+    CUDA admission: the policy's reserve plus the claim's device estimate (claim_gpu_estimate)
+    free on the exact UUID in five stable
     samples taken under the lock; display/compute co-tenants and utilization are diagnostic.
     `require_owned_completion` makes the release seal also require the supervisor's owned-Job
     completion record (the registry runner retains it); other callers' supervisors reap their
@@ -746,9 +883,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                                                           activity_profile=activity_profile))
         record = {'mechanism': 'existing PUBLIC/SceneWorks/gpu-locks UUID lock', 'device_uuid': uuid,
                   'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
+                  'claim_gpu_estimate': claim_estimate_record(policy),
                   'activity_profile': activity_profile, 'claim_utilization_percent': matched[0]['utilization_percent']}
         if shared_headroom:
-            record['activity_policy'] = ('non-isolated correctness; exact-card identity and policy cap plus reserve free '
+            record['activity_policy'] = ('non-isolated correctness; exact-card identity and estimate plus reserve free '
                                          'on a quiet card (memory.used spread/growth, utilization level/spread bounded); '
                                          'foreign contexts are diagnostic only')
             record['isolated_benchmark_claim'] = False
@@ -759,10 +897,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         elif activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
             record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts when utilization '
                                          'is nonzero; C also permitted at zero; below '
-                                         f'{MAX_BASELINE_UTILIZATION_PERCENT}% utilization, policy cap plus reserve free')
+                                         f'{MAX_BASELINE_UTILIZATION_PERCENT}% utilization, estimate plus reserve free')
             record['isolated_benchmark_claim'] = False
         else:
-            record['idle_policy'] = 'stable typed contexts, zero selected-card utilization, policy cap plus reserve free'
+            record['idle_policy'] = 'stable typed contexts, zero selected-card utilization, estimate plus reserve free'
         if constraints.get('child_cuda_visibility') is not None:
             record['child_visibility_binding'] = child_visibility_binding(
                 constraints, env, uuid, claim_deadline - time.monotonic())

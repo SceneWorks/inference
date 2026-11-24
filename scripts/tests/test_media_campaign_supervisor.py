@@ -433,6 +433,31 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
             safety.admission_estimate(1024, "s", 10**6 + 1, 10**6, "host")
 
+    def test_a_cuda_row_without_an_estimate_needs_the_shared_floor_not_its_cap(self):
+        cuda = dataclasses.replace(self.policy, backend="linux-cuda",
+                                   cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc",
+                                   gpu_free_reserve_bytes=1024, child_gpu_cap_bytes=84 * 1024**3)
+        admission = safety.runtime_guarded_admission(cuda)
+        self.assertEqual((admission["gpuEstimateSource"], admission["gpuEstimateBytes"]),
+                         (safety.DEFAULT_GPU_ESTIMATE_SOURCE, safety.DEFAULT_GPU_ESTIMATE_BYTES))
+        admission["hostAvailableBytes"] = admission["childFootprintCapBytes"] + admission["hostFreeReserveBytes"]
+        admission["gpuAvailableBytes"] = 1024 + safety.DEFAULT_GPU_ESTIMATE_BYTES
+        safety.validate_admission(admission, policy_sha256=cuda.sha256)
+        # A record from before the shared floor priced the card at its cap and still validates.
+        legacy = dict(admission, gpuEstimateSource=safety.CAP_FALLBACK_ESTIMATE_SOURCE,
+                      gpuEstimateBytes=cuda.child_gpu_cap_bytes, gpuAvailableBytes=1024 + cuda.child_gpu_cap_bytes)
+        safety.validate_admission(legacy, policy_sha256=cuda.sha256)
+        for bad in (dict(admission, gpuEstimateBytes=1), dict(legacy, gpuEstimateBytes=1)):
+            with self.subTest(bad=bad), self.assertRaisesRegex(safety.SupervisionError, "contradicts"):
+                safety.validate_admission(bad, policy_sha256=cuda.sha256)
+        # A small cap is its own floor; a measured peak above the floor raises the estimate.
+        small = dataclasses.replace(cuda, child_gpu_cap_bytes=12 * 1024**3)
+        self.assertEqual((safety.runtime_guarded_admission(small)["gpuEstimateSource"],
+                          safety.runtime_guarded_admission(small)["gpuEstimateBytes"]),
+                         (safety.CAP_FALLBACK_ESTIMATE_SOURCE, 12 * 1024**3))
+        measured = safety.runtime_guarded_admission(cuda, measured_peak_gpu_bytes=20 * 1024**3)
+        self.assertEqual(measured["gpuEstimateSource"], safety.MEASURED_PEAK_ESTIMATE_SOURCE)
+
     def test_an_estimate_admitted_row_is_still_aborted_at_its_cap(self):
         # Admitted on an 8092-byte estimate (exactly estimate plus reserve available), the child's
         # owned footprint then exceeds the 10**6 cap: the unchanged footprint watchdog aborts and
