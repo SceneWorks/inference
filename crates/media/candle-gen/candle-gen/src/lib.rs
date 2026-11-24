@@ -175,7 +175,8 @@ pub use sampler::{
     run_curated_sampler, run_curated_sampler_with_phase_transition_spans, run_flow_sampler,
     run_flow_sampler_spans, run_flow_sampler_with_phase_transition_spans, run_scm_sampler,
     run_scm_sampler_from, AvLatents, CandleAvLatentOps, CandleLatentOps, CandlePhaseTransitionFn,
-    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+    ScmDriver, ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP,
+    SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,
