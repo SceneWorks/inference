@@ -527,6 +527,12 @@ class PluralQualification(unittest.TestCase):
             receipt[resources.SELECTION_REFUSAL] = dict(refusal, cards=refusal["cards"][:1])
             with self.assertRaisesRegex(ValueError, "invalid card selection refusal"):
                 verify()
+            # A campaign that failed before choosing a card (staging or build) also verifies.
+            del receipt[resources.SELECTION_REFUSAL]
+            verify()
+            receipt["counts"] = {"6": {"accepted": False}}
+            with self.assertRaises(ValueError):
+                verify()
 
     def test_shared_gauge_accounts_for_a_retryable_failed_nvidia_tick(self):
         base = MagicMock()

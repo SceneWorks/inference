@@ -692,7 +692,7 @@ def card_switcher(payload: dict, work: Path, selection: dict, *, estimate=None, 
 @contextmanager
 def claim_chosen_card(backend: str, request_payload: dict, payload: dict, selection, output: Path, env: dict,
                       *, claim_policy, rebind=None, record=None, estimate=None, constraints=None,
-                      claim_with=None, selector=None, **claim):
+                      claim_with=None, selector=None, fixed_card=False, **claim):
     """Claim the card a proof chose and yield the claim record.
 
     For a card-free request (a recorded `selection`), a card taken before the claim holds it (lock
@@ -702,11 +702,12 @@ def claim_chosen_card(backend: str, request_payload: dict, payload: dict, select
     before. `claim_policy(payload)` and `constraints(payload)` give the claim's policy and
     constraints for the card in force; each switched attempt claims in its own subdirectory.
     `claim_with` is the caller's execution_claim (default this module's); `selector` passes
-    select_cuda_card options (a test's driver reader) to the switch.
+    select_cuda_card options (a test's driver reader) to the switch. A case that fixes its
+    physical card (`fixed_card`) never switches: it waits for that card.
     """
     claim_with = execution_claim if claim_with is None else claim_with
     abandon, state = (card_switcher(request_payload, output, selection, estimate=estimate, **(selector or {}))
-                      if selection is not None and backend == 'candle-cuda' else (None, None))
+                      if selection is not None and backend == 'candle-cuda' and not fixed_card else (None, None))
     attempt = 1
     while True:
         stack = ExitStack()
@@ -772,16 +773,23 @@ def record_selection_refusal(receipt: dict, error: BaseException) -> bool:
     return False
 
 
-def executed_card_policy(payload: dict, selection, *, named=None, estimate=None, refusal=None) -> dict | None:
+def executed_card_policy(payload: dict, selection, *, named=None, estimate=None, refusal=None,
+                         unstarted=False) -> dict | None:
     """The policy a verified proof ran under: the request's own when it names a card (and then no
     selection may be recorded), else the request's policy with the card its recorded selection
     chose. The first selection must have read every registered card (or exactly the one card its
     case names); each switch (`superseded`) must have read only the other card(s), chosen one that
-    fit, and been made from the card the previous selection chose."""
+    fit, and been made from the card the previous selection chose. None means nothing ran: no card
+    fit before the deadline (`refusal`), or the caller attests the run failed before selection
+    (`unstarted`); the caller must then confirm no claim, child or acceptance was recorded."""
     if not card_free_policy(payload):
         if selection is not None or refusal is not None:
             raise ValueError('a named-card proof records no card selection')
         return payload
+    if selection is None and refusal is None and unstarted:
+        # The run failed before it chose a card (a prerequisite, build or discovery failure):
+        # nothing was claimed or ran, so there is no card to verify.
+        return None
     if selection is None and refusal is not None:
         # No card fit before the deadline: nothing ran. The refusal must have read every candidate
         # and refused each one.

@@ -225,11 +225,11 @@ def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
 
 
-def ran_contract(contract, selection, refusal=None):
+def ran_contract(contract, selection, refusal=None, unstarted=False):
     """The contract as the comparison ran it: a card-free CUDA request bound to the card its
     recorded most-free selection chose (a named card records no selection); None when no card fit
     before the deadline and nothing ran."""
-    executed = executed_card_policy(contract["policy"], selection, refusal=refusal)
+    executed = executed_card_policy(contract["policy"], selection, refusal=refusal, unstarted=unstarted)
     if executed is None:
         return None
     if executed is contract["policy"]:
@@ -512,7 +512,8 @@ def verify(args, contract, profile):
     if (any(receipt.get(key) != value for key, value in {**contract, **source_pair.attempt_identity(os.environ)}.items())
             or type(receipt.get("accepted")) is not bool):
         raise ValueError("terminal receipt differs from the current exact plan or attempt")
-    if ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL)) is None and (
+    if ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL),
+                    unstarted=not receipt["accepted"] and "physical_claim" not in receipt) is None and (
             receipt["accepted"] or "physical_claim" in receipt or receipt["files"]):
         raise ValueError("a refused card selection cannot report a claim, child files or acceptance")
     limits = sample_limits(profile, contract["policy"])

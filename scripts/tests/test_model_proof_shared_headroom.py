@@ -868,6 +868,17 @@ class CardSelection(unittest.TestCase):
         self.assertEqual(rebound[0]['cudaDeviceUuid'], GPU1_UUID)
         self.assertEqual(record['cuda_card_selection']['superseded'][0]['left_uuid'], GPU0_UUID)
         self.assertEqual(resources.executed_card_policy(request, record['cuda_card_selection'])['cudaDeviceUuid'], GPU1_UUID)
+        # A card-free request whose case fixes its physical card waits for that card: even with a
+        # recorded selection no switch hook reaches the claim, so it never rebinds elsewhere.
+        attempts.clear()
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stderr(io.StringIO()):
+            _, fixed = resources.choose_card(request, Path(temporary), named=GPU0_UUID, reader=reader)
+            with resources.claim_chosen_card('candle-cuda', request, dict(request, cudaDeviceUuid=GPU0_UUID), fixed,
+                                             Path(temporary), {}, claim_policy=lambda c: claim_policy(c, Path(temporary)),
+                                             claim_with=claim_with, fixed_card=True,
+                                             selector={'reader': reader}) as held:
+                pass
+        self.assertEqual(attempts, [(GPU0_UUID, Path(temporary).name, False)])
         # A named card is never switched: no abandon hook reaches its claim.
         attempts.clear()
         with tempfile.TemporaryDirectory() as temporary:

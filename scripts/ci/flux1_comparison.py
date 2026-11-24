@@ -652,7 +652,8 @@ def verify(args, contract):
     # A card-free request ran on the card its recorded selection chose (and claimed); a named card
     # records no selection and verifies as before.
     executed = executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"),
-                                    refusal=r.get(SELECTION_REFUSAL))
+                                    refusal=r.get(SELECTION_REFUSAL),
+                                    unstarted=not r["accepted"] and "physical_claim" not in r)
     if executed is None and (r["accepted"] or "physical_claim" in r or r["logs"]):
         raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
     if "cuda_card_selection" in r and "physical_claim" in r:

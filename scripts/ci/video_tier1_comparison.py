@@ -594,6 +594,7 @@ def execute(args, contract):
                                claim_policy=lambda chosen: read_policy(claim_dir, "policy.json",
                                                                        dict(chosen, deadlineSeconds=budget)),
                                rebind=bind, record=receipt, constraints=constraints, claim_with=execution_claim,
+                               fixed_card=gpu0_bound,
                                original_deadline_monotonic=deadline) as claim:
             policy, adapter = bound["policy"], bound["adapter"]
             receipt["physical_claim"] = claim
@@ -918,7 +919,8 @@ def verify(args, contract):
     gpu0_bound = contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS
     executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"),
                                     named=targeted.GPU0_HARDWARE["uuid"] if gpu0_bound else None,
-                                    refusal=receipt.get(SELECTION_REFUSAL))
+                                    refusal=receipt.get(SELECTION_REFUSAL),
+                                    unstarted=not receipt["accepted"] and "physical_claim" not in receipt)
     if executed is None:
         # No card fit before the deadline: nothing ran, so there is nothing more to replay.
         if receipt["accepted"] or "physical_claim" in receipt or receipt["logs"] or receipt.get("observations"):

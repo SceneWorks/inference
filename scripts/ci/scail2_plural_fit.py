@@ -448,9 +448,10 @@ def executed_policy(contract, receipt):
             raise ValueError("a named-card campaign records no card selection")
         return contract["request"]["policy"]
     payload = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"),
-                                   estimate=CARD_ESTIMATE, refusal=receipt.get(SELECTION_REFUSAL))
+                                   estimate=CARD_ESTIMATE, refusal=receipt.get(SELECTION_REFUSAL),
+                                   unstarted=receipt.get("accepted") is False and not receipt.get("counts"))
     if payload is None:
-        return None  # no card fit before the deadline: nothing ran
+        return None  # no card fit before the deadline, or the campaign failed before choosing one
     if receipt["hardware"]["uuid"] != payload["cudaDeviceUuid"] or payload["cudaDeviceUuid"] not in c.CUDA_INDICES:
         raise ValueError("card-free campaign lacks its recorded most-free registered card selection")
     return payload
@@ -502,9 +503,9 @@ def verify(args, contract):
 
     executed = executed_policy(contract, receipt)
     if executed is None:
-        # A refused card selection: an unsuccessful campaign in which no count was attempted.
+        # A refused (or never-made) card selection: an unsuccessful campaign that attempted no count.
         if attempted or receipt["accepted"] or not receipt.get("failure"):
-            raise ValueError("a refused card selection cannot report attempted counts")
+            raise ValueError("a refused or unselected card cannot report attempted counts")
         return
     with TemporaryDirectory() as d:
         approved = tier1.read_policy(Path(d), "policy.json", executed)

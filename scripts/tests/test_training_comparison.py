@@ -415,13 +415,19 @@ class ComparisonContract(unittest.TestCase):
             calls.append((child['configuration'], child['policy']['cudaDeviceUuid'], abandon_wait is not None))
             destination.mkdir(parents=True)
             comparison_work.mkdir(parents=True)
+            # apply_stage makes the stage's owned runtime directory before the claim; a rerun after a
+            # switch makes it again (exist_ok=False), which fails unless the switch reset it.
+            (runtime_parent / ('comparison-' + rows_[0]['training_comparison_stage'])).mkdir(exist_ok=False)
             if len(calls) == 1:
                 raise resources.CudaCardTaken({'abandoned_wait': 'lock held'})
             raise ValueError('MOCK stage stops after the switch')
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'proof'
-            with patch.dict(os.environ, {'RUNNER_TEMP': directory}), \
+            runtime_parent = Path(directory) / 'runtime'
+            runtime_parent.mkdir()
+            (runtime_parent / '.sc-26850-owned-runtime').write_text('owned', encoding='utf-8')
+            with patch.dict(os.environ, {'RUNNER_TEMP': directory, 'BESPOKE_RUNTIME_DIR': str(runtime_parent)}), \
                     patch.object(proof, 'repository_identity', return_value={'revision': 'f' * 40}), \
                     patch.object(proof, 'run', side_effect=native_mock), \
                     patch.object(resources, 'choose_card', return_value=(dict(free['policy'], cudaDeviceUuid=gpu0), first)), \
@@ -431,6 +437,8 @@ class ComparisonContract(unittest.TestCase):
         # The taken GPU 0 stage never started; the stage reran under GPU 1's recipe.
         self.assertEqual(calls[0], ('fixed_cuda_comparison_gpu0', gpu0, True))
         self.assertEqual(calls[1][:2], ('fixed_cuda_comparison_gpu1', gpu1))
+        # The rerun reached its stage (and its mock stop) instead of FileExistsError on the runtime.
+        self.assertIn('MOCK stage stops after the switch', receipt['error'])
         self.assertEqual(receipt['cuda_card_selection'], second)
         self.assertEqual(receipt['request'], free)
 

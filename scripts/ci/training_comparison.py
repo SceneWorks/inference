@@ -275,6 +275,25 @@ def apply_stage(row: dict, env: dict) -> None:
         env['BESPOKE_RUNTIME_DIR'] = str(runtime)
 
 
+def reset_stage_runtime(stage: str, environment=None) -> None:
+    """Remove a stage's owned runtime subdirectory (made by apply_stage before its claim) so a
+    stage rerun after a card switch can create it afresh; its parent must carry the owned marker."""
+    environment = os.environ if environment is None else environment
+    if not environment.get('BESPOKE_RUNTIME_DIR'):
+        return
+    from scripts.ci import model_inference_proofs as proof
+    parent = Path(environment['BESPOKE_RUNTIME_DIR'])
+    runtime = parent / ('comparison-' + stage)
+    marker = parent / '.sc-26850-owned-runtime'
+    if not runtime.exists() and not runtime.is_symlink():
+        return
+    proof.unlinked_path(runtime, parent)
+    if proof.linked(marker) or not marker.is_file() or not runtime.is_dir():
+        raise ValueError('comparison stage runtime is not an owned directory')
+    import shutil
+    shutil.rmtree(runtime)
+
+
 def _finite(value: object, *, positive=False) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and (value > 0 if positive else True)
 
@@ -628,6 +647,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 receipt['stage_records'].pop()
                 shutil.rmtree(destination)
                 shutil.rmtree(work / stage)
+                reset_stage_runtime(stage)
                 receipt['cuda_card_selection'] = switched['selection']
                 value = concrete_request(request_value, switched['selection']['chosen_uuid'])
                 rows = rows_for(switched['selection']['chosen_uuid'])
@@ -693,7 +713,8 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
     if is_card_free(value):
         # Replay against the card the comparison's recorded most-free selection chose.
         executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'),
-                                        refusal=receipt.get(model_proof_resources.SELECTION_REFUSAL))
+                                        refusal=receipt.get(model_proof_resources.SELECTION_REFUSAL),
+                                        unstarted=not receipt.get('accepted') and not receipt.get('stage_records'))
         if executed is None:
             # No card fit before the deadline: an unsuccessful comparison that ran no stage.
             if receipt['accepted'] or receipt.get('stage_records') or 'measurement' in receipt or not receipt.get('error'):

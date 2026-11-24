@@ -451,7 +451,8 @@ def verify(args, contract):
     # stated estimate; a named card records no selection and verifies as before.
     estimate = CASE_DEVICE_ESTIMATES.get(contract["case"]) if contract["backend"] == "candle-cuda" else None
     executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"), estimate=estimate,
-                                    refusal=receipt.get(SELECTION_REFUSAL))
+                                    refusal=receipt.get(SELECTION_REFUSAL),
+                                    unstarted=not receipt["accepted"] and "physical_claim" not in receipt)
     if executed is None and (receipt["accepted"] or "physical_claim" in receipt or receipt["logs"]):
         raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
     if "physical_claim" in receipt and contract["backend"] == "candle-cuda" and (

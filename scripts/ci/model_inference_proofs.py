@@ -706,18 +706,25 @@ def executed_policy(receipt: dict, value: dict, rows=()) -> dict:
     if not card_free_policy(value['policy']) and 'request_resource_policy' in receipt:
         raise ValueError('a named-card proof records no card selection')
     named = next(iter({row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}), None)
+    cases = [case for case in receipt.get('cases', []) if isinstance(case, dict)]
+    claimed = [case for case in cases if isinstance(case.get('physical_execution'), dict)
+               and 'device_uuid' in case['physical_execution']]
+    # Nothing ran: no case reached a body claim, none completed, and the receipt is unsuccessful.
+    unstarted = not claimed and receipt.get('accepted') is False and receipt.get('completed') == 0
     executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'), named=named,
-                                    refusal=receipt.get(SELECTION_REFUSAL))
+                                    refusal=receipt.get(SELECTION_REFUSAL), unstarted=unstarted)
     if executed is None:
-        # No card fit before the deadline: an unsuccessful receipt in which nothing executed.
-        if receipt.get('accepted') is not False or receipt.get('completed') != 0:
-            raise ValueError('a refused card selection cannot report executed or accepted cases')
+        # No card fit before the deadline, or the run failed before it chose one.
+        if not unstarted:
+            raise ValueError('a refused or unselected card cannot report executed or accepted cases')
         return planned_card_policy(value['policy'])
     if card_free_policy(value['policy']):
-        for case in receipt.get('cases', []):
-            physical = case.get('physical_execution') if isinstance(case, dict) else None
-            if isinstance(physical, dict) and 'device_uuid' in physical:
-                require_claimed_card(physical, executed)
+        for case in claimed:
+            require_claimed_card(case['physical_execution'], executed)
+            # The recorded child visibility is the claimed card's, refreshed after any rebind.
+            visible = case.get('configuration_environment', {}).get('CUDA_VISIBLE_DEVICES', {})
+            if visible.get('value') != executed['cudaDeviceUuid']:
+                raise ValueError('recorded CUDA visibility differs from the claimed card')
     return executed
 
 
@@ -1481,11 +1488,12 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                             receipt['cuda_card_selection'] = card['selection']
                             bind_card(chosen)
                             card['pending'], switchable = False, card['selection']
+                        # A case that fixes its physical card waits for it; it never switches.
                         claim = claim_chosen_card(
                             backend, value['policy'] if card_free else json.loads(policy.canonical_bytes),
                             json.loads(policy.canonical_bytes), switchable, case_work, env,
                             claim_policy=lambda _chosen: policy, rebind=bind_card, record=receipt,
-                            claim_with=execution_claim, **options)
+                            claim_with=execution_claim, fixed_card=named_card is not None, **options)
                     supervision = {}
                     if approved_uuids and not discover:
                         probes = tuple(SystemProbe(item) for item in cuda_policies)
@@ -1494,6 +1502,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     with claim as physical:
                         if not discover:
                             phase_policy = policy  # the card in force after any switch
+                            # Record the controls the body actually runs with (its card after any rebind).
+                            result['configuration_environment'] = configuration_bindings(row, env)
                         result['physical_execution'] = physical
                         shared_completion = (not discover and backend == 'candle-cuda'
                                              and physical.get('activity_profile') == SHARED_CUDA_HEADROOM_PROFILE)

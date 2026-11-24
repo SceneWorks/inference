@@ -344,7 +344,8 @@ def verify(args, contract):
     backend = contract["backend"]
     # The policy the comparison ran under: a card-free request's recorded most-free card (and claim).
     executed = executed_card_policy(contract["policy"], row.get("cuda_card_selection"),
-                                    refusal=row.get(SELECTION_REFUSAL))
+                                    refusal=row.get(SELECTION_REFUSAL),
+                                    unstarted=not row["accepted"] and "physical_claim" not in row)
     if executed is None and (row["accepted"] or "physical_claim" in row or row["files"]):
         raise ValueError("a refused card selection cannot report a claim, child files or acceptance")
     if "cuda_card_selection" in row and "physical_claim" in row:

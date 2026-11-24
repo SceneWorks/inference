@@ -547,6 +547,48 @@ class Collector(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid card selection refusal'):
             resources.executed_card_policy({'backend': 'windows-cuda'}, None, named=uuid, refusal=bad)
 
+    def _fixed_cuda_row(self):
+        fqn = 'train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient'
+        source = next(row for row in proof.load_registry() if row['fqn'] == fqn)
+        return proof.configured_case(source, 'fixed_cuda')
+
+    def test_a_card_free_run_records_the_visibility_of_the_card_it_claimed(self):
+        row = self._fixed_cuda_row()
+        uuid = row['required_cuda_device_uuid']
+        # The planner fills a card-free policy with GPU 0; this case fixes GPU 1.
+        self.assertNotEqual(next(iter(resources.REGISTERED_CUDA_CARDS)), uuid)
+        selection = {'rule': resources.CARD_SELECTION_RULE, 'chosen_uuid': uuid,
+                     'chosen_index': resources.REGISTERED_CUDA_CARDS[uuid], 'polls': 1, 'wait_seconds': 0.,
+                     'cards': [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid],
+                                'estimate_source': resources.LEGACY_CAP_CLAIM_ESTIMATE_SOURCE,
+                                'estimate_bytes': 1000000, 'required_free_bytes': 1000100,
+                                'total_mib': 97887, 'used_mib': 0, 'free_mib': 97887}]}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', return_value=(uuid, selection)):
+            status, receipt, verified, _, _ = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 0)
+        case = receipt['cases'][0]
+        self.assertEqual(case['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'], uuid)
+        self.assertEqual(receipt['resource_policy']['cudaDeviceUuid'], uuid)
+        # A recorded visibility that still names the planner's card is refused.
+        stale = copy.deepcopy(receipt)
+        stale['cases'][0]['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'] = next(iter(resources.REGISTERED_CUDA_CARDS))
+        request = {'policy': receipt['request_resource_policy']}
+        with self.assertRaisesRegex(ValueError, 'visibility differs'):
+            proof.executed_policy(stale, request, (row,))
+
+    def test_a_card_free_run_that_fails_before_selection_still_verifies(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', side_effect=AssertionError('no selection before a body')):
+            status, receipt, verified, calls, _ = self._mock_run(
+                Path(temporary).resolve(), missing=True, row_override=self._fixed_cuda_row(),
+                backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 1)
+        self.assertFalse(receipt['accepted'])
+        self.assertNotIn('cuda_card_selection', receipt)
+        self.assertNotIn(resources.SELECTION_REFUSAL, receipt)
+
     def test_shared_owned_result_cross_module_identity_and_failed_closed_body(self):
         # The real collector loader imports canonical scripts.media_campaign_supervisor;
         # a distinct loaded class must survive dataclass/asdict and release value validation.
