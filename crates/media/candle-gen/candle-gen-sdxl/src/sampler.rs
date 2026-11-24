@@ -32,29 +32,24 @@
 
 use candle_core::Tensor;
 
-use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
-use candle_gen::{CandleError, Result};
+use candle_gen::gen_core::sampling::DiscreteAncestralSchedule;
+use candle_gen::Result;
 
 /// A discrete Euler / Euler-ancestral sampler over a precomputed σ table. SDXL uses the **ancestral**
 /// variant; the plain Euler step is kept for completeness (and matches the mlx `ancestral=false` path).
+///
+/// Schedule construction and host-f64 step coefficients delegate to [`DiscreteAncestralSchedule`]
+/// (`PIPE-9`).
 pub struct EulerAncestralSampler {
-    /// `[0, σ_1, …, σ_T]` (length `train_steps + 1`), host f64.
-    sigmas: Vec<f64>,
-    /// Ancestral (SDXL default, injects per-step noise) vs plain Euler (deterministic).
-    ancestral: bool,
+    schedule: DiscreteAncestralSchedule,
 }
 
 impl EulerAncestralSampler {
     /// The production SDXL ancestral sampler (`scaled_linear` β 0.00085→0.012, 1000 train steps).
     pub fn sdxl() -> Self {
-        // The table is built from constants that cannot fail; `new` only errors on an empty schedule.
-        Self::new(
-            SDXL_TRAIN_STEPS,
-            SDXL_BETA_START.into(),
-            SDXL_BETA_END.into(),
-            true,
-        )
-        .expect("sdxl sampler: nonzero train steps")
+        Self {
+            schedule: DiscreteAncestralSchedule::sdxl(),
+        }
     }
 
     /// Build a sampler from the `scaled_linear` β schedule. `ancestral` selects the
@@ -69,55 +64,31 @@ impl EulerAncestralSampler {
         beta_end: f64,
         ancestral: bool,
     ) -> Result<Self> {
-        // `train_steps < 2` is rejected, not just `== 0` (F-115): the per-step `i / (n - 1)` β interp
-        // divides by `n - 1`, so `n == 1` computes `0.0 / 0.0 = NaN`, yielding `sigmas = [0.0, NaN]`
-        // and NaN latents downstream. Two steps is the floor for a well-defined linear β schedule.
-        if train_steps < 2 {
-            return Err(CandleError::Msg(
-                "euler sampler: train_steps must be >= 2".into(),
-            ));
-        }
-        let n = train_steps;
-        let (a, b) = (beta_start.sqrt(), beta_end.sqrt());
-        let mut acp = 1.0f64;
-        let mut sigmas = Vec::with_capacity(n + 1);
-        sigmas.push(0.0); // the leading 0 (σ at t=0)
-        for i in 0..n {
-            let x = i as f64 / (n - 1) as f64;
-            let beta = {
-                let lin = a + x * (b - a);
-                lin * lin
-            };
-            acp *= 1.0 - beta;
-            sigmas.push(((1.0 - acp) / acp).sqrt());
-        }
-        Ok(Self { sigmas, ancestral })
+        let schedule =
+            DiscreteAncestralSchedule::new(train_steps, beta_start, beta_end, ancestral)?;
+        Ok(Self { schedule })
     }
 
     /// Whether this sampler injects ancestral noise (SDXL: true).
     pub fn is_ancestral(&self) -> bool {
-        self.ancestral
+        self.schedule.is_ancestral()
     }
 
     /// The maximum (start) time index: `len(sigmas) − 1` = `train_steps`. txt2img starts here;
     /// img2img would start at `max_time · strength`.
     pub fn max_time(&self) -> f64 {
-        (self.sigmas.len() - 1) as f64
+        self.schedule.max_time()
     }
 
     /// `σ_last` — the largest σ, the prior's noise scale.
     pub fn sigma_last(&self) -> f64 {
-        *self.sigmas.last().expect("σ table is never empty")
+        self.schedule.sigma_last()
     }
 
     /// Linearly interpolate the σ table at the (float) time `t` (the vendored `_interp`), host f64.
     /// At integer `t` this is exactly `sigmas[t]`.
     pub fn sigma(&self, t: f64) -> f64 {
-        let last = self.sigmas.len() - 1;
-        let lo = (t as usize).min(last);
-        let hi = (lo + 1).min(last);
-        let delta = t - lo as f64;
-        self.sigmas[lo] * (1.0 - delta) + delta * self.sigmas[hi]
+        self.schedule.sigma(t)
     }
 
     /// The `(t, t_prev)` step pairs: `_linspace(start_time, 0, num_steps + 1)` zipped with its tail.
@@ -127,17 +98,7 @@ impl EulerAncestralSampler {
     /// `img2img` run would pass `start_time = max_time·strength` and the reduced step count; txt2img
     /// passes `max_time` and the full count.
     pub fn timesteps(&self, num_steps: usize, start_time: f64) -> Vec<(f64, f64)> {
-        if num_steps == 0 {
-            return Vec::new();
-        }
-        let n = num_steps as f64;
-        let steps: Vec<f64> = (0..=num_steps)
-            .map(|i| {
-                let x = i as f64 / n; // arange/num_steps first, matching _linspace
-                (0.0 - start_time) * x + start_time
-            })
-            .collect();
-        steps.windows(2).map(|w| (w[0], w[1])).collect()
+        self.schedule.timesteps(num_steps, start_time)
     }
 
     /// The prior-scaling factor `σ_last · rsqrt(σ_last² + 1)` — the scalar [`scale_prior_noise`]
@@ -146,8 +107,7 @@ impl EulerAncestralSampler {
     ///
     /// [`scale_prior_noise`]: Self::scale_prior_noise
     pub fn prior_scale(&self) -> f64 {
-        let s = self.sigma_last();
-        s / (s * s + 1.0).sqrt()
+        self.schedule.prior_scale()
     }
 
     /// Scale already-drawn unit-normal `noise` into the prior latent space: `noise · σ_last ·
@@ -187,41 +147,16 @@ impl EulerAncestralSampler {
         t_prev: f64,
         noise: &Tensor,
     ) -> Result<Tensor> {
-        let sigma = self.sigma(t);
-        let sigma_prev = self.sigma(t_prev);
-        let sigma2 = sigma * sigma;
-        let sigma_prev2 = sigma_prev * sigma_prev;
-
-        // x' = sqrt(σ²+1)·x_t + eps·dt, dt = σ_down−σ (ancestral) | σ_prev−σ (euler), then ·renorm.
-        let c1 = (sigma2 + 1.0).sqrt();
-        let renorm = 1.0 / (sigma_prev2 + 1.0).sqrt();
-
-        if self.ancestral {
-            // σ_up²·(positive) only when σ²>0 (true for any t>0; the schedule's t is always >0,
-            // t_prev may be 0). Guard the σ²=0 corner to a no-noise step rather than dividing by 0.
-            let sigma_up = if sigma2 > 0.0 {
-                (sigma_prev2 * (sigma2 - sigma_prev2) / sigma2).sqrt()
-            } else {
-                0.0
-            };
-            // σ_down² = σ_prev² − σ_up² (the reference's `σ_prev² − σ_up**2`); clamp away a tiny
-            // negative from f64 round-off before the sqrt.
-            let sigma_down = (sigma_prev2 - sigma_up * sigma_up).max(0.0).sqrt();
-            let dt = sigma_down - sigma;
-            let mut x = (x_t.affine(c1, 0.0)? + eps_pred.affine(dt, 0.0)?)?;
-            if sigma_up != 0.0 {
-                // The denoise loop draws the ancestral noise on CPU in f32 (the seeded `StdRng`
-                // stream); cast to the running latent dtype so an f16 denoise doesn't error / get
-                // promoted to f32. A no-op when `noise` is already the latent dtype (e.g. the f32 tests).
-                let noise_term = noise.affine(sigma_up, 0.0)?.to_dtype(x.dtype())?;
-                x = (x + noise_term)?;
-            }
-            Ok(x.affine(renorm, 0.0)?)
-        } else {
-            let dt = sigma_prev - sigma;
-            let x = (x_t.affine(c1, 0.0)? + eps_pred.affine(dt, 0.0)?)?;
-            Ok(x.affine(renorm, 0.0)?)
+        let s = self.schedule.step_scalars(t, t_prev);
+        let mut x = (x_t.affine(s.c1, 0.0)? + eps_pred.affine(s.dt, 0.0)?)?;
+        if s.sigma_up != 0.0 {
+            // The denoise loop draws the ancestral noise on CPU in f32 (the seeded `StdRng`
+            // stream); cast to the running latent dtype so an f16 denoise doesn't error / get
+            // promoted to f32. A no-op when `noise` is already the latent dtype (e.g. the f32 tests).
+            let noise_term = noise.affine(s.sigma_up, 0.0)?.to_dtype(x.dtype())?;
+            x = (x + noise_term)?;
         }
+        Ok(x.affine(s.renorm, 0.0)?)
     }
 }
 
@@ -229,6 +164,7 @@ impl EulerAncestralSampler {
 mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
+    use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
 
     /// Host-f64 reference for one ancestral/euler step, element-wise — the ground truth the tensor
     /// path is checked against (run at f32 so the comparison is tight, not f16-lossy).
@@ -270,15 +206,16 @@ mod tests {
     #[test]
     fn sigma_table_endpoints_and_interp() {
         let s = EulerAncestralSampler::sdxl();
-        assert_eq!(s.sigmas.len(), 1001);
-        assert_eq!(s.sigmas[0], 0.0);
+        let sigmas = s.schedule.sigmas();
+        assert_eq!(sigmas.len(), 1001);
+        assert_eq!(sigmas[0], 0.0);
         assert_eq!(s.max_time(), 1000.0);
-        assert!(s.sigmas.windows(2).all(|w| w[1] >= w[0]), "σ not monotonic");
+        assert!(sigmas.windows(2).all(|w| w[1] >= w[0]), "σ not monotonic");
         // σ_last is the largest entry.
-        assert!((s.sigma_last() - s.sigmas[1000]).abs() < 1e-12);
+        assert!((s.sigma_last() - sigmas[1000]).abs() < 1e-12);
         // Linear interp at a half index.
         let mid = s.sigma(10.5);
-        assert!((mid - 0.5 * (s.sigmas[10] + s.sigmas[11])).abs() < 1e-9);
+        assert!((mid - 0.5 * (sigmas[10] + sigmas[11])).abs() < 1e-9);
     }
 
     /// `timesteps` spans `start_time` down to 0 over `num_steps` pairs; 0 steps yields no pairs

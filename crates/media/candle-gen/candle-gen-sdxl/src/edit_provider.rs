@@ -464,7 +464,7 @@ impl SdxlEdit {
     #[allow(clippy::too_many_arguments)]
     fn denoise_edit(
         &self,
-        mut latents: Tensor,
+        latents: Tensor,
         x0: &Tensor,
         init_noise: &Tensor,
         mask: Option<&Tensor>,
@@ -478,87 +478,42 @@ impl SdxlEdit {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
     ) -> Result<Tensor> {
-        // An empty schedule (img2img at strength ≤ 1/steps) is a no-op: the lightly-noised source. For
-        // inpaint that leaves the source untouched (no repaint), the honest result of a zero-step edit.
-        if steps.is_empty() {
-            candle_gen::execution::without_schedule(
-                "source_roundtrip",
-                "strength selected zero denoise steps",
-                "no denoiser evaluation",
-            );
-            candle_gen::execution::runtime(latents.device(), latents.dtype());
-            return Ok(latents);
-        }
-        let cfg = candle_gen::execution::f64_policy("sdxl/consumed_cfg", cfg);
-        let cfg_on = cfg > 1.0;
-        candle_gen::execution::policy("sdxl/edit_provider/cfg_on", format!("{cfg_on:?}").into());
-        let total = steps.len() as u32;
-        let (_, lat_c, lat_h, lat_w) = latents.dims4()?;
-        // Per-step latent preview (epic 16948, sc-16954). A bespoke ancestral loop, so it numbers its
-        // own frames on the step index — the schedule here is a `(t, t_prev)` timestep pair list, not
-        // a σ array. No renormalization: euler-ancestral folds the input scaling into its own step, so
-        // `latents` is already in the domain the reused fit was measured in.
-        let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
-
-        candle_gen::execution::schedule_f64(
-            "sdxl-euler-ancestral",
-            &steps
-                .iter()
-                .flat_map(|&(t, next)| [t, next])
-                .collect::<Vec<_>>(),
-            "epsilon",
-        );
-        candle_gen::execution::runtime(latents.device(), latents.dtype());
-        for (i, &(t, t_prev)) in steps.iter().enumerate() {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
-                crate::preview::project_spatial_latents(&latents)
-            });
-            let x_unet = if cfg_on {
-                Tensor::cat(&[&latents, &latents], 0)?
-            } else {
-                latents.clone()
-            };
-            // Plain SDXL forward (no control residuals, IP branch inert): the add_embedding
-            // micro-conditioning only.
-            observe_component_compute("unet", &self.device, DTYPE);
-            let eps = self.unet.forward_instantid(
-                &x_unet,
-                t,
-                conditioning,
-                pooled,
-                time_ids,
-                None,
-                None,
-            )?;
-            // Classifier-free guidance: row 0 = uncond, row 1 = cond.
-            let eps = if cfg_on {
-                let chunks = eps.chunk(2, 0)?;
-                (&chunks[0] + ((&chunks[1] - &chunks[0])? * cfg)?)?
-            } else {
-                eps
-            };
-            let noise = draw_noise(rng, lat_c, lat_h, lat_w, &self.device)?;
-            latents = self.sampler.step(&eps, &latents, t, t_prev, &noise)?;
-
-            // Inpaint: pin the kept (mask=0) region to the source re-noised to this step's σ, leaving
-            // the repaint (mask=1) region freely denoised. At the final step (t_prev=0) `init_noised =
-            // x0`, so the kept region ends exactly at the source. The 1-channel mask broadcasts over the
-            // 4 latent channels.
-            if let Some(mask) = mask {
-                let init_noised = self.sampler.add_noise(x0, init_noise, t_prev)?;
-                let keep = init_noised.broadcast_mul(&mask.affine(-1.0, 1.0)?)?; // (1−mask)·init_noised
-                let repaint = latents.broadcast_mul(mask)?; // mask·latents
-                latents = (keep + repaint)?;
-            }
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        Ok(latents)
+        let denoiser = crate::denoise::Denoiser {
+            unet: &self.unet,
+            sampler: &self.sampler,
+        };
+        crate::denoise::denoise_ancestral_core(
+            &denoiser,
+            latents,
+            conditioning,
+            pooled,
+            time_ids,
+            cfg,
+            steps,
+            rng,
+            cancel,
+            on_progress,
+            preview,
+            &[],
+            conditioning,
+            "sdxl/edit_provider/cfg_on",
+            || observe_component_compute("unet", &self.device, DTYPE),
+            |step_idx, latents| {
+                // Inpaint: pin the kept (mask=0) region to the source re-noised to this step's
+                // `t_prev`, leaving the repaint (mask=1) region freely denoised.
+                if let Some(mask) = mask {
+                    let (_, t_prev) = steps[step_idx];
+                    let init_noised = self.sampler.add_noise(x0, init_noise, t_prev)?;
+                    let keep = init_noised
+                        .broadcast_mul(&mask.affine(-1.0, 1.0).map_err(CandleError::from)?)
+                        .map_err(CandleError::from)?;
+                    let repaint = latents.broadcast_mul(mask).map_err(CandleError::from)?;
+                    Ok((keep + repaint).map_err(CandleError::from)?)
+                } else {
+                    Ok(latents)
+                }
+            },
+        )
     }
 }
 

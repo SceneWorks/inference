@@ -4,15 +4,11 @@
 //! the Candle commons prevents the sampler, curated path, and DDPM trainer from silently using
 //! different `scaled_linear` grids.
 
-/// SDXL's diffusers `scaled_linear` beta schedule.
-pub const SDXL_TRAIN_STEPS: usize = 1_000;
-pub const SDXL_BETA_START: f32 = 0.00085;
-pub const SDXL_BETA_END: f32 = 0.012;
-
-/// Kolors' diffusers `scaled_linear` beta schedule.
-pub const KOLORS_TRAIN_STEPS: usize = 1_100;
-pub const KOLORS_BETA_START: f32 = 0.00085;
-pub const KOLORS_BETA_END: f32 = 0.014;
+/// SDXL's diffusers `scaled_linear` beta schedule (re-exported from `gen_core::sampling`, `PIPE-9`).
+pub use gen_core::sampling::{
+    KOLORS_BETA_END, KOLORS_BETA_START, KOLORS_TRAIN_STEPS, SDXL_BETA_END, SDXL_BETA_START,
+    SDXL_TRAIN_STEPS,
+};
 
 #[cfg(test)]
 mod tests {

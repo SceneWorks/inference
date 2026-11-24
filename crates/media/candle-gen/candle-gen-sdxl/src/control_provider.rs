@@ -612,65 +612,62 @@ fn denoise_lightning_control(
     on_progress: &mut dyn FnMut(Progress),
     preview: &gen_core::PreviewSink,
 ) -> Result<Tensor> {
+    struct ControlLightningForward<'a> {
+        unet: &'a UNet2DConditionModel,
+        conditioning: &'a Tensor,
+        pooled: &'a Tensor,
+        time_ids: &'a Tensor,
+        controls: &'a [ControlContext<'a>],
+    }
+    impl crate::pipeline::SdxlLightningForward for ControlLightningForward<'_> {
+        fn predict_eps(&self, input: &Tensor, timestep: f64, _step_index: usize) -> Result<Tensor> {
+            let mut combined: Option<ControlResiduals> = None;
+            for control in self.controls {
+                let residuals = control.controlnet.forward(
+                    input,
+                    &control.cond_embed,
+                    timestep,
+                    self.conditioning,
+                    self.pooled,
+                    self.time_ids,
+                    control.scale,
+                )?;
+                combined = Some(match combined {
+                    None => residuals,
+                    Some(previous) => previous.add(&residuals)?,
+                });
+            }
+            let residuals =
+                combined.expect("admission requires one Control conditioning per checkpoint");
+            Ok(self.unet.forward_instantid(
+                input,
+                timestep,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                Some(&residuals.down),
+                Some(&residuals.mid),
+            )?)
+        }
+    }
+
     let policy = lightning_policy(steps)?;
-    let mut latents = seeded_sigma_prior(seed, width, height, policy.init_noise_scale(), device)?;
-    let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
-    candle_gen::execution::schedule(
-        "sdxl-lightning-euler",
-        &(0..=policy.num_steps())
-            .filter_map(|i| policy.sigma(i))
-            .collect::<Vec<_>>(),
-        "epsilon",
-    );
-    candle_gen::execution::runtime(latents.device(), latents.dtype());
-    for index in 0..policy.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        let coefficients = policy.coeffs(index);
-        candle_gen::preview::emit_preview_at(preview, &preview_counter, index, || {
-            crate::preview::project_spatial_latents(&latents.affine(coefficients.c_in as f64, 0.0)?)
-        });
-        let input = latents
-            .affine(coefficients.c_in as f64, 0.0)?
-            .to_dtype(DTYPE)?;
-        let mut combined: Option<ControlResiduals> = None;
-        for control in controls {
-            let residuals = control.controlnet.forward(
-                &input,
-                &control.cond_embed,
-                coefficients.timestep as f64,
-                conditioning,
-                pooled,
-                time_ids,
-                control.scale,
-            )?;
-            combined = Some(match combined {
-                None => residuals,
-                Some(previous) => previous.add(&residuals)?,
-            });
-        }
-        let residuals =
-            combined.expect("admission requires one Control conditioning per checkpoint");
-        let epsilon = unet.forward_instantid(
-            &input,
-            coefficients.timestep as f64,
+    let latents = seeded_sigma_prior(seed, width, height, policy.init_noise_scale(), device)?;
+    crate::pipeline::run_lightning_with_forward(
+        latents,
+        &policy,
+        DTYPE,
+        ControlLightningForward {
+            unet,
             conditioning,
             pooled,
             time_ids,
-            Some(&residuals.down),
-            Some(&residuals.mid),
-        )?;
-        latents = (latents
-            + epsilon
-                .to_dtype(DType::F32)?
-                .affine(coefficients.a_out as f64, 0.0)?)?;
-        on_progress(Progress::Step {
-            current: index as u32 + 1,
-            total: policy.num_steps() as u32,
-        });
-    }
-    Ok(latents.to_dtype(DTYPE)?)
+            controls,
+        },
+        cancel,
+        on_progress,
+        preview,
+    )
 }
 
 #[cfg(test)]
