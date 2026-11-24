@@ -94,6 +94,19 @@ def verify_memory_endpoints(backend, logs):
     return endpoints
 
 
+def verify_native_card(native, request_policy):
+    """The native conversions ran on the card their recorded selection chose (a card-free request)
+    or on the named card (no selection), and every tier's claim held that card."""
+    from scripts.ci.model_proof_resources import executed_card_policy, require_claimed_card
+    if native["backend"] != "candle-cuda":
+        if "cuda_card_selection" in native:
+            raise ValueError("a non-CUDA native conversion records no card selection")
+        return
+    executed = executed_card_policy(request_policy, native.get("cuda_card_selection"))
+    for tier in native["tiers"].values():
+        require_claimed_card(tier["supervision"]["device_claim"], executed)
+
+
 def main() -> None:
     env = os.environ
     backend = env["MODEL_PROOF_BACKEND"]
@@ -115,6 +128,7 @@ def main() -> None:
     if (native["source"]["revision"], native["backend"], native["source_manifest_sha256"],
             native["oracle_sha256"]) != (expected_sha, backend, digest(SOURCE), oracle_sha):
         raise ValueError("staged receipts differ from the proof source or oracle inputs")
+    verify_native_card(native, json.loads(env["MODEL_PROOF_REQUEST"])["policy"])
     case = json.loads((evidence / "00000/result.json").read_bytes())
     consumed = {}
     for observation in case["actual_inputs"]:

@@ -101,7 +101,7 @@ class PluralQualification(unittest.TestCase):
 
     def test_gpu0_must_be_explicit_and_keeps_all_counts_guards_and_native_code(self):
         with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
-            request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda")}
+            request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda", cuda_uuid=c.GPU)}
             previous = runner.plan("candle-cuda", request, "head")
             selected = dict(request, policy=c.policy("candle-cuda", cuda_uuid=c.GPU0))
             plan = runner.plan("candle-cuda", selected, "head")
@@ -157,6 +157,144 @@ class PluralQualification(unittest.TestCase):
             self.assertEqual(runner.plan("mlx", request, "head")["counts"], [6, 2])
             with self.assertRaises(ValueError):
                 runner.plan("mlx", dict(request, policy=dict(policy, childFootprintCapBytes=96 * c.GIB)), "head")
+
+    @unittest.skipUnless(os.name == "posix", "process-group supervision needs POSIX")
+    def test_mlx_admission_uses_the_reviewed_estimate_not_the_child_cap(self):
+        """An idle 128 GB Mac (96,999,358,464 bytes available, run 2026-11-24) was refused at the
+        80 GiB cap fallback. The reviewed estimate admits it; below estimate plus reserve refuses."""
+        import sys
+        from scripts import media_campaign_supervisor as safety
+
+        class Probe:
+            def __init__(self, free):
+                self.free = free
+
+            def host_admission(self):
+                host = safety.darwin_host_memory(4096, {
+                    "freePages": self.free // 4096, "speculativePages": 0, "purgeablePages": 0,
+                    "inactivePages": 0, "fileBackedPages": 0, "anonymousPages": 0,
+                    "throttledPages": 0, "activePages": 0})
+                return host["availableBytes"], host
+
+            def tree_footprint(self, _pgid):
+                return 1024
+
+        self.assertEqual(c.admission_estimate("mlx"), {
+            "static_floor_host_bytes": 32 * c.GIB,
+            "host_estimate_source": "scail2-plural-reviewed-unified-peak-v1"})
+        self.assertEqual(c.admission_estimate("candle-cuda")["static_floor_gpu_bytes"], 62 * c.GIB)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy.json").write_text(json.dumps(c.policy("mlx")), encoding="utf-8")
+            policy = safety.load_policy(root / "policy.json")
+
+            def run(free, estimate):
+                for name in ("stdout", "stderr"):
+                    (root / name).unlink(missing_ok=True)
+                return safety.run_guarded(
+                    [sys.executable, "-c", "pass"], cwd=root, env=dict(os.environ), policy=policy,
+                    stdout_path=root / "stdout", stderr_path=root / "stderr", probe=Probe(free),
+                    **estimate)
+
+            idle_mac = 96_999_358_464
+            # The previous cap fallback refuses the idle Mac exactly as the failed capture did.
+            with self.assertRaisesRegex(safety.SupervisionError, "child-footprint-cap-fallback"):
+                run(idle_mac, {})
+            result = run(idle_mac, c.admission_estimate("mlx"))
+            admission = safety.validate_admission(result.admission, policy_sha256=policy.sha256)
+            self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"],
+                              admission["childFootprintCapBytes"], admission["hostFreeReserveBytes"]),
+                             (c.MLX_HOST_ESTIMATE_SOURCE, 32 * c.GIB, 80 * c.GIB, 12 * c.GIB))
+            needed = policy.host_free_reserve_bytes + c.MLX_HOST_ESTIMATE_BYTES
+            with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory") as caught:
+                run(needed - 4096, c.admission_estimate("mlx"))
+            self.assertIn(c.MLX_HOST_ESTIMATE_SOURCE, caught.exception.detail)
+            run(needed, c.admission_estimate("mlx"))
+
+    def test_cuda_default_names_no_card_and_runs_on_whichever_registered_card_fits(self):
+        request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda")}
+        self.assertNotIn("cudaDeviceUuid", request["policy"])
+        with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
+            plan = runner.plan("candle-cuda", request, "head")
+            gpu0 = runner.plan("candle-cuda", {"selection": c.SELECTION,
+                                               "policy": c.policy("candle-cuda", cuda_uuid=c.GPU0)}, "head")
+        self.assertEqual(plan["cuda_card_selection"], runner.CARD_SELECTION_RULE)
+        self.assertEqual((plan["counts"], plan["cuda_completion"]), (c.COUNTS["candle-cuda"], "supervisor-owned-windows-job"))
+        self.assertNotIn("cuda_card_selection", gpu0)
+        self.assertIn("cuda_identity()", runner.source("candle-cuda", c.ANY_CARD))
+        # GPU 0 is short (another process holds 40 GB) and GPU 1 is free: the campaign takes GPU 1.
+        def reader(uuid, _deadline):
+            used = 40000 if uuid == c.GPU0 else 3000
+            return [{"uuid": uuid, "index": c.CUDA_INDICES[uuid], "total_mib": 97887,
+                     "used_mib": used, "free_mib": 97887 - used, "utilization_percent": 0}]
+        with TemporaryDirectory() as directory:
+            chosen, selection = runner.select_card("candle-cuda", Path(directory), reader=reader)
+        self.assertEqual((chosen, selection["chosen_index"]), (c.GPU, 1))
+        self.assertEqual([card.get("refusal", "")[:30] for card in selection["cards"]],
+                         ["57887 MiB free < 69632 MiB req", ""])
+        receipt = {"cuda_card_selection": selection, "hardware": {"uuid": c.GPU, "index": "1"}}
+        contract = dict(plan, backend="candle-cuda")
+        self.assertEqual(runner.executed_policy(contract, receipt), c.policy("candle-cuda", cuda_uuid=c.GPU))
+        for mutate in (lambda r: r["cuda_card_selection"].update(chosen_uuid=c.GPU0, chosen_index=0),
+                       lambda r: r["hardware"].update(uuid=c.GPU0),
+                       lambda r: r["cuda_card_selection"]["cards"].reverse(),
+                       lambda r: r["cuda_card_selection"]["cards"][1].update(required_free_bytes=1)):
+            bad = copy.deepcopy(receipt)
+            mutate(bad)
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "most-free registered card"):
+                runner.executed_policy(contract, bad)
+        # A named-card campaign (both accepted GPU 0 runs) records no selection and keeps its policy.
+        self.assertEqual(runner.executed_policy(gpu0, {}), c.policy("candle-cuda", cuda_uuid=c.GPU0))
+        with self.assertRaises(ValueError):
+            runner.executed_policy(gpu0, receipt)
+
+    def test_cuda_counts_state_the_reviewed_device_estimate_to_the_claim_and_supervisor(self):
+        estimate = c.admission_estimate("candle-cuda")
+        self.assertEqual(estimate, {
+            "static_floor_host_bytes": 58 * c.GIB, "host_estimate_source": "scail2-plural-reviewed-host-peak-v1",
+            "static_floor_gpu_bytes": 62 * c.GIB, "gpu_estimate_source": "scail2-plural-reviewed-device-peak-v1"})
+        with TemporaryDirectory() as directory:
+            loaded = runner.tier1.read_policy(Path(directory), "policy.json", c.policy("candle-cuda", cuda_uuid=c.GPU0))
+        claimed = c.claim_estimate(loaded)
+        self.assertEqual(claimed.sha256, loaded.sha256)
+        from scripts.ci.model_proof_resources import claim_required_free_bytes
+        self.assertEqual(claim_required_free_bytes(claimed), 68 * c.GIB)
+        from scripts import media_campaign_supervisor as safety
+        admission = safety.runtime_guarded_admission(loaded, **estimate)
+        self.assertEqual((admission["hostEstimateBytes"], admission["gpuEstimateBytes"]), (58 * c.GIB, 62 * c.GIB))
+
+    def test_a_count_priced_at_another_estimate_is_rejected_and_old_cap_records_still_verify(self):
+        from scripts import media_campaign_supervisor as safety
+        for backend in ("mlx", "candle-cuda"):
+            with TemporaryDirectory() as directory:
+                uuid = {"cuda_uuid": c.GPU0} if backend == "candle-cuda" else {}
+                loaded = runner.tier1.read_policy(Path(directory), "policy.json", c.policy(backend, **uuid))
+            stated = safety.runtime_guarded_admission(loaded, **c.admission_estimate(backend))
+            c.validate_stated_admission(stated, backend)
+            # The accepted GPU 0 and MLX runs were admitted at the caps (no stated estimate).
+            c.validate_stated_admission(safety.runtime_guarded_admission(loaded), backend)
+            wrong = dict(c.admission_estimate(backend))
+            for floor, source in (("static_floor_host_bytes", "host_estimate_source"),
+                                  ("static_floor_gpu_bytes", "gpu_estimate_source")):
+                if floor not in wrong:
+                    continue
+                bad = dict(wrong, **{floor: wrong[floor] - c.GIB})
+                with self.subTest(backend=backend, floor=floor), self.assertRaisesRegex(ValueError, "different estimate"):
+                    c.validate_stated_admission(safety.runtime_guarded_admission(loaded, **bad), backend)
+                renamed = dict(wrong, **{source: "other-estimate"})
+                with self.subTest(backend=backend, source=source), self.assertRaisesRegex(ValueError, "different estimate"):
+                    c.validate_stated_admission(safety.runtime_guarded_admission(loaded, **renamed), backend)
+        # The claim's recorded device estimate must be the campaign's too.
+        from scripts.ci.model_proof_resources import require_claimed_card
+        executed = c.policy("candle-cuda", cuda_uuid=c.GPU0)
+        claim = {"device_uuid": c.GPU0, "claim_gpu_estimate": {"source": c.CUDA_DEVICE_ESTIMATE_SOURCE,
+                                                               "estimate_bytes": c.CUDA_DEVICE_ESTIMATE_BYTES}}
+        require_claimed_card(claim, executed, runner.CARD_ESTIMATE)
+        require_claimed_card({"device_uuid": c.GPU0}, executed, runner.CARD_ESTIMATE)
+        for bad in (dict(claim, device_uuid=c.GPU),
+                    dict(claim, claim_gpu_estimate={"source": c.CUDA_DEVICE_ESTIMATE_SOURCE, "estimate_bytes": 60 * c.GIB})):
+            with self.assertRaises(ValueError):
+                require_claimed_card(bad, executed, runner.CARD_ESTIMATE)
 
     def test_all_counts_both_backend_shapes_and_mutated_native_results(self):
         for backend, counts in c.COUNTS.items():
@@ -298,7 +436,7 @@ class PluralQualification(unittest.TestCase):
         with TemporaryDirectory() as directory:
             dest = Path(directory) / "evidence"
             dest.mkdir()
-            contract = {"request": {"policy": c.policy("candle-cuda")}, "head": "head",
+            contract = {"request": {"policy": c.policy("candle-cuda", cuda_uuid=c.GPU)}, "head": "head",
                         "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}}
             receipt = {"contract": contract, "request": contract["request"], "run_id": "1",
                        "run_attempt": "1", "accepted": False, "failure": "incomplete campaign",
@@ -354,6 +492,47 @@ class PluralQualification(unittest.TestCase):
                 claim["lease_released"] = False
                 with self.assertRaisesRegex(ValueError, "release unverified"):
                     verify()
+
+    def test_no_card_fitting_before_the_deadline_leaves_a_verifiable_unsuccessful_receipt(self):
+        from scripts.ci import model_proof_resources as resources
+        refusal = {"rule": resources.CARD_SELECTION_RULE, "polls": 2,
+                   "cards": [{"uuid": uuid, "index": c.CUDA_INDICES[uuid], "refusal": "1000 MiB free < 69632 MiB required"}
+                             for uuid in sorted(c.CUDA_INDICES, key=c.CUDA_INDICES.get)],
+                   "admission_error": "no registered CUDA card had estimate plus reserve free"}
+        receipt = {}
+        self.assertTrue(resources.record_selection_refusal(
+            receipt, resources.CudaClaimRejected(refusal, "no registered CUDA card fits this proof")))
+        self.assertFalse(resources.record_selection_refusal({}, ValueError("other")))
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "evidence"
+            dest.mkdir()
+            contract = {"request": {"policy": c.policy("candle-cuda")}, "head": "head", "cuda_card_selection": "rule",
+                        "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}, "cuda_completion": "job"}
+            receipt.update({"contract": contract, "request": contract["request"], "run_id": "1", "run_attempt": "1",
+                            "accepted": False, "failure": "no registered CUDA card fits this proof", "logs": {},
+                            "counts": {}})
+
+            def verify():
+                path = dest / "receipt.json"
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                with patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_RUN_ID": "1",
+                        "GITHUB_RUN_ATTEMPT": "1", "SCAIL_PLURAL_RECEIPT_SHA256": runner.tier1.sha(path)}):
+                    runner.verify(SimpleNamespace(output=dest), contract)
+
+            verify()
+            receipt["accepted"] = True
+            with self.assertRaises(ValueError):
+                verify()
+            receipt["accepted"] = False
+            receipt[resources.SELECTION_REFUSAL] = dict(refusal, cards=refusal["cards"][:1])
+            with self.assertRaisesRegex(ValueError, "invalid card selection refusal"):
+                verify()
+            # A campaign that failed before choosing a card (staging or build) also verifies.
+            del receipt[resources.SELECTION_REFUSAL]
+            verify()
+            receipt["counts"] = {"6": {"accepted": False}}
+            with self.assertRaises(ValueError):
+                verify()
 
     def test_shared_gauge_accounts_for_a_retryable_failed_nvidia_tick(self):
         base = MagicMock()
@@ -422,7 +601,8 @@ class PluralQualification(unittest.TestCase):
         approved = SimpleNamespace(
             cuda_device_uuid=c.GPU, sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000, poll_millis=250
         )
-        with patch.object(c, "validate_admission"):
+        # The stated-estimate check has its own test; this fixture's admission is partial.
+        with patch.object(c, "validate_admission"), patch.object(c, "validate_stated_admission"):
             row = c.measured_row(
                 data, guard, pool, adapter, machine, "candle-cuda", 6, approved, "f" * 40
             )

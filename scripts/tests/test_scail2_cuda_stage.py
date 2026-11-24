@@ -459,7 +459,8 @@ class CudaRenderEnd(unittest.TestCase):
                 "f" * 40,
             )
 
-        with patch.object(contract, "validate_admission"):
+        # Its partial admission fixture is about render scope; stated estimates have their own test.
+        with patch.object(contract, "validate_admission"), patch.object(contract, "validate_stated_admission"):
             result = outcome()
             self.assertTrue(result["accepted"])
             candidate = result["candidate_row_pending_physical_review"]

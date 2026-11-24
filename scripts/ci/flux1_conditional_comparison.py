@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Manual, one-case FLUX.1 conditional base/head proof on one physical backend."""
 import argparse
+import dataclasses
 from dataclasses import asdict
 import hashlib
 import json
@@ -19,7 +20,10 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as base
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import conditional, conditional_evidence as evidence, conditional_probe, fixture, overlay
-from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
+from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
+                                              claim_chosen_card, executed_card_policy, execution_claim,
+                                              planned_card_policy, record_selection_refusal,
+                                              require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = overlay.BASE
@@ -53,6 +57,11 @@ MAX_DEADLINE_SECONDS = 1200
 # pool, so pulid-pid gets the same 48 GiB footprint cap, well below the runner's 128 GiB
 # (`physical_memory_bytes` 137438953472 in run 43558295383's receipt).
 DEFAULT_CAPS = {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 18 * GIB}
+# Device estimates stated to CUDA admission (claim, card selection, spawn). pulid-pid: run
+# 43553801528 used 24.79 GB of the whole GPU (scripts/tests/test_flux1_conditional_comparison.py);
+# 26 GiB (27.9 GB) covers it by 3.1 GB. Other cases have no recorded device peak and are admitted
+# at their 18 GiB cap.
+CASE_DEVICE_ESTIMATES = {"pulid-pid": ("flux1-conditional-pulid-pid-whole-gpu-peak-v1", 26 * GIB)}
 CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 48 * GIB, "child_gpu_cap_bytes": 40 * GIB}}
 # The watchdog samples the child's instantaneous footprint once per poll; arms run ~11 s, so a 1 s
 # poll can miss the final denoise/decode peak (run 43569270221). The supervisor now also records
@@ -60,6 +69,21 @@ CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 48 * GIB, "child_gpu_cap
 MAX_POLL_MILLIS = 250
 # Physical memory each conditional runner reports; a host cap must stay below it.
 RUNNER_HOST_BYTES = {"mlx": 137_438_953_472, "candle-cuda": 516_136_534_016}
+
+
+def spawn_estimate(estimate):
+    """The run_guarded device-estimate arguments for a stated case estimate (none: the cap)."""
+    return {} if estimate is None else {"static_floor_gpu_bytes": estimate[1], "gpu_estimate_source": estimate[0]}
+
+
+def check_spawn_estimate(admission, estimate):
+    """A child's spawn admission priced the card at the case's stated estimate, or (a record from
+    before the case stated one, or a case without one) at the child cap."""
+    legacy = (admission.get("staticFloorGpuBytes") is None
+              and admission.get("gpuEstimateSource") == "child-footprint-cap-fallback")
+    stated = estimate is not None and (admission.get("staticFloorGpuBytes"), admission.get("gpuEstimateSource")) == (estimate[1], estimate[0])
+    if not (legacy or stated):
+        raise ValueError("conditional child was admitted on a different device estimate than its case states")
 
 
 def case_caps(backend, case, policy):
@@ -108,7 +132,7 @@ def plan(backend, value, head, tier):
         raise ValueError("resource policy differs from conditional lane")
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.json"
-        base.write(path, value["policy"])
+        base.write(path, planned_card_policy(value["policy"]))
         policy = load_policy(path)
         caps = case_caps(backend, value["case"], policy)
     source = proof.repository_identity(head)
@@ -245,10 +269,13 @@ def execute(args, contract):
         receipt["fixture"] = fixture.snapshot_identity(snapshot, variant, "tier1")
         if eng4b:
             verify_pinned_inputs(receipt, contract)
+        request_policy = contract["request"]["policy"]
+        estimate = CASE_DEVICE_ESTIMATES.get(case) if backend == "candle-cuda" else None
+        # Builds never touch a GPU: a request that names no card builds first, then chooses (and if
+        # need be switches) its card in the claim's own admission window.
         policy_path = work / "policy.json"
-        base.write(policy_path, contract["request"]["policy"])
+        base.write(policy_path, planned_card_policy(request_policy))
         policy = load_policy(policy_path)
-        receipt["hardware"] = base.hardware(backend, policy)
         exes, environments = {}, {}
         for arm in evidence.ARMS:
             env = os.environ.copy()
@@ -267,17 +294,39 @@ def execute(args, contract):
         base.write(artifact / "receipt.json", receipt)
         claim_dir = work / "claim"
         claim_dir.mkdir()
-        claim_policy = policy
-        claim_deadline = last_child_start = None
+        claim_deadline = last_child_start = budget = None
         if backend == "candle-cuda":
             budget, reserve = cuda_claim_budget(policy, contract["tier"])
-            base.write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
-            claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
         lease_env = environments["base"]
-        with execution_claim(backend, claim_policy, claim_dir, lease_env,
-                             original_deadline_monotonic=claim_deadline) as claim:
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(request_policy, work, estimate=estimate, deadline_monotonic=last_child_start)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
+        bound = {}
+
+        def bind(chosen):
+            """Bind the run to the card in force: its policy, hardware and child visibility."""
+            base.write(policy_path, chosen)
+            bound["policy"] = load_policy(policy_path)
+            receipt["hardware"] = base.hardware(backend, bound["policy"])
+            if backend == "candle-cuda":
+                for arm_env in environments.values():
+                    arm_env["CUDA_VISIBLE_DEVICES"] = chosen["cudaDeviceUuid"]
+
+        def claim_policy(chosen):
+            if budget is None:
+                return bound["policy"]
+            base.write(claim_dir / "policy.json", dict(chosen, deadlineSeconds=budget))
+            held = load_policy(claim_dir / "policy.json")
+            return dataclasses.replace(held, claim_gpu_estimate=estimate) if estimate else held
+
+        bind(payload)
+        with claim_chosen_card(backend, request_policy, payload, selection, claim_dir, lease_env,
+                               claim_policy=claim_policy, rebind=bind, record=receipt, estimate=estimate,
+                               claim_with=execution_claim, original_deadline_monotonic=claim_deadline) as claim:
+            policy = bound["policy"]
             receipt["physical_claim"] = claim
             shared = {"PAIR_CASE": case, "PAIR_SNAPSHOT": str(snapshot), "PAIR_ASSETS": str(staged),
                       "PAIR_SOURCE": str(source_path)}
@@ -288,7 +337,8 @@ def execute(args, contract):
                 preflight = work / label
                 env = dict(environments[arm], **shared)
                 _, stdout = base.invoke(exes[arm], work / arm, preflight, env, policy, lease_env,
-                                        preflight=True, last_child_start=last_child_start)
+                                        preflight=True, last_child_start=last_child_start,
+                                        admission_estimate=spawn_estimate(estimate))
                 plan_data = json.loads((preflight / "plan.json").read_text(encoding="utf-8"))
                 evidence.validate_plan(plan_data, case, backend)
                 if stdout.splitlines().count("FLUX1_CONDITIONAL_PREFLIGHT " + case) != 1:
@@ -302,7 +352,8 @@ def execute(args, contract):
                 out = work / (arm + "-run")
                 env = dict(environments[arm], **shared)
                 guard, stdout = base.invoke(exes[arm], work / arm, out, env, policy, lease_env,
-                                            last_child_start=last_child_start)
+                                            last_child_start=last_child_start,
+                                            admission_estimate=spawn_estimate(estimate))
                 observed = evidence.read_arm(out, stdout, arm, case, backend, artifact, planned=arm in plans)
                 if arm in plans and observed["planned_route"] != plans[arm]:
                     raise ValueError("conditional render plan differs from preflight")
@@ -326,6 +377,7 @@ def execute(args, contract):
     except BaseException as exc:
         primary_error = exc
         receipt["failure"] = str(exc)
+        record_selection_refusal(receipt, exc)
         if isinstance(exc, (CudaClaimRejected, CudaReleaseRejected)):
             receipt["cuda_diagnostic"] = exc.diagnostic
         raise
@@ -395,6 +447,17 @@ def verify(args, contract):
                     or not all(re.fullmatch(r"[0-9a-f]{64}", build[key])
                                for key in ("overlay_sha256", "binary_sha256"))):
                 raise ValueError("conditional receipt source, overlay or executable identity mismatch")
+    # A card-free request ran on the card its recorded selection chose (and claimed) at the case's
+    # stated estimate; a named card records no selection and verifies as before.
+    estimate = CASE_DEVICE_ESTIMATES.get(contract["case"]) if contract["backend"] == "candle-cuda" else None
+    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"), estimate=estimate,
+                                    refusal=receipt.get(SELECTION_REFUSAL),
+                                    unstarted=not receipt["accepted"] and "physical_claim" not in receipt)
+    if executed is None and (receipt["accepted"] or "physical_claim" in receipt or receipt["logs"]):
+        raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
+    if "physical_claim" in receipt and contract["backend"] == "candle-cuda" and (
+            "cuda_card_selection" in receipt or receipt["physical_claim"].get("claim_gpu_estimate") is not None):
+        require_claimed_card(receipt["physical_claim"], executed, estimate)
     allowed = {"receipt.json"}
     limits = {phase + "." + suffix: cap for phase in phases(contract["tier"])
               for suffix, cap in base.retained_log_limits(contract["request"]["policy"]).items()}
@@ -428,6 +491,12 @@ def verify(args, contract):
         allowed.add(name)
     if {item.name for item in args.output.iterdir()} != allowed:
         raise ValueError("unexpected conditional upload file")
+    if contract["backend"] == "candle-cuda":
+        for name in receipt["logs"]:
+            if name.endswith(".supervisor.json"):
+                guard = json.loads((args.output / name).read_text(encoding="utf-8"))
+                if isinstance(guard.get("admission"), dict):
+                    check_spawn_estimate(guard["admission"], estimate)
     if receipt["accepted"]:
         if not receipt["physical_claim"]["post_execution_verified"]:
             raise ValueError("unreleased accepted conditional comparison")

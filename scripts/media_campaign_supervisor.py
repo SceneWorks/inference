@@ -94,6 +94,8 @@ class SafetyPolicy:
     child_gpu_cap_bytes: int | None
     sha256: str
     canonical_bytes: bytes
+    # The CUDA claim's stated device estimate (source, bytes); not part of the signed policy.
+    claim_gpu_estimate: tuple[str, int] | None = field(default=None, compare=False, kw_only=True)
 
 
 def load_policy(path: Path) -> SafetyPolicy:
