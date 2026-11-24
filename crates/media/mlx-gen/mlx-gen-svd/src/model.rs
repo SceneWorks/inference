@@ -19,6 +19,7 @@
 use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
@@ -43,9 +44,9 @@ pub const MODEL_ID: &str = "svd_xt";
 const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 #[allow(clippy::excessive_precision)]
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
-const CLIP_SIZE: usize = 224;
+use gen_core_family::svd::CLIP_SIZE;
 /// VAE spatial compression (8×).
-pub const VAE_SCALE: u32 = 8;
+pub use gen_core_family::svd::VAE_SCALE;
 /// Latent channels the `AutoencoderKLTemporalDecoder` produces and the U-Net consumes. Fixed by the
 /// weight shapes rather than by [`crate::config::VaeConfig`], which carries only the block topology.
 pub const LATENT_CHANNELS: u32 = 4;
@@ -113,18 +114,11 @@ pub struct Svd {
     compute_dtype: Dtype,
     pipeline: SvdPipeline,
     descriptor: ModelDescriptor,
+    load_binding: gen_core::RenderLoadBinding,
     memory: Option<crate::memory_strategy::PreparedSvdMemory>,
 }
 
-/// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
-///
-/// **Precision.** The dense path (`Precision::Bf16`, the registry's dense sentinel) runs the UNet +
-/// image encoder in **fp16** — the production dtype (SVD ships an fp16 variant and runs
-/// `torch_dtype=float16`); this is the fast path (≈½ the resident weights + half-precision matmuls,
-/// with the fp16-sensitive reductions — GroupNorm via fused `layer_norm`, attention via fused SDPA —
-/// upcast internally by MLX). `Precision::Fp32` selects the full-precision quality path (the
-/// S1/S3/S4 parity-validated precision). The **VAE always stays f32** (`force_upcast=True`).
-pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+fn validate_load_options(spec: &LoadSpec) -> Result<()> {
     if spec.quantize.is_some()
         || !spec.adapters.is_empty()
         || spec.control.is_some()
@@ -140,6 +134,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    Ok(())
+}
+
+/// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
+///
+/// **Precision.** The dense path (`Precision::Bf16`, the registry's dense sentinel) runs the UNet +
+/// image encoder in **fp16** — the production dtype (SVD ships an fp16 variant and runs
+/// `torch_dtype=float16`); this is the fast path (≈½ the resident weights + half-precision matmuls,
+/// with the fp16-sensitive reductions — GroupNorm via fused `layer_norm`, attention via fused SDPA —
+/// upcast internally by MLX). `Precision::Fp32` selects the full-precision quality path (the
+/// S1/S3/S4 parity-validated precision). The **VAE always stays f32** (`force_upcast=True`).
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    validate_load_options(spec)?;
     let memory = if spec.prepared_file_pins().is_prepared() {
         Some(crate::memory_strategy::PreparedSvdMemory::prepare(spec)?)
     } else {
@@ -202,8 +209,93 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         compute_dtype: dense,
         pipeline: SvdPipeline::new(image_encoder, vae, unet, SchedulerConfig::default()),
         descriptor: descriptor(),
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         memory,
     }))
+}
+
+fn validated_reference<'a>(
+    descriptor: &ModelDescriptor,
+    req: &'a GenerationRequest,
+) -> gen_core::Result<&'a Image> {
+    // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
+    // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
+    // — it overrides the frame-wise CFG ceiling.
+    descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    // Model-specific alignment + knob bounds the core contract leaves to each model (F-165).
+    validate_output_params(req)?;
+    // image→video needs the single Reference input — the one input not covered by the shared
+    // size-range validation, so bound it here (F-164).
+    let img = Svd::reference(req)?;
+    validate_reference_image(img)?;
+    Ok(img)
+}
+
+pub(crate) fn compile_video_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    validate_load_options(spec)?;
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(gen_core::Error::Unsupported(
+            "SVD video plans require directory weights".into(),
+        ));
+    }
+    let reference = validated_reference(&descriptor(), req)?;
+    let params = SvdParams::from_request(req);
+    let frames = params.num_frames as u32;
+    let schedule = EdmSchedule::karras(params.num_inference_steps, &SchedulerConfig::default());
+    gen_core_family::svd::plan_layout(
+        req,
+        reference,
+        frames,
+        params.decode_chunk_size.max(1) as u32,
+        schedule.sigmas,
+        gen_core::MemoryBudgetDomain::UnifiedMemory,
+        (
+            gen_core_family::svd::Execution::Mlx,
+            ImageEncoderConfig::default().projection_dim,
+        ),
+    )
+    .map(Some)
+}
+
+impl SvdParams {
+    fn from_request(req: &GenerationRequest) -> Self {
+        let mut params = SvdParams::default();
+        if let Some(f) = req.frames {
+            params.num_frames = f as i32;
+            // Default the decode chunk to the full clip (diffusers' `decode_chunk_size = num_frames`)
+            // unless the request overrides it below.
+            params.decode_chunk_size = f as i32;
+        }
+        if let Some(s) = req.steps {
+            params.num_inference_steps = s as usize;
+        }
+        // `params.fps` is the MOTION-conditioning cadence baked into `added_time_ids` (the value the
+        // model was trained on, ~7) — it comes from `conditioning_fps`, NOT `req.fps`. `req.fps` is the
+        // OUTPUT/playback cadence and is applied below at return time, so the two are decoupled
+        // (diffusers `StableVideoDiffusionPipeline(fps=…)` vs `export_to_video(fps=…)`; sc-3764).
+        if let Some(cfps) = req.conditioning_fps {
+            params.fps = cfps as i32;
+        }
+        if let Some(g) = req.guidance {
+            params.max_guidance_scale = g;
+        }
+        // SVD micro-conditioning knobs (sc-3523): `motion_bucket_id` / `noise_aug_strength` drive the
+        // `added_time_ids` motion conditioning; `decode_chunk_size` is the chunked-VAE memory knob.
+        // Each falls back to the reference default when the request leaves it `None`.
+        if let Some(m) = req.motion_bucket_id {
+            params.motion_bucket_id = m;
+        }
+        if let Some(n) = req.noise_aug_strength {
+            params.noise_aug_strength = n;
+        }
+        if let Some(c) = req.decode_chunk_size {
+            params.decode_chunk_size = c as i32;
+        }
+        params
+    }
 }
 
 /// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
@@ -327,7 +419,7 @@ fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> 
 
 impl Svd {
     /// Resolve the single conditioning reference image (image→video input).
-    fn reference<'a>(&self, req: &'a GenerationRequest) -> Result<&'a Image> {
+    fn reference(req: &GenerationRequest) -> Result<&Image> {
         match req.conditioning.as_slice() {
             [Conditioning::Reference {
                 image,
@@ -402,27 +494,27 @@ impl Svd {
     }
 }
 
-impl Svd {
-    fn generate_execution_attempt(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
 impl Generator for Svd {
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_impl(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
+            .map_err(Into::into)
         })
     }
 
@@ -440,8 +532,44 @@ impl Generator for Svd {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_impl(req, None, on_progress)
+                .map_err(Into::into)
         })
+    }
+
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        let Some(prepared) = &self.memory else {
+            return Ok(None);
+        };
+        if crate::memory_strategy::validate_memory_request(req).is_err() {
+            return Ok(None);
+        }
+        prepared.ensure_unchanged()?;
+        Ok(Some(prepared.numeric_tier()))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        context: &mut gen_core::MemoryRunContext,
+    ) -> gen_core::Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        let Some(prepared) = &self.memory else {
+            return Ok(false);
+        };
+        crate::memory_strategy::project_video_context(prepared, plan, req, context)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -474,18 +602,7 @@ impl Generator for Svd {
 
 impl Svd {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
-        // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
-        // — it overrides the frame-wise CFG ceiling.
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        // Model-specific alignment + knob bounds the core contract leaves to each model (F-165).
-        validate_output_params(req)?;
-        // image→video needs the single Reference input — the one input not covered by the shared
-        // size-range validation, so bound it here (F-164).
-        let img = self.reference(req)?;
-        validate_reference_image(img)?;
+        validated_reference(&self.descriptor, req)?;
         if req.memory.is_some() {
             let prepared = self.memory.as_ref().ok_or_else(|| {
                 Error::Msg("svd_xt: memory request requires a sealed physical receipt".into())
@@ -499,43 +616,13 @@ impl Svd {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let img = self.reference(req)?;
+        let img = Self::reference(req)?;
 
-        let mut params = SvdParams::default();
-        if let Some(f) = req.frames {
-            params.num_frames = f as i32;
-            // Default the decode chunk to the full clip (diffusers' `decode_chunk_size = num_frames`)
-            // unless the request overrides it below.
-            params.decode_chunk_size = f as i32;
-        }
-        if let Some(s) = req.steps {
-            params.num_inference_steps = s as usize;
-        }
-        // `params.fps` is the MOTION-conditioning cadence baked into `added_time_ids` (the value the
-        // model was trained on, ~7) — it comes from `conditioning_fps`, NOT `req.fps`. `req.fps` is the
-        // OUTPUT/playback cadence and is applied below at return time, so the two are decoupled
-        // (diffusers `StableVideoDiffusionPipeline(fps=…)` vs `export_to_video(fps=…)`; sc-3764).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps as i32;
-        }
-        if let Some(g) = req.guidance {
-            params.max_guidance_scale = g;
-        }
-        // SVD micro-conditioning knobs (sc-3523): `motion_bucket_id` / `noise_aug_strength` drive the
-        // `added_time_ids` motion conditioning; `decode_chunk_size` is the chunked-VAE memory knob.
-        // Each falls back to the reference default when the request leaves it `None`.
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as i32;
-        }
+        let params = SvdParams::from_request(req);
         let seed = req.seed.unwrap_or_else(default_seed);
 
         // Conditioning.
@@ -572,45 +659,21 @@ impl Svd {
             current: 0,
             total: total_steps,
         });
-        // Thread per-step progress through the 25-step denoise loop so progress UIs advance through the
-        // dominant denoise phase instead of sitting at 0% until decode (F-088).
-        let final_latents = if let Some(name) = req.sampler.as_deref() {
-            // Curated unified solver (epic 7114, sc-7122): swap the integrator, keep the native Karras
-            // EDM σ schedule (SVD is sampler-only). The native EDM Euler default (no `req.sampler`) stays
-            // on `denoise` below — byte-exact (N1).
-            self.pipeline.denoise_curated(
-                name,
-                &latents,
-                &image_embeds,
-                &image_latents,
-                &added_time_ids,
-                params.num_frames,
-                params.num_inference_steps,
-                params.min_guidance_scale,
-                params.max_guidance_scale,
-                seed,
-                &req.cancel,
-                on_progress,
-            )?
-        } else {
-            self.pipeline.denoise(
-                &latents,
-                &image_embeds,
-                &image_latents,
-                &added_time_ids,
-                params.num_frames,
-                params.num_inference_steps,
-                params.min_guidance_scale,
-                params.max_guidance_scale,
-                &req.cancel,
-                &mut |step| {
-                    on_progress(Progress::Step {
-                        current: step as u32,
-                        total: total_steps,
-                    })
-                },
-            )?
-        };
+        let final_latents = self.pipeline.denoise_scoped(
+            sched,
+            req.sampler.as_deref(),
+            seed,
+            &latents,
+            &image_embeds,
+            &image_latents,
+            &added_time_ids,
+            params.num_frames,
+            params.min_guidance_scale,
+            params.max_guidance_scale,
+            &req.cancel,
+            scope,
+            on_progress,
+        )?;
 
         on_progress(Progress::Decoding);
         mlx_gen::video_execution::policy(

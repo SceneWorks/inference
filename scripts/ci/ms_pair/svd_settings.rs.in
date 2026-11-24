@@ -1,0 +1,26 @@
+use crate::config::{SchedulerConfig, UnetConfig};
+use crate::pipeline::SvdParams;
+use crate::scheduler::EdmSchedule;
+
+const FRAMES: usize = 3;
+
+fn svd_settings(
+    cfg: &UnetConfig,
+    schedule: &EdmSchedule,
+    params: &SvdParams,
+    shape: &[usize],
+    embeds: &[usize],
+    time_ids: &[f32],
+    dtype: &str,
+    sampler: Option<&str>,
+) -> Value {
+    let min = params.min_guidance_scale;
+    let max = params.max_guidance_scale;
+    assert_eq!(params.num_frames as usize, FRAMES);
+    assert_eq!(params.num_inference_steps, STEPS);
+    json!({"seed":SEED,"steps":STEPS,"sampler":sampler.unwrap_or("euler"),"sampler_request":sampler,
+        "guidance":[min,min+(max-min)/2.0,max],"frames":params.num_frames,"denoiser_dtype":dtype,
+        "channels":cfg.block_out_channels,"depth":cfg.layers_per_block,"latent_shape":shape,
+        "image_embeds_shape":embeds,"time_id_bits":time_ids.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
+        "sigma_bits":schedule.sigmas.iter().map(|v|v.to_bits()).collect::<Vec<_>>()})
+}

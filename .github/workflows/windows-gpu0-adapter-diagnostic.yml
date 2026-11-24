@@ -1,0 +1,77 @@
+name: Windows GPU0 adapter metadata (manual)
+
+# SW-6953: verify that GPU0's selected WDDM adapter is resolvable from a parent masked to physical
+# GPU1. Metadata only: no model, no CUDA context, no device admission. It runs on the privileged
+# real-weights Windows host, so it lives outside ordinary ci.yml and is dispatch-only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+jobs:
+  gpu0-adapter:
+    name: Physical GPU0 adapter read-only diagnostic (Windows, manual)
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 5
+    env:
+      CUDA_VISIBLE_DEVICES: "-1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Locate the reviewed CPython interpreter for the Windows metadata checks
+        shell: cmd
+        run: call scripts\ci\real-weights\moss-edit-cuda\locate-existing-reviewed-python-without-installation.cmd
+      - name: Verify selected GPU0 WDDM metadata from a GPU1-masked parent
+        timeout-minutes: 1
+        shell: powershell
+        env:
+          CUDA_VISIBLE_DEVICES: '1'
+          CUDA_DEVICE_ORDER: PCI_BUS_ID
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "gpu0-adapter-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          $probe = @'
+          import json, os, sys
+          from pathlib import Path
+          from types import SimpleNamespace
+          sys.path.insert(0, str(Path.cwd()))
+          from scripts.ci.flux1_comparison import hardware
+          from scripts.ci.scail_plural.contract import GPU, GPU0, cuda_identity
+          from scripts.ci.video_tier1_comparison import cuda_adapter
+          from scripts.ci.windows_cuda_metadata import visible_devices
+          policy = SimpleNamespace(backend="windows-cuda", cuda_device_uuid=GPU0)
+          card = hardware("candle-cuda", policy, pci_bus=True)
+          if card["index"] != "0" or os.environ["CUDA_VISIBLE_DEVICES"] != "1":
+              raise ValueError("GPU0 physical identity or parent mask changed")
+          parent_devices = visible_devices()["devices"]
+          if parent_devices != [{"ordinal": 0, "uuid": GPU}]:
+              raise ValueError("the parent is not masked to physical GPU1")
+          adapter = cuda_adapter(policy)
+          identity = cuda_identity(card, adapter)
+          if os.environ["CUDA_VISIBLE_DEVICES"] != "1":
+              raise ValueError("metadata probe mutated the parent mask")
+          print(json.dumps({"source": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"],
+                            "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "parent_mask": "1",
+                            "parent_devices": parent_devices, "hardware": card,
+                            "adapter": adapter, "identity": identity}, sort_keys=True))
+          '@
+          $probePath = Join-Path $out 'probe.py'
+          [IO.File]::WriteAllText($probePath, $probe, [Text.UTF8Encoding]::new($false))
+          $response = & $env:REVIEWED_PYTHON -I $probePath
+          if ($LASTEXITCODE -ne 0 -or -not ($response -is [string]) -or
+              [Text.Encoding]::UTF8.GetByteCount($response) -gt 8192) { throw 'GPU0 adapter metadata probe failed' }
+          [IO.File]::WriteAllText((Join-Path $out 'adapter.json'), $response, [Text.UTF8Encoding]::new($false))
+      - name: Upload selected GPU0 adapter metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gpu0-adapter-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gpu0-adapter-${{ github.run_id }}-${{ github.run_attempt }}/adapter.json
+          if-no-files-found: error
+          retention-days: 3

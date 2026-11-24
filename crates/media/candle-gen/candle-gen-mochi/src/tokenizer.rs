@@ -17,7 +17,7 @@ use tokenizers::Tokenizer;
 const T5_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/t5_tokenizer.json");
 
 /// Mochi's `max_sequence_length` (`_get_t5_prompt_embeds` default).
-pub const MAX_SEQUENCE_LENGTH: usize = 256;
+pub use gen_core_family::mochi::MAX_SEQUENCE_LENGTH;
 
 /// T5 `<pad>` token id.
 pub const PAD_TOKEN_ID: u32 = 0;

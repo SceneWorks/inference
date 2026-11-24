@@ -1,0 +1,114 @@
+use crate::{ImageEncoderConfig, SvdImageEncoder, SvdPipeline, SvdUnet, SvdVae, VaeConfig};
+use mlx_rs::ops::{broadcast_to, multiply};
+use std::collections::HashMap;
+
+// Only the UNet is invoked. The native SvdPipeline constructor also owns its
+// CLIP and VAE, so construct their exact keys/shapes as scalar-backed views.
+// Their loaders clone, reshape or transpose them; neither component is evaluated.
+fn auxiliary_weights() -> ProofResult<(Weights, Weights)> {
+    let headers: HashMap<String, HashMap<String, Vec<i32>>> =
+        serde_json::from_str(r#"@SVD_AUX_SHAPES@"#)?;
+    let view = |component: &str, dtype| -> ProofResult<Weights> {
+        let scalar = Array::from_f32(0.0).as_dtype(dtype)?;
+        let mut w = Weights::empty();
+        for (key, shape) in &headers[component] {
+            w.insert(key.clone(), broadcast_to(&scalar, shape)?);
+        }
+        Ok(w)
+    };
+    Ok((
+        view("image_encoder", Dtype::Float16)?,
+        view("vae", Dtype::Float32)?,
+    ))
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env(FQN, "VIDEO_PAIR")?;
+    let sampler = match pair.case.as_str() {
+        "mlx-svd-native-euler" => None,
+        "mlx-svd-heun" => Some("heun"),
+        _ => return Err("unknown MLX SVD proof".into()),
+    };
+    let cfg = UnetConfig {
+        layers_per_block: 1,
+        ..Default::default()
+    };
+    let weights = Weights::from_file(
+        pair.root
+            .join("unet/diffusion_pytorch_model.fp16.safetensors"),
+    )?;
+    assert_eq!(weights.require("conv_in.weight")?.dtype(), Dtype::Float16);
+    let unet = SvdUnet::from_weights(&weights, &cfg)?;
+    weights.materialize_accessed()?;
+    let (clip, vae) = auxiliary_weights()?;
+    let model = SvdPipeline::new(
+        SvdImageEncoder::from_weights(&clip, &ImageEncoderConfig::default())?,
+        SvdVae::from_weights(&vae, &VaeConfig::default())?,
+        unet,
+        SchedulerConfig::default(),
+    );
+    let schedule = EdmSchedule::karras(STEPS, &model.scheduler);
+    let params = SvdParams {
+        num_frames: FRAMES as i32,
+        num_inference_steps: STEPS,
+        ..Default::default()
+    };
+    let inputs = Weights::from_file(pair.root.join("inputs.safetensors"))?;
+    let noise = multiply(
+        inputs.require("noise")?,
+        mlx_gen::array::scalar(schedule.init_noise_sigma()),
+    )?;
+    let (embeds, image) = (
+        inputs.require("image_embeds")?,
+        inputs.require("image_latents")?,
+    );
+    let ids = SvdPipeline::added_time_ids(&params);
+    eval([&noise, embeds, image, &ids])?;
+    let dims = |x: &Array| x.shape().iter().map(|&n| n as usize).collect::<Vec<_>>();
+    let settings = svd_settings(
+        &cfg,
+        &schedule,
+        &params,
+        &dims(&noise),
+        &dims(embeds),
+        &f32_values(&ids)?,
+        "F16",
+        sampler,
+    );
+    let cancel = CancelFlag::new();
+    measure(&pair, &noise, settings, |p| match sampler {
+        None => model.denoise(
+            &noise,
+            embeds,
+            image,
+            &ids,
+            params.num_frames,
+            STEPS,
+            params.min_guidance_scale,
+            params.max_guidance_scale,
+            &cancel,
+            &mut |current| {
+                p(Progress::Step {
+                    current: current as u32,
+                    total: STEPS as u32,
+                })
+            },
+        ),
+        Some(name) => model.denoise_curated(
+            name,
+            &noise,
+            embeds,
+            image,
+            &ids,
+            params.num_frames,
+            STEPS,
+            params.min_guidance_scale,
+            params.max_guidance_scale,
+            SEED,
+            &cancel,
+            p,
+        ),
+    })
+}

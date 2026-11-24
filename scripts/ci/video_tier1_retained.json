@@ -1,0 +1,2199 @@
+{
+  "cases": {
+    "cuda-mochi-masked-euler": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": null,
+            "head_bytes": 1511669760,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 1679446016,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 1880772608,
+            "head_bytes": 1679446016,
+            "ratio": 0.8929553784739085,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1880772608,
+            "head_bytes": 1679446016,
+            "ratio": 0.8929553784739085,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1545228288,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "inconclusive",
+        "pass",
+        "pass",
+        "inconclusive"
+      ],
+      "fixture": {
+        "depth": 2,
+        "files": {
+          "inputs.safetensors": "5cb617a23d48c118ff950d9af72505f33bdac7e43c2db5748de65c3d70132160",
+          "transformer/model.safetensors": "cfbbc4f378f0b4c9425668fdc775fbaf9900949bf5f5cf904dfdc470449a1284"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "5af7c091506900783e19a24ec2d26b35b348ba88921ee83c4ca5532fe84f691c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/transformer/model.safetensors": "500acae4b3f6c7784459e2b4597f76bc0a52c364fb062d1ece846d3c62fbc41a"
+          },
+          "repo": "SceneWorks/mochi-1-mlx",
+          "snapshot": "90a87786d9b5b592c3b3c083e5fcdf130007b1de"
+        },
+        "variant": "mochi"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "ae0a9d2f89ba2484c7dc14e084a6eea0e91eaa460d7195c1a67d742e98c8928d",
+      "missing_dedicated_pair_indices": [
+        1,
+        2,
+        5
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9998324289936397,
+            0.9996367625909947,
+            0.9881917845189743,
+            0.9997316419362109,
+            0.9997123791139794
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650824",
+      "terminal_sha256": "27969c9ed65309ab4cddbdb8a71e6501d60cc5ccaf6446fed247b5684a2b7169",
+      "timing": {
+        "base": [
+          0.014934925,
+          0.013909625,
+          0.01337635,
+          0.013863775,
+          0.01370765
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.014781625,
+          0.01399955,
+          0.0128268,
+          0.01326605,
+          0.0131893
+        ],
+        "interval": [
+          0.9568858409776558,
+          1.0064649478328855
+        ],
+        "median": 0.9621853490569134,
+        "paired_ratios": [
+          0.9897354690431991,
+          1.0064649478328855,
+          0.9589162962990652,
+          0.9568858409776558,
+          0.9621853490569134
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-scail2-animation-unipc": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 3222962176,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 3222958080,
+            "head_bytes": 3155849216,
+            "ratio": 0.9791778663159032,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "ratio": 1.0,
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "inconclusive",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "5d41f07bb77576018f578b210a04536be030db8230be2f7b591c7683d4c2e5cc",
+      "missing_dedicated_pair_indices": [
+        1,
+        2
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0003772206031394,
+            0.9999812871487032,
+            1.0003279902765165,
+            0.999828666126407,
+            1.0003053158443165
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "b30a3090e81871e6a0425b756f6b5e3300e1358d4d3bfb2a57d08918c608b816",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650857",
+      "terminal_sha256": "f6dce19caad1931363a7eb7ae645e3862fffe8c893dd551b56a71865e1b59787",
+      "timing": {
+        "base": [
+          0.016958475,
+          0.017207125,
+          0.01705965,
+          0.016137075,
+          0.01617935
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0172654,
+          0.01624555,
+          0.01709315,
+          0.016041225,
+          0.0162438
+        ],
+        "interval": [
+          0.9441176256928453,
+          1.018098620306366
+        ],
+        "median": 1.0019636979656674,
+        "paired_ratios": [
+          1.018098620306366,
+          0.9441176256928453,
+          1.0019636979656674,
+          0.9940602618504283,
+          1.0039834727600305
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "2108d24cae2c4d5b92bdcf269b6e2e79cfdd96a451dd5d2c66609462b2562991"
+    },
+    "cuda-scail2-replacement-dpmpp": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 3256516608,
+            "head_bytes": 3256516608,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 3256516608,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 3256516608,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 3155849216,
+            "head_bytes": 3155849216,
+            "ratio": 1.0,
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "inconclusive",
+        "inconclusive",
+        "inconclusive",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "fae929d7325b30d7014dafae1f34d41ac8f2c9132520457cc7d49ccce68aba67",
+      "missing_dedicated_pair_indices": [
+        2,
+        3,
+        4
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999094009333673,
+            0.9999763613405483,
+            0.999874929709512,
+            1.0001280384509317,
+            0.9998296237935789
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "b30a3090e81871e6a0425b756f6b5e3300e1358d4d3bfb2a57d08918c608b816",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650857",
+      "terminal_sha256": "047e32145946a53f41e587848609884a51c7450e0137edb7c9c171a93d5d61c8",
+      "timing": {
+        "base": [
+          0.016972225,
+          0.0170620375,
+          0.0170806,
+          0.01708115,
+          0.0170492875
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0169771875,
+          0.0170438625,
+          0.0171795375,
+          0.0170411125,
+          0.017918975
+        ],
+        "interval": [
+          0.9976560418941348,
+          1.0510101961738871
+        ],
+        "median": 1.000292389477514,
+        "paired_ratios": [
+          1.000292389477514,
+          0.998934769660423,
+          1.0057923901970656,
+          0.9976560418941348,
+          1.0510101961738871
+        ],
+        "verdict": "inconclusive"
+      },
+      "trace_sha256": "a559f418b9f0836b44ce401ad3f129a226424f73e7649090724bd1882516b4ac"
+    },
+    "cuda-svd-euler-cfg": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4665810944,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4665810944,
+            "ratio": 1.007243647218818,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632260608,
+            "ratio": 1.0000008842342796,
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "inconclusive",
+        "pass",
+        "inconclusive",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [
+        1,
+        2,
+        4
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0081967213114753,
+            1.0,
+            1.0081967213114753,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.006283597492414,
+            1.0000130103401592,
+            1.0063770500136322,
+            1.0001278195891556,
+            0.9999491685985167
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650824",
+      "terminal_sha256": "6b161492735bb0795882e1eef8d113704c5c9aa80f9aaf77801f97d0bc3ef267",
+      "timing": {
+        "base": [
+          0.089182425,
+          0.0806569,
+          0.082486675,
+          0.08406385,
+          0.08940735
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.12082445,
+          0.081385275,
+          0.0829302,
+          0.10347965,
+          0.098318475
+        ],
+        "interval": [
+          1.0053769290615726,
+          1.354801128137074
+        ],
+        "median": 1.0996688191742625,
+        "paired_ratios": [
+          1.354801128137074,
+          1.0090305355152505,
+          1.0053769290615726,
+          1.2309649153589801,
+          1.0996688191742625
+        ],
+        "verdict": "inconclusive"
+      },
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-svd-euler-single": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 4632256512,
+            "ratio": null,
+            "verdict": "inconclusive"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "pass",
+        "pass",
+        "inconclusive",
+        "pass",
+        "inconclusive"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [
+        3,
+        5
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            0.991869918699187,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.000053915871215,
+            1.0000670091063064,
+            1.00011475697707,
+            0.9938260880878782,
+            1.0001625202187476
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650824",
+      "terminal_sha256": "f201d79139e865647d95a7d7a1a6273704e75cb6f5df4c2df2d4ba6115cdd171",
+      "timing": {
+        "base": [
+          0.049164025,
+          0.047297725,
+          0.041310475,
+          0.051242375,
+          0.0453028
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0448298,
+          0.044467725,
+          0.04125385,
+          0.046590375,
+          0.044279025
+        ],
+        "interval": [
+          0.9092157613693744,
+          0.9986292822825203
+        ],
+        "median": 0.9401662553537194,
+        "paired_ratios": [
+          0.9118415345366861,
+          0.9401662553537194,
+          0.9986292822825203,
+          0.9092157613693744,
+          0.9774015071916085
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "cuda-svd-heun-cfg": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": null,
+            "head_bytes": 4632256512,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "ratio": 1.0,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": null,
+            "head_bytes": 4665810944,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 4632256512,
+            "head_bytes": 4632256512,
+            "ratio": 1.0,
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "inconclusive",
+        "pass",
+        "inconclusive",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "6e45b80a7d23f45d36e7c128f191a8bbb5469d6c049b568be6c400439ec7cdf5",
+          "unet/diffusion_pytorch_model.safetensors": "8a1dfa300c81fb43c04392a0cc153a1022852653d0962e8a1333d4a225f01e1e"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "fe9b6a762f4a4b18358cc73bfbd1148842cc067f70dd50cecf390f0a5516ee98",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "unet/diffusion_pytorch_model.safetensors": "54cd71251c18720c95d5c3827e52e691433d7cfac75e416e28ea55b370ab22f6"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "cuda-svd"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "d4b736e9f34ae3be4162943877834260e995230966ff2791a77d88cccb388fac",
+      "missing_dedicated_pair_indices": [
+        1,
+        2,
+        4
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0081967213114753,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0001008987692661,
+            0.9999992298675834,
+            0.9999907576636298,
+            1.0062773783339187,
+            0.9999922983258871
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650824",
+      "terminal_sha256": "074e2afa8b18b3309b551fddea8e5faed0d46d3212c437ee185190d28802ecbd",
+      "timing": {
+        "base": [
+          0.160594925,
+          0.1626773,
+          0.223264425,
+          0.165674275,
+          0.177140575
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.159776475,
+          0.157231975,
+          0.17519825,
+          0.1487616,
+          0.154262225
+        ],
+        "interval": [
+          0.7847118948753256,
+          0.9949036372102045
+        ],
+        "median": 0.897916106770348,
+        "paired_ratios": [
+          0.9949036372102045,
+          0.9665268294961866,
+          0.7847118948753256,
+          0.897916106770348,
+          0.8708463602988756
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "e164fe0083cf5ee05cc825f0fe2233e76c64f1c9ee203f6a505269d56ddbca40"
+    },
+    "cuda-ti2v5b-t2v-heun": {
+      "dedicated_adapter": {
+        "counter": "\\GPU Process Memory(*)\\Dedicated Usage",
+        "cuda_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "luid": "luid_0x00000000_0x0001e266",
+        "node_mask": 1,
+        "physical_node": 0
+      },
+      "dedicated_metrics": {
+        "basis": "wddm-pdh-dedicated-sampled",
+        "ceiling": 1.02,
+        "pairs": [
+          {
+            "base_bytes": null,
+            "head_bytes": null,
+            "ratio": null,
+            "verdict": "inconclusive"
+          },
+          {
+            "base_bytes": 1444560896,
+            "head_bytes": 1444564992,
+            "ratio": 1.0000028354637118,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444564992,
+            "head_bytes": 1444560896,
+            "ratio": 0.9999971645443281,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444564992,
+            "head_bytes": 1444560896,
+            "ratio": 0.9999971645443281,
+            "verdict": "pass"
+          },
+          {
+            "base_bytes": 1444560896,
+            "head_bytes": 1444560896,
+            "ratio": 1.0,
+            "verdict": "pass"
+          }
+        ],
+        "verdict": "inconclusive"
+      },
+      "dedicated_pairs": [
+        "inconclusive",
+        "pass",
+        "pass",
+        "pass",
+        "pass"
+      ],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "fb3f74c93401b64e87e60201d08a1ab88ff158fd50dec318e8a300211f50d994",
+          "transformer/model.safetensors": "e61077b49656eb8535f5a1dad73330ac011bdac9b32e08b6a6ebb8fd24ff509d"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "addccfddb976d2a2fd6598dc780055643dd0e798f1891557666cb4c3ec0b162d",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "transformer/diffusion_pytorch_model-00001-of-00005.safetensors": "2166da7c8abdd9652d81fb73ac47046a4aba12279fd95e75e3f2aad6a6f9f7a3",
+            "transformer/diffusion_pytorch_model-00002-of-00005.safetensors": "f2b0d42432b2f12a800dbf0cd752cf54f0a756cc47ff7bacef23054d6ba03c4d",
+            "transformer/diffusion_pytorch_model-00003-of-00005.safetensors": "148c4239ac3e5f38a946e139498b75ba7cde0de84b637e83010e49f34ba33a93",
+            "transformer/diffusion_pytorch_model-00004-of-00005.safetensors": "b7a70c48ea5cd2b8026f8480ddd0d5f8a323bfdc691acedfefcbc7927a544666",
+            "transformer/diffusion_pytorch_model-00005-of-00005.safetensors": "caab8f9edee861245db3aea068cedf66c66a5a3d9725b9b9914406d20df162cc"
+          },
+          "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+          "snapshot": "b8fff7315c768468a5333511427288870b2e9635"
+        },
+        "variant": "cuda-ti2v5b"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "initial_sha256": "d1b57b9929d7ada5da3140602b5ea38628be406be20614e3e869c7be4ded3903",
+      "missing_dedicated_pair_indices": [
+        1
+      ],
+      "peak_metrics": {
+        "cuda_pool_reserved_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "cuda_pool_used_high_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9994389324225273,
+            1.000349585599341,
+            1.0001228445506158,
+            0.9997505687787697,
+            1.0008828277710773
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "516c91bf595243a51760e02af4762116aee9016d984cbcf1cedfbe2e795381d3",
+      "retained_peaks": {
+        "cuda_pool_reserved_high_bytes": "pass",
+        "cuda_pool_used_high_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44861650920",
+      "terminal_sha256": "f10e94e467edf6ac581def9de1fc5b5d145009e115f1f32a2d5fa20d82487e30",
+      "timing": {
+        "base": [
+          0.0086722,
+          0.007725125,
+          0.00783865,
+          0.00801525,
+          0.007702775
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.008461425,
+          0.00817375,
+          0.0079997,
+          0.007717575,
+          0.006894225
+        ],
+        "interval": [
+          0.8950313361093891,
+          1.0580734939564085
+        ],
+        "median": 0.9756953252923134,
+        "paired_ratios": [
+          0.9756953252923134,
+          1.0580734939564085,
+          1.020545629668374,
+          0.9628614204173295,
+          0.8950313361093891
+        ],
+        "verdict": "inconclusive"
+      },
+      "trace_sha256": "e164fe0083cf5ee05cc825f0fe2233e76c64f1c9ee203f6a505269d56ddbca40"
+    },
+    "mlx-a14b-i2v-resident-heun": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "high_noise_model.safetensors": "cdefe86e14daa442d7377e53de9debbd862abf97a8de41ea4ce2e6a298dbec1e",
+          "inputs.safetensors": "a209ba3323998d6c192d9df67696313e46d2837285ac0ea70ebfe33a0d4402f4",
+          "low_noise_model.safetensors": "95b9d7ac9b9acf38915def4b39197a6d442751f2849f28cd7864823f5d92c5ab"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "cd0c8c3c80e1381bd4c2f1d27a258e310e0ccc670b7a455c0b28d12720968e89",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/high_noise_model.safetensors": "fd42f6795a518a17a7410a4cd55750c52bfc34085fa4fbce11c8f0370a88bddd",
+            "bf16/low_noise_model.safetensors": "8bbedb07bc2a28b5c31bdf4dcccc4ba77aa103d0cdc8a1dd5b13e08c5c42f4bf"
+          },
+          "repo": "SceneWorks/wan2.2-i2v-a14b-mlx",
+          "snapshot": "c6c786170031eccc3a1fac0f98f1ad4ff988271e"
+        },
+        "variant": "mlx-a14b-i2v"
+      },
+      "head": "2b1292dadd472252d005a3e7882805c0a8d8f2ff",
+      "initial_sha256": "d99a6585d41bae8c137e80e89d1ed50a793628abb89819a2a14665f26d04ac0d",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0000004868700263,
+            0.9997879529627356,
+            1.0000205608144215,
+            0.9997669088753871,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999951454991308,
+            1.0000048403933548,
+            1.0,
+            1.0000194044608128,
+            0.9999902980048866
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "c45077d55faa7243b92d1c09d059164b040e12401ea7cf8338874b6f8b49b644",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44857360714",
+      "terminal_sha256": "686df14d660bb982cd58c43ea6504c6d5480c85d3525257332b137a05cd2eace",
+      "timing": {
+        "base": [
+          0.0147518125,
+          0.01434796875,
+          0.0147945105,
+          0.0147509375,
+          0.01488072925
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.0144144375,
+          0.01464853125,
+          0.01472346875,
+          0.01456440625,
+          0.0145501875
+        ],
+        "interval": [
+          0.9771299289494088,
+          1.020948087163906
+        ],
+        "median": 0.9873546172912738,
+        "paired_ratios": [
+          0.9771299289494088,
+          1.020948087163906,
+          0.9951981006738952,
+          0.9873546172912738,
+          0.9777872613333113
+        ],
+        "verdict": "inconclusive"
+      },
+      "trace_sha256": "5315d2859146bb98dc5e111975750ab214882b0446fb9f4ce17ff8b8053565bb"
+    },
+    "mlx-a14b-i2v-swapped-heun": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "high_noise_model.safetensors": "cdefe86e14daa442d7377e53de9debbd862abf97a8de41ea4ce2e6a298dbec1e",
+          "inputs.safetensors": "a209ba3323998d6c192d9df67696313e46d2837285ac0ea70ebfe33a0d4402f4",
+          "low_noise_model.safetensors": "95b9d7ac9b9acf38915def4b39197a6d442751f2849f28cd7864823f5d92c5ab"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "cd0c8c3c80e1381bd4c2f1d27a258e310e0ccc670b7a455c0b28d12720968e89",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/high_noise_model.safetensors": "fd42f6795a518a17a7410a4cd55750c52bfc34085fa4fbce11c8f0370a88bddd",
+            "bf16/low_noise_model.safetensors": "8bbedb07bc2a28b5c31bdf4dcccc4ba77aa103d0cdc8a1dd5b13e08c5c42f4bf"
+          },
+          "repo": "SceneWorks/wan2.2-i2v-a14b-mlx",
+          "snapshot": "c6c786170031eccc3a1fac0f98f1ad4ff988271e"
+        },
+        "variant": "mlx-a14b-i2v"
+      },
+      "head": "2b1292dadd472252d005a3e7882805c0a8d8f2ff",
+      "initial_sha256": "d99a6585d41bae8c137e80e89d1ed50a793628abb89819a2a14665f26d04ac0d",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.994662423585533,
+            0.994662423585533,
+            0.994662423585533,
+            0.994662423585533,
+            0.994662423585533
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9980487076156991,
+            0.9979757134860536,
+            0.99798776068252,
+            0.9979634037802876,
+            0.9979756215645956
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "c45077d55faa7243b92d1c09d059164b040e12401ea7cf8338874b6f8b49b644",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44857360714",
+      "terminal_sha256": "686df14d660bb982cd58c43ea6504c6d5480c85d3525257332b137a05cd2eace",
+      "timing": {
+        "base": [
+          0.554901271,
+          0.5525985835,
+          0.55257353125,
+          0.5548746355,
+          0.551913875
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.55141346875,
+          0.55196875,
+          0.55186347925,
+          0.55320384375,
+          0.552473823
+        ],
+        "interval": [
+          0.993714553502978,
+          1.001014556845486
+        ],
+        "median": 0.9987150090262309,
+        "paired_ratios": [
+          0.993714553502978,
+          0.9988602332347455,
+          0.9987150090262309,
+          0.9969888842576226,
+          1.001014556845486
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "1eef06ffe424a80464610820b3b891cc49468b9d623fafdca15c63a5ee189c87"
+    },
+    "mlx-a14b-t2v-resident-heun": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "high_noise_model.safetensors": "0f2fc98de4c75604e837b2cebd8d263b9b8867e87d0b9843f255baab771ee4b6",
+          "inputs.safetensors": "fb3f74c93401b64e87e60201d08a1ab88ff158fd50dec318e8a300211f50d994",
+          "low_noise_model.safetensors": "c8ffd3d53a360fa7a4fdf51ea89a3eed5ea345b255d7bd23eeeb782fe4f1e647"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "19ded3df04353fb50ef32acbf705305c3eb4b02ca700fb26d8b9d86a964e6dc5",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/high_noise_model.safetensors": "6b279f0a1165e5df52e589de3ca2f25090e2ff64695ebde083d8a6d395a92a17",
+            "bf16/low_noise_model.safetensors": "4516f62b00702cf4a491da8f4bc56c939474f6443ebef9d222410b48666f0ef8"
+          },
+          "repo": "SceneWorks/wan2.2-t2v-a14b-mlx",
+          "snapshot": "991eb255c544bbb2e1f1e07da4355c2f0a5337b7"
+        },
+        "variant": "mlx-a14b-t2v"
+      },
+      "head": "2b1292dadd472252d005a3e7882805c0a8d8f2ff",
+      "initial_sha256": "d99a6585d41bae8c137e80e89d1ed50a793628abb89819a2a14665f26d04ac0d",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.000207451030779,
+            1.0000001633029492,
+            0.9999998366623529,
+            1.0002333883825545,
+            1.000233225041519
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9998592931965001,
+            0.9999708795605207,
+            0.9999806054216414,
+            0.9999563446412362,
+            0.9999563235307486
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "c45077d55faa7243b92d1c09d059164b040e12401ea7cf8338874b6f8b49b644",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44857360714",
+      "terminal_sha256": "8736c3989b005afc38c9eb98466e32c91c5df6f334015299aa14513a0c01af2d",
+      "timing": {
+        "base": [
+          0.01534328125,
+          0.0142791665,
+          0.014421802,
+          0.014959198,
+          0.0152091875
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.01470689575,
+          0.015174479,
+          0.01488170825,
+          0.015160875,
+          0.01478647925
+        ],
+        "interval": [
+          0.9585235068281108,
+          1.0627006135127004
+        ],
+        "median": 1.0134818056422543,
+        "paired_ratios": [
+          0.9585235068281108,
+          1.0627006135127004,
+          1.0318896522085104,
+          1.0134818056422543,
+          0.9722070459056409
+        ],
+        "verdict": "inconclusive"
+      },
+      "trace_sha256": "d41583fb04b63f42c2a4efdaf8d817e1c83a037a6550ac19ca0bbb8986b04714"
+    },
+    "mlx-mochi-masked-euler": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 2,
+        "files": {
+          "inputs.safetensors": "5cb617a23d48c118ff950d9af72505f33bdac7e43c2db5748de65c3d70132160",
+          "transformer/model.safetensors": "cfbbc4f378f0b4c9425668fdc775fbaf9900949bf5f5cf904dfdc470449a1284"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "5af7c091506900783e19a24ec2d26b35b348ba88921ee83c4ca5532fe84f691c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/transformer/model.safetensors": "500acae4b3f6c7784459e2b4597f76bc0a52c364fb062d1ece846d3c62fbc41a"
+          },
+          "repo": "SceneWorks/mochi-1-mlx",
+          "snapshot": "90a87786d9b5b592c3b3c083e5fcdf130007b1de"
+        },
+        "variant": "mochi"
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "initial_sha256": "ae0a9d2f89ba2484c7dc14e084a6eea0e91eaa460d7195c1a67d742e98c8928d",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9836457631784917,
+            1.000007635018758,
+            1.0001412664523868,
+            0.9998579018599051,
+            1.0000095437734473
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9996066230571823,
+            1.0001851767885548,
+            1.000266241923156,
+            0.9998958164957022,
+            1.0001272999178716
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "9ff0e8d791301e7bcc27646dfe322651033f154584e5c277401c0110f002af93",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44859962101",
+      "terminal_sha256": "f54be2a295d154f64543c188ca73d3f879eabe87533b01f2b576026a26f31b92",
+      "timing": {
+        "base": [
+          0.0081614375,
+          0.0081605835,
+          0.00812179175,
+          0.00820382275,
+          0.0083432085
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.00811839575,
+          0.008148302,
+          0.00824715625,
+          0.00813825,
+          0.0082853855
+        ],
+        "interval": [
+          0.9920070493965755,
+          1.0154355718367194
+        ],
+        "median": 0.9947262047892911,
+        "paired_ratios": [
+          0.9947262047892911,
+          0.9984950218326912,
+          1.0154355718367194,
+          0.9920070493965755,
+          0.9930694528369991
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "mlx-scail2-animation-unipc": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "initial_sha256": "e352c0534bc1e24fa59e4d19efcc4cf0c6e285b1c0805d6cf60a23b67f411f50",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999983841150715,
+            0.9999983841150715,
+            0.9999983841150715,
+            0.9999983841150715,
+            0.9999983841150715
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999761159891718,
+            0.9999521131908118,
+            1.0000040013455742,
+            1.000003995533208,
+            1.0000039896889605
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "f3a8d2cccd86065bc55a111a67eaceca593c7add4e3d292e5a00740ebd799f6e",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44859962189",
+      "terminal_sha256": "b5469d2d5df0d91a08edd8cae2a3f6d0074dcbef757c2a9ba085b3a08dfe2465",
+      "timing": {
+        "base": [
+          0.03894254175,
+          0.03865884375,
+          0.0388077915,
+          0.03862346875,
+          0.03877473975
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.038704771,
+          0.03820480225,
+          0.03903484375,
+          0.03876283325,
+          0.0385290415
+        ],
+        "interval": [
+          0.9882551712374998,
+          1.0058506872260433
+        ],
+        "median": 0.9938943186727148,
+        "paired_ratios": [
+          0.9938943186727148,
+          0.9882551712374998,
+          1.0058506872260433,
+          1.0036082854417367,
+          0.9936634455425326
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "48cc122eb79701beea30e9c087548c3873b5549ce21d753431f767295392e4d3"
+    },
+    "mlx-scail2-replacement-dpmpp": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "dit.safetensors": "ed604a5961d3b74f5de7ef7e8e5fd56e1219a4182a0213a5291090ee8c1b362d",
+          "inputs.safetensors": "f5d057ad4348ebffd203f07183c5cd5d286154b552af1e0ee6217513bf59edaf"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "55ecd52da0fb83e2f792ae3d52788ac94e2917acb04c3f968d9dc462fac2895c",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/dit.safetensors": "95734f74d5f21deb71950a482293bf260d0b6f9bb5a8a6a9b8ddc85ee73bff62"
+          },
+          "repo": "SceneWorks/scail2-mlx",
+          "snapshot": "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+        },
+        "variant": "scail2-bf16"
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "initial_sha256": "14757bcb18a531bcd6379f932689fa5f355b15087078cb76c8b6feebbdb41f70",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999983891735671,
+            0.9999983891735671,
+            0.9999983891735671,
+            0.9999983891735671,
+            0.9999983891735671
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0000119189555066,
+            1.0,
+            0.9999840811270195,
+            0.9999880809969542,
+            1.0000159076651074
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "f3a8d2cccd86065bc55a111a67eaceca593c7add4e3d292e5a00740ebd799f6e",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44859962189",
+      "terminal_sha256": "a59fed3ff8dd5faf24a44d46f63b41aa0491c79ad545b49106feead4ddb0ba96",
+      "timing": {
+        "base": [
+          0.038565015625,
+          0.038059562625,
+          0.038504901,
+          0.038509635375,
+          0.038426463625
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.038428609375,
+          0.038323822875,
+          0.038540041625,
+          0.038415895875,
+          0.038286062625
+        ],
+        "interval": [
+          0.9963462419708938,
+          1.0069433338633906
+        ],
+        "median": 0.9975658169939242,
+        "paired_ratios": [
+          0.9964629535917633,
+          1.0069433338633906,
+          1.0009126273302196,
+          0.9975658169939242,
+          0.9963462419708938
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "d19cc57f6069867f891d32bd71723c3aed22f3e21f505fc230f7192ebcb33918"
+    },
+    "mlx-svd-heun": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "62f1a733c2db7a504873e24558fb07dda67f4aa21f5c717c41fb71e8e9f8ef42",
+          "unet/diffusion_pytorch_model.fp16.safetensors": "541c8bb6021a30de0daec53d4e8b86ffdb9dc3149512583655ac934474f2efd2"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "f3dcaf490cb80c7aa239996e1fee8319f2b29c5f38d59623345e570d3ffb8a55",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "image_encoder/model.fp16.safetensors": "e8b504e4f815f4d66029cfc6c1bfd66afc4552f8a880e97fc464c8edd2bdc472",
+            "unet/diffusion_pytorch_model.fp16.safetensors": "b3b61a946afd8bc0a0c64e22f49422a9fbeb20abb5c2f004268890c0ce595678",
+            "vae/diffusion_pytorch_model.safetensors": "956cbb87f1c21ff08d597a3123d0bd9d80c6ef1ab6722d773191b15f002c11c8"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "mlx-svd"
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "initial_sha256": "817a9a144616e04175d42fabf7f3185e5d770a2a5733e9af8aa24895a2b94bac",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            1.0000084871059796,
+            1.0002265280711715,
+            0.9996602862388458,
+            0.9999575201635632,
+            0.9999858574052111
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "9ff0e8d791301e7bcc27646dfe322651033f154584e5c277401c0110f002af93",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44859962101",
+      "terminal_sha256": "ebfdb16d1acee549af37a529f243a19687889503209e3afd3d17a58e984234e0",
+      "timing": {
+        "base": [
+          0.11171815625,
+          0.112029125,
+          0.11167820825,
+          0.11197264575,
+          0.11193829175
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.112270927,
+          0.11206783325,
+          0.1121243855,
+          0.11230371875,
+          0.112184646
+        ],
+        "interval": [
+          1.0003455195244986,
+          1.0049479043385126
+        ],
+        "median": 1.002956731063935,
+        "paired_ratios": [
+          1.0049479043385126,
+          1.0003455195244986,
+          1.0039952042300069,
+          1.002956731063935,
+          1.0022008040872217
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "04af7f189e7f3a4662749b52f0b76935c845a20799026f1348ec2ece4548a025"
+    },
+    "mlx-svd-native-euler": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "62f1a733c2db7a504873e24558fb07dda67f4aa21f5c717c41fb71e8e9f8ef42",
+          "unet/diffusion_pytorch_model.fp16.safetensors": "541c8bb6021a30de0daec53d4e8b86ffdb9dc3149512583655ac934474f2efd2"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "f3dcaf490cb80c7aa239996e1fee8319f2b29c5f38d59623345e570d3ffb8a55",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "image_encoder/model.fp16.safetensors": "e8b504e4f815f4d66029cfc6c1bfd66afc4552f8a880e97fc464c8edd2bdc472",
+            "unet/diffusion_pytorch_model.fp16.safetensors": "b3b61a946afd8bc0a0c64e22f49422a9fbeb20abb5c2f004268890c0ce595678",
+            "vae/diffusion_pytorch_model.safetensors": "956cbb87f1c21ff08d597a3123d0bd9d80c6ef1ab6722d773191b15f002c11c8"
+          },
+          "repo": "stabilityai/stable-video-diffusion-img2vid-xt",
+          "snapshot": "9e43909513c6714f1bc78bcb44d96e733cd242aa"
+        },
+        "variant": "mlx-svd"
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "initial_sha256": "817a9a144616e04175d42fabf7f3185e5d770a2a5733e9af8aa24895a2b94bac",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999894977252934,
+            0.9999876773172066,
+            0.9999876773172066,
+            0.9999876773172066,
+            0.9999876773172066
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9998046331310686,
+            0.99997736958488,
+            0.9999773367197704,
+            1.000002840081022,
+            0.999977357717226
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "9ff0e8d791301e7bcc27646dfe322651033f154584e5c277401c0110f002af93",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44859962101",
+      "terminal_sha256": "16ea45a9725f4f76bf89352022050cc1f7a6012d77414f78d47092d07fb8d3ed",
+      "timing": {
+        "base": [
+          0.0640512395,
+          0.064134479,
+          0.063604354,
+          0.064187677,
+          0.06409325
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.063908875,
+          0.063707573,
+          0.06418211475,
+          0.0639493335,
+          0.063769125
+        ],
+        "interval": [
+          0.993343580447578,
+          1.0090836666621912
+        ],
+        "median": 0.9962867716804894,
+        "paired_ratios": [
+          0.997777334191948,
+          0.993343580447578,
+          1.0090836666621912,
+          0.9962867716804894,
+          0.9949429152055794
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "db630ffefdc2d17f0721822fa9b14bea1c1ecb27b778cd81340f9c519729302b"
+    },
+    "mlx-ti2v5b-t2v-heun": {
+      "dedicated_pairs": [],
+      "fixture": {
+        "depth": 1,
+        "files": {
+          "inputs.safetensors": "fb3f74c93401b64e87e60201d08a1ab88ff158fd50dec318e8a300211f50d994",
+          "model.safetensors": "36406796989d4dbbe3514c8aeb2887be825be1299427559660d76e5ffa3de749"
+        },
+        "fixture_schema": 1,
+        "geometry_sha256": "14799cb653c49df4ed816ef1964f5a1e5a21f2c9dfa34f633603d91aed94f600",
+        "seed": 104729,
+        "source": {
+          "header_sha256": {
+            "bf16/model.safetensors": "970424fdd8423091671193e681cb4d4991fac15f9bb175c5ce4ec2d2944b1233"
+          },
+          "repo": "SceneWorks/wan2.2-ti2v-5b-mlx",
+          "snapshot": "bb1b055249614cf9d7cf4373fbdbc184b77dee88"
+        },
+        "variant": "mlx-ti2v5b"
+      },
+      "head": "2b1292dadd472252d005a3e7882805c0a8d8f2ff",
+      "initial_sha256": "fba89ce16876beb57055676664c243d33824b2096e1348eaee30d68f5f34cf3f",
+      "peak_metrics": {
+        "mlx_allocator_peak_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999799192806559,
+            1.0000200811225874,
+            1.0,
+            1.0000200811225874,
+            1.0
+          ],
+          "verdict": "pass"
+        },
+        "process_footprint_bytes": {
+          "ceiling": 1.02,
+          "paired_ratios": [
+            0.9999838751874411,
+            0.9999356412266798,
+            0.9999033706116845,
+            0.9999194780612424,
+            1.000048306791527
+          ],
+          "verdict": "pass"
+        }
+      },
+      "receipt_sha256": "c45077d55faa7243b92d1c09d059164b040e12401ea7cf8338874b6f8b49b644",
+      "retained_peaks": {
+        "mlx_allocator_peak_bytes": "pass",
+        "process_footprint_bytes": "pass"
+      },
+      "run_id": "44857360714",
+      "terminal_sha256": "65adf7f4f5c945c032809a0e5c1498fa42e291db6f5be137d9777e3de1944141",
+      "timing": {
+        "base": [
+          0.00658066675,
+          0.00657915625,
+          0.00664625,
+          0.00669083325,
+          0.00656158325
+        ],
+        "ceiling": 1.02,
+        "head": [
+          0.00661245825,
+          0.00657995825,
+          0.006559802,
+          0.00656366675,
+          0.0065990625
+        ],
+        "interval": [
+          0.9809939217959138,
+          1.005711921737791
+        ],
+        "median": 1.0001219001296708,
+        "paired_ratios": [
+          1.0048310454256022,
+          1.0001219001296708,
+          0.9869929659582471,
+          0.9809939217959138,
+          1.005711921737791
+        ],
+        "verdict": "pass"
+      },
+      "trace_sha256": "5315d2859146bb98dc5e111975750ab214882b0446fb9f4ce17ff8b8053565bb"
+    }
+  },
+  "repository": "SceneWorks/inference",
+  "reviewed_source": "512bf5f6b4a65ada341d1b89d23d804274c6ec10",
+  "reviewed_tree": "26e9ea3a4c1412026e7725a2750b09512b8366ae",
+  "runs": {
+    "44857360714": {
+      "accepted": false,
+      "artifact_id": "14688168919",
+      "artifact_name": "model-proof-2b1292dadd472252d005a3e7882805c0a8d8f2ff-mlx-44857360714-1",
+      "artifact_zip_sha256": "7c0ee194ee85c3b6ab65028ff97cdb81384b038ca5b3d354e42dbe66bf1f548f",
+      "base": "38dab65f5d9640396cf2946cd4ee866ce46630c6",
+      "base_tree": "583299608475223416f4e1bcad3b4276eeefb055",
+      "binary_sha256": {
+        "base": "eee69d989695486d68a07034d6fc61e830e0dfd45ce3505b33051195d94ae67d",
+        "head": "84b5db3bf3b0e1fecc86c69c5502efe9e667c813672e0261ac0add9392deaf2d"
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_closure": {
+        "measured_tree": "b0cb92a86eb41292944f0df049726861869e7889",
+        "path": "scripts/ci/wan_pair",
+        "reviewed_tree": "7c0995b241ba6c2692a4cd72fa80ad1532e2767d"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "126bbb7128d78a016ec2ff72f7c60098bc3747277ce0ee7d92df68e3abbb5cfe",
+        "headers.json": "cc19b391d7efaaf98242582b38e151c05ea6498f046c334f9b0146bf13eb6cbc"
+      },
+      "fixture_source_sha256": {
+        "base": "199a9e18c8d24e99c8ff30fc602ab6effe31152454ccc668bf8ef6bf21e192f5",
+        "head": "569d7cb47fc443687552ea6b5f057410c208f12dce2b3e9f26fbae41ac7eb6bf"
+      },
+      "hardware": {
+        "chip": "Apple M5 Max",
+        "os_build": "26B131",
+        "physical_memory_bytes": 137438953472
+      },
+      "head": "2b1292dadd472252d005a3e7882805c0a8d8f2ff",
+      "head_tree": "6275109ec4a2818053294484f823b2e797a413ba",
+      "host": "macOS-27.2.1-arm64-arm-64bit",
+      "protocol": "wan-curated-tier1-v2",
+      "receipt_sha256": "c45077d55faa7243b92d1c09d059164b040e12401ea7cf8338874b6f8b49b644",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "rw-mage"
+      ],
+      "runner_name": "nax-macos-2"
+    },
+    "44859962101": {
+      "accepted": true,
+      "artifact_id": "14690215179",
+      "artifact_name": "model-proof-729fc019a40d4a047c9381e3da650ba22f2b6827-mlx-44859962101-1",
+      "artifact_zip_sha256": "82da389482d96d2d14e539ced05fb019b3fd16fc584b20c9f895491e0f6c1ad1",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "mochi": "cf5487255e1d8305011e606eb2090e7471bffc1f3d1db2514190f18dd3946c89",
+          "svd": "1396f68808d64dd1f37a9676d0a3131b4f9b43fdb09c3540a00bd8d4c174b7e6"
+        },
+        "head": {
+          "mochi": "9f9f290e265b4dbab44dd1800e27cbc8dbb0d699de144b4bb30220f6c0103713",
+          "svd": "fd21614253ff3e3e78a7f16cc526296ceb954cc8f3f577b88c74ad038b53b080"
+        }
+      },
+      "fixture_closure": {
+        "measured_tree": "b0eb6b937c4366c9e5ac67537c90ccf7cadf35cb",
+        "path": "scripts/ci/ms_pair",
+        "reviewed_tree": "b0eb6b937c4366c9e5ac67537c90ccf7cadf35cb"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "658cea8da1ed0faa81ae1f853fa7a83bd8e61ce71a94288cb1c681fa56418f19",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "ac769208e52cdb3b5ef109d9819861db5fa79bc7720c4608b70532e7c99c7d1a",
+        "ms_pair/aux_shapes.json": "f4caf29d2a38824533a462e29b93db1f6983a726e53b31fbec1266f392627d4e",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/mlx-gen/mlx-gen-mochi/src/lib.rs": "d794134fe3ddfd90ecc1b4b7d5e8fbfe944137ec72e242a8c994b48e20336af2",
+          "crates/media/mlx-gen/mlx-gen-mochi/src/video_pair_fixture.rs": "bea64298edc7d90b1b6ab52a6b7480f9cc008e95adc76241199770f58ff66818",
+          "crates/media/mlx-gen/mlx-gen-svd/src/lib.rs": "833cd262e7fb54a29f98f995548ed9eed2aee93afe0987055c6537eefc1a13e2",
+          "crates/media/mlx-gen/mlx-gen-svd/src/video_pair_fixture.rs": "13615412be9845038786930784591e5272503cd163041a5cd1272bfb4afaa5c1"
+        },
+        "head": {
+          "crates/media/mlx-gen/mlx-gen-mochi/src/lib.rs": "d794134fe3ddfd90ecc1b4b7d5e8fbfe944137ec72e242a8c994b48e20336af2",
+          "crates/media/mlx-gen/mlx-gen-mochi/src/video_pair_fixture.rs": "bea64298edc7d90b1b6ab52a6b7480f9cc008e95adc76241199770f58ff66818",
+          "crates/media/mlx-gen/mlx-gen-svd/src/lib.rs": "833cd262e7fb54a29f98f995548ed9eed2aee93afe0987055c6537eefc1a13e2",
+          "crates/media/mlx-gen/mlx-gen-svd/src/video_pair_fixture.rs": "13615412be9845038786930784591e5272503cd163041a5cd1272bfb4afaa5c1"
+        }
+      },
+      "hardware": {
+        "chip": "Apple M5 Max",
+        "os_build": "26B131",
+        "physical_memory_bytes": 137438953472
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "head_tree": "74cf57db14b5049e2da206ea9a7ebc921bfc05b1",
+      "host": "macOS-27.2.1-arm64-arm-64bit",
+      "protocol": "mochi-svd-tier1-v1",
+      "receipt_sha256": "9ff0e8d791301e7bcc27646dfe322651033f154584e5c277401c0110f002af93",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "rw-mage"
+      ],
+      "runner_name": "nax-macos-2"
+    },
+    "44859962189": {
+      "accepted": true,
+      "artifact_id": "14688938574",
+      "artifact_name": "model-proof-729fc019a40d4a047c9381e3da650ba22f2b6827-mlx-44859962189-1",
+      "artifact_zip_sha256": "e0f3bb025699d7a1566dd6d2f3124e95181151d9f40dd4949bbebbba1cdbc263",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "scail2": "b699a0c937efb221e64200cf2be6f070a036174032f80e63ae635beab0fce895"
+        },
+        "head": {
+          "scail2": "11fae9044973d20331bb59b07ff0308213d7a7143b277ce1bc43529572577480"
+        }
+      },
+      "fixture_closure": {
+        "measured_tree": "dc6672ec1695b26b7302067e347e3eba9c91b8ed",
+        "path": "scripts/ci/scail_pair",
+        "reviewed_tree": "dc6672ec1695b26b7302067e347e3eba9c91b8ed"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "18a44b34a31e8b2c47bc385277976ed3eef9e57e36af86492f40e2abf8cfae9d",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "5f02f6145cbf6229196df2aee0b8a98e3b82068ce7766c4bf7e2f0da6726ad73",
+        "scail_pair/overlay.py": "8815cdf67675023e6327ec837b922555a2d0ccb01f02f691818a77cc6d597ac1",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/mlx-gen/mlx-gen-scail2/src/generate.rs": "196bea8886914083e022ccdd7aa129814d9a475ec95c3f5d87e711819d968abb",
+          "crates/media/mlx-gen/mlx-gen-scail2/src/model.rs": "8b44f973a2bf223a344119d1ee86d2d92602dfee8d0d834018a96d6ab5b44772",
+          "crates/media/mlx-gen/mlx-gen-scail2/src/scail_pair_fixture.rs": "05c35bb870f3925062c30f9f17bb5275eb810d5eb9871f41ab666860d233b19f"
+        },
+        "head": {
+          "crates/media/mlx-gen/mlx-gen-scail2/src/generate.rs": "b600be8b781cbf979f496b2b2d48da7874d3fa256d2112aa22e4024f1aaa99e2",
+          "crates/media/mlx-gen/mlx-gen-scail2/src/model.rs": "8b44f973a2bf223a344119d1ee86d2d92602dfee8d0d834018a96d6ab5b44772",
+          "crates/media/mlx-gen/mlx-gen-scail2/src/scail_pair_fixture.rs": "4bdb384f8ed49b634a64f6806a22d0a019434e01b160248c715477c6a0e16721"
+        }
+      },
+      "hardware": {
+        "chip": "Apple M5 Max",
+        "os_build": "26B131",
+        "physical_memory_bytes": 137438953472
+      },
+      "head": "729fc019a40d4a047c9381e3da650ba22f2b6827",
+      "head_tree": "74cf57db14b5049e2da206ea9a7ebc921bfc05b1",
+      "host": "macOS-27.2.1-arm64-arm-64bit",
+      "protocol": "scail2-tier1-v1",
+      "receipt_sha256": "f3a8d2cccd86065bc55a111a67eaceca593c7add4e3d292e5a00740ebd799f6e",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "rw-mage"
+      ],
+      "runner_name": "nax-macos-2"
+    },
+    "44861650824": {
+      "accepted": false,
+      "artifact_id": "14690379712",
+      "artifact_name": "model-proof-339cca4716844d5b24b03ff726b35007e873ed08-candle-cuda-44861650824-1",
+      "artifact_zip_sha256": "ebb2f3a7fbdb37f164132f38d2a40b292172c9dac14157d1eca4b8bfe65c321f",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "mochi": "062ab4fcf3b3d9020c7c78ca96ae2c6263dbc9862c147073a11f33f2c9981afd",
+          "svd": "b1c7c633cf8ab485dd0698df47a3304a2e7b9ce49973fbc4e8e86b288ea61b82"
+        },
+        "head": {
+          "mochi": "d0ef6ed69e1ab67fa62ab96dc0ca0391ea4388efb7bf1d426f0e9197744697e0",
+          "svd": "3f4ab695dc0994a4333f9f0ad310674c31e6be5170c5b76819612350aeafdbad"
+        }
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_closure": {
+        "measured_tree": "b0eb6b937c4366c9e5ac67537c90ccf7cadf35cb",
+        "path": "scripts/ci/ms_pair",
+        "reviewed_tree": "b0eb6b937c4366c9e5ac67537c90ccf7cadf35cb"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "658cea8da1ed0faa81ae1f853fa7a83bd8e61ce71a94288cb1c681fa56418f19",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "ac769208e52cdb3b5ef109d9819861db5fa79bc7720c4608b70532e7c99c7d1a",
+        "ms_pair/aux_shapes.json": "f4caf29d2a38824533a462e29b93db1f6983a726e53b31fbec1266f392627d4e",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/candle-gen/candle-gen-mochi/src/lib.rs": "99673d9f9416b310d4517c4505adde414012013c32aafb012b8de10b98a5548b",
+          "crates/media/candle-gen/candle-gen-mochi/src/video_pair_fixture.rs": "e78972509eeeb3cb7ed8ceb8503a5ab5ebd1968909b881f11043a588f13d5618",
+          "crates/media/candle-gen/candle-gen-svd/src/lib.rs": "b3573e2c8fb4d4dc7c7de9a0af87e1ee6a002d2be34ed25711c9d5e4347fb0e6",
+          "crates/media/candle-gen/candle-gen-svd/src/video_pair_fixture.rs": "6135677b8eb6ff2cc6296c5f26afa1c6d83de3f1c72ead6d813ddf97e7fb06b2"
+        },
+        "head": {
+          "crates/media/candle-gen/candle-gen-mochi/src/lib.rs": "14e5d0e0f9a12e148ddc7e133577f6d8cd2ee5c669b10ea19417129ca28e13f2",
+          "crates/media/candle-gen/candle-gen-mochi/src/video_pair_fixture.rs": "e78972509eeeb3cb7ed8ceb8503a5ab5ebd1968909b881f11043a588f13d5618",
+          "crates/media/candle-gen/candle-gen-svd/src/lib.rs": "b16549251a8d67d0cfa9f20475b018da47019b1b999d7901e7c5aa6eb407f514",
+          "crates/media/candle-gen/candle-gen-svd/src/video_pair_fixture.rs": "6135677b8eb6ff2cc6296c5f26afa1c6d83de3f1c72ead6d813ddf97e7fb06b2"
+        }
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "mochi-svd-tier1-v1",
+      "receipt_sha256": "353dc8ce662994b4b4382d20bf7113325212a76e075b49b4d1e356b4cd6e118a",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows-2"
+    },
+    "44861650857": {
+      "accepted": false,
+      "artifact_id": "14690318519",
+      "artifact_name": "model-proof-339cca4716844d5b24b03ff726b35007e873ed08-candle-cuda-44861650857-1",
+      "artifact_zip_sha256": "3184a1c745886dd2a0e1190acd923182c0e1ba834dfd17e1e124d376dff8a4b4",
+      "base": "c7911db0e6cdcc41762326e2f8aad7e60634c2a1",
+      "base_tree": "f514a98282c65e91ab02e4a8df386cda0a60e72f",
+      "binary_sha256": {
+        "base": {
+          "scail2": "49d937efbf600d39fd28d4905be708997f6bdeadb5fc7e92f6ccbb16792cb8fe"
+        },
+        "head": {
+          "scail2": "9195337201167dad12c202d35207c731fe095ddaf7d0a1d2882a7dc106ac5ec5"
+        }
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_closure": {
+        "measured_tree": "dc6672ec1695b26b7302067e347e3eba9c91b8ed",
+        "path": "scripts/ci/scail_pair",
+        "reviewed_tree": "dc6672ec1695b26b7302067e347e3eba9c91b8ed"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "18a44b34a31e8b2c47bc385277976ed3eef9e57e36af86492f40e2abf8cfae9d",
+        "flux1_pair/fixture.py": "b218e1f07fb669d2105c6db97abfa29889e654d5b6629d3eeed90af00c1ad691",
+        "headers.json": "5f02f6145cbf6229196df2aee0b8a98e3b82068ce7766c4bf7e2f0da6726ad73",
+        "scail_pair/overlay.py": "8815cdf67675023e6327ec837b922555a2d0ccb01f02f691818a77cc6d597ac1",
+        "wan_pair/fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25"
+      },
+      "fixture_source_sha256": {
+        "base": {
+          "crates/media/candle-gen/candle-gen-scail2/src/generate.rs": "8d4317a7642dfeae85f3ff3a93800a9fa8231b2fa9d6097dce4b1f573d3f86c3",
+          "crates/media/candle-gen/candle-gen-scail2/src/model.rs": "8cdf27bc692ce0aafecbc5ca6596749b509ace53938cafc187ffb550c55aa8b4",
+          "crates/media/candle-gen/candle-gen-scail2/src/pipeline.rs": "ae2559ef06f89e733a69b320d0411a73bf3e2576eaba8a34b9bf4be2dbd07959",
+          "crates/media/candle-gen/candle-gen-scail2/src/scail_pair_fixture.rs": "edeb3af6656e2fca00f417a570a681bbdcaa2f05c51f2592fb5a10d8f2e5a31b",
+          "crates/media/candle-gen/candle-gen-wan/src/scheduler.rs": "ebdfa0e06dbfaa4883c5104f948b9324df4b854638d9dded899f8c88f3fc54b6"
+        },
+        "head": {
+          "crates/media/candle-gen/candle-gen-scail2/src/generate.rs": "000c8cdd1fbc1c7fe69e358e4d7721eb358e1d3617131d40dbfa61545fef3ebf",
+          "crates/media/candle-gen/candle-gen-scail2/src/model.rs": "8cdf27bc692ce0aafecbc5ca6596749b509ace53938cafc187ffb550c55aa8b4",
+          "crates/media/candle-gen/candle-gen-scail2/src/pipeline.rs": "d8078e9952482dc3af6b0d52f85daed9bca4a42350fc61ffd9b30f4b8df4ef6d",
+          "crates/media/candle-gen/candle-gen-scail2/src/scail_pair_fixture.rs": "a3d915f6d420d0b867de8ff7ce96c1d43154b3bc40a149dd92a7b8f447e16cce",
+          "crates/media/candle-gen/candle-gen-wan/src/scheduler.rs": "135cd3a7172deae5718c3c05d35004b87194d01614eecdbdb49c4201b74282bd"
+        }
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "scail2-tier1-v1",
+      "receipt_sha256": "b30a3090e81871e6a0425b756f6b5e3300e1358d4d3bfb2a57d08918c608b816",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows"
+    },
+    "44861650920": {
+      "accepted": false,
+      "artifact_id": "14689839708",
+      "artifact_name": "model-proof-339cca4716844d5b24b03ff726b35007e873ed08-candle-cuda-44861650920-1",
+      "artifact_zip_sha256": "85be3ff01eedce2535b4b73c3a382106a3aa92914ac88a3fde6676956d8085b8",
+      "base": "38dab65f5d9640396cf2946cd4ee866ce46630c6",
+      "base_tree": "583299608475223416f4e1bcad3b4276eeefb055",
+      "binary_sha256": {
+        "base": "b737d6bfbb00683446cdc1c70d0e8a7d6de48f904afe2f7d371ae16e57e5b738",
+        "head": "2cd96df99a7663a75389fa1f704be2809646f064abcf6dc9f9e73bd4acdb6596"
+      },
+      "failure": "paired parity or performance failed or was inconclusive; see per-case comparisons",
+      "fixture_closure": {
+        "measured_tree": "7c0995b241ba6c2692a4cd72fa80ad1532e2767d",
+        "path": "scripts/ci/wan_pair",
+        "reviewed_tree": "7c0995b241ba6c2692a4cd72fa80ad1532e2767d"
+      },
+      "fixture_inputs_sha256": {
+        "fixture.py": "6083b08750202410cd8860d4620b4c16c5706d0517ed59f698d38315d3d8ff25",
+        "headers.json": "cc19b391d7efaaf98242582b38e151c05ea6498f046c334f9b0146bf13eb6cbc"
+      },
+      "fixture_source_sha256": {
+        "base": "21f3b56a4f72d4addb243eb602691edb0d0c82d75af4715b4c6c084f73c33d03",
+        "head": "491bea8175d0d9d49608f30bd9492e9ff133ce13042fc0bd87b13e8f53aadbbe"
+      },
+      "hardware": {
+        "driver_version": "596.36",
+        "index": "1",
+        "memory.total": "97887",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+      },
+      "head": "339cca4716844d5b24b03ff726b35007e873ed08",
+      "head_tree": "5da487978f98b81af0993bf8063bfa50acf1b41a",
+      "host": "Windows-11-10.0.26300-SP0",
+      "protocol": "wan-curated-tier1-v2",
+      "receipt_sha256": "516c91bf595243a51760e02af4762116aee9016d984cbcf1cedfbe2e795381d3",
+      "run_attempt": "1",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "cuda",
+        "real-weights"
+      ],
+      "runner_name": "cuda-windows"
+    }
+  },
+  "schema_version": 1,
+  "source_review": {
+    "base": "Each proof keeps its exact frozen base tree and receives only its corresponding test overlay derived from the measured head. Base build and fixture source digests are retained by run.",
+    "mochi": "Both probes supply the prebuilt DiT, mask, text context and initial tensor directly to denoise. The E4 eager-load, CFG text handle and initial-latent lifetime changes affect the full provider around denoise and decode. The direct probe never acquires those handles and its default transformer text width stays 4096.",
+    "scail2": "The test-only overlay calls the production scheduler windows with frozen latent carriers. The E4 carrier metadata, scope projection, decoder and working-set pricing do not participate. The source delta does not change the observed scheduler and model inputs.",
+    "scope": "Retain only independent measurements of the synthetic direct denoise probes. Product admission, decoding and full-job memory require their own evidence.",
+    "shared": "The common phase entry now records a video phase with latent frame count when it receives a scope. These direct probes pass no request scope. The CPU-side PDH verification change leaves original failed pairs inconclusive.",
+    "svd": "Both probes construct the UNet and fixed conditioning/sigma inputs. Native MLX Euler and curated Heun plus Candle Euler/Heun execute the same denoise/sampler math. E4 centralizes the equivalent fixed phase shape (2D downsample factor 8) and keeps the direct phase unscoped. Codec load, output decode and conversion are outside the probe.",
+    "wan": "The earlier MLX overlay differs only in env parsing, equivalent Heun trace assertions, a BF16/F32-preserving fixture writer extension and CUDA-only files. The measured MLX calls invoke direct curated resident/swapped denoise; the later identity helper extracts the same shape and constructs the same phase for these fixed inputs. Candle calls Pipeline::denoise directly with no request scope. Registered plan, pre-load checks and RGB/decode pricing are outside the probes.",
+    "wan_cuda_timing": "The older run 44856440634 used the previous monitoring harness and is excluded from the timed follow-up baseline. The latest retained run 44861650920 is the unresolved comparison."
+  }
+}

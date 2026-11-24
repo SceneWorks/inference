@@ -1,0 +1,94 @@
+@WAN_PAIR_COMMON@
+
+const SAMPLER: &str = "heun";
+
+use crate::{gen_core, pipeline, Device, DitSource, GenerationRequest, Pipeline, Progress};
+use candle_gen::candle_core::{safetensors, DType};
+@CUDA_POOL_WITNESS@
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env("wan_pair_fixture::curated_tier1", "WAN_PAIR")?;
+    assert_eq!(pair.case, "cuda-ti2v5b-t2v-heun");
+    let device = Device::new_cuda(0)?;
+    let mut model = Pipeline::load(
+        &pair.root,
+        &device,
+        Vec::new(),
+        DitSource::Snapshot,
+        gen_core::CheckpointFactsSink::new(),
+    );
+    model.dit_cfg.num_layers = 1;
+    let dit = model.build_dit()?;
+    let inputs = safetensors::load(pair.root.join("inputs.safetensors"), &device)?;
+    let positive = dit.embed_text(&inputs["positive"].unsqueeze(0)?)?;
+    let negative = dit.embed_text(&inputs["negative"].unsqueeze(0)?)?;
+    // Five pixel frames and 64 × 96 pixels correspond to [2,4,6] latent cells with
+    // the native z48 stride. The denoise witness begins directly at those cells.
+    let request = GenerationRequest {
+        width: 96,
+        height: 64,
+        frames: Some(5),
+        scheduler_shift: Some(5.0),
+        seed: Some(SEED),
+        steps: Some(STEPS as u32),
+        guidance: Some(5.0),
+        sampler: Some(SAMPLER.to_owned()),
+        ..Default::default()
+    };
+    let knobs = model.resolve_knobs(&request);
+    let (t, h, w, cos, sin) = model.geometry(&request, knobs.frames)?;
+    assert_eq!((t, h, w), (2, 4, 6));
+    assert_eq!(knobs.shift, 5.0);
+    let noise = pipeline::create_noise(SEED, model.dit_cfg.out_channels, t, h, w, &device)?;
+    assert!(noise.device().is_cuda() && positive.device().is_cuda() && negative.device().is_cuda());
+    println!("\nMODEL_INFERENCE_DEVICE wan_pair_fixture::curated_tier1 candle-cuda");
+    assert_eq!(positive.dtype(), DType::BF16);
+    assert_eq!(negative.dtype(), DType::BF16);
+    let settings = json!({
+        "sampler":request.sampler,"seed":knobs.seed,"steps":knobs.steps,"shift":knobs.shift,
+        "guidance":[knobs.guidance],"denoiser_dtype":"BF16","latent_dtype":"F32","latent_shape":noise.dims(),
+        "patch":model.dit_cfg.patch,"model_width":model.dit_cfg.dim,"heads":model.dit_cfg.num_heads,
+        "depth":model.dit_cfg.num_layers,"reference_channels":0,"boundary_timestep":null,
+        "render_width":request.width,"render_height":request.height,"frames":knobs.frames,
+        "text_shape":inputs["positive"].dims(),"residency":"resident"
+    });
+    pair.measure(
+        noise.flatten_all()?.to_vec1::<f32>()?,
+        settings,
+        || {
+            let mut trace = Vec::new();
+            let mut progress = |event| {
+                if let Progress::Step { current, total } = event {
+                    trace.push(step(current, total));
+                }
+            };
+            device.synchronize()?;
+            let start = Instant::now();
+            let latent = model.denoise(
+                &dit,
+                &positive,
+                Some(&negative),
+                knobs.guidance,
+                &cos,
+                &sin,
+                noise.clone(),
+                None,
+                &knobs,
+                @WAN_CANDLE_DENOISE_ARGS@,
+                &mut progress,
+            )?;
+            device.synchronize()?;
+            let elapsed = start.elapsed().as_nanos().try_into()?;
+            assert!(latent.device().is_cuda());
+            assert_eq!(latent.dims(), &[1, 48, 2, 4, 6]);
+            assert_eq!(latent.dtype(), DType::F32);
+            let values = latent.flatten_all()?.to_vec1::<f32>()?;
+            Ok((elapsed, trace, latent.dims().to_vec(), values))
+        },
+        || pool_proof(&pair),
+    )?;
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED wan_pair_fixture::curated_tier1");
+    Ok(())
+}

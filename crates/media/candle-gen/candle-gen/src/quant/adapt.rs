@@ -68,13 +68,18 @@ mod tests {
         assert_eq!(llm.resident_bytes(), Some(operand.resident_bytes()));
         let round_trip = llm.to_adapt_linear().unwrap();
         for projection in [&layer, &copy, &round_trip] {
-            let Base::Packed(QLinear::Dense(DenseLinear::Linear(linear))) = &projection.base else {
+            let Base::Packed(base @ QLinear::Dense(DenseLinear::Linear(linear))) = &projection.base
+            else {
                 panic!("expected the original checkpoint projection");
             };
             assert!(Arc::ptr_eq(&operand, &linear.native_weight().unwrap()));
             assert_eq!(
                 linear.native_resident_bytes(),
                 Some(operand.resident_bytes())
+            );
+            assert_eq!(
+                base.resident_weight_bytes() as u64,
+                operand.resident_bytes()
             );
         }
         Ok(())

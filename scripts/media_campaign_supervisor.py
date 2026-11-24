@@ -1475,8 +1475,11 @@ def _run_admitted(
                 if policy.backend == "windows-cuda" and require_gpu_sample:
                     missing = [state for state in devices if state.peak <= 0]
                     if missing:
-                        label = f" on {missing[0].policy.cuda_device_uuid}" if multi_cuda else ""
-                        raise SupervisionError("probe-failure", f"CUDA child had no attributable GPU-memory sample{label}")
+                        witness = getattr(probe, "completed_process_gpu_sample", None)
+                        if (multi_cuda or missing[0].global_upper_bound_samples == 0 or witness is None
+                                or witness(child.pid) is not True):
+                            label = f" on {missing[0].policy.cuda_device_uuid}" if multi_cuda else ""
+                            raise SupervisionError("probe-failure", f"CUDA child had no attributable GPU-memory sample{label}")
                 if not retain_owned_completion:
                     child.wait()
             except SupervisionError as error:
@@ -1487,7 +1490,8 @@ def _run_admitted(
             # successful test may end between GPU polling ticks: report UNKNOWN, never a fake
             # zero measurement. Existing campaign callers retain their strict/default behavior.
             observed_gpu_peak = peak_gpu if gpu_free is not None else None
-            if not require_gpu_sample and observed_gpu_peak == 0:
+            # An independent WDDM completion witness never supplies NVIDIA/pool bytes here.
+            if observed_gpu_peak == 0 and (not require_gpu_sample or policy.backend == "windows-cuda"):
                 observed_gpu_peak = None
             lifetime_peak = getattr(probe, "lifetime_peak_bytes", lambda: None)()
             peaks = {"sampled_peak_host_bytes": peak_host,

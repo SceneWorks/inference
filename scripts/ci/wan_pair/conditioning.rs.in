@@ -1,0 +1,57 @@
+// Installed only in the two fixed CUDA conditioning experiments.
+impl Pair {
+    fn measure_conditioned(
+        &self,
+        initial: Vec<f32>,
+        settings: Value,
+        mut run: impl FnMut() -> ProofResult<(u64, Vec<Value>, Vec<usize>, Vec<f32>)>,
+        allocator_peak: impl FnOnce() -> ProofResult<u64>,
+    ) -> ProofResult<()> {
+        let calls = match self.case.as_str() {
+            "cuda-ti2v5b-t2v-heun" => 256,
+            "cuda-svd-euler-cfg" => 32,
+            _ => return Err("unregistered conditioned CUDA timing role".into()),
+        };
+        let origin = Instant::now();
+        let elapsed = || u64::try_from(origin.elapsed().as_nanos());
+        let (first_ns, reference_trace, reference_shape, reference_values) = run()?;
+        let mut conditioning_ns = vec![first_ns];
+        let mut record = |(ns, trace, shape, values): &(u64, Vec<Value>, Vec<usize>, Vec<f32>)| {
+            assert!(*ns > 0);
+            assert_eq!(trace, &reference_trace);
+            assert_eq!(shape, &reference_shape);
+            assert!(reference_values.iter().map(|v| v.to_bits()).eq(values.iter().map(|v| v.to_bits())));
+            conditioning_ns.push(*ns);
+        };
+        // The original measure() supplies the final unmeasured warmup.
+        for _ in 1..calls - 1 {
+            record(&run()?);
+        }
+        let mut conditioning_end_ns = 0;
+        let mut measured_start_ns = 0;
+        let mut measured_end_ns = 0;
+        let mut measured = 0;
+        self.measure(initial, settings, || {
+            if conditioning_end_ns == 0 {
+                let warm = run()?;
+                record(&warm);
+                conditioning_end_ns = elapsed()?;
+                return Ok(warm);
+            }
+            if measured == 0 {
+                measured_start_ns = elapsed()?;
+            }
+            let sample = run()?;
+            measured_end_ns = elapsed()?;
+            measured += 1;
+            Ok(sample)
+        }, allocator_peak)?;
+        assert_eq!(measured, calls);
+        assert_eq!(conditioning_ns.len(), calls);
+        fs::write(self.out.join("conditioning.json"), serde_json::to_vec(&json!({
+            "conditioning_ns": conditioning_ns, "conditioning_end_ns": conditioning_end_ns,
+            "measured_start_ns": measured_start_ns, "measured_end_ns": measured_end_ns
+        }))?)?;
+        Ok(())
+    }
+}

@@ -15,9 +15,10 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
 
-use crate::scheduler::{cfg_combine, MochiScheduler};
+use crate::scheduler::{advance, cfg_combine};
 use crate::transformer::MochiTransformer3DModel;
 use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
+use gen_core_family::mochi::{inverted_sigmas, MochiEuler};
 
 /// N-step 1st-order FlowMatchEuler **true-CFG** denoise (Mochi is not distilled).
 ///
@@ -37,40 +38,61 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    let mut sched = MochiScheduler::new();
-    sched.set_timesteps(steps, shift);
+    let sigmas = inverted_sigmas(steps, shift);
+    denoise_schedule(
+        transformer,
+        init_latents,
+        enc,
+        enc_mask,
+        &sigmas,
+        guidance,
+        shift,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_schedule(
+    transformer: &MochiTransformer3DModel,
+    init_latents: &Array,
+    enc: &Array,
+    enc_mask: &Array,
+    sigmas: &[f32],
+    guidance: f32,
+    shift: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     mlx_gen::video_execution::sampling(
         "mochi",
         "flow_euler",
         "velocity",
         serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
     );
-    mlx_gen::video_execution::schedule("mochi", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    mlx_gen::video_execution::schedule("mochi", sigmas);
 
     let mut latents = init_latents.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Cooperative cancel at the top of every step (the per-step `eval` below makes it land).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        // latent_model_input = cat([latents, latents]) → [2, C, F, H, W] (the two CFG branches).
-        let lmi = concatenate_axis(&[&latents, &latents], 0)?;
-        // Same model timestep for both branches (`t.expand(batch)`).
-        let timestep = Array::from_slice(&[t, t], &[2]);
-        // AsymmDiT velocity for [neg, pos]; CFG recombine runs in f32 (matches the reference).
-        let noise_pred = transformer
-            .forward(&lmi, enc, &timestep, enc_mask)?
-            .as_dtype(Dtype::Float32)?;
-        let velocity = cfg_combine(&noise_pred, guidance)?; // [1, C, F, H, W]
-        latents = sched.step(&velocity, &latents)?;
-        // Force per-step materialization so the next cancel check is meaningful and progress is real.
-        mlx_rs::transforms::eval([&latents])?;
-        on_progress(Progress::Step {
-            current: (i + 1) as u32,
-            total: steps as u32,
-        });
-    }
+    MochiEuler::run(
+        sigmas,
+        cancel,
+        |step, t| -> Result<()> {
+            // latent_model_input = cat([latents, latents]) → [2, C, F, H, W] (the two CFG branches).
+            let lmi = concatenate_axis(&[&latents, &latents], 0)?;
+            // Same model timestep for both branches (`t.expand(batch)`).
+            let timestep = Array::from_slice(&[t, t], &[2]);
+            // AsymmDiT velocity for [neg, pos]; CFG recombine runs in f32 (matches the reference).
+            let noise_pred = transformer
+                .forward(&lmi, enc, &timestep, enc_mask)?
+                .as_dtype(Dtype::Float32)?;
+            let velocity = cfg_combine(&noise_pred, guidance)?; // [1, C, F, H, W]
+            latents = advance(step, &velocity, &latents)?;
+            // Force per-step materialization so the next cancel check is meaningful and progress is real.
+            mlx_rs::transforms::eval([&latents])?;
+            Ok(())
+        },
+        on_progress,
+    )?;
     Ok(latents)
 }
 

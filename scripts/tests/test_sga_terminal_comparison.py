@@ -33,6 +33,19 @@ Z_TURBO_DIAGNOSTIC = dict(REQUEST, profile="z-image", variant="turbo",
 
 
 class TerminalTests(unittest.TestCase):
+    def test_candle_cuda_terminal_hub_root_resolves_through_the_real_staging_resolver(self):
+        # No mock: the SGA terminal route calls the shared staging hub_root without a staging
+        # plan, so it must take the configured model root and never the SCAIL-2 native cache.
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            default, ltx_root = root / "models", root / "ltx"
+            env = {"MODEL_PROOF_HUB_ROOT": str(default), "LTX25_PROOF_HUB_ROOT": str(ltx_root)}
+            self.assertEqual(comparison.terminal_hub_root("candle-cuda", z_image, env), default)
+            self.assertEqual(comparison.terminal_hub_root("candle-cuda", ltx, env), ltx_root)
+            self.assertTrue(default.is_dir() and ltx_root.is_dir())
+            with self.assertRaisesRegex(ValueError, "MODEL_PROOF_HUB_ROOT"):
+                comparison.terminal_hub_root("candle-cuda", z_image, {})
+
     def test_z_turbo_diagnostic_is_bound_and_requires_opposite_order(self):
         self.assertIs(comparison.profile_for("candle-cuda", Z_TURBO_DIAGNOSTIC), z_image)
         for overrides in ({"variant": "base"}, {"profile": "wan"}, {"cuda_device_uuid": UUID},

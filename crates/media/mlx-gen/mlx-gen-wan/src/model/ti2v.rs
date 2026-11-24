@@ -36,6 +36,7 @@ pub fn effective_te_quant(config: &WanModelConfig, load_quant: Option<Quant>) ->
 /// loaded, used, then dropped in turn — to bound peak memory (mirrors `generate_wan.py`, which never
 /// holds the T5 encoder + the 10 GB transformer resident at once).
 pub struct Wan {
+    pub(super) load_binding: Option<mlx_gen::gen_core::RenderLoadBinding>,
     pub(super) descriptor: ModelDescriptor,
     pub(super) config: WanModelConfig,
     pub(super) root: PathBuf,
@@ -179,6 +180,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         None
     };
     Ok(Box::new(Wan {
+        load_binding: Some(mlx_gen::gen_core::RenderLoadBinding::from_video_spec(spec)),
         descriptor: descriptor(),
         config,
         root,
@@ -199,6 +201,7 @@ impl Wan {
     fn generate_execution_attempt(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
@@ -208,20 +211,77 @@ impl Wan {
             self.descriptor.id,
             || mlx_gen::sc20686::RequestFacts::from_request(req),
             on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
+            |on_progress| self.generate_impl(req, scope, on_progress),
         )
         .map_err(Into::into)
     }
 }
 
 impl Generator for Wan {
+    fn video_load_binding(&self) -> Option<&mlx_gen::gen_core::RenderLoadBinding> {
+        self.load_binding.as_ref()
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<()> {
+        if &video_layout(&self.descriptor, &self.config, req, self.quant)? != plan.layout() {
+            return Err(mlx_gen::gen_core::Error::Unsupported(
+                "loaded Wan geometry differs from admission".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        Ok(self.i2v_memory.as_ref().and_then(|p| {
+            gen_core_memory_wan::validate_request(p, req)
+                .is_ok()
+                .then_some(p.tier)
+        }))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        ctx: &mut mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        if plan.geometry() != ctx.geometry {
+            return Ok(false);
+        }
+        match &self.i2v_memory {
+            Some(p) => gen_core_memory_wan::project_video_context(p, req, ctx),
+            None => Ok(true),
+        }
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -249,7 +309,7 @@ impl Generator for Wan {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_execution_attempt(req, None, on_progress)
         })
     }
 

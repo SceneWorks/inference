@@ -161,4 +161,42 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+    #[test]
+    fn all_seven_mask_colors_keep_frame_zero_and_source_time_order() {
+        // Seven colored 8x8 blocks on each frame, shifted one block per source frame.
+        let rgb = [
+            [1., 1., 1.],
+            [1., -1., -1.],
+            [-1., 1., -1.],
+            [-1., -1., 1.],
+            [1., 1., -1.],
+            [1., -1., 1.],
+            [-1., 1., 1.],
+        ];
+        let mut pixels = Vec::<f32>::new();
+        for channel in [0, 1, 2] {
+            for frame in 0..5 {
+                for _row in 0..8 {
+                    for x in 0..56 {
+                        pixels.push(rgb[(x / 8 + frame) % 7][channel]);
+                    }
+                }
+            }
+        }
+        let mask = Tensor::from_vec(pixels, (3, 5, 8, 56), &Device::Cpu).unwrap();
+        let packed = extract_and_compress_mask_to_latent(&mask, TEMPORAL_STRIDE).unwrap();
+        assert_eq!(packed.dims(), &[28, 2, 1, 7]);
+        let values = packed.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for slot in 0..4 {
+            for color in 0..7 {
+                for time in 0..2 {
+                    let frame = if time == 0 { 0 } else { slot + 1 };
+                    for x in 0..7 {
+                        let index = ((slot * 7 + color) * 2 + time) * 7 + x;
+                        assert_eq!(values[index], f32::from((x + frame) % 7 == color));
+                    }
+                }
+            }
+        }
+    }
 }

@@ -71,6 +71,42 @@ pub(super) fn validate_selection(
     request_contract_for_mode(prepared, mode).validate_selection(selection)
 }
 
+/// Seal the existing selected public request. An unpriced or crossed domain receives no receipt.
+pub fn project_video_context(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+    context: &mut MemoryRunContext,
+) -> gen_core::Result<bool> {
+    let Ok(mode) = validate_request(prepared, request) else {
+        return Ok(false);
+    };
+    // The catalog keys optional provider mode after its ordered adapter-stack digest. Its
+    // spelling may be translated only when the exact load and request produce the same axes.
+    let mode_tag = request
+        .video_mode
+        .as_ref()
+        .map(|m| format!("provider_video_mode:{m}"));
+    let catalog_overlay = match (&prepared.catalog_adapter_identity, mode_tag) {
+        (Some(adapters), Some(mode)) => Some(format!("{adapters}+{mode}")),
+        (adapters, None) => adapters.clone(),
+        (None, mode) => mode,
+    };
+    let overlay_matches = context.overlay.as_deref() == Some(&prepared.adapter_identity)
+        || context.overlay == catalog_overlay
+        || context.overlay == prepared.catalog_adapter_identity;
+    if !overlay_matches
+        || context.geometry != geometry_from_request(request)
+        || context.mode.as_key() != mode.key()
+        || context.selection.tier != prepared.tier
+    {
+        return Ok(false);
+    }
+    let revision = request_evidence_revision_for_selection(prepared, request, &context.selection)?;
+    context.overlay = Some(prepared.adapter_identity.clone());
+    context.evidence_revision = revision;
+    Ok(true)
+}
+
 pub(super) fn request_evidence_revision_for_selection(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,

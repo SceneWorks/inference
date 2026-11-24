@@ -143,6 +143,41 @@ pub struct Umt5Encoder {
 }
 
 impl Umt5Encoder {
+    /// Distinct retained projection weights and the dense device embedding, when present.
+    /// This excludes relative bias, norms and host-resident packed embedding tables.
+    pub fn resident_weight_bytes(&self) -> usize {
+        let embedding = match &self.shared {
+            QEmbedding::Dense(e) => {
+                e.embeddings().elem_count() * e.embeddings().dtype().size_in_bytes()
+            }
+            QEmbedding::Quantized { .. } => 0,
+        };
+        embedding
+            + self
+                .blocks
+                .iter()
+                .flat_map(|b| {
+                    [
+                        &b.attn.q,
+                        &b.attn.k,
+                        &b.attn.v,
+                        &b.attn.o,
+                        &b.ffn.wi_0,
+                        &b.ffn.wi_1,
+                        &b.ffn.wo,
+                    ]
+                })
+                .map(|p| {
+                    if let Some(l) = p.dense_base() {
+                        l.weight().elem_count() * l.weight().dtype().size_in_bytes()
+                    } else {
+                        p.base_qlinear()
+                            .map_or(0, candle_gen::quant::QLinear::resident_weight_bytes)
+                    }
+                })
+                .sum::<usize>()
+    }
+
     pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         // Packed-detect the `shared` embedding (sc-10025) via the shared loader — dense in the hosted Wan
         // tier (the MLX build keeps the T5 dense); the packed arm future-proofs + closes the guard. Its

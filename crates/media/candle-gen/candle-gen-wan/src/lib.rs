@@ -146,6 +146,112 @@ mod vae_tiling_assignment_tests {
     }
 }
 
+fn curated_solver(name: Option<&str>) -> Option<Solver> {
+    name.and_then(Solver::from_name).filter(|solver| {
+        matches!(
+            solver,
+            Solver::EulerAncestral | Solver::Heun | Solver::DpmppSde | Solver::Ddim
+        )
+    })
+}
+
+/// Resolve the dense 5B text-to-video trajectory from the same request geometry and
+/// native sigma builder used by both resident and sequential execution.
+pub fn dense_curated_phase(
+    req: &GenerationRequest,
+    seed: u64,
+) -> gen_core::Result<Option<VideoDenoisePhase<()>>> {
+    let Some(solver) = curated_solver(req.sampler.as_deref()) else {
+        return Ok(None);
+    };
+    if !req.conditioning.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
+                .into(),
+        ));
+    }
+    let RenderKnobs {
+        frames,
+        steps,
+        shift,
+        ..
+    } = RenderKnobs::resolve(req, seed);
+    if frames == 0 || steps == 0 {
+        return Err(gen_core::Error::Unsupported(
+            "Wan needs positive frame and step counts".into(),
+        ));
+    }
+    let (latent_frames, _, _) = pipeline::latent_dims(frames, req.width, req.height);
+    let phase = VideoDenoisePhase {
+        identity: RenderPhaseIdentity {
+            pass: 0,
+            phase: 0,
+            geometry: gen_core::MemoryGeometry {
+                width: req.width,
+                height: req.height,
+                batch: 1,
+                frames,
+                reference_count: 0,
+            },
+        },
+        latent_frames: latent_frames as u32,
+        models: VideoModelRule::Fixed(()),
+        solver,
+        sigmas: scheduler::flow_sigmas(steps, shift),
+        seed,
+    };
+    // Wan lowers only the first node from 1 by 1e-6 for its native log-SNR guard.
+    // High shifts can put the second node between that guarded value and one.
+    phase.validate_descending_schedule(Some(1.0))?;
+    Ok(Some(phase))
+}
+
+// Only text-only curated 5B uses the shared sampler on Candle.
+fn dense_video_layout(
+    _: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    if curated_solver(req.sampler.as_deref()).is_none()
+        || DitSource::from_environment().gguf_path().is_some()
+    {
+        return Ok(None);
+    }
+    validate_dense_request(&descriptor(), req)?;
+    let phase = dense_curated_phase(req, req.seed.unwrap_or(0))?.expect("curated solver");
+    let output = phase.identity.geometry;
+    let (t, h, w) = pipeline::latent_dims(output.frames, output.width, output.height);
+    let bytes = [Z_DIM, t, h, w]
+        .into_iter()
+        .try_fold(4u64, |n, d| n.checked_mul(d as u64))
+        .ok_or_else(|| gen_core::Error::Unsupported("Wan latent size overflow".into()))?;
+    let chunk = output
+        .frames
+        .min(Ti2vProviderVae::VAE_TILING.temporal_scale as u32);
+    let mut layout = gen_core::VideoPlanLayout::single(
+        output,
+        &phase,
+        bytes,
+        output.frames,
+        chunk,
+        vec![],
+        candle_gen::default_memory_budget_domain(),
+    );
+    let frame_rgb = u64::from(output.width) * u64::from(output.height) * 3;
+    let clip_rgb = frame_rgb * u64::from(output.frames);
+    // Both residency paths retain the final latent and original f32 decoded clip while
+    // frames_to_images rounds its separate scaled tensor on the decoder device.
+    let retained = bytes + clip_rgb * 4;
+    layout.phases[0].decoded_tensor_bytes =
+        gen_core_family::candle_round_rgb8_live_bytes(clip_rgb, retained)?;
+    // frames_to_images retains the f32 decoded clip and its f32 scaled copy while the
+    // separate CPU uint8 clip, final planar-to-interleaved frame and RGB result coexist.
+    layout.output_conversion = gen_core::VideoOutputConversion {
+        device_bytes: retained + clip_rgb * 4,
+        host_bytes: clip_rgb + frame_rgb,
+    };
+    Ok(Some(layout))
+}
+
 /// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
 pub(crate) const MAX_WAN_FRAMES: usize = 1025;
 /// Matching temporal-conditioning budget after the z16 VAE's 4x causal compression.
@@ -179,7 +285,11 @@ use candle_gen::{
 };
 use gen_core_tokenizer::TextTokenizer;
 
-use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::render::{
+    video::{ActiveVideoDenoiseScope, VideoDenoisePhase, VideoModelRule},
+    RenderPhaseIdentity,
+};
+use candle_gen::gen_core::sampling::Solver;
 use config::{
     TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE,
     DEFAULT_STEPS, MAX_AREA_5B, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
@@ -452,18 +562,7 @@ impl Pipeline {
     /// two paths can never resolve steps/guidance/shift differently (the residency change must be
     /// numerics-preserving, sc-12757).
     fn resolve_knobs(&self, req: &GenerationRequest) -> RenderKnobs {
-        RenderKnobs {
-            steps: req
-                .steps
-                .map(|s| s as usize)
-                .unwrap_or(DEFAULT_STEPS as usize),
-            frames: req.frames.unwrap_or(DEFAULT_FRAMES),
-            fps: req.fps.unwrap_or(DEFAULT_FPS),
-            guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE) as f64,
-            seed: req.seed.unwrap_or_else(gen_core::default_seed),
-            sampler: Sampler::parse(req.sampler.as_deref()),
-            shift: flow_shift(req.scheduler_shift),
-        }
+        RenderKnobs::resolve(req, req.seed.unwrap_or_else(gen_core::default_seed))
     }
 
     /// Latent geometry (z48 strides) + the token-grid RoPE tables `(t_lat, h_lat, w_lat, cos, sin)`.
@@ -578,10 +677,11 @@ impl Pipeline {
         latents0: Tensor,
         ti2v: Option<&Ti2vConditioning>,
         knobs: &RenderKnobs,
-        sampler_name: Option<&str>,
-        cancel: &CancelFlag,
+        req: &GenerationRequest,
+        phase: Option<&VideoDenoisePhase<()>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
+        let cancel = &req.cancel;
         candle_gen::execution::policy(
             "wan_denoise",
             serde_json::json!({
@@ -625,26 +725,21 @@ impl Pipeline {
                 "applied",
             );
         }
-        const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
-        let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
+        let latents = if let Some(phase) = phase {
             if ti2v.is_some() {
-                return Err(CandleError::Msg(
+                return Err(CandleError::Unsupported(
                     "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
                         .into(),
                 ));
             }
-            let native = scheduler::flow_sigmas(steps, shift);
             let n_train = config::NUM_TRAIN_TIMESTEPS as f64;
-            candle_gen::run_flow_sampler(
-                Some(name),
-                TimestepConvention::Sigma,
-                &native,
+            candle_gen::sampler::run_video_flow_sampler(
+                phase,
+                Some(1.0),
                 latents0,
-                knobs.seed,
                 cancel,
                 on_progress,
-                None,
-                |latents, t| -> CResult<Tensor> {
+                |latents, t, ()| -> CResult<Tensor> {
                     let ts = t as f64 * n_train;
                     let v_pos = dit.forward_prepared(latents, ts, &pos_kv, cos, sin)?;
                     let v = match &neg_kv {
@@ -706,47 +801,60 @@ impl Pipeline {
     fn render(
         &self,
         req: &GenerationRequest,
-        comps: &Components,
+        components: impl FnOnce() -> gen_core::Result<Components>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
-        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         let knobs = self.resolve_knobs(req);
+        let phase = dense_curated_phase(req, knobs.seed)?;
+        let active = phase
+            .as_ref()
+            .map(|phase| phase.enter(&req.cancel, scope))
+            .transpose()?;
+        let comps = components()?;
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
+        let latents = {
+            // Text encode (pos + optional neg for CFG), then project to the DiT context once.
+            let (_pos_embeds, ctx_pos, ctx_neg) = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let pos_embeds = self.encode(&comps, &req.prompt)?;
+                    crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
+                    let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
+                    let ctx_neg = if knobs.guidance > 1.0 {
+                        let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                        Some(comps.dit.embed_text(&self.encode(&comps, neg)?)?)
+                    } else {
+                        None
+                    };
+                    Ok((pos_embeds, ctx_pos, ctx_neg))
+                },
+            )?;
+            let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
+            let noise =
+                pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+            let (latents0, ti2v) =
+                self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
+            crate::sc20686_observer::observe("prefill-peak", 0, 0, 0);
 
-        // Text encode (pos + optional neg for CFG), then project to the DiT context once.
-        let (_pos_embeds, ctx_pos, ctx_neg) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let pos_embeds = self.encode(comps, &req.prompt)?;
-                crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
-                let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
-                let ctx_neg = if knobs.guidance > 1.0 {
-                    let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-                    Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
-                } else {
-                    None
-                };
-                Ok((pos_embeds, ctx_pos, ctx_neg))
-            },
-        )?;
-        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
-        let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let (latents0, ti2v) = self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
-        crate::sc20686_observer::observe("prefill-peak", 0, 0, 0);
-
-        let latents = self.denoise(
-            &comps.dit,
-            &ctx_pos,
-            ctx_neg.as_ref(),
-            knobs.guidance,
-            &cos,
-            &sin,
-            latents0,
-            ti2v.as_ref(),
-            &knobs,
-            req.sampler.as_deref(),
-            &req.cancel,
-            on_progress,
-        )?;
+            self.denoise(
+                &comps.dit,
+                &ctx_pos,
+                ctx_neg.as_ref(),
+                knobs.guidance,
+                &cos,
+                &sin,
+                latents0,
+                ti2v.as_ref(),
+                &knobs,
+                req,
+                phase.as_ref(),
+                on_progress,
+            )?
+        };
+        if let Some(active) = active {
+            active.finish()?;
+        }
         crate::sc20686_observer::observe("decode-steady", 0, 0, 0);
 
         on_progress(Progress::Decoding);
@@ -789,6 +897,7 @@ impl Pipeline {
     fn render_sequential(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         let knobs = self.resolve_knobs(req);
@@ -798,18 +907,31 @@ impl Pipeline {
         // The tiny tokenizer is cheap and stays resident across the whole render; the heavy bf16 UMT5
         // encoder (~11 GB, sc-12778) is dropped right after encoding.
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
-        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
-        let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        // TI2V has an extra staged VAE-encode phase before the DiT. The clean/mask tensors survive
-        // that VAE drop; the decode-only VAE is loaded again after denoise.
-        let (latents0, ti2v) = if req.conditioning.is_empty() {
-            (noise, None)
+        let prepare_inputs = || -> CResult<_> {
+            let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
+            let noise =
+                pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+            // TI2V has an extra staged VAE-encode phase before the DiT. The clean/mask tensors survive
+            // that VAE drop; the decode-only VAE is loaded again after denoise.
+            let (latents0, ti2v) = if req.conditioning.is_empty() {
+                (noise, None)
+            } else {
+                let vae = self.load_vae_with_encoder()?;
+                let prepared = self.prepare_ti2v(req, &vae, &noise, t_lat, h_lat, w_lat)?;
+                self.device.synchronize()?;
+                drop(vae);
+                prepared
+            };
+
+            Ok((cos, sin, latents0, ti2v))
+        };
+        let phase = dense_curated_phase(req, knobs.seed)?;
+        // Native mask conditioning needs its VAE before the text encoder loads. A
+        // curated T2V run creates its request-local RoPE and noise inside stage 2.
+        let native_inputs = if phase.is_none() {
+            Some(prepare_inputs()?)
         } else {
-            let vae = self.load_vae_with_encoder()?;
-            let prepared = self.prepare_ti2v(req, &vae, &noise, t_lat, h_lat, w_lat)?;
-            self.device.synchronize()?;
-            drop(vae);
-            prepared
+            None
         };
 
         // The cross-stage tensors that must survive a component drop: the raw UMT5 context (stage 1 →
@@ -817,8 +939,8 @@ impl Pipeline {
         let mut state = SeqState {
             pos: None,
             neg: None,
-            latents: Some(latents0),
-            ti2v,
+            latents: None,
+            active: None,
             on_progress: &mut *on_progress,
         };
 
@@ -847,17 +969,24 @@ impl Pipeline {
             // ── Stage 2: load the DiT → project + denoise. DROP the DiT before the VAE loads. ──
             |st| {
                 check_cancel(cancel)?;
+                st.active = phase
+                    .as_ref()
+                    .map(|phase| phase.enter(cancel, scope))
+                    .transpose()?;
                 (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
                 self.build_dit()
             },
             |dit, st| {
-                let pos = st.pos.as_ref().expect("pos context encoded in stage 1");
-                let ctx_pos = dit.embed_text(pos)?;
-                let ctx_neg = match &st.neg {
-                    Some(neg) => Some(dit.embed_text(neg)?),
+                let pos = st.pos.take().expect("pos context encoded in stage 1");
+                let ctx_pos = dit.embed_text(&pos)?;
+                let ctx_neg = match st.neg.take() {
+                    Some(neg) => Some(dit.embed_text(&neg)?),
                     None => None,
                 };
-                let latents0 = st.latents.take().expect("noise seeded before staging");
+                let (cos, sin, latents0, ti2v) = match native_inputs {
+                    Some(inputs) => inputs,
+                    None => prepare_inputs()?,
+                };
                 let latents = self.denoise(
                     dit,
                     &ctx_pos,
@@ -866,10 +995,10 @@ impl Pipeline {
                     &cos,
                     &sin,
                     latents0,
-                    st.ti2v.as_ref(),
+                    ti2v.as_ref(),
                     &knobs,
-                    req.sampler.as_deref(),
-                    cancel,
+                    req,
+                    phase.as_ref(),
                     st.on_progress,
                 )?;
                 st.latents = Some(latents);
@@ -877,6 +1006,9 @@ impl Pipeline {
             },
             // ── Stage 3: load the VAE → decode. ──
             |st| {
+                if let Some(active) = st.active.take() {
+                    active.finish()?;
+                }
                 check_cancel(cancel)?;
                 (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
                 self.load_vae()
@@ -909,13 +1041,30 @@ struct RenderKnobs {
     shift: f64,
 }
 
+impl RenderKnobs {
+    fn resolve(req: &GenerationRequest, seed: u64) -> Self {
+        RenderKnobs {
+            steps: req
+                .steps
+                .map(|s| s as usize)
+                .unwrap_or(DEFAULT_STEPS as usize),
+            frames: req.frames.unwrap_or(DEFAULT_FRAMES),
+            fps: req.fps.unwrap_or(DEFAULT_FPS),
+            guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE) as f64,
+            seed,
+            sampler: Sampler::parse(req.sampler.as_deref()),
+            shift: flow_shift(req.scheduler_shift),
+        }
+    }
+}
+
 /// The mutable render state threaded through [`run_three_stage_sequential`] (sc-12757): the
 /// cross-stage tensors
 /// that must outlive a component drop (the raw UMT5 context; the latents seeded → denoised → decoded)
 /// plus the progress sink. Held so exclusive access moves between the load/use closures via the
 /// `&mut SeqState` param rather than being captured by each closure — the borrow-checker-clean way to
 /// let the `FnOnce` stages share state without a `RefCell` (mirrors `wan14b`'s `SwapState`).
-struct SeqState<'a> {
+struct SeqState<'a, 's> {
     /// Raw UMT5 positive context, encoded in stage 1 (TE resident), projected + consumed in stage 2
     /// (DiT resident) — survives the TE drop.
     pos: Option<Tensor>,
@@ -924,12 +1073,13 @@ struct SeqState<'a> {
     /// Working latents: seeded before staging, denoised in stage 2 (survives the TE drop), decoded in
     /// stage 3 (survives the DiT drop).
     latents: Option<Tensor>,
-    /// Clean latent + masks for TI2V, prepared before the staged TE/DiT/decode sequence.
-    ti2v: Option<Ti2vConditioning>,
+    /// The staged DiT is dropped and synchronized before stage 3 closes this scope.
+    active: Option<ActiveVideoDenoiseScope<'s>>,
     on_progress: &'a mut dyn FnMut(Progress),
 }
 
 pub struct WanGenerator {
+    load_binding: gen_core::RenderLoadBinding,
     descriptor: ModelDescriptor,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
@@ -1001,197 +1151,10 @@ fn load_or_replace_cached_variant<T: Clone>(
 }
 
 impl WanGenerator {
-    fn pipeline(&self) -> Pipeline {
-        Pipeline::load(
-            &self.root,
-            &self.device,
-            self.adapters.clone(),
-            self.dit_source.clone(),
-            self.checkpoint_facts.clone(),
-        )
-    }
-
-    fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
-        Ok(load_or_replace_cached_variant(
-            &self.components,
-            |components| components.vae_has_encoder != with_vae_encoder,
-            || Ok(self.device.synchronize()?),
-            || pipe.load_components(with_vae_encoder),
-        )?)
-    }
-
-    fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
-        i2v_memory_strategy::selected_offload_policy(self.offload, self.i2v_memory.is_some(), req)
-    }
-}
-
-fn needs_ti2v_encoder(req: &GenerationRequest) -> bool {
-    req.conditioning.iter().any(|conditioning| {
-        matches!(
-            conditioning,
-            Conditioning::Reference { .. } | Conditioning::Keyframe { .. }
-        )
-    })
-}
-
-pub(crate) fn capture_wan_execution<G: Generator + ?Sized>(
-    generator: &G,
-    req: &GenerationRequest,
-    on_progress: &mut dyn FnMut(Progress),
-    loaded_adapter_count: usize,
-) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-    candle_gen::execution::capture_with(generator, req, on_progress, || {
-        // Dense folds and packed residual installs do not retain a byte-bound applied stack.
-        candle_gen::execution::unobserved_adapters(
-            loaded_adapter_count,
-            "candle-gen-wan/src/lib.rs or wan14b.rs",
-        );
-    })
-}
-
-impl Generator for WanGenerator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    /// The three correlated facts about the GGUF DiT this generator loaded (sc-11045 fix round,
-    /// BLOCKER 1): what the container stores (`gguf-container-v1`), that ggml blocks execute in
-    /// their stored packing on every host, and the measured receipt — published by the GGUF DiT
-    /// load (`gguf::load_wan_dit_gguf_publishing`). `None` on the snapshot
-    /// (dense/packed-tier) routes, which compile no plan, and before the lazy DiT has loaded.
-    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
-        self.checkpoint_facts.facts()
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg("wan: prompt must not be empty".into()));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg("wan: steps must be >= 1".into()));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "wan: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        // sc-12308: the 5B carries an area budget too (upstream `ti2v-5B` supports only `1280*704` /
-        // `704*1280`), but this lane checked only the per-edge range and the multiple — so a
-        // grid-aligned 1280×1280 validated and ran to an opaque OOM, exactly the sc-9028 hole the
-        // 14B lane already closed. mlx's 5B did cap (it silently refit instead); rejecting here is
-        // what makes the two backends agree on one geometry per request.
-        let area = req.width as usize * req.height as usize;
-        if area > MAX_AREA_5B {
-            return Err(gen_core::Error::Msg(format!(
-                "wan: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_5B} px \
-                 (1280×704); reduce the resolution",
-                req.width, req.height
-            )));
-        }
-        if let Some(f) = req.frames {
-            if f == 0 || f % 4 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: frames must satisfy frames % 4 == 1 (got {f})"
-                )));
-            }
-            if f as usize > MAX_WAN_FRAMES {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: frames {f} exceeds the maximum {MAX_WAN_FRAMES}"
-                )));
-            }
-        }
-        let reference_count = req
-            .conditioning
-            .iter()
-            .filter(|c| matches!(c, Conditioning::Reference { .. }))
-            .count();
-        let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
-            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
-                return Err(gen_core::Error::Msg(format!(
-                    "wan: {label} strength must be finite and in [0,1] (got {strength})"
-                )));
-            }
-            Ok(())
-        };
-        if let Some(strength) = req.strength {
-            check_strength("image", strength)?;
-        }
-        for conditioning in &req.conditioning {
-            match conditioning {
-                Conditioning::Reference {
-                    strength: Some(strength),
-                    ..
-                } => check_strength("Reference", *strength)?,
-                Conditioning::Keyframe { strength, .. } => check_strength("Keyframe", *strength)?,
-                _ => {}
-            }
-        }
-        let image_conditioned = reference_count > 0 || !req.keyframes().is_empty();
-        if reference_count > 1 {
-            return Err(gen_core::Error::Msg(
-                "wan: TI2V accepts at most one Reference image".into(),
-            ));
-        }
-        if reference_count > 0 && !req.keyframes().is_empty() {
-            return Err(gen_core::Error::Msg(
-                "wan: Reference and Keyframe conditioning cannot be combined; express the first \
-                 frame as Keyframe frame_idx=0"
-                    .into(),
-            ));
-        }
-        if !req.keyframes().is_empty() {
-            let frames = req.frames.unwrap_or(DEFAULT_FRAMES) as usize;
-            let t_lat = (frames - 1) / config::VAE_STRIDE_TEMPORAL as usize + 1;
-            for keyframe in req.keyframes() {
-                let index = if keyframe.frame_idx < 0 {
-                    t_lat as i32 + keyframe.frame_idx
-                } else {
-                    keyframe.frame_idx
-                };
-                if index < 0 || index as usize >= t_lat {
-                    return Err(gen_core::Error::Msg(format!(
-                        "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
-                        keyframe.frame_idx
-                    )));
-                }
-            }
-        }
-        const CURATED: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
-        if image_conditioned
-            && req
-                .sampler
-                .as_deref()
-                .is_some_and(|sampler| CURATED.contains(&sampler))
-        {
-            return Err(gen_core::Error::Msg(
-                "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
-                    .into(),
-            ));
-        }
-        if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
-            return Err(gen_core::Error::Msg(
-                "wan: trim_first_frames is not supported with Reference/Keyframe conditioning"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn generate_with_execution_report(
+    fn generate_scoped(
         &self,
         req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        capture_wan_execution(self, req, on_progress, self.adapters.len())
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
@@ -1233,12 +1196,14 @@ impl Generator for WanGenerator {
                     release_warm_cache_for_staged(&self.components, || {
                         Ok(self.device.synchronize()?)
                     })?;
-                    pipe.render_sequential(req, on_progress)?
+                    pipe.render_sequential(req, scope, on_progress)?
                 }
-                OffloadPolicy::Resident => {
-                    let components = self.components(&pipe, needs_ti2v_encoder(req))?;
-                    pipe.render(req, &components, on_progress)?
-                }
+                OffloadPolicy::Resident => pipe.render(
+                    req,
+                    || self.components(&pipe, needs_ti2v_encoder(req)),
+                    scope,
+                    on_progress,
+                )?,
             };
             Ok(GenerationOutput::Video {
                 frames,
@@ -1246,6 +1211,221 @@ impl Generator for WanGenerator {
                 audio: None,
             })
         })
+    }
+
+    fn pipeline(&self) -> Pipeline {
+        Pipeline::load(
+            &self.root,
+            &self.device,
+            self.adapters.clone(),
+            self.dit_source.clone(),
+            self.checkpoint_facts.clone(),
+        )
+    }
+
+    fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
+        Ok(load_or_replace_cached_variant(
+            &self.components,
+            |components| components.vae_has_encoder != with_vae_encoder,
+            || Ok(self.device.synchronize()?),
+            || pipe.load_components(with_vae_encoder),
+        )?)
+    }
+
+    fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
+        i2v_memory_strategy::selected_offload_policy(self.offload, self.i2v_memory.is_some(), req)
+    }
+}
+
+fn needs_ti2v_encoder(req: &GenerationRequest) -> bool {
+    req.conditioning.iter().any(|conditioning| {
+        matches!(
+            conditioning,
+            Conditioning::Reference { .. } | Conditioning::Keyframe { .. }
+        )
+    })
+}
+
+pub(crate) fn capture_wan_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    loaded_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        // Dense folds and packed residual installs do not retain a byte-bound applied stack.
+        record_wan_adapters(loaded_adapter_count);
+    })
+}
+
+fn record_wan_adapters(count: usize) {
+    candle_gen::execution::unobserved_adapters(count, "candle-gen-wan/src/lib.rs or wan14b.rs");
+}
+
+fn validate_dense_request(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg("wan: prompt must not be empty".into()));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg("wan: steps must be >= 1".into()));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "wan: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    // sc-12308: the 5B carries an area budget too (upstream `ti2v-5B` supports only `1280*704` /
+    // `704*1280`), but this lane checked only the per-edge range and the multiple — so a
+    // grid-aligned 1280×1280 validated and ran to an opaque OOM, exactly the sc-9028 hole the
+    // 14B lane already closed. mlx's 5B did cap (it silently refit instead); rejecting here is
+    // what makes the two backends agree on one geometry per request.
+    let area = req.width as usize * req.height as usize;
+    if area > MAX_AREA_5B {
+        return Err(gen_core::Error::Msg(format!(
+            "wan: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_5B} px \
+                 (1280×704); reduce the resolution",
+            req.width, req.height
+        )));
+    }
+    if let Some(f) = req.frames {
+        if f == 0 || f % 4 != 1 {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: frames must satisfy frames % 4 == 1 (got {f})"
+            )));
+        }
+        if f as usize > MAX_WAN_FRAMES {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: frames {f} exceeds the maximum {MAX_WAN_FRAMES}"
+            )));
+        }
+    }
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::Reference { .. }))
+        .count();
+    let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: {label} strength must be finite and in [0,1] (got {strength})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(strength) = req.strength {
+        check_strength("image", strength)?;
+    }
+    for conditioning in &req.conditioning {
+        match conditioning {
+            Conditioning::Reference {
+                strength: Some(strength),
+                ..
+            } => check_strength("Reference", *strength)?,
+            Conditioning::Keyframe { strength, .. } => check_strength("Keyframe", *strength)?,
+            _ => {}
+        }
+    }
+    let image_conditioned = reference_count > 0 || !req.keyframes().is_empty();
+    if reference_count > 1 {
+        return Err(gen_core::Error::Msg(
+            "wan: TI2V accepts at most one Reference image".into(),
+        ));
+    }
+    if reference_count > 0 && !req.keyframes().is_empty() {
+        return Err(gen_core::Error::Msg(
+            "wan: Reference and Keyframe conditioning cannot be combined; express the first \
+                 frame as Keyframe frame_idx=0"
+                .into(),
+        ));
+    }
+    if !req.keyframes().is_empty() {
+        let frames = req.frames.unwrap_or(DEFAULT_FRAMES) as usize;
+        let t_lat = (frames - 1) / config::VAE_STRIDE_TEMPORAL as usize + 1;
+        for keyframe in req.keyframes() {
+            let index = if keyframe.frame_idx < 0 {
+                t_lat as i32 + keyframe.frame_idx
+            } else {
+                keyframe.frame_idx
+            };
+            if index < 0 || index as usize >= t_lat {
+                return Err(gen_core::Error::Msg(format!(
+                    "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
+                    keyframe.frame_idx
+                )));
+            }
+        }
+    }
+    if image_conditioned && curated_solver(req.sampler.as_deref()).is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
+                .into(),
+        ));
+    }
+    if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
+        return Err(gen_core::Error::Msg(
+            "wan: trim_first_frames is not supported with Reference/Keyframe conditioning".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl Generator for WanGenerator {
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        self.dit_source
+            .gguf_path()
+            .is_none()
+            .then_some(&self.load_binding)
+    }
+
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    /// The three correlated facts about the GGUF DiT this generator loaded (sc-11045 fix round,
+    /// BLOCKER 1): what the container stores (`gguf-container-v1`), that ggml blocks execute in
+    /// their stored packing on every host, and the measured receipt — published by the GGUF DiT
+    /// load (`gguf::load_wan_dit_gguf_publishing`). `None` on the snapshot
+    /// (dense/packed-tier) routes, which compile no plan, and before the lazy DiT has loaded.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.checkpoint_facts.facts()
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_dense_request(&self.descriptor, req)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_generation(self.descriptor(), req, on_progress, |progress| {
+            record_wan_adapters(self.adapters.len());
+            self.generate_scoped(req, scope, progress)
+                .map(gen_core::GenerationReport::from_output)
+        })
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_scoped(req, None, on_progress)
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -1409,6 +1589,7 @@ fn build_generator_with_source(
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
     Ok(WanGenerator {
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         descriptor: descriptor(),
         memory_strategy,
         memory_tier,
@@ -1434,6 +1615,10 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(TI2V_REGISTRATION)
+        .register_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: dense_video_layout,
+        })
         .register_generator(wan14b::T2V_14B_REGISTRATION)
         .register_generator(wan14b::I2V_14B_REGISTRATION)
         .register_generator(model_vace::VACE_REGISTRATION)
@@ -1751,6 +1936,212 @@ mod tests {
     use candle_gen::candle_core::safetensors as cst;
     use candle_gen::gen_core::ConditioningKind;
     use std::collections::HashMap;
+
+    #[test]
+    fn video_plan_candle_5b_streams_native_codec_and_preserves_native_aliases() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/no-weights".into()));
+        let registry = provider_registry().unwrap();
+        let mut req = GenerationRequest {
+            prompt: "video".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            steps: Some(2),
+            sampler: Some("heun".into()),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let phase = &plan.layout().phases[0];
+        assert_eq!(
+            (
+                phase.latent_frames,
+                phase.decoded_frames,
+                phase.decode_chunk_frames
+            ),
+            (3, 9, 4)
+        );
+        assert_eq!(phase.latent_bytes, 4 * 48 * 3 * 32 * 32);
+        let clip_rgb = 512 * 512 * 9 * 3;
+        assert_eq!(
+            phase.decoded_tensor_bytes,
+            clip_rgb * 29 + phase.latent_bytes
+        );
+        assert_eq!(
+            plan.minimum_decode_live_bytes(plan.layout().domain)
+                .unwrap(),
+            phase.decoded_tensor_bytes
+        );
+        assert!(registry
+            .compile_video_plan(config::MODEL_ID_I2V_14B, &spec, &req)
+            .unwrap()
+            .is_none());
+        req.sampler = Some("uni_pc".into());
+        assert!(registry
+            .compile_video_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .is_none());
+    }
+
+    fn assert_video_solver_matches_legacy(
+        req: &GenerationRequest,
+        phase: &VideoDenoisePhase<()>,
+        expected_evals: usize,
+    ) {
+        let x = Tensor::from_vec(vec![0.125f32, 1.], 2, &Device::Cpu).unwrap();
+        let cancel = CancelFlag::new();
+        let mut reference = Vec::new();
+        let legacy = candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            gen_core::sampling::TimestepConvention::Sigma,
+            &phase.sigmas,
+            x.clone(),
+            phase.seed,
+            &cancel,
+            &mut |_| {},
+            None,
+            |latent, sigma| {
+                reference.push(sigma.to_bits());
+                Ok(latent.affine(0.5, f64::from(sigma))?)
+            },
+        )
+        .unwrap();
+        let mut actual = Vec::new();
+        let output = candle_gen::sampler::run_video_flow_sampler(
+            phase,
+            Some(1.0),
+            x,
+            &cancel,
+            &mut |_| {},
+            |latent, sigma, ()| {
+                actual.push(sigma.to_bits());
+                Ok(latent.affine(0.5, f64::from(sigma))?)
+            },
+        )
+        .unwrap();
+        assert_eq!(reference, actual);
+        assert_eq!(
+            output.to_vec1::<f32>().unwrap(),
+            legacy.to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(actual.len(), expected_evals);
+    }
+
+    #[test]
+    fn curated_video_phase_preserves_guarded_first_sigma_for_high_shift_ddim() {
+        let req = GenerationRequest {
+            sampler: Some("ddim".into()),
+            scheduler_shift: Some(100_000.0),
+            steps: Some(50),
+            ..Default::default()
+        };
+        let phase = dense_curated_phase(&req, 37).unwrap().unwrap();
+        assert_eq!(phase.sigmas, scheduler::flow_sigmas(50, 100_000.0));
+        assert!(phase.sigmas[1] > phase.sigmas[0]);
+        assert!(phase.validate_descending_schedule(None).is_err());
+        assert_video_solver_matches_legacy(&req, &phase, 50);
+    }
+
+    #[test]
+    fn curated_video_phase_preserves_finite_first_sigma_above_one_for_small_shift_ddim() {
+        let req = GenerationRequest {
+            sampler: Some("ddim".into()),
+            scheduler_shift: Some(2.6e-16),
+            steps: Some(50),
+            ..Default::default()
+        };
+        let phase = dense_curated_phase(&req, 37).unwrap().unwrap();
+        assert!(phase.sigmas[0] > 1.0);
+        phase.validate_descending_schedule(None).unwrap();
+        assert_video_solver_matches_legacy(&req, &phase, 50);
+    }
+
+    #[test]
+    fn curated_video_phase_refusal_precedes_resident_component_load() {
+        use candle_gen::request_scope::{CandleRequestScopeConfig, CandleRequestScopeCore};
+        let req = GenerationRequest {
+            sampler: Some("heun".into()),
+            width: 192,
+            height: 128,
+            frames: Some(17),
+            ..Default::default()
+        };
+        let mut geometry = dense_curated_phase(&req, 0)
+            .unwrap()
+            .unwrap()
+            .identity
+            .geometry;
+        geometry.frames = 1;
+        let mut scope = CandleRequestScopeCore::new(
+            CandleRequestScopeConfig::new(
+                MODEL_ID,
+                Device::Cpu,
+                geometry,
+                None,
+                false,
+                1,
+                |_, _, _| Ok(()),
+            )
+            .unwrap(),
+        );
+        let pipe = tiny_pipeline(Path::new("."), vec![]);
+        let result = pipe.render(
+            &req,
+            || panic!("rejected scope must prevent component load or projection"),
+            Some(&mut scope),
+            &mut |_| panic!("rejected before preparation progress"),
+        );
+        assert!(matches!(result, Err(CandleError::Unsupported(_))));
+    }
+
+    #[test]
+    fn curated_video_phase_matches_the_legacy_dense_solver_and_rejects_mask_blends() {
+        let req = GenerationRequest {
+            sampler: Some("heun".into()),
+            frames: Some(17),
+            width: 192,
+            height: 128,
+            steps: Some(4),
+            scheduler_shift: Some(3.),
+            ..Default::default()
+        };
+        let phase = dense_curated_phase(&req, 37).unwrap().unwrap();
+        assert_eq!(phase.sigmas, scheduler::flow_sigmas(4, 3.));
+        assert_eq!(phase.latent_frames, 5);
+        assert_eq!(phase.identity.geometry.frames, 17);
+        assert_video_solver_matches_legacy(&req, &phase, 7);
+        for name in [
+            None,
+            Some("unipc"),
+            Some("uni_pc"),
+            Some("euler"),
+            Some("dpmpp_2m"),
+            Some("dpmpp2m"),
+        ] {
+            let native = GenerationRequest {
+                sampler: name.map(str::to_owned),
+                ..Default::default()
+            };
+            assert!(dense_curated_phase(&native, 37).unwrap().is_none());
+        }
+        let masked = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                },
+                strength: None,
+            }],
+            ..req
+        };
+        assert!(matches!(
+            dense_curated_phase(&masked, 37),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+    }
 
     struct AdapterReportFixture(ModelDescriptor);
 

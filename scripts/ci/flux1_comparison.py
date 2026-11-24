@@ -275,10 +275,10 @@ def retained_phase_limits(phase, policy):
     return limits
 
 
-def retain_logs(work, artifact, receipt):
+def retain_logs(work, artifact, receipt, phases=None):
     records = receipt["logs"]
     errors = []
-    for phase in phase_names(receipt["tier"]):
+    for phase in phase_names(receipt["tier"]) if phases is None else phases:
         limits = retained_phase_limits(phase, receipt["request"]["policy"])
         for suffix, cap in limits.items():
             source = work / phase / suffix
@@ -297,7 +297,8 @@ def retain_logs(work, artifact, receipt):
 
 
 def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, measure=False, last_child_start=None,
-           retain_windows_footprint=False):
+           arguments=(), capture_cuda_basis=False, dedicated_adapter=None, observer=None, retain_owned_completion=False,
+           completion_claim=None, retain_windows_footprint=False):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -307,20 +308,28 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
         env["SCENEWORKS_METAL_EXECUTION_LOCK_FD"] = fd
         fds = (int(fd),)
     stderr_path = out / "stderr.log"
+    cuda_probe = (PairCudaProbe(policy, out / "cuda-pool.json", dedicated_adapter=dedicated_adapter,
+                                retain_windows_footprint=retain_windows_footprint)
+                  if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
+    probe = cuda_probe if observer is None else observer(cuda_probe, policy)
     try:
         mode = ["--preflight"] if preflight else ["--measure"] if measure else []
-        cuda_probe = (PairCudaProbe(policy, out / "cuda-pool.json", retain_windows_footprint=retain_windows_footprint)
-                      if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
-        guard = run_guarded([str(binary), *mode],
+        guard = run_guarded([str(binary), *mode, *arguments],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
-                            probe=cuda_probe)
+                            probe=probe, retain_owned_completion=retain_owned_completion or completion_claim is not None,
+                            claim_deadline_monotonic=completion_claim["claim_deadline_monotonic"] if completion_claim is not None else None)
+        if completion_claim is not None:
+            completion_claim["owned_execution_completion"] = guard.owned_completion
     except SupervisionError as error:
+        if completion_claim is not None and isinstance(getattr(error, "owned_completion", None), dict):
+            completion_claim["owned_execution_completion"] = error.owned_completion
         proof.write_json(out / "supervisor.json", {
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
             "host_memory": error.watchdog_host_memory, "child_footprint": error.watchdog_child_footprint,
             "device_memory": error.watchdog_device_memory,
+            **({"fit_observation": probe.fit_observation()} if observer is not None else {}),
         }, owned=out.parent)
         # The supervisor can refuse before spawn. Preserve its reason whether or not
         # it created a log; a failing child may have filled its entire stderr budget.
@@ -336,7 +345,14 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
         if tail:
             print(proof.redact(tail, env), file=sys.stderr)
         raise
+    finally:
+        if probe is not None:
+            probe.close()
     summary = asdict(guard)
+    if observer is not None:
+        summary["fit_observation"] = probe.fit_observation()
+    if capture_cuda_basis and probe is not None:
+        summary["cuda_attribution"] = probe.measurement()
     if retain_windows_footprint:
         if cuda_probe is None:
             raise ValueError("retaining Windows CUDA host counters requires the supervised Windows route")
@@ -345,7 +361,7 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 
-def hardware(backend, policy):
+def hardware(backend, policy, *, pci_bus=False):
     if backend == "mlx":
         def sysctl(name):
             return subprocess.check_output(["/usr/sbin/sysctl", "-n", name], text=True, timeout=10).strip()
@@ -353,6 +369,8 @@ def hardware(backend, policy):
                 "os_build": sysctl("kern.osversion")}
     from scripts.media_campaign_windows import trusted_nvidia_smi
     fields = ["name", "uuid", "index", "memory.total", "driver_version"]
+    if pci_bus:
+        fields.append("pci.bus_id")
     command = [trusted_nvidia_smi(), "--id=" + policy.cuda_device_uuid, "--query-gpu=" + ",".join(fields),
                "--format=csv,noheader,nounits"]
     values = subprocess.check_output(command, text=True, timeout=15).strip().split(", ")

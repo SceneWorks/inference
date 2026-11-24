@@ -91,6 +91,13 @@ pub trait Generator {
         None
     }
 
+    /// Materialized weights owned by this exact loaded, planned video generator.
+    /// They remain live throughout the request. A caller can deduct them once from a
+    /// gross cold price when its committed snapshot already contains those same bytes.
+    fn video_plan_resident_weight_bytes(&self, _plan: &crate::VideoRenderPlan) -> Option<u64> {
+        None
+    }
+
     /// Snapshot retained base and optional reference components without opening weights. Call
     /// within the serialized cache transaction. Missing information grants no retained credit.
     fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
@@ -398,6 +405,66 @@ pub trait Generator {
         )
     }
 
+    /// Execute with the worker's already configured memory scope. Video providers that own
+    /// typed denoise phases borrow it for phase entry and exit. The caller owns final teardown.
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        _scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.generate_with_execution_report(req, on_progress)
+    }
+
+    /// Identity of the actual factory arguments for a migrated video provider.
+    fn video_load_binding(&self) -> Option<&crate::RenderLoadBinding> {
+        None
+    }
+
+    /// An existing provider-owned priceable structural evidence tier, if one covers this request.
+    fn video_memory_evidence_tier(
+        &self,
+        _plan: &crate::VideoRenderPlan,
+        _req: &GenerationRequest,
+    ) -> Result<Option<crate::MemoryNumericTier>> {
+        Ok(None)
+    }
+
+    /// Map a separately selected catalog evidence row onto its provider's structural request
+    /// identity, where applicable. A provider may withhold an unsupported evidence domain.
+    fn project_video_memory_context(
+        &self,
+        plan: &crate::VideoRenderPlan,
+        _req: &GenerationRequest,
+        context: &mut MemoryRunContext,
+    ) -> Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        Ok(plan.geometry() == context.geometry)
+    }
+
+    /// Compare facts retained at load with the compiled physical layout before allocating.
+    fn validate_video_plan(
+        &self,
+        plan: &crate::VideoRenderPlan,
+        _req: &GenerationRequest,
+    ) -> Result<()> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())
+    }
+
+    fn generate_video_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &crate::VideoRenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.run(req, self.memory_strategy_contract(), scope, |scope| {
+            self.validate_video_plan(plan, req)?;
+            self.generate_with_scoped_execution_report(req, Some(scope), on_progress)
+        })
+    }
+
     /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
     /// (path **B**) of the stateless [`Conditioning::ConversationHistory`] carrier (path **A**). A
     /// context-aware conversational TTS model (e.g. MOSS-TTS-Realtime, a voice-agent foundation model)
@@ -435,7 +502,7 @@ pub trait Generator {
     }
 }
 
-pub(super) fn requires_memory_request_scope(contract: &MemoryProviderContract) -> bool {
+pub(crate) fn requires_memory_request_scope(contract: &MemoryProviderContract) -> bool {
     contract.strategies.iter().any(|capability| {
         capability.strategy.is_optimized()
             && matches!(

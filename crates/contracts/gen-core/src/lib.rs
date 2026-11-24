@@ -112,6 +112,10 @@ pub mod numeric;
 pub mod phase;
 pub mod registry;
 pub mod render;
+pub use render::video_plan::{
+    VideoOutputConversion, VideoPackedComponent, VideoPhaseLayout, VideoPlanLayout,
+    VideoPlanRegistration, VideoReferenceLayout, VideoRenderPlan,
+};
 pub use render::{
     MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,
     RenderPlanRegistration, RenderRun, RenderStage,

@@ -412,3 +412,94 @@ fn carry_refuses_stochastic_variant_change() {
         .is_err());
     assert_eq!(state.next_step(), 1);
 }
+
+/// Mock Wan's two experts on the same absolute trajectory, including the SDE midpoint crossing.
+/// Compare evaluations, the solver's observed history, all draw indices and final FP32 bits.
+#[test]
+fn video_slots_follow_every_evaluation_with_legacy_history_and_draws() {
+    use crate::render::video::{VideoModelCoordinate, VideoModelRule};
+    use crate::MoeExpert::{High, Low};
+
+    let sigmas = [0.99, 0.61, 0.52, 0.27, 0.0];
+    let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+    let rule = VideoModelRule::AtOrAbove {
+        coordinate: VideoModelCoordinate::TruncatedTimestep {
+            num_train_timesteps: 1000,
+        },
+        threshold: 875.,
+        high: High,
+        low: Low,
+    };
+    assert_eq!(rule.slot(0.875), High);
+    assert_eq!(rule.slot(0.87499), Low);
+    for solver in [
+        Solver::Ddim,
+        Solver::EulerAncestral,
+        Solver::Heun,
+        Solver::DpmppSde,
+        Solver::Dpmpp2m,
+    ] {
+        let run = |legacy: bool| {
+            let ops = ObservedOps::default();
+            let mut slots = Vec::new();
+            let mut predict = |x: &Vec<f32>, sigma: f32| {
+                let t = (sigma * 1000.).trunc();
+                let slot = if legacy {
+                    if t >= 875. {
+                        High
+                    } else {
+                        Low
+                    }
+                } else {
+                    rule.slot(sigma)
+                };
+                slots.push((sigma.to_bits(), slot));
+                // Distinct branch guidance, shared channel-concatenated reference.
+                let guide = match slot {
+                    High => 3.5,
+                    Low => 5.,
+                };
+                let reference = 0.125;
+                denoise(&ops, x, sigma).map(|c| {
+                    c.into_iter()
+                        .map(|v| reference + guide * (v - reference))
+                        .collect()
+                })
+            };
+            let sampler = solver.boxed::<ObservedOps>();
+            let seed = u64::MAX - 5;
+            let output = if legacy {
+                sampler.sample(&ops, &ms, &mut predict, initial(), &sigmas, seed)
+            } else {
+                let mut state = SolverRunState::new(solver, &sigmas);
+                sampler.sample_span(
+                    &ops,
+                    &ms,
+                    &mut predict,
+                    initial(),
+                    &sigmas,
+                    seed,
+                    0..sigmas.len() - 1,
+                    &mut state,
+                )
+            }
+            .unwrap();
+            (
+                slots,
+                ops.0.into_inner(),
+                output.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            )
+        };
+        let (slots, trace, output) = run(false);
+        assert_eq!(run(true), (slots.clone(), trace, output), "{solver:?}");
+        assert_eq!((slots[0].1, slots[1].1), (High, Low));
+        if solver == Solver::DpmppSde {
+            let midpoint = f32::from_bits(slots[1].0);
+            assert!(sigmas[1] < midpoint && midpoint < sigmas[0]);
+        }
+        if solver == Solver::Heun {
+            assert_eq!(slots[1].0, sigmas[1].to_bits());
+            assert_eq!(slots[1], slots[2]);
+        }
+    }
+}

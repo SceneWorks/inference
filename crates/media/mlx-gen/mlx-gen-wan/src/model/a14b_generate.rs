@@ -6,6 +6,7 @@ impl Wan14b {
     fn generate_execution_attempt(
         &self,
         request: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
@@ -15,20 +16,77 @@ impl Wan14b {
             self.descriptor.id,
             || mlx_gen::sc20686::RequestFacts::from_request(request),
             on_progress,
-            |on_progress| self.generate_impl(request, on_progress),
+            |on_progress| self.generate_impl(request, scope, on_progress),
         )
         .map_err(Into::into)
     }
 }
 
 impl Generator for Wan14b {
+    fn video_load_binding(&self) -> Option<&mlx_gen::gen_core::RenderLoadBinding> {
+        self.load_binding.as_ref()
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<()> {
+        if &video_layout(&self.descriptor, &self.config, req, self.quant)? != plan.layout() {
+            return Err(mlx_gen::gen_core::Error::Unsupported(
+                "loaded Wan geometry differs from admission".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        Ok(self.i2v_memory.as_ref().and_then(|p| {
+            gen_core_memory_wan::validate_request(p, req)
+                .is_ok()
+                .then_some(p.tier)
+        }))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &mlx_gen::gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        ctx: &mut mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<bool> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        plan.check_inputs(req)?;
+        if plan.geometry() != ctx.geometry {
+            return Ok(false);
+        }
+        match &self.i2v_memory {
+            Some(p) => gen_core_memory_wan::project_video_context(p, req, ctx),
+            None => Ok(true),
+        }
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -56,7 +114,7 @@ impl Generator for Wan14b {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(request, on_progress)
+            self.generate_execution_attempt(request, None, on_progress)
         })
     }
 
@@ -101,12 +159,20 @@ impl Wan14b {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
     /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     pub(super) fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        let id = self.descriptor.id;
+        Self::validate_metadata(&self.descriptor, &self.config, req)
+    }
+
+    pub(super) fn validate_metadata(
+        descriptor: &ModelDescriptor,
+        config: &WanModelConfig,
+        req: &GenerationRequest,
+    ) -> Result<()> {
+        let id = descriptor.id;
         // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 16 is
         // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
         // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (none for T2V, `Reference`
         // for I2V).
-        self.descriptor.capabilities.validate_request(id, req)?;
+        descriptor.capabilities.validate_request(id, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -125,13 +191,13 @@ impl Wan14b {
         // sc-12607: the 16-px grid stride (candle rejects via `is_multiple_of(SIZE_MULTIPLE_14B)`).
         // sc-12308: the area cap (T2V was uncapped entirely; I2V refit 1280×720 → 1264×704). Both A14B
         // variants share the 14B family's 921 600 budget.
-        let (dw, dh) = grid(&self.config, A14bProviderVae::VAE_TILING);
+        let (dw, dh) = grid(config, A14bProviderVae::VAE_TILING);
         reject_off_grid(id, req, dw, dh)?;
-        reject_over_area(id, req, dw, dh, self.config.max_area)?;
+        reject_over_area(id, req, dw, dh, config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
         // extended noise length would mismatch the conditioning's temporal dim).
-        if self.config.is_i2v_concat() {
+        if config.is_i2v_concat() {
             let Some((_, strength)) = i2v_reference(req) else {
                 return Err(Error::Msg(format!(
                     "{id}: image-to-video requires a Reference conditioning image"
@@ -173,6 +239,7 @@ impl Wan14b {
     pub(super) fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Reject anything outside the advertised surface before doing expensive work — in particular
@@ -201,22 +268,19 @@ impl Wan14b {
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
         // byte-identical pre-swap path (both experts co-resident, no per-stage `clear_cache`).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || crate::i2v_memory_strategy::staged(req);
+        let offload = crate::i2v_memory_strategy::effective_offload(self.offload_policy, req);
+        let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
-        let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
-        // trim_first_frames: generate `trim` extra leading temporal chunks (each = vae_stride_t = 4
-        // latent frames → 4 output frames after the non-causal T→4T decode) and discard them after
-        // decode, so the first kept frame sees a full temporal receptive field (port of
-        // generate_wan.py). gen_frames stays 1+4k since frames is and we add a multiple of 4.
-        let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let vae_stride = provider_vae_stride(A14bProviderVae::VAE_TILING);
-        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim * vae_stride.0;
-        // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid, then
-        // enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280; no-op for T2V's max_area 0).
-        let (width, height) = resolve_capped_dims(req, cfg, A14bProviderVae::VAE_TILING);
+        let vae = A14bProviderVae::VAE_TILING;
+        let VideoDimensions {
+            frames,
+            trim_out,
+            width,
+            height,
+            lat,
+        } = video_dimensions(req, cfg, vae)?;
+        let vae_stride = provider_vae_stride(vae);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
@@ -232,7 +296,6 @@ impl Wan14b {
 
         // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
         // generation length.
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12736/sc-12795: every `Sequential` route keeps only ONE expert resident; `Resident`
@@ -259,7 +322,7 @@ impl Wan14b {
         preflight_denoise_memory_guard(
             self.descriptor.id,
             wan14b_denoise_resident_bytes(
-                self.offload_policy,
+                offload,
                 req.sampler.as_deref(),
                 low_bytes.saturating_add(low_adapter_bytes),
                 high_bytes.saturating_add(high_adapter_bytes),
@@ -330,20 +393,39 @@ impl Wan14b {
         // --- Stage 2: dual-expert MoE denoise (→ freed). Under `Sequential`, native solvers swap at
         // the step boundary and curated solvers at the exact model-evaluation boundary; both keep one
         // expert resident. `Resident` keeps both experts for byte-identical legacy behavior. ---
-        let latents = if sequential && is_wan_curated(req.sampler.as_deref()) {
-            let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
+        let curated = req
+            .sampler
+            .as_deref()
+            .filter(|name| is_wan_curated(Some(name)))
+            .map(|name| {
+                crate::pipeline::curated_phase(
+                    name,
+                    crate::scheduler::compute_sigmas(steps, shift, cfg.num_train_timesteps),
+                    seed,
+                    &lat,
+                    A14bProviderVae::VAE_TILING,
+                    u32::from(y.is_some()),
+                    crate::pipeline::wan_expert_rule(
+                        cfg.num_train_timesteps,
+                        cfg.boundary * cfg.num_train_timesteps as f32,
+                    ),
+                )
+            })
+            .transpose()?;
+        let active = curated
+            .as_ref()
+            .map(|phase| phase.enter(&req.cancel, scope))
+            .transpose()?;
+        let latents = if let (true, Some(phase)) = (sequential, curated.as_ref()) {
             let low_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
             let high_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
             on_progress(Progress::Loading(LoadPhase::Renderer));
             let latents = denoise_moe_curated_swapped(
-                boundary_timestep,
+                phase,
                 req.sampler.as_deref().expect("curated sampler"),
                 cfg.num_train_timesteps,
-                steps,
-                shift,
                 &init_noise,
                 y.as_ref(),
-                seed,
                 &req.cancel,
                 on_progress,
                 |high| {
@@ -356,6 +438,9 @@ impl Wan14b {
                         MoeExpert::Low
                     };
                     let (dit, report) = self.build_expert_staged(which)?;
+                    if req.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     let cond = dit.embed_text(&context)?;
                     let uncond = Some(dit.embed_text(&context_null)?);
                     if high {
@@ -443,18 +528,15 @@ impl Wan14b {
             // `denoise_moe_curated` (the boundary expert swap happens inside its predict closure); the
             // native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). Works for both T2V (`y = None`)
             // and I2V (`y = Some` channel-concat conditioning).
-            if is_wan_curated(req.sampler.as_deref()) {
-                denoise_moe_curated(
+            if let Some(phase) = &curated {
+                crate::pipeline::denoise_moe_curated_prepared(
                     &low,
                     &high,
-                    boundary_timestep,
-                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                    phase,
+                    req.sampler.as_deref().expect("curated sampler"),
                     cfg.num_train_timesteps,
-                    steps,
-                    shift,
                     &init_noise,
                     y.as_ref(),
-                    seed,
                     &req.cancel,
                     on_progress,
                 )?
@@ -480,6 +562,11 @@ impl Wan14b {
                 )?
             }
         };
+
+        if let Some(active) = active {
+            drop((context, context_null, init_noise, y));
+            active.finish()?;
+        }
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);

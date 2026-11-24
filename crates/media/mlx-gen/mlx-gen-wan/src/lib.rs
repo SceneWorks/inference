@@ -402,7 +402,7 @@ pub use vae22::Wan22Vae;
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
+    let registry = model::register_video_plans(registry)
         .register_generator(model::TI2V_REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)

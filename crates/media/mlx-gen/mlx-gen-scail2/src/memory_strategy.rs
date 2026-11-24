@@ -1136,7 +1136,7 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
     };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mlx_gen::{Conditioning, GenerationRequest, Image, ReplacementMode};
 
@@ -1363,7 +1363,7 @@ mod tests {
         }
     }
 
-    fn request(mode: &str, width: u32, height: u32, frames: u32) -> GenerationRequest {
+    pub(crate) fn request(mode: &str, width: u32, height: u32, frames: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "dance".to_owned(),
             width,
@@ -1460,7 +1460,7 @@ mod tests {
         .unwrap();
     }
 
-    fn fixture_spec(
+    pub(crate) fn fixture_spec(
         tier: &str,
         adapter_shape: Option<(&str, AdapterKind)>,
     ) -> (tempfile::TempDir, LoadSpec) {
@@ -1610,7 +1610,7 @@ mod tests {
         assert!(base_prepared.ensure_unchanged(&base_spec.adapters).is_err());
     }
 
-    fn admitted_context(
+    pub(crate) fn admitted_context(
         prepared: &PreparedMemory,
         request: &GenerationRequest,
         cache_state: gen_core::MemoryCacheState,

@@ -1,0 +1,255 @@
+@WAN_PAIR_COMMON@
+
+const SAMPLER: &str = "heun";
+
+use crate::config::WanModelConfig;
+use crate::pipeline::{denoise_curated, denoise_moe_curated, denoise_moe_curated_swapped, Expert};
+use crate::transformer::WanTransformer;
+use mlx_gen::{ios_quantum, weights::Weights, CancelFlag, Progress};
+use mlx_rs::{random, transforms::eval, Array, DeviceType, Stream};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+struct Prepared {
+    dit: WanTransformer,
+    positive: Array,
+    negative: Array,
+    guidance: f32,
+}
+
+impl Prepared {
+    fn load(
+        root: &Path,
+        file: &str,
+        cfg: &WanModelConfig,
+        inputs: &Weights,
+        guidance: f32,
+    ) -> mlx_gen::Result<Self> {
+        let dit = WanTransformer::from_weights(&Weights::from_file(root.join(file))?, cfg)?;
+        let positive = dit.embed_text(inputs.require("positive")?)?;
+        let negative = dit.embed_text(inputs.require("negative")?)?;
+        eval([&positive, &negative])?;
+        assert_eq!(positive.dtype(), mlx_rs::Dtype::Bfloat16);
+        assert_eq!(negative.dtype(), mlx_rs::Dtype::Bfloat16);
+        Ok(Self {
+            dit,
+            positive,
+            negative,
+            guidance,
+        })
+    }
+
+    fn expert(&self) -> Expert<'_> {
+        Expert {
+            transformer: &self.dit,
+            ctx_cond: self.positive.clone(),
+            ctx_uncond: Some(self.negative.clone()),
+            guidance: self.guidance,
+        }
+    }
+}
+
+struct Listener;
+impl Drop for Listener {
+    fn drop(&mut self) {
+        ios_quantum::set_quantum_listener(None);
+    }
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env("wan_pair_fixture::curated_tier1", "WAN_PAIR")?;
+    let mut cfg = match pair.case.as_str() {
+        "mlx-a14b-t2v-resident-heun" => WanModelConfig::wan22_t2v_14b(),
+        "mlx-a14b-i2v-resident-heun" | "mlx-a14b-i2v-swapped-heun" => {
+            WanModelConfig::wan22_i2v_14b()
+        }
+        "mlx-ti2v5b-t2v-heun" => WanModelConfig::wan22_ti2v_5b(),
+        _ => return Err("unknown MLX case".into()),
+    };
+    let stream = Stream::task_local_or_default();
+    assert!(matches!(stream.get_device()?.get_type()?, DeviceType::Gpu));
+    crate::model_inference_device::record_model_inference_device();
+    cfg.num_layers = 1;
+    let inputs = Weights::from_file(pair.root.join("inputs.safetensors"))?;
+    let shape = [cfg.out_dim as i32, 2, 4, 6];
+    let noise = random::normal::<f32>(&shape[..], None, None, Some(&random::key(SEED)?))?;
+    let y = if cfg.is_i2v_concat() {
+        Some(inputs.require("y")?.clone())
+    } else {
+        None
+    };
+    eval([&noise])?;
+    if let Some(condition) = &y {
+        eval([condition])?;
+    }
+    let swapped = pair.case == "mlx-a14b-i2v-swapped-heun";
+    let (low_cfg, high_cfg) = cfg.sample_guide_scale.resolve_dual(None);
+    let load = |high| {
+        let (file, guidance) = if !cfg.dual_model {
+            ("model.safetensors", cfg.sample_guide_scale.effective())
+        } else if high {
+            ("high_noise_model.safetensors", high_cfg)
+        } else {
+            ("low_noise_model.safetensors", low_cfg)
+        };
+        Prepared::load(&pair.root, file, &cfg, &inputs, guidance)
+    };
+    // For resident routes, load and project once just as the serving caller does.
+    // Sequential reloads/projections happen inside the shipping sampler at the swap.
+    let low = (!swapped).then(|| load(false)).transpose()?;
+    let high = (cfg.dual_model && !swapped)
+        .then(|| load(true))
+        .transpose()?;
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&trace);
+    assert!(!ios_quantum::set_quantum_listener(Some(Box::new(
+        move |mark| {
+            if let ios_quantum::QuantumMark::Metadata {
+                provider: "curated",
+                kind: "callback_evaluated",
+                fields,
+            } = mark
+            {
+                let field = |key| fields.iter().find(|entry| entry.0 == key).unwrap().1;
+                observed.lock().unwrap().push(json!({"event":"evaluate",
+                "evaluation":field("completed_predict_evaluations"),"sigma_bits":field("sigma_bits")}));
+            }
+        }
+    ))));
+    let _listener = Listener;
+    let cancel = CancelFlag::new();
+    let nt = cfg.num_train_timesteps;
+    let boundary = cfg.boundary * nt as f32;
+    // Keep the allocator’s lifetime high-water, including resident weight preparation.
+    let settings = json!({
+        "sampler":SAMPLER,"seed":SEED,"steps":STEPS,"shift":cfg.sample_shift,
+        "guidance":if cfg.dual_model { vec![low_cfg, high_cfg] } else { vec![cfg.sample_guide_scale.effective()] },
+        "denoiser_dtype":"BF16","latent_dtype":"F32","latent_shape":noise.shape(),
+        "patch":cfg.patch_size,"model_width":cfg.dim,"heads":cfg.num_heads,"depth":cfg.num_layers,
+        "reference_channels":y.as_ref().map_or(0, |condition| condition.shape()[0]),
+        "boundary_timestep":cfg.dual_model.then_some(boundary as u32),
+        "render_width":shape[3] as usize * cfg.vae_stride.2,"render_height":shape[2] as usize * cfg.vae_stride.1,
+        "frames":1 + (shape[1] as usize - 1) * cfg.vae_stride.0,
+        "text_shape":inputs.require("positive")?.shape(),"residency":if swapped { "swapped" } else { "resident" }
+    });
+    let initial = mlx_gen::array::contiguous(&noise)?
+        .as_slice::<f32>()
+        .to_vec();
+    pair.measure(
+        initial,
+        settings,
+        || {
+            trace.lock().unwrap().clear();
+            let mut progress = |event| {
+                if let Progress::Step { current, total } = event {
+                    trace.lock().unwrap().push(step(current, total));
+                }
+            };
+            stream.synchronize_and_retire()?;
+            let start = Instant::now();
+            let latent = if swapped {
+                // Only the private call spelling differs between revisions. The
+                // candidate receives its production phase declaration from the
+                // same schedule and threshold as the legacy private API.
+                macro_rules! swapped {
+                    (base, $loader:expr) => {
+                        denoise_moe_curated_swapped(
+                            boundary,
+                            SAMPLER,
+                            nt,
+                            STEPS,
+                            cfg.sample_shift,
+                            &noise,
+                            y.as_ref(),
+                            SEED,
+                            &cancel,
+                            &mut progress,
+                            $loader,
+                        )
+                    };
+                    (head, $loader:expr) => {{
+                        let phase = crate::pipeline::curated_phase(
+                            SAMPLER,
+                            crate::scheduler::compute_sigmas(STEPS, cfg.sample_shift, nt),
+                            SEED,
+                            noise.shape(),
+                            crate::vae::WanVae::VAE_TILING,
+                            u32::from(y.is_some()),
+                            crate::pipeline::wan_expert_rule(nt, boundary),
+                        )?;
+                        denoise_moe_curated_swapped(
+                            &phase,
+                            SAMPLER,
+                            nt,
+                            &noise,
+                            y.as_ref(),
+                            &cancel,
+                            &mut progress,
+                            $loader,
+                        )
+                    }};
+                }
+                swapped!(@WAN_MLX_SWAP_ARM@, |high| {
+                    let e = load(high)?;
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(json!({"event":"load_expert","high":high}));
+                    Ok((e.dit, e.positive, Some(e.negative), e.guidance))
+                })?
+            } else if let Some(h) = &high {
+                denoise_moe_curated(
+                    &low.as_ref().unwrap().expert(),
+                    &h.expert(),
+                    boundary,
+                    SAMPLER,
+                    nt,
+                    STEPS,
+                    cfg.sample_shift,
+                    &noise,
+                    y.as_ref(),
+                    SEED,
+                    &cancel,
+                    &mut progress,
+                )?
+            } else {
+                let e = low.as_ref().unwrap();
+                denoise_curated(
+                    &e.dit,
+                    SAMPLER,
+                    nt,
+                    STEPS,
+                    cfg.sample_shift,
+                    e.guidance,
+                    &e.positive,
+                    Some(&e.negative),
+                    &noise,
+                    SEED,
+                    &cancel,
+                    &mut progress,
+                )?
+            };
+            eval([&latent])?;
+            stream.synchronize_and_retire()?;
+            let elapsed = start.elapsed().as_nanos().try_into()?;
+            assert_eq!(latent.shape(), &shape);
+            // MLX may return a strided view. Serialize logical C/F/H/W order.
+            let values = mlx_gen::array::contiguous(&latent)?
+                .as_slice::<f32>()
+                .to_vec();
+            Ok((
+                elapsed,
+                trace.lock().unwrap().clone(),
+                shape.map(|x| x as usize).to_vec(),
+                values,
+            ))
+        },
+        || Ok(mlx_rs::memory::get_peak_memory() as u64),
+    )?;
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED wan_pair_fixture::curated_tier1");
+    Ok(())
+}

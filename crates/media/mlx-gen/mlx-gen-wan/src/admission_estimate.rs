@@ -281,6 +281,24 @@ mod tests {
         assert_eq!(priced.dit_resident_bytes, 8_377_000_000);
         let resident = estimate(MODEL_ID_T2V_14B, &root, OffloadPolicy::Resident, &req);
         assert_eq!(resident.dit_resident_bytes, 2 * 8_377_000_000);
+        let staged_request = GenerationRequest {
+            sampler: Some("heun".into()),
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..req
+        };
+        assert_eq!(
+            estimate(
+                MODEL_ID_T2V_14B,
+                &root,
+                OffloadPolicy::Resident,
+                &staged_request
+            )
+            .dit_resident_bytes,
+            priced.dit_resident_bytes
+        );
         // The provider's own decode/activation pricing, not a re-derivation.
         assert_eq!(
             priced.decode_working_set_bytes,
@@ -413,6 +431,18 @@ mod tests {
         assert!(
             priced.dit_resident_bytes < expert,
             "the packed expert is resident"
+        );
+        let admitted = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..req
+        };
+        assert_eq!(
+            estimate(MODEL_ID_VACE_FUN, &root, OffloadPolicy::Resident, &admitted)
+                .dit_resident_bytes,
+            priced.dit_resident_bytes
         );
         let load = priced.phases()[1];
         assert_eq!(load.0, "load");

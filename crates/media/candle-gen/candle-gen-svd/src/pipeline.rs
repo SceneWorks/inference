@@ -6,6 +6,7 @@
 //! Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::gen_core::render::video::VideoDenoisePhase;
 use candle_gen::gen_core::sampling::EdmModelSampling;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{check_cancel, CandleError, Result as CResult};
@@ -173,10 +174,54 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
-    let device = latents.device().clone();
-    let sched = EdmSchedule::karras(steps, scheduler);
-    let ms = EdmModelSampling::svd();
+    let schedule = EdmSchedule::karras(steps, scheduler);
+    let phase = video_phase(latents.dims5()?, sampler, schedule.sigmas, seed)?;
+    phase.run(cancel, None, || {
+        denoise_phase(
+            &phase,
+            latents,
+            image_embeds,
+            image_latents,
+            num_frames,
+            min_g,
+            max_g,
+            cancel,
+            on_progress,
+            |input, time, embeds| {
+                Ok(unet.forward(input, time, embeds, added_time_ids, num_frames)?)
+            },
+        )
+    })
+}
 
+pub(crate) fn video_phase(
+    shape: (usize, usize, usize, usize, usize),
+    sampler: Option<&str>,
+    sigmas: Vec<f32>,
+    seed: u64,
+) -> CResult<VideoDenoisePhase<(), Option<&str>>> {
+    let (batch, frames, _, height, width) = shape;
+    Ok(gen_core_family::svd::phase(
+        [batch as u32, frames as u32, height as u32, width as u32],
+        sampler,
+        sigmas,
+        seed,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_phase(
+    phase: &VideoDenoisePhase<(), Option<&str>>,
+    latents: &Tensor,
+    image_embeds: &Tensor,
+    image_latents: &Tensor,
+    num_frames: usize,
+    min_g: f32,
+    max_g: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut forward: impl FnMut(&Tensor, f32, &Tensor) -> CResult<Tensor>,
+) -> CResult<Tensor> {
     // Whether classifier-free guidance is active. SVD ramps the guidance per frame via
     // `linspace(min, max, F)`, so the diffusers `do_classifier_free_guidance` gate is `max > 1.0`:
     // when the max is 1.0 every per-frame scale is ≤ 1.0 and the blend `uncond + g·(cond − uncond)`
@@ -190,22 +235,24 @@ pub fn denoise(
     let cfg_inputs = if cfg_active {
         let zeros_e = image_embeds.zeros_like()?;
         let zeros_l = image_latents.zeros_like()?;
-        let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
+        let guidance = guidance_schedule(num_frames, min_g, max_g, latents.device())?;
         Some((zeros_e, zeros_l, guidance))
     } else {
         None
     };
 
     candle_gen::run_curated_sampler(
-        sampler,
-        &ms,
-        &sched.sigmas,
+        phase.solver,
+        &EdmModelSampling::svd(),
+        &phase.sigmas,
         latents.clone(),
-        seed,
+        phase.seed,
         cancel,
         on_progress,
         None,
         |x_in, t| -> CResult<Tensor> {
+            // The sampler reports progress immediately before this predictor. A callback can cancel.
+            check_cancel(cancel)?;
             // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
             // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.
             match &cfg_inputs {
@@ -217,14 +264,14 @@ pub fn denoise(
                     zeros_e,
                     guidance,
                     cancel,
-                    |inp, embeds| Ok(unet.forward(inp, t, embeds, added_time_ids, num_frames)?),
+                    |inp, embeds| forward(inp, t, embeds),
                 ),
                 // Guidance disabled (max ≤ 1.0): single-batch cond-only forward. The CFG blend at
                 // scale 1.0 is exactly `cond`, so this returns the same velocity the 2-batch path
                 // would — at half the UNet compute.
                 None => {
                     let inp = Tensor::cat(&[x_in, image_latents], 2)?; // [1, F, 8, h, w]
-                    Ok(unet.forward(&inp, t, image_embeds, added_time_ids, num_frames)?)
+                    forward(&inp, t, image_embeds)
                     // [1,F,4,h,w]
                 }
             }
@@ -351,7 +398,77 @@ pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::MemoryGeometry;
     use std::cell::Cell;
+
+    #[test]
+    fn phase_uses_uncompressed_frames_and_the_output_pixel_grid() {
+        let latents = Tensor::zeros(
+            (1, 5, 4, 2, 3),
+            candle_gen::candle_core::DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let phase = video_phase(
+            latents.dims5().unwrap(),
+            Some("heun"),
+            vec![700., 0.002, 0.],
+            41,
+        )
+        .unwrap();
+        assert_eq!(phase.latent_frames, 5);
+        assert_eq!(
+            phase.identity.geometry,
+            MemoryGeometry {
+                batch: 1,
+                frames: 5,
+                width: 24,
+                height: 16,
+                reference_count: 1
+            }
+        );
+        assert_eq!(phase.seed, 41);
+        assert_eq!(phase.sigmas, [700., 0.002, 0.]);
+        assert_eq!(phase.solver, Some("heun"));
+    }
+
+    #[test]
+    fn cancel_from_first_step_stops_cond_only_forward() {
+        let x = Tensor::zeros(
+            (1, 2, 4, 1, 1),
+            candle_gen::candle_core::DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let embeds = Tensor::zeros((1, 1, 2), x.dtype(), x.device()).unwrap();
+        let phase = video_phase(x.dims5().unwrap(), None, vec![2., 0.], 4).unwrap();
+        let cancel = CancelFlag::new();
+        let calls = Cell::new(0);
+        let mut steps = Vec::new();
+        let result = denoise_phase(
+            &phase,
+            &x,
+            &embeds,
+            &x,
+            2,
+            1.,
+            1.,
+            &cancel,
+            &mut |event| {
+                if let Progress::Step { current, total } = event {
+                    steps.push((current, total));
+                    cancel.cancel();
+                }
+            },
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(x.clone())
+            },
+        );
+        assert_eq!(steps, [(1, 1)]);
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(calls.get(), 0);
+    }
 
     /// sc-8993 (F-013): when guidance is disabled every per-frame scale is `1.0`, and the CFG blend
     /// `uncond + g·(cond − uncond)` with `g == 1.0` is exactly `cond` for ANY uncond. This is the

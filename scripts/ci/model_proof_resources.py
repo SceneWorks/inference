@@ -30,9 +30,13 @@ RELEASE_SAMPLING_SECONDS = 5 * (RELEASE_QUERY_SECONDS * RELEASE_QUERY_ATTEMPTS +
 
 
 class CudaClaimRejected(ValueError):
-    def __init__(self, diagnostic: dict):
-        super().__init__('claimed CUDA UUID is absent or occupied; no model execution')
+    def __init__(self, diagnostic: dict, message='claimed CUDA UUID is absent or occupied; no model execution'):
+        super().__init__(message)
         self.diagnostic = diagnostic
+
+
+class _AdmissionInventoryTimeout(TimeoutError):
+    """The selected GPU query exceeded its bounded five-sample admission window."""
 
 
 class CudaReleaseRejected(ValueError):
@@ -84,6 +88,14 @@ def proof_cuda_shared_release(device: dict, uuid: str, physical_index: int, tota
             and all(type(value) is int for value in (total, used, free))
             and total == total_mib and total > 0 and 0 <= used <= total
             and 0 <= free <= total and used + free <= total + 2)
+
+
+def _valid_shared_admission_card(device: dict, uuid: str, physical_index: int, total_mib: int) -> bool:
+    # The selected inventory reader maps an explicit [N/A] to None.
+    utilization = device.get('utilization_percent')
+    return (proof_cuda_shared_release(device, uuid, physical_index, total_mib)
+            and 'utilization_percent' in device
+            and (utilization is None or type(utilization) is int and 0 <= utilization <= 100))
 
 
 def shared_owned_completion(record: dict) -> bool:
@@ -220,7 +232,7 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
 
 
 def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: int, policy, baseline: dict,
-                           *, activity_profile: str = STRICT_CUDA_ACTIVITY) -> dict:
+                           *, activity_profile: str = STRICT_CUDA_ACTIVITY, allow_empty: bool = False) -> dict:
     """Retain only bounded predicates from samples already collected by the guard."""
     path = output / f'{phase}-samples.json'
     try:
@@ -231,7 +243,7 @@ def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: 
         if len(raw) > 512 * 1024:
             return {'status': 'missing-or-over-budget'}
         samples = json.loads(raw.decode('utf-8'))
-        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+        if not isinstance(samples, list) or not (0 if allow_empty else 1) <= len(samples) <= 5:
             raise ValueError('invalid release sample count')
         facts = []
         for sample in samples:
@@ -445,10 +457,17 @@ WAIT_NOTICE_SECONDS = 60
 
 
 def _wait_notice(observation: dict, reason: str) -> None:
-    """Print the current refusal reason to the job log at most once per minute; never wait silently."""
+    """Log every refusal: a new kind of reason at once, a repeated one at most once per minute.
+
+    Numbers inside a reason (free MiB, utilization percent) do not make it a new kind, so a
+    steady refusal cannot flood the log, and a wait is never silent.
+    """
     now = time.monotonic()
-    if now - observation.get('_last_notice', float('-inf')) >= WAIT_NOTICE_SECONDS:
+    kind = re.sub(r'\d+', 'N', reason)
+    if (kind != observation.get('_last_kind')
+            or now - observation.get('_last_notice', float('-inf')) >= WAIT_NOTICE_SECONDS):
         observation['_last_notice'] = now
+        observation['_last_kind'] = kind
         print('CUDA admission waiting: ' + reason, file=sys.stderr, flush=True)
 
 
@@ -467,6 +486,20 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
                 'admission_wait': dict(observation)})
         try:
             devices, processes = reader(output, 'model-proof-claimed-device', deadline)
+        except (subprocess.TimeoutExpired, TimeoutError) as error:
+            # A slow driver query is an inventory failure, not a refusal: log it and retry within
+            # the claim deadline. Every other inventory error still refuses at once.
+            observation['inventory_timeouts'] = observation.get('inventory_timeouts', 0) + 1
+            observation['last_inventory_timeout'] = str(error)[:512]
+            observation['last_refusal'] = 'nvidia-smi inventory query timed out'
+            _wait_notice(notice, f'{uuid}: nvidia-smi inventory query timed out; retrying')
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                pause = min(policy.poll_millis / 1000, remaining)
+                pause_unlocked(pause)
+                observation['inventory_timeout_wait_seconds'] = (
+                    observation.get('inventory_timeout_wait_seconds', 0.) + pause)
+            continue
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': str(error),
                                      'admission_wait': dict(observation)}) from error
@@ -480,7 +513,7 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
             physical_index = matches[0].get('index')
         # Identity/counter sanity only: the unchanged cap+reserve check below
         # remains the sole readiness decision; release policy never admits work.
-        if len(matches) != 1 or not proof_cuda_shared_release(
+        if len(matches) != 1 or not _valid_shared_admission_card(
                 matches[0], uuid, physical_index,
                 observation.get('admitted_total_mib', matches[0].get('total_mib'))):
             raise CudaClaimRejected({**diagnostic, 'admission_error': 'invalid selected primary identity/metadata',
@@ -494,9 +527,11 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
         observation['headroom_shortfalls'] += 1
         observation.setdefault('first_shortfall', diagnostic)
         card = diagnostic.get('selected_card') or {}
-        _wait_notice(notice, f"{uuid}: {card.get('free_mib')} MiB free < "
-                             f"{-(-(policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes) // 1024**2)} MiB "
-                             'required (reserve + child cap); foreign activity is not a refusal reason')
+        reason = (f"{card.get('free_mib')} MiB free < "
+                  f"{-(-(policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes) // 1024**2)} MiB "
+                  'required (reserve + child cap); foreign activity is not a refusal reason')
+        observation['last_refusal'] = reason
+        _wait_notice(notice, f'{uuid}: {reason}')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             continue
@@ -518,27 +553,42 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
             return settled_cuda_samples(probe, output, 'model-proof-admission', uuid, physical_index,
                 policy, baseline, deadline, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            timed_out = isinstance(error, _AdmissionInventoryTimeout)
             facts = cuda_sample_diagnostic(output, 'model-proof-admission', uuid, physical_index,
-                                           policy, baseline, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY)
+                policy, baseline, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY, allow_empty=timed_out)
             samples = facts.get('samples', [])
-            last = samples[-1] if samples else {}
-            card = last.get('selected_card') or {}
-            valid = (last.get('predicates', {}).get('unique_uuid') is True
-                     and last.get('selected_index_matches_admission') is True
-                     and proof_cuda_shared_release({**card, 'uuid': uuid}, uuid, physical_index,
-                                                   baseline['admitted_total_mib']))
-            if str(error) != 'physical GPU occupied during model-proof-admission' or not valid:
+            def valid_identity(sample):
+                card = sample.get('selected_card') or {}
+                return (sample.get('predicates', {}).get('unique_uuid') is True
+                        and sample.get('selected_index_matches_admission') is True
+                        and _valid_shared_admission_card(dict(card, uuid=uuid), uuid, physical_index,
+                                                         baseline['admitted_total_mib']))
+            if timed_out and facts.get('status') == 'retained-existing-samples' and all(map(valid_identity, samples)):
+                observation['inventory_window_timeouts'] = observation.get('inventory_window_timeouts', 0) + 1
+                observation['last_inventory_window_timeout'] = {'error': str(error), 'discarded_samples': len(samples)}
+                reason = f'incomplete admission window: {error}'
+                if time.monotonic() >= deadline:
+                    message = 'original CUDA claim deadline expired during admission inventory sampling'
+                    raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': message,
+                        'admission_samples': facts, 'admission_wait': dict(observation)}, message) from error
+            elif str(error) == 'physical GPU occupied during model-proof-admission' and samples and valid_identity(samples[-1]):
+                reason = window_reason() or 'free memory fell below reserve + child cap'
+            else:
                 raise
             observation['stable_sample_restarts'] += 1
-            reason = window_reason() or 'free memory fell below reserve + child cap'
-            _wait_notice(notice, f'{uuid}: card not admissible during stable sampling: {reason}')
+            observation['last_refusal'] = reason
+            _wait_notice(notice, f'{uuid}: restarting stable sampling: {reason}')
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 pause = min(policy.poll_millis / 1000, remaining)
                 pause_unlocked(pause)
-                observation['headroom_wait_seconds'] += pause
-            _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline, observation, notice,
-                                   pause_unlocked)
+                key = 'inventory_timeout_wait_seconds' if timed_out else 'headroom_wait_seconds'
+                observation[key] = observation.get(key, 0.) + pause
+            devices, processes = _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline,
+                                                        observation, notice, pause_unlocked)
+            current = next(device for device in devices if device['uuid'] == uuid)
+            baseline.update(reserved_baseline_mib=current['used_mib'], process_identities=proof_cuda_contexts(
+                uuid, processes, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY))
 
 
 def effective_claim_deadline(started: float, policy, original_deadline_monotonic: float | None = None) -> float:
@@ -560,6 +610,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
     `require_owned_completion` makes the release seal also require the supervisor's owned-Job
     completion record (the registry runner retains it); other callers' supervisors reap their
     own trees before the claim exits.
+
+    A busy or short card is a queueing condition: the lock, headroom and quiet-window waits
+    continue until the claim deadline, logging each refusal reason, and the deadline refusal
+    records the last one.
 
     A hosted Mac/Linux worker is an isolated Actions execution environment. The provisioned
     Mac route claims the shared host-global cooperative POSIX lease in addition to its runner
@@ -722,15 +776,31 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         settle_deadline = (claim_deadline if shared_headroom
                            else min(claim_deadline, time.monotonic() + 30))
         window = {}
+        def read_admission_window(out, label, window_deadline):
+            # Only this selected-card inventory query may restart a shared admission window.
+            try:
+                return inventory_reader(out, label, window_deadline)
+            except (TimeoutError, subprocess.TimeoutExpired) as error:
+                if not isinstance(error, subprocess.TimeoutExpired) and (type(error) is not TimeoutError
+                        or str(error) != 'GPU inventory sampling deadline exhausted'):
+                    raise
+                raise _AdmissionInventoryTimeout(str(error)) from error
+
         def probe():
             # Headroom admission also needs a quiet card across the window (fresh per attempt).
             check = idle_check
             if shared_headroom:
-                check, window['state'] = veda_cuda_guard.stable_window(idle_check)
+                def valid_card(card, rows):
+                    if not _valid_shared_admission_card(card, uuid, matched[0]['index'],
+                                                        context_baseline['admitted_total_mib']):
+                        raise RuntimeError('invalid selected primary identity/metadata during admission sampling')
+                    return idle_check(card, rows)
+                check, window['state'] = veda_cuda_guard.stable_window(valid_card)
             return veda_cuda_guard.sample_baseline(
-                matched[0], output, 'model-proof-admission', context_baseline, idle_check=check,
+                matched[0], output, 'model-proof-admission', dict(context_baseline), idle_check=check,
                 identity_key=identity_key, permit_bounded_growth=True,
-                require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader)
+                require_stable_contexts=not shared_headroom,
+                inventory_reader=read_admission_window if shared_headroom else inventory_reader)
         try:
             if shared_headroom:
                 selected, baseline = _shared_admission_samples(probe, inventory_reader, output, uuid,

@@ -57,6 +57,37 @@ impl Generator for ReceiptGenerator {
     fn retained_weight_bytes(&self) -> Option<u64> {
         self.inner.retained_weight_bytes()
     }
+    fn video_plan_resident_weight_bytes(&self, plan: &crate::VideoRenderPlan) -> Option<u64> {
+        self.inner.video_plan_resident_weight_bytes(plan)
+    }
+    fn video_load_binding(&self) -> Option<&crate::RenderLoadBinding> {
+        self.inner.video_load_binding()
+    }
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &crate::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> Result<Option<crate::MemoryNumericTier>> {
+        self.scope
+            .with_prepared(|| self.inner.video_memory_evidence_tier(plan, req))
+    }
+    fn project_video_memory_context(
+        &self,
+        plan: &crate::VideoRenderPlan,
+        req: &GenerationRequest,
+        context: &mut MemoryRunContext,
+    ) -> Result<bool> {
+        self.scope
+            .with_prepared(|| self.inner.project_video_memory_context(plan, req, context))
+    }
+    fn validate_video_plan(
+        &self,
+        plan: &crate::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> Result<()> {
+        self.scope
+            .with_prepared(|| self.inner.validate_video_plan(plan, req))
+    }
     fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
         self.inner.retained_component_state()
     }
@@ -181,6 +212,29 @@ impl Generator for ReceiptGenerator {
     ) -> Result<CompletedGeneration> {
         self.scope
             .with_prepared(|| self.inner.generate_with_execution_report(req, on_progress))
+    }
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.scope.with_prepared(|| {
+            self.inner
+                .generate_with_scoped_execution_report(req, scope, on_progress)
+        })
+    }
+    fn generate_video_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &crate::VideoRenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.scope.with_prepared(|| {
+            self.inner
+                .generate_video_planned_with_execution_report(req, plan, scope, on_progress)
+        })
     }
     fn open_conversation(
         &self,

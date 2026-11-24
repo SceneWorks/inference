@@ -2,6 +2,9 @@
 from pathlib import Path
 import os
 import copy
+import hashlib
+import json
+import sys
 import posixpath
 import shlex
 import re
@@ -105,6 +108,177 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertIn('github.run_id', bridge['concurrency']['group'])
         self.assertIn('github.run_attempt', bridge['concurrency']['group'])
 
+    def test_paired_cohort_routes_are_exact_and_worker_receives_the_hosted_plan_hash(self):
+        workflow = document("model-inference-proofs.yml")
+        plan = workflow["jobs"]["plan"]
+        steps = plan["steps"]
+        setup = next(s for s in steps if s.get("id") == "plan")
+        python = setup["run"].split("<<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        selectors = ("wan-curated-tier1", "mochi-svd-tier1", "scail2-tier1")
+        for selector in selectors:
+            self.assertIn(selector, workflow["env"]["MODEL_PROOF_SCRIPT"])
+            self.assertIn(selector, steps[0]["with"]["fetch-depth"])
+        for selector in (*selectors, "scail2-plural-fit", "hub-snapshots", "registered", "mochi-svd-tier1-other"):
+            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as location:
+                root = Path(location)
+                data = {"runner": ["expected"], "asset_setup": selector}
+                if selector == "scail2-plural-fit":
+                    data.update(protocol="scail2-plural-fit-v1", asset_setup="hub-snapshots")
+                (root / "model-proof-plan.json").write_text(json.dumps(data), encoding="utf-8")
+                output = root / "output"
+                subprocess.run([sys.executable, "-I", "-"], input=python, text=True, check=True,
+                               env=dict(os.environ, RUNNER_TEMP=location, GITHUB_OUTPUT=str(output)), encoding="utf-8")
+                row, = json.loads(output.read_text(encoding="utf-8").removeprefix("matrix="))["include"]
+                self.assertEqual(row["paired_source"], selector in selectors)
+                fresh = selector in (*selectors, "scail2-plural-fit")
+                self.assertEqual(row["fresh_source"], fresh)
+                digest = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                self.assertEqual(row["video_plan_sha256"], digest if fresh else "")
+        self.assertEqual(workflow["jobs"]["prove"]["env"]["VIDEO_TIER1_PLAN_SHA256"], "${{ matrix.video_plan_sha256 }}")
+
+    def test_local_proof_actions_resolve_from_an_exact_checkout_on_a_clean_windows_workspace(self):
+        # `uses: ./...` resolves against GITHUB_WORKSPACE, not MODEL_PROOF_CWD. On a clean
+        # workspace only directories that an earlier checkout of this exact revision created exist.
+        from scripts.tests.test_ci_workflow_policy import evaluate_condition
+
+        job = document("model-inference-proofs.yml")["jobs"]["prove"]
+        cwd = job["env"]["MODEL_PROOF_CWD"]
+        self.assertEqual(cwd, "${{ matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, "
+                              "github.run_attempt) || '.' }}")
+        for fresh in (True, False):
+            for os_name in ("Windows", "macOS", "Linux"):
+                with self.subTest(fresh_source=fresh, os=os_name):
+                    values = {"runner.os": os_name, "matrix.fresh_source": fresh,
+                              "matrix.paired_source": fresh, "matrix.asset_setup": "hub-snapshots"}
+                    model_cwd = "paired-src-7-1" if fresh else "."
+                    checkouts, actions = [], []
+                    for step in job["steps"]:
+                        uses = step.get("uses", "")
+                        if not (uses.startswith("actions/checkout@") or uses.startswith("./")):
+                            continue
+                        if "if" in step and not evaluate_condition(step["if"], values):
+                            continue
+                        if uses.startswith("./"):
+                            actions.append(uses)
+                            top = posixpath.normpath(uses).split("/")[0]
+                            exact = [path for path, ref in checkouts if ref == "${{ github.sha }}"]
+                            root = "." if top.startswith(".") else top
+                            self.assertIn(root, exact, f"{uses} has no exact checkout at {root}")
+                            continue
+                        path = step.get("with", {}).get("path", ".")
+                        path = model_cwd if path == "${{ env.MODEL_PROOF_CWD }}" else path
+                        checkouts.append((posixpath.normpath(path), step.get("with", {}).get("ref")))
+                    windows = os_name == "Windows"
+                    self.assertEqual(len(actions), int(windows))
+                    if windows and fresh:
+                        self.assertEqual(actions, ["./proof-storage-action/.github/actions/cleanup-runner-storage"])
+                        sparse = next(s for s in job["steps"] if s.get("with", {}).get("path") == "proof-storage-action")
+                        self.assertEqual(sparse["with"]["sparse-checkout"], ".github/actions/cleanup-runner-storage")
+                        self.assertIs(sparse["with"]["persist-credentials"], False)
+                    elif windows:
+                        self.assertEqual(actions, ["./.github/actions/cleanup-runner-storage"])
+
+    @unittest.skipUnless(os.name == "posix", "uses local Git and Bash; does not contact Actions")
+    def test_paired_and_scail_checkouts_survive_a_reused_promisor_repository(self):
+        job = document("model-inference-proofs.yml")["jobs"]["prove"]
+        steps = job["steps"]
+        create = next(s for s in steps if s.get("id") == "fresh_checkout")
+        source = next(s for s in steps if s.get("id") == "source")
+        cleanup = next(s for s in steps if s.get("name") == "Remove the owned proof checkout")
+        self.assertEqual(create["if"], "matrix.fresh_source")
+        self.assertIn("matrix.fresh_source && format('paired-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
+        self.assertEqual(source["with"]["path"], "${{ env.MODEL_PROOF_CWD }}")
+        self.assertEqual(source["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(source["with"]["fetch-depth"],
+                         "${{ matrix.paired_source && '0' || (env.MODEL_PROOF_SCRIPT == 'sga_adapter_comparison.py'"
+                         " || env.MODEL_PROOF_SCRIPT == 'sga_terminal_comparison.py') && '128' || '1' }}")
+        self.assertIs(source["with"]["persist-credentials"], False)
+        self.assertLess(steps.index(create), steps.index(source))
+        self.assertEqual(cleanup["if"], "always() && steps.fresh_checkout.outcome == 'success'")
+        for step in steps:
+            if step.get("working-directory"):
+                self.assertEqual(step["working-directory"], source["with"]["path"])
+            # All Wan-reachable script commands must resolve inside the selected source on both OSes.
+            if (step.get("name") in {"Install reviewed CPython 3.12 on Windows", "Select Rustup proxies on Linux and macOS",
+                    "Select real pinned Rust toolchain on Windows", "Report actual host and pinned toolchain (no model execution)",
+                    "Validate owned evidence tree before any upload"} or "Run exact registered model tests" in step.get("name", "")
+                    or "Stage and bind declared pinned Hub snapshots" in step.get("name", "")):
+                self.assertEqual(step.get("working-directory"), source["with"]["path"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            origin = Path(temporary) / "origin"
+            workspace = Path(temporary) / "workspace"
+            def git(path, *args):
+                return subprocess.check_output(["git", "-c", "user.name=proof-test", "-c", "user.email=proof@localhost",
+                                                "-C", str(path), *args], text=True).strip()
+            origin.mkdir()
+            git(origin, "init", "-q", "-b", "main")
+            git(origin, "config", "uploadpack.allowFilter", "true")
+            git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+            git(origin, "commit", "-q", "--allow-empty", "-m", "history")
+            (origin / "source").write_text("before migration", encoding="utf-8")
+            git(origin, "add", "source")
+            git(origin, "commit", "-qm", "trusted base")
+            base = git(origin, "rev-parse", "HEAD")
+            (origin / "source").write_text("after migration", encoding="utf-8")
+            git(origin, "commit", "-qam", "candidate")
+            head = git(origin, "rev-parse", "HEAD")
+            git(origin, "clone", "-q", "--depth=2", "--filter=blob:none", "--no-checkout", origin.as_uri(), str(workspace))
+            git(workspace, "checkout", "-q", "--detach", head)
+            self.assertEqual(git(workspace, "config", "remote.origin.promisor"), "true")
+            git(workspace, "remote", "set-url", "origin", (origin.parent / "offline").as_uri())
+            legacy = subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(workspace),
+                                     str(origin.parent / "reused-clone")], capture_output=True, text=True, encoding="utf-8")
+            self.assertNotEqual(legacy.returncode, 0)
+            self.assertIn("promisor", legacy.stderr)
+
+            marker = workspace / "listener-owned"
+            marker.write_text("preserve", encoding="utf-8")
+            env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="paired-src-42-3")
+            def run_step(step, check=True):
+                return subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=workspace,
+                                      env=env, check=check, capture_output=True)
+            run_step(create)
+            self.assertNotEqual(run_step(create, check=False).returncode, 0)
+            owned = workspace / env["MODEL_PROOF_CWD"]
+            git(owned, "init", "-q")
+            git(owned, "remote", "add", "origin", origin.as_uri())
+            # Pinned checkout v5 uses this full-history refspec without --unshallow on fresh repos.
+            git(owned, "fetch", "-q", "--prune", "--no-recurse-submodules", "origin",
+                "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+            git(owned, "checkout", "-q", "--detach", head)
+            git(owned, "merge-base", "--is-ancestor", base, head)
+            self.assertEqual(git(owned, "rev-parse", "HEAD"), head)
+            self.assertNotEqual(git(owned, "rev-parse", "HEAD^{tree}"), git(owned, "rev-parse", base + "^{tree}"))
+            self.assertEqual(git(owned, "rev-parse", "HEAD^{tree}"), git(origin, "rev-parse", "HEAD^{tree}"))
+            self.assertEqual(git(owned, "rev-parse", "--is-shallow-repository"), "false")
+            env["MODEL_PROOF_CWD"] = "."
+            self.assertNotEqual(run_step(cleanup, check=False).returncode, 0)
+            self.assertTrue(owned.is_dir())
+            env["MODEL_PROOF_CWD"] = owned.name
+            run_step(cleanup)
+            self.assertFalse(owned.exists())
+            self.assertEqual(git(workspace, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), head)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+            # SCAIL needs a complete tip tree for its fixture overlay, but no
+            # paired migration base. Reproduce checkout v5's SHA-only fetch.
+            run_step(create)
+            git(owned, "init", "-q")
+            git(owned, "fetch", "-q", "--no-tags", "--depth=1", origin.as_uri(), head)
+            git(owned, "checkout", "-q", "--detach", "FETCH_HEAD")
+            self.assertEqual(git(owned, "rev-parse", "--is-shallow-repository"), "true")
+            scratch = origin.parent / "scail-build"
+            git(owned, "clone", "--quiet", "--shared", "--no-checkout", str(owned), str(scratch))
+            git(scratch, "checkout", "--quiet", "--detach", head)
+            self.assertEqual(git(scratch, "rev-parse", "HEAD^{tree}"), git(origin, "rev-parse", head + "^{tree}"))
+            (scratch / "source").write_text("fixture overlay", encoding="utf-8")
+            self.assertEqual((owned / "source").read_text(encoding="utf-8"), "after migration")
+            run_step(cleanup)
+            self.assertFalse(owned.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
     def test_owned_paths_and_runner_context_are_step_not_job_environment(self):
         for filename, name in (('model-inference-proofs.yml', 'prove'), ('real-weights.yml', 'model-proof-execute')):
             with self.subTest(workflow=filename):
@@ -158,7 +332,8 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertIn('rustc -vV', report['run'])
             self.assertIn('command -v cargo', report['run'])
             self.assertIn('command -v rustc', report['run'])
-            selected.append((posix, windows))
+            # Both endpoints run the same selector; the Wan route runs it in its fresh checkout.
+            selected.append(tuple({k: v for k, v in s.items() if k != "working-directory"} for s in (posix, windows)))
         self.assertEqual(selected[0], selected[1])
 
     def test_bridge_preserves_iris_asset_setup_from_validated_plan(self):

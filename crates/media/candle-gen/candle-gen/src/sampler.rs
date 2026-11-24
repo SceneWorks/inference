@@ -562,6 +562,33 @@ pub fn run_flow_sampler(
     )
 }
 
+/// Sample inside an admitted video phase with raw flow sigma conditioning. The solver requests its
+/// own evaluation coordinates, including Heun correctors and off-grid DPM++ SDE midpoints.
+pub fn run_video_flow_sampler<S: Copy>(
+    phase: &gen_core::render::video::VideoDenoisePhase<S>,
+    first_before_guard: Option<f32>,
+    latents: Tensor,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Tensor, f32, S) -> Result<Tensor>,
+) -> Result<Tensor> {
+    phase.validate_descending_schedule(first_before_guard)?;
+    run_flow_sampler(
+        Some(phase.solver.name()),
+        TimestepConvention::Sigma,
+        &phase.sigmas,
+        latents,
+        phase.seed,
+        cancel,
+        on_progress,
+        None,
+        |x, sigma| {
+            crate::check_cancel(cancel)?;
+            predict(x, sigma, phase.models.slot(sigma))
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_flow_sampler_spans(
     sampler_name: Option<&str>,

@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 candle-gen = { path = "../candle-gen" }
 # The vendored fast-tokenizer JSON (google t5-v1.1-xxl) is loaded from memory.
 tokenizers = { workspace = true }

@@ -1208,7 +1208,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn request(mode: &str, width: u32, height: u32, frames: u32) -> GenerationRequest {
+    pub(crate) fn request(mode: &str, width: u32, height: u32, frames: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "dance".to_owned(),
             width,
@@ -1464,7 +1464,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn admitted_context(
+    pub(crate) fn admitted_context(
         prepared: &PreparedMemory,
         request: &GenerationRequest,
         cache_state: gen_core::MemoryCacheState,

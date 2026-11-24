@@ -71,6 +71,9 @@
 /// declared budget names the same chunking everywhere; the budget itself is per-family evidence.
 pub const CONSTRAINED_ATTN_SCORES_BUDGET: u64 = 64 * 1024 * 1024;
 
+/// Native Candle video attention i32 overflow guard, also used to price its exact row blocks.
+pub const VIDEO_ATTENTION_SCORE_ELEMENTS: u64 = 1_000_000_000;
+
 /// How much attention scratch one call may build at once.
 ///
 /// [`UNBOUNDED`](Self::UNBOUNDED) is the default everywhere and means a single un-chunked call —

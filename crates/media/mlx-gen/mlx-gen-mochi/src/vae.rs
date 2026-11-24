@@ -653,8 +653,15 @@ impl MochiVaeDecoder {
 /// structure + latent statistics and the `vae/` safetensors for the weights, at f32 compute precision.
 pub fn load_vae_decoder(root: &Path) -> Result<MochiVaeDecoder> {
     let cfg = MochiVaeConfig::from_model_dir(root)?;
+    load_vae_decoder_with_config(root, &cfg)
+}
+
+pub(crate) fn load_vae_decoder_with_config(
+    root: &Path,
+    cfg: &MochiVaeConfig,
+) -> Result<MochiVaeDecoder> {
     let w = Weights::from_dir(root.join("vae"))?;
-    let vae = MochiVaeDecoder::from_weights(&w, &cfg)?;
+    let vae = MochiVaeDecoder::from_weights(&w, cfg)?;
     // Materialize at load, for the same GPU-watchdog reason as `load_t5_encoder` (sc-24245).
     w.materialize_accessed()?;
     Ok(vae)
