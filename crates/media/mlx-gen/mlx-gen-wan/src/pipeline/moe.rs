@@ -350,12 +350,12 @@ pub(crate) fn denoise_moe_curated_swapped(
 ///
 /// Callers must `eval` any output that must survive the drop (the latents) *before* the expert is
 /// dropped, or MLX's lazy graph would keep the expert's weights referenced and freeing it would reclaim
-/// nothing — [`denoise_range`] already `eval`s the latents after every step, so by the time `use_high`
+/// nothing — [`denoise_expert_slice`] already `eval`s the latents after every step, so by the time `use_high`
 /// returns they are materialized and independent of the expert.
 ///
 /// Generic over the expert type `E` and threaded state `St` so a weight-free unit test can pin the
 /// never-co-resident property with a lightweight liveness witness — no GPU, no real weights — exactly as
-/// the resident/sequential parity rests on [`denoise_range`]. The load closures receive `&mut St` so
+/// the resident/sequential parity rests on [`denoise_expert_slice`]. The load closures receive `&mut St` so
 /// they can emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St`
 /// to advance the shared scheduler/latents.
 #[allow(clippy::too_many_arguments)]

@@ -724,7 +724,12 @@ impl Pipeline {
                 &mut driver_state,
                 &mut hooks,
                 |_, out, _| Ok(out),
-            )?;
+            )
+            .inspect_err(|err| {
+                if matches!(err, CandleError::Canceled) {
+                    sc20686_observer::observe_cancelled();
+                }
+            })?;
             match out {
                 candle_gen::gen_core::BoundaryState::XSigma(t)
                 | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: t, .. }

@@ -171,7 +171,7 @@ impl Wan14b {
     /// crossing ⇒ at most one swap; the two experts are **never co-resident** (the Pillar-1 win).
     ///
     /// **Parity:** one continuous scheduler advances across the swap and each expert drives the
-    /// identical per-step [`denoise_range`] the resident [`denoise_moe`] drives, so the prefix/suffix
+    /// identical per-step [`denoise_expert_slice`] the resident [`denoise_moe`] drives, so the prefix/suffix
     /// split reproduces the resident per-step `t ≥ boundary` choice bit-for-bit — only residency /
     /// lifetime changes. Each expert projects the raw UMT5 `context`/`context_null` through its **own**
     /// `text_embedder` after it loads (the entangled per-expert projection), so the small raw contexts

@@ -1025,7 +1025,7 @@ pub fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -> Vec<f
 
 /// VACE CFG denoise loop (sc-3436, SW-6968) — routes through [`WanNativeDriver`] +
 /// [`mlx_gen::gen_core::guidance::cfg`] (`PIPE-7`, `PIPE-8`), running
-/// [`WanVaceTransformer::forward_vace_cached`] with the constant 96-ch `control` + per-vace-layer
+/// `WanVaceTransformer::forward_vace_cached` with the constant 96-ch `control` + per-vace-layer
 /// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent
 /// is constant across steps (built once by the caller from [`prepare_video_latents`] +
 /// [`prepare_masks`] + [`build_vace_control`]).

@@ -561,7 +561,7 @@ pub(crate) fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -
 
 /// VACE CFG denoise loop — routes through [`WanNativeDriver`] +
 /// [`candle_gen::gen_core::guidance::cfg`] (`PIPE-7`, `PIPE-8`, `SW-6968`), running
-/// [`WanVaceTransformer::forward_cached_prepared`] with the constant 96-ch control + per-vace-layer
+/// `WanVaceTransformer::forward_cached_prepared` with the constant 96-ch control + per-vace-layer
 /// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent
 /// is embedded once (`embed_control`) and reused across every step + both CFG branches.
 ///

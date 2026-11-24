@@ -675,7 +675,7 @@ impl Pipeline {
     /// The resident MoE render (unchanged residency: `Components` holds UMT5, **both** experts and the
     /// VAE co-resident for the whole generation). Encodes once, projects both experts' contexts, then
     /// splits the denoise at the boundary-crossing index and drives each half through
-    /// [`denoise_range`](Self::denoise_range).
+    /// [`denoise_expert_slice`](Self::denoise_expert_slice).
     fn render(
         &self,
         req: &GenerationRequest,
