@@ -185,7 +185,7 @@ use config::{
     DEFAULT_STEPS, MAX_AREA_5B, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
 };
 use rope::WanRope;
-use scheduler::{flow_shift, FlowScheduler, Sampler};
+use scheduler::{flow_shift, Sampler, WanNativeDriver};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
 
@@ -650,7 +650,12 @@ impl Pipeline {
                     let v = match &neg_kv {
                         Some(neg_kv) => {
                             let v_neg = dit.forward_prepared(latents, ts, neg_kv, cos, sin)?;
-                            pipeline::cfg(&v_pos, &v_neg, guidance)?
+                            candle_gen::gen_core::guidance::cfg(
+                                &candle_gen::CandleLatentOps,
+                                &v_pos,
+                                &v_neg,
+                                guidance as f32,
+                            )?
                         }
                         None => v_pos,
                     };
@@ -659,44 +664,77 @@ impl Pipeline {
                 },
             )?
         } else {
-            // Native FlowScheduler (UniPC default / flow Euler) — the byte-exact N1 path, untouched.
-            let mut latents = latents0;
-            let mut sched = FlowScheduler::new(knobs.sampler, steps, shift);
-            let total = steps as u32;
-            for i in 0..steps {
-                check_cancel(cancel)?;
-                let t = sched.timestep(i);
-                let timestep_tokens = ti2v
-                    .map(|conditioning| conditioning.mask_tokens.affine(t, 0.0))
-                    .transpose()?;
-                let predict = |cross_kv: &transformer::PreparedWanCrossKv| -> CResult<Tensor> {
-                    Ok(match &timestep_tokens {
-                        Some(tokens) => {
-                            dit.forward_tokens_prepared(&latents, tokens, cross_kv, cos, sin)?
+            // Native FlowScheduler (UniPC default / flow Euler / flow DPM++2M) routed through
+            // typed `WanNativeDriver` (`SW-6968`, `PIPE-7`, `PIPE-8`); TI2V mask blend attaches
+            // via `StepHooks::on_post_step`.
+            let driver = WanNativeDriver::new(
+                "wan_candle_ti2v_5b",
+                knobs.sampler,
+                steps,
+                shift,
+                |latents: &Tensor, _step: usize, t: f64| -> CResult<Tensor> {
+                    let timestep_tokens = ti2v
+                        .map(|conditioning| conditioning.mask_tokens.affine(t, 0.0))
+                        .transpose()?;
+                    let predict = |cross_kv: &transformer::PreparedWanCrossKv| -> CResult<Tensor> {
+                        Ok(match &timestep_tokens {
+                            Some(tokens) => {
+                                dit.forward_tokens_prepared(latents, tokens, cross_kv, cos, sin)?
+                            }
+                            None => dit.forward_prepared(latents, t, cross_kv, cos, sin)?,
+                        })
+                    };
+                    let v_pos = predict(&pos_kv)?;
+                    match &neg_kv {
+                        Some(neg_kv) => {
+                            let v_neg = predict(neg_kv)?;
+                            Ok(candle_gen::gen_core::guidance::cfg(
+                                &candle_gen::CandleLatentOps,
+                                &v_pos,
+                                &v_neg,
+                                guidance as f32,
+                            )?)
                         }
-                        None => dit.forward_prepared(&latents, t, cross_kv, cos, sin)?,
-                    })
-                };
-                let v_pos = predict(&pos_kv)?;
-                let v = match &neg_kv {
-                    Some(neg_kv) => {
-                        let v_neg = predict(neg_kv)?;
-                        pipeline::cfg(&v_pos, &v_neg, guidance)?
+                        None => Ok(v_pos),
                     }
-                    None => v_pos,
-                };
-                check_cancel(cancel)?;
-                latents = sched.step(&v, &latents)?;
+                },
+            );
+            let mut driver_state = candle_gen::driver::DriverRunState::new();
+            let mut ti2v_blend_hook = |_info: &candle_gen::driver::DriverStepInfo,
+                                       latents: Tensor| {
                 if let Some(conditioning) = ti2v {
-                    latents =
-                        pipeline::ti2v_blend(&conditioning.clean, &conditioning.mask, &latents)?;
+                    pipeline::ti2v_blend(&conditioning.clean, &conditioning.mask, &latents)
+                        .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))
+                } else {
+                    Ok(latents)
                 }
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
+            };
+            let mut hooks = candle_gen::driver::StepHooks::new(on_progress);
+            if ti2v.is_some() {
+                hooks.on_post_step = Some(&mut ti2v_blend_hook);
             }
-            latents
+            let out = candle_gen::driver::run_candle_driver_slices(
+                &driver,
+                [candle_gen::driver::SliceSpec::full(steps)],
+                candle_gen::gen_core::BoundaryState::XSigma(latents0),
+                steps,
+                knobs.seed,
+                cancel,
+                None,
+                &mut driver_state,
+                &mut hooks,
+                |_, out, _| Ok(out),
+            )
+            .inspect_err(|err| {
+                if matches!(err, CandleError::Canceled) {
+                    sc20686_observer::observe_cancelled();
+                }
+            })?;
+            match out {
+                candle_gen::gen_core::BoundaryState::XSigma(t)
+                | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: t, .. }
+                | candle_gen::gen_core::BoundaryState::RouteSpecific { state: t, .. } => t,
+            }
         };
         Ok(latents)
     }

@@ -22,9 +22,8 @@ use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::WanVaceConfig;
 use crate::model_vace::ProviderVae;
-use crate::pipeline::cfg;
 use crate::quant::QLinear;
-use crate::scheduler::{FlowScheduler, Sampler};
+use crate::scheduler::{Sampler, WanNativeDriver};
 use crate::transformer::{ln_no_affine, timestep_sinusoid, Block, PreparedBlockCrossKv};
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
@@ -560,10 +559,11 @@ pub(crate) fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -
     vec![weighted_control_scale(req.control_scale, masking_strength); vace_layers]
 }
 
-/// VACE CFG denoise loop — mirrors the candle base Wan denoise (`FlowScheduler` per step), but each step
-/// runs [`WanVaceTransformer::forward_cached`] with the constant 96-ch control + per-vace-layer
-/// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent is
-/// embedded once (`embed_control`) and reused across every step + both CFG branches.
+/// VACE CFG denoise loop — routes through [`WanNativeDriver`] +
+/// [`candle_gen::gen_core::guidance::cfg`] (`PIPE-7`, `PIPE-8`, `SW-6968`), running
+/// `WanVaceTransformer::forward_cached_prepared` with the constant 96-ch control + per-vace-layer
+/// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent
+/// is embedded once (`embed_control`) and reused across every step + both CFG branches.
 ///
 /// `init_noise`: `[1, 16, T, h, w]` (f32). `ctx_pos` / `ctx_neg`: projected contexts (`embed_text`).
 #[allow(clippy::too_many_arguments)]
@@ -583,63 +583,27 @@ pub fn denoise_vace(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<Tensor> {
-    candle_gen::execution::policy(
-        "wan_vace_denoise",
-        serde_json::json!({"guidance_bits": guidance.to_bits(), "scale_bits": scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>()}),
-    );
-    let (_b, _c, f, hl, wl) = init_noise.dims5()?;
-    let (pt, ph, pw) = transformer.cfg.base.patch;
-    debug_assert_eq!(
-        ph, pw,
-        "wan-vace token length assumes a square spatial patch (ph == pw)"
-    );
-    let l = (f / pt) * (hl / ph) * (wl / ph); // width uses `ph` too (square patch)
-    crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, l as u64, 0, "");
-    let control_emb = transformer.embed_control(control, l)?;
-    let pos_kv = transformer.prepare_cross_kv(ctx_pos)?;
-    let neg_kv = ctx_neg
-        .map(|context| transformer.prepare_cross_kv(context))
-        .transpose()?;
-
     let mut latents = init_noise.clone();
-    let mut sched = FlowScheduler::new(sampler, steps, shift);
-    for i in 0..steps {
-        if cancel.is_cancelled() {
-            crate::sc20686_observer::observe_cancelled();
-            return Err(CandleError::Canceled);
-        }
-        let t = sched.timestep(i);
-        let cond = transformer.forward_cached_prepared(
-            &latents,
-            t,
-            &control_emb,
-            &pos_kv,
-            scales,
-            cos,
-            sin,
-        )?;
-        let v = match &neg_kv {
-            Some(neg_kv) => {
-                let uncond = transformer.forward_cached_prepared(
-                    &latents,
-                    t,
-                    &control_emb,
-                    neg_kv,
-                    scales,
-                    cos,
-                    sin,
-                )?;
-                cfg(&cond, &uncond, guidance)?
-            }
-            None => cond,
-        };
-        if cancel.is_cancelled() {
-            crate::sc20686_observer::observe_cancelled();
-            return Err(CandleError::Canceled);
-        }
-        latents = sched.step(&v, &latents)?;
-        on_step(i + 1);
-    }
+    let mut driver_state = candle_gen::driver::DriverRunState::new();
+    denoise_vace_slice(
+        transformer,
+        control,
+        scales,
+        sampler,
+        steps,
+        shift,
+        guidance,
+        ctx_pos,
+        ctx_neg,
+        &mut latents,
+        0..steps,
+        0,
+        cos,
+        sin,
+        &mut driver_state,
+        cancel,
+        on_step,
+    )?;
     Ok(latents)
 }
 
@@ -652,31 +616,42 @@ pub fn crossing_index(timesteps: &[f64], boundary_timestep: f64) -> usize {
         .unwrap_or(timesteps.len())
 }
 
-/// Run a contiguous denoise range on one VACE expert while preserving a single scheduler across the
-/// high→low boundary. The expert embeds its own text/control projections once for its range.
+/// Run a contiguous denoise range on one VACE expert through [`WanNativeDriver`] while carrying
+/// multistep solver history in the request-owned [`candle_gen::driver::DriverRunState`] across the
+/// high→low boundary (`PIPE-3`, `PIPE-7`, `PIPE-8`, `SW-6968`).
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_vace_range(
+pub fn denoise_vace_slice(
     transformer: &WanVaceTransformer,
     control: &Tensor,
     scales: &[f32],
-    scheduler: &mut FlowScheduler,
+    sampler: Sampler,
+    total_steps: usize,
+    shift: f64,
     guidance: f64,
     ctx_pos: &Tensor,
     ctx_neg: Option<&Tensor>,
     latents: &mut Tensor,
-    timesteps: &[f64],
     range: std::ops::Range<usize>,
+    phase: usize,
     cos: &Tensor,
     sin: &Tensor,
+    driver_state: &mut candle_gen::driver::DriverRunState,
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
     candle_gen::execution::policy(
         "wan_vace_denoise",
         serde_json::json!({"guidance_bits": guidance.to_bits(), "scale_bits": scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>()}),
     );
     let (_b, _c, f, hl, wl) = latents.dims5()?;
     let (pt, ph, pw) = transformer.cfg.base.patch;
+    debug_assert_eq!(
+        ph, pw,
+        "wan-vace token length assumes a square spatial patch (ph == pw)"
+    );
     let l = (f / pt) * (hl / ph) * (wl / pw);
     crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, l as u64, 0, "");
     let control_emb = transformer.embed_control(control, l)?;
@@ -684,43 +659,91 @@ pub fn denoise_vace_range(
     let neg_kv = ctx_neg
         .map(|context| transformer.prepare_cross_kv(context))
         .transpose()?;
-    for i in range {
-        if cancel.is_cancelled() {
-            crate::sc20686_observer::observe_cancelled();
-            return Err(CandleError::Canceled);
-        }
-        let timestep = timesteps[i];
-        let cond = transformer.forward_cached_prepared(
-            latents,
-            timestep,
-            &control_emb,
-            &pos_kv,
-            scales,
-            cos,
-            sin,
-        )?;
-        let velocity = match &neg_kv {
-            Some(neg_kv) => {
-                let uncond = transformer.forward_cached_prepared(
-                    latents,
-                    timestep,
-                    &control_emb,
-                    neg_kv,
-                    scales,
-                    cos,
-                    sin,
-                )?;
-                cfg(&cond, &uncond, guidance)?
+
+    let driver = WanNativeDriver::new(
+        "wan_candle_vace",
+        sampler,
+        total_steps,
+        shift,
+        |latents: &Tensor, _step: usize, timestep: f64| -> CResult<Tensor> {
+            let cond = transformer.forward_cached_prepared(
+                latents,
+                timestep,
+                &control_emb,
+                &pos_kv,
+                scales,
+                cos,
+                sin,
+            )?;
+            match &neg_kv {
+                Some(neg_kv) => {
+                    let uncond = transformer.forward_cached_prepared(
+                        latents,
+                        timestep,
+                        &control_emb,
+                        neg_kv,
+                        scales,
+                        cos,
+                        sin,
+                    )?;
+                    Ok(candle_gen::gen_core::guidance::cfg(
+                        &candle_gen::CandleLatentOps,
+                        &cond,
+                        &uncond,
+                        guidance as f32,
+                    )?)
+                }
+                None => Ok(cond),
             }
-            None => cond,
-        };
-        if cancel.is_cancelled() {
-            crate::sc20686_observer::observe_cancelled();
-            return Err(CandleError::Canceled);
+        },
+    );
+    let (transition, history) = if range.start == 0 {
+        (
+            candle_gen::driver::SliceTransition::Start,
+            candle_gen::driver::DriverHistoryPolicy::Reset,
+        )
+    } else {
+        (
+            candle_gen::driver::SliceTransition::Continue,
+            candle_gen::driver::DriverHistoryPolicy::Carry,
+        )
+    };
+    let mut on_progress = |progress: candle_gen::gen_core::Progress| {
+        if let candle_gen::gen_core::Progress::Step { current, .. } = progress {
+            on_step(current as usize);
         }
-        *latents = scheduler.step(&velocity, latents)?;
-        on_step(i + 1);
-    }
+    };
+    let mut hooks = candle_gen::driver::StepHooks::new(&mut on_progress);
+    let out = candle_gen::driver::run_candle_driver_slices(
+        &driver,
+        [candle_gen::driver::SliceSpec {
+            pass: 0,
+            phase,
+            span: range,
+            transition,
+            history,
+            geometry: None,
+            request_boundary_estimate: false,
+        }],
+        candle_gen::gen_core::BoundaryState::XSigma(latents.clone()),
+        total_steps,
+        0,
+        cancel,
+        None,
+        driver_state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )
+    .inspect_err(|err| {
+        if matches!(err, CandleError::Canceled) {
+            crate::sc20686_observer::observe_cancelled();
+        }
+    })?;
+    *latents = match out {
+        candle_gen::gen_core::BoundaryState::XSigma(t)
+        | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: t, .. }
+        | candle_gen::gen_core::BoundaryState::RouteSpecific { state: t, .. } => t,
+    };
     Ok(())
 }
 

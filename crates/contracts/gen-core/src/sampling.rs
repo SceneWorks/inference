@@ -753,6 +753,69 @@ pub fn boogu_turbo_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     s
 }
 
+/// Wan MLX shifted-sigma schedule (`PIPE-9`): `num_steps + 1` `f32` sigmas with trailing `0.0`.
+///
+/// Computed in `f64` and cast to `f32` at the end, matching the MLX Wan reference:
+/// `σ_max = 1 - 1/N`, `σ_min = 0`, `s_k = σ_max + ((σ_min - σ_max)/num_steps) · k`,
+/// `σ'_k = shift·s_k / (1 + (shift − 1)·s_k)` for `k = 0..num_steps`, plus terminal `0.0`.
+pub fn wan_mlx_sigmas(num_steps: usize, shift: f32, num_train_timesteps: usize) -> Vec<f32> {
+    let n_train = num_train_timesteps as f64;
+    let sigma_max = 1.0 - 1.0 / n_train;
+    let sigma_min = 0.0_f64;
+    let shift = shift as f64;
+    let n = num_steps as f64;
+    let step = (sigma_min - sigma_max) / n;
+
+    let mut out = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let s = sigma_max + step * (k as f64);
+        let shifted = shift * s / (1.0 + (shift - 1.0) * s);
+        out.push(shifted as f32);
+    }
+    out.push(0.0_f32);
+    out
+}
+
+/// Wan MLX integer-valued model timesteps from sigmas (`PIPE-9`): `(σ[:-1] · num_train).trunc()`.
+pub fn wan_mlx_timesteps(sigmas: &[f32], num_train_timesteps: usize) -> Vec<f32> {
+    let nt = num_train_timesteps as f32;
+    sigmas[..sigmas.len().saturating_sub(1)]
+        .iter()
+        .map(|&s| (s * nt).trunc())
+        .collect()
+}
+
+/// Wan Candle shifted-sigma schedule in `f64` (`PIPE-9`): `steps + 1` `f64` sigmas with trailing
+/// `0.0`.
+///
+/// Mirrors diffusers' `UniPCMultistepScheduler(use_flow_sigmas=True)`:
+/// `s_k = 1 + (1/N - 1)·k/steps`, `σ'_k = shift·s_k / (1 + (shift − 1)·s_k)`, with the
+/// `σ_0 -= 1e-6` guard when `|σ_0 - 1| < 1e-6` to keep `log(1 − σ_0)` finite, plus terminal `0.0`.
+pub fn wan_candle_sigmas_f64(steps: usize, shift: f64, num_train_timesteps: usize) -> Vec<f64> {
+    let n = num_train_timesteps as f64;
+    let mut sigmas: Vec<f64> = (0..steps)
+        .map(|k| {
+            let s = 1.0 + (1.0 / n - 1.0) * (k as f64) / (steps as f64);
+            shift * s / (1.0 + (shift - 1.0) * s)
+        })
+        .collect();
+    if let Some(first) = sigmas.first_mut() {
+        if (*first - 1.0).abs() < 1e-6 {
+            *first -= 1e-6;
+        }
+    }
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// Wan Candle shifted-sigma schedule cast to `f32` (`PIPE-9`).
+pub fn wan_candle_sigmas(steps: usize, shift: f64, num_train_timesteps: usize) -> Vec<f32> {
+    wan_candle_sigmas_f64(steps, shift, num_train_timesteps)
+        .iter()
+        .map(|&s| s as f32)
+        .collect()
+}
+
 /// A PiD **`from_ldm` early-stop** capture plan (epic 7840, sc-7993): how far to denoise before
 /// handing the partially-denoised `x_k` to the PiD pixel decoder, and the achieved degrade σ to decode
 /// it with. Resolved by [`flow_capture_plan`] from a flow-match schedule + the request's
@@ -2152,5 +2215,26 @@ mod tests {
         assert_eq!(b_turbo.len(), 5);
         assert!((b_turbo[0] - 0.999).abs() < 1e-6);
         assert_eq!(b_turbo[4], 0.0);
+
+        // Wan MLX & Candle flow-match schedules (`PIPE-9`)
+        let w_mlx = wan_mlx_sigmas(40, 5.0, 1000);
+        assert_eq!(w_mlx.len(), 41);
+        assert_eq!(*w_mlx.last().unwrap(), 0.0);
+        let sm = 0.999_f64;
+        assert_eq!(
+            w_mlx[0].to_bits(),
+            ((5.0 * sm / (1.0 + 4.0 * sm)) as f32).to_bits()
+        );
+        let w_mlx_ts = wan_mlx_timesteps(&w_mlx, 1000);
+        assert_eq!(w_mlx_ts.len(), 40);
+        assert_eq!(w_mlx_ts[0], (w_mlx[0] * 1000.0).trunc());
+
+        let w_candle = wan_candle_sigmas_f64(40, 5.0, 1000);
+        assert_eq!(w_candle.len(), 41);
+        assert_eq!(w_candle[0].to_bits(), (1.0 - 1e-6_f64).to_bits());
+        assert_eq!(*w_candle.last().unwrap(), 0.0);
+        let w_candle_f32 = wan_candle_sigmas(40, 5.0, 1000);
+        assert_eq!(w_candle_f32.len(), 41);
+        assert_eq!(w_candle_f32[0].to_bits(), (w_candle[0] as f32).to_bits());
     }
 }

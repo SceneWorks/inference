@@ -83,11 +83,6 @@ pub fn create_noise(
     Tensor::from_vec(data, (1, z_dim, t_lat, h_lat, w_lat), device)
 }
 
-/// Classifier-free guidance: `uncond + g·(cond − uncond)`.
-pub fn cfg(cond: &Tensor, uncond: &Tensor, guidance: f64) -> Result<Tensor> {
-    uncond + (cond - uncond)?.affine(guidance, 0.0)?
-}
-
 /// Build the latent and token masks for Wan TI2V Reference/keyframe conditioning. Each `(frame,
 /// strength)` produces `1-strength` in both masks, so the same weight controls clean-latent blending
 /// and the per-token diffusion timestep. The token mask follows the DiT patch-grid order.

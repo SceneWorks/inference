@@ -30,41 +30,85 @@ pub fn crossing_index(timesteps: &[f32], boundary_timestep: f32) -> usize {
         .unwrap_or(timesteps.len())
 }
 
-/// Run the denoise steps `range` on a **single** expert, advancing the (shared, continuous) scheduler
-/// and mutating `latents` in place. Extracted (sc-12736) so the resident MoE loop ([`denoise_moe`]) and
-/// the sequential expert-swap drive the **identical** per-step math over their respective step ranges:
-/// the prefix/suffix split is bit-exact to the resident per-step `t ≥ boundary` choice because the same
-/// `sched` advances through every step in order (a multistep solver's history therefore carries across
-/// the crossing unchanged). The per-expert `StepCache` (RoPE + cross-K/V) is built once here, at the
-/// start of the range.
+/// Run the denoise steps `range` on a **single** expert through [`WanNativeDriver`], carrying the
+/// request-owned [`mlx_gen::driver::DriverRunState`] solver history across compatible expert
+/// crossings (`PIPE-3`, `PIPE-7`, `SW-6968`).
 ///
-/// `y` is the optional I2V channel-concat conditioning (see `predict`). `grid` is the shared patch
-/// grid (both experts see the same F/H/W). `on_step(i)` is called with the **global** step index after
-/// each completed step.
+/// Both the resident MoE loop ([`denoise_moe`]) and the sequential expert-swap drive the
+/// **identical** typed driver slice over their respective step ranges: when `range.start == 0`
+/// the slice enters via `Start/Reset`, and when `range.start > 0` it continues via `Continue/Carry`
+/// so the multistep `FlowUniPC` / `FlowDpmpp2m` history survives the expert swap bit-for-bit.
+/// An empty `range` is a no-op (never builds an unused `StepCache`).
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_range(
-    sched: &mut dyn WanScheduler,
+pub fn denoise_expert_slice(
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    total_steps: usize,
+    shift: f32,
     e: &Expert,
     grid: (usize, usize, usize),
     y: Option<&Array>,
     latents: &mut Array,
-    timesteps: &[f32],
     range: std::ops::Range<usize>,
+    phase: usize,
     cancel: &CancelFlag,
+    driver_state: &mut mlx_gen::driver::DriverRunState,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<()> {
-    let cache = build_cache(e.transformer, &e.ctx_cond, e.ctx_uncond.as_ref(), grid)?;
-    for i in range {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let t = timesteps[i];
-        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;
-        *latents = sched.step(&pred, latents)?;
-        mlx_rs::transforms::eval([&*latents])?;
-        on_step(i + 1);
+    if range.is_empty() {
+        return Ok(());
     }
+    let cache = build_cache(e.transformer, &e.ctx_cond, e.ctx_uncond.as_ref(), grid)?;
+    let driver = WanNativeDriver::new(
+        "wan_native_moe",
+        kind,
+        num_train_timesteps,
+        total_steps,
+        shift,
+        |x: &Array, _step: usize, t: f32| predict(e.transformer, x, t, &cache, e.guidance, y),
+    );
+    let (transition, history) = if range.start == 0 {
+        (
+            mlx_gen::driver::SliceTransition::Start,
+            mlx_gen::driver::DriverHistoryPolicy::Reset,
+        )
+    } else {
+        (
+            mlx_gen::driver::SliceTransition::Continue,
+            mlx_gen::driver::DriverHistoryPolicy::Carry,
+        )
+    };
+    let mut on_progress = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut on_progress);
+    let out = mlx_gen::driver::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec {
+            pass: 0,
+            phase,
+            span: range,
+            transition,
+            history,
+            geometry: None,
+            request_boundary_estimate: false,
+        }],
+        mlx_gen::gen_core::BoundaryState::XSigma(latents.clone()),
+        total_steps,
+        0,
+        cancel,
+        None,
+        driver_state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    *latents = match out {
+        mlx_gen::gen_core::BoundaryState::XSigma(x)
+        | mlx_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    };
     Ok(())
 }
 
@@ -75,9 +119,10 @@ pub fn denoise_range(
 ///
 /// This is the **resident** path: BOTH experts are held resident by the caller for the whole loop. The
 /// single high→low boundary crossing is a prefix/suffix split ([`crossing_index`] + two
-/// [`denoise_range`] calls over one continuous scheduler), so it is bit-exact to the old per-step
-/// `t ≥ boundary` choice — and drives the *identical* per-step math the sequential expert-swap
-/// (sc-12736) drives, so the residency change stays numerics-preserving.
+/// [`denoise_expert_slice`] calls sharing one request-owned [`mlx_gen::driver::DriverRunState`]
+/// via `Carry`), so it is bit-exact to the single-scheduler choice — and drives the *identical*
+/// per-step math the sequential expert-swap (sc-12736) drives, so the residency change stays
+/// numerics-preserving.
 ///
 /// `y` is the optional I2V-14B channel-concat conditioning `[20, F, H, W]` ([`build_i2v_y`]),
 /// concatenated onto each forward's noise latent (see `predict`); `None` for T2V. It is constant
@@ -96,16 +141,15 @@ pub fn denoise_moe(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(kind, num_train_timesteps);
-    sched.set_timesteps(steps, shift);
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let timesteps = crate::scheduler::integer_timesteps(&sigmas, num_train_timesteps);
     mlx_gen::video_execution::sampling(
         "wan",
         &format!("{kind:?}"),
         "flow_velocity",
         serde_json::json!({"low_guidance_bits":low.guidance.to_bits(),"high_guidance_bits":high.guidance.to_bits(),"shift_bits":shift.to_bits()}),
     );
-    mlx_gen::video_execution::schedule("wan", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    mlx_gen::video_execution::schedule("wan", &sigmas);
 
     // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`. Scoped +
     // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
@@ -113,31 +157,39 @@ pub fn denoise_moe(
 
     // The grid is shared — the channel-concat `y` doesn't change F/H/W and each expert's contexts are
     // constant across steps. The single high→low crossing: high runs `0..k` (`t ≥ boundary`), low runs
-    // `k..steps`. One continuous `sched` advances across the split, so a multistep solver's history is
-    // unbroken (bit-exact to the old per-step choice).
+    // `k..steps`. One request-owned `DriverRunState` carries multistep solver history across the split.
     let grid = low.transformer.patch_grid(init_noise);
     let k = crossing_index(&timesteps, boundary_timestep);
     let mut latents = init_noise.clone();
-    denoise_range(
-        &mut *sched,
+    let mut driver_state = mlx_gen::driver::DriverRunState::new();
+    denoise_expert_slice(
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
         high,
         grid,
         y,
         &mut latents,
-        &timesteps,
         0..k,
+        0,
         cancel,
+        &mut driver_state,
         on_step,
     )?;
-    denoise_range(
-        &mut *sched,
+    denoise_expert_slice(
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
         low,
         grid,
         y,
         &mut latents,
-        &timesteps,
         k..timesteps.len(),
+        1,
         cancel,
+        &mut driver_state,
         on_step,
     )?;
     Ok(latents)
@@ -298,12 +350,12 @@ pub(crate) fn denoise_moe_curated_swapped(
 ///
 /// Callers must `eval` any output that must survive the drop (the latents) *before* the expert is
 /// dropped, or MLX's lazy graph would keep the expert's weights referenced and freeing it would reclaim
-/// nothing — [`denoise_range`] already `eval`s the latents after every step, so by the time `use_high`
+/// nothing — [`denoise_expert_slice`] already `eval`s the latents after every step, so by the time `use_high`
 /// returns they are materialized and independent of the expert.
 ///
 /// Generic over the expert type `E` and threaded state `St` so a weight-free unit test can pin the
 /// never-co-resident property with a lightweight liveness witness — no GPU, no real weights — exactly as
-/// the resident/sequential parity rests on [`denoise_range`]. The load closures receive `&mut St` so
+/// the resident/sequential parity rests on [`denoise_expert_slice`]. The load closures receive `&mut St` so
 /// they can emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St`
 /// to advance the shared scheduler/latents.
 #[allow(clippy::too_many_arguments)]
