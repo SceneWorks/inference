@@ -297,16 +297,9 @@ fn compile_kolors_for_mode(
     }
     let steps = req.steps.unwrap_or(config::DEFAULT_STEPS) as usize;
     let raw_ref = pipeline::resolve_raw_reference(req).map_err(gen_core::Error::from)?;
-    let is_applicability_probe = req.prompt == "feature applicability probe"
-        && req.conditioning.is_empty()
-        && req.source_image.is_none()
-        && req.low_res_start.is_none()
-        && req.sampler.is_none()
-        && req.scheduler.is_none();
 
     let (sigmas, sampler_name): (Vec<f32>, &'static str) = if let Some(curated_name) =
         pipeline::curated_route(req.sampler.as_deref(), req.scheduler.as_deref())
-            .or(is_applicability_probe.then_some("euler"))
     {
         let solver = gen_core::sampling::Solver::from_name(curated_name)
             .unwrap_or(gen_core::sampling::Solver::Euler);

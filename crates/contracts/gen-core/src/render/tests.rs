@@ -1530,3 +1530,123 @@ fn single_pass_plans_keep_pass_zero_and_digest_binding() {
     }
     assert!(compiled.check_request(&descriptor(), &changed).is_err());
 }
+
+#[test]
+fn packed_image_plan_supports_multi_control_with_reference_in_any_order() {
+    let mut ctrl_ref_desc = descriptor();
+    ctrl_ref_desc.capabilities.conditioning = vec![
+        crate::ConditioningKind::Control,
+        crate::ConditioningKind::Reference,
+    ];
+
+    let ctrl_img_0 = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![11; 16 * 16 * 3],
+    };
+    let ctrl_img_1 = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![22; 16 * 16 * 3],
+    };
+    let ref_img = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![33; 16 * 16 * 3],
+    };
+    let c0 = Conditioning::Control {
+        image: ctrl_img_0,
+        kind: ControlKind::Canny,
+        scale: Some(0.8),
+    };
+    let c1 = Conditioning::Control {
+        image: ctrl_img_1,
+        kind: ControlKind::Depth,
+        scale: Some(0.6),
+    };
+    let r = Conditioning::Reference {
+        image: ref_img.clone(),
+        strength: Some(0.75),
+    };
+
+    let req_ref_first = GenerationRequest {
+        width: 16,
+        height: 16,
+        conditioning: vec![r.clone(), c0.clone(), c1.clone()],
+        ..Default::default()
+    };
+    let req_ref_mid = GenerationRequest {
+        conditioning: vec![c0.clone(), r.clone(), c1.clone()],
+        ..req_ref_first.clone()
+    };
+    let req_ref_last = GenerationRequest {
+        conditioning: vec![c0.clone(), c1.clone(), r.clone()],
+        ..req_ref_first.clone()
+    };
+
+    // Descriptor without Control + Reference capabilities must still refuse.
+    assert!(matches!(
+        RenderPlan::packed_image_trajectory(
+            &descriptor(),
+            &req_ref_first,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        ),
+        Err(Error::Unsupported(_))
+    ));
+
+    let plan = RenderPlan::packed_image_trajectory(
+        &ctrl_ref_desc,
+        &req_ref_first,
+        pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+    )
+    .expect("MultiControl + Reference must compile when descriptor accepts both");
+    assert!(plan.has_conditioning());
+    assert!(plan.check_request(&ctrl_ref_desc, &req_ref_first).is_ok());
+    assert!(plan.check_request(&ctrl_ref_desc, &req_ref_mid).is_ok());
+    assert!(plan.check_request(&ctrl_ref_desc, &req_ref_last).is_ok());
+
+    // Swapping control order must fail request binding.
+    let swapped_controls = GenerationRequest {
+        conditioning: vec![r.clone(), c1.clone(), c0.clone()],
+        ..req_ref_first.clone()
+    };
+    assert!(plan
+        .check_request(&ctrl_ref_desc, &swapped_controls)
+        .is_err());
+
+    // Mutating reference pixels must fail request binding.
+    let mut mutated_ref = req_ref_first.clone();
+    if let Conditioning::Reference { image, .. } = &mut mutated_ref.conditioning[0] {
+        image.pixels[0] ^= 1;
+    }
+    assert!(plan.check_request(&ctrl_ref_desc, &mutated_ref).is_err());
+
+    // Mutating control scale must fail request binding.
+    let mut mutated_scale = req_ref_first.clone();
+    if let Conditioning::Control { scale, .. } = &mut mutated_scale.conditioning[1] {
+        *scale = Some(0.5);
+    }
+    assert!(plan.check_request(&ctrl_ref_desc, &mutated_scale).is_err());
+
+    // Multiple references paired with multiple controls must still be refused.
+    let two_refs = GenerationRequest {
+        conditioning: vec![
+            r,
+            Conditioning::Reference {
+                image: ref_img,
+                strength: Some(0.5),
+            },
+            c0,
+            c1,
+        ],
+        ..req_ref_first
+    };
+    assert!(matches!(
+        RenderPlan::packed_image_trajectory(
+            &ctrl_ref_desc,
+            &two_refs,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}

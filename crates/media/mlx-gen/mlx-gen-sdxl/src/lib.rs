@@ -673,6 +673,58 @@ mod explicit_registry_tests {
             .expect("native MultiControlNet SDXL must compile a RenderPlan");
         assert_eq!(ctrl_plan.executed_steps(), 8);
 
+        // 3b. Native MultiControlNet + img2img Reference (in any conditioning order)
+        let ctrl_ref_req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Canny,
+                    scale: Some(0.8),
+                },
+                Conditioning::Reference {
+                    image: dummy_img.clone(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Depth,
+                    scale: Some(0.6),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        let ctrl_ref_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ctrl_spec, &ctrl_ref_req)
+            .unwrap()
+            .expect("native MultiControlNet + img2img Reference SDXL must compile a RenderPlan");
+        assert_eq!(ctrl_ref_plan.sampler(), "euler_ancestral");
+        assert!(
+            ctrl_ref_plan.executed_steps() > 0 && ctrl_ref_plan.executed_steps() < 8,
+            "MultiControlNet + Reference at strength=0.5 must trim the img2img step schedule"
+        );
+        let ctrl_ref_reordered = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: dummy_img.clone(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Canny,
+                    scale: Some(0.8),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Depth,
+                    scale: Some(0.6),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        assert!(ctrl_ref_plan
+            .check_request(&super::descriptor(), &ctrl_ref_reordered)
+            .is_ok());
+
         // 4. Native IP-Adapter
         let ip_spec = spec
             .clone()

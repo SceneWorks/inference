@@ -10,7 +10,7 @@
 //! refusal declared in [`DriverSupport`] without loading weights or running inference compute.
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::rc::Rc;
@@ -693,18 +693,20 @@ pub fn run_driver_slices<L, D: FamilyDriver<L> + ?Sized>(
 // =================================================================================================
 
 thread_local! {
-    /// Reentrancy depth for the current thread inside any [`GlobalRngTrajectoryGate`] acquisition.
+    /// Addresses of [`GlobalRngTrajectoryGate`] instances currently locked by this thread.
     /// Allows nested helpers on the owning thread (e.g., InstantID calling SDXL `seeded_prior`
-    /// followed by `denoise_ip_multi_control`) to stay inside one serialized trajectory without
-    /// self-deadlocking, while blocking every other thread until the outer trajectory finishes.
-    static GLOBAL_RNG_TRAJECTORY_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// followed by `denoise_ip_multi_control`) to re-enter the same gate without
+    /// self-deadlocking, while still acquiring the lock for any distinct gate instance and
+    /// blocking every other thread until the outer trajectory finishes.
+    static HELD_GATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Serializes whole trajectories (`seed → draws → materialization`) for providers that draw from
 /// a process-global RNG such as MLX's `mlx_rs::random::seed` / `random::normal` (`B3`, `PIPE-14`).
 ///
-/// Reentrant on the currently owning thread; cross-thread callers wait until the active trajectory
-/// finishes and materializes all draws, guaranteeing zero cross-request RNG interleaving.
+/// Reentrant on the currently owning thread for the same gate instance; cross-thread callers wait
+/// until the active trajectory finishes and materializes all draws, guaranteeing zero cross-request
+/// RNG interleaving.
 pub struct GlobalRngTrajectoryGate {
     lock: Mutex<()>,
 }
@@ -718,19 +720,24 @@ impl GlobalRngTrajectoryGate {
 
     /// Acquire a whole-trajectory lease on the calling thread.
     ///
-    /// Nested calls on the same owning thread increment a thread-local depth counter without
-    /// re-locking; any other thread blocks until the outermost lease drops.
+    /// Nested calls on the same owning thread for the same gate instance succeed without
+    /// re-locking; acquiring a distinct gate instance still locks that gate's mutex, and any
+    /// other thread blocks until the outermost lease drops.
     pub fn acquire(&self) -> GlobalRngTrajectoryLease<'_> {
-        let depth = GLOBAL_RNG_TRAJECTORY_DEPTH.get();
-        if depth > 0 {
-            GLOBAL_RNG_TRAJECTORY_DEPTH.set(depth + 1);
-            return GlobalRngTrajectoryLease { _guard: None };
+        let gate_addr = self as *const Self as usize;
+        let already_held = HELD_GATES.with(|gates| gates.borrow().contains(&gate_addr));
+        if already_held {
+            return GlobalRngTrajectoryLease {
+                gate_addr,
+                _guard: None,
+            };
         }
         // Recover from a poisoned mutex so a panic in one failed trajectory does not permanently
         // wedge unrelated subsequent requests (`PIPE-15`).
         let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        GLOBAL_RNG_TRAJECTORY_DEPTH.set(1);
+        HELD_GATES.with(|gates| gates.borrow_mut().push(gate_addr));
         GlobalRngTrajectoryLease {
+            gate_addr,
             _guard: Some(guard),
         }
     }
@@ -751,14 +758,22 @@ impl Default for GlobalRngTrajectoryGate {
 /// RAII lease returned by [`GlobalRngTrajectoryGate::acquire`]. `!Send` so the lock is always
 /// released on the thread that acquired it.
 pub struct GlobalRngTrajectoryLease<'a> {
+    gate_addr: usize,
     _guard: Option<MutexGuard<'a, ()>>,
 }
 
 impl Drop for GlobalRngTrajectoryLease<'_> {
     fn drop(&mut self) {
-        let depth = GLOBAL_RNG_TRAJECTORY_DEPTH.get();
-        debug_assert!(depth > 0, "global RNG trajectory depth underflow");
-        GLOBAL_RNG_TRAJECTORY_DEPTH.set(depth.saturating_sub(1));
+        if self._guard.is_some() {
+            HELD_GATES.with(|gates| {
+                let mut held = gates.borrow_mut();
+                if let Some(pos) = held.iter().rposition(|&addr| addr == self.gate_addr) {
+                    held.swap_remove(pos);
+                } else {
+                    debug_assert!(false, "global RNG trajectory gate address missing on drop");
+                }
+            });
+        }
     }
 }
 
@@ -1054,6 +1069,14 @@ pub mod conformance {
                         support.driver_id, st.stochastic_draw_index, draws_after_first
                     )));
                 }
+                if st.stochastic_draw_index != unsplit_state.stochastic_draw_index {
+                    return Err(Error::Msg(format!(
+                        "{}: Continue+Reset changed total stochastic_draw_index ({} != unsplit {})",
+                        support.driver_id,
+                        st.stochastic_draw_index,
+                        unsplit_state.stochastic_draw_index
+                    )));
+                }
                 if progress != expected_progress {
                     return Err(Error::Msg(format!(
                         "{}: Continue+Reset progress {:?} != expected {:?}",
@@ -1061,6 +1084,52 @@ pub mod conformance {
                     )));
                 }
                 verified_reset_preserves_draws = true;
+            } else {
+                // Must refuse Continue + Reset with typed Error::Unsupported.
+                let driver = (case.make_driver)();
+                let mut st = DriverRunState::new();
+                let mut on_progress = |_: Progress| {};
+                let mut hooks = StepHooks::new(&mut on_progress);
+                let mid = driver.run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..case.split_at,
+                        total_steps: case.total_steps,
+                        state: BoundaryState::XSigma((case.make_initial)()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: Some(case.base_geometry),
+                        seed: case.seed,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut st,
+                    &mut hooks,
+                )?;
+                let err = driver.run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 1,
+                        span: case.split_at..case.total_steps,
+                        total_steps: case.total_steps,
+                        state: mid,
+                        transition: SliceTransition::Continue,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: Some(case.base_geometry),
+                        seed: case.seed,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut st,
+                    &mut hooks,
+                );
+                if !matches!(err, Err(Error::Unsupported(_))) {
+                    return Err(Error::Msg(format!(
+                        "{}: expected typed Unsupported refusal for Continue+Reset when reset_history=false",
+                        support.driver_id
+                    )));
+                }
             }
         } else {
             // Must refuse a partial slice with typed Error::Unsupported.
@@ -1093,19 +1162,181 @@ pub mod conformance {
         }
 
         // 3. Read-only boundary estimate conformance (or typed refusal).
-        let driver = (case.make_driver)();
-        let mut st = DriverRunState::new();
-        let mut progress = Vec::new();
         let boundary_span = if support.arbitrary_slice {
             0..case.split_at
         } else {
             0..case.total_steps
         };
         let expected_boundary_ticks = boundary_span.len();
-        let boundary_res = {
-            let mut on_progress = |p: Progress| progress.push(p);
+        if support.read_only_boundary_estimate {
+            // Baseline run over `boundary_span` without requesting a boundary estimate so we can
+            // prove the boundary estimate is strictly read-only with respect to solver RNG draws,
+            // outer steps, history resets, observer/post-step hooks, and numerical solver history.
+            let baseline_driver = (case.make_driver)();
+            let mut baseline_state = DriverRunState::new();
+            let mut baseline_progress = Vec::new();
+            let mut baseline_observe_count = 0usize;
+            let mut baseline_post_step_count = 0usize;
+            let baseline_out = {
+                let mut on_progress = |p: Progress| baseline_progress.push(p);
+                let mut on_observe = |_info: &DriverStepInfo, _l: &L| {
+                    baseline_observe_count += 1;
+                    Ok(())
+                };
+                let mut on_post_step = |_info: &DriverStepInfo, l: L| {
+                    baseline_post_step_count += 1;
+                    Ok(l)
+                };
+                let mut hooks = StepHooks::new(&mut on_progress);
+                hooks.on_observe = Some(&mut on_observe);
+                hooks.on_post_step = Some(&mut on_post_step);
+                baseline_driver.run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: boundary_span.clone(),
+                        total_steps: case.total_steps,
+                        state: BoundaryState::XSigma((case.make_initial)()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: Some(case.base_geometry),
+                        seed: case.seed,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut baseline_state,
+                    &mut hooks,
+                )?
+            };
+
+            let driver = (case.make_driver)();
+            let mut st = DriverRunState::new();
+            let mut progress = Vec::new();
+            let mut boundary_observe_count = 0usize;
+            let mut boundary_post_step_count = 0usize;
+            let out = {
+                let mut on_progress = |p: Progress| progress.push(p);
+                let mut on_observe = |_info: &DriverStepInfo, _l: &L| {
+                    boundary_observe_count += 1;
+                    Ok(())
+                };
+                let mut on_post_step = |_info: &DriverStepInfo, l: L| {
+                    boundary_post_step_count += 1;
+                    Ok(l)
+                };
+                let mut hooks = StepHooks::new(&mut on_progress);
+                hooks.on_observe = Some(&mut on_observe);
+                hooks.on_post_step = Some(&mut on_post_step);
+                driver.run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: boundary_span,
+                        total_steps: case.total_steps,
+                        state: BoundaryState::XSigma((case.make_initial)()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: Some(case.base_geometry),
+                        seed: case.seed,
+                        cancel: &cancel,
+                        request_boundary_estimate: true,
+                    },
+                    &mut st,
+                    &mut hooks,
+                )?
+            };
+            if !matches!(out, BoundaryState::CleanEstimate { .. }) {
+                return Err(Error::Msg(format!(
+                    "{}: read_only_boundary_estimate=true must return BoundaryState::CleanEstimate",
+                    support.driver_id
+                )));
+            }
+            if progress.len() != expected_boundary_ticks || progress != baseline_progress {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate altered outer progress ({:?} != baseline {:?})",
+                    support.driver_id, progress, baseline_progress
+                )));
+            }
+            if st.boundary_evaluations == 0 {
+                return Err(Error::Msg(format!(
+                    "{}: read_only_boundary_estimate=true did not account boundary_evaluations",
+                    support.driver_id
+                )));
+            }
+            if st.stochastic_draw_index != baseline_state.stochastic_draw_index {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate consumed solver RNG draws ({} != baseline {})",
+                    support.driver_id,
+                    st.stochastic_draw_index,
+                    baseline_state.stochastic_draw_index
+                )));
+            }
+            if st.completed_outer_steps != baseline_state.completed_outer_steps {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate advanced completed_outer_steps ({} != baseline {})",
+                    support.driver_id,
+                    st.completed_outer_steps,
+                    baseline_state.completed_outer_steps
+                )));
+            }
+            if st.history_resets != baseline_state.history_resets {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate mutated history_resets ({} != baseline {})",
+                    support.driver_id, st.history_resets, baseline_state.history_resets
+                )));
+            }
+            if boundary_observe_count != baseline_observe_count {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate invoked on_observe ({} != baseline {})",
+                    support.driver_id, boundary_observe_count, baseline_observe_count
+                )));
+            }
+            if boundary_post_step_count != baseline_post_step_count {
+                return Err(Error::Msg(format!(
+                    "{}: boundary estimate invoked on_post_step ({} != baseline {})",
+                    support.driver_id, boundary_post_step_count, baseline_post_step_count
+                )));
+            }
+            if support.arbitrary_slice && support.carry_history {
+                // Continuing the rest of the pass from the baseline XSigma using `st` (which
+                // underwent the boundary estimate) must reproduce `unsplit_latent` bit-for-bit,
+                // proving the boundary estimate did not mutate carried solver history.
+                let mut cont_progress = Vec::new();
+                let continued_out = {
+                    let mut on_progress = |p: Progress| cont_progress.push(p);
+                    let mut hooks = StepHooks::new(&mut on_progress);
+                    driver.run_slice(
+                        SliceInput {
+                            pass: 0,
+                            phase: 1,
+                            span: case.split_at..case.total_steps,
+                            total_steps: case.total_steps,
+                            state: baseline_out,
+                            transition: SliceTransition::Continue,
+                            history: DriverHistoryPolicy::Carry,
+                            geometry: Some(case.base_geometry),
+                            seed: case.seed,
+                            cancel: &cancel,
+                            request_boundary_estimate: false,
+                        },
+                        &mut st,
+                        &mut hooks,
+                    )?
+                };
+                let continued_latent = extract_latent(continued_out);
+                if !(case.latents_equal)(&continued_latent, &unsplit_latent) {
+                    return Err(Error::Msg(format!(
+                        "{}: boundary estimate mutated carried solver history (continuation diverged from unsplit trajectory)",
+                        support.driver_id
+                    )));
+                }
+            }
+        } else {
+            let driver = (case.make_driver)();
+            let mut st = DriverRunState::new();
+            let mut on_progress = |_: Progress| {};
             let mut hooks = StepHooks::new(&mut on_progress);
-            driver.run_slice(
+            let boundary_res = driver.run_slice(
                 SliceInput {
                     pass: 0,
                     phase: 0,
@@ -1121,35 +1352,13 @@ pub mod conformance {
                 },
                 &mut st,
                 &mut hooks,
-            )
-        };
-        if support.read_only_boundary_estimate {
-            let out = boundary_res?;
-            if !matches!(out, BoundaryState::CleanEstimate { .. }) {
+            );
+            if !matches!(boundary_res, Err(Error::Unsupported(_))) {
                 return Err(Error::Msg(format!(
-                    "{}: read_only_boundary_estimate=true must return BoundaryState::CleanEstimate",
+                    "{}: expected typed Unsupported refusal when read_only_boundary_estimate=false",
                     support.driver_id
                 )));
             }
-            if progress.len() != expected_boundary_ticks {
-                return Err(Error::Msg(format!(
-                    "{}: boundary estimate emitted extra outer progress ({} != {})",
-                    support.driver_id,
-                    progress.len(),
-                    expected_boundary_ticks
-                )));
-            }
-            if st.boundary_evaluations == 0 {
-                return Err(Error::Msg(format!(
-                    "{}: read_only_boundary_estimate=true did not account boundary_evaluations",
-                    support.driver_id
-                )));
-            }
-        } else if !matches!(boundary_res, Err(Error::Unsupported(_))) {
-            return Err(Error::Msg(format!(
-                "{}: expected typed Unsupported refusal when read_only_boundary_estimate=false",
-                support.driver_id
-            )));
         }
 
         // 4. Renoise / Resample guards:
@@ -1593,5 +1802,308 @@ mod tests {
         assert_eq!(events[5].1, "materialize");
         assert_eq!(events[6].1, "seed");
         assert_eq!(events[11].1, "materialize");
+    }
+
+    #[test]
+    fn global_rng_trajectory_gate_keeps_distinct_gates_mutually_exclusive_across_threads() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let gate_a = Arc::new(GlobalRngTrajectoryGate::new());
+        let gate_b = Arc::new(GlobalRngTrajectoryGate::new());
+        let t2_inside_b = Arc::new(Barrier::new(2));
+        let t1_attempting_b = Arc::new(AtomicBool::new(false));
+        let active_in_b = Arc::new(AtomicUsize::new(0));
+        let max_in_b = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let t2_gate_b = Arc::clone(&gate_b);
+        let t2_barrier = Arc::clone(&t2_inside_b);
+        let t2_attempting = Arc::clone(&t1_attempting_b);
+        let t2_active = Arc::clone(&active_in_b);
+        let t2_max = Arc::clone(&max_in_b);
+        let t2_events = Arc::clone(&events);
+        let t2 = std::thread::spawn(move || {
+            t2_gate_b.run_trajectory(|| {
+                let now = t2_active.fetch_add(1, Ordering::SeqCst) + 1;
+                t2_max.fetch_max(now, Ordering::SeqCst);
+                t2_events.lock().unwrap().push("t2_enter_b");
+                // Synchronize once T2 definitely owns `gate_b` and T1 already owns `gate_a`.
+                t2_barrier.wait();
+                while !t2_attempting.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                for _ in 0..64 {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    t2_active.load(Ordering::SeqCst),
+                    1,
+                    "T1 holding gate_a must not bypass gate_b's mutex"
+                );
+                t2_events.lock().unwrap().push("t2_exit_b");
+                t2_active.fetch_sub(1, Ordering::SeqCst);
+            });
+        });
+
+        let t1_gate_a = Arc::clone(&gate_a);
+        let t1_gate_b = Arc::clone(&gate_b);
+        let t1_barrier = Arc::clone(&t2_inside_b);
+        let t1_attempting = Arc::clone(&t1_attempting_b);
+        let t1_active = Arc::clone(&active_in_b);
+        let t1_max = Arc::clone(&max_in_b);
+        let t1_events = Arc::clone(&events);
+        let t1 = std::thread::spawn(move || {
+            let lease_a = t1_gate_a.acquire();
+            t1_barrier.wait();
+            t1_attempting.store(true, Ordering::SeqCst);
+            let lease_b = t1_gate_b.acquire();
+            let now = t1_active.fetch_add(1, Ordering::SeqCst) + 1;
+            t1_max.fetch_max(now, Ordering::SeqCst);
+            t1_events.lock().unwrap().push("t1_enter_b");
+            // Re-entering `gate_b` on the owning thread remains non-deadlocking.
+            t1_gate_b.run_trajectory(|| {
+                t1_events.lock().unwrap().push("t1_reenter_b");
+            });
+            // Dropping `gate_a` before `gate_b` must keep `gate_b` locked and reentrant.
+            drop(lease_a);
+            t1_gate_b.run_trajectory(|| {
+                t1_events.lock().unwrap().push("t1_still_holds_b");
+            });
+            t1_events.lock().unwrap().push("t1_exit_b");
+            t1_active.fetch_sub(1, Ordering::SeqCst);
+            drop(lease_b);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(max_in_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "t2_enter_b",
+                "t2_exit_b",
+                "t1_enter_b",
+                "t1_reenter_b",
+                "t1_still_holds_b",
+                "t1_exit_b",
+            ]
+        );
+    }
+
+    #[test]
+    fn conformance_harness_catches_reset_draw_wipe_missing_reset_refusal_and_dirty_boundary_estimate(
+    ) {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            None,
+            WipeDrawsOnReset,
+            IgnoreResetRefusal,
+            BoundaryConsumesDraw,
+            BoundaryAdvancesOuterStep,
+            BoundaryInvokesObserve,
+            BoundaryInvokesPostStep,
+            BoundaryResetsHistory,
+            BoundaryMutatesHistory,
+        }
+
+        struct FaultyDriver {
+            support: DriverSupport,
+            fault: Fault,
+        }
+
+        impl FamilyDriver<Vec<f32>> for FaultyDriver {
+            fn support(&self) -> &DriverSupport {
+                &self.support
+            }
+
+            fn run_slice(
+                &self,
+                input: SliceInput<'_, Vec<f32>>,
+                state: &mut DriverRunState,
+                hooks: &mut StepHooks<'_, Vec<f32>>,
+            ) -> Result<BoundaryState<Vec<f32>>> {
+                if !(matches!(self.fault, Fault::IgnoreResetRefusal)
+                    && input.transition == SliceTransition::Continue
+                    && input.history == DriverHistoryPolicy::Reset)
+                {
+                    self.support.validate_slice(&input, state)?;
+                }
+                state.enter_slice(&input)?;
+                if matches!(self.fault, Fault::WipeDrawsOnReset)
+                    && input.transition == SliceTransition::Continue
+                    && input.history == DriverHistoryPolicy::Reset
+                {
+                    state.stochastic_draw_index = 0;
+                }
+                let mut latent = match input.state {
+                    BoundaryState::XSigma(x)
+                    | BoundaryState::CleanEstimate { latent: x, .. }
+                    | BoundaryState::RouteSpecific { state: x, .. } => x,
+                };
+                let mut acc = state.take_history::<f32>().unwrap_or(0.0);
+                for step in input.span.clone() {
+                    if input.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    let info = DriverStepInfo {
+                        pass: input.pass,
+                        phase: input.phase,
+                        outer_step: step,
+                        total_outer_steps: input.total_steps,
+                        eval_in_step: 0,
+                        kind: DriverEvaluationKind::Trajectory,
+                        sigma: (input.total_steps - step) as f32,
+                        next_sigma: (input.total_steps - step - 1) as f32,
+                    };
+                    hooks.observe(&info, &latent)?;
+                    state.record_evaluation(DriverEvaluationKind::Trajectory);
+                    let draw_idx = state.next_draw_index();
+                    acc += 0.1 * (step as f32 + 1.0);
+                    for x in &mut latent {
+                        *x = *x * 0.9 + acc * 0.01 + (draw_idx as f32) * 1e-4;
+                    }
+                    latent = hooks.post_step(&info, latent)?;
+                    state.record_outer_step(step);
+                    hooks.emit_progress(&info);
+                }
+                state.set_history(acc);
+                state.finish_slice(input.span.end);
+
+                if input.request_boundary_estimate {
+                    state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                    let fake_traj_info = DriverStepInfo {
+                        pass: input.pass,
+                        phase: input.phase,
+                        outer_step: input.span.end,
+                        total_outer_steps: input.total_steps,
+                        eval_in_step: 0,
+                        kind: DriverEvaluationKind::Trajectory,
+                        sigma: 0.0,
+                        next_sigma: 0.0,
+                    };
+                    match self.fault {
+                        Fault::BoundaryConsumesDraw => {
+                            let _ = state.next_draw_index();
+                        }
+                        Fault::BoundaryAdvancesOuterStep => {
+                            state.record_outer_step(input.span.end);
+                        }
+                        Fault::BoundaryInvokesObserve => {
+                            hooks.observe(&fake_traj_info, &latent)?;
+                        }
+                        Fault::BoundaryInvokesPostStep => {
+                            latent = hooks.post_step(&fake_traj_info, latent)?;
+                        }
+                        Fault::BoundaryResetsHistory => {
+                            state.reset_history();
+                        }
+                        Fault::BoundaryMutatesHistory => {
+                            state.set_history(acc + 42.0);
+                        }
+                        _ => {}
+                    }
+                    return Ok(BoundaryState::CleanEstimate {
+                        latent,
+                        source: crate::EstimateSource::EndpointEvaluation,
+                    });
+                }
+                Ok(BoundaryState::XSigma(latent))
+            }
+        }
+
+        let base_support = DriverSupport {
+            driver_id: "faulty_driver",
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: true,
+            geometry_change: true,
+            read_only_boundary_estimate: true,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons::default(),
+        };
+
+        let run_case = |support: DriverSupport, fault: Fault| {
+            verify_driver_conformance(ConformanceCase {
+                total_steps: 4,
+                split_at: 2,
+                seed: 7,
+                base_geometry: (512, 512),
+                alt_geometry: (1024, 1024),
+                make_driver: move || {
+                    Box::new(FaultyDriver {
+                        support: support.clone(),
+                        fault,
+                    })
+                },
+                make_initial: || vec![1.0, -0.5, 0.25, 0.75],
+                latents_equal: |a, b| {
+                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+                },
+            })
+        };
+
+        // Sanity: clean driver passes, including when `reset_history=false` with proper refusal.
+        assert!(run_case(base_support.clone(), Fault::None).is_ok());
+        let no_reset_support = DriverSupport {
+            reset_history: false,
+            ..base_support.clone()
+        };
+        let no_reset_report =
+            run_case(no_reset_support.clone(), Fault::None).expect("typed refusal should pass");
+        assert!(!no_reset_report.verified_reset_preserves_draws);
+
+        // Every injected fault must be caught by `verify_driver_conformance`.
+        for (support, fault, expected_fragment) in [
+            (
+                base_support.clone(),
+                Fault::WipeDrawsOnReset,
+                "stochastic_draw_index",
+            ),
+            (
+                no_reset_support,
+                Fault::IgnoreResetRefusal,
+                "Continue+Reset",
+            ),
+            (
+                base_support.clone(),
+                Fault::BoundaryConsumesDraw,
+                "consumed solver RNG draws",
+            ),
+            (
+                base_support.clone(),
+                Fault::BoundaryAdvancesOuterStep,
+                "completed_outer_steps",
+            ),
+            (
+                base_support.clone(),
+                Fault::BoundaryInvokesObserve,
+                "on_observe",
+            ),
+            (
+                base_support.clone(),
+                Fault::BoundaryInvokesPostStep,
+                "on_post_step",
+            ),
+            (
+                base_support.clone(),
+                Fault::BoundaryResetsHistory,
+                "history_resets",
+            ),
+            (
+                base_support,
+                Fault::BoundaryMutatesHistory,
+                "carried solver history",
+            ),
+        ] {
+            let err = run_case(support, fault).expect_err("injected fault must fail conformance");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_fragment),
+                "expected error mentioning {expected_fragment:?}, got {msg:?}"
+            );
+        }
     }
 }

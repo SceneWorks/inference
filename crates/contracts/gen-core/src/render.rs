@@ -274,6 +274,10 @@ enum PackedImageConditioning {
         scale_bits: Option<u32>,
         reference: ReferenceImageInput,
     },
+    MultiControlWithReference {
+        controls: Vec<ControlImageInput>,
+        reference: ReferenceImageInput,
+    },
     Inpaint {
         reference: ReferenceImageInput,
         mask: MaskImageInput,
@@ -397,6 +401,49 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                     });
                 }
                 PackedImageConditioning::MultiControl { controls }
+            }
+            items
+                if items.len() > 2
+                    && items.iter().all(|c| {
+                        matches!(
+                            c,
+                            Conditioning::Control { .. } | Conditioning::Reference { .. }
+                        )
+                    })
+                    && items
+                        .iter()
+                        .filter(|c| matches!(c, Conditioning::Reference { .. }))
+                        .count()
+                        == 1 =>
+            {
+                let mut controls = Vec::with_capacity(items.len() - 1);
+                let mut reference = None;
+                for c in items {
+                    match c {
+                        Conditioning::Control { image, kind, scale } => {
+                            controls.push(ControlImageInput {
+                                width: image.width,
+                                height: image.height,
+                                pixels_sha256: image_digest(image)?,
+                                kind: control_kind_key(kind),
+                                scale_bits: scale.map(f32::to_bits),
+                            });
+                        }
+                        Conditioning::Reference { image, strength } => {
+                            reference = Some(ReferenceImageInput {
+                                width: image.width,
+                                height: image.height,
+                                pixels_sha256: image_digest(image)?,
+                                strength_bits: strength.map(f32::to_bits),
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                PackedImageConditioning::MultiControlWithReference {
+                    controls,
+                    reference: reference.expect("guard ensures one Reference"),
+                }
             }
             items
                 if items.iter().all(|c| {
@@ -828,6 +875,7 @@ impl RenderPlan {
                 ));
             }
             PackedImageConditioning::ControlWithReference { .. }
+            | PackedImageConditioning::MultiControlWithReference { .. }
                 if !(descriptor
                     .capabilities
                     .accepts(crate::ConditioningKind::Control)
