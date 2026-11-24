@@ -24,7 +24,7 @@ from scripts.ci import video_tier1_followup as followup
 from scripts.ci import video_tier1_cuda_diagnostic as targeted
 from scripts.ci.wan_pair import production_timing
 from scripts.ci.flux1_pair.fixture import sha
-from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.model_proof_resources import choose_card, executed_card_policy, execution_claim, planned_card_policy
 from scripts.media_campaign_supervisor import load_policy, runtime_guarded_admission, validate_admission
 
 BASE = "38dab65f5d9640396cf2946cd4ee866ce46630c6"
@@ -142,7 +142,7 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
         extra_contract = {"followup": extension, "controller_revision": head, "controller_tree": source["tree"]}
     with TemporaryDirectory() as directory:
         path = Path(directory) / "policy.json"
-        proof.write_json(path, value["policy"])
+        proof.write_json(path, planned_card_policy(value["policy"]))
         policy = load_policy(path)
     if (policy.backend != proof.POLICY_BACKENDS[backend] or policy.deadline_seconds > 180
             or policy.child_footprint_cap_bytes > 20 * GIB or policy.poll_millis > 250
@@ -530,7 +530,14 @@ def execute(args, contract):
     proof.unlinked_path(work, temporary)
     work.mkdir()
     try:
-        policy = read_policy(work, "policy.json", contract["request"]["policy"])
+        # A request that names no card runs on the registered card with the most free memory that
+        # fits (GPU 0 when its follow-up is bound to GPU 0).
+        payload, selection = choose_card(
+            contract["request"]["policy"], work,
+            named=targeted.GPU0_HARDWARE["uuid"] if contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS else None)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
+        policy = read_policy(work, "policy.json", payload)
         receipt["hardware"] = paired.hardware(backend, policy)
         adapter = None
         if backend == "candle-cuda":
@@ -557,7 +564,7 @@ def execute(args, contract):
         claim_dir = work / "claim"
         claim_dir.mkdir()
         budget = contract["claim_budget_seconds"]
-        claim_policy = read_policy(claim_dir, "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
+        claim_policy = read_policy(claim_dir, "policy.json", dict(payload, deadlineSeconds=budget))
         deadline = time.monotonic() + budget
         last_start = deadline - policy.deadline_seconds - contract["release_reserve_seconds"]
         lease_env = builds["base"][2]
@@ -882,6 +889,10 @@ def verify(args, contract):
             or receipt.get("run_id") != os.environ["GITHUB_RUN_ID"]
             or receipt.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
         raise ValueError("video comparison artifact contract/run mismatch")
+    # Replay against the policy the comparison ran under: the request's, or for a card-free
+    # request the card its recorded selection chose.
+    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"))
+    contract = dict(contract, request=dict(contract["request"], policy=executed))
     backend = contract["backend"]
     entries = log_entries(contract)
     logs = receipt["logs"]

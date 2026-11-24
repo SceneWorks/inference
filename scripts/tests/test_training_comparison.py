@@ -35,6 +35,25 @@ class ComparisonContract(unittest.TestCase):
                                  'deadlineSeconds':plan['case_deadline_seconds']},
                       'training_comparison': {k: plan[k] for k in ('protocol', 'stages', 'max_physical_updates')}}
 
+    def test_a_card_free_comparison_runs_the_registered_recipe_of_the_card_it_selects(self):
+        base, named = self.request()
+        free = dict(named, configuration=comparison.CARD_FREE_RECIPE,
+                    policy={k: v for k, v in named['policy'].items() if k != 'cudaDeviceUuid'})
+        self.assertTrue(comparison.is_card_free(free))
+        self.assertFalse(comparison.is_card_free(named))
+        self.assertEqual(comparison.planning_configuration(free), 'fixed_cuda_comparison_gpu0')
+        plan = comparison.validate_request((base,), free, 'candle-cuda')
+        self.assertEqual((plan['cuda_uuid'], plan['physical_index']), (None, None))
+        gpu1_uuid = comparison.DEVICES['gpu1'][0]
+        concrete = comparison.concrete_request(free, gpu1_uuid)
+        gpu1 = proof.configured_case(self.cases['sdxl'], 'fixed_cuda_comparison_gpu1')
+        self.assertEqual((concrete['configuration'], concrete['policy']['cudaDeviceUuid']),
+                         ('fixed_cuda_comparison_gpu1', gpu1_uuid))
+        self.assertEqual(comparison.validate_request((gpu1,), concrete, 'candle-cuda')['cuda_uuid'], gpu1_uuid)
+        # A card-free configuration with a named card, or a named configuration without one, is refused.
+        with self.assertRaises(ValueError):
+            comparison.validate_request((base,), dict(free, policy=named['policy']), 'candle-cuda')
+
     def fixture(self, row):
         plan = comparison.spec(row)
         stage, n, warm = row['training_comparison_stage'], plan['updates_per_stage'], plan['warmups_per_stage']

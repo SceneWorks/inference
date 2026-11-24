@@ -24,6 +24,9 @@ DEVICES = {
     'gpu1': ('GPU-e4b79931-7be6-f216-460a-f5405cfafffe', 1),
 }
 RECIPES = {f'fixed_cuda_comparison_{name}': name for name in DEVICES}
+# A request naming this configuration and a policy with no card runs on whichever registered card
+# has the most free memory that fits, through that card's own registered recipe.
+CARD_FREE_RECIPE = 'fixed_cuda_comparison'
 SHA = re.compile(r'[0-9a-f]{64}')
 
 
@@ -136,6 +139,26 @@ def is_recipe(name: object) -> bool:
     return name in RECIPES if isinstance(name, str) else False
 
 
+def is_card_free(value: dict) -> bool:
+    from scripts.ci.model_proof_resources import card_free_policy
+    return value.get('configuration') == CARD_FREE_RECIPE and card_free_policy(value.get('policy'))
+
+
+def recipe_for(uuid: str) -> str:
+    """The registered comparison recipe that runs on physical card `uuid`."""
+    return next(name for name, binding in RECIPES.items() if DEVICES[binding][0] == uuid)
+
+
+def planning_configuration(value: dict):
+    """The configuration a card-free request is planned and validated under (its first card's recipe)."""
+    return recipe_for(DEVICES['gpu0'][0]) if is_card_free(value) else value.get('configuration')
+
+
+def concrete_request(value: dict, uuid: str) -> dict:
+    """A card-free request bound to card `uuid`: that card's recipe and policy."""
+    return dict(value, configuration=recipe_for(uuid), policy=dict(value['policy'], cudaDeviceUuid=uuid))
+
+
 def recipe_binding(row: dict, name: str, recipe: dict) -> tuple[str, int]:
     plan = spec(row)
     binding = RECIPES.get(name)
@@ -154,6 +177,10 @@ def recipe_binding(row: dict, name: str, recipe: dict) -> tuple[str, int]:
 
 
 def validate_request(rows: tuple[dict, ...], value: dict, backend: str) -> dict:
+    if is_card_free(value):
+        from scripts.ci.model_proof_resources import CARD_SELECTION_RULE
+        plan = validate_request(rows, concrete_request(value, DEVICES['gpu0'][0]), backend)
+        return {**plan, 'device_binding': CARD_SELECTION_RULE, 'cuda_uuid': None, 'physical_index': None}
     if backend != 'candle-cuda' or len(rows) != 1 or not is_recipe(value.get('configuration')):
         raise ValueError('comparison requires one exact CUDA training case and reviewed comparison recipe')
     row = rows[0]
@@ -526,7 +553,7 @@ def _inventory(root: Path) -> dict:
     return result
 
 
-def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path) -> int:
+def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path, *, rows_for=None) -> int:
     from scripts.ci import model_inference_proofs as proof
     # This clock starts before discovery/compilation/admission of the first child.
     # All readiness waits and subsequent children consume this SAME budget.
@@ -546,6 +573,14 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                'terminal_model_evidence': False}
     receipt['comparison_started_monotonic'] = started
     receipt['comparison_deadline_monotonic'] = started + value['policy']['deadlineSeconds']
+    if is_card_free(value):
+        # Run every stage on the registered card with the most free memory that fits, under
+        # that card's own registered recipe.
+        from scripts.ci.model_proof_resources import choose_card
+        chosen, receipt['cuda_card_selection'] = choose_card(value['policy'], work)
+        value = concrete_request(value, chosen['cudaDeviceUuid'])
+        rows = rows_for(chosen['cudaDeviceUuid'])
+        validate_request(rows, value, backend)
     results = []
     inherited_target = os.environ.get('CARGO_TARGET_DIR')
     # One fresh owned compile namespace for the whole model comparison. Later
@@ -609,7 +644,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
 
 
 def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
-                     rows: tuple[dict, ...], backend: str) -> dict:
+                     rows: tuple[dict, ...], backend: str, *, rows_for=None) -> dict:
     from scripts.ci import model_inference_proofs as proof
     plan = validate_request(rows, value, backend)
     proof.unlinked_path(output, temporary)
@@ -625,6 +660,15 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             or receipt.get('acceptance_scope') != 'controlled-training-timing-supplement'
             or any(receipt.get(k) is not False for k in ('checkpoint_byte_integrity_attested', 'verified_named_revision', 'terminal_model_evidence'))):
         raise ValueError('comparison source/request/plan binding mismatch')
+    from scripts.ci.model_proof_resources import executed_card_policy
+    if is_card_free(value):
+        # Replay against the card the comparison's recorded most-free selection chose.
+        executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'))
+        value = concrete_request(value, executed['cudaDeviceUuid'])
+        rows = rows_for(executed['cudaDeviceUuid'])
+        validate_request(rows, value, backend)
+    elif 'cuda_card_selection' in receipt:
+        raise ValueError('a named-card comparison records no card selection')
     records = receipt.get('stage_records')
     original_start = receipt.get('comparison_started_monotonic')
     original_deadline = receipt.get('comparison_deadline_monotonic')

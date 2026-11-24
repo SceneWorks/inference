@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as base
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import conditional, conditional_evidence as evidence, conditional_probe, fixture, overlay
-from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
+from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
+                                              executed_card_policy, execution_claim, planned_card_policy)
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = overlay.BASE
@@ -108,7 +109,7 @@ def plan(backend, value, head, tier):
         raise ValueError("resource policy differs from conditional lane")
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.json"
-        base.write(path, value["policy"])
+        base.write(path, planned_card_policy(value["policy"]))
         policy = load_policy(path)
         caps = case_caps(backend, value["case"], policy)
     source = proof.repository_identity(head)
@@ -245,8 +246,12 @@ def execute(args, contract):
         receipt["fixture"] = fixture.snapshot_identity(snapshot, variant, "tier1")
         if eng4b:
             verify_pinned_inputs(receipt, contract)
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(contract["request"]["policy"], work)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
         policy_path = work / "policy.json"
-        base.write(policy_path, contract["request"]["policy"])
+        base.write(policy_path, payload)
         policy = load_policy(policy_path)
         receipt["hardware"] = base.hardware(backend, policy)
         exes, environments = {}, {}
@@ -271,7 +276,7 @@ def execute(args, contract):
         claim_deadline = last_child_start = None
         if backend == "candle-cuda":
             budget, reserve = cuda_claim_budget(policy, contract["tier"])
-            base.write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
+            base.write(claim_dir / "policy.json", dict(payload, deadlineSeconds=budget))
             claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
@@ -395,6 +400,8 @@ def verify(args, contract):
                     or not all(re.fullmatch(r"[0-9a-f]{64}", build[key])
                                for key in ("overlay_sha256", "binary_sha256"))):
                 raise ValueError("conditional receipt source, overlay or executable identity mismatch")
+    # A card-free request ran on the card its recorded selection chose; a named card records none.
+    executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"))
     allowed = {"receipt.json"}
     limits = {phase + "." + suffix: cap for phase in phases(contract["tier"])
               for suffix, cap in base.retained_log_limits(contract["request"]["policy"]).items()}

@@ -23,6 +23,7 @@ from scripts.ci import wan_adapter_tier1_fixture as wan
 from scripts.ci import z_image_tier1_fixture as z_image
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.model_proof_resources import choose_card, executed_card_policy, planned_card_policy
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
@@ -47,14 +48,16 @@ PROOF_BIN = "sw-sga-adapter-pair"
 
 def request_value(backend, value):
     keys = {"selection", "profile", "download_missing"}
+    # A CUDA request may name its card (cuda_device_uuid) or leave it to the most-free selection.
     route_key = "runner" if backend == "mlx" else "cuda_device_uuid"
-    if (not isinstance(value, dict) or set(value) != keys | {route_key}
+    if (not isinstance(value, dict)
+            or not (set(value) == keys | {route_key} or (backend == "candle-cuda" and set(value) == keys))
             or value["selection"] != "sga-adapter-tier1" or value["download_missing"] is not True
             or not isinstance(value["profile"], str) or (backend, value["profile"]) not in PROFILES):
         raise ValueError("select one registered backend/adapter profile with download_missing=true")
     if backend == "mlx" and value["runner"] != "nax":
         raise ValueError("adapter comparison requires its secondary MLX runner label")
-    if backend == "candle-cuda" and (not isinstance(value["cuda_device_uuid"], str) or not re.fullmatch(
+    if backend == "candle-cuda" and "cuda_device_uuid" in value and (not isinstance(value["cuda_device_uuid"], str) or not re.fullmatch(
             r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value["cuda_device_uuid"]
     )):
         raise ValueError("adapter comparison requires the exact physical CUDA device UUID")
@@ -64,8 +67,8 @@ def request_value(backend, value):
 def policy_value(backend, request):
     if backend == "mlx":
         return POLICY
-    return dict(POLICY, backend="windows-cuda", cudaDeviceUuid=request["cuda_device_uuid"],
-                gpuFreeReserveBytes=2 * GIB, childGpuCapBytes=12 * GIB)
+    named = {"cudaDeviceUuid": request["cuda_device_uuid"]} if "cuda_device_uuid" in request else {}
+    return dict(POLICY, backend="windows-cuda", **named, gpuFreeReserveBytes=2 * GIB, childGpuCapBytes=12 * GIB)
 
 
 def plan(backend, value, head):
@@ -77,7 +80,7 @@ def plan(backend, value, head):
     with TemporaryDirectory(prefix="sga-adapter-policy-") as directory:
         policy_path = Path(directory) / "policy.json"
         policy = policy_value(backend, value)
-        proof.write_json(policy_path, policy)
+        proof.write_json(policy_path, planned_card_policy(policy))
         load_policy(policy_path)
     baseline_tree = paired.git(ROOT, "rev-parse", BASE + "^{tree}")
     runner = proof.NAX_ROUTES["nax"]["labels"] if backend == "mlx" else proof.RUNNERS[backend]
@@ -237,8 +240,12 @@ def execute(args, contract):
             raise ValueError("adapter comparison baseline checkout differs from the workflow pin")
         fixture = work / "fixture"
         receipt["fixture_sha256"] = profile.materialize(fixture)
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(contract["policy"], work)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
         policy_path = work / "policy.json"
-        proof.write_json(policy_path, contract["policy"])
+        proof.write_json(policy_path, payload)
         policy = load_policy(policy_path)
         receipt["hardware"] = paired.hardware(backend, policy)
         env.update(CARGO_INCREMENTAL="0", PAIR_SGA_FIXTURE=str(fixture))
@@ -261,7 +268,7 @@ def execute(args, contract):
         if backend == "candle-cuda":
             reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
             budget = (len(ARMS) + 1) * policy.deadline_seconds + reserve
-            proof.write_json(claim_dir / "policy.json", dict(contract["policy"], deadlineSeconds=budget))
+            proof.write_json(claim_dir / "policy.json", dict(payload, deadlineSeconds=budget))
             claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
@@ -275,10 +282,10 @@ def execute(args, contract):
                     guard, stdout = paired.invoke(binary, work / arm, run, arm_env, policy, env,
                                                   last_child_start=last_child_start)
                     observation = asdict(guard)
-                    validate_guard(observation, contract["policy"])
+                    validate_guard(observation, payload)
                     if backend == "candle-cuda":
                         validate_cuda_pool(bounded_owned_file(run / "cuda-pool.json", work, 4096),
-                                           observation, contract["policy"])
+                                           observation, payload)
                     result = bounded_owned_file(run / "result.json", work, RESULT_LIMIT)
                     observations[arm] = profile.observe(stdout, result, backend)
                 finally:
@@ -312,6 +319,8 @@ def verify(args, contract):
             or type(row.get("accepted")) is not bool):
         raise ValueError("proof receipt does not match the current plan and attempt")
     backend = contract["backend"]
+    # The policy the comparison ran under: a card-free request's recorded most-free card.
+    executed = executed_card_policy(contract["policy"], row.get("cuda_card_selection"))
     limits = log_limits(backend)
     files = row["files"]
     if {entry.name for entry in args.output.iterdir()} != {"receipt.json", *files}:
@@ -339,11 +348,11 @@ def verify(args, contract):
         if not {arm + "." + suffix for suffix in ("stdout.log", "stderr.log", "result.json", "supervisor.json")} <= files.keys():
             raise ValueError("accepted comparison lacks complete guarded child evidence")
         guard = json.loads((args.output / f"{arm}.supervisor.json").read_text(encoding="utf-8"))
-        validate_guard(guard, contract["policy"])
+        validate_guard(guard, executed)
         if backend == "candle-cuda":
             if f"{arm}.cuda-pool.json" not in files:
                 raise ValueError("accepted comparison is missing its owned CUDA allocation receipt")
-            validate_cuda_pool(args.output / f"{arm}.cuda-pool.json", guard, contract["policy"])
+            validate_cuda_pool(args.output / f"{arm}.cuda-pool.json", guard, executed)
         proof_rows.append(profile.observe((args.output / f"{arm}.stdout.log").read_text(encoding="utf-8"),
                                           args.output / f"{arm}.result.json", backend))
     if (compiler_identity(row["arms"]["base"]) != compiler_identity(row["arms"]["head"])

@@ -22,7 +22,8 @@ from scripts.ci import stage_pinned_hub_snapshots as hub_snapshots
 from scripts.ci.flux1_conditional_asset_inventory import confined, fetch_pinned
 from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
-from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
+from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
+                                              executed_card_policy, execution_claim, planned_card_policy)
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
@@ -114,7 +115,7 @@ def plan(backend, value, head, tier):
         raise ValueError("resource policy differs from lane")
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.json"
-        write(path, value["policy"])
+        write(path, planned_card_policy(value["policy"]))
         policy = load_policy(path)
         deadline = performance.MAX_CHILD_SECONDS if measured else 1200
         if policy.deadline_seconds > deadline or policy.child_footprint_cap_bytes > 24 * 1024**3:
@@ -454,8 +455,12 @@ def execute(args, contract):
             raise ValueError("ENG-4b baseline tree differs from the reviewed merge")
         paths, receipt["fixtures"] = snapshots(
             work, tier, download_missing=contract["request"].get("download_missing", False))
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(contract["request"]["policy"], work)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
         policy_path = work / "policy.json"
-        write(policy_path, contract["request"]["policy"])
+        write(policy_path, payload)
         policy = load_policy(policy_path)
         receipt["hardware"] = hardware(backend, policy)
         # Both executables finish linking before either arm's first render.
@@ -489,7 +494,7 @@ def execute(args, contract):
         claim_deadline = last_child_start = None
         if backend == "candle-cuda":
             budget, reserve = cuda_claim_budget(policy, tier)
-            write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
+            write(claim_dir / "policy.json", dict(payload, deadlineSeconds=budget))
             claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
@@ -622,6 +627,8 @@ def verify(args, contract):
             allowed.add(name)
     if {p.name for p in args.output.iterdir()} != allowed:
         raise ValueError("unexpected upload file")
+    # A card-free request ran on the card its recorded selection chose; a named card records none.
+    executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"))
     if completed:
         if not r["physical_claim"]["post_execution_verified"]:
             raise ValueError("unreleased accepted comparison")
@@ -642,7 +649,7 @@ def verify(args, contract):
 def read_measured_sample(receipt, name, variant, arm, directory, *, published=False):
     preflight = receipt["preflight"][preflight_key(ENG4B_REAL, arm, variant)]
     reference = receipt["arms"][arm]["renders"][variant]
-    policy = receipt["request"]["policy"]
+    policy = executed_card_policy(receipt["request"]["policy"], receipt.get("cuda_card_selection"))
     limits = retained_phase_limits(name, policy)
 
     def read(suffix):

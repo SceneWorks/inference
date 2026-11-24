@@ -698,20 +698,12 @@ def request(raw: str, backend: str) -> dict:
 def executed_policy(receipt: dict, value: dict) -> dict:
     """The resource policy a proof ran under: the request's own, or for a card-free request the
     request's policy with the registered card the producer selected (and recorded)."""
-    from scripts.ci.model_proof_resources import card_free_policy, REGISTERED_CUDA_CARDS, CARD_SELECTION_RULE
-    if not card_free_policy(value['policy']):
-        if 'cuda_card_selection' in receipt or 'request_resource_policy' in receipt:
-            raise ValueError('a named-card proof records no card selection')
-        return value['policy']
-    selection = receipt.get('cuda_card_selection')
-    chosen = selection.get('chosen_uuid') if isinstance(selection, dict) else None
-    fitting = [card for card in selection.get('cards', []) if 'refusal' not in card] if isinstance(selection, dict) else []
-    if (receipt.get('request_resource_policy') != value['policy'] or chosen not in REGISTERED_CUDA_CARDS
-            or selection.get('rule') != CARD_SELECTION_RULE
-            or selection.get('chosen_index') != REGISTERED_CUDA_CARDS[chosen]
-            or not fitting or chosen != max(fitting, key=lambda card: (card['free_mib'], -card['index']))['uuid']):
+    from scripts.ci.model_proof_resources import card_free_policy, executed_card_policy
+    if card_free_policy(value['policy']) and receipt.get('request_resource_policy') != value['policy']:
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
-    return dict(value['policy'], cudaDeviceUuid=chosen)
+    if not card_free_policy(value['policy']) and 'request_resource_policy' in receipt:
+        raise ValueError('a named-card proof records no card selection')
+    return executed_card_policy(value['policy'], receipt.get('cuda_card_selection'))
 
 
 def command(row: dict, discover: bool) -> list[str]:
@@ -1312,8 +1304,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     sys.path.insert(0, str(ROOT))
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
     from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, metadata_policy_payload,
-                                                  execution_claim, card_free_policy, select_cuda_card,
-                                                  REGISTERED_CUDA_CARDS)
+                                                  execution_claim, card_free_policy, choose_card)
     policy_payload, card_selection = value['policy'], None
     if card_free_policy(policy_payload):
         # The request names no card: run on the registered card with the most free memory that
@@ -1323,14 +1314,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         named = {row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}
         if len(named) > 1:
             raise ValueError('selected cases name different CUDA cards; request one card explicitly')
-        candidates = {}
-        for uuid in sorted(named or REGISTERED_CUDA_CARDS):
-            candidate_path = work / f'candidate-policy-{uuid}.json'
-            write_json(candidate_path, dict(policy_payload, cudaDeviceUuid=uuid))
-            candidates[uuid] = load_policy(candidate_path)
-        chosen, card_selection = select_cuda_card(
-            candidates, time.monotonic() + next(iter(candidates.values())).deadline_seconds)
-        policy_payload = dict(policy_payload, cudaDeviceUuid=chosen)
+        policy_payload, card_selection = choose_card(policy_payload, work, named=next(iter(named), None))
     policy_path = work / 'policy.json'
     write_json(policy_path, policy_payload)
     policy = load_policy(policy_path)
@@ -1902,16 +1886,25 @@ def main() -> int:
             value = request(raw, args.backend)
         if 'sensenova_source_sha' in value and value['sensenova_source_sha'] != args.expected_sha:
             raise ValueError('dispatched inference SHA differs from the requested SenseNova source')
-        rows = select(load_registry(args.registry), value['selection'], args.backend, value.get('configuration'))
+        rows = select(load_registry(args.registry), value['selection'], args.backend,
+                      training_comparison.planning_configuration(value))
         multi_cuda.bind_rows(rows, value, args.backend)
         comparison_plan = None
-        if 'training_comparison' in value or training_comparison.is_recipe(value.get('configuration')):
+        # A card-free comparison runs the registered recipe of whichever card its selection chooses.
+        comparison_rows = lambda uuid: select(load_registry(args.registry), value['selection'], args.backend,
+                                              training_comparison.recipe_for(uuid))
+        if ('training_comparison' in value or training_comparison.is_recipe(value.get('configuration'))
+                or training_comparison.is_card_free(value)):
             comparison_plan = training_comparison.validate_request(rows, value, args.backend)
         if args.verify_artifacts:
             if args.output is None:
                 raise ValueError('owned evidence output is required')
-            verifier = training_comparison.verify_artifacts if comparison_plan else verify_artifacts
-            print(json.dumps(verifier(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend)))
+            if comparison_plan:
+                print(json.dumps(training_comparison.verify_artifacts(
+                    args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend,
+                    rows_for=comparison_rows)))
+            else:
+                print(json.dumps(verify_artifacts(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend)))
             return 0
         if args.plan:
             for row in rows:
@@ -1919,12 +1912,11 @@ def main() -> int:
             repository_identity(args.expected_sha)
             sys.path.insert(0, str(ROOT))
             from scripts.media_campaign_supervisor import load_policy
-            from scripts.ci.model_proof_resources import card_free_policy, REGISTERED_CUDA_CARDS
+            from scripts.ci.model_proof_resources import card_free_policy, planned_card_policy
             with tempfile.TemporaryDirectory(prefix='model-proof-policy-') as directory:
                 path = Path(directory) / 'policy.json'
                 # A card-free request is checked as it will run: with a registered card filled in.
-                write_json(path, dict(value['policy'], cudaDeviceUuid=next(iter(REGISTERED_CUDA_CARDS)))
-                           if card_free_policy(value['policy']) else value['policy'])
+                write_json(path, planned_card_policy(value['policy']))
                 load_policy(path)
                 if card_free_policy(value['policy']) and multi_cuda.FIELDS.intersection(value):
                     raise ValueError('a multi-GPU proof names every card in its policies')
@@ -1934,7 +1926,7 @@ def main() -> int:
                     load_policy(extra_path)
                 if 'sensenova_reference_policy' in value:
                     reference_policy = Path(directory) / 'sensenova-reference-policy.json'
-                    write_json(reference_policy, value['sensenova_reference_policy'])
+                    write_json(reference_policy, planned_card_policy(value['sensenova_reference_policy']))
                     load_policy(reference_policy)
             runner = NAX_ROUTES[value['runner']]['labels'] if value.get('runner') in NAX_ROUTES else RUNNERS[args.backend]
             iris_route = ((args.backend == 'mlx' and value.get('runner') == 'nax')
@@ -1983,8 +1975,10 @@ def main() -> int:
             return 0
         if args.output is None:
             raise ValueError('an owned workflow output directory is required')
-        executor = training_comparison.run if comparison_plan else run
-        return executor(rows, args.backend, value, args.expected_sha, args.output)
+        if comparison_plan:
+            return training_comparison.run(rows, args.backend, value, args.expected_sha, args.output,
+                                           rows_for=comparison_rows)
+        return run(rows, args.backend, value, args.expected_sha, args.output)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print('model proof rejected: ' + str(error), file=sys.stderr)
         return 1
