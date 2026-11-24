@@ -24,7 +24,8 @@ from scripts.ci import z_image_tier1_fixture as z_image
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.ci.model_proof_resources import (choose_card, claim_chosen_card, executed_card_policy,
-                                              planned_card_policy, require_claimed_card)
+                                              planned_card_policy, record_selection_refusal,
+                                              require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
@@ -317,6 +318,7 @@ def execute(args, contract):
         receipt["accepted"] = True
     except BaseException as error:
         receipt["failure"] = proof.redact(str(error), env)[:4096]
+        record_selection_refusal(receipt, error)
         raise
     finally:
         try:
@@ -341,7 +343,10 @@ def verify(args, contract):
         raise ValueError("proof receipt does not match the current plan and attempt")
     backend = contract["backend"]
     # The policy the comparison ran under: a card-free request's recorded most-free card (and claim).
-    executed = executed_card_policy(contract["policy"], row.get("cuda_card_selection"))
+    executed = executed_card_policy(contract["policy"], row.get("cuda_card_selection"),
+                                    refusal=row.get(SELECTION_REFUSAL))
+    if executed is None and (row["accepted"] or "physical_claim" in row or row["files"]):
+        raise ValueError("a refused card selection cannot report a claim, child files or acceptance")
     if "cuda_card_selection" in row and "physical_claim" in row:
         require_claimed_card(row["physical_claim"], executed)
     limits = log_limits(backend)

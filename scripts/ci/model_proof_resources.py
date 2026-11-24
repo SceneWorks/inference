@@ -758,16 +758,42 @@ def _cards_read(record, payload: dict, expected) -> str:
     return chosen
 
 
-def executed_card_policy(payload: dict, selection, *, named=None, estimate=None) -> dict:
+SELECTION_REFUSAL = 'cuda_card_selection_refusal'
+
+
+def record_selection_refusal(receipt: dict, error: BaseException) -> bool:
+    """Keep a card selection's refusal (no registered card fit before the deadline) in the receipt,
+    as claim refusals keep theirs, so the unsuccessful run still publishes verifiable evidence."""
+    diagnostic = getattr(error, 'diagnostic', None)
+    if (isinstance(error, CudaClaimRejected) and isinstance(diagnostic, dict)
+            and diagnostic.get('rule') == CARD_SELECTION_RULE and 'chosen_uuid' not in diagnostic):
+        receipt[SELECTION_REFUSAL] = diagnostic
+        return True
+    return False
+
+
+def executed_card_policy(payload: dict, selection, *, named=None, estimate=None, refusal=None) -> dict | None:
     """The policy a verified proof ran under: the request's own when it names a card (and then no
     selection may be recorded), else the request's policy with the card its recorded selection
     chose. The first selection must have read every registered card (or exactly the one card its
     case names); each switch (`superseded`) must have read only the other card(s), chosen one that
     fit, and been made from the card the previous selection chose."""
     if not card_free_policy(payload):
-        if selection is not None:
+        if selection is not None or refusal is not None:
             raise ValueError('a named-card proof records no card selection')
         return payload
+    if selection is None and refusal is not None:
+        # No card fit before the deadline: nothing ran. The refusal must have read every candidate
+        # and refused each one.
+        cards = refusal.get('cards') if isinstance(refusal, dict) else None
+        expected = sorted([named] if named else REGISTERED_CUDA_CARDS, key=REGISTERED_CUDA_CARDS.get)
+        if (refusal.get('rule') != CARD_SELECTION_RULE or not isinstance(cards, list)
+                or [card.get('uuid') for card in cards] != expected
+                or any(not isinstance(card.get('refusal'), str) or not card['refusal'] for card in cards)):
+            raise ValueError('card-free proof records an invalid card selection refusal')
+        return None
+    if refusal is not None:
+        raise ValueError('a proof that selected a card records no selection refusal')
     superseded = selection.get('superseded', []) if isinstance(selection, dict) else None
     if not isinstance(superseded, list) or (named and superseded):
         raise ValueError('card-free proof records an invalid card re-selection')

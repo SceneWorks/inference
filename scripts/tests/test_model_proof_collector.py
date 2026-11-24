@@ -419,7 +419,7 @@ class Collector(unittest.TestCase):
                 proof.publish_file(source, destination / 'hard.png', root, 100)
             self.assertEqual(victim.read_bytes(), b'private')
 
-    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None, backend='mlx', supervisor_module=None):
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None, backend='mlx', supervisor_module=None, card_free=False):
         row = case() if row_override is None else row_override
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
@@ -429,6 +429,8 @@ class Collector(unittest.TestCase):
         mock_request = request('windows-cuda' if backend == 'candle-cuda' else 'darwin-mlx')
         if backend == 'candle-cuda':
             mock_request['policy'].update(cudaDeviceUuid=row['required_cuda_device_uuid'], gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
+            if card_free:
+                del mock_request['policy']['cudaDeviceUuid']
         source_safety = supervisor_module or safety
         def toolchain(env, **_kwargs):
             if backend == 'mlx':
@@ -519,6 +521,31 @@ class Collector(unittest.TestCase):
             verified = proof.verify_artifacts(output, root, mock_request, expected, (row,))
             receipt = json.loads((output / 'receipt.json').read_text(encoding="utf-8"))
             return status, receipt, verified, guard.call_count, output
+
+    def test_no_card_fitting_before_the_deadline_publishes_a_verifiable_unsuccessful_receipt(self):
+        fqn = 'train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient'
+        source = next(row for row in proof.load_registry() if row['fqn'] == fqn)
+        row = proof.configured_case(source, 'fixed_cuda')
+        uuid = row['required_cuda_device_uuid']
+        refusal = {'rule': resources.CARD_SELECTION_RULE, 'polls': 3,
+                   'cards': [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid],
+                              'refusal': '100 MiB free < 1 MiB required'}],
+                   'admission_error': 'no registered CUDA card had estimate plus reserve free'}
+        rejected = resources.CudaClaimRejected(refusal, 'no registered CUDA card fits this proof; no model execution')
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', side_effect=rejected):
+            status, receipt, verified, runs, output = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 1)
+        self.assertFalse(receipt['accepted'])
+        self.assertEqual(receipt[resources.SELECTION_REFUSAL], refusal)
+        self.assertEqual(receipt['cases'][0]['cuda_claim_diagnostic'], refusal)
+        self.assertNotIn('cuda_card_selection', receipt)
+        self.assertEqual(runs, 1)  # discovery only; no body child
+        # The refusal verifies only as a complete refusal of every candidate.
+        bad = dict(refusal, cards=[dict(refusal['cards'][0], refusal='')])
+        with self.assertRaisesRegex(ValueError, 'invalid card selection refusal'):
+            resources.executed_card_policy({'backend': 'windows-cuda'}, None, named=uuid, refusal=bad)
 
     def test_shared_owned_result_cross_module_identity_and_failed_closed_body(self):
         # The real collector loader imports canonical scripts.media_campaign_supervisor;

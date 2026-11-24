@@ -22,7 +22,8 @@ from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import conditional, conditional_evidence as evidence, conditional_probe, fixture, overlay
 from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
                                               claim_chosen_card, executed_card_policy, execution_claim,
-                                              planned_card_policy, require_claimed_card)
+                                              planned_card_policy, record_selection_refusal,
+                                              require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = overlay.BASE
@@ -376,6 +377,7 @@ def execute(args, contract):
     except BaseException as exc:
         primary_error = exc
         receipt["failure"] = str(exc)
+        record_selection_refusal(receipt, exc)
         if isinstance(exc, (CudaClaimRejected, CudaReleaseRejected)):
             receipt["cuda_diagnostic"] = exc.diagnostic
         raise
@@ -448,7 +450,10 @@ def verify(args, contract):
     # A card-free request ran on the card its recorded selection chose (and claimed) at the case's
     # stated estimate; a named card records no selection and verifies as before.
     estimate = CASE_DEVICE_ESTIMATES.get(contract["case"]) if contract["backend"] == "candle-cuda" else None
-    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"), estimate=estimate)
+    executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"), estimate=estimate,
+                                    refusal=receipt.get(SELECTION_REFUSAL))
+    if executed is None and (receipt["accepted"] or "physical_claim" in receipt or receipt["logs"]):
+        raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
     if "physical_claim" in receipt and contract["backend"] == "candle-cuda" and (
             "cuda_card_selection" in receipt or receipt["physical_claim"].get("claim_gpu_estimate") is not None):
         require_claimed_card(receipt["physical_claim"], executed, estimate)

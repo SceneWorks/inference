@@ -493,6 +493,41 @@ class PluralQualification(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "release unverified"):
                     verify()
 
+    def test_no_card_fitting_before_the_deadline_leaves_a_verifiable_unsuccessful_receipt(self):
+        from scripts.ci import model_proof_resources as resources
+        refusal = {"rule": resources.CARD_SELECTION_RULE, "polls": 2,
+                   "cards": [{"uuid": uuid, "index": c.CUDA_INDICES[uuid], "refusal": "1000 MiB free < 69632 MiB required"}
+                             for uuid in sorted(c.CUDA_INDICES, key=c.CUDA_INDICES.get)],
+                   "admission_error": "no registered CUDA card had estimate plus reserve free"}
+        receipt = {}
+        self.assertTrue(resources.record_selection_refusal(
+            receipt, resources.CudaClaimRejected(refusal, "no registered CUDA card fits this proof")))
+        self.assertFalse(resources.record_selection_refusal({}, ValueError("other")))
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "evidence"
+            dest.mkdir()
+            contract = {"request": {"policy": c.policy("candle-cuda")}, "head": "head", "cuda_card_selection": "rule",
+                        "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}, "cuda_completion": "job"}
+            receipt.update({"contract": contract, "request": contract["request"], "run_id": "1", "run_attempt": "1",
+                            "accepted": False, "failure": "no registered CUDA card fits this proof", "logs": {},
+                            "counts": {}})
+
+            def verify():
+                path = dest / "receipt.json"
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                with patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_RUN_ID": "1",
+                        "GITHUB_RUN_ATTEMPT": "1", "SCAIL_PLURAL_RECEIPT_SHA256": runner.tier1.sha(path)}):
+                    runner.verify(SimpleNamespace(output=dest), contract)
+
+            verify()
+            receipt["accepted"] = True
+            with self.assertRaises(ValueError):
+                verify()
+            receipt["accepted"] = False
+            receipt[resources.SELECTION_REFUSAL] = dict(refusal, cards=refusal["cards"][:1])
+            with self.assertRaisesRegex(ValueError, "invalid card selection refusal"):
+                verify()
+
     def test_shared_gauge_accounts_for_a_retryable_failed_nvidia_tick(self):
         base = MagicMock()
         observer = runner.Observer.__new__(runner.Observer)

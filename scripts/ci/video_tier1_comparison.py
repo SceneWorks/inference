@@ -26,7 +26,7 @@ from scripts.ci.wan_pair import production_timing
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, choose_card, claim_chosen_card,
                                               executed_card_policy, execution_claim, planned_card_policy,
-                                              require_claimed_card)
+                                              record_selection_refusal, require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import load_policy, runtime_guarded_admission, validate_admission
 
 BASE = "38dab65f5d9640396cf2946cd4ee866ce46630c6"
@@ -668,6 +668,7 @@ def execute(args, contract):
             raise ValueError(COMPARISON_MISS)
     except BaseException as error:
         receipt["failure"] = proof.redact(str(error), dict(os.environ))
+        record_selection_refusal(receipt, error)
         raise
     finally:
         errors = paired.retain_logs(work, output, receipt, phases(contract["cases"], contract.get("followup")))
@@ -916,7 +917,13 @@ def verify(args, contract):
     # request the card its recorded selection chose (and claimed).
     gpu0_bound = contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS
     executed = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"),
-                                    named=targeted.GPU0_HARDWARE["uuid"] if gpu0_bound else None)
+                                    named=targeted.GPU0_HARDWARE["uuid"] if gpu0_bound else None,
+                                    refusal=receipt.get(SELECTION_REFUSAL))
+    if executed is None:
+        # No card fit before the deadline: nothing ran, so there is nothing more to replay.
+        if receipt["accepted"] or "physical_claim" in receipt or receipt["logs"] or receipt.get("observations"):
+            raise ValueError("a refused card selection cannot report a claim, measurements or acceptance")
+        return
     if "cuda_card_selection" in receipt and "physical_claim" in receipt:
         require_claimed_card(receipt["physical_claim"], executed)
     contract = dict(contract, request=dict(contract["request"], policy=executed))

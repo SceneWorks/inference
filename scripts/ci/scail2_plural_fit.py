@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as paired, model_inference_proofs as proof
 from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as evidence
 from scripts.ci import wddm_process_memory as wddm
-from scripts.ci.model_proof_resources import (CARD_SELECTION_RULE, choose_card, claim_chosen_card,
+from scripts.ci.model_proof_resources import (CARD_SELECTION_RULE, SELECTION_REFUSAL, choose_card,
+                                              claim_chosen_card, record_selection_refusal,
                                               executed_card_policy, require_claimed_card,
                                               execution_claim, proof_cuda_shared_release,
                                               validate_shared_release_record)
@@ -423,6 +424,7 @@ def execute(args, contract):
         if not receipt["accepted"]:
             receipt["failure"] = "incomplete owned WDDM poll series"
     except BaseException as exc:
+        record_selection_refusal(receipt, exc)
         receipt["failure"] = proof.redact(str(exc), dict(os.environ))
         raise
     finally:
@@ -446,7 +448,9 @@ def executed_policy(contract, receipt):
             raise ValueError("a named-card campaign records no card selection")
         return contract["request"]["policy"]
     payload = executed_card_policy(contract["request"]["policy"], receipt.get("cuda_card_selection"),
-                                   estimate=CARD_ESTIMATE)
+                                   estimate=CARD_ESTIMATE, refusal=receipt.get(SELECTION_REFUSAL))
+    if payload is None:
+        return None  # no card fit before the deadline: nothing ran
     if receipt["hardware"]["uuid"] != payload["cudaDeviceUuid"] or payload["cudaDeviceUuid"] not in c.CUDA_INDICES:
         raise ValueError("card-free campaign lacks its recorded most-free registered card selection")
     return payload
@@ -496,8 +500,14 @@ def verify(args, contract):
         raise ValueError("unexplained partial campaign")
     from tempfile import TemporaryDirectory
 
+    executed = executed_policy(contract, receipt)
+    if executed is None:
+        # A refused card selection: an unsuccessful campaign in which no count was attempted.
+        if attempted or receipt["accepted"] or not receipt.get("failure"):
+            raise ValueError("a refused card selection cannot report attempted counts")
+        return
     with TemporaryDirectory() as d:
-        approved = tier1.read_policy(Path(d), "policy.json", executed_policy(contract, receipt))
+        approved = tier1.read_policy(Path(d), "policy.json", executed)
     fresh_cuda = "cuda_completion" in contract
     require_job = fresh_cuda or contract["request"].get("continuation") == c.CONTINUATION
     for count in attempted:

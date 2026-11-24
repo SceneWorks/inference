@@ -699,13 +699,20 @@ def executed_policy(receipt: dict, value: dict, rows=()) -> dict:
     """The resource policy a proof ran under: the request's own, or for a card-free request the
     request's policy with the registered card the producer selected (and recorded), which every
     executed case's claim must hold."""
-    from scripts.ci.model_proof_resources import card_free_policy, executed_card_policy, require_claimed_card
+    from scripts.ci.model_proof_resources import (SELECTION_REFUSAL, card_free_policy, executed_card_policy,
+                                                  planned_card_policy, require_claimed_card)
     if card_free_policy(value['policy']) and receipt.get('request_resource_policy') != value['policy']:
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
     if not card_free_policy(value['policy']) and 'request_resource_policy' in receipt:
         raise ValueError('a named-card proof records no card selection')
     named = next(iter({row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}), None)
-    executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'), named=named)
+    executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'), named=named,
+                                    refusal=receipt.get(SELECTION_REFUSAL))
+    if executed is None:
+        # No card fit before the deadline: an unsuccessful receipt in which nothing executed.
+        if receipt.get('accepted') is not False or receipt.get('completed') != 0:
+            raise ValueError('a refused card selection cannot report executed or accepted cases')
+        return planned_card_policy(value['policy'])
     if card_free_policy(value['policy']):
         for case in receipt.get('cases', []):
             physical = case.get('physical_execution') if isinstance(case, dict) else None
@@ -1314,7 +1321,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
     from scripts.ci.model_proof_resources import (CudaCardTaken, CudaClaimRejected, CudaReleaseRejected,
                                                   metadata_policy_payload, execution_claim, card_free_policy,
-                                                  choose_card, claim_chosen_card, planned_card_policy)
+                                                  choose_card, claim_chosen_card, planned_card_policy,
+                                                  record_selection_refusal)
     card_free = card_free_policy(value['policy'])
     named_card = None
     if card_free:
@@ -1352,6 +1360,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         'accepted': False, 'cases': []}
     receipt.update(receipt_claims([], False))
     card = {'selection': None, 'pending': card_free, 'env': None}
+    if card_free:
+        receipt['request_resource_policy'] = value['policy']
 
     def bind_card(chosen):
         """Run every remaining phase on the card in force (chosen, or switched before the claim)."""
@@ -1586,6 +1596,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             except (ValueError, OSError, SupervisionError) as error:
                 if isinstance(error, CudaCardTaken):
                     raise  # the parent comparison switches its card and reruns this stage
+                record_selection_refusal(receipt, error)
                 result['error'] = redact(str(error), env)
                 if isinstance(error, CudaClaimRejected):
                     result['cuda_claim_diagnostic'] = error.diagnostic

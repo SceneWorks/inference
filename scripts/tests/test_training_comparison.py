@@ -434,6 +434,30 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual(receipt['cuda_card_selection'], second)
         self.assertEqual(receipt['request'], free)
 
+    def test_a_card_free_comparison_with_no_card_fitting_publishes_a_verifiable_refusal(self):
+        from scripts.ci import model_proof_resources as resources
+        base, named = self.request()
+        named['policy'].update(pollMillis=100, termGraceMillis=100)
+        free = dict(named, configuration=comparison.CARD_FREE_RECIPE,
+                    policy={k: v for k, v in named['policy'].items() if k != 'cudaDeviceUuid'})
+        refusal = {'rule': resources.CARD_SELECTION_RULE, 'polls': 5, 'admission_error': 'none fits',
+                   'cards': [{'uuid': uuid, 'index': index, 'refusal': '1 MiB free < 93 GiB required'}
+                             for uuid, index in resources.REGISTERED_CUDA_CARDS.items()]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'proof'
+            with patch.dict(os.environ, {'RUNNER_TEMP': directory}), \
+                    patch.object(proof, 'repository_identity', return_value={'revision': 'f' * 40}), \
+                    patch.object(proof, 'run') as stage, \
+                    patch.object(resources, 'choose_card', side_effect=resources.CudaClaimRejected(refusal)):
+                code = comparison.run((base,), 'candle-cuda', free, 'f' * 40, root, rows_for=lambda uuid: (base,))
+                verified = comparison.verify_artifacts(root, Path(directory), free, 'f' * 40, (base,), 'candle-cuda',
+                                                       rows_for=lambda uuid: (base,))
+            stage.assert_not_called()
+            receipt = json.loads((root / 'receipt.json').read_text(encoding='utf-8'))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt[resources.SELECTION_REFUSAL], refusal)
+        self.assertFalse(verified['accepted'])
+
     def test_driver_one_fresh_namespace_each_stage_same_original_deadline(self):
         code,receipt,observed=self.mocked_driver()
         self.assertEqual(code,0)

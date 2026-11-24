@@ -24,7 +24,8 @@ from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
                                               claim_chosen_card, executed_card_policy, execution_claim,
-                                              planned_card_policy, require_claimed_card)
+                                              planned_card_policy, record_selection_refusal,
+                                              require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
@@ -576,6 +577,7 @@ def execute(args, contract):
     except BaseException as exc:
         primary_error = exc
         receipt["failure"] = str(exc)
+        record_selection_refusal(receipt, exc)
         if isinstance(exc, (CudaClaimRejected, CudaReleaseRejected)):
             receipt["cuda_diagnostic"] = exc.diagnostic
         raise
@@ -649,7 +651,10 @@ def verify(args, contract):
         raise ValueError("unexpected upload file")
     # A card-free request ran on the card its recorded selection chose (and claimed); a named card
     # records no selection and verifies as before.
-    executed = executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"))
+    executed = executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"),
+                                    refusal=r.get(SELECTION_REFUSAL))
+    if executed is None and (r["accepted"] or "physical_claim" in r or r["logs"]):
+        raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
     if "cuda_card_selection" in r and "physical_claim" in r:
         require_claimed_card(r["physical_claim"], executed)
     if completed:

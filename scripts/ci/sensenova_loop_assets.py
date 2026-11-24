@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ci.model_inference_proofs import repository_identity
-from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, choose_card, claim_chosen_card,
+from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, CudaClaimRejected, choose_card,
+                                              claim_chosen_card, record_selection_refusal,
                                               executed_card_policy, execution_claim, require_claimed_card,
                                               shared_owned_completion)
 from scripts.ci.sensenova_loop_reference import validate_cuda_witness
@@ -117,6 +118,18 @@ def offline_environment() -> dict[str, str]:
     env["TRANSFORMERS_OFFLINE"] = "1"
     env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
     return env
+
+
+def refused_selection_kept(path, select):
+    """Run a card selection; when no card fits before the deadline, keep the refusal (its per-card
+    reasons) in the stage report as an unsuccessful receipt before failing the stage."""
+    try:
+        return select()
+    except CudaClaimRejected as error:
+        record = {}
+        if record_selection_refusal(record, error):
+            write(path, {"accepted": False, "failure": str(error), **record})
+        raise
 
 
 def registered_index(uuid):
@@ -249,7 +262,9 @@ def reference(args, source, source_sha, snapshot, work, report, request):
     # A reference policy that names no card runs on the registered card with the most free memory that
     # fits; selection and claim share one wait budget.
     deadline = time.monotonic() + request["sensenova_reference_policy"]["deadlineSeconds"]
-    policy_data, selection = choose_card(request["sensenova_reference_policy"], work, deadline_monotonic=deadline)
+    policy_data, selection = refused_selection_kept(
+        report / "reference-card-refusal.json",
+        lambda: choose_card(request["sensenova_reference_policy"], work, deadline_monotonic=deadline))
     path = work / "reference-policy.json"
     write(path, policy_data)
     policy = load_policy(path)
@@ -310,7 +325,9 @@ def native(args, source, source_sha, snapshot, work, report, request):
                    cwd=ROOT, env=env, check=True, timeout=2700)
     exe = target / "release/examples" / ("prepare_snapshot.exe" if os.name == "nt" else "prepare_snapshot")
     native_deadline = time.monotonic() + request["policy"]["deadlineSeconds"]
-    native_policy, native_selection = choose_card(request["policy"], work, deadline_monotonic=native_deadline)
+    native_policy, native_selection = refused_selection_kept(
+        report / "native-card-refusal.json",
+        lambda: choose_card(request["policy"], work, deadline_monotonic=native_deadline))
     policy_path = work / "native-policy.json"
     write(policy_path, native_policy)
     policy = load_policy(policy_path)

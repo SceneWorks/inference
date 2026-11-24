@@ -576,17 +576,6 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     receipt['comparison_started_monotonic'] = started
     receipt['comparison_deadline_monotonic'] = started + value['policy']['deadlineSeconds']
     request_value, abandon, switched = value, None, None
-    if is_card_free(value):
-        # Run every stage on the registered card with the most free memory that fits, under that
-        # card's own registered recipe. If that card is taken before the first stage's claim, the
-        # first stage switches to the other card when it fits (see card_switcher).
-        from scripts.ci.model_proof_resources import card_switcher, choose_card
-        chosen, receipt['cuda_card_selection'] = choose_card(
-            value['policy'], work, deadline_monotonic=receipt['comparison_deadline_monotonic'])
-        abandon, switched = card_switcher(value['policy'], work, receipt['cuda_card_selection'])
-        value = concrete_request(value, chosen['cudaDeviceUuid'])
-        rows = rows_for(chosen['cudaDeviceUuid'])
-        validate_request(rows, value, backend)
     results = []
     inherited_target = os.environ.get('CARGO_TARGET_DIR')
     # One fresh owned compile namespace for the whole model comparison. Later
@@ -594,6 +583,21 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     # no cross-listener rebuild can replace it between bounded stages.
     os.environ['CARGO_TARGET_DIR'] = str(work / 'cargo-target')
     try:
+        if is_card_free(value):
+            # Run every stage on the registered card with the most free memory that fits, under that
+            # card's own registered recipe. If that card is taken before the first stage's claim, the
+            # first stage switches to the other card when it fits (see card_switcher). A refusal
+            # (no card fit before the deadline) is kept in the unsuccessful receipt.
+            try:
+                chosen, receipt['cuda_card_selection'] = model_proof_resources.choose_card(
+                    value['policy'], work, deadline_monotonic=receipt['comparison_deadline_monotonic'])
+            except model_proof_resources.CudaClaimRejected as error:
+                model_proof_resources.record_selection_refusal(receipt, error)
+                raise
+            abandon, switched = model_proof_resources.card_switcher(value['policy'], work, receipt['cuda_card_selection'])
+            value = concrete_request(value, chosen['cudaDeviceUuid'])
+            rows = rows_for(chosen['cudaDeviceUuid'])
+            validate_request(rows, value, backend)
         queue = list(plan['execution_order'])
         while queue:
             stage = queue[0]
@@ -688,7 +692,17 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
     from scripts.ci.model_proof_resources import executed_card_policy
     if is_card_free(value):
         # Replay against the card the comparison's recorded most-free selection chose.
-        executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'))
+        executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'),
+                                        refusal=receipt.get(model_proof_resources.SELECTION_REFUSAL))
+        if executed is None:
+            # No card fit before the deadline: an unsuccessful comparison that ran no stage.
+            if receipt['accepted'] or receipt.get('stage_records') or 'measurement' in receipt or not receipt.get('error'):
+                raise ValueError('a refused card selection cannot report stages or measurements')
+            if _inventory(output) != receipt.get('artifacts'):
+                raise ValueError('comparison artifact hash/file inventory mismatch')
+            return {'protocol': PROTOCOL, 'source_revision': expected, 'accepted': False, 'files': 2,
+                    'bytes': sum((output / n).stat().st_size for n in ('receipt.json', 'summary.md')),
+                    'conservative_updates_charged': 0, 'automatic_retry': False, 'production_promotion': False}
         value = concrete_request(value, executed['cudaDeviceUuid'])
         rows = rows_for(executed['cudaDeviceUuid'])
         validate_request(rows, value, backend)

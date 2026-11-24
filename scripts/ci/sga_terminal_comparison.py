@@ -22,7 +22,7 @@ from scripts.ci import sga_adapter_comparison as source_pair
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, choose_card, claim_chosen_card,
                                               executed_card_policy, execution_claim, planned_card_policy,
-                                              require_claimed_card)
+                                              record_selection_refusal, require_claimed_card, SELECTION_REFUSAL)
 from scripts.ci.pinned_hub_source import verify_file_inventory_receipt
 from scripts.ci.sga_paired_performance import PAIRS, compare_peaks, compare_timing
 from scripts.ci.stage_pinned_hub_snapshots import hub_root
@@ -225,10 +225,13 @@ def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
 
 
-def ran_contract(contract, selection):
+def ran_contract(contract, selection, refusal=None):
     """The contract as the comparison ran it: a card-free CUDA request bound to the card its
-    recorded most-free selection chose (a named card records no selection)."""
-    executed = executed_card_policy(contract["policy"], selection)
+    recorded most-free selection chose (a named card records no selection); None when no card fit
+    before the deadline and nothing ran."""
+    executed = executed_card_policy(contract["policy"], selection, refusal=refusal)
+    if executed is None:
+        return None
     if executed is contract["policy"]:
         return contract
     request = dict(contract["request"], **{DEVICE_KEY["candle-cuda"]: executed["cudaDeviceUuid"]})
@@ -485,6 +488,7 @@ def execute(args, contract, profile):
             receipt["accepted"] = True
     except BaseException as error:
         receipt["failure"] = proof.redact(str(error), env)[:4096]
+        record_selection_refusal(receipt, error)
         raise
     finally:
         try:
@@ -508,6 +512,9 @@ def verify(args, contract, profile):
     if (any(receipt.get(key) != value for key, value in {**contract, **source_pair.attempt_identity(os.environ)}.items())
             or type(receipt.get("accepted")) is not bool):
         raise ValueError("terminal receipt differs from the current exact plan or attempt")
+    if ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL)) is None and (
+            receipt["accepted"] or "physical_claim" in receipt or receipt["files"]):
+        raise ValueError("a refused card selection cannot report a claim, child files or acceptance")
     limits = sample_limits(profile, contract["policy"])
     samples = sample_schedule(contract["request"])
     allowed = {f"{name}.{leaf}": cap for name, _ in samples for leaf, cap in limits.items()}
@@ -547,7 +554,9 @@ def verify(args, contract, profile):
         raise ValueError("retained terminal source arms resolved different preflight metadata")
     if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
         raise ValueError("terminal artifact compiler identity changed")
-    ran = ran_contract(contract, receipt.get("cuda_card_selection"))
+    ran = ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL))
+    if ran is None:
+        raise ValueError("a refused card selection cannot report completed terminal samples")
     if "cuda_card_selection" in receipt:
         require_claimed_card(receipt["physical_claim"], ran["policy"])
     observations = {name: read_sample(name, args.output, profile, ran, upload=True) for name, _ in samples}

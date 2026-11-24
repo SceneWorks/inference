@@ -4,6 +4,7 @@ Metadata only: no driver query, GPU claim or model run. Named-card requests keep
 record no selection, so earlier named-GPU0 evidence verifies unchanged."""
 import contextlib
 import io
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -129,6 +130,23 @@ class CardFreeComparisons(unittest.TestCase):
         claims["q4"]["supervision"]["device_claim"]["device_uuid"] = GPU0
         with self.assertRaisesRegex(ValueError, "different card"):
             seal.verify_native_card({"backend": "candle-cuda", "tiers": claims, "cuda_card_selection": selection}, policy)
+
+    def test_sensenova_keeps_a_refused_selection_in_its_stage_report(self):
+        from scripts.ci import sensenova_loop_assets as assets
+        refusal = {"rule": resources.CARD_SELECTION_RULE, "polls": 1, "admission_error": "none fits",
+                   "cards": [{"uuid": GPU0, "index": 0, "refusal": "busy"}, {"uuid": GPU1, "index": 1, "refusal": "busy"}]}
+
+        def refuse():
+            raise resources.CudaClaimRejected(refusal, "no registered CUDA card fits this proof")
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "reference-card-refusal.json"
+            with self.assertRaises(resources.CudaClaimRejected):
+                assets.refused_selection_kept(path, refuse)
+            kept = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((kept["accepted"], kept[resources.SELECTION_REFUSAL]), (False, refusal))
+        policy = {"backend": "windows-cuda", "deadlineSeconds": 60}
+        self.assertIsNone(resources.executed_card_policy(policy, None, refusal=refusal))
 
 if __name__ == "__main__":
     unittest.main()
