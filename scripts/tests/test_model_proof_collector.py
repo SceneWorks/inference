@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -428,7 +429,8 @@ class Collector(unittest.TestCase):
         source.write_text('// test fixture; no actual Rust execution', encoding='utf-8')
         mock_request = request('windows-cuda' if backend == 'candle-cuda' else 'darwin-mlx')
         if backend == 'candle-cuda':
-            mock_request['policy'].update(cudaDeviceUuid=row['required_cuda_device_uuid'], gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
+            card = next(iter(resources.fixed_cards((row,))))  # by UUID or by physical index alone
+            mock_request['policy'].update(cudaDeviceUuid=card, gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
             if card_free:
                 del mock_request['policy']['cudaDeviceUuid']
         source_safety = supervisor_module or safety
@@ -492,7 +494,7 @@ class Collector(unittest.TestCase):
         @contextlib.contextmanager
         def shared_controller(*_args, **_kwargs):
             physical = {'activity_profile': resources.SHARED_CUDA_HEADROOM_ACTIVITY,
-                'device_uuid':row['required_cuda_device_uuid'],'physical_index':1,
+                'device_uuid':next(iter(resources.fixed_cards((row,)))),'physical_index':1,
                 'post_execution_verified':False,'lease_released':False,
                 'claim_deadline_monotonic':100000000000.0}
             try:
@@ -577,6 +579,44 @@ class Collector(unittest.TestCase):
         request = {'policy': receipt['request_resource_policy']}
         with self.assertRaisesRegex(ValueError, 'visibility differs'):
             proof.executed_policy(stale, request, (row,))
+
+    def test_an_index_only_case_selects_its_card_even_when_the_other_is_freer(self):
+        # A registry case restricted by physical index alone (GPU 1), with no UUID.
+        row = next(row for row in proof.load_registry()
+                   if row['fqn'] == 'transformer::edit::tests::frozen_edit_oracle_cuda')
+        self.assertNotIn('required_cuda_device_uuid', row)
+        gpu1 = next(uuid for uuid, index in resources.REGISTERED_CUDA_CARDS.items() if index == row['required_cuda_physical_index'])
+        self.assertEqual(row['required_cuda_physical_index'], 1)
+        self.assertEqual(resources.fixed_cards((row,)), {gpu1})
+        read = []
+
+        def reader(uuid, _deadline):
+            read.append(uuid)
+            used = 1000 if resources.REGISTERED_CUDA_CARDS[uuid] == 0 else 60000  # GPU 0 is freer
+            return [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid], 'total_mib': 97887,
+                     'used_mib': used, 'free_mib': 97887 - used, 'utilization_percent': 0}]
+
+        real = resources.select_cuda_card
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card',
+                             side_effect=lambda *args, **kwargs: real(*args, **dict(kwargs, reader=reader))), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status, receipt, verified, _, _ = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(set(read), {gpu1})
+        self.assertEqual(receipt['cuda_card_selection']['chosen_uuid'], gpu1)
+        self.assertEqual(receipt['resource_policy']['cudaDeviceUuid'], gpu1)
+        self.assertEqual(receipt['cases'][0]['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'], gpu1)
+        # A recorded selection of the freer GPU 0 does not verify for this index-1 case.
+        gpu0 = next(uuid for uuid, index in resources.REGISTERED_CUDA_CARDS.items() if index == 0)
+        wrong = copy.deepcopy(receipt)
+        wrong['cuda_card_selection']['cards'][0].update(uuid=gpu0, index=0)
+        wrong['cuda_card_selection'].update(chosen_uuid=gpu0, chosen_index=0)
+        with self.assertRaises(ValueError):
+            proof.executed_policy(wrong, {'policy': receipt['request_resource_policy']}, (row,))
+        with self.assertRaisesRegex(ValueError, 'unregistered CUDA physical index'):
+            resources.fixed_cards((dict(row, required_cuda_physical_index=7),))
 
     def test_a_card_free_run_that_fails_before_selection_still_verifies(self):
         with tempfile.TemporaryDirectory() as temporary, \

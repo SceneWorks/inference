@@ -538,6 +538,22 @@ REGISTERED_CUDA_CARDS = {
 CARD_SELECTION_RULE = 'most-free-card-covering-estimate-plus-reserve-v1'
 
 
+def fixed_cards(rows) -> set:
+    """The registered cards the selected cases fix: by UUID, or by physical index alone (resolved
+    to the registered card at that index). Such a case waits for its card and never switches."""
+    by_index = {index: uuid for uuid, index in REGISTERED_CUDA_CARDS.items()}
+    fixed = set()
+    for row in rows:
+        uuid, index = row.get('required_cuda_device_uuid'), row.get('required_cuda_physical_index')
+        if index is not None and index not in by_index:
+            raise ValueError(f'case requires unregistered CUDA physical index {index}')
+        if uuid is not None and index is not None and by_index[index] != uuid:
+            raise ValueError('case CUDA UUID and physical index name different registered cards')
+        if uuid is not None or index is not None:
+            fixed.add(uuid if uuid is not None else by_index[index])
+    return fixed
+
+
 def card_free_policy(payload: dict) -> bool:
     """A Windows CUDA request policy that names no card: the proof runs on whichever card fits."""
     return isinstance(payload, dict) and payload.get('backend') == 'windows-cuda' and 'cudaDeviceUuid' not in payload

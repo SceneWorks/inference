@@ -705,7 +705,11 @@ def executed_policy(receipt: dict, value: dict, rows=()) -> dict:
         raise ValueError('card-free proof lacks its recorded most-free registered card selection')
     if not card_free_policy(value['policy']) and 'request_resource_policy' in receipt:
         raise ValueError('a named-card proof records no card selection')
-    named = next(iter({row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}), None)
+    from scripts.ci.model_proof_resources import fixed_cards
+    fixed = fixed_cards(rows) if card_free_policy(value['policy']) else set()
+    if len(fixed) > 1:
+        raise ValueError('selected cases fix different CUDA cards')
+    named = next(iter(fixed), None)
     cases = [case for case in receipt.get('cases', []) if isinstance(case, dict)]
     claimed = [case for case in cases if isinstance(case.get('physical_execution'), dict)
                and 'device_uuid' in case['physical_execution']]
@@ -1328,8 +1332,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
     from scripts.ci.model_proof_resources import (CudaCardTaken, CudaClaimRejected, CudaReleaseRejected,
                                                   metadata_policy_payload, execution_claim, card_free_policy,
-                                                  choose_card, claim_chosen_card, planned_card_policy,
-                                                  record_selection_refusal)
+                                                  choose_card, claim_chosen_card, fixed_cards,
+                                                  planned_card_policy, record_selection_refusal)
     card_free = card_free_policy(value['policy'])
     named_card = None
     if card_free:
@@ -1338,7 +1342,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         # taken before that claim). A case that names a card keeps it (and may wait).
         if multi_cuda.FIELDS.intersection(value):
             raise ValueError('a multi-GPU proof names every card in its policies')
-        named = {row['required_cuda_device_uuid'] for row in rows if row.get('required_cuda_device_uuid')}
+        # A case fixed by UUID or by physical index alone keeps that card (and waits for it).
+        named = fixed_cards(rows)
         if len(named) > 1:
             raise ValueError('selected cases name different CUDA cards; request one card explicitly')
         named_card = next(iter(named), None)
