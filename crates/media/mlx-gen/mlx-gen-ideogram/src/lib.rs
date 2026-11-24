@@ -49,7 +49,7 @@ pub use loader::{
 pub use model::{
     descriptor, descriptor_turbo, load, load_turbo, Ideogram4, MODEL_ID, MODEL_ID_TURBO,
 };
-pub use pipeline::{EditInit, Ideogram4Pipeline};
+pub use pipeline::{EditInit, Ideogram4Pipeline, IdeogramEulerDriver, IdeogramVelocityForward};
 pub use scheduler::{make_step_intervals, LogitNormalSchedule};
 pub use text_encoder::Ideogram4TextEncoder;
 pub use transformer::Ideogram4Transformer;
