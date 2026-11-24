@@ -97,6 +97,289 @@ pub fn denoise_flow_map_with_references(
     )
 }
 
+/// Forward-evaluation seam for [`Flux3FlowMapDriver`] (`SW-6968`, `PIPE-7`).
+///
+/// Generic over the predictor so weights-free Tier 0 tests can run
+/// [`candle_gen::driver::conformance::verify_driver_conformance`] and verify FLUX.3's native
+/// `(timestep, target_timestep)` + `dt`-rounded predictor semantics without loading weights.
+pub trait Flux3FlowMapForward {
+    /// Evaluate the DiT at `(timestep, target_timestep)` with optional PAG perturbation layers.
+    fn forward_pag(
+        &self,
+        x: &Tensor,
+        timestep: f32,
+        target_timestep: Option<f32>,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Tensor>;
+}
+
+impl<F> Flux3FlowMapForward for F
+where
+    F: Fn(&Tensor, f32, Option<f32>, Option<&[u32]>) -> Result<Tensor>,
+{
+    fn forward_pag(
+        &self,
+        x: &Tensor,
+        timestep: f32,
+        target_timestep: Option<f32>,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Tensor> {
+        self(x, timestep, target_timestep, pag_layers)
+    }
+}
+
+fn flux3_driver_support(driver_id: &'static str) -> candle_gen::driver::DriverSupport {
+    candle_gen::driver::DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: candle_gen::driver::DriverRefusalReasons {
+            renoise_from_clean:
+                "FLUX.3 flow-map/base Euler driver does not re-noise from clean estimates",
+            geometry_change:
+                "FLUX.3 flow-map/base Euler driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "FLUX.3 flow-map/base Euler driver does not expose read-only boundary clean estimates",
+            ..candle_gen::driver::DriverRefusalReasons::default()
+        },
+    }
+}
+
+/// Apply one FLUX.3 Euler update: `dt · velocity` runs at f32 opmath and only the product is
+/// rounded to `compute`, then added into the f32 state `x` (`AP13 class (a)`).
+fn flux3_euler_step_candle(
+    x: &Tensor,
+    velocity: &Tensor,
+    dt: f32,
+    compute: DType,
+) -> Result<Tensor> {
+    // torch: the Python-float `dt` is NOT rounded to bf16 first; the multiply runs at f32
+    // opmath and only the product takes the velocity's dtype.
+    let scaled = to(&to(velocity, DType::F32)?.affine(dt as f64, 0.0)?, compute)?;
+    to(&x.add(&to(&scaled, DType::F32)?)?, DType::F32)
+}
+
+/// Typed [`candle_gen::driver::FamilyDriver`] for FLUX.3's native flow-map Euler integrator
+/// (`SW-6968`, `PIPE-7`), preserving `(schedule[step], Some(schedule[step + 1]))`, optional PAG,
+/// compute-dtype rounding on `dt · velocity`, and an `f32` running latent.
+pub struct Flux3FlowMapDriver<F> {
+    schedule: Vec<f32>,
+    compute: DType,
+    pag: Option<candle_gen::gen_core::PagResolved>,
+    forward: F,
+    support: candle_gen::driver::DriverSupport,
+}
+
+impl<F: Flux3FlowMapForward> Flux3FlowMapDriver<F> {
+    pub fn new(
+        driver_id: &'static str,
+        schedule: &[f32],
+        compute: DType,
+        pag: Option<candle_gen::gen_core::PagResolved>,
+        forward: F,
+    ) -> Result<Self> {
+        if schedule.len() < 2 {
+            return Err(Error::Msg(format!(
+                "flux3: a schedule needs at least two points, got {}",
+                schedule.len()
+            )));
+        }
+        Ok(Self {
+            schedule: schedule.to_vec(),
+            compute,
+            pag,
+            forward,
+            support: flux3_driver_support(driver_id),
+        })
+    }
+
+    pub fn total_steps(&self) -> usize {
+        self.schedule.len() - 1
+    }
+}
+
+impl<F: Flux3FlowMapForward> candle_gen::driver::FamilyDriver<Tensor> for Flux3FlowMapDriver<F> {
+    fn support(&self) -> &candle_gen::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: candle_gen::driver::SliceInput<'_, Tensor>,
+        state: &mut candle_gen::driver::DriverRunState,
+        hooks: &mut candle_gen::driver::StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        let total_steps = self.total_steps();
+        if input.total_steps != total_steps || input.span.end > total_steps {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with FLUX.3 flow-map schedule length {}",
+                self.support.driver_id, input.span, input.total_steps, total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+        let init = match input.state {
+            candle_gen::gen_core::BoundaryState::XSigma(x)
+            | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | candle_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let mut x = to(&init, DType::F32).map_err(candle_gen::gen_core::Error::from)?;
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            let t = self.schedule[step];
+            let target = self.schedule[step + 1];
+            let dt = target - t;
+            let info = candle_gen::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: candle_gen::driver::DriverEvaluationKind::Trajectory,
+                sigma: t,
+                next_sigma: target,
+            };
+            hooks.observe(&info, &x)?;
+            let cond = self
+                .forward
+                .forward_pag(&x, t, Some(target), None)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            state.record_evaluation(candle_gen::driver::DriverEvaluationKind::Trajectory);
+            let step_pag = self
+                .pag
+                .as_ref()
+                .map_or(0.0, |p| p.step_scale(step, total_steps));
+            let velocity = if step_pag > 0.0 {
+                let layers = self
+                    .pag
+                    .as_ref()
+                    .map_or(&[][..], |p| p.step_layers(step, total_steps));
+                let pert = self
+                    .forward
+                    .forward_pag(&x, t, Some(target), Some(layers))
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                state.record_evaluation(candle_gen::driver::DriverEvaluationKind::Trajectory);
+                apply_pag_candle(&cond, &cond, &pert, step_pag, self.compute)
+                    .map_err(candle_gen::gen_core::Error::from)?
+            } else {
+                cond
+            };
+            x = flux3_euler_step_candle(&x, &velocity, dt, self.compute)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            x = hooks.post_step(&info, x)?;
+            hooks.materialize(&info, &x)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(candle_gen::gen_core::BoundaryState::XSigma(x))
+    }
+}
+
+/// Typed [`candle_gen::driver::FamilyDriver`] for FLUX.3's base CFG Euler loop
+/// (`target_timestep: None`), sharing the same driver contract, `dt`-rounded Euler update,
+/// cancellation, and progress reporting.
+struct Flux3BaseDriver<F> {
+    schedule: Vec<f32>,
+    compute: DType,
+    predict_velocity: F,
+    support: candle_gen::driver::DriverSupport,
+}
+
+impl<F> Flux3BaseDriver<F>
+where
+    F: Fn(&Tensor, usize, usize, f32) -> Result<Tensor>,
+{
+    fn new(
+        driver_id: &'static str,
+        schedule: &[f32],
+        compute: DType,
+        predict_velocity: F,
+    ) -> Result<Self> {
+        if schedule.len() < 2 {
+            return Err(Error::Msg("flux3: CFG schedule needs two points".into()));
+        }
+        Ok(Self {
+            schedule: schedule.to_vec(),
+            compute,
+            predict_velocity,
+            support: flux3_driver_support(driver_id),
+        })
+    }
+}
+
+impl<F> candle_gen::driver::FamilyDriver<Tensor> for Flux3BaseDriver<F>
+where
+    F: Fn(&Tensor, usize, usize, f32) -> Result<Tensor>,
+{
+    fn support(&self) -> &candle_gen::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: candle_gen::driver::SliceInput<'_, Tensor>,
+        state: &mut candle_gen::driver::DriverRunState,
+        hooks: &mut candle_gen::driver::StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        let total_steps = self.schedule.len() - 1;
+        if input.total_steps != total_steps || input.span.end > total_steps {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with FLUX.3 CFG schedule length {}",
+                self.support.driver_id, input.span, input.total_steps, total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+        let init = match input.state {
+            candle_gen::gen_core::BoundaryState::XSigma(x)
+            | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | candle_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let mut x = to(&init, DType::F32).map_err(candle_gen::gen_core::Error::from)?;
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            let t = self.schedule[step];
+            let target = self.schedule[step + 1];
+            let dt = target - t;
+            let info = candle_gen::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: candle_gen::driver::DriverEvaluationKind::Trajectory,
+                sigma: t,
+                next_sigma: target,
+            };
+            hooks.observe(&info, &x)?;
+            let velocity = (self.predict_velocity)(&x, step, total_steps, t)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            state.record_evaluation(candle_gen::driver::DriverEvaluationKind::Trajectory);
+            x = flux3_euler_step_candle(&x, &velocity, dt, self.compute)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            x = hooks.post_step(&info, x)?;
+            hooks.materialize(&info, &x)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(candle_gen::gen_core::BoundaryState::XSigma(x))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_flow_map_with_references_pag(
     dit: &Flux3Dit,
@@ -116,49 +399,53 @@ fn denoise_flow_map_with_references_pag(
                 .into(),
         ));
     }
-    if schedule.len() < 2 {
-        return Err(Error::Msg(format!(
-            "flux3: a schedule needs at least two points, got {}",
-            schedule.len()
-        )));
-    }
     let compute = dit.compute_dtype();
     let device = dit.device();
-    let total_steps = schedule.len() - 1;
-    let mut x = to(&noise.to_device(device)?, DType::F32)?;
+    let init = to(&noise.to_device(device)?, DType::F32)?;
     let text_tokens = text.tokens.to_device(device)?;
-    for step in 0..total_steps {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let driver = Flux3FlowMapDriver::new(
+        "flux3_flow_map_candle",
+        schedule,
+        compute,
+        pag.cloned(),
+        |x: &Tensor, t: f32, target: Option<f32>, pag_layers: Option<&[u32]>| {
+            let sample = SampleTokens {
+                text: &text_tokens,
+                text_ids: &text.ids,
+                image: x,
+                image_ids,
+                image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                timestep: t,
+                target_timestep: target,
+            };
+            dit.forward_pag(std::slice::from_ref(&sample), pag_layers)
+        },
+    )?;
+    let total_steps = driver.total_steps();
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let mut on_progress = |progress: candle_gen::gen_core::Progress| {
+        if let candle_gen::gen_core::Progress::Step { current, .. } = progress {
+            on_step(current as usize);
         }
-        let t = schedule[step];
-        let dt = schedule[step + 1] - schedule[step];
-        let target = schedule[step + 1];
-        let sample = SampleTokens {
-            text: &text_tokens,
-            text_ids: &text.ids,
-            image: &x,
-            image_ids,
-            image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-            timestep: t,
-            target_timestep: Some(target),
-        };
-        let cond = dit.forward_pag(std::slice::from_ref(&sample), None)?;
-        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
-        let velocity = if step_pag > 0.0 {
-            let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
-            let pert = dit.forward_pag(std::slice::from_ref(&sample), Some(layers))?;
-            apply_pag_candle(&cond, &cond, &pert, step_pag, compute)?
-        } else {
-            cond
-        };
-        // torch: the Python-float `dt` is NOT rounded to bf16 first; the multiply runs at f32
-        // opmath and only the product takes the velocity's dtype.
-        let scaled = to(&to(&velocity, DType::F32)?.affine(dt as f64, 0.0)?, compute)?;
-        x = to(&x.add(&to(&scaled, DType::F32)?)?, DType::F32)?;
-        on_step(step + 1);
+    };
+    let mut hooks = candle_gen::driver::StepHooks::new(&mut on_progress);
+    let out = candle_gen::driver::run_candle_driver_slices(
+        &driver,
+        [candle_gen::driver::SliceSpec::full(total_steps)],
+        candle_gen::gen_core::BoundaryState::XSigma(init),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    match out {
+        candle_gen::gen_core::BoundaryState::XSigma(x)
+        | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | candle_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => Ok(x),
     }
-    Ok(x)
 }
 
 /// Base checkpoint Euler CFG, preserving upstream's [unconditional, conditional] pack and
@@ -228,110 +515,125 @@ fn denoise_base_with_references_pag(
             "flux3: CFG needs a base DiT and finite non-negative guidance".into(),
         ));
     }
-    if schedule.len() < 2 {
-        return Err(Error::Msg("flux3: CFG schedule needs two points".into()));
-    }
     let compute = dit.compute_dtype();
-    let total_steps = schedule.len() - 1;
     let cfg_off_with_pag = gen_core_flux3::base_cfg_off_with_pag(guidance, pag);
-    let mut x = noise.to_device(dit.device())?.to_dtype(DType::F32)?;
+    let init = noise.to_device(dit.device())?.to_dtype(DType::F32)?;
     let text_tokens = text.tokens.to_device(dit.device())?;
     let neg_tokens = negative
         .map(|n| n.tokens.to_device(dit.device()))
         .transpose()?;
-    for step in 0..total_steps {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
-        let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
-        let velocity = if cfg_off_with_pag {
-            let pos_sample = SampleTokens {
-                text: &text_tokens,
-                text_ids: &text.ids,
-                image: &x,
-                image_ids,
-                image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-                timestep: schedule[step],
-                target_timestep: None,
-            };
-            let cond = dit.forward_pag(std::slice::from_ref(&pos_sample), None)?;
-            if step_pag > 0.0 {
-                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
-                apply_pag_candle(&cond, &cond, &pert, step_pag, compute)?
-            } else {
-                cond
-            }
-        } else {
-            let negative = negative.ok_or_else(|| {
-                Error::Unsupported(
-                    "flux3: base CFG needs independently encoded negative conditioning".into(),
-                )
-            })?;
-            let neg_tokens = neg_tokens.as_ref().expect("encoded negative tokens");
-            let samples = [
-                SampleTokens {
-                    text: neg_tokens,
-                    text_ids: &negative.ids,
-                    image: &x,
-                    image_ids,
-                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-                    timestep: schedule[step],
-                    target_timestep: None,
-                },
-                SampleTokens {
-                    text: &text_tokens,
-                    text_ids: &text.ids,
-                    image: &x,
-                    image_ids,
-                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-                    timestep: schedule[step],
-                    target_timestep: None,
-                },
-            ];
-            let prediction = dit.forward(&samples)?;
-            let rows = x.dim(0)?;
-            let u = prediction.narrow(0, 0, rows)?;
-            let c = prediction.narrow(0, rows, rows)?;
-            let difference = to(
-                &c.to_dtype(DType::F32)?.sub(&u.to_dtype(DType::F32)?)?,
-                compute,
-            )?;
-            let scaled = to(
-                &difference
-                    .to_dtype(DType::F32)?
-                    .affine(guidance as f64, 0.0)?,
-                compute,
-            )?;
-            let pred_cfg = to(
-                &u.to_dtype(DType::F32)?.add(&scaled.to_dtype(DType::F32)?)?,
-                compute,
-            )?;
-            if step_pag > 0.0 {
+    let driver = Flux3BaseDriver::new(
+        "flux3_base_cfg_candle",
+        schedule,
+        compute,
+        |x: &Tensor, step: usize, total_steps: usize, t: f32| {
+            let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
+            let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
+            if cfg_off_with_pag {
                 let pos_sample = SampleTokens {
                     text: &text_tokens,
                     text_ids: &text.ids,
-                    image: &x,
+                    image: x,
                     image_ids,
                     image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-                    timestep: schedule[step],
+                    timestep: t,
                     target_timestep: None,
                 };
-                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
-                apply_pag_candle(&pred_cfg, &c, &pert, step_pag, compute)?
+                let cond = dit.forward_pag(std::slice::from_ref(&pos_sample), None)?;
+                if step_pag > 0.0 {
+                    let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                    apply_pag_candle(&cond, &cond, &pert, step_pag, compute)
+                } else {
+                    Ok(cond)
+                }
             } else {
-                pred_cfg
+                let negative = negative.ok_or_else(|| {
+                    Error::Unsupported(
+                        "flux3: base CFG needs independently encoded negative conditioning".into(),
+                    )
+                })?;
+                let neg_tokens = neg_tokens.as_ref().expect("encoded negative tokens");
+                let samples = [
+                    SampleTokens {
+                        text: neg_tokens,
+                        text_ids: &negative.ids,
+                        image: x,
+                        image_ids,
+                        image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                        timestep: t,
+                        target_timestep: None,
+                    },
+                    SampleTokens {
+                        text: &text_tokens,
+                        text_ids: &text.ids,
+                        image: x,
+                        image_ids,
+                        image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                        timestep: t,
+                        target_timestep: None,
+                    },
+                ];
+                let prediction = dit.forward(&samples)?;
+                let rows = x.dim(0)?;
+                let u = prediction.narrow(0, 0, rows)?;
+                let c = prediction.narrow(0, rows, rows)?;
+                let difference = to(
+                    &c.to_dtype(DType::F32)?.sub(&u.to_dtype(DType::F32)?)?,
+                    compute,
+                )?;
+                let scaled = to(
+                    &difference
+                        .to_dtype(DType::F32)?
+                        .affine(guidance as f64, 0.0)?,
+                    compute,
+                )?;
+                let pred_cfg = to(
+                    &u.to_dtype(DType::F32)?.add(&scaled.to_dtype(DType::F32)?)?,
+                    compute,
+                )?;
+                if step_pag > 0.0 {
+                    let pos_sample = SampleTokens {
+                        text: &text_tokens,
+                        text_ids: &text.ids,
+                        image: x,
+                        image_ids,
+                        image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                        timestep: t,
+                        target_timestep: None,
+                    };
+                    let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                    apply_pag_candle(&pred_cfg, &c, &pert, step_pag, compute)
+                } else {
+                    Ok(pred_cfg)
+                }
             }
-        };
-        let dt = schedule[step + 1] - schedule[step];
-        let update = to(
-            &velocity.to_dtype(DType::F32)?.affine(dt as f64, 0.0)?,
-            compute,
-        )?;
-        x = x.add(&update.to_dtype(DType::F32)?)?;
-        on_step(step + 1);
+        },
+    )?;
+    let total_steps = schedule.len() - 1;
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let mut on_progress = |progress: candle_gen::gen_core::Progress| {
+        if let candle_gen::gen_core::Progress::Step { current, .. } = progress {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = candle_gen::driver::StepHooks::new(&mut on_progress);
+    let out = candle_gen::driver::run_candle_driver_slices(
+        &driver,
+        [candle_gen::driver::SliceSpec::full(total_steps)],
+        candle_gen::gen_core::BoundaryState::XSigma(init),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    match out {
+        candle_gen::gen_core::BoundaryState::XSigma(x)
+        | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | candle_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => Ok(x),
     }
-    Ok(x)
 }
 
 /// The image ids of a `(h, w)` token grid, scaled for the DiT (`scaled_ids(latent_ids(h, w))`).
@@ -585,5 +887,233 @@ mod tests {
             );
             assert!(!gen_core_flux3::base_cfg_off_with_pag(guidance, None));
         }
+    }
+
+    fn tensor_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn flux3_flow_map_driver_passes_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let schedule = gen_core_flux3::flow_map_schedule(4, gen_core_flux3::DEFAULT_ALPHA).unwrap();
+        let sched_clone = schedule.clone();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 19,
+            base_geometry: (64, 64),
+            alt_geometry: (128, 128),
+            make_driver: move || {
+                Box::new(
+                    Flux3FlowMapDriver::new(
+                        "flux3_flow_map_candle_test",
+                        &sched_clone,
+                        DType::BF16,
+                        None,
+                        |x: &Tensor, t: f32, target: Option<f32>, _pag: Option<&[u32]>| {
+                            let target = target.expect("flow-map must pass Some(target_timestep)");
+                            let coeff = 0.25 + 0.5 * f64::from(t) - 0.1 * f64::from(target);
+                            to(&x.affine(coeff, 0.05)?, DType::BF16)
+                        },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::new(&[0.5_f32, -0.75, 1.25, -0.25], &Device::Cpu)
+                    .unwrap()
+                    .reshape((2, 2))
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+            },
+            latents_equal: tensor_bit_equal,
+        })
+        .expect("FLUX.3 Candle flow-map driver passes Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn flux3_flow_map_driver_preserves_target_timesteps_rounding_and_pag() {
+        use candle_gen::driver::{DriverRunState, FamilyDriver, SliceInput, StepHooks};
+        use candle_gen::gen_core::{BoundaryState, PagConfig, Progress};
+
+        // Schedule with < 2 points is rejected.
+        assert!(Flux3FlowMapDriver::new(
+            "flux3_short",
+            &[1.0],
+            DType::BF16,
+            None,
+            |x: &Tensor, _: f32, _: Option<f32>, _: Option<&[u32]>| Ok(x.clone()),
+        )
+        .is_err());
+
+        let schedule = gen_core_flux3::flow_map_schedule(4, gen_core_flux3::DEFAULT_ALPHA).unwrap();
+        let pag = gen_core_flux3::flux3_pag_capability(true)
+            .resolve(Some(&PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }))
+            .unwrap();
+        let seen_calls =
+            std::cell::RefCell::new(Vec::<(f32, Option<f32>, Option<Vec<u32>>)>::new());
+        let driver = Flux3FlowMapDriver::new(
+            "flux3_flow_map_candle_pag_test",
+            &schedule,
+            DType::BF16,
+            Some(pag.clone()),
+            |x: &Tensor, t: f32, target: Option<f32>, layers: Option<&[u32]>| {
+                assert_eq!(x.dtype(), DType::F32, "running latent x must stay F32");
+                seen_calls
+                    .borrow_mut()
+                    .push((t, target, layers.map(|l| l.to_vec())));
+                let factor = if layers.is_some() { 0.15 } else { 0.45 };
+                to(
+                    &x.affine(
+                        factor + 0.1 * f64::from(t),
+                        f64::from(target.unwrap_or(0.0)) * 0.2,
+                    )?,
+                    DType::BF16,
+                )
+            },
+        )
+        .unwrap();
+
+        let init = Tensor::new(&[0.5_f32, -0.75, 1.25, -0.25], &Device::Cpu)
+            .unwrap()
+            .reshape((2, 2))
+            .unwrap();
+        let cancel = CancelFlag::default();
+        let mut state = DriverRunState::new();
+        let mut ticks = Vec::new();
+        let out = {
+            let mut on_progress = |p: Progress| ticks.push(p);
+            let mut hooks = StepHooks::new(&mut on_progress);
+            driver
+                .run_slice(
+                    SliceInput::full_trajectory(init.clone(), 4, 7, &cancel),
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        let BoundaryState::XSigma(driver_x) = out else {
+            panic!("expected XSigma");
+        };
+        assert_eq!(driver_x.dtype(), DType::F32);
+
+        // Reference calculation matching the frozen upstream formula bit-for-bit.
+        let mut ref_x = to(&init, DType::F32).unwrap();
+        let mut expected_calls = Vec::new();
+        for step in 0..4 {
+            let t = schedule[step];
+            let target = schedule[step + 1];
+            let dt = target - t;
+            expected_calls.push((t, Some(target), None));
+            let cond = to(
+                &ref_x
+                    .affine(0.45 + 0.1 * f64::from(t), f64::from(target) * 0.2)
+                    .unwrap(),
+                DType::BF16,
+            )
+            .unwrap();
+            let step_pag = pag.step_scale(step, 4);
+            let velocity = if step_pag > 0.0 {
+                let layers = pag.step_layers(step, 4);
+                expected_calls.push((t, Some(target), Some(layers.to_vec())));
+                let pert = to(
+                    &ref_x
+                        .affine(0.15 + 0.1 * f64::from(t), f64::from(target) * 0.2)
+                        .unwrap(),
+                    DType::BF16,
+                )
+                .unwrap();
+                apply_pag_candle(&cond, &cond, &pert, step_pag, DType::BF16).unwrap()
+            } else {
+                cond
+            };
+            let scaled = to(
+                &to(&velocity, DType::F32)
+                    .unwrap()
+                    .affine(dt as f64, 0.0)
+                    .unwrap(),
+                DType::BF16,
+            )
+            .unwrap();
+            ref_x = to(
+                &ref_x.add(&to(&scaled, DType::F32).unwrap()).unwrap(),
+                DType::F32,
+            )
+            .unwrap();
+        }
+        assert!(tensor_bit_equal(&driver_x, &ref_x));
+        assert_eq!(*seen_calls.borrow(), expected_calls);
+        assert_eq!(
+            ticks,
+            vec![
+                Progress::Step {
+                    current: 1,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 3,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 4,
+                    total: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn flux3_base_driver_passes_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let schedule = gen_core_flux3::flow_map_schedule(4, gen_core_flux3::DEFAULT_ALPHA).unwrap();
+        let sched_clone = schedule.clone();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 23,
+            base_geometry: (64, 64),
+            alt_geometry: (128, 128),
+            make_driver: move || {
+                Box::new(
+                    Flux3BaseDriver::new(
+                        "flux3_base_cfg_candle_test",
+                        &sched_clone,
+                        DType::BF16,
+                        |x: &Tensor, _step: usize, _total: usize, t: f32| {
+                            to(&x.affine(0.3 + 0.2 * f64::from(t), 0.0)?, DType::BF16)
+                        },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::new(&[0.25_f32, -0.5, 0.75, -1.0], &Device::Cpu)
+                    .unwrap()
+                    .reshape((2, 2))
+                    .unwrap()
+            },
+            latents_equal: tensor_bit_equal,
+        })
+        .expect("FLUX.3 Candle base CFG driver passes Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
     }
 }

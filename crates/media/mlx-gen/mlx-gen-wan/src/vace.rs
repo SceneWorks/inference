@@ -38,7 +38,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::WanVaceConfig;
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::{rope_apply, RopeTable};
-use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
+use crate::scheduler::{compute_sigmas, integer_timesteps, SolverKind, WanNativeDriver};
 use crate::text_encoder::gelu_tanh;
 use crate::vae::WanVae;
 
@@ -1023,11 +1023,12 @@ pub fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -> Vec<f
     vec![weighted_control_scale(req.control_scale, masking_strength); vace_layers]
 }
 
-/// VACE CFG denoise loop (sc-3436) — mirrors the validated base Wan [`crate::pipeline::denoise`]
-/// (same `make_scheduler` + per-step `eval`), but each step runs [`WanVaceTransformer::forward_vace`]
-/// with the constant 96-ch `control` + per-vace-layer `scales`, classifier-free-guided against the
-/// (optional) unconditional context. The control latent is constant across steps (built once by the
-/// caller from [`prepare_video_latents`] + [`prepare_masks`] + [`build_vace_control`]).
+/// VACE CFG denoise loop (sc-3436, SW-6968) — routes through [`WanNativeDriver`] +
+/// [`mlx_gen::gen_core::guidance::cfg`] (`PIPE-7`, `PIPE-8`), running
+/// [`WanVaceTransformer::forward_vace_cached`] with the constant 96-ch `control` + per-vace-layer
+/// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent
+/// is constant across steps (built once by the caller from [`prepare_video_latents`] +
+/// [`prepare_masks`] + [`build_vace_control`]).
 ///
 /// `init_noise`: `[out_dim, T, h, w]` (f32). `ctx_cond` / `ctx_uncond`: raw text embeddings
 /// `[1, L, text_dim]` (the transformer projects them via its `text_embedder`). CFG:
@@ -1049,67 +1050,35 @@ pub fn denoise_vace(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(kind, num_train_timesteps);
-    sched.set_timesteps(steps, shift);
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     mlx_gen::video_execution::sampling(
         "wan_vace",
         &format!("{kind:?}"),
         "flow_velocity",
         serde_json::json!({"guidance_bits":guidance.to_bits(),"control_scale_bits":scales.iter().map(|v|v.to_bits()).collect::<Vec<_>>()}),
     );
-    mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    mlx_gen::video_execution::schedule("wan_vace", &sigmas);
 
-    // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
-    // latent (shared by every step AND both CFG branches) and the projected text contexts (constant
-    // per branch). The old loop rebuilt all of these inside each of the 2 forwards per step.
-    mlx_gen::sc20686::mark_phase("prepare-cache");
-    let cache = transformer.build_vace_cache(init_noise, control)?;
-    let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
-    let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
-    mlx_rs::transforms::eval([
-        &cache.cos_t,
-        &cache.sin_t,
-        &cache.control_emb,
-        &ctx_cond_emb,
-    ])?;
-    transformer.sc20686_bind(
-        &cache,
-        &[
-            &ctx_cond_emb,
-            ctx_uncond_emb.as_ref().unwrap_or(&ctx_cond_emb),
-        ],
-    );
-
-    // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
-    // sequential B=1 forwards, while `crate::pipeline::denoise` batches them into one B=2 forward
-    // (sc-2853). Adopting that pattern needs `build_vace_cache`/`forward_vace_cached` extended to
-    // the stacked-context + broadcast-latent form AND a real-weight VACE parity re-validation:
-    // sc-2853's bit-exactness was proven for the base transformer only, never the VACE branch, and
-    // Wan's bf16-native path is a known batch-size numerics hazard (the sc-2680 B2≠2×B1 gotcha).
-    // Until a VACE golden validates the batched form, sequential B=1 is the parity-safe choice.
     let mut latents = init_noise.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let cond = transformer.forward_vace_cached(&latents, t, &cache, &ctx_cond_emb, scales)?;
-        let pred = match &ctx_uncond_emb {
-            Some(uncond_emb) => {
-                let uncond =
-                    transformer.forward_vace_cached(&latents, t, &cache, uncond_emb, scales)?;
-                add(
-                    &uncond,
-                    &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
-                )?
-            }
-            None => cond,
-        };
-        latents = sched.step(&pred, &latents)?;
-        mlx_rs::transforms::eval([&latents])?;
-        on_step(i + 1);
-    }
+    let mut driver_state = mlx_gen::driver::DriverRunState::new();
+    denoise_vace_slice(
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
+        transformer,
+        control,
+        scales,
+        guidance,
+        ctx_cond,
+        ctx_uncond,
+        &mut latents,
+        0..steps,
+        0,
+        cancel,
+        &mut driver_state,
+        on_step,
+    )?;
     Ok(latents)
 }
 
@@ -1119,14 +1088,8 @@ pub fn denoise_vace(
 /// the **low-noise** expert below it, switching the transformer, its per-expert VACE step cache (the
 /// patch-embedded control latent + RoPE — each expert carries its **own** `vace_patch_embedding`, so
 /// `control_emb` differs per expert), its per-expert projected text contexts (each expert has its own
-/// `text_embedder`), and its per-expert guidance together. The control latent + per-vace-layer
-/// `scales` are constant across steps and shared by both experts (built once by the caller from
-/// [`prepare_video_latents`] + [`prepare_masks`] + [`build_vace_control`]).
-///
-/// `ctx_cond`/`ctx_uncond` are the **raw** text embeddings `[1, L, text_dim]` (each expert projects
-/// them via its own `text_embedder`); pass `ctx_uncond = None` for the CFG-disabled fast path.
-/// Returns the denoised `[out_dim, T, h, w]` (f32). Reduces to [`denoise_vace`] when both experts are
-/// the same transformer with equal guidance.
+/// `text_embedder`), and its per-expert guidance together while carrying solver history across the
+/// crossing in one request-owned [`mlx_gen::driver::DriverRunState`] (`PIPE-3`, `PIPE-7`).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_vace_moe(
     low: &WanVaceTransformer,
@@ -1146,21 +1109,24 @@ pub fn denoise_vace_moe(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(kind, num_train_timesteps);
-    sched.set_timesteps(steps, shift);
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let timesteps = integer_timesteps(&sigmas, num_train_timesteps);
     mlx_gen::video_execution::sampling(
         "wan_vace",
         &format!("{kind:?}"),
         "flow_velocity",
         serde_json::json!({"low_guidance_bits":guidance_low.to_bits(),"high_guidance_bits":guidance_high.to_bits(),"boundary_bits":boundary_timestep.to_bits(),"control_scale_bits":scales.iter().map(|v|v.to_bits()).collect::<Vec<_>>()}),
     );
-    mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    mlx_gen::video_execution::schedule("wan_vace", &sigmas);
 
     let k = crate::pipeline::crossing_index(&timesteps, boundary_timestep);
     let mut latents = init_noise.clone();
-    denoise_vace_range(
-        &mut *sched,
+    let mut driver_state = mlx_gen::driver::DriverRunState::new();
+    denoise_vace_slice(
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
         high,
         control,
         scales,
@@ -1168,13 +1134,17 @@ pub fn denoise_vace_moe(
         ctx_cond,
         ctx_uncond,
         &mut latents,
-        &timesteps,
         0..k,
+        0,
         cancel,
+        &mut driver_state,
         on_step,
     )?;
-    denoise_vace_range(
-        &mut *sched,
+    denoise_vace_slice(
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
         low,
         control,
         scales,
@@ -1182,20 +1152,25 @@ pub fn denoise_vace_moe(
         ctx_cond,
         ctx_uncond,
         &mut latents,
-        &timesteps,
         k..steps,
+        1,
         cancel,
+        &mut driver_state,
         on_step,
     )?;
     Ok(latents)
 }
 
-/// Run one expert over an absolute timestep range while preserving a shared scheduler and latent
-/// stream. The VACE cache and projected contexts are built inside this call, so a staged caller can
-/// drop them with the expert before loading the next expert.
+/// Run one VACE expert over an absolute timestep range through [`WanNativeDriver`] while carrying
+/// multistep solver history in the request-owned [`mlx_gen::driver::DriverRunState`] (`PIPE-3`,
+/// `PIPE-7`, `PIPE-8`). The VACE cache and projected contexts are built inside this call, so a
+/// staged caller can drop them with the expert before loading the next expert.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn denoise_vace_range(
-    sched: &mut dyn WanScheduler,
+pub(crate) fn denoise_vace_slice(
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    total_steps: usize,
+    shift: f32,
     transformer: &WanVaceTransformer,
     control: &Array,
     scales: &[f32],
@@ -1203,11 +1178,18 @@ pub(crate) fn denoise_vace_range(
     ctx_cond: &Array,
     ctx_uncond: Option<&Array>,
     latents: &mut Array,
-    timesteps: &[f32],
     range: std::ops::Range<usize>,
+    phase: usize,
     cancel: &CancelFlag,
+    driver_state: &mut mlx_gen::driver::DriverRunState,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
+    // latent (shared by every step AND both CFG branches) and the projected text contexts (constant
+    // per branch).
     mlx_gen::sc20686::mark_phase("prepare-cache");
     let cache = transformer.build_vace_cache(latents, control)?;
     let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
@@ -1226,28 +1208,73 @@ pub(crate) fn denoise_vace_range(
         ],
     );
 
-    for i in range {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let t = timesteps[i];
-        let cond = transformer.forward_vace_cached(latents, t, &cache, &ctx_cond_emb, scales)?;
-        let pred = match &ctx_uncond_emb {
-            Some(uncond_emb) => {
-                let uncond =
-                    transformer.forward_vace_cached(latents, t, &cache, uncond_emb, scales)?;
-                add(
-                    &uncond,
-                    &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
-                )?
+    // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
+    // sequential B=1 forwards to preserve VACE bf16 parity.
+    let driver = WanNativeDriver::new(
+        "wan_native_vace",
+        kind,
+        num_train_timesteps,
+        total_steps,
+        shift,
+        |x: &Array, _step: usize, t: f32| {
+            let cond = transformer.forward_vace_cached(x, t, &cache, &ctx_cond_emb, scales)?;
+            match &ctx_uncond_emb {
+                Some(uncond_emb) => {
+                    let uncond =
+                        transformer.forward_vace_cached(x, t, &cache, uncond_emb, scales)?;
+                    Ok(mlx_gen::gen_core::guidance::cfg(
+                        &mlx_gen::MlxLatentOps,
+                        &cond,
+                        &uncond,
+                        guidance,
+                    )?)
+                }
+                None => Ok(cond),
             }
-            None => cond,
-        };
-        *latents = sched.step(&pred, latents)?;
-        mlx_rs::transforms::eval([&*latents])?;
-        on_step(i + 1);
-    }
+        },
+    );
+    let (transition, history) = if range.start == 0 {
+        (
+            mlx_gen::driver::SliceTransition::Start,
+            mlx_gen::driver::DriverHistoryPolicy::Reset,
+        )
+    } else {
+        (
+            mlx_gen::driver::SliceTransition::Continue,
+            mlx_gen::driver::DriverHistoryPolicy::Carry,
+        )
+    };
+    let mut on_progress = |progress: mlx_gen::Progress| {
+        if let mlx_gen::Progress::Step { current, .. } = progress {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut on_progress);
+    let out = mlx_gen::driver::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec {
+            pass: 0,
+            phase,
+            span: range,
+            transition,
+            history,
+            geometry: None,
+            request_boundary_estimate: false,
+        }],
+        mlx_gen::gen_core::BoundaryState::XSigma(latents.clone()),
+        total_steps,
+        0,
+        cancel,
+        None,
+        driver_state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    *latents = match out {
+        mlx_gen::gen_core::BoundaryState::XSigma(x)
+        | mlx_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    };
     Ok(())
 }
 
@@ -1501,7 +1528,7 @@ mod tests {
 
         // Pre-swap resident oracle: build both expert caches first and select expert/cache/guidance
         // independently at every step, matching the original `denoise_vace_moe` implementation.
-        let mut sched = make_scheduler(SolverKind::UniPC, 1000);
+        let mut sched = crate::scheduler::make_scheduler(SolverKind::UniPC, 1000);
         sched.set_timesteps(steps, 1.0);
         let timesteps = sched.timesteps().to_vec();
         let low_cache = low.build_vace_cache(&init_noise, &control).unwrap();

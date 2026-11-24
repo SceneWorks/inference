@@ -44,9 +44,9 @@ use crate::config::{
     NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
     T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW,
 };
-use crate::pipeline::{cfg, create_noise, frames_to_images};
+use crate::pipeline::{create_noise, frames_to_images};
 use crate::rope::WanRope;
-use crate::scheduler::{FlowScheduler, Sampler};
+use crate::scheduler::{FlowScheduler, Sampler, WanNativeDriver};
 use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
 
@@ -528,13 +528,15 @@ impl Pipeline {
         }
     }
 
-    /// Run the denoise steps `range` on a single expert, advancing the (shared, continuous) scheduler
-    /// and mutating `latents` in place. Extracted so the resident MoE loop and the staged expert-swap
-    /// drive the **identical** per-step math over their respective step ranges — the prefix/suffix split
-    /// is bit-exact to the resident per-step `t ≥ boundary` choice because the same `sched` advances
-    /// through every step in order (sc-12733).
+    /// Run the denoise steps `range` on a single expert through [`WanNativeDriver`], carrying the
+    /// request-owned [`candle_gen::driver::DriverRunState`] solver history across compatible
+    /// expert crossings (`PIPE-3`, `PIPE-7`, `PIPE-8`, `SW-6968`).
+    ///
+    /// Both the resident MoE loop and the staged expert-swap drive the identical typed driver
+    /// slice over their respective step ranges: `range.start == 0` enters via `Start/Reset`, and
+    /// `range.start > 0` continues via `Continue/Carry`. An empty `range` is a no-op.
     #[allow(clippy::too_many_arguments)]
-    fn denoise_range(
+    fn denoise_expert_slice(
         &self,
         expert: &WanTransformer,
         ctx_pos: &Tensor,
@@ -543,13 +545,17 @@ impl Pipeline {
         y: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
-        sched: &mut FlowScheduler,
+        knobs: &RenderKnobs,
         latents: &mut Tensor,
         range: std::ops::Range<usize>,
-        total: u32,
+        phase: usize,
+        driver_state: &mut candle_gen::driver::DriverRunState,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
         candle_gen::execution::policy(
             "wan14b_expert_range",
             serde_json::json!({
@@ -592,31 +598,77 @@ impl Pipeline {
                 "applied",
             );
         }
-        for i in range {
-            check_cancel(cancel)?;
-            let t = sched.timestep(i);
-            // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
-            let x = match y {
-                Some(y) => Tensor::cat(&[&*latents, y], 1)?,
-                None => latents.clone(),
-            };
-            let v_pos = expert.forward_prepared(&x, t, &pos_kv, cos, sin)?;
-            // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
-            // is `Some` iff that guidance > 1.0 (sc-8993).
-            let v = match &neg_kv {
-                Some(neg_kv) if cfg_active(guidance) => {
-                    let v_neg = expert.forward_prepared(&x, t, neg_kv, cos, sin)?;
-                    cfg(&v_pos, &v_neg, guidance)?
+
+        let driver = WanNativeDriver::new(
+            "wan_candle_14b_moe",
+            knobs.sampler,
+            knobs.steps,
+            knobs.shift,
+            |latents: &Tensor, _step: usize, t: f64| -> CResult<Tensor> {
+                // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
+                let x = match y {
+                    Some(y) => Tensor::cat(&[latents, y], 1)?,
+                    None => latents.clone(),
+                };
+                let v_pos = expert.forward_prepared(&x, t, &pos_kv, cos, sin)?;
+                // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
+                // is `Some` iff that guidance > 1.0 (sc-8993).
+                match &neg_kv {
+                    Some(neg_kv) if cfg_active(guidance) => {
+                        let v_neg = expert.forward_prepared(&x, t, neg_kv, cos, sin)?;
+                        Ok(candle_gen::gen_core::guidance::cfg(
+                            &candle_gen::CandleLatentOps,
+                            &v_pos,
+                            &v_neg,
+                            guidance as f32,
+                        )?)
+                    }
+                    _ => Ok(v_pos),
                 }
-                _ => v_pos,
-            };
-            check_cancel(cancel)?;
-            *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+            },
+        );
+        let (transition, history) = if range.start == 0 {
+            (
+                candle_gen::driver::SliceTransition::Start,
+                candle_gen::driver::DriverHistoryPolicy::Reset,
+            )
+        } else {
+            (
+                candle_gen::driver::SliceTransition::Continue,
+                candle_gen::driver::DriverHistoryPolicy::Carry,
+            )
+        };
+        let mut hooks = candle_gen::driver::StepHooks::new(on_progress);
+        let out = candle_gen::driver::run_candle_driver_slices(
+            &driver,
+            [candle_gen::driver::SliceSpec {
+                pass: 0,
+                phase,
+                span: range,
+                transition,
+                history,
+                geometry: None,
+                request_boundary_estimate: false,
+            }],
+            candle_gen::gen_core::BoundaryState::XSigma(latents.clone()),
+            knobs.steps,
+            knobs.seed,
+            cancel,
+            None,
+            driver_state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .inspect_err(|err| {
+            if matches!(err, CandleError::Canceled) {
+                crate::sc20686_observer::observe_cancelled();
+            }
+        })?;
+        *latents = match out {
+            candle_gen::gen_core::BoundaryState::XSigma(t)
+            | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: t, .. }
+            | candle_gen::gen_core::BoundaryState::RouteSpecific { state: t, .. } => t,
+        };
         Ok(())
     }
 
@@ -677,12 +729,12 @@ impl Pipeline {
         };
 
         let mut latents = create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let mut sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
-        let total = knobs.steps as u32;
+        let sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
         // MoE: high-noise expert at/above the boundary timestep, low-noise below. Flow-match timesteps
         // are monotonically decreasing, so the crossing is a single prefix/suffix split (sc-12733).
         let k = crossing_index(&sched, knobs.steps, knobs.boundary_ts);
-        self.denoise_range(
+        let mut driver_state = candle_gen::driver::DriverRunState::new();
+        self.denoise_expert_slice(
             &comps.high,
             &high_pos,
             high_neg.as_ref(),
@@ -690,14 +742,15 @@ impl Pipeline {
             y.as_ref(),
             &cos,
             &sin,
-            &mut sched,
+            &knobs,
             &mut latents,
             0..k,
-            total,
+            0,
+            &mut driver_state,
             &req.cancel,
             on_progress,
         )?;
-        self.denoise_range(
+        self.denoise_expert_slice(
             &comps.low,
             &low_pos,
             low_neg.as_ref(),
@@ -705,10 +758,11 @@ impl Pipeline {
             y.as_ref(),
             &cos,
             &sin,
-            &mut sched,
+            &knobs,
             &mut latents,
             k..knobs.steps,
-            total,
+            1,
+            &mut driver_state,
             &req.cancel,
             on_progress,
         )?;
@@ -805,20 +859,17 @@ impl Pipeline {
         check_cancel(cancel)?;
 
         let mut latents = create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let mut sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
-        let total = knobs.steps as u32;
+        let sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
         // The single high→low crossing: high runs `0..k` (`t ≥ boundary`), low runs `k..steps`.
         let k = crossing_index(&sched, knobs.steps, knobs.boundary_ts);
 
         // ── Stage 2: the expert swap — hold only the ACTIVE expert (the two are NEVER co-resident). ──
         // Load high, project + denoise `0..k`, DROP high; then load low, project + denoise `k..steps`.
-        // Driven through [`staged_expert_swap`], whose block-scoping frees the inactive expert before the
-        // next loads; the `sync` boundary drains in-flight kernels before the freed pool is reused. The
-        // high expert's applied-residual count is carried past its drop in a `Cell` (a `usize`, not the
-        // expert) so the cross-expert zero-match guard runs once both have loaded.
+        // Driven through [`staged_expert_swap`], carrying multistep solver history in request-owned
+        // `DriverRunState` via `Carry` (`PIPE-3`, `PIPE-7`).
         let high_applied: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let mut swap_state = SwapState {
-            sched: &mut sched,
+            driver_state: candle_gen::driver::DriverRunState::new(),
             latents: &mut latents,
             // Reborrow so `on_progress` is usable again for Stage 3 after `swap_state` dies.
             on_progress: &mut *on_progress,
@@ -845,7 +896,7 @@ impl Pipeline {
                     Some(neg) if cfg_active(knobs.g_high) => Some(high.embed_text(neg)?),
                     _ => None,
                 };
-                self.denoise_range(
+                self.denoise_expert_slice(
                     high,
                     &high_pos,
                     high_neg.as_ref(),
@@ -853,10 +904,11 @@ impl Pipeline {
                     y.as_ref(),
                     &cos,
                     &sin,
-                    st.sched,
+                    &knobs,
                     st.latents,
                     0..k,
-                    total,
+                    0,
+                    &mut st.driver_state,
                     cancel,
                     st.on_progress,
                 )
@@ -880,7 +932,7 @@ impl Pipeline {
                     Some(neg) if cfg_active(knobs.g_low) => Some(low.embed_text(neg)?),
                     _ => None,
                 };
-                self.denoise_range(
+                self.denoise_expert_slice(
                     low,
                     &low_pos,
                     low_neg.as_ref(),
@@ -888,10 +940,11 @@ impl Pipeline {
                     y.as_ref(),
                     &cos,
                     &sin,
-                    st.sched,
+                    &knobs,
                     st.latents,
                     k..knobs.steps,
-                    total,
+                    1,
+                    &mut st.driver_state,
                     cancel,
                     st.on_progress,
                 )
@@ -943,12 +996,11 @@ fn crossing_index(sched: &FlowScheduler, steps: usize, boundary_ts: f64) -> usiz
         .unwrap_or(steps)
 }
 
-/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12733). Held as `&mut`
-/// references so exclusive access moves between the load/use closures via the `&mut SwapState` param
-/// rather than being captured by each closure — the borrow-checker-clean way to let two `FnOnce`
-/// stages share the scheduler/latents without a `RefCell`.
+/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12733, SW-6968): the
+/// request-owned [`candle_gen::driver::DriverRunState`] carrying solver history across the swap,
+/// the in-place latents, and the progress sink.
 struct SwapState<'a> {
-    sched: &'a mut FlowScheduler,
+    driver_state: candle_gen::driver::DriverRunState,
     latents: &'a mut Tensor,
     on_progress: &'a mut dyn FnMut(Progress),
 }

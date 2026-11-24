@@ -80,37 +80,15 @@ pub fn make_scheduler(kind: SolverKind, num_train_timesteps: usize) -> Box<dyn W
 
 /// Shifted-sigma schedule (`_compute_sigmas`): `num_steps + 1` f32 sigmas, trailing `0.0`.
 ///
-/// Computed in f64 (numpy path) and cast to f32 at the end. `σ_max = (N−1)/N`, `σ_min = 0`, where
-/// `N = num_train_timesteps`; interpolate `linspace(σ_max, σ_min, n+1)[:-1]`, apply the shift once,
-/// then append `0.0`.
+/// Delegates to [`mlx_gen::gen_core::sampling::wan_mlx_sigmas`] (`PIPE-9`):
+/// `σ_max = (N−1)/N`, `σ_min = 0`, `linspace(σ_max, σ_min, n+1)[:-1]`, algebraic shift, trailing `0.0`.
 pub fn compute_sigmas(num_steps: usize, shift: f32, num_train_timesteps: usize) -> Vec<f32> {
-    let n_train = num_train_timesteps as f64;
-    let sigma_max = 1.0 - 1.0 / n_train; // (N-1)/N
-    let sigma_min = 0.0_f64;
-    let shift = shift as f64;
-    let n = num_steps as f64;
-    // numpy linspace(σ_max, σ_min, num_steps+1) with endpoint=True evaluates `start + step·k`,
-    // step = (stop−start)/(num−1) = (σ_min−σ_max)/num_steps; `[:-1]` keeps k = 0..num_steps-1.
-    let step = (sigma_min - sigma_max) / n;
-
-    let mut out = Vec::with_capacity(num_steps + 1);
-    for k in 0..num_steps {
-        let s = sigma_max + step * (k as f64);
-        let shifted = shift * s / (1.0 + (shift - 1.0) * s);
-        out.push(shifted as f32);
-    }
-    out.push(0.0_f32);
-    out
+    mlx_gen::gen_core::sampling::wan_mlx_sigmas(num_steps, shift, num_train_timesteps)
 }
 
-/// Integer-valued model timesteps from sigmas: `(σ[:-1] · num_train).trunc` (int64 cast truncates
-/// toward zero), back to f32.
-fn integer_timesteps(sigmas: &[f32], num_train_timesteps: usize) -> Vec<f32> {
-    let nt = num_train_timesteps as f32;
-    sigmas[..sigmas.len() - 1]
-        .iter()
-        .map(|&s| (s * nt).trunc())
-        .collect()
+/// Integer-valued model timesteps from sigmas: `(σ[:-1] · num_train).trunc` (`PIPE-9`).
+pub fn integer_timesteps(sigmas: &[f32], num_train_timesteps: usize) -> Vec<f32> {
+    mlx_gen::gen_core::sampling::wan_mlx_timesteps(sigmas, num_train_timesteps)
 }
 
 // =====================================================================================
@@ -601,6 +579,317 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
     Ok(x)
 }
 
+// =====================================================================================
+// Typed FamilyDriver for Wan Native Flow-SNR Solvers (SW-6968, PIPE-3, PIPE-7)
+// =====================================================================================
+
+/// Forward-evaluation seam for [`WanNativeDriver`] (`SW-6968`, `PIPE-7`).
+///
+/// Generic over the forward predictor so weights-free Tier 0 tests can run
+/// [`mlx_gen::driver::conformance::verify_driver_conformance`] and expert-crossing `Carry`
+/// trajectory parity checks over mocked forwards without loading any model weights.
+pub trait WanNativeForward {
+    /// Predict the flow velocity `v` for `latents` at absolute outer `step` and integer `timestep`.
+    fn predict_velocity(&self, latents: &Array, step: usize, timestep: f32) -> Result<Array>;
+}
+
+impl<F> WanNativeForward for F
+where
+    F: Fn(&Array, usize, f32) -> Result<Array>,
+{
+    fn predict_velocity(&self, latents: &Array, step: usize, timestep: f32) -> Result<Array> {
+        self(latents, step, timestep)
+    }
+}
+
+/// Owner-local adapter lifting an `FnMut` predictor (e.g. `denoise_approx`'s mutable `TrunkCache`
+/// / `TokenPruner`) into [`WanNativeForward`].
+pub struct WanMutForward<F>(std::cell::RefCell<F>);
+
+impl<F> WanMutForward<F>
+where
+    F: FnMut(&Array, usize, f32) -> Result<Array>,
+{
+    pub fn new(forward: F) -> Self {
+        Self(std::cell::RefCell::new(forward))
+    }
+}
+
+impl<F> WanNativeForward for WanMutForward<F>
+where
+    F: FnMut(&Array, usize, f32) -> Result<Array>,
+{
+    fn predict_velocity(&self, latents: &Array, step: usize, timestep: f32) -> Result<Array> {
+        (self.0.borrow_mut())(latents, step, timestep)
+    }
+}
+
+enum WanSolverState {
+    Euler(FlowMatchEuler),
+    Dpmpp2m(FlowDpmpp2m),
+    UniPC(FlowUniPC),
+}
+
+impl WanSolverState {
+    fn new_at_step(
+        kind: SolverKind,
+        num_train_timesteps: usize,
+        num_steps: usize,
+        shift: f32,
+        start_step: usize,
+    ) -> Self {
+        match kind {
+            SolverKind::Euler => {
+                let mut s = FlowMatchEuler::new(num_train_timesteps);
+                s.set_timesteps(num_steps, shift);
+                s.step_index = start_step;
+                Self::Euler(s)
+            }
+            SolverKind::Dpmpp2m => {
+                let mut s = FlowDpmpp2m::new(num_train_timesteps);
+                s.set_timesteps(num_steps, shift);
+                s.step_index = start_step;
+                Self::Dpmpp2m(s)
+            }
+            SolverKind::UniPC => {
+                let mut s = FlowUniPC::new(num_train_timesteps, 2);
+                s.set_timesteps(num_steps, shift);
+                s.step_index = start_step;
+                Self::UniPC(s)
+            }
+        }
+    }
+
+    fn step_index(&self) -> usize {
+        match self {
+            Self::Euler(s) => s.step_index,
+            Self::Dpmpp2m(s) => s.step_index,
+            Self::UniPC(s) => s.step_index,
+        }
+    }
+
+    fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array> {
+        match self {
+            Self::Euler(s) => s.step(model_output, sample),
+            Self::Dpmpp2m(s) => s.step(model_output, sample),
+            Self::UniPC(s) => s.step(model_output, sample),
+        }
+    }
+}
+
+/// Request-owned Wan native multistep solver history stored inside [`mlx_gen::driver::DriverRunState`].
+///
+/// Carried across compatible expert-crossing slices (`0..crossing` high expert -> `crossing..steps`
+/// low expert, including resident MoE, staged expert swap, and VACE-Fun) via
+/// [`mlx_gen::driver::DriverHistoryPolicy::Carry`], and cleanly refused if solver kind, train-step
+/// convention, step count, or shifted sigma schedule disagrees (`PIPE-3`, `PIPE-7`).
+struct WanSolverHistory {
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    total_steps: usize,
+    sigmas_bits: Vec<u32>,
+    expected_next_step: usize,
+    solver: WanSolverState,
+}
+
+/// Typed [`mlx_gen::driver::FamilyDriver`] for Wan's native flow-SNR solvers (`UniPC`,
+/// `Dpmpp2m`, `Euler`) across dense T2V, TI2V mask-blend, A14B MoE (resident + staged swap),
+/// and VACE / VACE-Fun routes (`SW-6968`, `PIPE-3`, `PIPE-7`).
+pub struct WanNativeDriver<F> {
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    num_steps: usize,
+    shift: f32,
+    sigmas: Vec<f32>,
+    sigmas_bits: Vec<u32>,
+    timesteps: Vec<f32>,
+    forward: F,
+    support: mlx_gen::driver::DriverSupport,
+}
+
+impl<F: WanNativeForward> WanNativeDriver<F> {
+    fn build_support(driver_id: &'static str) -> mlx_gen::driver::DriverSupport {
+        mlx_gen::driver::DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: mlx_gen::driver::DriverRefusalReasons {
+                renoise_from_clean:
+                    "native MLX Wan flow-SNR driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native MLX Wan flow-SNR driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native MLX Wan flow-SNR driver does not expose read-only boundary clean estimates",
+                ..mlx_gen::driver::DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        kind: SolverKind,
+        num_train_timesteps: usize,
+        num_steps: usize,
+        shift: f32,
+        forward: F,
+    ) -> Self {
+        let sigmas = compute_sigmas(num_steps, shift, num_train_timesteps);
+        let timesteps = integer_timesteps(&sigmas, num_train_timesteps);
+        let sigmas_bits = sigmas.iter().map(|s| s.to_bits()).collect();
+        Self {
+            kind,
+            num_train_timesteps,
+            num_steps,
+            shift,
+            sigmas,
+            sigmas_bits,
+            timesteps,
+            forward,
+            support: Self::build_support(driver_id),
+        }
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
+    }
+}
+
+impl<F: WanNativeForward> mlx_gen::driver::FamilyDriver<Array> for WanNativeDriver<F> {
+    fn support(&self) -> &mlx_gen::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: mlx_gen::driver::SliceInput<'_, Array>,
+        state: &mut mlx_gen::driver::DriverRunState,
+        hooks: &mut mlx_gen::driver::StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        if input.total_steps != self.num_steps || input.span.end > self.num_steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with Wan schedule length {}",
+                self.support.driver_id, input.span, input.total_steps, self.num_steps
+            )));
+        }
+
+        // Validate Carry compatibility BEFORE mutating `state` (`PIPE-3`).
+        let carrying = input.transition == mlx_gen::driver::SliceTransition::Continue
+            && input.history == mlx_gen::driver::DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<WanSolverHistory>() else {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Wan solver history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.kind != self.kind {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible solver change ({:?} -> {:?})",
+                    self.support.driver_id, existing.kind, self.kind
+                )));
+            }
+            if existing.num_train_timesteps != self.num_train_timesteps
+                || existing.total_steps != input.total_steps
+                || existing.sigmas_bits != self.sigmas_bits
+            {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Wan schedule or train-timestep convention",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start
+                || existing.solver.step_index() != input.span.start
+            {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous step {} (history at {})",
+                    self.support.driver_id,
+                    input.span.start,
+                    existing.solver.step_index()
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        if !carrying {
+            state.set_history(WanSolverHistory {
+                kind: self.kind,
+                num_train_timesteps: self.num_train_timesteps,
+                total_steps: input.total_steps,
+                sigmas_bits: self.sigmas_bits.clone(),
+                expected_next_step: input.span.start,
+                solver: WanSolverState::new_at_step(
+                    self.kind,
+                    self.num_train_timesteps,
+                    self.num_steps,
+                    self.shift,
+                    input.span.start,
+                ),
+            });
+        }
+
+        let mut latents = match input.state {
+            mlx_gen::gen_core::BoundaryState::XSigma(x)
+            | mlx_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let info = mlx_gen::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: mlx_gen::driver::DriverEvaluationKind::Trajectory,
+                sigma: self.sigmas[step],
+                next_sigma: self.sigmas[step + 1],
+            };
+            hooks.observe(&info, &latents)?;
+            let t = self.timesteps[step];
+            let pred = self
+                .forward
+                .predict_velocity(&latents, step, t)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            state.record_evaluation(mlx_gen::driver::DriverEvaluationKind::Trajectory);
+            latents = {
+                let history = state
+                    .history_mut::<WanSolverHistory>()
+                    .expect("wan solver history initialized on slice entry");
+                let next = history
+                    .solver
+                    .step(&pred, &latents)
+                    .map_err(mlx_gen::gen_core::Error::from)?;
+                history.expected_next_step = step + 1;
+                next
+            };
+            latents = hooks.post_step(&info, latents)?;
+            // Force per-step evaluation to bound MLX's lazy graph and keep cancellation responsive.
+            mlx_rs::transforms::eval([&latents])
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            hooks.materialize(&info, &latents)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(mlx_gen::gen_core::BoundaryState::XSigma(latents))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +1016,450 @@ mod tests {
         }
         let xs = x.as_slice::<f32>();
         assert!(xs.iter().all(|v| v.is_finite()));
+    }
+
+    fn mlx_bit_equal(a: &Array, b: &Array) -> bool {
+        mlx_rs::transforms::eval([a, b]).unwrap();
+        let sa = a.as_slice::<f32>();
+        let sb = b.as_slice::<f32>();
+        sa.len() == sb.len() && sa.iter().zip(sb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    fn mock_expert_velocity(
+        x: &Array,
+        step: usize,
+        timestep: f32,
+        slope: f32,
+        bias: f32,
+    ) -> Result<Array> {
+        // Deterministic, weights-free non-trivial velocity depending on latent, step, and timestep
+        // so multistep UniPC history (`model_outputs`, `last_sample`, `this_order`) is exercised.
+        let scale = slope + 0.00025 * timestep + 0.01 * (step as f32);
+        let offset = bias - 0.0001 * timestep;
+        Ok(add(
+            &multiply(x, Array::from_f32(scale))?,
+            Array::from_f32(offset),
+        )?)
+    }
+
+    #[test]
+    fn wan_native_driver_passes_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        for kind in [SolverKind::UniPC, SolverKind::Dpmpp2m, SolverKind::Euler] {
+            let report = verify_driver_conformance(ConformanceCase {
+                total_steps: 6,
+                split_at: 3,
+                seed: 42,
+                base_geometry: (64, 64),
+                alt_geometry: (128, 128),
+                make_driver: move || {
+                    Box::new(WanNativeDriver::new(
+                        "wan_native_mlx_test",
+                        kind,
+                        1000,
+                        6,
+                        5.0,
+                        |x: &Array, step: usize, t: f32| {
+                            mock_expert_velocity(x, step, t, 0.35, -0.1)
+                        },
+                    ))
+                },
+                make_initial: || {
+                    Array::from_slice(&[0.4_f32, -0.8, 1.2, -0.3, 0.7, 0.1, -1.1, 0.9], &[2, 2, 2])
+                },
+                latents_equal: mlx_bit_equal,
+            })
+            .unwrap_or_else(|e| panic!("conformance failed for {kind:?}: {e}"));
+            assert!(report.verified_inert_split, "{kind:?}");
+            assert!(report.verified_reset_preserves_draws, "{kind:?}");
+            assert!(report.verified_cancellation, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn wan_native_unipc_expert_crossing_carry_matches_legacy_bit_for_bit() {
+        use mlx_gen::driver::{
+            DriverHistoryPolicy, DriverRunState, FamilyDriver, SliceInput, SliceTransition,
+            StepHooks,
+        };
+        use mlx_gen::gen_core::{BoundaryState, CancelFlag, Progress};
+
+        let steps = 8usize;
+        let shift = 5.0_f32;
+        let num_train = 1000usize;
+        let init = Array::from_slice(
+            &[0.25_f32, -0.75, 1.1, -0.4, 0.6, -0.2, 0.9, -1.3],
+            &[2, 2, 2],
+        );
+        let cancel = CancelFlag::default();
+
+        // Legacy single-scheduler reference across a high->low expert crossing.
+        let mut legacy_sched = FlowUniPC::new(num_train, 2);
+        legacy_sched.set_timesteps(steps, shift);
+        let timesteps = legacy_sched.timesteps().to_vec();
+        let crossing = timesteps.iter().position(|&t| t < 875.0).unwrap_or(steps);
+        assert!(crossing > 0 && crossing < steps, "crossing={crossing}");
+
+        let mut legacy_latents = init.clone();
+        for (i, &t) in timesteps.iter().enumerate() {
+            let v = if i < crossing {
+                mock_expert_velocity(&legacy_latents, i, t, 0.45, 0.12).unwrap()
+            } else {
+                mock_expert_velocity(&legacy_latents, i, t, 0.22, -0.07).unwrap()
+            };
+            legacy_latents = legacy_sched.step(&v, &legacy_latents).unwrap();
+            mlx_rs::transforms::eval([&legacy_latents]).unwrap();
+        }
+
+        // Typed FamilyDriver with two distinct expert drivers sharing one DriverRunState via Carry.
+        let high_driver = WanNativeDriver::new(
+            "wan_moe_high",
+            SolverKind::UniPC,
+            num_train,
+            steps,
+            shift,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.45, 0.12),
+        );
+        let low_driver = WanNativeDriver::new(
+            "wan_moe_low",
+            SolverKind::UniPC,
+            num_train,
+            steps,
+            shift,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.22, -0.07),
+        );
+
+        let mut state = DriverRunState::new();
+        let mut ticks = Vec::new();
+        let high_out = {
+            let mut on_progress = |p: Progress| ticks.push(p);
+            let mut hooks = StepHooks::new(&mut on_progress);
+            high_driver
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..crossing,
+                        total_steps: steps,
+                        state: BoundaryState::XSigma(init),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 7,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        let low_out = {
+            let mut on_progress = |p: Progress| ticks.push(p);
+            let mut hooks = StepHooks::new(&mut on_progress);
+            low_driver
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 1,
+                        span: crossing..steps,
+                        total_steps: steps,
+                        state: high_out,
+                        transition: SliceTransition::Continue,
+                        history: DriverHistoryPolicy::Carry,
+                        geometry: None,
+                        seed: 7,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        let BoundaryState::XSigma(carried_latents) = low_out else {
+            panic!("expected XSigma boundary state");
+        };
+        assert!(
+            mlx_bit_equal(&carried_latents, &legacy_latents),
+            "Carry across expert crossing must match legacy single-scheduler UniPC bit-for-bit"
+        );
+        let expected_ticks: Vec<Progress> = (1..=steps)
+            .map(|i| Progress::Step {
+                current: i as u32,
+                total: steps as u32,
+            })
+            .collect();
+        assert_eq!(ticks, expected_ticks);
+        assert_eq!(state.completed_outer_steps, steps);
+        assert_eq!(state.history_resets, 0);
+    }
+
+    #[test]
+    fn wan_native_carry_refuses_incompatible_and_reset_clears_history_independently_of_rng() {
+        use mlx_gen::driver::{
+            DriverHistoryPolicy, DriverRunState, FamilyDriver, SliceInput, SliceTransition,
+            StepHooks,
+        };
+        use mlx_gen::gen_core::{BoundaryState, CancelFlag, Error as CoreError, Progress};
+
+        let steps = 6usize;
+        let split = 3usize;
+        let cancel = CancelFlag::default();
+        let init = Array::from_slice(&[0.5_f32, -0.5, 0.9, -0.2], &[4]);
+
+        let unipc = WanNativeDriver::new(
+            "wan_unipc",
+            SolverKind::UniPC,
+            1000,
+            steps,
+            5.0,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.4, 0.1),
+        );
+        let dpmpp = WanNativeDriver::new(
+            "wan_dpmpp",
+            SolverKind::Dpmpp2m,
+            1000,
+            steps,
+            5.0,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.4, 0.1),
+        );
+        let diff_shift = WanNativeDriver::new(
+            "wan_shift",
+            SolverKind::UniPC,
+            1000,
+            steps,
+            3.0,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.4, 0.1),
+        );
+
+        // Missing prior history refuses Carry.
+        {
+            let mut empty_state = DriverRunState::new();
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            let res = unipc.run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: split..steps,
+                    total_steps: steps,
+                    state: BoundaryState::XSigma(init.clone()),
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: None,
+                    seed: 1,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut empty_state,
+                &mut hooks,
+            );
+            assert!(matches!(res, Err(CoreError::Unsupported(_))));
+        }
+
+        // Run first half with UniPC.
+        let mut state = DriverRunState::new();
+        state.next_draw_index();
+        state.next_draw_index();
+        let draws_before = state.stochastic_draw_index;
+        let mid = {
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            unipc
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..split,
+                        total_steps: steps,
+                        state: BoundaryState::XSigma(init.clone()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 1,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        let BoundaryState::XSigma(mid_arr) = mid else {
+            panic!("expected XSigma");
+        };
+
+        // Incompatible solver (UniPC -> Dpmpp2m) refuses Carry.
+        {
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            let res = dpmpp.run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: split..steps,
+                    total_steps: steps,
+                    state: BoundaryState::XSigma(mid_arr.clone()),
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: None,
+                    seed: 1,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state,
+                &mut hooks,
+            );
+            assert!(matches!(res, Err(CoreError::Unsupported(_))));
+        }
+
+        // Incompatible shift (5.0 -> 3.0) refuses Carry.
+        {
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            let res = diff_shift.run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: split..steps,
+                    total_steps: steps,
+                    state: BoundaryState::XSigma(mid_arr.clone()),
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: None,
+                    seed: 1,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state,
+                &mut hooks,
+            );
+            assert!(matches!(res, Err(CoreError::Unsupported(_))));
+        }
+
+        // Continue + Reset clears UniPC history without altering stochastic_draw_index,
+        // and diverges from Carry (proving history was actually cleared).
+        let mut carried_state = DriverRunState::new();
+        let carried = {
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            let m = unipc
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..split,
+                        total_steps: steps,
+                        state: BoundaryState::XSigma(init),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 1,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut carried_state,
+                    &mut hooks,
+                )
+                .unwrap();
+            unipc
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 1,
+                        span: split..steps,
+                        total_steps: steps,
+                        state: m,
+                        transition: SliceTransition::Continue,
+                        history: DriverHistoryPolicy::Carry,
+                        geometry: None,
+                        seed: 1,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut carried_state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        let reset_out = {
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            unipc
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 1,
+                        span: split..steps,
+                        total_steps: steps,
+                        state: BoundaryState::XSigma(mid_arr),
+                        transition: SliceTransition::Continue,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 1,
+                        cancel: &cancel,
+                        request_boundary_estimate: false,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap()
+        };
+        assert_eq!(state.stochastic_draw_index, draws_before);
+        assert_eq!(state.history_resets, 1);
+        let (BoundaryState::XSigma(c_arr), BoundaryState::XSigma(r_arr)) = (carried, reset_out)
+        else {
+            panic!("expected XSigma");
+        };
+        assert!(
+            !mlx_bit_equal(&c_arr, &r_arr),
+            "Reset must actually clear UniPC multistep history"
+        );
+    }
+
+    #[test]
+    fn wan_native_driver_post_step_hook_applies_ti2v_blend() {
+        use mlx_gen::driver::{DriverRunState, FamilyDriver, SliceInput, StepHooks};
+        use mlx_gen::gen_core::{BoundaryState, CancelFlag, Progress};
+
+        let steps = 4usize;
+        let cancel = CancelFlag::default();
+        let mask = Array::from_slice(&[0.0_f32, 0.0, 1.0, 1.0], &[4]);
+        let frozen = Array::from_slice(&[3.0_f32, -2.0, 0.0, 0.0], &[4]);
+        let init = Array::from_slice(&[3.0_f32, -2.0, 0.5, -0.5], &[4]);
+        let driver = WanNativeDriver::new(
+            "wan_ti2v_hook",
+            SolverKind::UniPC,
+            1000,
+            steps,
+            5.0,
+            |x: &Array, step: usize, t: f32| mock_expert_velocity(x, step, t, 0.3, 0.05),
+        );
+        let mut state = DriverRunState::new();
+        let mut noop = |_: Progress| {};
+        let mut blend = |_info: &mlx_gen::driver::DriverStepInfo, latents: Array| {
+            let masked = multiply(&mask, &latents)
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            add(&frozen, &masked).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+        };
+        let mut hooks = StepHooks::new(&mut noop);
+        hooks.on_post_step = Some(&mut blend);
+        let out = driver
+            .run_slice(
+                SliceInput::full_trajectory(init, steps, 1, &cancel),
+                &mut state,
+                &mut hooks,
+            )
+            .unwrap();
+        let BoundaryState::XSigma(arr) = out else {
+            panic!("expected XSigma");
+        };
+        mlx_rs::transforms::eval([&arr]).unwrap();
+        let vals = arr.as_slice::<f32>();
+        assert_eq!(vals[0].to_bits(), 3.0_f32.to_bits());
+        assert_eq!(vals[1].to_bits(), (-2.0_f32).to_bits());
+        assert!(vals[2].is_finite() && vals[3].is_finite());
     }
 }

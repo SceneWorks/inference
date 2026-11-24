@@ -69,7 +69,7 @@ pub use model::{
 };
 pub use pipeline::{
     decode_tokens, denoise_flow_map, denoise_one, float_image_to_rgb8, generate_one, image_ids,
-    noise,
+    noise, Flux3FlowMapDriver, Flux3FlowMapForward,
 };
 pub use text_encoder::{Flux3TextEncoder, TextConditioning};
 
