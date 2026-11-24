@@ -226,6 +226,22 @@ struct ImageInputs {
     enhance_max_tokens: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ControlImageInput {
+    width: u32,
+    height: u32,
+    pixels_sha256: [u8; 32],
+    kind: String,
+    scale_bits: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct MaskImageInput {
+    width: u32,
+    height: u32,
+    pixels_sha256: [u8; 32],
+}
+
 /// Bind the actual bytes and controls of an image pass before load so a queued request
 /// cannot swap its source or conditioning inputs after plan compilation.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -247,6 +263,9 @@ enum PackedImageConditioning {
         kind: String,
         scale_bits: Option<u32>,
     },
+    MultiControl {
+        controls: Vec<ControlImageInput>,
+    },
     ControlWithReference {
         width: u32,
         height: u32,
@@ -254,6 +273,10 @@ enum PackedImageConditioning {
         kind: String,
         scale_bits: Option<u32>,
         reference: ReferenceImageInput,
+    },
+    Inpaint {
+        reference: ReferenceImageInput,
+        mask: MaskImageInput,
     },
     /// A reference an earlier pass of the same multi-pass plan produces. Its pixels do not exist
     /// before load, so the plan binds the declared geometry and strength instead of a digest.
@@ -334,6 +357,47 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                     strength_bits: strength.map(f32::to_bits),
                 },
             },
+            [Conditioning::Reference {
+                image: ref_img,
+                strength,
+            }, Conditioning::Mask { image: mask_img }]
+            | [Conditioning::Mask { image: mask_img }, Conditioning::Reference {
+                image: ref_img,
+                strength,
+            }] => PackedImageConditioning::Inpaint {
+                reference: ReferenceImageInput {
+                    width: ref_img.width,
+                    height: ref_img.height,
+                    pixels_sha256: image_digest(ref_img)?,
+                    strength_bits: strength.map(f32::to_bits),
+                },
+                mask: MaskImageInput {
+                    width: mask_img.width,
+                    height: mask_img.height,
+                    pixels_sha256: image_digest(mask_img)?,
+                },
+            },
+            items
+                if items.len() > 1
+                    && items
+                        .iter()
+                        .all(|c| matches!(c, Conditioning::Control { .. })) =>
+            {
+                let mut controls = Vec::with_capacity(items.len());
+                for c in items {
+                    let Conditioning::Control { image, kind, scale } = c else {
+                        unreachable!()
+                    };
+                    controls.push(ControlImageInput {
+                        width: image.width,
+                        height: image.height,
+                        pixels_sha256: image_digest(image)?,
+                        kind: control_kind_key(kind),
+                        scale_bits: scale.map(f32::to_bits),
+                    });
+                }
+                PackedImageConditioning::MultiControl { controls }
+            }
             items
                 if items.iter().all(|c| {
                     matches!(
@@ -1024,6 +1088,16 @@ impl RenderPlan {
             ));
         }
         self.check_bound_load(loaded)
+    }
+
+    /// Check `spec` using exact source/pin verification when the plan was sealed with
+    /// [`Self::packed_image_trajectory_with_exact_load`], or binding equality otherwise.
+    pub fn check_load_compatible(&self, spec: &LoadSpec) -> Result<()> {
+        if self.exact_load.is_some() {
+            self.check_load_spec(spec)
+        } else {
+            self.check_load(&RenderLoadBinding::from_spec(spec))
+        }
     }
 
     fn check_bound_load(&self, loaded: &RenderLoadBinding) -> Result<()> {

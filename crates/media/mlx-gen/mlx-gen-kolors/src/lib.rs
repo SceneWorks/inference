@@ -327,6 +327,89 @@ mod explicit_registry_tests {
             "unexpected error: {load_err}"
         );
     }
+
+    #[test]
+    fn native_kolors_routes_compile_render_plans() {
+        use mlx_gen::gen_core::{
+            Conditioning, ControlKind, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+            WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/tmp/kolors-native".into()));
+        let dummy_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+
+        let native_req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(17),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &native_req)
+            .unwrap()
+            .expect("native Kolors txt2img must compile a RenderPlan");
+        assert_eq!(plan.sampler(), "euler_discrete");
+        assert_eq!(plan.executed_steps(), 8);
+        assert_eq!(plan.sigmas().last(), Some(&0.0));
+        let rebound = plan
+            .rebind_load_placement(&spec.clone().with_offload_policy(OffloadPolicy::Sequential))
+            .unwrap();
+        assert_eq!(rebound.executed_steps(), 8);
+
+        let img2img_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: dummy_img.clone(),
+                strength: Some(0.5),
+            }],
+            ..native_req.clone()
+        };
+        let img_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &img2img_req)
+            .unwrap()
+            .expect("native Kolors img2img must compile a RenderPlan");
+        assert_eq!(img_plan.sampler(), "euler_discrete");
+        assert_eq!(img_plan.executed_steps(), 4);
+
+        let ctrl_spec = spec
+            .clone()
+            .with_control(WeightsSource::Dir("/tmp/kolors-pose".into()));
+        let ctrl_req = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                image: dummy_img.clone(),
+                kind: ControlKind::Pose,
+                scale: Some(0.8),
+            }],
+            ..native_req.clone()
+        };
+        let ctrl_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ctrl_spec, &ctrl_req)
+            .unwrap()
+            .expect("native Kolors ControlNet-pose must compile a RenderPlan");
+        assert_eq!(ctrl_plan.executed_steps(), 8);
+
+        let ip_spec = spec
+            .clone()
+            .with_ip_adapter(WeightsSource::Dir("/tmp/kolors-ip".into()));
+        let ip_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: dummy_img,
+                strength: Some(0.6),
+            }],
+            ..native_req
+        };
+        let ip_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ip_spec, &ip_req)
+            .unwrap()
+            .expect("native Kolors IP-Adapter must compile a RenderPlan");
+        assert_eq!(ip_plan.executed_steps(), 8);
+    }
 }
 
 #[cfg(test)]

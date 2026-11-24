@@ -481,7 +481,6 @@ impl Pipeline {
             run.begin_rendering().map_err(CandleError::from)?;
         }
         let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
-        let total = sampler.num_steps() as u32;
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // A cancellation raised during prompt/reference setup must be observed even when this
             // image's strength selects an empty denoise schedule.
@@ -510,53 +509,30 @@ impl Pipeline {
                     on_progress,
                 )?
             } else {
-                let mut latents = match init_latents.as_ref() {
+                let latents = match init_latents.as_ref() {
                     Some(init) => sampler.add_noise(init, &noise)?,
                     None => (&noise * sampler.init_noise_sigma() as f64)?,
                 };
-                // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers its
-                // own frames on the STEP INDEX -- this lane walks a `KolorsEulerSampler` timestep
-                // table, not a descending sigma array. One eval per step, so nothing repeats for the
-                // counter to dedup; it still bounds and dedups on principle.
-                let preview_counter =
-                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-                for i in 0..sampler.num_steps() {
-                    if req.cancel.is_cancelled() {
-                        return Err(CandleError::Canceled);
-                    }
-                    let scaled = (&latents / sampler.scale_in(i) as f64)?;
-                    // Preview `scaled` -- the very tensor this step feeds the UNet, and therefore the
-                    // domain the reused fit was measured in. Binding the preview to the lane's own
-                    // `scale_in` is what stops the two coming to disagree about the renormalization.
-                    candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
-                        crate::preview::project_spatial_latents(&scaled)
-                    });
-                    let model_in = if use_guide {
-                        Tensor::cat(&[&scaled, &scaled], 0)?
-                    } else {
-                        scaled
-                    };
-                    let eps = components.unet.forward_projected(
-                        &model_in,
-                        sampler.timestep(i) as f64,
-                        &encoder_hidden_states,
-                        &pooled,
-                        &time_ids,
-                    )?;
-                    let eps = if use_guide {
-                        let ch = eps.chunk(2, 0)?;
-                        let (uncond, cond) = (&ch[0], &ch[1]);
-                        (uncond + ((cond - uncond)? * guidance as f64)?)?
-                    } else {
-                        eps
-                    };
-                    latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
-                    on_progress(Progress::Step {
-                        current: i as u32 + 1,
-                        total,
-                    });
+                if let Some(run) = run {
+                    run.begin_denoise_phase(0).map_err(CandleError::from)?;
                 }
-                latents
+                let result = denoise_native_with_unet(
+                    &sampler,
+                    latents,
+                    &components.unet,
+                    &encoder_hidden_states,
+                    &pooled,
+                    &time_ids,
+                    use_guide,
+                    guidance,
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                );
+                if let Some(run) = run {
+                    run.end_denoise_phase(0).map_err(CandleError::from)?;
+                }
+                result?
             };
             if let Some(run) = run {
                 run.finish_image_denoise_phases()
@@ -665,7 +641,6 @@ impl Pipeline {
         };
         let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
         let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
-        let total = sampler.num_steps() as u32;
         let mut latents = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             ensure_not_cancelled(req)?;
@@ -694,46 +669,30 @@ impl Pipeline {
                     on_progress,
                 )?
             } else {
-                let mut current = match init_latents.as_ref() {
+                let current = match init_latents.as_ref() {
                     Some(init) => sampler.add_noise(init, &noise)?,
                     None => (&noise * sampler.init_noise_sigma() as f64)?,
                 };
-                let preview_counter =
-                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-                for step in 0..sampler.num_steps() {
-                    ensure_not_cancelled(req)?;
-                    let scaled = (&current / sampler.scale_in(step) as f64)?;
-                    candle_gen::preview::emit_preview_at(
-                        &req.preview,
-                        &preview_counter,
-                        step,
-                        || crate::preview::project_spatial_latents(&scaled),
-                    );
-                    let model_in = if use_guide {
-                        Tensor::cat(&[&scaled, &scaled], 0)?
-                    } else {
-                        scaled
-                    };
-                    let eps = unet.forward_projected(
-                        &model_in,
-                        sampler.timestep(step) as f64,
-                        &encoder_hidden_states,
-                        &pooled,
-                        &time_ids,
-                    )?;
-                    let eps = if use_guide {
-                        let chunks = eps.chunk(2, 0)?;
-                        (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance as f64)?)?
-                    } else {
-                        eps
-                    };
-                    current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
-                    on_progress(Progress::Step {
-                        current: step as u32 + 1,
-                        total,
-                    });
+                if let Some(run) = run {
+                    run.begin_denoise_phase(0).map_err(CandleError::from)?;
                 }
-                current
+                let result = denoise_native_with_unet(
+                    &sampler,
+                    current,
+                    &unet,
+                    &encoder_hidden_states,
+                    &pooled,
+                    &time_ids,
+                    use_guide,
+                    guidance,
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                );
+                if let Some(run) = run {
+                    run.end_denoise_phase(0).map_err(CandleError::from)?;
+                }
+                result?
             };
             if let Some(run) = run {
                 run.finish_image_denoise_phases()
@@ -872,7 +831,7 @@ impl Pipeline {
             let eps = if use_guide {
                 let ch = eps.chunk(2, 0)?;
                 let (uncond, cond) = (&ch[0], &ch[1]);
-                (uncond + ((cond - uncond)? * guidance as f64)?)?
+                gen_core::guidance::cfg(&candle_gen::CandleLatentOps, cond, uncond, guidance)?
             } else {
                 eps
             };
@@ -1084,6 +1043,59 @@ impl<T> Drop for SynchronizedPhase<T> {
 /// The latter two are required for img2img strength `0`, whose native and curated schedules contain
 /// no model evaluations and therefore cannot rely on a denoise-loop poll.
 #[inline]
+#[allow(clippy::too_many_arguments)]
+fn denoise_native_with_unet(
+    sampler: &KolorsEulerSampler,
+    latents: Tensor,
+    unet: &KolorsUnet,
+    encoder_hidden_states: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    use_guide: bool,
+    guidance: f32,
+    cancel: &gen_core::runtime::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
+) -> Result<Tensor> {
+    struct UnetProjectedForward<'a> {
+        unet: &'a KolorsUnet,
+        encoder_hidden_states: &'a Tensor,
+        pooled: &'a Tensor,
+        time_ids: &'a Tensor,
+    }
+    impl crate::sampler::KolorsLeadingEulerForward for UnetProjectedForward<'_> {
+        fn predict_eps(
+            &self,
+            model_in: &Tensor,
+            timestep: f64,
+            _step_index: usize,
+        ) -> Result<Tensor> {
+            self.unet.forward_projected(
+                model_in,
+                timestep,
+                self.encoder_hidden_states,
+                self.pooled,
+                self.time_ids,
+            )
+        }
+    }
+    crate::sampler::run_leading_euler(
+        sampler,
+        latents,
+        use_guide,
+        guidance,
+        UnetProjectedForward {
+            unet,
+            encoder_hidden_states,
+            pooled,
+            time_ids,
+        },
+        cancel,
+        on_progress,
+        preview,
+    )
+}
+
 fn ensure_not_cancelled(req: &GenerationRequest) -> Result<()> {
     if req.cancel.is_cancelled() {
         Err(CandleError::Canceled)

@@ -17,48 +17,42 @@ use mlx_rs::ops::{divide, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
-use mlx_gen::sampler::AlphaSchedule;
-use mlx_gen::{DiffusionSampler, Error, Result};
+use mlx_gen::gen_core::sampling::{
+    BetaCumprodPrecision, LeadingEulerSchedule, KOLORS_BETA_END, KOLORS_BETA_START,
+    KOLORS_TRAIN_STEPS,
+};
+use mlx_gen::{DiffusionSampler, Result};
 
 /// Kolors' `num_train_timesteps` — the length of the `scaled_linear` schedule the sampler interpolates
 /// over. `num_steps` must lie in `1..=NUM_TRAIN_TIMESTEPS`: `0` divides by zero below, and a value above
 /// it makes `step_ratio == 0` so every timestep collapses to a single value.
-pub const NUM_TRAIN_TIMESTEPS: usize = 1100;
+pub const NUM_TRAIN_TIMESTEPS: usize = KOLORS_TRAIN_STEPS;
 
 /// Kolors' `scaled_linear` β schedule endpoints (diffusers `EulerDiscreteScheduler` config: β₀ =
 /// 0.00085, β₁ = 0.014). Single source of truth (F-083) — the native sampler
 /// ([`KolorsEulerSampler::kolors`]), the curated-path `DiscreteModelSampling` (`model.rs`), and the
 /// trainer's DDPM schedule (`training.rs`) all build the *same* `scaled_linear` betas over
 /// [`NUM_TRAIN_TIMESTEPS`], so hoist the literals here rather than re-spelling them at each site.
-pub const BETA_START: f32 = 0.00085;
-pub const BETA_END: f32 = 0.014;
+pub const BETA_START: f32 = KOLORS_BETA_START;
+pub const BETA_END: f32 = KOLORS_BETA_END;
 
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
+///
+/// Schedule construction delegates to [`LeadingEulerSchedule`] (`PIPE-9`) with
+/// [`BetaCumprodPrecision::F32`] for bit-exact parity with MLX's existing `AlphaSchedule` table.
 pub struct KolorsEulerSampler {
-    /// Interpolated sigmas at the (effective) timesteps, length `num_steps + 1` (trailing `0.0`).
-    /// For img2img this is the schedule **sliced** at the strength-derived start (`begin_index`).
-    sigmas: Vec<f32>,
-    /// The (float) leading timesteps fed to the U-Net, length `num_steps`.
-    timesteps: Vec<f32>,
-    init_noise_sigma: f32,
-    /// The σ at the img2img start (`sigmas[begin_index]`) — what diffusers' `add_noise` scales the
-    /// noise by when seeding the init latents. Equals `sigmas[0]` after the img2img slice; for the
-    /// full txt2img schedule it is just the max σ and is unused (txt2img seeds via init noise).
-    start_sigma: f32,
+    schedule: LeadingEulerSchedule,
     model_dtype: Dtype,
 }
 
 impl KolorsEulerSampler {
     /// Kolors defaults: `num_train_timesteps=1100`, β₀=0.00085, β₁=0.014, `steps_offset=1`.
     pub fn kolors(num_steps: usize, model_dtype: Dtype) -> Result<Self> {
-        Self::new(
-            NUM_TRAIN_TIMESTEPS,
-            BETA_START,
-            BETA_END,
-            1,
-            num_steps,
+        let schedule = LeadingEulerSchedule::kolors(num_steps, BetaCumprodPrecision::F32)?;
+        Ok(Self {
+            schedule,
             model_dtype,
-        )
+        })
     }
 
     /// The img2img variant of [`Self::kolors`]: build the full `num_steps` schedule, then slice it at
@@ -68,18 +62,10 @@ impl KolorsEulerSampler {
     /// and seeds the init latents with [`Self::add_noise`] at `σ = sigmas[t_start]`. `strength ≤
     /// 1/num_steps` ⇒ 0 effective steps ⇒ the (un-noised) init is returned unchanged.
     pub fn kolors_img2img(num_steps: usize, strength: f32, model_dtype: Dtype) -> Result<Self> {
-        let full = Self::kolors(num_steps, model_dtype)?;
-        let init_timestep = ((num_steps as f32 * strength) as usize).min(num_steps);
-        let t_start = num_steps - init_timestep;
-        // sigmas has length num_steps+1 (trailing 0); slicing from t_start keeps that trailing 0.
-        let sigmas = full.sigmas[t_start..].to_vec();
-        let timesteps = full.timesteps[t_start..].to_vec();
-        let start_sigma = sigmas[0];
+        let schedule =
+            LeadingEulerSchedule::kolors_img2img(num_steps, strength, BetaCumprodPrecision::F32)?;
         Ok(Self {
-            sigmas,
-            timesteps,
-            init_noise_sigma: full.init_noise_sigma,
-            start_sigma,
+            schedule,
             model_dtype,
         })
     }
@@ -92,7 +78,10 @@ impl KolorsEulerSampler {
         use mlx_rs::ops::add;
         let x0 = x0.as_dtype(Dtype::Float32)?;
         let noise = noise.as_dtype(Dtype::Float32)?;
-        Ok(add(&x0, &multiply(&noise, scalar(self.start_sigma))?)?)
+        Ok(add(
+            &x0,
+            &multiply(&noise, scalar(self.schedule.start_sigma()))?,
+        )?)
     }
 
     /// The per-node EDM/k-diffusion σ schedule of this baked run — `[σ(t₀), …, σ(t_{n-1}), 0]`
@@ -104,7 +93,7 @@ impl KolorsEulerSampler {
     /// `x + eps·dt`; `scale_model_input` only divides the U-Net input by `√(σ²+1)`), so the captured
     /// latent is mapped into the student's VP frame by the plan's rescale before decode.
     pub fn edm_sigmas(&self) -> &[f32] {
-        &self.sigmas
+        self.schedule.sigmas()
     }
 
     /// Truncate the baked schedule to its first `run_steps` steps — the PiD `from_ldm` early-stop
@@ -115,8 +104,7 @@ impl KolorsEulerSampler {
     /// full-denoise path. `timesteps` keeps `num_steps` entries and `sigmas` keeps `num_steps + 1`
     /// (the trailing `0`), matching the invariant `step`/`scale_model_input` index into.
     pub fn truncate_to(mut self, run_steps: usize) -> Self {
-        self.timesteps.truncate(run_steps);
-        self.sigmas.truncate(run_steps + 1);
+        self.schedule = self.schedule.truncate_to(run_steps);
         self
     }
 
@@ -128,48 +116,16 @@ impl KolorsEulerSampler {
         num_steps: usize,
         model_dtype: Dtype,
     ) -> Result<Self> {
-        // Defensive: `num_steps == 0` divides by zero at `num_train_timesteps / num_steps` below
-        // (F-124). The request boundary rejects this, but guard here so any caller gets a typed error.
-        if num_steps == 0 {
-            return Err(Error::Msg("kolors sampler: num_steps must be >= 1".into()));
-        }
-        let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end);
-        // Per-train-step Karras sigma √((1-ᾱ)/ᾱ) (the `alphas_cumprod` field is public).
-        let full: Vec<f64> = sched
-            .alphas_cumprod
-            .iter()
-            .map(|&acp| {
-                let a = acp as f64;
-                ((1.0 - a) / a).sqrt()
-            })
-            .collect();
-
-        // leading: timesteps = (arange(0,N)·step_ratio).round()[::-1] + steps_offset.
-        let step_ratio = (num_train_timesteps / num_steps) as i64;
-        let timesteps: Vec<f32> = (0..num_steps)
-            .rev()
-            .map(|j| ((j as i64 * step_ratio) + steps_offset) as f32)
-            .collect();
-
-        // np.interp(timesteps, arange(0, N), full), then append 0 (final_sigmas_type="zero").
-        let interp = |t: f32| -> f32 {
-            let tt = (t as f64).clamp(0.0, (num_train_timesteps - 1) as f64);
-            let lo = tt.floor() as usize;
-            let hi = (lo + 1).min(num_train_timesteps - 1);
-            let frac = tt - lo as f64;
-            (full[lo] * (1.0 - frac) + full[hi] * frac) as f32
-        };
-        let mut sigmas: Vec<f32> = timesteps.iter().map(|&t| interp(t)).collect();
-        let max_sigma = sigmas.iter().copied().fold(0.0_f32, f32::max);
-        sigmas.push(0.0);
-
+        let schedule = LeadingEulerSchedule::new(
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            steps_offset,
+            num_steps,
+            BetaCumprodPrecision::F32,
+        )?;
         Ok(Self {
-            sigmas,
-            timesteps,
-            // leading spacing ⇒ init_noise_sigma = (max_sigma² + 1)^0.5.
-            init_noise_sigma: (max_sigma * max_sigma + 1.0).sqrt(),
-            // The full txt2img schedule starts at the max σ; the img2img slice overrides this.
-            start_sigma: max_sigma,
+            schedule,
             model_dtype,
         })
     }
@@ -177,35 +133,36 @@ impl KolorsEulerSampler {
 
 impl DiffusionSampler for KolorsEulerSampler {
     fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        let sigmas = self.schedule.sigmas();
+        let timesteps = self.schedule.timesteps();
         let mut values = vec![
-            self.init_noise_sigma,
-            self.start_sigma,
+            self.schedule.init_noise_sigma(),
+            self.schedule.start_sigma(),
             mlx_gen::sampler::sampling_dtype_code(self.model_dtype) as f32,
         ];
-        for (i, &time) in self.timesteps.iter().enumerate() {
-            values.extend([time, self.sigmas[i], self.sigmas[i + 1]]);
+        for (i, &time) in timesteps.iter().enumerate() {
+            values.extend([time, sigmas[i], sigmas[i + 1]]);
         }
         Some(("kolors-leading-euler-time-sigma-triples-v1", values))
     }
 
     fn num_steps(&self) -> usize {
-        self.timesteps.len()
+        self.schedule.num_steps()
     }
 
     fn timestep(&self, i: usize) -> f32 {
-        self.timesteps[i]
+        self.schedule.timestep(i)
     }
 
     fn scale_model_input(&self, x: &Array, i: usize) -> Result<Array> {
-        let sigma = self.sigmas[i] as f64;
-        let scaled = divide(x, scalar(((sigma * sigma + 1.0).sqrt()) as f32))?;
+        let scaled = divide(x, scalar(self.schedule.scale_in(i)))?;
         Ok(scaled.as_dtype(self.model_dtype)?)
     }
 
     fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
         Ok(multiply(
             &noise.as_dtype(Dtype::Float32)?,
-            scalar(self.init_noise_sigma),
+            scalar(self.schedule.init_noise_sigma()),
         )?)
     }
 
@@ -214,7 +171,7 @@ impl DiffusionSampler for KolorsEulerSampler {
         // Euler, epsilon prediction, gamma=0: prev = x + eps·(σ_next − σ). (diffusers upcasts to f32.)
         let eps = model_output.as_dtype(Dtype::Float32)?;
         let x = x.as_dtype(Dtype::Float32)?;
-        let dt = self.sigmas[i + 1] - self.sigmas[i];
+        let dt = self.schedule.step_dt(i);
         Ok(add(&x, &multiply(&eps, scalar(dt))?)?)
     }
 }
@@ -291,5 +248,49 @@ mod tests {
                 "run_steps {rs}: schedule unchanged"
             );
         }
+    }
+
+    #[test]
+    fn kolors_euler_sampler_passes_sdxl_discrete_driver_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+        use mlx_gen_sdxl::{SdxlDiscreteDriver, SdxlEpsPredictor};
+
+        struct FakeKolorsPredictor;
+        impl SdxlEpsPredictor for FakeKolorsPredictor {
+            fn predict_eps(&self, x_in: &Array, timestep: f32, step_index: usize) -> Result<Array> {
+                let scale = scalar(0.04 + 0.0001 * timestep + 0.005 * (step_index as f32));
+                Ok(x_in.multiply(&scale)?)
+            }
+        }
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 17,
+            base_geometry: (1024, 1024),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                let sampler = KolorsEulerSampler::kolors(6, Dtype::Float32).unwrap();
+                Box::new(SdxlDiscreteDriver::new_owned(
+                    "kolors_native_euler_discrete",
+                    Box::new(sampler),
+                    FakeKolorsPredictor,
+                    false,
+                ))
+            },
+            make_initial: || Array::from_slice(&[0.3f32, -0.4, 0.2, 0.9], &[1, 1, 1, 4]),
+            latents_equal: |a, b| {
+                a.eval().unwrap();
+                b.eval().unwrap();
+                a.as_slice::<f32>() == b.as_slice::<f32>()
+            },
+        })
+        .expect("KolorsEulerSampler through SdxlDiscreteDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
     }
 }

@@ -1257,6 +1257,322 @@ impl SamplerPolicy for TcdPolicy {
     }
 }
 
+// =================================================================================================
+// Native SDXL Ancestral & Kolors Leading-Euler Schedule Builders (PIPE-9)
+// =================================================================================================
+
+/// SDXL's diffusers `scaled_linear` beta schedule constants.
+pub const SDXL_TRAIN_STEPS: usize = 1_000;
+pub const SDXL_BETA_START: f32 = 0.00085;
+pub const SDXL_BETA_END: f32 = 0.012;
+
+/// Kolors' diffusers `scaled_linear` beta schedule constants (`num_train_timesteps = 1100`,
+/// `timestep_spacing = "leading"`, `steps_offset = 1`).
+pub const KOLORS_TRAIN_STEPS: usize = 1_100;
+pub const KOLORS_BETA_START: f32 = 0.00085;
+pub const KOLORS_BETA_END: f32 = 0.014;
+pub const KOLORS_STEPS_OFFSET: i64 = 1;
+
+/// Precision of the cumulative `alphas_cumprod` product used to build the leading-Euler sigma
+/// table (`AP13` class (a) per-backend parity: MLX Kolors accumulates via `AlphaSchedule` f32
+/// cumprod; Candle Kolors accumulates in f64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BetaCumprodPrecision {
+    F32,
+    F64,
+}
+
+/// Shared host schedule builder for Kolors' native leading-spacing `EulerDiscreteScheduler`
+/// (`PIPE-9`: single source of truth for both MLX and Candle Kolors).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeadingEulerSchedule {
+    sigmas: Vec<f32>,
+    timesteps: Vec<f32>,
+    init_noise_sigma: f32,
+    start_sigma: f32,
+}
+
+impl LeadingEulerSchedule {
+    /// Build a leading-spacing `EulerDiscreteScheduler` schedule over `scaled_linear` betas.
+    pub fn new(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        steps_offset: i64,
+        num_steps: usize,
+        precision: BetaCumprodPrecision,
+    ) -> crate::Result<Self> {
+        if num_steps == 0 {
+            return Err(crate::Error::Msg(
+                "kolors sampler: num_steps must be >= 1".into(),
+            ));
+        }
+        if num_steps > num_train_timesteps {
+            return Err(crate::Error::Msg(format!(
+                "kolors sampler: num_steps must be <= {num_train_timesteps} (got {num_steps})"
+            )));
+        }
+
+        let full: Vec<f64> = match precision {
+            BetaCumprodPrecision::F32 => {
+                let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end);
+                sched
+                    .alphas_cumprod
+                    .iter()
+                    .map(|&acp| {
+                        let a = acp as f64;
+                        ((1.0 - a) / a).sqrt()
+                    })
+                    .collect()
+            }
+            BetaCumprodPrecision::F64 => {
+                let (b0, b1) = (f64::from(beta_start).sqrt(), f64::from(beta_end).sqrt());
+                let mut acp = 1.0f64;
+                let mut table = Vec::with_capacity(num_train_timesteps);
+                for i in 0..num_train_timesteps {
+                    let frac = if num_train_timesteps == 1 {
+                        0.0
+                    } else {
+                        i as f64 / (num_train_timesteps - 1) as f64
+                    };
+                    let beta = (b0 + (b1 - b0) * frac).powi(2);
+                    acp *= 1.0 - beta;
+                    table.push(((1.0 - acp) / acp).sqrt());
+                }
+                table
+            }
+        };
+
+        let step_ratio = (num_train_timesteps / num_steps) as i64;
+        let timesteps: Vec<f32> = (0..num_steps)
+            .rev()
+            .map(|j| ((j as i64 * step_ratio) + steps_offset) as f32)
+            .collect();
+
+        let interp = |t: f32| -> f32 {
+            let tt = (t as f64).clamp(0.0, (num_train_timesteps - 1) as f64);
+            let lo = tt.floor() as usize;
+            let hi = (lo + 1).min(num_train_timesteps - 1);
+            let frac = tt - lo as f64;
+            (full[lo] * (1.0 - frac) + full[hi] * frac) as f32
+        };
+        let mut sigmas: Vec<f32> = timesteps.iter().map(|&t| interp(t)).collect();
+        let max_sigma = sigmas.iter().copied().fold(0.0_f32, f32::max);
+        sigmas.push(0.0);
+
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: (max_sigma * max_sigma + 1.0).sqrt(),
+            start_sigma: max_sigma,
+        })
+    }
+
+    /// Build Kolors' native leading-Euler schedule (`num_train_timesteps = 1100`, `steps_offset = 1`).
+    pub fn kolors(num_steps: usize, precision: BetaCumprodPrecision) -> crate::Result<Self> {
+        Self::new(
+            KOLORS_TRAIN_STEPS,
+            KOLORS_BETA_START,
+            KOLORS_BETA_END,
+            KOLORS_STEPS_OFFSET,
+            num_steps,
+            precision,
+        )
+    }
+
+    /// Build Kolors' img2img tail schedule using diffusers' `floor(steps * strength)` rule.
+    pub fn kolors_img2img(
+        num_steps: usize,
+        strength: f32,
+        precision: BetaCumprodPrecision,
+    ) -> crate::Result<Self> {
+        let full = Self::kolors(num_steps, precision)?;
+        let effective = ((num_steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(num_steps);
+        let start = num_steps - effective;
+        let sigmas = full.sigmas[start..].to_vec();
+        let timesteps = full.timesteps[start..].to_vec();
+        let start_sigma = sigmas[0];
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: full.init_noise_sigma,
+            start_sigma,
+        })
+    }
+
+    /// Truncate the baked schedule to its first `run_steps` steps (PiD `from_ldm` early-stop).
+    pub fn truncate_to(mut self, run_steps: usize) -> Self {
+        self.timesteps.truncate(run_steps);
+        self.sigmas.truncate(run_steps + 1);
+        self
+    }
+
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len()
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
+    }
+
+    pub fn timestep(&self, i: usize) -> f32 {
+        self.timesteps[i]
+    }
+
+    pub fn init_noise_sigma(&self) -> f32 {
+        self.init_noise_sigma
+    }
+
+    pub fn start_sigma(&self) -> f32 {
+        self.start_sigma
+    }
+
+    pub fn scale_in(&self, i: usize) -> f32 {
+        let s = self.sigmas[i] as f64;
+        (s * s + 1.0).sqrt() as f32
+    }
+
+    pub fn step_dt(&self, i: usize) -> f32 {
+        self.sigmas[i + 1] - self.sigmas[i]
+    }
+}
+
+/// Scalar coefficients for one host-f64 discrete Euler / Euler-ancestral update step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiscreteAncestralStepScalars {
+    pub c1: f64,
+    pub dt: f64,
+    pub sigma_up: f64,
+    pub renorm: f64,
+}
+
+/// Shared host-f64 discrete Euler / Euler-ancestral schedule table (`PIPE-9`).
+///
+/// Used by Candle SDXL (`EulerAncestralSampler`). MLX SDXL retains its MLX-op sigma table and
+/// f16-rounded timestep schedule where 1-ULP MLX op parity with Python `mlx_sd` is load-bearing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscreteAncestralSchedule {
+    sigmas: Vec<f64>,
+    ancestral: bool,
+}
+
+impl DiscreteAncestralSchedule {
+    /// Production SDXL ancestral schedule (`scaled_linear` β 0.00085→0.012, 1000 train steps).
+    pub fn sdxl() -> Self {
+        Self::new(
+            SDXL_TRAIN_STEPS,
+            SDXL_BETA_START.into(),
+            SDXL_BETA_END.into(),
+            true,
+        )
+        .expect("sdxl schedule: nonzero train steps")
+    }
+
+    /// Build a host-f64 `scaled_linear` sigma table `[0.0, σ_1, ..., σ_T]`.
+    pub fn new(
+        train_steps: usize,
+        beta_start: f64,
+        beta_end: f64,
+        ancestral: bool,
+    ) -> crate::Result<Self> {
+        if train_steps < 2 {
+            return Err(crate::Error::Msg(
+                "euler sampler: train_steps must be >= 2".into(),
+            ));
+        }
+        let n = train_steps;
+        let (a, b) = (beta_start.sqrt(), beta_end.sqrt());
+        let mut acp = 1.0f64;
+        let mut sigmas = Vec::with_capacity(n + 1);
+        sigmas.push(0.0);
+        for i in 0..n {
+            let x = i as f64 / (n - 1) as f64;
+            let lin = a + x * (b - a);
+            let beta = lin * lin;
+            acp *= 1.0 - beta;
+            sigmas.push(((1.0 - acp) / acp).sqrt());
+        }
+        Ok(Self { sigmas, ancestral })
+    }
+
+    pub fn is_ancestral(&self) -> bool {
+        self.ancestral
+    }
+
+    pub fn max_time(&self) -> f64 {
+        (self.sigmas.len() - 1) as f64
+    }
+
+    pub fn sigma_last(&self) -> f64 {
+        *self.sigmas.last().expect("sigma table is never empty")
+    }
+
+    pub fn sigmas(&self) -> &[f64] {
+        &self.sigmas
+    }
+
+    pub fn sigma(&self, t: f64) -> f64 {
+        let last = self.sigmas.len() - 1;
+        let lo = (t as usize).min(last);
+        let hi = (lo + 1).min(last);
+        let delta = t - lo as f64;
+        self.sigmas[lo] * (1.0 - delta) + delta * self.sigmas[hi]
+    }
+
+    pub fn timesteps(&self, num_steps: usize, start_time: f64) -> Vec<(f64, f64)> {
+        if num_steps == 0 {
+            return Vec::new();
+        }
+        let n = num_steps as f64;
+        let steps: Vec<f64> = (0..=num_steps)
+            .map(|i| {
+                let x = i as f64 / n;
+                (0.0 - start_time) * x + start_time
+            })
+            .collect();
+        steps.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
+    pub fn prior_scale(&self) -> f64 {
+        let s = self.sigma_last();
+        s / (s * s + 1.0).sqrt()
+    }
+
+    pub fn step_scalars(&self, t: f64, t_prev: f64) -> DiscreteAncestralStepScalars {
+        let sigma = self.sigma(t);
+        let sigma_prev = self.sigma(t_prev);
+        let sigma2 = sigma * sigma;
+        let sigma_prev2 = sigma_prev * sigma_prev;
+        let c1 = (sigma2 + 1.0).sqrt();
+        let renorm = 1.0 / (sigma_prev2 + 1.0).sqrt();
+        if self.ancestral {
+            let sigma_up = if sigma2 > 0.0 {
+                (sigma_prev2 * (sigma2 - sigma_prev2) / sigma2).sqrt()
+            } else {
+                0.0
+            };
+            let sigma_down = (sigma_prev2 - sigma_up * sigma_up).max(0.0).sqrt();
+            DiscreteAncestralStepScalars {
+                c1,
+                dt: sigma_down - sigma,
+                sigma_up,
+                renorm,
+            }
+        } else {
+            DiscreteAncestralStepScalars {
+                c1,
+                dt: sigma_prev - sigma,
+                sigma_up: 0.0,
+                renorm,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

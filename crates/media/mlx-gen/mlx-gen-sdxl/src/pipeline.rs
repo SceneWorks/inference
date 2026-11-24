@@ -14,8 +14,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{
-    CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, MlxLatentOps, PreviewSink, Progress,
-    Result,
+    CancelFlag, DiffusionSampler, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, Error, FamilyDriver, Image, LatentDecoder,
+    MlxLatentOps, PreviewSink, Progress, Result, SliceInput, SliceSpec, SliceTransition, StepHooks,
 };
 
 use crate::inpaint::InpaintBlend;
@@ -828,10 +829,296 @@ pub(crate) fn guided_eps_pair(
     Ok((eps_text, eps_neg))
 }
 
+/// Forward evaluation seam for native discrete SDXL-family denoising (`PIPE-7`).
+///
+/// Generic over model prediction so Tier 0 `DriverSupport` conformance tests can drive
+/// [`SdxlDiscreteDriver`] without loading weights or executing a learned forward.
+pub trait SdxlEpsPredictor {
+    /// Predict the guided (or unguided) noise residual ε for scaled model input `x_in` at
+    /// `timestep` and 0-based `step_index`.
+    fn predict_eps(&self, x_in: &Array, timestep: f32, step_index: usize) -> Result<Array>;
+}
+
+enum SamplerSlot<'a> {
+    Borrowed(&'a dyn DiffusionSampler),
+    Owned(Box<dyn DiffusionSampler + 'a>),
+}
+
+impl SamplerSlot<'_> {
+    fn as_sampler(&self) -> &dyn DiffusionSampler {
+        match self {
+            Self::Borrowed(s) => *s,
+            Self::Owned(s) => s.as_ref(),
+        }
+    }
+}
+
+/// Typed [`FamilyDriver`] for native MLX SDXL (ancestral, inpaint, IP, control, InstantID,
+/// LCM, Lightning, Hyper) and native MLX Kolors (`KolorsEulerSampler`) discrete trajectories
+/// (`SW-6966`, `PIPE-7`).
+pub struct SdxlDiscreteDriver<'a, F> {
+    sampler: SamplerSlot<'a>,
+    predictor: F,
+    support: DriverSupport,
+    inpaint_quantum: bool,
+}
+
+impl<'a, F: SdxlEpsPredictor> SdxlDiscreteDriver<'a, F> {
+    fn build_support(driver_id: &'static str, uses_global_rng: bool) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native discrete SDXL/Kolors driver does not re-noise from clean estimates; use curated shared driver",
+                geometry_change:
+                    "native discrete SDXL/Kolors driver does not support geometry-changing low-res start; use curated shared driver",
+                read_only_boundary_estimate:
+                    "native discrete SDXL/Kolors driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    /// Build a discrete SDXL-family driver with explicit `driver_id` and `uses_global_rng` flag.
+    pub fn new(
+        driver_id: &'static str,
+        sampler: &'a dyn DiffusionSampler,
+        predictor: F,
+        uses_global_rng: bool,
+    ) -> Self {
+        Self {
+            sampler: SamplerSlot::Borrowed(sampler),
+            predictor,
+            support: Self::build_support(driver_id, uses_global_rng),
+            inpaint_quantum: false,
+        }
+    }
+
+    /// Build a discrete SDXL-family driver owning a boxed [`DiffusionSampler`] (used by `'static`
+    /// Tier 0 conformance harnesses).
+    pub fn new_owned(
+        driver_id: &'static str,
+        sampler: Box<dyn DiffusionSampler + 'a>,
+        predictor: F,
+        uses_global_rng: bool,
+    ) -> Self {
+        Self {
+            sampler: SamplerSlot::Owned(sampler),
+            predictor,
+            support: Self::build_support(driver_id, uses_global_rng),
+            inpaint_quantum: false,
+        }
+    }
+
+    pub fn with_inpaint_quantum(mut self, inpaint_quantum: bool) -> Self {
+        self.inpaint_quantum = inpaint_quantum;
+        self
+    }
+}
+
+impl<F: SdxlEpsPredictor> FamilyDriver<Array> for SdxlDiscreteDriver<'_, F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let mut latents = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let sampler = self.sampler.as_sampler();
+        let steps = sampler.num_steps();
+        for i in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            // Scale the latents into the model's input space: identity for the ancestral sampler
+            // (which folds the renormalization into its step -> bit-identical to the pre-trait
+            // loop), `x/sqrt(sigma^2+1)` for Lightning and Kolors Euler.
+            let x_in = sampler
+                .scale_model_input(&latents, i)
+                .map_err(gen_core::Error::from)?;
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "discrete-state",
+                i as u64,
+                1,
+                &latents,
+            );
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "discrete-scaled-input",
+                i as u64,
+                1,
+                &x_in,
+            );
+            let timestep = sampler.timestep(i);
+            let next_timestep = if i + 1 < steps {
+                sampler.timestep(i + 1)
+            } else {
+                0.0
+            };
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: i,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: timestep,
+                next_sigma: next_timestep,
+            };
+            hooks.observe(&info, &x_in)?;
+            let eps = self
+                .predictor
+                .predict_eps(&x_in, timestep, i)
+                .map_err(gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            if self.support.uses_global_rng {
+                state.next_draw_index();
+            }
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "discrete-epsilon",
+                i as u64,
+                1,
+                &eps,
+            );
+            // sc-26270: the CFG combine above, the sampler update and the inpaint blend materialize
+            // together in the per-step eval below — one guarded iOS quantum, checked before the
+            // update's graph is built. A pass-through off device.
+            mlx_gen::ios_quantum::before(
+                crate::quantum::SAMPLER_STEP,
+                crate::quantum::sampler_step_bytes(&latents, self.inpaint_quantum),
+            )
+            .map_err(gen_core::Error::from)?;
+            latents = sampler
+                .step(&eps, &latents, i)
+                .map_err(gen_core::Error::from)?;
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "discrete-update-pending",
+                i as u64,
+                1,
+                &latents,
+            );
+            latents = hooks.post_step(&info, latents)?;
+            hooks.materialize(&info, &latents)?;
+            state.record_outer_step(i);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(latents))
+    }
+}
+
+struct ProductionSdxlPredictor<'a> {
+    unet: &'a UNet2DConditionModel,
+    conditioning: &'a Array,
+    pooled: &'a Array,
+    time_ids: &'a Array,
+    controls: &'a [ControlContext<'a>],
+    cn_enc: &'a Array,
+    ip: Option<(&'a Array, f32)>,
+    cfg: f32,
+    plan: crate::plan::SdxlForwardPlan<'a>,
+}
+
+impl SdxlEpsPredictor for ProductionSdxlPredictor<'_> {
+    fn predict_eps(&self, x_in: &Array, timestep: f32, _step_index: usize) -> Result<Array> {
+        if self.cfg > 1.0 {
+            let (eps_text, eps_neg) = guided_eps_pair(
+                self.unet,
+                x_in,
+                timestep,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                self.controls,
+                self.cn_enc,
+                self.ip,
+                self.plan,
+            )?;
+            // `eps_neg + cfg·(eps_text − eps_neg)` via shared gen-core `cfg` over `MlxLatentOps`
+            // (`PIPE-8`, sc-7443): preserves fp16 compute dtype bit-identically.
+            Ok(gen_core::guidance::cfg(
+                &MlxLatentOps,
+                &eps_text,
+                &eps_neg,
+                self.cfg,
+            )?)
+        } else {
+            forward_eps(
+                self.unet,
+                x_in,
+                timestep,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                self.controls,
+                self.cn_enc,
+                self.ip,
+                self.plan,
+            )
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_core(
     d: &Denoiser,
-    mut latents: Array,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    inpaint: Option<&InpaintBlend>,
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+) -> Result<Array> {
+    denoise_core_planned(
+        d,
+        None,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        preview,
+        inpaint,
+        controls,
+        ip,
+        control_encoder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_core_planned(
+    d: &Denoiser,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
+    latents: Array,
     conditioning: &Array,
     pooled: &Array,
     time_ids: &Array,
@@ -847,10 +1134,16 @@ fn denoise_core(
     let steps = d.sampler.num_steps();
     let execution_schedule = d.sampler.execution_schedule();
     observe_denoise_policy(d.plan, cfg, controls, ip, inpaint.is_some());
-    // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
-    // unchanged, matching the reference's `int(num_steps · strength)` loop count. Guards the
-    // degenerate schedule and the σ=0 ancestral step that would otherwise NaN.
+    // A zero-step denoise (img2img at strength <= 1/steps) is a no-op: return the init latents
+    // unchanged, matching the reference's `int(num_steps * strength)` loop count. Guards the
+    // degenerate schedule and the sigma=0 ancestral step that would otherwise NaN.
     if steps == 0 {
+        if let Some(run) = run {
+            for phase in 0..run.plan().denoise_spans().len() {
+                run.begin_denoise_phase(phase)?;
+                run.end_denoise_phase(phase)?;
+            }
+        }
         mlx_gen::ios_quantum::diagnostic_metadata(
             "sdxl",
             "discrete-zero-denoise",
@@ -869,49 +1162,73 @@ fn denoise_core(
     }
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
     // fp16 (`max|Δ|=0`, compile_parity.rs), so it does not move the precision-load-bearing fp16
-    // golden. The GELU/GEGLU activations are already compiled (sc-2721). Scoped + restored on drop by
-    // the RAII guard (F-006/F-007) instead of leaking the render thread's setting into later work.
+    // golden. Scoped + restored on drop by the RAII guard (F-006/F-007).
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
-    let total = steps as u32;
     let preview_sigmas: Vec<f32> = (0..=steps).rev().map(|step| step as f32).collect();
     let preview_counter = mlx_gen::preview::PreviewCounter::new(&preview_sigmas);
-    // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
-    // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
-    // The override is shared across branches — matching the InstantID MultiControlNet path,
-    // where the vendored pipeline passes the same `prompt_image_emb` to every sub-ControlNet.
     let cn_enc = control_encoder.unwrap_or(conditioning);
-    for i in 0..steps {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+
+    let driver = SdxlDiscreteDriver::new(
+        "mlx_sdxl_discrete",
+        d.sampler,
+        ProductionSdxlPredictor {
+            unet: d.unet,
+            conditioning,
+            pooled,
+            time_ids,
+            controls,
+            cn_enc,
+            ip,
+            cfg,
+            plan: d.plan,
+        },
+        // Serialize whole trajectory across threads when using MLX global RNG (B3 / PIPE-14).
+        true,
+    )
+    .with_inpaint_quantum(inpaint.is_some());
+
+    let spans: Vec<SliceSpec> = match run {
+        Some(run) => {
+            let plan_spans = run.plan().denoise_spans();
+            let covered: usize = plan_spans.iter().map(|s| s.len()).sum();
+            if covered == steps && !plan_spans.is_empty() {
+                plan_spans
+                    .into_iter()
+                    .enumerate()
+                    .map(|(phase, span)| SliceSpec {
+                        pass: run.plan().pass_index(),
+                        phase,
+                        span,
+                        transition: if phase == 0 {
+                            SliceTransition::Start
+                        } else {
+                            SliceTransition::Continue
+                        },
+                        history: if phase == 0 {
+                            DriverHistoryPolicy::Reset
+                        } else {
+                            DriverHistoryPolicy::Carry
+                        },
+                        geometry: Some(run.plan().phase_output_size(phase)),
+                        request_boundary_estimate: false,
+                    })
+                    .collect()
+            } else {
+                vec![SliceSpec::full(steps)]
+            }
         }
-        // Scale the latents into the model's input space: identity for the ancestral sampler (which
-        // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
-        // for Lightning and Kolors Euler. Preview the same tensor the U-Net sees: this preserves the
-        // ancestral path byte-for-byte while keeping every discrete sampler in the fit's domain.
-        let x_in = d.sampler.scale_model_input(&latents, i)?;
-        // These are actual borrowed loop bindings, before the existing forward/eval barriers.
-        // Logical metadata deliberately makes no readiness or freed-parent backing claim.
-        mlx_gen::sampler::diagnostic_sampling_tensor(
-            "sdxl",
-            "discrete-state",
-            i as u64,
-            1,
-            &latents,
-        );
-        mlx_gen::sampler::diagnostic_sampling_tensor(
-            "sdxl",
-            "discrete-scaled-input",
-            i as u64,
-            1,
-            &x_in,
-        );
+        None => vec![SliceSpec::full(steps)],
+    };
+
+    let mut state = DriverRunState::new();
+    let mut on_observe = |info: &DriverStepInfo, x_in: &Array| -> gen_core::Result<()> {
         mlx_gen::ios_quantum::diagnostic_metadata(
             "sdxl",
             "discrete-epoch",
             &[
                 ("schema", 1),
-                ("evaluation", i as u64),
+                ("evaluation", info.outer_step as u64),
                 ("steps", steps as u64),
                 ("cfg_on", u64::from(cfg_on)),
                 ("cfg_batched", u64::from(d.plan.cfg_batching.is_batched())),
@@ -924,90 +1241,69 @@ fn denoise_core(
             preview,
             &preview_counter,
             &preview_sigmas,
-            preview_sigmas[i],
-            &x_in,
+            preview_sigmas[info.outer_step],
+            x_in,
         );
-        let timestep = d.sampler.timestep(i);
-        let eps = if cfg_on {
-            let (eps_text, eps_neg) = guided_eps_pair(
-                d.unet,
-                &x_in,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                controls,
-                cn_enc,
-                ip,
-                d.plan,
-            )?;
-            // `eps_neg + cfg·(eps_text − eps_neg)` via the shared gen-core `cfg` over `MlxLatentOps`
-            // (epic 7434 P3, sc-7443). The dtype-preserving `MlxLatentOps::axpy` casts the scale to the
-            // eps dtype, so CFG runs in the compute dtype (fp16) byte-identically to the retired hand
-            // combine — an f32 scale would promote fp16 eps to f32, and the sampler step (which keys off
-            // `eps.dtype()`) would then run f32, silently leaving the latents f32. (Byte-equivalence
-            // proven by `guidance_ops_tests::cfg_half_precision_is_byte_identical_and_preserves_dtype`.)
-            gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
-        } else {
-            forward_eps(
-                d.unet,
-                &x_in,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                controls,
-                cn_enc,
-                ip,
-                d.plan,
-            )?
-        };
-        mlx_gen::sampler::diagnostic_sampling_tensor("sdxl", "discrete-epsilon", i as u64, 1, &eps);
-        // sc-26270: the CFG combine above, the sampler update and the inpaint blend materialize
-        // together in the per-step eval below — one guarded iOS quantum, checked before the update's
-        // graph is built (the combine's is lazy, unallocated). A pass-through off device.
-        mlx_gen::ios_quantum::before(
-            crate::quantum::SAMPLER_STEP,
-            crate::quantum::sampler_step_bytes(&latents, inpaint.is_some()),
-        )?;
-        latents = d.sampler.step(&eps, &latents, i)?;
-        mlx_gen::sampler::diagnostic_sampling_tensor(
-            "sdxl",
-            "discrete-update-pending",
-            i as u64,
-            1,
-            &latents,
-        );
-        // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's σ,
-        // keep the repaint region freely denoised. No RNG draw → ancestral stream unperturbed.
+        Ok(())
+    };
+    let mut on_post_step = |info: &DriverStepInfo, mut latents: Array| -> gen_core::Result<Array> {
+        // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's
+        // sigma, keep the repaint region freely denoised. No RNG draw -> ancestral stream intact.
         if let Some(b) = inpaint {
-            latents = b.blend(&latents, i)?;
+            latents = b
+                .blend(&latents, info.outer_step)
+                .map_err(gen_core::Error::from)?;
             mlx_gen::sampler::diagnostic_sampling_tensor(
                 "sdxl",
                 "discrete-blend-pending",
-                i as u64,
+                info.outer_step as u64,
                 1,
                 &latents,
             );
         }
-        // Force evaluation each step (the reference's per-step `mx.eval`). Beyond bounding the lazy
-        // graph, this materializes the global-RNG state split between steps so the ancestral noise
-        // stream is byte-identical to the reference — leaving it lazy across all steps perturbs the
-        // draws and re-introduces the chaotic divergence (sc-2400 S5).
-        latents.eval()?;
-        mlx_gen::ios_quantum::finish(crate::quantum::SAMPLER_STEP, &[&latents])?;
+        Ok(latents)
+    };
+    let mut on_materialize = |info: &DriverStepInfo, latents: &Array| -> gen_core::Result<()> {
+        // Force evaluation each step (the reference's per-step `mx.eval`). Beyond bounding the
+        // lazy graph, this materializes the global-RNG state split between steps so the ancestral
+        // noise stream is byte-identical to the reference (sc-2400 S5).
+        latents
+            .eval()
+            .map_err(|e| gen_core::Error::from(Error::from(e)))?;
+        mlx_gen::ios_quantum::finish(crate::quantum::SAMPLER_STEP, &[latents])
+            .map_err(gen_core::Error::from)?;
         mlx_gen::sampler::diagnostic_sampling_tensor(
             "sdxl",
             "discrete-update-after-barrier",
-            i as u64,
+            info.outer_step as u64,
             1,
-            &latents,
+            latents,
         );
-        on_progress(Progress::Step {
-            current: i as u32 + 1,
-            total,
-        });
-    }
+        Ok(())
+    };
+    let mut hooks = StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut on_observe);
+    hooks.on_post_step = Some(&mut on_post_step);
+    hooks.on_materialize = Some(&mut on_materialize);
+
+    let seed = run.map_or(0, |r| r.plan().base_seed());
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        spans,
+        gen_core::BoundaryState::XSigma(latents),
+        steps,
+        seed,
+        cancel,
+        run,
+        &mut state,
+        &mut hooks,
+        |_, boundary, _| Ok(boundary),
+    )?;
+    let latents = match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    };
     observe_native_sampling(execution_schedule.as_ref(), latents.dtype());
     Ok(latents)
 }
@@ -2623,5 +2919,76 @@ mod tests {
             reset_out, unsplit_out,
             "per-span reset must differ from preserved multistep history"
         );
+    }
+
+    #[test]
+    fn sdxl_discrete_driver_passes_tier0_conformance_without_weights() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        struct FakeLinearPredictor;
+        impl SdxlEpsPredictor for FakeLinearPredictor {
+            fn predict_eps(&self, x_in: &Array, timestep: f32, step_index: usize) -> Result<Array> {
+                let scale = scalar(0.05 + 0.0001 * timestep + 0.01 * (step_index as f32));
+                Ok(x_in.multiply(&scale)?)
+            }
+        }
+
+        // Pure host/MLX arithmetic DiffusionSampler (no learned weights) mirroring deterministic
+        // discrete step progression so the conformance harness checks split-parity bit-for-bit.
+        struct FakeDiscreteSampler {
+            timesteps: Vec<f32>,
+        }
+        impl DiffusionSampler for FakeDiscreteSampler {
+            fn num_steps(&self) -> usize {
+                self.timesteps.len()
+            }
+            fn timestep(&self, i: usize) -> f32 {
+                self.timesteps[i]
+            }
+            fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
+                Ok(noise.clone())
+            }
+            fn step(
+                &self,
+                model_output: &Array,
+                latents: &Array,
+                step_index: usize,
+            ) -> Result<Array> {
+                let dt = scalar(0.1 / ((step_index + 1) as f32));
+                Ok(latents.subtract(&model_output.multiply(&dt)?)?)
+            }
+        }
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 42,
+            base_geometry: (1024, 1024),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                let sampler = FakeDiscreteSampler {
+                    timesteps: vec![999.0, 833.0, 666.0, 500.0, 333.0, 166.0],
+                };
+                Box::new(SdxlDiscreteDriver::new_owned(
+                    "sdxl_discrete_tier0_test",
+                    Box::new(sampler),
+                    FakeLinearPredictor,
+                    false,
+                ))
+            },
+            make_initial: || Array::from_slice(&[0.5f32, -0.25, 0.75, -0.1], &[1, 1, 1, 4]),
+            latents_equal: |a, b| {
+                a.eval().unwrap();
+                b.eval().unwrap();
+                a.as_slice::<f32>() == b.as_slice::<f32>()
+            },
+        })
+        .expect("SdxlDiscreteDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
     }
 }

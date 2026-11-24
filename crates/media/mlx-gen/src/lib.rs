@@ -67,6 +67,7 @@ pub mod block_residency;
 pub mod capability;
 pub mod coherence;
 pub mod convrot_int8;
+pub mod driver;
 pub mod error;
 pub mod image_execution;
 pub mod img2img;
@@ -151,6 +152,12 @@ pub use control::{
     AcceptedControlKinds, ControlBranch,
 };
 pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecoder};
+pub use driver::{
+    acquire_global_rng_trajectory, run_mlx_driver_slices, with_global_rng_trajectory,
+    DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate, GlobalRngTrajectoryLease,
+    SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
     flow_capture_plan, schedule_sigmas, vp_capture_plan, vp_sigma_from_edm, CapturePlan,

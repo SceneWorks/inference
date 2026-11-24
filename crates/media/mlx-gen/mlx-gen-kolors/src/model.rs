@@ -252,26 +252,30 @@ pub(crate) fn render_sample(
     steps: usize,
     dtype: Dtype,
 ) -> Result<Image> {
-    random::seed(seed)?;
-    let lh = (height as i32) / SPATIAL_SCALE;
-    let lw = (width as i32) / SPATIAL_SCALE;
-    let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-    let sampler = KolorsEulerSampler::kolors(steps.max(1), dtype)?;
-    // Match the time_ids batch to the conditioning batch the caller supplied (mirrors SDXL's
-    // `render_sample`), so this stays correct if the preview ever runs a B=1 (CFG-off) batch.
-    let time_ids = kolors_time_ids(pooled.shape()[0], height as i32, width as i32);
-    let latents = sampler.scale_initial_noise(&init_noise)?;
-    let d = Denoiser::new(unet, &sampler);
-    let latents = denoise(
-        &d,
-        latents,
-        context,
-        pooled,
-        &time_ids,
-        guidance,
-        &CancelFlag::default(),
-        &mut |_| {},
-    )?;
+    let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+        random::seed(seed)?;
+        let lh = (height as i32) / SPATIAL_SCALE;
+        let lw = (width as i32) / SPATIAL_SCALE;
+        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let sampler = KolorsEulerSampler::kolors(steps.max(1), dtype)?;
+        // Match the time_ids batch to the conditioning batch the caller supplied (mirrors SDXL's
+        // `render_sample`), so this stays correct if the preview ever runs a B=1 (CFG-off) batch.
+        let time_ids = kolors_time_ids(pooled.shape()[0], height as i32, width as i32);
+        let latents = sampler.scale_initial_noise(&init_noise)?;
+        let d = Denoiser::new(unet, &sampler);
+        let latents = denoise(
+            &d,
+            latents,
+            context,
+            pooled,
+            &time_ids,
+            guidance,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )?;
+        latents.eval()?;
+        Ok(latents)
+    })?;
     // Training preview — native VAE decode only (no PiD overlay in the trainer's render path).
     decode_image(vae, &latents, None)
 }
@@ -1605,29 +1609,33 @@ impl Kolors {
         width: i32,
     ) -> Result<Image> {
         validate_dims(height, width)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005) — the uncond row
-        // is never used, so encoding it would be a large wasted forward.
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_latents(
-            &init_noise,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            cfg,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
+        let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            random::seed(seed)?;
+            let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+            let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let pos = self.encode(prompt)?;
+            // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005) — the uncond row
+            // is never used, so encoding it would be a large wasted forward.
+            let neg = if cfg > 1.0 {
+                Some(self.encode(negative)?)
+            } else {
+                None
+            };
+            let latents = self.denoise_latents(
+                &init_noise,
+                &pos,
+                neg.as_ref(),
+                num_steps,
+                cfg,
+                height,
+                width,
+                None,
+                &CancelFlag::new(),
+                &mut |_p| {},
+            )?;
+            latents.eval()?;
+            Ok(latents)
+        })?;
         self.decode(&latents)
     }
 
@@ -1653,29 +1661,33 @@ impl Kolors {
         // VAE-encode the init (no RNG: mean, not a sample) so the first global-RNG draw is the
         // add_noise noise — matching the reference's `prepare_latents` order.
         let init_latents = encode_init_latents(self.vae(), image, width as u32, height as u32)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_img2img_latents(
-            &init_latents,
-            &noise,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            strength,
-            cfg,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
+        let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            random::seed(seed)?;
+            let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+            let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let pos = self.encode(prompt)?;
+            let neg = if cfg > 1.0 {
+                Some(self.encode(negative)?)
+            } else {
+                None
+            };
+            let latents = self.denoise_img2img_latents(
+                &init_latents,
+                &noise,
+                &pos,
+                neg.as_ref(),
+                num_steps,
+                strength,
+                cfg,
+                height,
+                width,
+                None,
+                &CancelFlag::new(),
+                &mut |_p| {},
+            )?;
+            latents.eval()?;
+            Ok(latents)
+        })?;
         self.decode(&latents)
     }
 
@@ -1697,30 +1709,34 @@ impl Kolors {
         width: i32,
     ) -> Result<Image> {
         validate_dims(height, width)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_controlnet_latents(
-            controlnet,
-            &init_noise,
-            control_image,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            cfg,
-            control_scale,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
+        let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            random::seed(seed)?;
+            let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+            let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let pos = self.encode(prompt)?;
+            let neg = if cfg > 1.0 {
+                Some(self.encode(negative)?)
+            } else {
+                None
+            };
+            let latents = self.denoise_controlnet_latents(
+                controlnet,
+                &init_noise,
+                control_image,
+                &pos,
+                neg.as_ref(),
+                num_steps,
+                cfg,
+                control_scale,
+                height,
+                width,
+                None,
+                &CancelFlag::new(),
+                &mut |_p| {},
+            )?;
+            latents.eval()?;
+            Ok(latents)
+        })?;
         self.decode(&latents)
     }
 
@@ -1752,34 +1768,38 @@ impl Kolors {
         // VAE-encode the init (no RNG: mean) so the first global-RNG draw is the add_noise noise.
         let init_latents =
             encode_init_latents(self.vae(), reference_image, width as u32, height as u32)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_controlnet_ip_latents(
-            controlnet,
-            &ip_tokens,
-            &init_latents,
-            &noise,
-            control_image,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            strength,
-            cfg,
-            control_scale,
-            ip_scale,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
+        let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            random::seed(seed)?;
+            let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+            let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let pos = self.encode(prompt)?;
+            let neg = if cfg > 1.0 {
+                Some(self.encode(negative)?)
+            } else {
+                None
+            };
+            let latents = self.denoise_controlnet_ip_latents(
+                controlnet,
+                &ip_tokens,
+                &init_latents,
+                &noise,
+                control_image,
+                &pos,
+                neg.as_ref(),
+                num_steps,
+                strength,
+                cfg,
+                control_scale,
+                ip_scale,
+                height,
+                width,
+                None,
+                &CancelFlag::new(),
+                &mut |_p| {},
+            )?;
+            latents.eval()?;
+            Ok(latents)
+        })?;
         self.decode(&latents)
     }
 
@@ -1802,29 +1822,33 @@ impl Kolors {
     ) -> Result<Image> {
         validate_dims(height, width)?;
         let ip_tokens = ip_encoder.tokens(reference_image)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_ip_latents(
-            &ip_tokens,
-            &init_noise,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            cfg,
-            ip_scale,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
+        let latents = mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            random::seed(seed)?;
+            let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+            let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let pos = self.encode(prompt)?;
+            let neg = if cfg > 1.0 {
+                Some(self.encode(negative)?)
+            } else {
+                None
+            };
+            let latents = self.denoise_ip_latents(
+                &ip_tokens,
+                &init_noise,
+                &pos,
+                neg.as_ref(),
+                num_steps,
+                cfg,
+                ip_scale,
+                height,
+                width,
+                None,
+                &CancelFlag::new(),
+                &mut |_p| {},
+            )?;
+            latents.eval()?;
+            Ok(latents)
+        })?;
         self.decode(&latents)
     }
 }

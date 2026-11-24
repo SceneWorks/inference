@@ -129,6 +129,14 @@ pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecode
 // Canonical SDXL-family `scaled_linear` schedule parameters shared by inference and training.
 pub mod diffusion_schedule;
 
+// Typed bespoke-loop FamilyDriver contract bindings (PIPE-7 / B3).
+pub mod driver;
+pub use driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate,
+    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
+
 /// Attempt-local observations of completed provider execution.
 pub mod execution;
 

@@ -40,6 +40,7 @@ mod pipeline;
 // projects through `candle_gen_sdxl::preview` rather than restating the fit.
 pub mod preview;
 mod sampler;
+pub use sampler::{KolorsLeadingEulerDriver, KolorsLeadingEulerForward};
 mod tokenizer;
 mod training;
 mod unet;
@@ -123,7 +124,7 @@ impl KolorsGenerator {
         self.validate(req)?;
         if let Some(plan) = plan {
             plan.check_request(&self.descriptor, req)?;
-            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+            plan.check_load_compatible(&self.loaded_spec)?;
         }
         let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
@@ -239,6 +240,14 @@ pub(crate) fn compile_kolors(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_kolors_for_mode(spec, req, true)
+}
+
+fn compile_kolors_for_mode(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    allow_exact_load: bool,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_low_res_start_kolors(Some(spec), req)?;
     if spec.control.is_some()
         || !spec.extra_controls.is_empty()
@@ -248,23 +257,9 @@ pub(crate) fn compile_kolors(
             .conditioning
             .iter()
             .any(|c| matches!(c, Conditioning::Control { .. } | Conditioning::Mask { .. }))
-        || req.scheduler.as_deref() == Some("discrete")
-        || req.sampler.as_deref() == Some(config::DEFAULT_SAMPLER)
     {
         return Ok(None);
     }
-    let is_applicability_probe = req.prompt == "feature applicability probe"
-        && req.conditioning.is_empty()
-        && req.source_image.is_none()
-        && req.low_res_start.is_none()
-        && req.sampler.is_none()
-        && req.scheduler.is_none();
-    let Some(curated_name) =
-        pipeline::curated_route(req.sampler.as_deref(), req.scheduler.as_deref())
-            .or(is_applicability_probe.then_some("euler"))
-    else {
-        return Ok(None);
-    };
     let desc = descriptor();
     desc.capabilities.validate_request(MODEL_ID, req)?;
     let reference_count = req
@@ -300,48 +295,72 @@ pub(crate) fn compile_kolors(
             req.width, req.height
         )));
     }
-    let solver = gen_core::sampling::Solver::from_name(curated_name)
-        .unwrap_or(gen_core::sampling::Solver::Euler);
     let steps = req.steps.unwrap_or(config::DEFAULT_STEPS) as usize;
-    let sched = pipeline::kolors_alpha_schedule().map_err(gen_core::Error::from)?;
-    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
-    let native =
-        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
-    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-    if let Some((_, raw_strength)) =
-        pipeline::resolve_raw_reference(req).map_err(gen_core::Error::from)?
+    let raw_ref = pipeline::resolve_raw_reference(req).map_err(gen_core::Error::from)?;
+    let is_applicability_probe = req.prompt == "feature applicability probe"
+        && req.conditioning.is_empty()
+        && req.source_image.is_none()
+        && req.low_res_start.is_none()
+        && req.sampler.is_none()
+        && req.scheduler.is_none();
+
+    let (sigmas, sampler_name): (Vec<f32>, &'static str) = if let Some(curated_name) =
+        pipeline::curated_route(req.sampler.as_deref(), req.scheduler.as_deref())
+            .or(is_applicability_probe.then_some("euler"))
     {
-        let start = if req.low_res_start.is_some() {
-            gen_core::resolve_img2img_init_time_step(
-                sigmas.len().saturating_sub(1),
-                Some(raw_strength),
-            )?
-        } else {
-            let effective = ((steps as f32 * raw_strength.clamp(0.0, 1.0)) as usize).min(steps);
-            sigmas.len().saturating_sub(1).saturating_sub(effective)
+        let solver = gen_core::sampling::Solver::from_name(curated_name)
+            .unwrap_or(gen_core::sampling::Solver::Euler);
+        let sched = pipeline::kolors_alpha_schedule().map_err(gen_core::Error::from)?;
+        let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+        let native =
+            gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
+        let mut sigmas =
+            candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+        if let Some((_, raw_strength)) = raw_ref {
+            let start = if req.low_res_start.is_some() {
+                gen_core::resolve_img2img_init_time_step(
+                    sigmas.len().saturating_sub(1),
+                    Some(raw_strength),
+                )?
+            } else {
+                let effective = ((steps as f32 * raw_strength.clamp(0.0, 1.0)) as usize).min(steps);
+                sigmas.len().saturating_sub(1).saturating_sub(effective)
+            };
+            sigmas = sigmas[start..].to_vec();
+        }
+        (sigmas, solver.name())
+    } else {
+        let sampler = match raw_ref {
+            Some((_, raw_strength)) => sampler::KolorsEulerSampler::img2img(steps, raw_strength)
+                .map_err(gen_core::Error::Msg)?,
+            None => sampler::KolorsEulerSampler::new(steps).map_err(gen_core::Error::Msg)?,
         };
-        sigmas = sigmas[start..].to_vec();
-    }
+        (sampler.sigmas().to_vec(), config::DEFAULT_SAMPLER)
+    };
+
     let executed_steps = sigmas.len().saturating_sub(1);
     if executed_steps == 0 && req.low_res_start.is_none() {
         return Ok(None);
     }
     let guidance = req.guidance.unwrap_or(config::DEFAULT_GUIDANCE);
-    gen_core::RenderPlan::packed_image_trajectory(
-        &desc,
-        req,
-        gen_core::render::PackedImagePass {
-            pixel_stride: SIZE_MULTIPLE,
-            token_width: 4,
-            sampler: solver.name(),
-            guidance,
-            sigmas,
-            executed_steps,
-            capture_sigma: 0.0,
-        },
-    )
-    .map(|plan| plan.bind_load(spec))
-    .map(Some)
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 4,
+        sampler: sampler_name,
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    let pins = spec.prepared_file_pins();
+    let use_exact_load = allow_exact_load
+        && (pins.is_finalized() || pins.is_prepared() || spec.file_source_paths().is_empty());
+    let plan = if use_exact_load {
+        gen_core::RenderPlan::packed_image_trajectory_with_exact_load(&desc, spec, req, pass)?
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)?.bind_load(spec)
+    };
+    Ok(Some(plan))
 }
 
 fn evict_warm_for_staged<T>(slot: &Mutex<Option<T>>) -> Option<T> {
@@ -360,8 +379,7 @@ impl Generator for KolorsGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        let spec = LoadSpec::new(WeightsSource::Dir(self.root.clone()));
-        if let Some(plan) = compile_kolors(&spec, req)? {
+        if let Some(plan) = compile_kolors_for_mode(&self.loaded_spec, req, false)? {
             return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
         }
         candle_gen::execution::capture_with(self, req, on_progress, || {
@@ -377,8 +395,7 @@ impl Generator for KolorsGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        let spec = LoadSpec::new(WeightsSource::Dir(self.root.clone()));
-        if let Some(plan) = compile_kolors(&spec, req)? {
+        if let Some(plan) = compile_kolors_for_mode(&self.loaded_spec, req, false)? {
             return self.generate_planned(req, &plan, None, on_progress);
         }
         let output = self.run_generate(req, None, None, on_progress)?;
@@ -1185,5 +1202,52 @@ mod tests {
                 "compile_render_plan must reject illegal low_res_start request: {bad_low_res_req:?}"
             );
         }
+    }
+
+    #[test]
+    fn candle_kolors_native_euler_discrete_compiles_render_plan_with_exact_load_rebind() {
+        let registry = provider_registry().expect("kolors registry");
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()));
+        let req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(19),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &req)
+            .unwrap()
+            .expect("native Kolors txt2img must compile a RenderPlan");
+        assert_eq!(plan.sampler(), config::DEFAULT_SAMPLER);
+        assert_eq!(plan.executed_steps(), 8);
+        assert_eq!(plan.sigmas().last(), Some(&0.0));
+        let rebound = plan
+            .rebind_load_placement(
+                &spec
+                    .clone()
+                    .with_offload_policy(gen_core::OffloadPolicy::Sequential),
+            )
+            .unwrap();
+        assert_eq!(rebound.executed_steps(), 8);
+
+        let img2img_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            ..req
+        };
+        let img_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &img2img_req)
+            .unwrap()
+            .expect("native Kolors img2img must compile a RenderPlan");
+        assert_eq!(img_plan.sampler(), config::DEFAULT_SAMPLER);
+        assert_eq!(img_plan.executed_steps(), 4);
     }
 }
