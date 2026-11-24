@@ -112,6 +112,24 @@ def policy(backend, *, cuda_uuid=None):
     raise ValueError("unregistered plural SCAIL backend")
 
 
+# Pre-spawn estimate-plus-reserve-v1 admission for the MLX arm. Without one the supervisor
+# prices the row at its 80 GiB child cap and requires cap plus reserve (92 GiB) free, which
+# an idle 128 GB Mac does not have. The largest reviewed Darwin lifetime footprint of a packaged
+# plural count is 30,355,858,720 bytes (6 references, M5 Max; SceneWorks
+# config/scail2-plural-memory.json); 32 GiB rounds that up. The policy, its 80 GiB kill cap
+# and its 12 GiB live free-memory reserve are unchanged.
+MLX_HOST_ESTIMATE_SOURCE = "scail2-plural-reviewed-unified-peak-v1"
+MLX_HOST_ESTIMATE_BYTES = 32 * GIB
+
+
+def admission_estimate(backend):
+    """The run_guarded estimate arguments for one plural count (none: the cap fallback)."""
+    if backend == "mlx":
+        return {"static_floor_host_bytes": MLX_HOST_ESTIMATE_BYTES,
+                "host_estimate_source": MLX_HOST_ESTIMATE_SOURCE}
+    return {}
+
+
 def validate_stage(stage, root):
     if (
         (stage["repository"], stage["revision"], stage["subfolder"], stage["status"])

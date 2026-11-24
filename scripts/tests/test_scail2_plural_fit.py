@@ -158,6 +158,59 @@ class PluralQualification(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.plan("mlx", dict(request, policy=dict(policy, childFootprintCapBytes=96 * c.GIB)), "head")
 
+    @unittest.skipUnless(os.name == "posix", "process-group supervision needs POSIX")
+    def test_mlx_admission_uses_the_reviewed_estimate_not_the_child_cap(self):
+        """An idle 128 GB Mac (96,999,358,464 bytes available, run 2026-11-24) was refused at the
+        80 GiB cap fallback. The reviewed estimate admits it; below estimate plus reserve refuses."""
+        import sys
+        from scripts import media_campaign_supervisor as safety
+
+        class Probe:
+            def __init__(self, free):
+                self.free = free
+
+            def host_admission(self):
+                host = safety.darwin_host_memory(4096, {
+                    "freePages": self.free // 4096, "speculativePages": 0, "purgeablePages": 0,
+                    "inactivePages": 0, "fileBackedPages": 0, "anonymousPages": 0,
+                    "throttledPages": 0, "activePages": 0})
+                return host["availableBytes"], host
+
+            def tree_footprint(self, _pgid):
+                return 1024
+
+        self.assertEqual(c.admission_estimate("mlx"), {
+            "static_floor_host_bytes": 32 * c.GIB,
+            "host_estimate_source": "scail2-plural-reviewed-unified-peak-v1"})
+        self.assertEqual(c.admission_estimate("candle-cuda"), {})
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy.json").write_text(json.dumps(c.policy("mlx")), encoding="utf-8")
+            policy = safety.load_policy(root / "policy.json")
+
+            def run(free, estimate):
+                for name in ("stdout", "stderr"):
+                    (root / name).unlink(missing_ok=True)
+                return safety.run_guarded(
+                    [sys.executable, "-c", "pass"], cwd=root, env=dict(os.environ), policy=policy,
+                    stdout_path=root / "stdout", stderr_path=root / "stderr", probe=Probe(free),
+                    **estimate)
+
+            idle_mac = 96_999_358_464
+            # The previous cap fallback refuses the idle Mac exactly as the failed capture did.
+            with self.assertRaisesRegex(safety.SupervisionError, "child-footprint-cap-fallback"):
+                run(idle_mac, {})
+            result = run(idle_mac, c.admission_estimate("mlx"))
+            admission = safety.validate_admission(result.admission, policy_sha256=policy.sha256)
+            self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"],
+                              admission["childFootprintCapBytes"], admission["hostFreeReserveBytes"]),
+                             (c.MLX_HOST_ESTIMATE_SOURCE, 32 * c.GIB, 80 * c.GIB, 12 * c.GIB))
+            needed = policy.host_free_reserve_bytes + c.MLX_HOST_ESTIMATE_BYTES
+            with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory") as caught:
+                run(needed - 4096, c.admission_estimate("mlx"))
+            self.assertIn(c.MLX_HOST_ESTIMATE_SOURCE, caught.exception.detail)
+            run(needed, c.admission_estimate("mlx"))
+
     def test_all_counts_both_backend_shapes_and_mutated_native_results(self):
         for backend, counts in c.COUNTS.items():
             for count in counts:

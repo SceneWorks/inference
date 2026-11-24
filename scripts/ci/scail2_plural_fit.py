@@ -344,6 +344,7 @@ def execute(args, contract):
                     capture_cuda_basis=backend == "candle-cuda",
                     dedicated_adapter=adapter,
                     observer=Observer, completion_claim=claim if require_job else None,
+                    admission_estimate=c.admission_estimate(backend),
                 )
                 native = json.loads(evidence.owned_file(out, "native.json", c.MIB).read_bytes())
                 record["native"] = native
