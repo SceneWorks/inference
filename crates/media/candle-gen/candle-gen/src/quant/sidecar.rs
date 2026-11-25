@@ -25,7 +25,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1014,12 +1014,23 @@ fn write_runtime_index(
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        if fs::write(&tmp, bytes).is_ok() {
-            // A missing index is harmless: a reader can reconstruct it from runtime headers.
-            let _ = fs::remove_file(&path);
-            if fs::rename(&tmp, path).is_err() {
-                let _ = fs::remove_file(tmp);
+        // Cache directories can already contain staged files. Never follow or truncate an
+        // existing temporary pathname when publishing a derived index.
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            let written = file.write_all(&bytes);
+            drop(file);
+            if written.is_ok() {
+                // A missing index is harmless: a reader can reconstruct it from runtime headers.
+                let _ = fs::remove_file(&path);
+                if fs::rename(&tmp, path).is_ok() {
+                    return;
+                }
             }
+            let _ = fs::remove_file(tmp);
         }
     }
 }
