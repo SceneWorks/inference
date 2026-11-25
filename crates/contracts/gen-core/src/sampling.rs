@@ -816,6 +816,27 @@ pub fn wan_candle_sigmas(steps: usize, shift: f64, num_train_timesteps: usize) -
         .collect()
 }
 
+/// Boogu Turbo DMD ascending clean-fraction schedule with optional flow time-shift override
+/// (`PIPE-9`): maps `clean -> 1.0 - clean`, applies `flow_schedule_with_shift(None, 0.0, shift, …)`,
+/// and maps back to `1.0 - noise` so an absent shift returns [`boogu_dmd_sigmas`] bit-for-bit.
+pub fn boogu_dmd_shifted_sigmas(
+    conditioning_sigma: f32,
+    steps: usize,
+    scheduler_shift: Option<f32>,
+) -> crate::Result<Vec<f32>> {
+    let clean = boogu_dmd_sigmas(conditioning_sigma, steps);
+    if scheduler_shift.is_none() {
+        return Ok(clean);
+    }
+    let noise: Vec<f32> = clean.iter().map(|sigma| 1.0 - sigma).collect();
+    Ok(
+        flow_schedule_with_shift(None, 0.0, scheduler_shift, steps, &noise)?
+            .into_iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect(),
+    )
+}
+
 /// A PiD **`from_ldm` early-stop** capture plan (epic 7840, sc-7993): how far to denoise before
 /// handing the partially-denoised `x_k` to the PiD pixel decoder, and the achieved degrade σ to decode
 /// it with. Resolved by [`flow_capture_plan`] from a flow-match schedule + the request's
@@ -1633,6 +1654,97 @@ impl DiscreteAncestralSchedule {
                 renorm,
             }
         }
+    }
+}
+
+/// diffusers `SCMScheduler` default `max_timesteps` (`arctan(80/0.5)`-adjacent; Sprint default is
+/// `π/2 ≈ 1.57080`).
+pub const SCM_DEFAULT_MAX_TIMESTEP: f32 = std::f32::consts::FRAC_PI_2;
+/// diffusers Sprint default `intermediate_timesteps` (only consulted when `num_inference_steps == 2`).
+pub const SCM_DEFAULT_INTERMEDIATE_TIMESTEP: f32 = 1.3;
+/// diffusers `SCMScheduler` `sigma_data` — the std-dev of the multi-step renoise.
+pub const SCM_SIGMA_DATA: f32 = 0.5;
+
+/// SANA-Sprint SCM (TrigFlow continuous-time consistency) denoising schedule (`PIPE-9`):
+/// descending angle timesteps `t ∈ [max_timesteps … 0]`, length `num_steps + 1` (the trailing `0`
+/// is the clean endpoint).
+///
+/// Mirrors diffusers `SCMScheduler.set_timesteps`:
+/// * `num_steps == 2` → `[max_timesteps, intermediate_timesteps, 0]`;
+/// * otherwise → `linspace(max_timesteps, 0, num_steps + 1)`.
+#[derive(Clone, Debug)]
+pub struct ScmScheduler {
+    /// Descending angle timesteps, length `num_steps + 1`.
+    pub timesteps: Vec<f32>,
+    /// `sigma_data` (the renoise std-dev; `0.5` for Sprint).
+    pub sigma_data: f32,
+}
+
+impl ScmScheduler {
+    /// Build the Sprint schedule for `num_steps` (`max_timesteps = π/2`, `intermediate = 1.3`).
+    pub fn new(num_steps: usize) -> Self {
+        Self::with_timesteps(
+            num_steps,
+            SCM_DEFAULT_MAX_TIMESTEP,
+            SCM_DEFAULT_INTERMEDIATE_TIMESTEP,
+        )
+    }
+
+    /// Build the schedule for `num_steps` with explicit `max_timesteps` / `intermediate_timesteps`.
+    pub fn with_timesteps(
+        num_steps: usize,
+        max_timesteps: f32,
+        intermediate_timesteps: f32,
+    ) -> Self {
+        let n = num_steps.max(1);
+        let timesteps = if n == 2 {
+            vec![max_timesteps, intermediate_timesteps, 0.0]
+        } else {
+            (0..=n)
+                .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
+                .collect()
+        };
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Wrap an explicit descending angle schedule (length `num_steps + 1`).
+    pub fn from_timesteps(timesteps: Vec<f32>) -> Self {
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`.
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len().saturating_sub(1)
+    }
+
+    /// Whether this is a true single-step schedule (one renoise-free step).
+    pub fn is_single_step(&self) -> bool {
+        self.num_steps() <= 1
+    }
+
+    /// The **SCM conditioning timestep** the trunk embeds at step `i`:
+    /// `scm_timestep = sin(t) / (cos(t) + sin(t))` where `t` is the angle timestep.
+    pub fn scm_timestep(&self, i: usize) -> f32 {
+        let t = self.timesteps[i];
+        let (s, c) = (t.sin(), t.cos());
+        s / (c + s)
+    }
+
+    /// The model-input scale at step `i`: `sqrt(scm_t² + (1 - scm_t)²)`.
+    pub fn input_scale(&self, i: usize) -> f32 {
+        let st = self.scm_timestep(i);
+        (st * st + (1.0 - st) * (1.0 - st)).sqrt()
+    }
+
+    /// TrigFlow recombination weights `(1 - 2·scm_t, 1 - 2·scm_t + 2·scm_t²)` at `scm_t`.
+    pub const fn trigflow_recombine_weights(scm_t: f32) -> (f32, f32) {
+        (1.0 - 2.0 * scm_t, 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t)
     }
 }
 

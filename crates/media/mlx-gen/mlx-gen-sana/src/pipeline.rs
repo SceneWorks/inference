@@ -47,7 +47,11 @@
 
 use mlx_gen::attention::AttentionBudget;
 use mlx_gen::block_residency::BlockPlan;
-use mlx_gen::gen_core::GenerationMemory;
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use mlx_gen::gen_core::{BoundaryState, EstimateSource, GenerationMemory};
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
@@ -855,6 +859,282 @@ pub fn denoise_sprint_from_with_preview(
     )
 }
 
+/// Typed `FamilyDriver` for SANA-Sprint's TrigFlow / SCM continuous-time consistency loop (`SW-6969`).
+///
+/// Operates in `sigma_data`-scaled SCM latent space across slices `[start, end)` and divides by
+/// `sigma_data` on reaching the clean endpoint (`span.end == total_steps`), preserving bit-exact
+/// TrigFlow recombination, keyed renoise, and iOS `SCM_STEP` materialization via
+/// [`StepHooks::on_materialize`].
+pub struct SanaScmDriver<F> {
+    support: DriverSupport,
+    scheduler: ScmScheduler,
+    start_step: usize,
+    emit_ios_diagnostics: bool,
+    forward: F,
+}
+
+impl<F> SanaScmDriver<F>
+where
+    F: Fn(&Array, f32, usize) -> Result<Array>,
+{
+    /// Construct a SANA-Sprint SCM driver over `scheduler` starting at `start_step`.
+    pub fn new(scheduler: ScmScheduler, start_step: usize, forward: F) -> Self {
+        Self::with_diagnostics(scheduler, start_step, false, forward)
+    }
+
+    pub(crate) fn with_diagnostics(
+        scheduler: ScmScheduler,
+        start_step: usize,
+        emit_ios_diagnostics: bool,
+        forward: F,
+    ) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "sana_sprint_scm",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: true,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    renoise_from_clean: "SANA-Sprint SCM owns its TrigFlow angle renoise and refuses external Renoise transitions",
+                    geometry_change: "SANA-Sprint SCM does not support mid-trajectory spatial resampling",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            scheduler,
+            start_step,
+            emit_ios_diagnostics,
+            forward,
+        }
+    }
+
+    fn step_key(seed: u64, abs_step: usize) -> mlx_gen::gen_core::Result<Array> {
+        let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(abs_step as u64 + 1));
+        random::key(sub).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+    }
+}
+
+impl<F> FamilyDriver<Array> for SanaScmDriver<F>
+where
+    F: Fn(&Array, f32, usize) -> Result<Array>,
+{
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        let n = self.scheduler.num_steps();
+        let start = self.start_step.min(n);
+        let active_steps = n - start;
+        if input.total_steps != active_steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match active SCM step count={active_steps}",
+                self.support.driver_id, input.total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let sd = self.scheduler.sigma_data;
+        let mut latents = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let mut denoised = latents.clone();
+        let mut previous_renoise = false;
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let abs_step = start + step;
+            let s = self.scheduler.timesteps[abs_step];
+            let t_next = self.scheduler.timesteps[abs_step + 1];
+            let scm_t = self.scheduler.scm_timestep(abs_step);
+            let in_scale = self.scheduler.input_scale(abs_step);
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: s,
+                next_sigma: t_next,
+            };
+
+            // Per-eval compute boundary (MLX is lazy): force the prior step's graph so cancel/progress
+            // and iOS SCM_STEP quanta are responsive before the trunk forward.
+            hooks.materialize(&info, &latents)?;
+            let completed_before = state.completed_outer_steps as u64;
+            if self.emit_ios_diagnostics {
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::SPRINT_MODEL_ID,
+                    "scm_callback_evaluated",
+                    &[
+                        ("schema", 1),
+                        ("step", abs_step as u64),
+                        ("start", start as u64),
+                        ("declared_steps", n as u64),
+                        ("completed_steps", completed_before),
+                        ("history_present", u64::from(completed_before > 0)),
+                        ("previous_renoise", u64::from(previous_renoise)),
+                        (
+                            "state_dtype",
+                            mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                        ),
+                        ("state_logical_bytes", mlx_gen::ios_quantum::bytes(&latents)),
+                        (
+                            "denoised_owner_logical_bytes",
+                            mlx_gen::ios_quantum::bytes(&denoised),
+                        ),
+                    ],
+                );
+            }
+            hooks.observe(&info, &latents)?;
+
+            // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
+            let lat_in = multiply(
+                divide(&latents, arr1(sd))
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?,
+                arr1(in_scale),
+            )
+            .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            if self.emit_ios_diagnostics {
+                mlx_gen::sampler::diagnostic_sampling_tensor(
+                    crate::model::SPRINT_MODEL_ID,
+                    "forward_argument",
+                    completed_before + 1,
+                    lat_in.shape().first().copied().unwrap_or(0) as u64,
+                    &lat_in,
+                );
+            }
+            let raw = (self.forward)(&lat_in, scm_t, abs_step)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            if self.emit_ios_diagnostics {
+                mlx_gen::sampler::diagnostic_sampling_tensor(
+                    crate::model::SPRINT_MODEL_ID,
+                    "forward_return",
+                    completed_before + 1,
+                    raw.shape().first().copied().unwrap_or(0) as u64,
+                    &raw,
+                );
+            }
+
+            // Renoise to the next angle (skipped on the final / single-step transition, matching
+            // diffusers `if len(self.timesteps) > 1`).
+            let renoise_key = if self.scheduler.is_single_step() || abs_step + 1 >= n {
+                None
+            } else {
+                let _draw = state.next_draw_index();
+                Some(Self::step_key(input.seed, abs_step)?)
+            };
+            let (pred_x0, next) = scm_step(
+                &latents,
+                &lat_in,
+                &raw,
+                ScmStepAngles {
+                    scm_t,
+                    in_scale,
+                    sigma_data: sd,
+                    s,
+                    t_next,
+                },
+                renoise_key.as_ref(),
+            )?;
+            denoised = pred_x0;
+            latents = hooks.post_step(&info, next)?;
+            previous_renoise = renoise_key.is_some();
+            state.record_outer_step(step);
+            if self.emit_ios_diagnostics {
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::SPRINT_MODEL_ID,
+                    "scm_update",
+                    &[
+                        ("schema", 1),
+                        ("step", abs_step as u64),
+                        ("completed_steps", state.completed_outer_steps as u64),
+                        ("noise", u64::from(previous_renoise)),
+                        ("terminal_alias", u64::from(renoise_key.is_none())),
+                        ("next_angle_bits", t_next.to_bits() as u64),
+                        (
+                            "state_dtype",
+                            mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                        ),
+                    ],
+                );
+            }
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+
+        if input.request_boundary_estimate {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let est = if input.span.end < input.total_steps {
+                let abs_step = start + input.span.end;
+                let s = self.scheduler.timesteps[abs_step];
+                let t_next = self.scheduler.timesteps[abs_step + 1];
+                let scm_t = self.scheduler.scm_timestep(abs_step);
+                let in_scale = self.scheduler.input_scale(abs_step);
+                let lat_in = multiply(
+                    divide(&latents, arr1(sd))
+                        .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?,
+                    arr1(in_scale),
+                )
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+                let raw = (self.forward)(&lat_in, scm_t, abs_step)?;
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                let (pred_x0, _) = scm_step(
+                    &latents,
+                    &lat_in,
+                    &raw,
+                    ScmStepAngles {
+                        scm_t,
+                        in_scale,
+                        sigma_data: sd,
+                        s,
+                        t_next,
+                    },
+                    None,
+                )?;
+                divide(&pred_x0, arr1(sd))
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+            } else {
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                divide(&denoised, arr1(sd))
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+            };
+            return Ok(BoundaryState::CleanEstimate {
+                latent: est,
+                source: EstimateSource::EndpointEvaluation,
+            });
+        }
+
+        if input.span.end == input.total_steps {
+            let out = divide(&denoised, arr1(sd))
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            Ok(BoundaryState::CleanEstimate {
+                latent: out,
+                source: EstimateSource::EndpointEvaluation,
+            })
+        } else {
+            Ok(BoundaryState::XSigma(latents))
+        }
+    }
+}
+
 /// [`denoise_sprint_from_with_preview`] under an explicit memory plan (SC-15523 rungs 3 and 4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn denoise_sprint_from_with_memory(
@@ -873,7 +1153,6 @@ pub(crate) fn denoise_sprint_from_with_memory(
     plan: crate::transformer::SanaForwardPlan,
 ) -> Result<Array> {
     let sd = scheduler.sigma_data;
-    let mut latents = latents;
 
     // The embedded guidance scalar (CFG-free): guidance_scale * guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
@@ -881,147 +1160,65 @@ pub(crate) fn denoise_sprint_from_with_memory(
 
     let n = scheduler.num_steps();
     let start = start_step.min(n);
-    let total = (n - start).max(1) as u32;
+    let active_steps = n - start;
     let preview_schedule = &scheduler.timesteps[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(preview_schedule);
-    let mut denoised = latents.clone();
-    let mut completed_steps = 0u64;
-    let mut previous_renoise = false;
-    // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
-    // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
-    let step_key = |step: usize| -> Result<Array> {
-        let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
-        Ok(random::key(sub)?)
-    };
 
-    for i in start..n {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        // Per-eval compute boundary (MLX is lazy): force the prior step's graph so cancel/progress are
-        // responsive rather than deferred to decode. The prior step's SCM update (or the seeded
-        // prior on the first step) materializes here, inside its own guarded quantum.
-        materialize_latents(
-            crate::quantum::labels::SCM_STEP,
-            &[&latents],
-            crate::quantum::scm_step_bytes(latents.size() as u64),
-        )?;
-        mlx_gen::ios_quantum::diagnostic_metadata(
-            crate::model::SPRINT_MODEL_ID,
-            "scm_callback_evaluated",
-            &[
-                ("schema", 1),
-                ("step", i as u64),
-                ("start", start as u64),
-                ("declared_steps", n as u64),
-                ("completed_steps", completed_steps),
-                ("history_present", u64::from(completed_steps > 0)),
-                ("previous_renoise", u64::from(previous_renoise)),
-                (
-                    "state_dtype",
-                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
-                ),
-                ("state_logical_bytes", mlx_gen::ios_quantum::bytes(&latents)),
-                (
-                    "denoised_owner_logical_bytes",
-                    mlx_gen::ios_quantum::bytes(&denoised),
-                ),
-            ],
-        );
-        on_progress(Progress::Step {
-            current: (i - start) as u32 + 1,
-            total,
-        });
-
-        let s = scheduler.timesteps[i];
-        crate::preview::emit_sprint_preview(
-            preview,
-            &previews,
-            preview_schedule,
-            s,
-            &latents,
-            1.0 / sd,
-        );
-        let t_next = scheduler.timesteps[i + 1];
-        let scm_t = scheduler.scm_timestep(i);
-        let in_scale = scheduler.input_scale(i);
-
-        // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
-        let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
+    let predict = |lat_in: &Array, scm_t: f32, _abs_step: usize| -> Result<Array> {
         let scm_t_arr = arr1(scm_t);
-        mlx_gen::sampler::diagnostic_sampling_tensor(
-            crate::model::SPRINT_MODEL_ID,
-            "forward_argument",
-            completed_steps + 1,
-            lat_in.shape().first().copied().unwrap_or(0) as u64,
-            &lat_in,
-        );
-        let raw = transformer.forward_with_memory(
-            &lat_in,
+        transformer.forward_with_memory(
+            lat_in,
             cond,
             &scm_t_arr,
             Some(&guidance),
             cond_mask,
             plan,
             cancel,
-        )?;
-
-        mlx_gen::sampler::diagnostic_sampling_tensor(
-            crate::model::SPRINT_MODEL_ID,
-            "forward_return",
-            completed_steps + 1,
-            raw.shape().first().copied().unwrap_or(0) as u64,
-            &raw,
+        )
+    };
+    let driver = SanaScmDriver::with_diagnostics(scheduler.clone(), start, true, predict);
+    let mut run_state = DriverRunState::new();
+    let mut on_materialize = |_info: &DriverStepInfo, latents: &Array| {
+        materialize_latents(
+            crate::quantum::labels::SCM_STEP,
+            &[latents],
+            crate::quantum::scm_step_bytes(latents.size() as u64),
+        )
+        .map_err(Into::into)
+    };
+    let mut on_observe = |info: &DriverStepInfo, latents: &Array| {
+        crate::preview::emit_sprint_preview(
+            preview,
+            &previews,
+            preview_schedule,
+            info.sigma,
+            latents,
+            1.0 / sd,
         );
-
-        // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
-        // `if len(self.timesteps) > 1`). On the last step `t_next == 0` ⇒ `cos(0)=1`, `sin(0)=0`, so the
-        // renoise reduces to exactly `pred_x0` — gate the noise DRAW on a non-terminal step (`i+1 < n`)
-        // so the final step doesn't burn a wasted `random::normal` + key derivation (F-092; bit-exact,
-        // the drawn noise was multiplied by `sin(0)=0` anyway).
-        let renoise_key = if scheduler.is_single_step() || i + 1 >= n {
-            None
-        } else {
-            Some(step_key(i)?)
-        };
-        let (pred_x0, next) = scm_step(
-            &latents,
-            &lat_in,
-            &raw,
-            ScmStepAngles {
-                scm_t,
-                in_scale,
-                sigma_data: sd,
-                s,
-                t_next,
-            },
-            renoise_key.as_ref(),
-        )?;
-        denoised = pred_x0;
-        latents = next;
-        completed_steps += 1;
-        previous_renoise = renoise_key.is_some();
-        mlx_gen::ios_quantum::diagnostic_metadata(
-            crate::model::SPRINT_MODEL_ID,
-            "scm_update",
-            &[
-                ("schema", 1),
-                ("step", i as u64),
-                ("completed_steps", completed_steps),
-                ("noise", u64::from(previous_renoise)),
-                ("terminal_alias", u64::from(renoise_key.is_none())),
-                ("next_angle_bits", t_next.to_bits() as u64),
-                (
-                    "state_dtype",
-                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
-                ),
-            ],
-        );
-    }
+        Ok(())
+    };
+    let mut hooks = StepHooks::new(on_progress);
+    hooks.on_materialize = Some(&mut on_materialize);
+    hooks.on_observe = Some(&mut on_observe);
+    let out = match run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(active_steps)],
+        BoundaryState::XSigma(latents),
+        active_steps,
+        seed,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, state, _| Ok(state),
+    )? {
+        BoundaryState::XSigma(x)
+        | BoundaryState::CleanEstimate { latent: x, .. }
+        | BoundaryState::RouteSpecific { state: x, .. } => x,
+    };
 
     // diffusers: latents = denoised / sigma_data (the decode input). The last step's update is
     // still lazy here and materializes with the division.
-    let out = divide(&denoised, arr1(sd))?;
     materialize_latents(
         crate::quantum::labels::SCM_FINAL,
         &[&out],
@@ -1029,6 +1226,7 @@ pub(crate) fn denoise_sprint_from_with_memory(
             mlx_gen::ios_quantum::elementwise_bytes(out.size() as u64, 1),
         ),
     )?;
+    let completed_steps = run_state.completed_outer_steps as u64;
     mlx_gen::ios_quantum::diagnostic_metadata(
         crate::model::SPRINT_MODEL_ID,
         "solve_complete",
@@ -1088,8 +1286,7 @@ pub(crate) fn scm_step(
     // `lat_in`, NOT the un-scaled latent):
     //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / sqrt(scm_t²+(1-scm_t)²)
     //   noise_pred = noise_pred * sigma_data
-    let a = 1.0 - 2.0 * scm_t;
-    let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
+    let (a, b) = ScmScheduler::trigflow_recombine_weights(scm_t);
     let model_output = multiply(
         &divide(
             &add(&multiply(lat_in, arr1(a))?, &multiply(raw, arr1(b))?)?,
@@ -3463,5 +3660,52 @@ mod quantum_tests {
         }
 
         eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::sequential_reference_reorder_is_byte_identical");
+    }
+
+    #[test]
+    fn sana_scm_driver_passes_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 19,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(SanaScmDriver::new(
+                    ScmScheduler::new(4),
+                    0,
+                    |lat_in, scm_t, step| {
+                        let scale = arr1(0.15 * scm_t + 0.05 * step as f32 + 0.1);
+                        Ok(multiply(lat_in, &scale)?)
+                    },
+                ))
+            },
+            make_initial: || {
+                multiply(
+                    Array::from_slice(&[0.3f32, -1.1, 2.0, 0.05], &[1, 1, 2, 2]),
+                    arr1(crate::scm::SIGMA_DATA),
+                )
+                .unwrap()
+            },
+            latents_equal: |a, b| {
+                a.eval().unwrap();
+                b.eval().unwrap();
+                a.as_slice::<f32>()
+                    .iter()
+                    .zip(b.as_slice::<f32>().iter())
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("SanaScmDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
+        assert_eq!(report.unsplit_draws, 3);
     }
 }
