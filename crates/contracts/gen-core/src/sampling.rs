@@ -753,6 +753,90 @@ pub fn boogu_turbo_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     s
 }
 
+/// Wan MLX shifted-sigma schedule (`PIPE-9`): `num_steps + 1` `f32` sigmas with trailing `0.0`.
+///
+/// Computed in `f64` and cast to `f32` at the end, matching the MLX Wan reference:
+/// `σ_max = 1 - 1/N`, `σ_min = 0`, `s_k = σ_max + ((σ_min - σ_max)/num_steps) · k`,
+/// `σ'_k = shift·s_k / (1 + (shift − 1)·s_k)` for `k = 0..num_steps`, plus terminal `0.0`.
+pub fn wan_mlx_sigmas(num_steps: usize, shift: f32, num_train_timesteps: usize) -> Vec<f32> {
+    let n_train = num_train_timesteps as f64;
+    let sigma_max = 1.0 - 1.0 / n_train;
+    let sigma_min = 0.0_f64;
+    let shift = shift as f64;
+    let n = num_steps as f64;
+    let step = (sigma_min - sigma_max) / n;
+
+    let mut out = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let s = sigma_max + step * (k as f64);
+        let shifted = shift * s / (1.0 + (shift - 1.0) * s);
+        out.push(shifted as f32);
+    }
+    out.push(0.0_f32);
+    out
+}
+
+/// Wan MLX integer-valued model timesteps from sigmas (`PIPE-9`): `(σ[:-1] · num_train).trunc()`.
+pub fn wan_mlx_timesteps(sigmas: &[f32], num_train_timesteps: usize) -> Vec<f32> {
+    let nt = num_train_timesteps as f32;
+    sigmas[..sigmas.len().saturating_sub(1)]
+        .iter()
+        .map(|&s| (s * nt).trunc())
+        .collect()
+}
+
+/// Wan Candle shifted-sigma schedule in `f64` (`PIPE-9`): `steps + 1` `f64` sigmas with trailing
+/// `0.0`.
+///
+/// Mirrors diffusers' `UniPCMultistepScheduler(use_flow_sigmas=True)`:
+/// `s_k = 1 + (1/N - 1)·k/steps`, `σ'_k = shift·s_k / (1 + (shift − 1)·s_k)`, with the
+/// `σ_0 -= 1e-6` guard when `|σ_0 - 1| < 1e-6` to keep `log(1 − σ_0)` finite, plus terminal `0.0`.
+pub fn wan_candle_sigmas_f64(steps: usize, shift: f64, num_train_timesteps: usize) -> Vec<f64> {
+    let n = num_train_timesteps as f64;
+    let mut sigmas: Vec<f64> = (0..steps)
+        .map(|k| {
+            let s = 1.0 + (1.0 / n - 1.0) * (k as f64) / (steps as f64);
+            shift * s / (1.0 + (shift - 1.0) * s)
+        })
+        .collect();
+    if let Some(first) = sigmas.first_mut() {
+        if (*first - 1.0).abs() < 1e-6 {
+            *first -= 1e-6;
+        }
+    }
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// Wan Candle shifted-sigma schedule cast to `f32` (`PIPE-9`).
+pub fn wan_candle_sigmas(steps: usize, shift: f64, num_train_timesteps: usize) -> Vec<f32> {
+    wan_candle_sigmas_f64(steps, shift, num_train_timesteps)
+        .iter()
+        .map(|&s| s as f32)
+        .collect()
+}
+
+/// Boogu Turbo DMD ascending clean-fraction schedule with optional flow time-shift override
+/// (`PIPE-9`): maps `clean -> 1.0 - clean`, applies `flow_schedule_with_shift(None, 0.0, shift, …)`,
+/// and maps back to `1.0 - noise` so an absent shift returns [`boogu_dmd_sigmas`] bit-for-bit.
+pub fn boogu_dmd_shifted_sigmas(
+    conditioning_sigma: f32,
+    steps: usize,
+    scheduler_shift: Option<f32>,
+) -> crate::Result<Vec<f32>> {
+    let clean = boogu_dmd_sigmas(conditioning_sigma, steps);
+    if scheduler_shift.is_none() {
+        return Ok(clean);
+    }
+    let noise: Vec<f32> = clean.iter().map(|sigma| 1.0 - sigma).collect();
+    Ok(
+        flow_schedule_with_shift(None, 0.0, scheduler_shift, steps, &noise)?
+            .into_iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect(),
+    )
+}
+
 /// A PiD **`from_ldm` early-stop** capture plan (epic 7840, sc-7993): how far to denoise before
 /// handing the partially-denoised `x_k` to the PiD pixel decoder, and the achieved degrade σ to decode
 /// it with. Resolved by [`flow_capture_plan`] from a flow-match schedule + the request's
@@ -1254,6 +1338,413 @@ impl SamplerPolicy for TcdPolicy {
 
     fn sigma(&self, _i: usize) -> Option<f32> {
         None
+    }
+}
+
+// =================================================================================================
+// Native SDXL Ancestral & Kolors Leading-Euler Schedule Builders (PIPE-9)
+// =================================================================================================
+
+/// SDXL's diffusers `scaled_linear` beta schedule constants.
+pub const SDXL_TRAIN_STEPS: usize = 1_000;
+pub const SDXL_BETA_START: f32 = 0.00085;
+pub const SDXL_BETA_END: f32 = 0.012;
+
+/// Kolors' diffusers `scaled_linear` beta schedule constants (`num_train_timesteps = 1100`,
+/// `timestep_spacing = "leading"`, `steps_offset = 1`).
+pub const KOLORS_TRAIN_STEPS: usize = 1_100;
+pub const KOLORS_BETA_START: f32 = 0.00085;
+pub const KOLORS_BETA_END: f32 = 0.014;
+pub const KOLORS_STEPS_OFFSET: i64 = 1;
+
+/// Precision of the cumulative `alphas_cumprod` product used to build the leading-Euler sigma
+/// table (`AP13` class (a) per-backend parity: MLX Kolors accumulates via `AlphaSchedule` f32
+/// cumprod; Candle Kolors accumulates in f64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BetaCumprodPrecision {
+    F32,
+    F64,
+}
+
+/// Shared host schedule builder for Kolors' native leading-spacing `EulerDiscreteScheduler`
+/// (`PIPE-9`: single source of truth for both MLX and Candle Kolors).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeadingEulerSchedule {
+    sigmas: Vec<f32>,
+    timesteps: Vec<f32>,
+    init_noise_sigma: f32,
+    start_sigma: f32,
+}
+
+impl LeadingEulerSchedule {
+    /// Build a leading-spacing `EulerDiscreteScheduler` schedule over `scaled_linear` betas.
+    pub fn new(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        steps_offset: i64,
+        num_steps: usize,
+        precision: BetaCumprodPrecision,
+    ) -> crate::Result<Self> {
+        if num_steps == 0 {
+            return Err(crate::Error::Msg(
+                "kolors sampler: num_steps must be >= 1".into(),
+            ));
+        }
+        if num_steps > num_train_timesteps {
+            return Err(crate::Error::Msg(format!(
+                "kolors sampler: num_steps must be <= {num_train_timesteps} (got {num_steps})"
+            )));
+        }
+
+        let full: Vec<f64> = match precision {
+            BetaCumprodPrecision::F32 => {
+                let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end);
+                sched
+                    .alphas_cumprod
+                    .iter()
+                    .map(|&acp| {
+                        let a = acp as f64;
+                        ((1.0 - a) / a).sqrt()
+                    })
+                    .collect()
+            }
+            BetaCumprodPrecision::F64 => {
+                let (b0, b1) = (f64::from(beta_start).sqrt(), f64::from(beta_end).sqrt());
+                let mut acp = 1.0f64;
+                let mut table = Vec::with_capacity(num_train_timesteps);
+                for i in 0..num_train_timesteps {
+                    let frac = if num_train_timesteps == 1 {
+                        0.0
+                    } else {
+                        i as f64 / (num_train_timesteps - 1) as f64
+                    };
+                    let beta = (b0 + (b1 - b0) * frac).powi(2);
+                    acp *= 1.0 - beta;
+                    table.push(((1.0 - acp) / acp).sqrt());
+                }
+                table
+            }
+        };
+
+        let step_ratio = (num_train_timesteps / num_steps) as i64;
+        let timesteps: Vec<f32> = (0..num_steps)
+            .rev()
+            .map(|j| ((j as i64 * step_ratio) + steps_offset) as f32)
+            .collect();
+
+        let interp = |t: f32| -> f32 {
+            let tt = (t as f64).clamp(0.0, (num_train_timesteps - 1) as f64);
+            let lo = tt.floor() as usize;
+            let hi = (lo + 1).min(num_train_timesteps - 1);
+            let frac = tt - lo as f64;
+            (full[lo] * (1.0 - frac) + full[hi] * frac) as f32
+        };
+        let mut sigmas: Vec<f32> = timesteps.iter().map(|&t| interp(t)).collect();
+        let max_sigma = sigmas.iter().copied().fold(0.0_f32, f32::max);
+        sigmas.push(0.0);
+
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: (max_sigma * max_sigma + 1.0).sqrt(),
+            start_sigma: max_sigma,
+        })
+    }
+
+    /// Build Kolors' native leading-Euler schedule (`num_train_timesteps = 1100`, `steps_offset = 1`).
+    pub fn kolors(num_steps: usize, precision: BetaCumprodPrecision) -> crate::Result<Self> {
+        Self::new(
+            KOLORS_TRAIN_STEPS,
+            KOLORS_BETA_START,
+            KOLORS_BETA_END,
+            KOLORS_STEPS_OFFSET,
+            num_steps,
+            precision,
+        )
+    }
+
+    /// Build Kolors' img2img tail schedule using diffusers' `floor(steps * strength)` rule.
+    pub fn kolors_img2img(
+        num_steps: usize,
+        strength: f32,
+        precision: BetaCumprodPrecision,
+    ) -> crate::Result<Self> {
+        let full = Self::kolors(num_steps, precision)?;
+        let effective = ((num_steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(num_steps);
+        let start = num_steps - effective;
+        let sigmas = full.sigmas[start..].to_vec();
+        let timesteps = full.timesteps[start..].to_vec();
+        let start_sigma = sigmas[0];
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: full.init_noise_sigma,
+            start_sigma,
+        })
+    }
+
+    /// Truncate the baked schedule to its first `run_steps` steps (PiD `from_ldm` early-stop).
+    pub fn truncate_to(mut self, run_steps: usize) -> Self {
+        self.timesteps.truncate(run_steps);
+        self.sigmas.truncate(run_steps + 1);
+        self
+    }
+
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len()
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
+    }
+
+    pub fn timestep(&self, i: usize) -> f32 {
+        self.timesteps[i]
+    }
+
+    pub fn init_noise_sigma(&self) -> f32 {
+        self.init_noise_sigma
+    }
+
+    pub fn start_sigma(&self) -> f32 {
+        self.start_sigma
+    }
+
+    pub fn scale_in(&self, i: usize) -> f32 {
+        let s = self.sigmas[i] as f64;
+        (s * s + 1.0).sqrt() as f32
+    }
+
+    pub fn step_dt(&self, i: usize) -> f32 {
+        self.sigmas[i + 1] - self.sigmas[i]
+    }
+}
+
+/// Scalar coefficients for one host-f64 discrete Euler / Euler-ancestral update step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiscreteAncestralStepScalars {
+    pub c1: f64,
+    pub dt: f64,
+    pub sigma_up: f64,
+    pub renorm: f64,
+}
+
+/// Shared host-f64 discrete Euler / Euler-ancestral schedule table (`PIPE-9`).
+///
+/// Used by Candle SDXL (`EulerAncestralSampler`). MLX SDXL retains its MLX-op sigma table and
+/// f16-rounded timestep schedule where 1-ULP MLX op parity with Python `mlx_sd` is load-bearing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscreteAncestralSchedule {
+    sigmas: Vec<f64>,
+    ancestral: bool,
+}
+
+impl DiscreteAncestralSchedule {
+    /// Production SDXL ancestral schedule (`scaled_linear` β 0.00085→0.012, 1000 train steps).
+    pub fn sdxl() -> Self {
+        Self::new(
+            SDXL_TRAIN_STEPS,
+            SDXL_BETA_START.into(),
+            SDXL_BETA_END.into(),
+            true,
+        )
+        .expect("sdxl schedule: nonzero train steps")
+    }
+
+    /// Build a host-f64 `scaled_linear` sigma table `[0.0, σ_1, ..., σ_T]`.
+    pub fn new(
+        train_steps: usize,
+        beta_start: f64,
+        beta_end: f64,
+        ancestral: bool,
+    ) -> crate::Result<Self> {
+        if train_steps < 2 {
+            return Err(crate::Error::Msg(
+                "euler sampler: train_steps must be >= 2".into(),
+            ));
+        }
+        let n = train_steps;
+        let (a, b) = (beta_start.sqrt(), beta_end.sqrt());
+        let mut acp = 1.0f64;
+        let mut sigmas = Vec::with_capacity(n + 1);
+        sigmas.push(0.0);
+        for i in 0..n {
+            let x = i as f64 / (n - 1) as f64;
+            let lin = a + x * (b - a);
+            let beta = lin * lin;
+            acp *= 1.0 - beta;
+            sigmas.push(((1.0 - acp) / acp).sqrt());
+        }
+        Ok(Self { sigmas, ancestral })
+    }
+
+    pub fn is_ancestral(&self) -> bool {
+        self.ancestral
+    }
+
+    pub fn max_time(&self) -> f64 {
+        (self.sigmas.len() - 1) as f64
+    }
+
+    pub fn sigma_last(&self) -> f64 {
+        *self.sigmas.last().expect("sigma table is never empty")
+    }
+
+    pub fn sigmas(&self) -> &[f64] {
+        &self.sigmas
+    }
+
+    pub fn sigma(&self, t: f64) -> f64 {
+        let last = self.sigmas.len() - 1;
+        let lo = (t as usize).min(last);
+        let hi = (lo + 1).min(last);
+        let delta = t - lo as f64;
+        self.sigmas[lo] * (1.0 - delta) + delta * self.sigmas[hi]
+    }
+
+    pub fn timesteps(&self, num_steps: usize, start_time: f64) -> Vec<(f64, f64)> {
+        if num_steps == 0 {
+            return Vec::new();
+        }
+        let n = num_steps as f64;
+        let steps: Vec<f64> = (0..=num_steps)
+            .map(|i| {
+                let x = i as f64 / n;
+                (0.0 - start_time) * x + start_time
+            })
+            .collect();
+        steps.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
+    pub fn prior_scale(&self) -> f64 {
+        let s = self.sigma_last();
+        s / (s * s + 1.0).sqrt()
+    }
+
+    pub fn step_scalars(&self, t: f64, t_prev: f64) -> DiscreteAncestralStepScalars {
+        let sigma = self.sigma(t);
+        let sigma_prev = self.sigma(t_prev);
+        let sigma2 = sigma * sigma;
+        let sigma_prev2 = sigma_prev * sigma_prev;
+        let c1 = (sigma2 + 1.0).sqrt();
+        let renorm = 1.0 / (sigma_prev2 + 1.0).sqrt();
+        if self.ancestral {
+            let sigma_up = if sigma2 > 0.0 {
+                (sigma_prev2 * (sigma2 - sigma_prev2) / sigma2).sqrt()
+            } else {
+                0.0
+            };
+            let sigma_down = (sigma_prev2 - sigma_up * sigma_up).max(0.0).sqrt();
+            DiscreteAncestralStepScalars {
+                c1,
+                dt: sigma_down - sigma,
+                sigma_up,
+                renorm,
+            }
+        } else {
+            DiscreteAncestralStepScalars {
+                c1,
+                dt: sigma_prev - sigma,
+                sigma_up: 0.0,
+                renorm,
+            }
+        }
+    }
+}
+
+/// diffusers `SCMScheduler` default `max_timesteps` (`arctan(80/0.5)`-adjacent; Sprint default is
+/// `π/2 ≈ 1.57080`).
+pub const SCM_DEFAULT_MAX_TIMESTEP: f32 = std::f32::consts::FRAC_PI_2;
+/// diffusers Sprint default `intermediate_timesteps` (only consulted when `num_inference_steps == 2`).
+pub const SCM_DEFAULT_INTERMEDIATE_TIMESTEP: f32 = 1.3;
+/// diffusers `SCMScheduler` `sigma_data` — the std-dev of the multi-step renoise.
+pub const SCM_SIGMA_DATA: f32 = 0.5;
+
+/// SANA-Sprint SCM (TrigFlow continuous-time consistency) denoising schedule (`PIPE-9`):
+/// descending angle timesteps `t ∈ [max_timesteps … 0]`, length `num_steps + 1` (the trailing `0`
+/// is the clean endpoint).
+///
+/// Mirrors diffusers `SCMScheduler.set_timesteps`:
+/// * `num_steps == 2` → `[max_timesteps, intermediate_timesteps, 0]`;
+/// * otherwise → `linspace(max_timesteps, 0, num_steps + 1)`.
+#[derive(Clone, Debug)]
+pub struct ScmScheduler {
+    /// Descending angle timesteps, length `num_steps + 1`.
+    pub timesteps: Vec<f32>,
+    /// `sigma_data` (the renoise std-dev; `0.5` for Sprint).
+    pub sigma_data: f32,
+}
+
+impl ScmScheduler {
+    /// Build the Sprint schedule for `num_steps` (`max_timesteps = π/2`, `intermediate = 1.3`).
+    pub fn new(num_steps: usize) -> Self {
+        Self::with_timesteps(
+            num_steps,
+            SCM_DEFAULT_MAX_TIMESTEP,
+            SCM_DEFAULT_INTERMEDIATE_TIMESTEP,
+        )
+    }
+
+    /// Build the schedule for `num_steps` with explicit `max_timesteps` / `intermediate_timesteps`.
+    pub fn with_timesteps(
+        num_steps: usize,
+        max_timesteps: f32,
+        intermediate_timesteps: f32,
+    ) -> Self {
+        let n = num_steps.max(1);
+        let timesteps = if n == 2 {
+            vec![max_timesteps, intermediate_timesteps, 0.0]
+        } else {
+            (0..=n)
+                .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
+                .collect()
+        };
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Wrap an explicit descending angle schedule (length `num_steps + 1`).
+    pub fn from_timesteps(timesteps: Vec<f32>) -> Self {
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`.
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len().saturating_sub(1)
+    }
+
+    /// Whether this is a true single-step schedule (one renoise-free step).
+    pub fn is_single_step(&self) -> bool {
+        self.num_steps() <= 1
+    }
+
+    /// The **SCM conditioning timestep** the trunk embeds at step `i`:
+    /// `scm_timestep = sin(t) / (cos(t) + sin(t))` where `t` is the angle timestep.
+    pub fn scm_timestep(&self, i: usize) -> f32 {
+        let t = self.timesteps[i];
+        let (s, c) = (t.sin(), t.cos());
+        s / (c + s)
+    }
+
+    /// The model-input scale at step `i`: `sqrt(scm_t² + (1 - scm_t)²)`.
+    pub fn input_scale(&self, i: usize) -> f32 {
+        let st = self.scm_timestep(i);
+        (st * st + (1.0 - st) * (1.0 - st)).sqrt()
+    }
+
+    /// TrigFlow recombination weights `(1 - 2·scm_t, 1 - 2·scm_t + 2·scm_t²)` at `scm_t`.
+    pub const fn trigflow_recombine_weights(scm_t: f32) -> (f32, f32) {
+        (1.0 - 2.0 * scm_t, 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t)
     }
 }
 
@@ -1836,5 +2327,26 @@ mod tests {
         assert_eq!(b_turbo.len(), 5);
         assert!((b_turbo[0] - 0.999).abs() < 1e-6);
         assert_eq!(b_turbo[4], 0.0);
+
+        // Wan MLX & Candle flow-match schedules (`PIPE-9`)
+        let w_mlx = wan_mlx_sigmas(40, 5.0, 1000);
+        assert_eq!(w_mlx.len(), 41);
+        assert_eq!(*w_mlx.last().unwrap(), 0.0);
+        let sm = 0.999_f64;
+        assert_eq!(
+            w_mlx[0].to_bits(),
+            ((5.0 * sm / (1.0 + 4.0 * sm)) as f32).to_bits()
+        );
+        let w_mlx_ts = wan_mlx_timesteps(&w_mlx, 1000);
+        assert_eq!(w_mlx_ts.len(), 40);
+        assert_eq!(w_mlx_ts[0], (w_mlx[0] * 1000.0).trunc());
+
+        let w_candle = wan_candle_sigmas_f64(40, 5.0, 1000);
+        assert_eq!(w_candle.len(), 41);
+        assert_eq!(w_candle[0].to_bits(), (1.0 - 1e-6_f64).to_bits());
+        assert_eq!(*w_candle.last().unwrap(), 0.0);
+        let w_candle_f32 = wan_candle_sigmas(40, 5.0, 1000);
+        assert_eq!(w_candle_f32.len(), 41);
+        assert_eq!(w_candle_f32[0].to_bits(), (w_candle[0] as f32).to_bits());
     }
 }

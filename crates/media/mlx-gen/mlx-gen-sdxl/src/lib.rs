@@ -114,14 +114,14 @@ pub use model::{
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
     denoise_cfgpp_planned, denoise_cfgpp_with_preview, denoise_control,
-    denoise_control_with_preview, denoise_curated, denoise_curated_planned,
+    denoise_control_with_preview, denoise_core_planned, denoise_curated, denoise_curated_planned,
     denoise_curated_with_preview, denoise_inpaint, denoise_inpaint_with_preview, denoise_ip,
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
     encode_conditioning_windows, encode_init_latents, encode_init_latents_tiled,
     preprocess_control_image, preprocess_init_image, seeded_prior, text_time_ids, ControlContext,
-    Denoiser,
+    Denoiser, SdxlDiscreteDriver, SdxlEpsPredictor,
 };
 pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
@@ -592,6 +592,215 @@ mod explicit_registry_tests {
             load_err.contains("different model or adapter stack"),
             "unexpected error: {load_err}"
         );
+    }
+
+    #[test]
+    fn native_sdxl_routes_and_hires_multipass_compile_with_exact_load_rebind() {
+        use mlx_gen::gen_core::MultiPassRenderPlan;
+        use mlx_gen::{
+            Conditioning, ControlKind, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+            WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/tmp/sdxl-native".into()));
+        let dummy_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+
+        // 1. Native ancestral txt2img
+        let ancestral_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let ancestral_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &ancestral_req)
+            .unwrap()
+            .expect("native ancestral SDXL must compile a RenderPlan");
+        assert_eq!(ancestral_plan.sampler(), "euler_ancestral");
+        assert_eq!(ancestral_plan.executed_steps(), 8);
+        assert_eq!(ancestral_plan.sigmas().last(), Some(&0.0));
+
+        // 2. Native inpaint (Reference + Mask)
+        let inpaint_req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: dummy_img.clone(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Mask {
+                    image: dummy_img.clone(),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        let inpaint_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &inpaint_req)
+            .unwrap()
+            .expect("native inpaint SDXL must compile a RenderPlan");
+        assert_eq!(inpaint_plan.sampler(), "euler_ancestral");
+        assert!(inpaint_plan.executed_steps() > 0 && inpaint_plan.executed_steps() <= 8);
+
+        // 3. Native MultiControlNet
+        let ctrl_spec = spec
+            .clone()
+            .with_control(WeightsSource::Dir("/tmp/ctrl0".into()))
+            .with_extra_control(WeightsSource::Dir("/tmp/ctrl1".into()));
+        let ctrl_req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Canny,
+                    scale: Some(0.8),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Depth,
+                    scale: Some(0.6),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        let ctrl_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ctrl_spec, &ctrl_req)
+            .unwrap()
+            .expect("native MultiControlNet SDXL must compile a RenderPlan");
+        assert_eq!(ctrl_plan.executed_steps(), 8);
+
+        // 3b. Native MultiControlNet + img2img Reference (in any conditioning order)
+        let ctrl_ref_req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Canny,
+                    scale: Some(0.8),
+                },
+                Conditioning::Reference {
+                    image: dummy_img.clone(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Depth,
+                    scale: Some(0.6),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        let ctrl_ref_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ctrl_spec, &ctrl_ref_req)
+            .unwrap()
+            .expect("native MultiControlNet + img2img Reference SDXL must compile a RenderPlan");
+        assert_eq!(ctrl_ref_plan.sampler(), "euler_ancestral");
+        assert!(
+            ctrl_ref_plan.executed_steps() > 0 && ctrl_ref_plan.executed_steps() < 8,
+            "MultiControlNet + Reference at strength=0.5 must trim the img2img step schedule"
+        );
+        let ctrl_ref_reordered = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: dummy_img.clone(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Canny,
+                    scale: Some(0.8),
+                },
+                Conditioning::Control {
+                    image: dummy_img.clone(),
+                    kind: ControlKind::Depth,
+                    scale: Some(0.6),
+                },
+            ],
+            ..ancestral_req.clone()
+        };
+        assert!(ctrl_ref_plan
+            .check_request(&super::descriptor(), &ctrl_ref_reordered)
+            .is_ok());
+
+        // 4. Native IP-Adapter
+        let ip_spec = spec
+            .clone()
+            .with_ip_adapter(WeightsSource::Dir("/tmp/ip".into()));
+        let ip_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: dummy_img.clone(),
+                strength: Some(0.6),
+            }],
+            ..ancestral_req.clone()
+        };
+        let ip_plan = registry
+            .compile_render_plan(super::MODEL_ID, &ip_spec, &ip_req)
+            .unwrap()
+            .expect("native IP-Adapter SDXL must compile a RenderPlan");
+        assert_eq!(ip_plan.executed_steps(), 8);
+
+        // 5. Native acceleration routes (Lightning, LCM, Hyper)
+        for (sampler, steps) in [("lightning", 4), ("lcm", 4), ("hyper", 4)] {
+            let accel_req = GenerationRequest {
+                sampler: Some(sampler.into()),
+                steps: Some(steps),
+                guidance: Some(1.0),
+                ..ancestral_req.clone()
+            };
+            let accel_plan = registry
+                .compile_render_plan(super::MODEL_ID, &spec, &accel_req)
+                .unwrap()
+                .expect("native acceleration SDXL must compile a RenderPlan");
+            assert_eq!(accel_plan.sampler(), sampler);
+            assert_eq!(accel_plan.executed_steps(), steps as usize);
+        }
+
+        // 6. Hires.fix MultiPassRenderPlan (SW-6967 readiness) + rebind_load_placement
+        let base_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            steps: Some(6),
+            ..ancestral_req.clone()
+        };
+        let refine_req = GenerationRequest {
+            width: 1024,
+            height: 1024,
+            steps: Some(6),
+            ..ancestral_req
+        };
+        let multi = MultiPassRenderPlan::compile(
+            &[
+                mlx_gen::gen_core::PlannedPassRequest {
+                    request: &base_req,
+                    produced_reference: None,
+                },
+                mlx_gen::gen_core::PlannedPassRequest {
+                    request: &refine_req,
+                    produced_reference: Some(mlx_gen::gen_core::ProducedReference {
+                        from_pass: 0,
+                        width: 1024,
+                        height: 1024,
+                        strength: Some(0.5),
+                    }),
+                },
+            ],
+            |req| registry.compile_render_plan(super::MODEL_ID, &spec, req),
+        )
+        .unwrap()
+        .expect("MultiPassRenderPlan must compile on mlx-gen-sdxl");
+        assert_eq!(multi.passes().len(), 2);
+        assert!(multi.passes()[1].produced_reference().is_some());
+        let placed_spec = spec.clone().with_offload_policy(OffloadPolicy::Sequential);
+        let rebound = multi.rebind_load_placement(&placed_spec).unwrap();
+        rebound.passes()[0]
+            .check_load_compatible(&placed_spec)
+            .unwrap();
+        rebound.passes()[1]
+            .check_load_compatible(&placed_spec)
+            .unwrap();
     }
 }
 

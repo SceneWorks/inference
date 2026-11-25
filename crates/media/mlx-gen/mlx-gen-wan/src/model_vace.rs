@@ -45,10 +45,10 @@ use crate::pipeline::{
     latent_shape, preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid,
     reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
 };
-use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
+use crate::scheduler::{compute_sigmas, integer_timesteps, SolverKind};
 use crate::text_encoder::encode_text_staged_for_tier_with_progress;
 use crate::vace::{
-    build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
+    build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_slice, prepare_masks,
     prepare_video_latents, vace_control_scales, WanVaceTransformer,
 };
 
@@ -857,8 +857,8 @@ impl WanVaceFun {
         cancel: &mlx_gen::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let mut sched = make_scheduler(kind, num_train_timesteps);
-        sched.set_timesteps(steps, shift);
+        let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+        let timesteps = integer_timesteps(&sigmas, num_train_timesteps);
         mlx_gen::video_execution::sampling(
             "wan_vace",
             &format!("{kind:?}"),
@@ -871,8 +871,7 @@ impl WanVaceFun {
                 scales,
             ),
         );
-        mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
-        let timesteps = sched.timesteps().to_vec();
+        mlx_gen::video_execution::schedule("wan_vace", &sigmas);
         let k = crossing_index(&timesteps, boundary_timestep);
         if k == 0 || k == steps {
             return Err(Error::Msg(format!(
@@ -887,7 +886,7 @@ impl WanVaceFun {
         let low_applied = std::cell::Cell::new(0usize);
 
         struct VaceSwapState<'a> {
-            sched: &'a mut dyn WanScheduler,
+            driver_state: mlx_gen::driver::DriverRunState,
             latents: &'a mut Array,
             on_progress: &'a mut dyn FnMut(Progress),
         }
@@ -895,6 +894,7 @@ impl WanVaceFun {
         let denoise_expert = |transformer: &WanVaceTransformer,
                               guidance: f32,
                               range: std::ops::Range<usize>,
+                              phase: usize,
                               state: &mut VaceSwapState| {
             let progress = &mut *state.on_progress;
             let mut on_step = |i: usize| {
@@ -903,8 +903,11 @@ impl WanVaceFun {
                     total,
                 })
             };
-            denoise_vace_range(
-                &mut *state.sched,
+            denoise_vace_slice(
+                kind,
+                num_train_timesteps,
+                steps,
+                shift,
                 transformer,
                 control,
                 scales,
@@ -912,15 +915,16 @@ impl WanVaceFun {
                 ctx_cond,
                 ctx_uncond,
                 &mut *state.latents,
-                &timesteps,
                 range,
+                phase,
                 cancel,
+                &mut state.driver_state,
                 &mut on_step,
             )
         };
 
         let mut state = VaceSwapState {
-            sched: &mut *sched,
+            driver_state: mlx_gen::driver::DriverRunState::new(),
             latents: &mut latents,
             on_progress,
         };
@@ -937,7 +941,7 @@ impl WanVaceFun {
                 high_applied.set(applied);
                 Ok(transformer)
             },
-            |transformer, state| denoise_expert(transformer, guidance_high, 0..k, state),
+            |transformer, state| denoise_expert(transformer, guidance_high, 0..k, 0, state),
             |state| {
                 if cancel.is_cancelled() {
                     return Err(Error::Canceled);
@@ -954,7 +958,7 @@ impl WanVaceFun {
                 }
                 Ok(transformer)
             },
-            |transformer, state| denoise_expert(transformer, guidance_low, k..steps, state),
+            |transformer, state| denoise_expert(transformer, guidance_low, k..steps, 1, state),
             || {
                 mlx_rs::memory::clear_cache();
                 Ok(())

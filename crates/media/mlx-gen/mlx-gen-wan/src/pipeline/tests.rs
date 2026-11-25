@@ -1176,7 +1176,8 @@ fn latent_shape_rejects_zero_frames() {
 fn cfg_combine_is_uncond_plus_gs_delta() {
     let cond = Array::from_slice(&[2.0f32, 4.0], &[2]);
     let uncond = Array::from_slice(&[1.0f32, 1.0], &[2]);
-    let got = cfg_combine(&cond, &uncond, 3.0).unwrap();
+    let got =
+        mlx_gen::gen_core::guidance::cfg(&mlx_gen::MlxLatentOps, &cond, &uncond, 3.0).unwrap();
     // 1 + 3*(2-1) = 4 ; 1 + 3*(4-1) = 10
     assert_eq!(got.as_slice::<f32>(), &[4.0, 10.0]);
 }
@@ -1403,7 +1404,7 @@ fn curated_video_phase_uses_the_same_wan_grid_and_expert_times_as_the_native_ref
             ),
             (192, 128, 17, reference_count, 5)
         );
-        let mut native = make_scheduler(SolverKind::UniPC, train);
+        let mut native = crate::scheduler::make_scheduler(SolverKind::UniPC, train);
         native.set_timesteps(steps, shift);
         let crossing = crossing_index(native.timesteps(), boundary);
         for (i, &sigma) in phase.sigmas[..steps].iter().enumerate() {

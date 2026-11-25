@@ -26,103 +26,10 @@
 //! guidance axis as the embedded / CFG-free case (the descriptor advertises NO
 //! `supported_guidance_methods`, [`crate::model`]).
 
-use std::f32::consts::FRAC_PI_2;
-
-/// diffusers `SCMScheduler` default `max_timesteps` (`arctan(80/0.5)`-adjacent; the Sprint default is
-/// `1.57080 ≈ π/2`).
-pub const DEFAULT_MAX_TIMESTEP: f32 = FRAC_PI_2;
-/// diffusers Sprint default `intermediate_timesteps` (only consulted when `num_inference_steps == 2`).
-pub const DEFAULT_INTERMEDIATE_TIMESTEP: f32 = 1.3;
-/// diffusers `SCMScheduler` `sigma_data` — the std-dev of the multi-step renoise.
-pub const SIGMA_DATA: f32 = 0.5;
-
-/// A SANA-Sprint SCM (TrigFlow consistency) denoising schedule: the descending angle timesteps
-/// `t ∈ [max_timesteps … 0]`, length `num_steps + 1` (the trailing `0` is the clean endpoint).
-///
-/// Mirrors diffusers `SCMScheduler.set_timesteps`:
-/// * `num_steps == 2` → `[max_timesteps, intermediate_timesteps, 0]`;
-/// * otherwise → `linspace(max_timesteps, 0, num_steps + 1)`.
-#[derive(Clone, Debug)]
-pub struct ScmScheduler {
-    /// Descending angle timesteps, length `num_steps + 1`.
-    pub timesteps: Vec<f32>,
-    /// `sigma_data` (the renoise std-dev; `0.5` for Sprint).
-    pub sigma_data: f32,
-}
-
-impl ScmScheduler {
-    /// Build the Sprint schedule for `num_steps` (the diffusers `set_timesteps` default path:
-    /// `max_timesteps = π/2`, `intermediate_timesteps = 1.3`). 1–4 steps is the Sprint operating band.
-    pub fn new(num_steps: usize) -> Self {
-        Self::with_timesteps(
-            num_steps,
-            DEFAULT_MAX_TIMESTEP,
-            DEFAULT_INTERMEDIATE_TIMESTEP,
-        )
-    }
-
-    /// Build the schedule for `num_steps` with explicit `max_timesteps` / `intermediate_timesteps`
-    /// (the latter only used for the `num_steps == 2` two-point schedule, matching diffusers).
-    pub fn with_timesteps(
-        num_steps: usize,
-        max_timesteps: f32,
-        intermediate_timesteps: f32,
-    ) -> Self {
-        // F-091: `num_steps == 0` makes the linear branch's `i/n` a `0/0` NaN (poisoning the whole
-        // schedule). Clamp to a minimum of one step (a request `steps=0` is a no-op-degenerate the
-        // pipeline should treat as single-step, not NaN) — matching gen-core's `build_flow_sigmas`.
-        let n = num_steps.max(1);
-        let timesteps = if n == 2 {
-            vec![max_timesteps, intermediate_timesteps, 0.0]
-        } else {
-            (0..=n)
-                .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
-                .collect()
-        };
-        Self {
-            timesteps,
-            sigma_data: SIGMA_DATA,
-        }
-    }
-
-    /// Wrap an explicit descending angle schedule (length `num_steps + 1`).
-    pub fn from_timesteps(timesteps: Vec<f32>) -> Self {
-        Self {
-            timesteps,
-            sigma_data: SIGMA_DATA,
-        }
-    }
-
-    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`. `saturating_sub` so a
-    /// (degenerate) empty schedule from `from_timesteps(vec![])` reports 0 rather than underflowing
-    /// `usize` (F-091).
-    pub fn num_steps(&self) -> usize {
-        self.timesteps.len().saturating_sub(1)
-    }
-
-    /// Whether this is a true single-step schedule (one renoise-free step). diffusers skips the
-    /// between-step noise when `len(timesteps) == 1` *after* the pipeline drops the trailing `0`
-    /// (`timesteps = timesteps[:-1]`), i.e. when `num_steps == 1`.
-    pub fn is_single_step(&self) -> bool {
-        self.num_steps() <= 1
-    }
-
-    /// The **SCM conditioning timestep** the trunk embeds at step `i` (diffusers
-    /// `scm_timestep = sin(t)/(cos(t)+sin(t))` where `t` is the angle timestep). The trunk consumes
-    /// this, NOT the raw angle.
-    pub fn scm_timestep(&self, i: usize) -> f32 {
-        let t = self.timesteps[i];
-        let (s, c) = (t.sin(), t.cos());
-        s / (c + s)
-    }
-
-    /// The model-input scale at step `i` (diffusers
-    /// `sqrt(scm_t² + (1 - scm_t)²)`, applied to `latents / sigma_data`).
-    pub fn input_scale(&self, i: usize) -> f32 {
-        let st = self.scm_timestep(i);
-        (st * st + (1.0 - st) * (1.0 - st)).sqrt()
-    }
-}
+pub use mlx_gen::gen_core::sampling::{
+    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP as DEFAULT_INTERMEDIATE_TIMESTEP,
+    SCM_DEFAULT_MAX_TIMESTEP as DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA as SIGMA_DATA,
+};
 
 #[cfg(test)]
 mod tests {

@@ -109,8 +109,9 @@ pub mod denoise;
 pub use denoise::{
     decode_image, decode_image_with_tiling, denoise_curated, denoise_ip_control,
     denoise_ip_multi_control, preprocess_control_image, seeded_prior, seeded_sigma_prior,
-    text_time_ids, ControlContext, Denoiser,
+    text_time_ids, ControlContext, Denoiser, SdxlAncestralDriver, SdxlAncestralForward,
 };
+pub use pipeline::{SdxlLightningDriver, SdxlLightningForward};
 
 // Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long prompt
 // weighting" shape that lets every CLIP-conditioned SDXL family accept a prompt past CLIP's
@@ -454,10 +455,15 @@ impl SdxlGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
+        let allow_planned_reference = plan.is_some_and(|p| p.produced_reference().is_some());
+        if allow_planned_reference {
+            validate_sdxl_request(&self.descriptor, Some(&self.file_pin_spec), req, true)?;
+        } else {
+            self.validate(req)?;
+        }
         if let Some(plan) = plan {
             plan.check_request(&self.descriptor, req)?;
-            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+            plan.check_load_compatible(&self.file_pin_spec)?;
         }
         let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         if let Some(seal) = &self.artifact_seal {
@@ -709,39 +715,51 @@ fn resolve_effective_seed(req: &GenerationRequest, plan: Option<&gen_core::Rende
     )
 }
 
-pub(crate) fn compile_sdxl(
-    spec: &LoadSpec,
+/// Extract the img2img reference input for planned SDXL execution (`SW-6966` / `SW-6967`).
+///
+/// Accepts either legacy `req.source_image` (with empty `req.conditioning`) or a single
+/// `Conditioning::Reference` entry produced by `MultiPassRenderPlan::compile_image_refinement`
+/// (with `req.source_image == None`). Standalone `SdxlGenerator::validate` continues to refuse
+/// standalone `Conditioning::Reference` because `plain_descriptor().capabilities.conditioning` is
+/// empty.
+pub(crate) fn planned_reference_input(
     req: &GenerationRequest,
-) -> gen_core::Result<Option<gen_core::RenderPlan>> {
-    validate_low_res_start_sdxl(Some(spec), req)?;
-    if spec.control.is_some()
-        || !spec.extra_controls.is_empty()
-        || spec.ip_adapter.is_some()
-        || spec.identity.is_some()
-        || req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                gen_core::Conditioning::Control { .. } | gen_core::Conditioning::Mask { .. }
-            )
-        })
-        || matches!(
-            req.sampler.as_deref(),
-            Some(pipeline::LIGHTNING_SAMPLER | "hyper")
-        )
-        || req.scheduler.as_deref() == Some("discrete")
-        || req
-            .sampler
-            .as_deref()
-            .is_some_and(|s| gen_core::sampling::Solver::from_name(s).is_none())
-        || req
-            .scheduler
-            .as_deref()
-            .is_some_and(|s| gen_core::sampling::Scheduler::from_name(s).is_none())
-    {
-        return Ok(None);
+) -> gen_core::Result<Option<(&gen_core::Image, Option<f32>)>> {
+    if req.conditioning.is_empty() {
+        return Ok(req.source_image.as_ref().map(|img| (img, req.strength)));
     }
-    let desc = plain_descriptor();
-    desc.capabilities.validate_request(MODEL_ID, req)?;
+    if req.source_image.is_none() && req.conditioning.len() == 1 {
+        if let gen_core::Conditioning::Reference { image, strength } = &req.conditioning[0] {
+            return Ok(Some((image, strength.or(req.strength))));
+        }
+    }
+    plain_descriptor()
+        .capabilities
+        .validate_request(MODEL_ID, req)?;
+    Ok(None)
+}
+
+fn validate_sdxl_request(
+    descriptor: &ModelDescriptor,
+    spec: Option<&LoadSpec>,
+    req: &GenerationRequest,
+    allow_planned_reference: bool,
+) -> gen_core::Result<()> {
+    validate_low_res_start_sdxl(spec, req)?;
+    if allow_planned_reference
+        && req.source_image.is_none()
+        && req.conditioning.len() == 1
+        && matches!(
+            &req.conditioning[0],
+            gen_core::Conditioning::Reference { .. }
+        )
+    {
+        let mut caps = descriptor.capabilities.clone();
+        caps.conditioning = vec![gen_core::ConditioningKind::Reference];
+        caps.validate_request(MODEL_ID, req)?;
+    } else {
+        descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    }
     if req.prompt.is_empty() {
         return Err(gen_core::Error::Msg(
             "sdxl: prompt must not be empty".into(),
@@ -758,45 +776,134 @@ pub(crate) fn compile_sdxl(
             req.width, req.height
         )));
     }
-    let solver = req
-        .sampler
-        .as_deref()
-        .and_then(gen_core::sampling::Solver::from_name)
-        .unwrap_or(gen_core::sampling::Solver::Ddim);
-    let steps = req.steps.unwrap_or(30) as usize;
-    let sched = pipeline::sdxl_alpha_schedule().map_err(gen_core::Error::from)?;
-    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
-    let native =
-        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
-    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-    if req.source_image.is_some() {
-        let raw_strength = req.strength.unwrap_or(DEFAULT_EDIT_STRENGTH);
-        let start_step = gen_core::resolve_img2img_init_time_step(
-            sigmas.len().saturating_sub(1),
-            Some(raw_strength),
-        )?;
-        sigmas = sigmas[start_step..].to_vec();
+    if req.sampler.as_deref() == Some(pipeline::LIGHTNING_SAMPLER) {
+        if let Some(sched) = req.scheduler.as_deref() {
+            let recognized = gen_core::sampling::Scheduler::from_name(sched);
+            if recognized.is_some_and(|s| s != gen_core::sampling::Scheduler::Normal) {
+                return Err(gen_core::Error::Msg(format!(
+                    "sdxl: the `lightning` sampler uses its own fixed trailing schedule and \
+                     ignores the `scheduler` axis (got `{sched}`) — omit `scheduler` (or use \
+                     `normal`) for lightning"
+                )));
+            }
+        }
     }
-    let executed_steps = sigmas.len().saturating_sub(1);
-    if executed_steps == 0 && req.low_res_start.is_none() {
+    Ok(())
+}
+
+pub(crate) fn compile_sdxl(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_sdxl_for_mode(spec, req, true)
+}
+
+fn compile_sdxl_for_mode(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    allow_exact_load: bool,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_low_res_start_sdxl(Some(spec), req)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+        || req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                gen_core::Conditioning::Control { .. } | gen_core::Conditioning::Mask { .. }
+            )
+        })
+        || req.sampler.as_deref() == Some("hyper")
+        || req.scheduler.as_deref() == Some("discrete")
+    {
         return Ok(None);
     }
-    let guidance = req.guidance.unwrap_or(7.0);
-    gen_core::RenderPlan::packed_image_trajectory(
-        &desc,
-        req,
-        gen_core::render::PackedImagePass {
-            pixel_stride: SIZE_MULTIPLE,
-            token_width: 4,
-            sampler: solver.name(),
-            guidance,
-            sigmas,
-            executed_steps,
-            capture_sigma: 0.0,
-        },
-    )
-    .map(|plan| plan.bind_load(spec))
-    .map(Some)
+    let desc = plain_descriptor();
+    validate_sdxl_request(&desc, Some(spec), req, true)?;
+    let reference = planned_reference_input(req)?;
+    let is_lightning = req.sampler.as_deref() == Some(pipeline::LIGHTNING_SAMPLER);
+
+    let (sigmas, executed_steps, sampler_name, guidance): (Vec<f32>, usize, &'static str, f32) =
+        if is_lightning {
+            if reference.is_some() {
+                return Ok(None);
+            }
+            use candle_gen::gen_core::sampling::SamplerPolicy;
+            let steps =
+                req.steps
+                    .unwrap_or(pipeline::LIGHTNING_DEFAULT_STEPS as u32) as usize;
+            let policy = pipeline::lightning_policy(steps).map_err(gen_core::Error::from)?;
+            let sigmas: Vec<f32> = (0..=policy.num_steps())
+                .filter_map(|i| policy.sigma(i))
+                .collect();
+            let executed_steps = policy.num_steps();
+            (sigmas, executed_steps, pipeline::LIGHTNING_SAMPLER, 1.0)
+        } else {
+            if req
+                .sampler
+                .as_deref()
+                .is_some_and(|s| gen_core::sampling::Solver::from_name(s).is_none())
+                || req
+                    .scheduler
+                    .as_deref()
+                    .is_some_and(|s| gen_core::sampling::Scheduler::from_name(s).is_none())
+            {
+                return Ok(None);
+            }
+            let solver = req
+                .sampler
+                .as_deref()
+                .and_then(gen_core::sampling::Solver::from_name)
+                .unwrap_or(gen_core::sampling::Solver::Ddim);
+            let steps = req.steps.unwrap_or(30) as usize;
+            let sched = pipeline::sdxl_alpha_schedule().map_err(gen_core::Error::from)?;
+            let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+            let native = gen_core::sampling::schedule_sigmas(
+                gen_core::sampling::Scheduler::Normal,
+                &ms,
+                steps,
+            );
+            let mut sigmas =
+                candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+            if let Some((_, strength_opt)) = reference {
+                let raw_strength = strength_opt.unwrap_or(DEFAULT_EDIT_STRENGTH);
+                let start_step = gen_core::resolve_img2img_init_time_step(
+                    sigmas.len().saturating_sub(1),
+                    Some(raw_strength),
+                )?;
+                sigmas = sigmas[start_step..].to_vec();
+            }
+            let executed_steps = sigmas.len().saturating_sub(1);
+            if executed_steps == 0 && req.low_res_start.is_none() {
+                return Ok(None);
+            }
+            (
+                sigmas,
+                executed_steps,
+                solver.name(),
+                req.guidance.unwrap_or(7.0),
+            )
+        };
+
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 4,
+        sampler: sampler_name,
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    let pins = spec.prepared_file_pins();
+    let use_exact_load = allow_exact_load
+        && (pins.is_finalized() || pins.is_prepared() || spec.file_source_paths().is_empty());
+    let plan = if use_exact_load {
+        gen_core::RenderPlan::packed_image_trajectory_with_exact_load(&desc, spec, req, pass)?
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)?.bind_load(spec)
+    };
+    Ok(Some(plan))
 }
 
 impl Generator for SdxlGenerator {
@@ -805,7 +912,7 @@ impl Generator for SdxlGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        if let Some(plan) = compile_sdxl(&self.file_pin_spec, req)? {
+        if let Some(plan) = compile_sdxl_for_mode(&self.file_pin_spec, req, false)? {
             return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
         }
         let mut completed = candle_gen::execution::capture_with(self, req, on_progress, || {
@@ -845,7 +952,7 @@ impl Generator for SdxlGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        if let Some(plan) = compile_sdxl(&self.file_pin_spec, req)? {
+        if let Some(plan) = compile_sdxl_for_mode(&self.file_pin_spec, req, false)? {
             return self.generate_planned(req, &plan, None, on_progress);
         }
         let output = self.run_generate(req, None, None, on_progress)?;
@@ -957,51 +1064,7 @@ impl Generator for SdxlGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_low_res_start_sdxl(Some(&self.file_pin_spec), req)?;
-        // The shared capability floor (count/size range/guidance/negative/sampler/conditioning):
-        // since the descriptor advertises NO conditioning, any conditioning entry is rejected here.
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        // Model-specific floor on top of the shared one (mirrors mlx-gen-sdxl::validate_request).
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "sdxl: prompt must not be empty".into(),
-            ));
-        }
-        // An explicit `steps: Some(0)` would VAE-decode pure scaled noise — reject loudly (a derived
-        // 0 from img2img strength would be a legitimate no-op, but this is txt2img-only).
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(
-                "sdxl: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
-            ));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        // F-116: `lightning` (sc-6128) runs its own fixed Euler-trailing schedule and never consults
-        // `req.scheduler` — so a caller-selected NON-DEFAULT curated scheduler (karras / sgm_uniform /
-        // …) would be silently dropped (the F-004 shape). Reject that combination loudly instead of
-        // misleading. Only a recognized non-default scheduler is rejected; the default `normal`, `None`,
-        // and any unrecognized value (e.g. the native-fallback `discrete` alias) all pass — a worker
-        // that always populates `scheduler:"normal"` alongside `lightning` must not hard-error, and
-        // every one of these resolves to lightning's own trailing schedule anyway (nothing dropped).
-        if req.sampler.as_deref() == Some(pipeline::LIGHTNING_SAMPLER) {
-            if let Some(sched) = req.scheduler.as_deref() {
-                let recognized = gen_core::sampling::Scheduler::from_name(sched);
-                if recognized.is_some_and(|s| s != gen_core::sampling::Scheduler::Normal) {
-                    return Err(gen_core::Error::Msg(format!(
-                        "sdxl: the `lightning` sampler uses its own fixed trailing schedule and \
-                         ignores the `scheduler` axis (got `{sched}`) — omit `scheduler` (or use \
-                         `normal`) for lightning"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        validate_sdxl_request(&self.descriptor, Some(&self.file_pin_spec), req, false)
     }
 
     fn generate(
@@ -2376,6 +2439,115 @@ mod tests {
         assert!(
             load_err.contains("different model or adapter stack"),
             "unexpected error: {load_err}"
+        );
+    }
+
+    #[test]
+    fn candle_sdxl_lightning_and_hires_multipass_compile_with_exact_load_rebind() {
+        let registry = provider_registry().expect("sdxl registry");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tok_l = tmp.path().join("clip_l.json");
+        let tok_g = tmp.path().join("clip_g.json");
+        let vae = tmp.path().join("vae.safetensors");
+        std::fs::write(&tok_l, "{}").unwrap();
+        std::fs::write(&tok_g, "{}").unwrap();
+        std::fs::write(&vae, [0u8; 8]).unwrap();
+
+        let mut pinned_spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))
+            .with_component("tokenizer_clip_l", WeightsSource::File(tok_l))
+            .with_component("tokenizer_clip_bigg", WeightsSource::File(tok_g))
+            .with_component("vae_fp16_fix", WeightsSource::File(vae));
+        pinned_spec.prepare_file_sources().unwrap();
+
+        // 1. Native Lightning compiles a RenderPlan with exact load binding (while still refusing
+        //    low_res_start via the test above).
+        let lightning_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(4),
+            guidance: Some(1.0),
+            sampler: Some("lightning".into()),
+            seed: Some(9),
+            ..Default::default()
+        };
+        let lightning_plan = registry
+            .compile_render_plan(MODEL_ID, &pinned_spec, &lightning_req)
+            .unwrap()
+            .expect("native lightning must compile a RenderPlan");
+        assert_eq!(lightning_plan.sampler(), "lightning");
+        assert_eq!(lightning_plan.executed_steps(), 4);
+        assert_eq!(lightning_plan.sigmas().last(), Some(&0.0));
+
+        // 2. MultiPassRenderPlan (base + Hires.fix pass-1 Conditioning::Reference, SW-6967 readiness)
+        //    compiles cleanly and supports rebind_load_placement while standalone validate STILL
+        //    refuses standalone Conditioning::Reference.
+        let base_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 512,
+            height: 512,
+            steps: Some(8),
+            guidance: Some(7.0),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            seed: Some(11),
+            ..Default::default()
+        };
+        let refine_req = GenerationRequest {
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            ..base_req.clone()
+        };
+        let multi = gen_core::MultiPassRenderPlan::compile(
+            &[
+                gen_core::PlannedPassRequest {
+                    request: &base_req,
+                    produced_reference: None,
+                },
+                gen_core::PlannedPassRequest {
+                    request: &refine_req,
+                    produced_reference: Some(gen_core::ProducedReference {
+                        from_pass: 0,
+                        width: 1024,
+                        height: 1024,
+                        strength: Some(0.5),
+                    }),
+                },
+            ],
+            |req| registry.compile_render_plan(MODEL_ID, &pinned_spec, req),
+        )
+        .expect(
+            "MultiPassRenderPlan must compile pass-1 Conditioning::Reference on candle-gen-sdxl",
+        )
+        .expect("MultiPassRenderPlan present");
+        assert_eq!(multi.passes().len(), 2);
+        assert!(multi.passes()[1].produced_reference().is_some());
+        assert_eq!(multi.passes()[1].executed_steps(), 4);
+
+        let placed = pinned_spec
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential);
+        let rebound = multi.rebind_load_placement(&placed).unwrap();
+        rebound.passes()[0].check_load_compatible(&placed).unwrap();
+        rebound.passes()[1].check_load_compatible(&placed).unwrap();
+
+        // Standalone SdxlGenerator::validate MUST still refuse standalone Conditioning::Reference.
+        let g = registry.load(MODEL_ID, &pinned_spec).expect("load sdxl");
+        let standalone_ref_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            ..refine_req
+        };
+        assert!(
+            g.validate(&standalone_ref_req).is_err(),
+            "standalone SdxlGenerator::validate must still refuse Conditioning::Reference"
         );
     }
 }

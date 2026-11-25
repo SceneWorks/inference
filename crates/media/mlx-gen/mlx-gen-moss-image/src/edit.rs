@@ -5,14 +5,19 @@ use crate::{
     transformer::Transformer,
 };
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use mlx_gen::gen_core::guidance::{cfg as guidance_cfg, pag_apply};
 use mlx_gen::gen_core::{
     weightsmeta::{CheckpointMeta, Dtype as StoredDtype},
-    PinnedWeightsFile,
+    BoundaryState, PinnedWeightsFile,
 };
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, LoadSpec, Progress, Result, WeightsSource};
+use mlx_gen::{CancelFlag, Error, LoadSpec, MlxLatentOps, Progress, Result, WeightsSource};
 use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
-use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{Array, Dtype};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::Path};
@@ -370,27 +375,120 @@ fn cfg_pag_euler_step(
     pag_scale: f32,
     delta_sigma: f32,
 ) -> Result<Array> {
+    let ops = MlxLatentOps;
     let scalar = |x: f32| Array::from_slice(&[x], &[1]);
     let cond_f32 = conditional.as_dtype(Dtype::Float32)?;
     let mut prediction = cond_f32.clone();
     if let Some(unconditional) = unconditional {
         let negative = unconditional.as_dtype(Dtype::Float32)?;
-        prediction = add(
-            &negative,
-            multiply(subtract(prediction, &negative)?, scalar(guidance))?,
-        )?;
+        prediction = guidance_cfg(&ops, &prediction, &negative, guidance)?;
     }
     if let Some(perturbed) = perturbed.filter(|_| pag_scale > 0.0) {
         let perturbed = perturbed.as_dtype(Dtype::Float32)?;
-        prediction = add(
-            prediction,
-            multiply(subtract(&cond_f32, &perturbed)?, scalar(pag_scale))?,
-        )?;
+        prediction = pag_apply(&ops, &prediction, &cond_f32, &perturbed, pag_scale)?;
     }
     Ok(add(
         current.as_dtype(Dtype::Float32)?,
         multiply(prediction, scalar(delta_sigma))?,
     )?)
+}
+
+/// Typed `FamilyDriver` for MOSS-Image Edit's per-sample CFG/PAG Euler loop (`SW-6969`).
+pub struct MossEditDriver<F> {
+    support: DriverSupport,
+    sigmas: Vec<f32>,
+    step_fn: F,
+}
+
+impl<F> MossEditDriver<F>
+where
+    F: Fn(&Array, usize, f32, f32, &CancelFlag) -> Result<Array>,
+{
+    pub fn new(sigmas: Vec<f32>, step_fn: F) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "moss_image_edit",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: false,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    renoise_from_clean: "MOSS-Image Edit driver refuses external Renoise transitions",
+                    geometry_change: "MOSS-Image Edit driver does not support mid-trajectory spatial resampling",
+                    read_only_boundary_estimate: "MOSS-Image Edit per-sample step driver does not expose a separate read-only boundary estimator",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            sigmas,
+            step_fn,
+        }
+    }
+}
+
+impl<F> FamilyDriver<Array> for MossEditDriver<F>
+where
+    F: Fn(&Array, usize, f32, f32, &CancelFlag) -> Result<Array>,
+{
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        let expected_steps = self.sigmas.len().saturating_sub(1);
+        if input.total_steps != expected_steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match edit sigma schedule steps={expected_steps}",
+                self.support.driver_id, input.total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let mut latents = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for index in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let sigma = self.sigmas[index];
+            let next_sigma = self.sigmas[index + 1];
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: index,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma,
+                next_sigma,
+            };
+            hooks.observe(&info, &latents)?;
+            latents = (self.step_fn)(&latents, index, sigma, next_sigma, input.cancel)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            latents = hooks.post_step(&info, latents)?;
+            hooks.materialize(&info, &latents)?;
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            state.record_outer_step(index);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(latents))
+    }
 }
 
 #[cfg(test)]
@@ -427,8 +525,8 @@ impl EditSampling<'_> {
             self.resolved.training_shift,
         )?;
         let total_steps = sigmas.len() - 1;
-        let mut latents = noise.as_dtype(Dtype::Float32)?;
-        for (index, pair) in sigmas.windows(2).enumerate() {
+        let latents = noise.as_dtype(Dtype::Float32)?;
+        let driver = MossEditDriver::new(sigmas, |latents, index, sigma, next_sigma, cancel| {
             let pag_scale = self.resolved.pag_step_scale(index, total_steps);
             let pag_layers = self
                 .resolved
@@ -438,13 +536,13 @@ impl EditSampling<'_> {
             let mut outputs = Vec::new();
             for (sample, positive) in self.positive.iter().enumerate() {
                 check(cancel)?;
-                let current = mlx_gen::attention::slice_axis(&latents, 0, sample as i32, 1)?;
+                let current = mlx_gen::attention::slice_axis(latents, 0, sample as i32, 1)?;
                 let predict = |context: &Array, layers: &[u32]| -> Result<Array> {
                     Ok(self
                         .transformer
                         .forward_edit_with_pag(
                             &current,
-                            pair[0],
+                            sigma,
                             crate::transformer::EditConditioning {
                                 context,
                                 references: self.references,
@@ -473,7 +571,7 @@ impl EditSampling<'_> {
                     perturbed.as_ref(),
                     self.resolved.guidance,
                     pag_scale,
-                    pair[1] - pair[0],
+                    next_sigma - sigma,
                 )?;
                 mlx_rs::transforms::eval([&next])?;
                 #[cfg(test)]
@@ -489,15 +587,28 @@ impl EditSampling<'_> {
                 });
                 outputs.push(next);
             }
-            latents = concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 0)?;
-            check(cancel)?;
-            progress(Progress::Step {
-                current: index as u32 + 1,
-                total: total_steps as u32,
-            });
-        }
+            Ok(concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 0)?)
+        });
+        let mut run_state = DriverRunState::new();
+        let mut hooks = StepHooks::new(progress);
+        let out = run_mlx_driver_slices(
+            &driver,
+            [SliceSpec::full(total_steps)],
+            BoundaryState::XSigma(latents),
+            total_steps,
+            0,
+            cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, state, _| Ok(state),
+        )?;
         check(cancel)?;
-        Ok(latents)
+        Ok(match out {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        })
     }
 }
 
@@ -894,5 +1005,52 @@ mod tests {
         assert!(EditAssets::prepare(&spec).is_err());
         spec.prepare_with_file_pins([]).unwrap();
         assert!(EditAssets::prepare(&spec).is_err());
+    }
+
+    #[test]
+    fn moss_edit_driver_passes_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let sigmas = moss_image_schedule(4, 1.0, 1.0).unwrap();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 5,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: move || {
+                Box::new(MossEditDriver::new(
+                    sigmas.clone(),
+                    |latents, step, sigma, next_sigma, _cancel| {
+                        let cond = multiply(
+                            latents,
+                            Array::from_slice(&[0.2 + 0.1 * sigma + 0.01 * step as f32], &[1]),
+                        )?;
+                        let uncond = multiply(latents, Array::from_slice(&[0.05], &[1]))?;
+                        cfg_pag_euler_step(
+                            latents,
+                            &cond,
+                            Some(&uncond),
+                            None,
+                            2.5,
+                            0.0,
+                            next_sigma - sigma,
+                        )
+                    },
+                ))
+            },
+            make_initial: || Array::from_slice(&[0.4f32, -0.2, 0.6, -0.8], &[1, 1, 2, 2]),
+            latents_equal: |a, b| {
+                logical_f32_readback(a)
+                    .unwrap()
+                    .iter()
+                    .zip(logical_f32_readback(b).unwrap().iter())
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("MossEditDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
     }
 }

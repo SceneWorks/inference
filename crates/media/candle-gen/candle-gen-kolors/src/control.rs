@@ -708,63 +708,23 @@ impl KolorsControl {
         } else {
             let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
             let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
-            let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
-            let total = sampler.num_steps() as u32;
-            // A bespoke loop numbers its own frames, on the STEP INDEX: this lane walks a
-            // `KolorsEulerSampler` timestep table, not a descending sigma array.
-            let preview_counter =
-                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-            for i in 0..sampler.num_steps() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let scaled = (&latents / sampler.scale_in(i) as f64)?;
-                // Per-step latent preview (epic 16948, sc-16954): `scaled` is the very tensor this
-                // step feeds the UNet, and therefore the domain the reused SDXL fit was measured in.
-                // Emitted BEFORE `model_in` may move it. Failures are swallowed.
-                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
-                    crate::preview::project_spatial_latents(&scaled)
-                });
-                let model_in = if use_guide {
-                    Tensor::cat(&[&scaled, &scaled], 0)?
-                } else {
-                    scaled
-                };
-                let t = sampler.timestep(i) as f64;
-                // Control residuals from the Kolors ControlNet (its own context projection), scaled by
-                // `control_scale`, then added into the UNet skip + mid via `forward_instantid`.
-                let res = resident.denoise.controlnet.forward(
-                    &model_in,
-                    &cond_embed,
-                    t,
-                    &cn_context,
-                    &pooled,
-                    &time_ids,
-                    control_scale,
-                )?;
-                let eps = resident.denoise.unet.forward_instantid(
-                    &model_in,
-                    t,
-                    &projected,
-                    &pooled,
-                    &time_ids,
-                    Some(res.down.as_slice()),
-                    Some(&res.mid),
-                )?;
-                let eps = if use_guide {
-                    let ch = eps.chunk(2, 0)?;
-                    let (uncond, cond) = (&ch[0], &ch[1]);
-                    (uncond + ((cond - uncond)? * req.guidance as f64)?)?
-                } else {
-                    eps
-                };
-                latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
-            }
-            latents
+            let latents = (noise * sampler.init_noise_sigma() as f64)?;
+            denoise_control_native(
+                &sampler,
+                latents,
+                &resident.denoise,
+                &cond_embed,
+                &cn_context,
+                &projected,
+                &pooled,
+                &time_ids,
+                control_scale,
+                use_guide,
+                req.guidance,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+            )?
         };
 
         on_progress(Progress::Decoding);
@@ -876,55 +836,23 @@ impl KolorsControl {
         } else {
             let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
             let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
-            let mut current = (noise * sampler.init_noise_sigma() as f64)?;
-            let total = sampler.num_steps() as u32;
-            let preview_counter =
-                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-            for step in 0..sampler.num_steps() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let scaled = (&current / sampler.scale_in(step) as f64)?;
-                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step, || {
-                    crate::preview::project_spatial_latents(&scaled)
-                });
-                let model_in = if use_guide {
-                    Tensor::cat(&[&scaled, &scaled], 0)?
-                } else {
-                    scaled
-                };
-                let timestep = sampler.timestep(step) as f64;
-                let residuals = denoise.controlnet.forward(
-                    &model_in,
-                    &cond_embed,
-                    timestep,
-                    &cn_context,
-                    &pooled,
-                    &time_ids,
-                    control_scale,
-                )?;
-                let eps = denoise.unet.forward_instantid(
-                    &model_in,
-                    timestep,
-                    &projected,
-                    &pooled,
-                    &time_ids,
-                    Some(residuals.down.as_slice()),
-                    Some(&residuals.mid),
-                )?;
-                let eps = if use_guide {
-                    let chunks = eps.chunk(2, 0)?;
-                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * req.guidance as f64)?)?
-                } else {
-                    eps
-                };
-                current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
-                on_progress(Progress::Step {
-                    current: step as u32 + 1,
-                    total,
-                });
-            }
-            current
+            let current = (noise * sampler.init_noise_sigma() as f64)?;
+            denoise_control_native(
+                &sampler,
+                current,
+                &denoise,
+                &cond_embed,
+                &cn_context,
+                &projected,
+                &pooled,
+                &time_ids,
+                control_scale,
+                use_guide,
+                req.guidance,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+            )?
         };
         denoise.release()?;
 
@@ -949,7 +877,83 @@ impl KolorsControl {
         decode.release()?;
         Ok(image)
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn denoise_control_native(
+    sampler: &KolorsEulerSampler,
+    latents: Tensor,
+    denoise: &ControlDenoisePhase,
+    cond_embed: &Tensor,
+    cn_context: &Tensor,
+    projected: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    control_scale: f64,
+    use_guide: bool,
+    guidance: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Tensor> {
+    struct ControlForward<'a> {
+        denoise: &'a ControlDenoisePhase,
+        cond_embed: &'a Tensor,
+        cn_context: &'a Tensor,
+        projected: &'a Tensor,
+        pooled: &'a Tensor,
+        time_ids: &'a Tensor,
+        control_scale: f64,
+    }
+    impl crate::sampler::KolorsLeadingEulerForward for ControlForward<'_> {
+        fn predict_eps(
+            &self,
+            model_in: &Tensor,
+            timestep: f64,
+            _step_index: usize,
+        ) -> Result<Tensor> {
+            let residuals = self.denoise.controlnet.forward(
+                model_in,
+                self.cond_embed,
+                timestep,
+                self.cn_context,
+                self.pooled,
+                self.time_ids,
+                self.control_scale,
+            )?;
+            Ok(self.denoise.unet.forward_instantid(
+                model_in,
+                timestep,
+                self.projected,
+                self.pooled,
+                self.time_ids,
+                Some(residuals.down.as_slice()),
+                Some(&residuals.mid),
+            )?)
+        }
+    }
+    crate::sampler::run_leading_euler(
+        sampler,
+        latents,
+        use_guide,
+        guidance,
+        ControlForward {
+            denoise,
+            cond_embed,
+            cn_context,
+            projected,
+            pooled,
+            time_ids,
+            control_scale,
+        },
+        cancel,
+        None,
+        on_progress,
+        preview,
+    )
+}
+
+impl KolorsControl {
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (borrows `&self.tokenizer` / `&self.chatglm`); passed as a closure to the shared
     /// [`common::cfg_batch_context`], so the ChatGLM3 plumbing is per-site and only the CFG convention

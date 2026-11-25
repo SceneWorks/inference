@@ -254,21 +254,272 @@ pub struct ControlContext<'a> {
     pub scale: f64,
 }
 
-/// Run the InstantID denoise with CFG and **multiple** ControlNet branches whose residuals are summed
-/// (the diffusers `MultiControlNetModel` rule) before injection — the engine for InstantID pose mode
-/// (`controls = [IdentityNet(kps), OpenPose(skeleton)]`). A single-element `controls` is bit-identical
-/// to [`denoise_ip_control`]; an empty `controls` runs plain IP (or, with the IP context cleared, plain
-/// SDXL).
+/// Forward evaluation seam for Candle SDXL ancestral denoising (`SW-6966`, `PIPE-7`).
 ///
-/// `steps` is the `(t, t_prev)` schedule ([`EulerAncestralSampler::timesteps`]); `controlnet_encoder` is
-/// the cross-attention conditioning every branch shares (the face tokens for InstantID — the vendored
-/// pipeline passes the same `prompt_image_emb` to every sub-ControlNet). The face IP tokens are NOT a
-/// parameter: they are already set on `d.unet` (the precondition above). Progress is emitted per step;
-/// `cancel` is checked between steps; the ancestral noise comes from `rng`.
+/// Generic over model prediction so Tier 0 `DriverSupport` conformance tests can drive
+/// [`SdxlAncestralDriver`] without loading weights or executing a learned forward.
+pub trait SdxlAncestralForward {
+    /// Predict the (already CFG-combined when `cfg > 1.0`) noise residual ε for raw latent `x_t`
+    /// at timestep `timestep` and 0-based `step_index`.
+    fn predict_eps(&self, x_t: &Tensor, timestep: f64, step_index: usize) -> Result<Tensor>;
+}
+
+enum AncestralRngSource<'a> {
+    Borrowed(std::cell::RefCell<&'a mut StdRng>),
+    SeededPerTrajectory(u64),
+}
+
+enum AncestralScheduleOwner<'a> {
+    Borrowed {
+        sampler: &'a EulerAncestralSampler,
+        steps: &'a [(f64, f64)],
+    },
+    Owned {
+        sampler: EulerAncestralSampler,
+        steps: Vec<(f64, f64)>,
+    },
+}
+
+impl AncestralScheduleOwner<'_> {
+    fn sampler(&self) -> &EulerAncestralSampler {
+        match self {
+            Self::Borrowed { sampler, .. } => sampler,
+            Self::Owned { sampler, .. } => sampler,
+        }
+    }
+
+    fn steps(&self) -> &[(f64, f64)] {
+        match self {
+            Self::Borrowed { steps, .. } => steps,
+            Self::Owned { steps, .. } => steps,
+        }
+    }
+}
+
+/// Typed [`candle_gen::driver::FamilyDriver`] for Candle SDXL Euler-ancestral trajectories
+/// (InstantID, multi-control, img2img, and inpaint edit) (`SW-6966`, `PIPE-7`).
+pub struct SdxlAncestralDriver<'a, F> {
+    schedule: AncestralScheduleOwner<'a>,
+    forward: F,
+    rng: AncestralRngSource<'a>,
+    support: candle_gen::driver::DriverSupport,
+}
+
+impl<'a, F: SdxlAncestralForward> SdxlAncestralDriver<'a, F> {
+    fn build_support(driver_id: &'static str) -> candle_gen::driver::DriverSupport {
+        candle_gen::driver::DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: candle_gen::driver::DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle SDXL ancestral driver does not re-noise from clean estimates; use curated shared driver",
+                geometry_change:
+                    "native Candle SDXL ancestral driver does not support geometry-changing low-res start; use curated shared driver",
+                read_only_boundary_estimate:
+                    "native Candle SDXL ancestral driver does not expose read-only boundary clean estimates",
+                ..candle_gen::driver::DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    /// Construct a driver that continues an already-seeded caller `StdRng` stream (preserving
+    /// exact launch-portable prior + ancestral draw continuity).
+    pub fn with_borrowed_rng(
+        driver_id: &'static str,
+        sampler: &'a EulerAncestralSampler,
+        steps: &'a [(f64, f64)],
+        forward: F,
+        rng: &'a mut StdRng,
+    ) -> Self {
+        Self {
+            schedule: AncestralScheduleOwner::Borrowed { sampler, steps },
+            forward,
+            rng: AncestralRngSource::Borrowed(std::cell::RefCell::new(rng)),
+            support: Self::build_support(driver_id),
+        }
+    }
+
+    /// Construct an owned `'static` driver whose ancestral `StdRng` lives inside per-trajectory
+    /// [`candle_gen::driver::DriverRunState`] cache (independent of numerical history resets, used
+    /// by reusable multi-case Tier 0 conformance tests).
+    pub fn with_owned_seeded_trajectory(
+        driver_id: &'static str,
+        sampler: EulerAncestralSampler,
+        steps: Vec<(f64, f64)>,
+        forward: F,
+        seed: u64,
+    ) -> SdxlAncestralDriver<'static, F> {
+        SdxlAncestralDriver {
+            schedule: AncestralScheduleOwner::Owned { sampler, steps },
+            forward,
+            rng: AncestralRngSource::SeededPerTrajectory(seed),
+            support: SdxlAncestralDriver::<'static, F>::build_support(driver_id),
+        }
+    }
+}
+
+impl<F: SdxlAncestralForward> candle_gen::driver::FamilyDriver<Tensor>
+    for SdxlAncestralDriver<'_, F>
+{
+    fn support(&self) -> &candle_gen::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: candle_gen::driver::SliceInput<'_, Tensor>,
+        state: &mut candle_gen::driver::DriverRunState,
+        hooks: &mut candle_gen::driver::StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let steps = self.schedule.steps();
+        let sampler = self.schedule.sampler();
+        if input.span.end > steps.len() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "sdxl ancestral driver '{}': slice span {:?} exceeds {} steps",
+                self.support.driver_id,
+                input.span,
+                steps.len()
+            )));
+        }
+
+        let mut latents = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let device = latents.device().clone();
+        let (_, lat_c, lat_h, lat_w) = latents.dims4().map_err(CandleError::from)?;
+
+        for global_step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let (t, t_prev) = steps[global_step];
+            let info = candle_gen::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: global_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: candle_gen::driver::DriverEvaluationKind::Trajectory,
+                sigma: sampler.sigma(t) as f32,
+                next_sigma: sampler.sigma(t_prev) as f32,
+            };
+            hooks.observe(&info, &latents)?;
+            let eps = self.forward.predict_eps(&latents, t, global_step)?;
+            state.record_evaluation(candle_gen::driver::DriverEvaluationKind::Trajectory);
+
+            let noise = match &self.rng {
+                AncestralRngSource::Borrowed(rng) => {
+                    draw_noise(&mut rng.borrow_mut(), lat_c, lat_h, lat_w, &device)?
+                }
+                AncestralRngSource::SeededPerTrajectory(seed) => {
+                    if state.cache_ref::<StdRng>().is_none() {
+                        state.set_cache(StdRng::seed_from_u64(*seed));
+                    }
+                    let rng = state
+                        .cache_mut::<StdRng>()
+                        .expect("seeded ancestral RNG cache initialized");
+                    draw_noise(rng, lat_c, lat_h, lat_w, &device)?
+                }
+            };
+            state.next_draw_index();
+
+            latents = sampler.step(&eps, &latents, t, t_prev, &noise)?;
+            latents = hooks.post_step(&info, latents)?;
+            hooks.materialize(&info, &latents)?;
+            state.record_outer_step(global_step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(latents))
+    }
+}
+
+struct ProductionAncestralForward<'a, O> {
+    unet: &'a UNet2DConditionModel,
+    conditioning: &'a Tensor,
+    pooled: &'a Tensor,
+    time_ids: &'a Tensor,
+    cfg: f64,
+    cfg_on: bool,
+    controls: &'a [ControlContext<'a>],
+    controlnet_encoder: &'a Tensor,
+    on_before_unet: O,
+}
+
+impl<O: Fn()> SdxlAncestralForward for ProductionAncestralForward<'_, O> {
+    fn predict_eps(&self, x_t: &Tensor, t: f64, _step_index: usize) -> Result<Tensor> {
+        let x_unet = if self.cfg_on {
+            Tensor::cat(&[x_t, x_t], 0)?
+        } else {
+            x_t.clone()
+        };
+
+        let mut combined: Option<ControlResiduals> = None;
+        for cc in self.controls {
+            let res = cc.controlnet.forward(
+                &x_unet,
+                &cc.cond_embed,
+                t,
+                self.controlnet_encoder,
+                self.pooled,
+                self.time_ids,
+                cc.scale,
+            )?;
+            combined = Some(match combined {
+                None => res,
+                Some(prev) => prev.add(&res)?,
+            });
+        }
+
+        (self.on_before_unet)();
+        let eps = match &combined {
+            Some(r) => self.unet.forward_instantid(
+                &x_unet,
+                t,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                Some(r.down.as_slice()),
+                Some(&r.mid),
+            )?,
+            None => self.unet.forward_instantid(
+                &x_unet,
+                t,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                None,
+                None,
+            )?,
+        };
+
+        // Classifier-free guidance: row 0 = uncond, row 1 = cond (`PIPE-8`).
+        if self.cfg_on {
+            let chunks = eps.chunk(2, 0)?;
+            let (uncond, cond) = (&chunks[0], &chunks[1]);
+            gen_core::guidance::cfg(&candle_gen::CandleLatentOps, cond, uncond, self.cfg as f32)
+                .map_err(CandleError::from)
+        } else {
+            Ok(eps)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_ip_multi_control(
+pub(crate) fn denoise_ancestral_core(
     d: &Denoiser,
-    mut latents: Tensor,
+    latents: Tensor,
     conditioning: &Tensor,
     pooled: &Tensor,
     time_ids: &Tensor,
@@ -280,6 +531,9 @@ pub fn denoise_ip_multi_control(
     preview: &gen_core::PreviewSink,
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
+    cfg_policy_key: &'static str,
+    on_before_unet: impl Fn(),
+    mut post_step: impl FnMut(usize, Tensor) -> gen_core::Result<Tensor>,
 ) -> Result<Tensor> {
     // A zero-step schedule is a no-op (img2img at strength ≤ 1/steps) — return the init latents,
     // never invoking the σ=0 ancestral step that would NaN. (txt2img always has steps ≥ 1.)
@@ -297,18 +551,7 @@ pub fn denoise_ip_multi_control(
         candle_gen::execution::f64_policy("sdxl/control_scale", control.scale);
     }
     let cfg_on = cfg > 1.0;
-    candle_gen::execution::policy("sdxl/denoise/cfg_on", format!("{cfg_on:?}").into());
-    let total = steps.len() as u32;
-    let device = latents.device().clone();
-    let (lat_c, lat_h, lat_w) = {
-        let (_, c, h, w) = latents.dims4()?;
-        (c, h, w)
-    };
-    // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers frames itself, on
-    // the STEP INDEX — this schedule is a `(t, t_prev)` timestep pair list, not a descending σ array.
-    // No renormalization is applied here and none is wanted: euler-ancestral folds the input scaling
-    // into its own step ("the UNet input is the raw latents", below), so `latents` is ALREADY in the
-    // domain the reused fit was measured in — this is the very lane it was measured on.
+    candle_gen::execution::policy(cfg_policy_key, format!("{cfg_on:?}").into());
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
     candle_gen::execution::schedule_f64(
@@ -320,79 +563,102 @@ pub fn denoise_ip_multi_control(
         "epsilon",
     );
     candle_gen::execution::runtime(latents.device(), latents.dtype());
-    for (i, &(t, t_prev)) in steps.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
-            crate::preview::project_spatial_latents(&latents)
+
+    let forward = ProductionAncestralForward {
+        unet: d.unet,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cfg_on,
+        controls,
+        controlnet_encoder,
+        on_before_unet,
+    };
+    let driver = SdxlAncestralDriver::with_borrowed_rng(
+        "sdxl_candle_ancestral",
+        d.sampler,
+        steps,
+        forward,
+        rng,
+    );
+    let slices = [candle_gen::driver::SliceSpec::full(steps.len())];
+    let mut observe = |info: &candle_gen::driver::DriverStepInfo, x: &Tensor| {
+        candle_gen::preview::emit_preview_at(preview, &preview_counter, info.outer_step, || {
+            crate::preview::project_spatial_latents(x)
         });
-        // Euler-ancestral folds the input renormalization into its step (the sampler's `step` applies
-        // `rsqrt(σ_prev²+1)`), so the UNet input is the raw latents — no `scale_model_input`. CFG runs
-        // the cond + uncond rows in one batched forward.
-        let x_unet = if cfg_on {
-            Tensor::cat(&[&latents, &latents], 0)?
-        } else {
-            latents.clone()
-        };
+        Ok(())
+    };
+    let mut post_step_hook =
+        |info: &candle_gen::driver::DriverStepInfo, x: Tensor| post_step(info.outer_step, x);
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let mut hooks = candle_gen::driver::StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut observe);
+    hooks.on_post_step = Some(&mut post_step_hook);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        slices,
+        gen_core::BoundaryState::XSigma(latents),
+        steps.len(),
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_phase, boundary, _state| Ok(boundary),
+    )?;
+    Ok(match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    })
+}
 
-        // Sum each branch's (already `scale`'d) residuals — the MultiControlNet rule. One branch ⇒ the
-        // single residual unchanged; zero ⇒ `None` (no injection). All branches share the face tokens
-        // as their cross-attention conditioning (`controlnet_encoder`).
-        let mut combined: Option<ControlResiduals> = None;
-        for cc in controls {
-            let res = cc.controlnet.forward(
-                &x_unet,
-                &cc.cond_embed,
-                t,
-                controlnet_encoder,
-                pooled,
-                time_ids,
-                cc.scale,
-            )?;
-            combined = Some(match combined {
-                None => res,
-                Some(prev) => prev.add(&res)?,
-            });
-        }
-
-        // The InstantID UNet forward: the `add_embedding` micro-conditioning + the decoupled IP branch
-        // (from the set context) + the (summed) control residuals.
-        let eps = match &combined {
-            Some(r) => d.unet.forward_instantid(
-                &x_unet,
-                t,
-                conditioning,
-                pooled,
-                time_ids,
-                Some(r.down.as_slice()),
-                Some(&r.mid),
-            )?,
-            None => {
-                d.unet
-                    .forward_instantid(&x_unet, t, conditioning, pooled, time_ids, None, None)?
-            }
-        };
-
-        // Classifier-free guidance: row 0 = uncond, row 1 = cond (the candle txt2img convention).
-        let eps = if cfg_on {
-            let chunks = eps.chunk(2, 0)?;
-            let (uncond, cond) = (&chunks[0], &chunks[1]);
-            (uncond + ((cond - uncond)? * cfg)?)?
-        } else {
-            eps
-        };
-
-        // One continuing seeded stream → launch-portable determinism. The noise is unused at the final
-        // step (σ_up = 0) but still drawn so the stream advances identically regardless of schedule.
-        let noise = draw_noise(rng, lat_c, lat_h, lat_w, &device)?;
-        latents = d.sampler.step(&eps, &latents, t, t_prev, &noise)?;
-        on_progress(Progress::Step {
-            current: i as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+/// Run the InstantID denoise with CFG and **multiple** ControlNet branches whose residuals are summed
+/// (the diffusers `MultiControlNetModel` rule) before injection — the engine for InstantID pose mode
+/// (`controls = [IdentityNet(kps), OpenPose(skeleton)]`). A single-element `controls` is bit-identical
+/// to [`denoise_ip_control`]; an empty `controls` runs plain IP (or, with the IP context cleared, plain
+/// SDXL).
+///
+/// `steps` is the `(t, t_prev)` schedule ([`EulerAncestralSampler::timesteps`]); `controlnet_encoder` is
+/// the cross-attention conditioning every branch shares (the face tokens for InstantID — the vendored
+/// pipeline passes the same `prompt_image_emb` to every sub-ControlNet). The face IP tokens are NOT a
+/// parameter: they are already set on `d.unet` (the precondition above). Progress is emitted per step;
+/// `cancel` is checked between steps; the ancestral noise comes from `rng`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_multi_control(
+    d: &Denoiser,
+    latents: Tensor,
+    conditioning: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    cfg: f64,
+    steps: &[(f64, f64)],
+    rng: &mut StdRng,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
+    controls: &[ControlContext],
+    controlnet_encoder: &Tensor,
+) -> Result<Tensor> {
+    denoise_ancestral_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        steps,
+        rng,
+        cancel,
+        on_progress,
+        preview,
+        controls,
+        controlnet_encoder,
+        "sdxl/denoise/cfg_on",
+        || {},
+        |_step, x| Ok(x),
+    )
 }
 
 /// Run the InstantID denoise with CFG and a **single** ControlNet branch (the IdentityNet on the kps
@@ -564,17 +830,17 @@ pub fn denoise_curated(
                 let uncond = evaluate(Some(0))?;
                 candle_gen::residency::check_cancel(cancel)?;
                 let cond = evaluate(Some(1))?;
-                (&uncond + ((cond - &uncond)? * cfg)?)?
+                gen_core::guidance::cfg(&candle_gen::CandleLatentOps, &cond, &uncond, cfg as f32)?
             } else {
                 evaluate(None)?
             };
 
-            // CFG combine: row 0 = uncond, row 1 = cond (the candle convention). Raw ε in f32 so the
-            // `DiscreteModelSampling` x0 recombine + solver math stay f32.
+            // CFG combine: row 0 = uncond, row 1 = cond (the candle convention, `PIPE-8`). Raw ε
+            // in f32 so the `DiscreteModelSampling` x0 recombine + solver math stay f32.
             let eps = if cfg_on && !sequential {
                 let chunks = eps.chunk(2, 0)?;
                 let (uncond, cond) = (&chunks[0], &chunks[1]);
-                (uncond + ((cond - uncond)? * cfg)?)?
+                gen_core::guidance::cfg(&candle_gen::CandleLatentOps, cond, uncond, cfg as f32)?
             } else {
                 eps
             };
@@ -1026,5 +1292,57 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED denoise::tests::denoise_curated_honors_cancel");
+    }
+
+    #[test]
+    fn sdxl_ancestral_driver_passes_tier0_conformance_without_weights() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        struct FakeLinearForward;
+        impl SdxlAncestralForward for FakeLinearForward {
+            fn predict_eps(
+                &self,
+                x_t: &Tensor,
+                timestep: f64,
+                step_index: usize,
+            ) -> Result<Tensor> {
+                let scale = 0.05 + 0.0001 * timestep + 0.01 * (step_index as f64);
+                Ok(x_t.affine(scale, 0.0)?)
+            }
+        }
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 42,
+            base_geometry: (1024, 1024),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                let sampler = EulerAncestralSampler::sdxl();
+                let steps = sampler.timesteps(6, sampler.max_time());
+                Box::new(SdxlAncestralDriver::with_owned_seeded_trajectory(
+                    "sdxl_candle_ancestral_tier0",
+                    sampler,
+                    steps,
+                    FakeLinearForward,
+                    42,
+                ))
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![0.5f32, -0.25, 0.75, -0.1], (1, 4, 1, 1), &Device::Cpu)
+                    .unwrap()
+            },
+            latents_equal: |a, b| {
+                a.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    == b.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            },
+        })
+        .expect("SdxlAncestralDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
     }
 }

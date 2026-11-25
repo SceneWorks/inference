@@ -764,30 +764,24 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
             dir: "candle-gen-kolors",
             register: candle_gen_kolors::register_providers,
             denoise: Denoise::Shared,
-            // sc-16954/sc-20790 inventory. Kolors has one hooked driver call — the registered route's
-            // curated resident lane in `pipeline.rs` — and resident plus request-staged leading-Euler
-            // loops in each of `pipeline.rs`, `control.rs`, and `ip_provider.rs`, all emitting directly.
-            // The two providers' CURATED lanes are invisible here by construction: they reach
-            // `candle_gen_sdxl::denoise_curated` rather than a driver of their own, so the hook they
-            // build is counted in `candle-gen-sdxl`'s `denoise.rs` row. No dark site — this crate has
-            // no trainer.
+            // sc-16954/sc-20790/SW-6966 inventory. Kolors has one hooked driver call — the
+            // registered route's curated lane in `pipeline.rs` — and one consolidated native
+            // leading-Euler driver helper in `sampler.rs` (`KolorsLeadingEulerDriver` via
+            // `run_leading_euler`) shared by all six resident + request-staged native routes across
+            // `pipeline.rs`, `control.rs`, and `ip_provider.rs`. The two bespoke providers' CURATED
+            // lanes reach `candle_gen_sdxl::denoise_curated`, counted in `candle-gen-sdxl`'s
+            // `denoise.rs` row. No dark site — this crate has no trainer.
             routes: &[
-                FileRoutes {
-                    file: "control.rs",
-                    hooked: 0,
-                    direct: 2,
-                    dark: &[],
-                },
-                FileRoutes {
-                    file: "ip_provider.rs",
-                    hooked: 0,
-                    direct: 2,
-                    dark: &[],
-                },
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 1,
-                    direct: 2,
+                    direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "sampler.rs",
+                    hooked: 0,
+                    direct: 1,
                     dark: &[],
                 },
             ],
@@ -985,35 +979,21 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
             dir: "candle-gen-sdxl",
             register: candle_gen_sdxl::register_providers,
             denoise: Denoise::Shared,
-            // sc-16954's inventory, and the first to mix both wiring layers in one crate. SDXL ships
-            // SIX emitting lanes across four files plus one deliberately dark trainer site:
-            //   * `control_provider.rs` — the generic ControlNet route's bespoke Euler loop
-            //     (direct).
-            //   * `pipeline.rs` — the registered route's two lanes: the curated driver call (hooked)
-            //     and the bespoke Lightning Euler loop (direct).
-            //   * `denoise.rs` — the shared helpers the name-driven providers, Kolors and InstantID
-            //     all reach: `denoise_curated` (hooked, forwarding its caller's hook) and the bespoke
-            //     `denoise_ip_multi_control` ancestral loop (direct).
-            //   * `edit_provider.rs` — the bespoke img2img/inpaint ancestral loop (direct).
+            // sc-16954 / SW-6966 inventory, mixing both wiring layers in one crate:
+            //   * `pipeline.rs` — the registered route's curated driver call (hooked) plus the
+            //     consolidated `SdxlLightningDriver` observation site (`run_lightning_with_forward`,
+            //     direct) shared by base SDXL-Lightning and `control_provider.rs`.
+            //   * `denoise.rs` — `denoise_curated` (hooked, forwarding its caller's hook) plus the
+            //     consolidated `SdxlAncestralDriver` observation site (`denoise_ancestral_core`,
+            //     direct) shared by InstantID, `ip_provider.rs`, and `edit_provider.rs`.
             //   * `training.rs` — the trainer's periodic sample render, dark on purpose.
-            // `ip_provider.rs` gets no row: it drives `denoise::denoise_curated` and the ancestral
-            // loop rather than a driver of its own, so its wiring is counted where those live.
+            // `control_provider.rs`, `edit_provider.rs`, and `ip_provider.rs` delegate to those
+            // shared driver helpers rather than owning duplicated loops, so their wiring is counted
+            // where the drivers live.
             routes: &[
-                FileRoutes {
-                    file: "control_provider.rs",
-                    hooked: 0,
-                    direct: 1,
-                    dark: &[],
-                },
                 FileRoutes {
                     file: "denoise.rs",
                     hooked: 1,
-                    direct: 1,
-                    dark: &[],
-                },
-                FileRoutes {
-                    file: "edit_provider.rs",
-                    hooked: 0,
                     direct: 1,
                     dark: &[],
                 },

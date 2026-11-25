@@ -55,6 +55,7 @@ pub use adapters::TurboLoraReport;
 /// Ideogram image bucket to `candle_gen_ideogram::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied
 /// literal.
 pub use config::SIZE_MULTIPLE;
+pub use pipeline::{IdeogramEulerDriver, IdeogramVelocityForward};
 
 pub(crate) fn observe_component_precision(component: &str, device: &Device, dtype: DType) {
     candle_gen::execution::runtime(device, dtype);

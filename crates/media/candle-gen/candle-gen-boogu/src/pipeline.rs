@@ -21,9 +21,16 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, BoundaryState, Conditioning, EstimateSource, GenerationRequest, Image, PidWeights,
+    Progress,
+};
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -626,6 +633,166 @@ fn resolved_guidance(requested: Option<f32>, turbo: bool) -> f32 {
     )
 }
 
+/// Typed `FamilyDriver` for Candle Boogu Turbo's native DMD predict-and-renoise loop (`SW-6969`).
+///
+/// Emits `StepHooks::on_observe` before prediction (preserving exact preview order), integrates
+/// `lat += pred * (1 - sigma)` in F32, and renoises with `seed.wrapping_add(STEP_RNG_SALT)` +
+/// `(step_offset + step + 1)` on non-terminal steps.
+pub struct BooguTurboDmdDriver<F> {
+    support: DriverSupport,
+    /// Ascending clean-fraction sigmas for the active pass (`len() == total_steps`).
+    sigmas: Vec<f32>,
+    /// Absolute schedule start offset (non-zero for img2img).
+    step_offset: usize,
+    forward: F,
+}
+
+impl<F> BooguTurboDmdDriver<F>
+where
+    F: Fn(&Tensor, f32, usize) -> Result<Tensor>,
+{
+    /// Construct a Candle Boogu Turbo DMD driver over the active clean-fraction `sigmas` and `forward` seam.
+    pub fn new(sigmas: Vec<f32>, step_offset: usize, forward: F) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "candle_boogu_turbo_dmd",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: true,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    renoise_from_clean: "Boogu Turbo DMD owns its internal clean-to-renoise step and refuses external Renoise transitions",
+                    geometry_change: "Boogu Turbo DMD does not support mid-trajectory spatial resampling",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            sigmas,
+            step_offset,
+            forward,
+        }
+    }
+
+    fn clean_estimate(&self, lat: &Tensor, pred: &Tensor, sigma: f32) -> gen_core::Result<Tensor> {
+        let lat_f32 = lat
+            .to_dtype(DType::F32)
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        let pred_f32 = pred
+            .to_dtype(DType::F32)
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        let scaled =
+            (pred_f32 * (1.0 - sigma) as f64).map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        (lat_f32 + scaled).map_err(|e| gen_core::Error::Msg(e.to_string()))
+    }
+}
+
+impl<F> FamilyDriver<Tensor> for BooguTurboDmdDriver<F>
+where
+    F: Fn(&Tensor, f32, usize) -> Result<Tensor>,
+{
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        if input.total_steps != self.sigmas.len() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match DMD sigma schedule len={}",
+                self.support.driver_id,
+                input.total_steps,
+                self.sigmas.len()
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let mut lat = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let sigma = self.sigmas[step];
+            let next_sigma = self.sigmas.get(step + 1).copied().unwrap_or(1.0);
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma,
+                next_sigma,
+            };
+            // Match the shared sampler contract: observe the running state entering this outer step
+            // before prediction and re-noise.
+            hooks.observe(&info, &lat)?;
+            let pred = (self.forward)(&lat, sigma, step).map_err(gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            // Predict (clean estimate): x += (1 − sigma)·v, in f32.
+            lat = self.clean_estimate(&lat, &pred, sigma)?;
+            // Renoise to the next sigma level with fresh salted noise (all but the final step).
+            if step + 1 < input.total_steps {
+                let _draw = state.next_draw_index();
+                let renoise_seed = input.seed.wrapping_add(candle_gen::STEP_RNG_SALT);
+                let step_key = (self.step_offset + step + 1) as u64;
+                let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+                    "boogu/pipeline",
+                    renoise_seed.wrapping_add(step_key),
+                ));
+                let noise_vec = candle_gen::seeded_normal_vec(&mut rng, lat.elem_count());
+                let noise = Tensor::from_vec(noise_vec, lat.shape(), &Device::Cpu)
+                    .and_then(|t| t.to_device(lat.device()))
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                let term_noise = (noise * (1.0 - next_sigma) as f64)
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                let term_lat =
+                    (&lat * next_sigma as f64).map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                lat = (term_noise + term_lat).map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+            }
+            lat = hooks.post_step(&info, lat)?;
+            hooks.materialize(&info, &lat)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+
+        if input.request_boundary_estimate {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let est = if input.span.end < self.sigmas.len() {
+                let sigma = self.sigmas[input.span.end];
+                let pred =
+                    (self.forward)(&lat, sigma, input.span.end).map_err(gen_core::Error::from)?;
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                self.clean_estimate(&lat, &pred, sigma)?
+            } else {
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                lat.clone()
+            };
+            return Ok(BoundaryState::CleanEstimate {
+                latent: est,
+                source: EstimateSource::EndpointEvaluation,
+            });
+        }
+
+        Ok(BoundaryState::XSigma(lat))
+    }
+}
+
 fn turbo_prediction(
     dit: &BooguTransformer,
     latent: &Tensor,
@@ -638,30 +805,21 @@ fn turbo_prediction(
     match negative {
         Some(negative) => {
             let negative = dit.forward(latent, timestep, negative)?;
-            Ok((&positive + ((&positive - negative)? * guidance as f64)?)?)
+            let (residual_weight, _) =
+                gen_core::guidance::boogu_turbo_residual_cfg_weights(guidance);
+            Ok((&positive + ((&positive - negative)? * residual_weight as f64)?)?)
         }
         None => Ok(positive),
     }
 }
 
 fn turbo_shifted_sigmas(req: &GenerationRequest, steps: usize) -> Result<Vec<f32>> {
-    let clean = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
-    if req.scheduler_shift.is_none() {
-        return Ok(clean);
-    }
-    let noise: Vec<_> = clean.iter().map(|sigma| 1.0 - sigma).collect();
-    Ok(
-        candle_gen::resolve_flow_schedule_with_shift(
-            None,
-            req.scheduler_shift,
-            0.0,
-            steps,
-            &noise,
-        )?
-        .into_iter()
-        .map(|sigma| 1.0 - sigma)
-        .collect(),
+    candle_gen::gen_core::sampling::boogu_dmd_shifted_sigmas(
+        DEFAULT_TURBO_SIGMA,
+        steps,
+        req.scheduler_shift,
     )
+    .map_err(Into::into)
 }
 
 pub(crate) fn stage_denoise_turbo(
@@ -726,48 +884,46 @@ pub(crate) fn stage_denoise_turbo(
     }
     let sigmas = turbo_shifted_sigmas(req, steps)?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
-    let total = (steps - start) as u32;
+    let run_sigmas = sigmas[start..].to_vec();
+    let total_steps = run_sigmas.len();
+    let turbo_guidance = resolved_guidance(req.guidance, true);
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
-        let mut lat = blend_reference(clean.as_ref(), noise, 1.0 - sigmas[start])?;
+        let lat = blend_reference(clean.as_ref(), noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
         candle_gen::execution::schedule("boogu-turbo-dmd", &sigmas[start..], "clean-fraction");
         candle_gen::execution::runtime(lat.device(), lat.dtype());
-        for (current, i) in (start..steps).enumerate() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            preview_hook.emit_step(&preview_counter, i, &lat);
-            let sigma = sigmas[i];
+        let driver = BooguTurboDmdDriver::new(run_sigmas.clone(), start, |lat, sigma, _step| {
             let t = Tensor::from_vec(vec![sigma], (1,), device)?;
-            let pred = turbo_prediction(
-                &heavy.dit,
-                &lat,
-                &t,
-                &cond,
-                uncond.as_ref(),
-                resolved_guidance(req.guidance, true),
-            )?;
-            lat =
-                (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
-            if i + 1 < steps {
-                let sigma_next = sigmas[i + 1];
-                let noise = init_noise(
-                    req.height,
-                    req.width,
-                    seed.wrapping_add(candle_gen::STEP_RNG_SALT),
-                    (i + 1) as u64,
-                    device,
-                )?;
-                lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
-            }
-            on_progress(Progress::Step {
-                current: (current + 1) as u32,
-                total,
-            });
-        }
-        Ok(lat)
+            turbo_prediction(&heavy.dit, lat, &t, &cond, uncond.as_ref(), turbo_guidance)
+        });
+        let mut run_state = DriverRunState::new();
+        let mut on_observe = |info: &DriverStepInfo, lat: &Tensor| {
+            preview_hook.emit_step(&preview_counter, start + info.outer_step, lat);
+            Ok(())
+        };
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        let mut spec = SliceSpec::full(total_steps);
+        spec.geometry = Some((req.width, req.height));
+        let out = run_candle_driver_slices(
+            &driver,
+            [spec],
+            BoundaryState::XSigma(lat),
+            total_steps,
+            seed,
+            &req.cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, state, _| Ok(state),
+        )?;
+        Ok(match out {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        })
     })
 }
 
@@ -1178,59 +1334,50 @@ pub(crate) fn render_turbo(
 
     let sigmas = turbo_shifted_sigmas(req, steps)?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
-    let total = (steps - start) as u32;
+    let run_sigmas = sigmas[start..].to_vec();
+    let total_steps = run_sigmas.len();
+    let turbo_guidance = resolved_guidance(req.guidance, true);
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
-        let mut lat = blend_reference(clean, noise, 1.0 - sigmas[start])?;
+        let lat = blend_reference(clean, noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
         candle_gen::execution::schedule("boogu-turbo-dmd", &sigmas[start..], "clean-fraction");
         candle_gen::execution::runtime(lat.device(), lat.dtype());
-        for (current, i) in (start..steps).enumerate() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
+        let driver = BooguTurboDmdDriver::new(run_sigmas.clone(), start, |lat, sigma, _step| {
+            let t = Tensor::from_vec(vec![sigma], (1,), device)?;
+            turbo_prediction(&comps.dit, lat, &t, &cond, uncond.as_ref(), turbo_guidance)
+        });
+        let mut run_state = DriverRunState::new();
+        let mut on_observe = |info: &DriverStepInfo, lat: &Tensor| {
             // Match the shared sampler contract: preview the running state entering this outer step.
             // For i > 0 this is the previous clean estimate after DMD re-noise, which is also the
             // tensor the DiT consumes below. The transient x0 estimate is never previewed twice.
-            preview_hook.emit_step(&preview_counter, i, &lat);
-            let sigma = sigmas[i];
-            let t = Tensor::from_vec(vec![sigma], (1,), device)?;
-            let pred = turbo_prediction(
-                &comps.dit,
-                &lat,
-                &t,
-                &cond,
-                uncond.as_ref(),
-                resolved_guidance(req.guidance, true),
-            )?;
-            // Predict (clean estimate): x += (1 − sigma)·v, in f32.
-            lat =
-                (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
-            // Renoise to the next sigma level with fresh noise (all but the final step). Key the
-            // renoise stream with STEP_RNG_SALT (sc-11210 / F-117): the initial latent is keyed by
-            // `seed`, so an unsalted `seed + step` renoise draw is byte-identical to image `i+step`'s
-            // initial-noise stream in the same `count`-batch (each image renders at `base_seed + i`),
-            // correlating batch noise. Offsetting the renoise family by the golden-ratio salt separates
-            // it from every initial-noise stream — the same prior-vs-step separation the conditioned
-            // SDXL/InstantID lanes use. Output-changing: mirrors the mlx twin lockstep.
-            if i + 1 < steps {
-                let sigma_next = sigmas[i + 1];
-                let noise = init_noise(
-                    req.height,
-                    req.width,
-                    seed.wrapping_add(candle_gen::STEP_RNG_SALT),
-                    (i + 1) as u64,
-                    device,
-                )?;
-                lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
-            }
-            on_progress(Progress::Step {
-                current: (current + 1) as u32,
-                total,
-            });
-        }
+            preview_hook.emit_step(&preview_counter, start + info.outer_step, lat);
+            Ok(())
+        };
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        let mut spec = SliceSpec::full(total_steps);
+        spec.geometry = Some((req.width, req.height));
+        let out = run_candle_driver_slices(
+            &driver,
+            [spec],
+            BoundaryState::XSigma(lat),
+            total_steps,
+            seed,
+            &req.cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, state, _| Ok(state),
+        )?;
+        let lat = match out {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
         on_progress(Progress::Decoding);
         decode(&comps.vae, pid_decoder.as_ref(), &lat)
     })
@@ -1742,6 +1889,7 @@ fn time_shift_v1(t: f64, mu: f64) -> f64 {
     candle_gen::gen_core::sampling::time_shift_v1(t, mu)
 }
 
+#[cfg(test)]
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     candle_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
@@ -1989,5 +2137,57 @@ mod execution_policy_tests {
         assert_ne!(report(None, false), report(Some(2.0), false));
         assert_eq!(report(None, true), report(Some(0.0), true));
         assert_ne!(report(None, true), report(Some(2.0), true));
+    }
+
+    #[test]
+    fn candle_boogu_turbo_dmd_driver_passes_tier0_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let sigmas =
+            candle_gen::gen_core::sampling::boogu_dmd_shifted_sigmas(DEFAULT_TURBO_SIGMA, 4, None)
+                .unwrap();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 42,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: move || {
+                Box::new(BooguTurboDmdDriver::new(
+                    sigmas.clone(),
+                    0,
+                    |lat, sigma, step| {
+                        let scale = 0.15 + 0.05 * sigma as f64 + 0.02 * step as f64;
+                        Ok((lat * scale)?)
+                    },
+                ))
+            },
+            make_initial: || {
+                Tensor::from_vec(
+                    vec![0.25f32, -0.5, 0.75, -0.125],
+                    (1, 1, 2, 2),
+                    &Device::Cpu,
+                )
+                .unwrap()
+            },
+            latents_equal: |a, b| {
+                let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                va.len() == vb.len()
+                    && va
+                        .iter()
+                        .zip(vb.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("Candle BooguTurboDmdDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
+        assert_eq!(report.unsplit_draws, 3);
     }
 }

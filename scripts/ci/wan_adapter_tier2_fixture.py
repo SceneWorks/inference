@@ -129,30 +129,56 @@ fn sga_wan_pool(phase: &str) -> CResult<()> {
 '''
 
 
-def overlay(read, _arm, backend, binary, *, phase_memory=False):
+def overlay(read, arm, backend, binary, *, phase_memory=False):
     if backend == "candle-cuda":
         prefix = f"crates/media/candle-gen/{package(backend)}/src/"
         path = prefix + "wan14b.rs"
         raw = read(path)
         marker = b"            return Ok((dit, Some(report.applied)));"
         raw = replace_once(raw, marker, b"            println!(\"SGA_WAN_EXPERT_ADAPTERS {:?} {}\", expert, report.applied);\n" + marker)
-        marker = b"            let t = sched.timestep(i);"
-        raw = replace_once(raw, marker, marker + b"\n            let sga_step_start = std::time::Instant::now();")
-        marker = b"            *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)"
-        raw = replace_once(raw, marker, marker + b"\n            self.device.synchronize()?;\n"
-                           b"            println!(\"SGA_WAN_OUTER_STEP {} {} {}\", i + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());")
         if phase_memory:
             raw = memory_overlay(raw)
-        return {path: raw, prefix + f"bin/{binary}.rs": CANDLE_PROBE.read_bytes()}
+        if arm == "base":
+            marker = b"            let t = sched.timestep(i);"
+            raw = replace_once(raw, marker, marker + b"\n            let sga_step_start = std::time::Instant::now();")
+            marker = b"            *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)"
+            raw = replace_once(raw, marker, marker + b"\n            self.device.synchronize()?;\n"
+                               b"            println!(\"SGA_WAN_OUTER_STEP {} {} {}\", i + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());")
+            return {path: raw, prefix + f"bin/{binary}.rs": CANDLE_PROBE.read_bytes()}
+        sched_path = prefix + "scheduler.rs"
+        sched_raw = read(sched_path)
+        marker = b"            let timestep = self.sigmas[step] * NUM_TRAIN_TIMESTEPS as f64;"
+        sched_raw = replace_once(sched_raw, marker, marker + b"\n            let sga_step_start = std::time::Instant::now();")
+        marker = b"            latents = hooks.post_step(&info, latents)?;"
+        sched_raw = replace_once(
+            sched_raw,
+            marker,
+            marker + b"\n            latents.device().synchronize().map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;\n"
+            b"            println!(\"SGA_WAN_OUTER_STEP {} {} {}\", step + 1, timestep.to_bits(), sga_step_start.elapsed().as_nanos());",
+        )
+        return {path: raw, sched_path: sched_raw, prefix + f"bin/{binary}.rs": CANDLE_PROBE.read_bytes()}
     if phase_memory:
         raise ValueError("Wan phase memory diagnostic requires the native CUDA fixture")
     prefix = f"crates/media/mlx-gen/{PACKAGE}/src/"
-    path = prefix + "pipeline/moe.rs"
-    raw = replace_once(read(path), b"        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;",
-                       b"        let sga_step_start = std::time::Instant::now();\n"
-                       b"        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;")
-    raw = replace_once(raw, b"        on_step(i + 1);", b"        println!(\"SGA_WAN_OUTER_STEP {} {} {}\", "
-                       b"i + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());\n        on_step(i + 1);")
+    if arm == "base":
+        path = prefix + "pipeline/moe.rs"
+        raw = replace_once(read(path), b"        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;",
+                           b"        let sga_step_start = std::time::Instant::now();\n"
+                           b"        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;")
+        raw = replace_once(raw, b"        on_step(i + 1);", b"        println!(\"SGA_WAN_OUTER_STEP {} {} {}\", "
+                           b"i + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());\n        on_step(i + 1);")
+        return {path: raw, prefix + f"bin/{binary}.rs": PROBE.read_bytes()}
+    path = prefix + "scheduler.rs"
+    raw = replace_once(
+        read(path),
+        b"            let t = self.timesteps[step];",
+        b"            let t = self.timesteps[step];\n            let sga_step_start = std::time::Instant::now();",
+    )
+    raw = replace_once(
+        raw,
+        b"            hooks.emit_progress(&info);",
+        b"            println!(\"SGA_WAN_OUTER_STEP {} {} {}\", step + 1, t.to_bits(), sga_step_start.elapsed().as_nanos());\n            hooks.emit_progress(&info);",
+    )
     return {path: raw, prefix + f"bin/{binary}.rs": PROBE.read_bytes()}
 
 

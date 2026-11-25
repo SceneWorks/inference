@@ -7,14 +7,19 @@ use crate::{
 };
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use candle_gen::gen_core::guidance::{cfg as guidance_cfg, pag_apply};
 use candle_gen::gen_core::snapshot_inventory::hex_lower as hex;
 use candle_gen::gen_core::{
     weightsmeta::{CheckpointMeta, Dtype as StoredDtype},
-    PinnedWeightsFile,
+    BoundaryState, PinnedWeightsFile,
 };
 use candle_gen::gen_core::{CancelFlag, LoadSpec, Progress, WeightsSource};
 use candle_gen::weights::Weights;
-use candle_gen::{CandleError as Error, Result};
+use candle_gen::{CandleError as Error, CandleLatentOps, Result};
 use candle_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use sha2::{Digest, Sha256};
@@ -363,20 +368,121 @@ fn cfg_pag_euler_step(
     pag_scale: f32,
     delta: f32,
 ) -> Result<Tensor> {
+    let ops = CandleLatentOps;
     let cond_f32 = conditional.to_dtype(DType::F32)?;
     let mut prediction = cond_f32.clone();
     if let Some(negative) = unconditional {
         let negative = negative.to_dtype(DType::F32)?;
-        prediction = negative.add(&((&prediction - &negative)? * f64::from(guidance))?)?;
+        prediction = guidance_cfg(&ops, &prediction, &negative, guidance)?;
     }
     if let Some(perturbed) = perturbed.filter(|_| pag_scale > 0.0) {
         let perturbed = perturbed.to_dtype(DType::F32)?;
-        prediction = prediction.add(&((&cond_f32 - &perturbed)? * f64::from(pag_scale))?)?;
+        prediction = pag_apply(&ops, &prediction, &cond_f32, &perturbed, pag_scale)?;
     }
     Ok(current
         .to_dtype(DType::F32)?
         .add(&(prediction * f64::from(delta))?)?)
 }
+
+/// Typed `FamilyDriver` for Candle MOSS-Image Edit's per-sample CFG/PAG Euler loop (`SW-6969`).
+pub struct MossEditDriver<F> {
+    support: DriverSupport,
+    sigmas: Vec<f32>,
+    step_fn: F,
+}
+
+impl<F> MossEditDriver<F>
+where
+    F: Fn(&Tensor, usize, f32, f32, &CancelFlag) -> Result<Tensor>,
+{
+    pub fn new(sigmas: Vec<f32>, step_fn: F) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "candle_moss_image_edit",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: false,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    renoise_from_clean: "MOSS-Image Edit driver refuses external Renoise transitions",
+                    geometry_change: "MOSS-Image Edit driver does not support mid-trajectory spatial resampling",
+                    read_only_boundary_estimate: "MOSS-Image Edit per-sample step driver does not expose a separate read-only boundary estimator",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            sigmas,
+            step_fn,
+        }
+    }
+}
+
+impl<F> FamilyDriver<Tensor> for MossEditDriver<F>
+where
+    F: Fn(&Tensor, usize, f32, f32, &CancelFlag) -> Result<Tensor>,
+{
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        let expected_steps = self.sigmas.len().saturating_sub(1);
+        if input.total_steps != expected_steps {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match edit sigma schedule steps={expected_steps}",
+                self.support.driver_id, input.total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let mut latents = match input.state {
+            BoundaryState::XSigma(t)
+            | BoundaryState::CleanEstimate { latent: t, .. }
+            | BoundaryState::RouteSpecific { state: t, .. } => t,
+        };
+
+        for index in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            let sigma = self.sigmas[index];
+            let next_sigma = self.sigmas[index + 1];
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: index,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma,
+                next_sigma,
+            };
+            hooks.observe(&info, &latents)?;
+            latents = (self.step_fn)(&latents, index, sigma, next_sigma, input.cancel)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            latents = hooks.post_step(&info, latents)?;
+            hooks.materialize(&info, &latents)?;
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            state.record_outer_step(index);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(latents))
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     pub(crate) static SAMPLING_TRACE: std::cell::RefCell<Option<Vec<[Tensor; 4]>>> = const { std::cell::RefCell::new(None) };
@@ -411,8 +517,8 @@ impl EditSampling<'_> {
             self.resolved.training_shift,
         )?;
         let total_steps = sigmas.len() - 1;
-        let mut latents = noise.to_dtype(DType::F32)?;
-        for (index, pair) in sigmas.windows(2).enumerate() {
+        let latents = noise.to_dtype(DType::F32)?;
+        let driver = MossEditDriver::new(sigmas, |latents, index, sigma, next_sigma, cancel| {
             let pag_scale = self.resolved.pag_step_scale(index, total_steps);
             let pag_layers = self
                 .resolved
@@ -427,7 +533,7 @@ impl EditSampling<'_> {
                 let predict = |context: &Tensor, layers: &[u32]| {
                     self.transformer.forward_edit_with_pag(
                         &current,
-                        pair[0],
+                        sigma,
                         crate::transformer::EditConditioning {
                             context,
                             references: self.references,
@@ -455,7 +561,7 @@ impl EditSampling<'_> {
                     perturbed.as_ref(),
                     self.resolved.guidance,
                     pag_scale,
-                    pair[1] - pair[0],
+                    next_sigma - sigma,
                 )?;
                 #[cfg(test)]
                 SAMPLING_TRACE.with(|trace| {
@@ -474,16 +580,86 @@ impl EditSampling<'_> {
                 });
                 outputs.push(next);
             }
-            latents = Tensor::cat(&outputs, 0)?;
-            latents.device().synchronize()?;
-            check(cancel)?;
-            progress(Progress::Step {
-                current: index as u32 + 1,
-                total: total_steps as u32,
-            });
-        }
+            Ok(Tensor::cat(&outputs, 0)?)
+        });
+        let mut run_state = DriverRunState::new();
+        let mut on_materialize = |_info: &DriverStepInfo, lat: &Tensor| {
+            lat.device()
+                .synchronize()
+                .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))
+        };
+        let mut hooks = StepHooks::new(progress);
+        hooks.on_materialize = Some(&mut on_materialize);
+        let out = run_candle_driver_slices(
+            &driver,
+            [SliceSpec::full(total_steps)],
+            BoundaryState::XSigma(latents),
+            total_steps,
+            0,
+            cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, state, _| Ok(state),
+        )?;
         check(cancel)?;
-        Ok(latents)
+        Ok(match out {
+            BoundaryState::XSigma(t)
+            | BoundaryState::CleanEstimate { latent: t, .. }
+            | BoundaryState::RouteSpecific { state: t, .. } => t,
+        })
+    }
+}
+
+#[cfg(test)]
+mod driver_conformance_tests {
+    use super::*;
+    use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+    #[test]
+    fn candle_moss_edit_driver_passes_tier0_conformance() {
+        let sigmas = moss_image_schedule(4, 1.0, 1.0).unwrap();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 5,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: move || {
+                Box::new(MossEditDriver::new(
+                    sigmas.clone(),
+                    |latents, step, sigma, next_sigma, _cancel| {
+                        let cond = (latents * (0.2 + 0.1 * f64::from(sigma) + 0.01 * step as f64))?;
+                        let uncond = (latents * 0.05)?;
+                        cfg_pag_euler_step(
+                            latents,
+                            &cond,
+                            Some(&uncond),
+                            None,
+                            2.5,
+                            0.0,
+                            next_sigma - sigma,
+                        )
+                    },
+                ))
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![0.4f32, -0.2, 0.6, -0.8], (1, 1, 2, 2), &Device::Cpu).unwrap()
+            },
+            latents_equal: |a, b| {
+                let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                va.len() == vb.len()
+                    && va
+                        .iter()
+                        .zip(vb.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("Candle MossEditDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
     }
 }
 

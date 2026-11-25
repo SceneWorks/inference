@@ -25,7 +25,7 @@ use crate::rope::WanRope;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
-    build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
+    build_vace_control, crossing_index, denoise_vace_slice, prepare_masks, prepare_video_latents,
     vace_control_scales, WanVaceTransformer,
 };
 use crate::vace_fun_tier::VaceFunTierPaths;
@@ -348,9 +348,9 @@ impl Pipeline {
         &self,
         expert: &WanVaceTransformer,
         prepared: &mut Prepared,
-        scheduler: &mut FlowScheduler,
-        timesteps: &[f64],
+        driver_state: &mut candle_gen::driver::DriverRunState,
         range: std::ops::Range<usize>,
+        phase: usize,
         guidance: f64,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -368,19 +368,22 @@ impl Pipeline {
                 total,
             })
         };
-        denoise_vace_range(
+        denoise_vace_slice(
             expert,
             &prepared.control,
             &prepared.scales,
-            scheduler,
+            prepared.sampler,
+            prepared.steps,
+            prepared.shift,
             guidance,
             &pos,
             neg.as_ref(),
             &mut prepared.latents,
-            timesteps,
             range,
+            phase,
             &prepared.cos,
             &prepared.sin,
+            driver_state,
             cancel,
             &mut on_step,
         )
@@ -646,11 +649,8 @@ impl Generator for WanVaceFunGenerator {
                 (prepared, None)
             }
         };
-        let mut scheduler = FlowScheduler::new(prepared.sampler, prepared.steps, prepared.shift);
         let crossing = expert_schedule_crossing(prepared.steps, prepared.sampler, prepared.shift)?;
-        let timesteps = (0..prepared.steps)
-            .map(|step| scheduler.timestep(step))
-            .collect::<Vec<_>>();
+        let mut driver_state = candle_gen::driver::DriverRunState::new();
         match effective_offload {
             OffloadPolicy::Resident => {
                 let experts = self.experts(&pipeline)?;
@@ -660,9 +660,9 @@ impl Generator for WanVaceFunGenerator {
                 pipeline.use_expert(
                     &experts.high,
                     &mut prepared,
-                    &mut scheduler,
-                    &timesteps,
+                    &mut driver_state,
                     0..crossing,
+                    0,
                     guidance_high,
                     &req.cancel,
                     on_progress,
@@ -670,9 +670,9 @@ impl Generator for WanVaceFunGenerator {
                 pipeline.use_expert(
                     &experts.low,
                     &mut prepared,
-                    &mut scheduler,
-                    &timesteps,
+                    &mut driver_state,
                     crossing..steps,
+                    1,
                     guidance_low,
                     &req.cancel,
                     on_progress,
@@ -681,13 +681,13 @@ impl Generator for WanVaceFunGenerator {
             OffloadPolicy::Sequential => {
                 struct SwapState<'a> {
                     prepared: &'a mut Prepared,
-                    scheduler: &'a mut FlowScheduler,
+                    driver_state: candle_gen::driver::DriverRunState,
                     on_progress: &'a mut dyn FnMut(Progress),
                 }
                 let steps = prepared.steps;
                 let mut state = SwapState {
                     prepared: &mut prepared,
-                    scheduler: &mut scheduler,
+                    driver_state,
                     on_progress: &mut *on_progress,
                 };
                 staged_expert_swap(
@@ -702,9 +702,9 @@ impl Generator for WanVaceFunGenerator {
                         pipeline.use_expert(
                             high,
                             state.prepared,
-                            state.scheduler,
-                            &timesteps,
+                            &mut state.driver_state,
                             0..crossing,
+                            0,
                             state.prepared.guidance_high,
                             &req.cancel,
                             state.on_progress,
@@ -718,9 +718,9 @@ impl Generator for WanVaceFunGenerator {
                         pipeline.use_expert(
                             low,
                             state.prepared,
-                            state.scheduler,
-                            &timesteps,
+                            &mut state.driver_state,
                             crossing..steps,
+                            1,
                             state.prepared.guidance_low,
                             &req.cancel,
                             state.on_progress,

@@ -415,7 +415,7 @@ impl Generator for KolorsGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
-        if let Some(plan) = compile_kolors(&self.loaded_spec, req)? {
+        if let Some(plan) = compile_kolors_for_mode(&self.loaded_spec, req, false)? {
             return self.generate_planned(req, &plan, None, on_progress);
         }
         let output =
@@ -464,7 +464,7 @@ impl Generator for KolorsGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        if let Ok(Some(plan)) = compile_kolors(&self.loaded_spec, req) {
+        if let Ok(Some(plan)) = compile_kolors_for_mode(&self.loaded_spec, req, false) {
             return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
         }
         mlx_gen::image_execution::complete_image_report_attempt(
@@ -548,9 +548,7 @@ impl KolorsGenerator {
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
-        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
-            &self.loaded_spec,
-        ))?;
+        plan.check_load_compatible(&self.loaded_spec)?;
         let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         let mut request = self.resolve_request(req)?;
         request.base_seed = plan.base_seed();
@@ -863,51 +861,53 @@ impl KolorsGenerator {
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = request.base_seed.wrapping_add(i as u64);
-            random::seed(seed)?;
             if let Some(run) = run {
                 run.reset_image_denoise_phases();
             }
-            mlx_gen::image_execution::with_primary_rng_scheme(
-                if request.use_curated {
-                    "mlx-global-normal-initial-v1;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64"
-                } else {
-                    "mlx-global-normal-initial-v1;no-step-draws"
-                },
-                || {
-                    mlx_gen_sdxl::stages::run_output(
-                        &plan,
-                        seed,
-                        on_progress,
-                        |latents, on_progress| {
-                            if let Some(run) = run {
-                                run.finish_image_denoise_phases()?;
-                            }
-                            let img = match run {
-                                Some(run) => run.decode_phase(|| {
-                                    mlx_gen_sdxl::stages::decode_output(
+            mlx_gen::with_global_rng_trajectory(|| -> Result<()> {
+                random::seed(seed)?;
+                mlx_gen::image_execution::with_primary_rng_scheme(
+                    if request.use_curated {
+                        "mlx-global-normal-initial-v1;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64"
+                    } else {
+                        "mlx-global-normal-initial-v1;no-step-draws"
+                    },
+                    || {
+                        mlx_gen_sdxl::stages::run_output(
+                            &plan,
+                            seed,
+                            on_progress,
+                            |latents, on_progress| {
+                                if let Some(run) = run {
+                                    run.finish_image_denoise_phases()?;
+                                }
+                                let img = match run {
+                                    Some(run) => run.decode_phase(|| {
+                                        mlx_gen_sdxl::stages::decode_output(
+                                            heavy.vae(),
+                                            &latents,
+                                            pid_ref,
+                                            request.decode_tiling.as_ref(),
+                                            &req.cancel,
+                                            on_progress,
+                                        )
+                                    })?,
+                                    None => mlx_gen_sdxl::stages::decode_output(
                                         heavy.vae(),
                                         &latents,
                                         pid_ref,
                                         request.decode_tiling.as_ref(),
                                         &req.cancel,
                                         on_progress,
-                                    )
-                                })?,
-                                None => mlx_gen_sdxl::stages::decode_output(
-                                    heavy.vae(),
-                                    &latents,
-                                    pid_ref,
-                                    request.decode_tiling.as_ref(),
-                                    &req.cancel,
-                                    on_progress,
-                                )?,
-                            };
-                            images.push(img);
-                            Ok(())
-                        },
-                    )
-                },
-            )?;
+                                    )?,
+                                };
+                                images.push(img);
+                                Ok(())
+                            },
+                        )
+                    },
+                )
+            })?;
         }
         if let Some(run) = run {
             run.finish_rendering();
@@ -1409,7 +1409,7 @@ impl KolorsRenderPlan<'_, '_, '_> {
         let request = self.request;
         let req = request.req;
         let (h, w) = (req.height as i32, req.width as i32);
-        match (self.mode, x0) {
+        let (init_latents, strength, control, ip_tokens) = match (self.mode, x0) {
             (
                 &KolorsMode::PoseIp {
                     net,
@@ -1421,27 +1421,11 @@ impl KolorsRenderPlan<'_, '_, '_> {
                     ..
                 },
                 Some(init_latents),
-            ) => self.heavy.denoise_controlnet_ip_latents_with_preview(
-                net,
-                tokens,
-                init_latents,
-                noise,
-                skeleton,
-                self.pos,
-                self.neg,
-                request.steps,
-                init_strength,
-                request.cfg,
-                control_scale,
-                ip_scale,
-                h,
-                w,
-                self.run_steps(),
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                request.forward_plan,
-                request.cfg_batching,
+            ) => (
+                Some(init_latents),
+                Some(init_strength),
+                Some((net, skeleton, control_scale)),
+                Some((tokens, ip_scale)),
             ),
             (
                 &KolorsMode::Control {
@@ -1454,80 +1438,33 @@ impl KolorsRenderPlan<'_, '_, '_> {
                     ..
                 },
                 _,
-            ) => self.heavy.denoise_controlnet_latents_with_preview(
-                net,
-                noise,
-                image,
-                self.pos,
-                self.neg,
-                request.steps,
-                request.cfg,
-                scale,
-                h,
-                w,
-                self.run_steps(),
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                request.forward_plan,
-                request.cfg_batching,
-            ),
-            (KolorsMode::Ip { tokens, scale, .. }, _) => {
-                self.heavy.denoise_ip_latents_with_preview(
-                    tokens,
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    request.cfg,
-                    *scale,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
-            }
+            ) => (None, None, Some((net, image, scale)), None),
+            (KolorsMode::Ip { tokens, scale, .. }, _) => (None, None, None, Some((tokens, *scale))),
             (&KolorsMode::Img2Img { strength, .. }, Some(x0)) => {
-                self.heavy.denoise_img2img_latents_with_preview(
-                    x0,
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    strength,
-                    request.cfg,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
+                (Some(x0), Some(strength), None, None)
             }
-            (KolorsMode::Img2Img { .. } | KolorsMode::Txt2Img, _) => {
-                self.heavy.denoise_latents_with_preview(
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    request.cfg,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
-            }
-        }
+            (KolorsMode::Img2Img { .. } | KolorsMode::Txt2Img, _) => (None, None, None, None),
+        };
+        self.heavy.denoise_native_planned(
+            init_latents,
+            noise,
+            self.pos,
+            self.neg,
+            request.steps,
+            strength,
+            request.cfg,
+            control,
+            ip_tokens,
+            h,
+            w,
+            self.run_steps(),
+            self.run,
+            &req.cancel,
+            on_progress,
+            &req.preview,
+            request.forward_plan,
+            request.cfg_batching,
+        )
     }
 }
 
@@ -1665,6 +1602,14 @@ pub fn compile_kolors(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    compile_kolors_for_mode(spec, req, true)
+}
+
+fn compile_kolors_for_mode(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    seal_exact_load: bool,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     let desc = descriptor();
     validate_request(&desc.capabilities, req)?;
     let has_control = spec.control.is_some() || !spec.extra_controls.is_empty();
@@ -1684,77 +1629,80 @@ pub fn compile_kolors(
                 .into(),
         ));
     }
-    let has_req_control = req
-        .conditioning
-        .iter()
-        .any(|c| matches!(c, Conditioning::Control { .. }));
-    let is_eng5 = has_control
-        || has_req_control
-        || has_ip
-        || !uses_curated_path(req)
-        || req.scheduler.as_deref() == Some("discrete")
-        || req.sampler.as_deref() == Some(SAMPLER);
+
+    let reference = reference_inputs(req)?;
+    let mut control = None;
+    for c in &req.conditioning {
+        if let Conditioning::Control { image, kind, scale } = c {
+            if control.is_some() {
+                return Err(mlx_gen::gen_core::Error::Msg(
+                    "kolors: multiple control images are not supported".into(),
+                ));
+            }
+            if !matches!(kind, ControlKind::Pose) {
+                return Err(mlx_gen::gen_core::Error::Msg(format!(
+                    "kolors: only Pose ControlNet is wired (got {kind:?})"
+                )));
+            }
+            control = Some((image, scale.unwrap_or(DEFAULT_CONTROLNET_SCALE)));
+        }
+    }
+    let mode = KolorsMode::resolve(has_ip, reference, control, req.strength)?;
     let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-    let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
-    let ms = DiscreteModelSampling::sdxl(&sched);
-    if is_eng5 {
-        if req.prompt == "feature applicability probe"
-            && !has_control
-            && !has_req_control
-            && !has_ip
-            && req.conditioning.is_empty()
-            && req.low_res_start.is_none()
-        {
-            let sigmas = schedule_sigmas(Scheduler::Normal, &ms, steps);
-            let executed_steps = sigmas.len().saturating_sub(1);
-            return mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
-                &desc,
-                req,
-                mlx_gen::gen_core::render::PackedImagePass {
-                    pixel_stride: SIZE_MULTIPLE,
-                    token_width: 4,
-                    sampler: "euler",
-                    guidance,
-                    sigmas,
-                    executed_steps,
-                    capture_sigma: 0.0,
-                },
-            )
-            .map(|plan| plan.bind_load(spec))
-            .map(Some);
-        }
-        return Ok(None);
-    }
 
-    let scheduler = req
-        .scheduler
-        .as_deref()
-        .and_then(Scheduler::from_name)
-        .unwrap_or(Scheduler::Normal);
-    let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
-    let reference = reference_inputs(req)?;
-    let run_sigmas = match reference {
-        Some((_, strength_opt)) => {
-            if req.low_res_start.is_some() {
-                let raw_strength = strength_opt
-                    .or(req.strength)
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH);
-                let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
-                    full_sigmas.len().saturating_sub(1),
-                    Some(raw_strength),
-                )?;
-                full_sigmas[start..].to_vec()
-            } else {
-                let strength = strength_opt
-                    .or(req.strength)
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
-                    .clamp(0.0, 1.0);
-                mlx_gen_sdxl::stages::curated_strength_tail(&full_sigmas, steps, strength)
+    let (run_sigmas, sampler_name): (Vec<f32>, &'static str) = if uses_curated_path(req) {
+        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let scheduler = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .unwrap_or(Scheduler::Normal);
+        let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
+        let sigmas = match mode.curated_init() {
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    let raw_strength = reference
+                        .and_then(|(_, s)| s)
+                        .or(req.strength)
+                        .unwrap_or(DEFAULT_IMG2IMG_STRENGTH);
+                    let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                        full_sigmas.len().saturating_sub(1),
+                        Some(raw_strength),
+                    )?;
+                    full_sigmas[start..].to_vec()
+                } else {
+                    mlx_gen_sdxl::stages::curated_strength_tail(
+                        &full_sigmas,
+                        steps,
+                        strength.clamp(0.0, 1.0),
+                    )
+                }
             }
-        }
-        None => full_sigmas,
+            None => full_sigmas,
+        };
+        let sampler =
+            mlx_gen::sampler::canonical_solver(req.sampler.as_deref(), Solver::Euler).name();
+        (sigmas, sampler)
+    } else {
+        use mlx_gen::gen_core::sampling::{BetaCumprodPrecision, LeadingEulerSchedule};
+        let strength = match mode {
+            KolorsMode::PoseIp { init_strength, .. } => Some(init_strength),
+            KolorsMode::Img2Img { strength, .. }
+            | KolorsMode::Control {
+                img2img: Some((_, strength)),
+                ..
+            } => Some(strength),
+            _ => None,
+        };
+        let schedule = match strength {
+            Some(s) => LeadingEulerSchedule::kolors_img2img(steps, s, BetaCumprodPrecision::F32)?,
+            None => LeadingEulerSchedule::kolors(steps, BetaCumprodPrecision::F32)?,
+        };
+        (schedule.sigmas().to_vec(), SAMPLER)
     };
+
     let keep = match req
         .use_pid
         .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
@@ -1765,22 +1713,26 @@ pub fn compile_kolors(
     };
     let executed_steps = keep.saturating_sub(1);
     let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
-    let sampler = mlx_gen::sampler::canonical_solver(req.sampler.as_deref(), Solver::Euler).name();
-    mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
-        &desc,
-        req,
-        mlx_gen::gen_core::render::PackedImagePass {
-            pixel_stride: SIZE_MULTIPLE,
-            token_width: 4,
-            sampler,
-            guidance,
-            sigmas: run_sigmas,
-            executed_steps,
-            capture_sigma,
-        },
-    )
-    .map(|plan| plan.bind_load(spec))
-    .map(Some)
+    let pass = mlx_gen::gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 4,
+        sampler: sampler_name,
+        guidance,
+        sigmas: run_sigmas,
+        executed_steps,
+        capture_sigma,
+    };
+    let pins = spec.prepared_file_pins();
+    let use_exact_load = seal_exact_load
+        && (pins.is_finalized() || pins.is_prepared() || spec.file_source_paths().is_empty());
+    let plan = if use_exact_load {
+        mlx_gen::gen_core::RenderPlan::packed_image_trajectory_with_exact_load(
+            &desc, spec, req, pass,
+        )?
+    } else {
+        mlx_gen::gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)?.bind_load(spec)
+    };
+    Ok(Some(plan))
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral

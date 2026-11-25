@@ -591,51 +591,20 @@ impl IpAdapterKolors {
         } else {
             let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
             let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
-            let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
-            let total = sampler.num_steps() as u32;
-            // A bespoke loop numbers its own frames, on the STEP INDEX: this lane walks a
-            // `KolorsEulerSampler` timestep table, not a descending sigma array.
-            let preview_counter =
-                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-            for i in 0..sampler.num_steps() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let scaled = (&latents / sampler.scale_in(i) as f64)?;
-                // Per-step latent preview (epic 16948, sc-16954): `scaled` is the very tensor this
-                // step feeds the UNet, and therefore the domain the reused SDXL fit was measured in.
-                // Emitted BEFORE `model_in` may move it. Failures are swallowed.
-                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
-                    crate::preview::project_spatial_latents(&scaled)
-                });
-                let model_in = if use_guide {
-                    Tensor::cat(&[&scaled, &scaled], 0)?
-                } else {
-                    scaled
-                };
-                let eps = resident.denoise.unet.forward_instantid(
-                    &model_in,
-                    sampler.timestep(i) as f64,
-                    &projected,
-                    &pooled,
-                    &time_ids,
-                    None, // pure IP — no ControlNet down residuals
-                    None, // … and no mid residual
-                )?;
-                let eps = if use_guide {
-                    let ch = eps.chunk(2, 0)?;
-                    let (uncond, cond) = (&ch[0], &ch[1]);
-                    (uncond + ((cond - uncond)? * req.guidance as f64)?)?
-                } else {
-                    eps
-                };
-                latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
-            }
-            latents
+            let latents = (noise * sampler.init_noise_sigma() as f64)?;
+            denoise_ip_native(
+                &sampler,
+                latents,
+                &resident.denoise.unet,
+                &projected,
+                &pooled,
+                &time_ids,
+                use_guide,
+                req.guidance,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+            )?
         };
 
         on_progress(Progress::Decoding);
@@ -740,45 +709,20 @@ impl IpAdapterKolors {
         } else {
             let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
             let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
-            let mut current = (noise * sampler.init_noise_sigma() as f64)?;
-            let total = sampler.num_steps() as u32;
-            let preview_counter =
-                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
-            for step in 0..sampler.num_steps() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let scaled = (&current / sampler.scale_in(step) as f64)?;
-                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step, || {
-                    crate::preview::project_spatial_latents(&scaled)
-                });
-                let model_in = if use_guide {
-                    Tensor::cat(&[&scaled, &scaled], 0)?
-                } else {
-                    scaled
-                };
-                let eps = denoise.unet.forward_instantid(
-                    &model_in,
-                    sampler.timestep(step) as f64,
-                    &projected,
-                    &pooled,
-                    &time_ids,
-                    None,
-                    None,
-                )?;
-                let eps = if use_guide {
-                    let chunks = eps.chunk(2, 0)?;
-                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * req.guidance as f64)?)?
-                } else {
-                    eps
-                };
-                current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
-                on_progress(Progress::Step {
-                    current: step as u32 + 1,
-                    total,
-                });
-            }
-            current
+            let current = (noise * sampler.init_noise_sigma() as f64)?;
+            denoise_ip_native(
+                &sampler,
+                current,
+                &denoise.unet,
+                &projected,
+                &pooled,
+                &time_ids,
+                use_guide,
+                req.guidance,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+            )?
         };
         denoise.release()?;
 
@@ -801,7 +745,65 @@ impl IpAdapterKolors {
         vae.release()?;
         Ok(image)
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn denoise_ip_native(
+    sampler: &KolorsEulerSampler,
+    latents: Tensor,
+    unet: &UNet2DConditionModel,
+    projected: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    use_guide: bool,
+    guidance: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Tensor> {
+    struct IpForward<'a> {
+        unet: &'a UNet2DConditionModel,
+        projected: &'a Tensor,
+        pooled: &'a Tensor,
+        time_ids: &'a Tensor,
+    }
+    impl crate::sampler::KolorsLeadingEulerForward for IpForward<'_> {
+        fn predict_eps(
+            &self,
+            model_in: &Tensor,
+            timestep: f64,
+            _step_index: usize,
+        ) -> Result<Tensor> {
+            Ok(self.unet.forward_instantid(
+                model_in,
+                timestep,
+                self.projected,
+                self.pooled,
+                self.time_ids,
+                None,
+                None,
+            )?)
+        }
+    }
+    crate::sampler::run_leading_euler(
+        sampler,
+        latents,
+        use_guide,
+        guidance,
+        IpForward {
+            unet,
+            projected,
+            pooled,
+            time_ids,
+        },
+        cancel,
+        None,
+        on_progress,
+        preview,
+    )
+}
+
+impl IpAdapterKolors {
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (borrows `&self.tokenizer` / `&self.chatglm`); passed as a closure to the shared
     /// [`common::cfg_batch_context`], so only the CFG convention is shared, not the ChatGLM3 plumbing.

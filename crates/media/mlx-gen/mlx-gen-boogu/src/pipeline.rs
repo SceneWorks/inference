@@ -31,6 +31,11 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use mlx_gen::gen_core::BoundaryState;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{
     add_noise_by_interpolation, preprocess_init_image,
@@ -589,7 +594,170 @@ impl BooguHeavy {
             })
             .collect()
     }
+}
 
+/// Boogu residual classifier-free guidance combine (`PIPE-8`):
+/// `cond + residual_weight·(cond − uncond)`, preserving Boogu's exact BF16/FP32 promotion order.
+fn boogu_residual_cfg_combine(cond: &Array, uncond: &Array, residual_weight: f32) -> Result<Array> {
+    Ok(add(
+        cond,
+        multiply(subtract(cond, uncond)?, Array::from_f32(residual_weight))?,
+    )?)
+}
+
+/// Typed `FamilyDriver` for Boogu Turbo's native DMD predict-and-renoise loop (`SW-6969`).
+///
+/// Generic over its forward-prediction seam so weights-free Tier 0 conformance tests can verify
+/// slicing, boundary clean estimates, cancellation, and typed refusals without loading weights.
+pub struct BooguTurboDmdDriver<F> {
+    support: DriverSupport,
+    /// Ascending clean-fraction sigmas for the active pass (`len() == total_steps`).
+    sigmas: Vec<f32>,
+    /// Absolute schedule start offset (non-zero for img2img) so renoise keys `seed + step_offset + step + 1`
+    /// match the unsplit img2img trajectory bit-for-bit.
+    step_offset: usize,
+    forward: F,
+}
+
+impl<F> BooguTurboDmdDriver<F>
+where
+    F: Fn(&Array, f32, usize) -> Result<Array>,
+{
+    /// Construct a Boogu Turbo DMD driver over the active clean-fraction `sigmas` and `forward` seam.
+    pub fn new(sigmas: Vec<f32>, step_offset: usize, forward: F) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "boogu_turbo_dmd",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: true,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    renoise_from_clean: "Boogu Turbo DMD owns its internal clean-to-renoise step and refuses external Renoise transitions",
+                    geometry_change: "Boogu Turbo DMD does not support mid-trajectory spatial resampling",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            sigmas,
+            step_offset,
+            forward,
+        }
+    }
+
+    fn clean_estimate(&self, lat: &Array, pred: &Array, sigma: f32) -> Result<Array> {
+        Ok(add(
+            lat.as_dtype(Dtype::Float32)?,
+            multiply(pred.as_dtype(Dtype::Float32)?, Array::from_f32(1.0 - sigma))?,
+        )?)
+    }
+}
+
+impl<F> FamilyDriver<Array> for BooguTurboDmdDriver<F>
+where
+    F: Fn(&Array, f32, usize) -> Result<Array>,
+{
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        if input.total_steps != self.sigmas.len() {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match DMD sigma schedule len={}",
+                self.support.driver_id,
+                input.total_steps,
+                self.sigmas.len()
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let mut lat = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let sigma = self.sigmas[step];
+            let next_sigma = self.sigmas.get(step + 1).copied().unwrap_or(1.0);
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma,
+                next_sigma,
+            };
+            hooks.observe(&info, &lat)?;
+            let pred = (self.forward)(&lat, sigma, step)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            // Predict (clean estimate): x += (1 − sigma)·v, in f32.
+            lat = self.clean_estimate(&lat, &pred, sigma)?;
+            // Renoise to the next sigma level with fresh keyed noise (all but the final step).
+            if step + 1 < input.total_steps {
+                let _draw = state.next_draw_index();
+                let key = random::key(
+                    input
+                        .seed
+                        .wrapping_add((self.step_offset + step + 1) as u64),
+                )
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+                let noise = random::normal::<f32>(lat.shape(), None, None, Some(&key))
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+                lat = add(
+                    multiply(&noise, Array::from_f32(1.0 - next_sigma))
+                        .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?,
+                    multiply(&lat, Array::from_f32(next_sigma))
+                        .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?,
+                )
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            }
+            lat = hooks.post_step(&info, lat)?;
+            hooks.materialize(&info, &lat)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+
+        if input.request_boundary_estimate {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let est = if input.span.end < self.sigmas.len() {
+                let sigma = self.sigmas[input.span.end];
+                let pred = (self.forward)(&lat, sigma, input.span.end)?;
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                self.clean_estimate(&lat, &pred, sigma)?
+            } else {
+                state.record_evaluation(DriverEvaluationKind::BoundaryEstimate);
+                lat.clone()
+            };
+            return Ok(BoundaryState::CleanEstimate {
+                latent: est,
+                source: mlx_gen::gen_core::EstimateSource::EndpointEvaluation,
+            });
+        }
+
+        Ok(BoundaryState::XSigma(lat))
+    }
+}
+
+impl BooguHeavy {
     /// True-CFG flow velocity for the Base / img2img paths: `pred = cond + (scale − 1)·(cond − uncond)`
     /// (or `cond` alone when CFG is off), negated into `run_flow_sampler`'s noise-fraction FLOW
     /// convention and cast to f32. Shared by [`Self::render_base_t2i`] and [`Self::render_base_img2img`].
@@ -607,13 +775,7 @@ impl BooguHeavy {
         let pred = match &c.uncond {
             Some((u_hidden, u_mask)) => {
                 let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
-                add(
-                    &cond_v,
-                    &multiply(
-                        &subtract(&cond_v, &uncond_v)?,
-                        Array::from_f32(residual_weight),
-                    )?,
-                )?
+                boogu_residual_cfg_combine(&cond_v, &uncond_v, residual_weight)?
             }
             None => cond_v,
         };
@@ -644,13 +806,7 @@ impl BooguHeavy {
                 let uncond_v = self
                     .dit
                     .forward_edit_multi(x, ref_latents, &t, u_hidden, u_mask)?;
-                add(
-                    &cond_v,
-                    &multiply(
-                        &subtract(&cond_v, &uncond_v)?,
-                        Array::from_f32(residual_weight),
-                    )?,
-                )?
+                boogu_residual_cfg_combine(&cond_v, &uncond_v, residual_weight)?
             }
             None => cond_v,
         };
@@ -876,22 +1032,11 @@ impl BooguHeavy {
         }
 
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
-        let clean_sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
-        let sigmas = if opts.scheduler_shift.is_some() {
-            let noise_sigmas: Vec<_> = clean_sigmas.iter().map(|sigma| 1.0 - sigma).collect();
-            mlx_gen::resolve_flow_schedule_with_shift(
-                None,
-                opts.scheduler_shift,
-                0.0,
-                opts.steps,
-                &noise_sigmas,
-            )?
-            .into_iter()
-            .map(|sigma| 1.0 - sigma)
-            .collect()
-        } else {
-            clean_sigmas
-        };
+        let sigmas = mlx_gen::gen_core::sampling::boogu_dmd_shifted_sigmas(
+            opts.conditioning_sigma,
+            opts.steps,
+            opts.scheduler_shift,
+        )?;
         let lat = self.denoise_turbo_native(
             c,
             opts.guidance,
@@ -956,22 +1101,11 @@ impl BooguHeavy {
 
         // Native DMD student loop seeded from the noise-blended reference (see the pre-split note: the
         // native clean-fraction `c_k` → noise-fraction `1 − c_k` matches the curated blend byte-for-byte).
-        let clean_sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
-        let sigmas = if opts.scheduler_shift.is_some() {
-            let noise_sigmas: Vec<_> = clean_sigmas.iter().map(|sigma| 1.0 - sigma).collect();
-            mlx_gen::resolve_flow_schedule_with_shift(
-                None,
-                opts.scheduler_shift,
-                0.0,
-                opts.steps,
-                &noise_sigmas,
-            )?
-            .into_iter()
-            .map(|sigma| 1.0 - sigma)
-            .collect()
-        } else {
-            clean_sigmas
-        };
+        let sigmas = mlx_gen::gen_core::sampling::boogu_dmd_shifted_sigmas(
+            opts.conditioning_sigma,
+            opts.steps,
+            opts.scheduler_shift,
+        )?;
         let start = start_step.min(sigmas.len().saturating_sub(1));
         let lat = add_noise_by_interpolation(clean, &noise, 1.0 - sigmas[start])?;
         let lat = self.denoise_turbo_native(
@@ -1077,16 +1211,15 @@ impl BooguHeavy {
     }
 
     /// The native DMD student few-step loop, shared by the Turbo t2i and img2img paths so the two never
-    /// diverge (F-093 / sc-11122). Runs `sigmas[start..]` (clean-fraction ascending): each step predicts
-    /// the clean estimate `x += (1 − σ)·v` (f32), then — except on the final entry — renoises to the next
-    /// level `x = (1 − σ_next)·noise + σ_next·x` with fresh per-step noise. `lat` is the already-seeded
-    /// start latent; progress streams over the `sigmas.len() − start` steps, cancellation per step.
+    /// diverge (F-093 / sc-11122). Routed through [`BooguTurboDmdDriver`] under the typed `FamilyDriver`
+    /// contract (`SW-6969`): each step predicts `x += (1 − σ)·v` (f32), then — except on the final entry —
+    /// renoises to `x = (1 − σ_next)·noise + σ_next·x` with fresh keyed per-step noise.
     #[allow(clippy::too_many_arguments)]
     fn denoise_turbo_native(
         &self,
         c: &BooguBaseCond,
         guidance: f32,
-        mut lat: Array,
+        lat: Array,
         sigmas: &[f32],
         start: usize,
         height: u32,
@@ -1095,46 +1228,45 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let total = (sigmas.len() - start) as u32;
-        for i in start..sigmas.len() {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let sigma = sigmas[i];
+        let run_sigmas = sigmas[start..].to_vec();
+        let total_steps = run_sigmas.len();
+        let driver = BooguTurboDmdDriver::new(run_sigmas, start, |lat, sigma, _step| {
             let t = Array::from_slice(&[sigma], &[1]);
-            let pred = self.dit.forward(&lat, &t, &c.cond, &c.cond_mask)?;
-            let pred = if let Some((negative, mask)) = &c.uncond {
-                let negative = self.dit.forward(&lat, &t, negative, mask)?;
-                add(
-                    &pred,
-                    &multiply(&subtract(&pred, &negative)?, Array::from_f32(guidance))?,
-                )?
+            let pred = self.dit.forward(lat, &t, &c.cond, &c.cond_mask)?;
+            if let Some((negative, mask)) = &c.uncond {
+                let negative = self.dit.forward(lat, &t, negative, mask)?;
+                let (residual_weight, _) =
+                    mlx_gen::gen_core::guidance::boogu_turbo_residual_cfg_weights(guidance);
+                boogu_residual_cfg_combine(&pred, &negative, residual_weight)
             } else {
-                pred
-            };
-            // Predict (clean estimate): x += (1 − sigma)·v, in f32.
-            lat = add(
-                &lat.as_dtype(Dtype::Float32)?,
-                &multiply(
-                    &pred.as_dtype(Dtype::Float32)?,
-                    Array::from_f32(1.0 - sigma),
-                )?,
-            )?;
-            // Renoise to the next sigma level with fresh noise (all but the final step).
-            if i + 1 < sigmas.len() {
-                let sigma_next = sigmas[i + 1];
-                let noise = init_noise(height, width, seed, (i + 1) as u64)?;
-                lat = add(
-                    &multiply(&noise, Array::from_f32(1.0 - sigma_next))?,
-                    &multiply(&lat, Array::from_f32(sigma_next))?,
-                )?;
+                Ok(pred)
             }
-            eval([&lat])?;
-            on_progress(Progress::Step {
-                current: (i - start + 1) as u32,
-                total,
-            });
-        }
+        });
+        let mut run_state = DriverRunState::new();
+        let mut on_materialize = |_info: &DriverStepInfo, lat: &Array| {
+            eval([lat]).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+        };
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_materialize = Some(&mut on_materialize);
+        let mut spec = SliceSpec::full(total_steps);
+        spec.geometry = Some((width, height));
+        let out = run_mlx_driver_slices(
+            &driver,
+            [spec],
+            BoundaryState::XSigma(lat),
+            total_steps,
+            seed,
+            cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, state, _| Ok(state),
+        )?;
+        let lat = match out {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
         mlx_gen::image_execution::sampled_native_with_rng(
             "boogu-dmd-predict-renoise-v1",
             "clean-fraction",
@@ -1438,6 +1570,7 @@ pub(crate) fn resolve_reference<'a>(
         .map(|(image, strength)| (image, resolve_strength(strength, None))))
 }
 
+#[cfg(test)]
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     mlx_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
@@ -1638,4 +1771,51 @@ mod tests {
     }
 
     const DEFAULT_TURBO_SIGMA_TEST: f32 = 0.001;
+
+    #[test]
+    fn boogu_turbo_dmd_driver_passes_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let sigmas = mlx_gen::gen_core::sampling::boogu_dmd_shifted_sigmas(
+            DEFAULT_TURBO_SIGMA_TEST,
+            4,
+            None,
+        )
+        .unwrap();
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 42,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: move || {
+                Box::new(BooguTurboDmdDriver::new(
+                    sigmas.clone(),
+                    0,
+                    |lat, sigma, step| {
+                        let scale = Array::from_f32(0.15 + 0.05 * sigma + 0.02 * step as f32);
+                        Ok(multiply(lat, &scale)?)
+                    },
+                ))
+            },
+            make_initial: || Array::from_slice(&[0.25f32, -0.5, 0.75, -0.125], &[1, 1, 2, 2]),
+            latents_equal: |a, b| {
+                a.eval().unwrap();
+                b.eval().unwrap();
+                a.as_slice::<f32>()
+                    .iter()
+                    .zip(b.as_slice::<f32>().iter())
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("BooguTurboDmdDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
+        assert_eq!(report.unsplit_draws, 3);
+    }
 }

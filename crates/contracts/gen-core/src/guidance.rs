@@ -173,6 +173,14 @@ pub const fn boogu_residual_cfg_weights(scale: f32) -> (f32, f32) {
     (scale - 1.0, -1.0)
 }
 
+/// Direct residual difference weight and velocity negation sign `(residual_weight, -1.0)` for
+/// Boogu Turbo (`PIPE-8`), where `guidance` is already a residual weight (default `0.0`) and
+/// must not round-trip through `(1.0 + guidance) - 1.0`.
+pub const fn boogu_turbo_residual_cfg_weights(residual_weight: f32) -> (f32, f32) {
+    let _ = CombineVariant::BooguResidualCfgNegated;
+    (residual_weight, -1.0)
+}
+
 // =================================================================================================
 // GuidanceOps — the axis-parameterized backend op extension (sc-7437).
 // =================================================================================================
@@ -230,6 +238,21 @@ pub fn cfg<G: GuidanceOps>(
 ) -> Result<G::Latent> {
     let diff = g.sub(cond, uncond)?;
     g.axpy(1.0, uncond, scale, &diff)
+}
+
+/// Linearly-weighted classifier-free guidance combine (`PIPE-8`):
+/// `scale·cond + (1 − scale)·uncond`.
+///
+/// Algebraically equivalent to [`cfg()`] (`uncond + scale·(cond − uncond)`), but preserves the
+/// exact `scale·cond + (1 − scale)·uncond` floating-point evaluation order required for
+/// bit-exact parity (`AP13 class (a)`) on families such as Ideogram 4's asymmetric two-DiT CFG.
+pub fn cfg_linear_blend<L: LatentOps>(
+    ops: &L,
+    cond: &L::Latent,
+    uncond: &L::Latent,
+    scale: f32,
+) -> Result<L::Latent> {
+    ops.axpy(scale, cond, 1.0 - scale, uncond)
 }
 
 // =================================================================================================
@@ -944,6 +967,29 @@ mod tests {
     }
 
     #[test]
+    fn boogu_turbo_residual_cfg_weights_are_bit_exact() {
+        for guidance in [0.0_f32, 0.1_f32, 0.3_f32, 0.7_f32, 1.5_f32] {
+            let (residual_weight, negate_sign) = boogu_turbo_residual_cfg_weights(guidance);
+            assert_eq!(
+                residual_weight.to_bits(),
+                guidance.to_bits(),
+                "Boogu Turbo residual weight must stay bit-exact for guidance={guidance}"
+            );
+            assert_eq!(negate_sign.to_bits(), (-1.0_f32).to_bits());
+        }
+        // Contrast with `(1.0 + g) - 1.0` round-tripping through `boogu_residual_cfg_weights`,
+        // which loses ULPs on non-dyadic values such as 0.1 and 0.3.
+        assert_ne!(
+            boogu_residual_cfg_weights(1.0_f32 + 0.3_f32).0.to_bits(),
+            0.3_f32.to_bits()
+        );
+        assert_ne!(
+            boogu_residual_cfg_weights(1.0_f32 + 0.1_f32).0.to_bits(),
+            0.1_f32.to_bits()
+        );
+    }
+
+    #[test]
     fn pipe8_named_boogu_and_qwen_guidance_operators() {
         assert_eq!(GuidanceOperator::PlainCfg.name(), "plain_cfg");
         assert_eq!(
@@ -1002,5 +1048,22 @@ mod tests {
 
     fn expected_ungated_check(v: &[f32]) -> Vec<f32> {
         v.to_vec()
+    }
+
+    #[test]
+    fn cfg_linear_blend_matches_direct_linear_combination_bit_exact() {
+        let cond = vec![1.25_f32, -0.75, 0.333_333_34, 4.5];
+        let uncond = vec![-0.5_f32, 2.125, -1.75, 0.125];
+        for scale in [1.0_f32, 3.0, 7.0] {
+            let out = cfg_linear_blend(&OPS, &cond, &uncond, scale).unwrap();
+            let expected: Vec<f32> = cond
+                .iter()
+                .zip(&uncond)
+                .map(|(&c, &u)| scale * c + (1.0 - scale) * u)
+                .collect();
+            for (got, want) in out.iter().zip(&expected) {
+                assert_eq!(got.to_bits(), want.to_bits(), "scale={scale}");
+            }
+        }
     }
 }

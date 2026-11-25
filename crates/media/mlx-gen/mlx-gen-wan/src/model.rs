@@ -37,13 +37,13 @@ use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::feature_cache::TrunkCache;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
-    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_moe,
-    denoise_moe_curated_swapped, denoise_range, denoise_ti2v, frames_to_images, latent_shape,
+    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_expert_slice,
+    denoise_moe, denoise_moe_curated_swapped, denoise_ti2v, frames_to_images, latent_shape,
     preflight_denoise_memory_guard, preprocess_ti2v_image, refuse_unwired_approximation,
     reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
     ti2v_blend_init, Expert,
 };
-use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
+use crate::scheduler::{compute_sigmas, integer_timesteps, SolverKind};
 use crate::text_encoder::encode_text_staged_for_tier_with_progress;
 use crate::token_pruning::TokenPruner;
 use crate::transformer::WanTransformer;

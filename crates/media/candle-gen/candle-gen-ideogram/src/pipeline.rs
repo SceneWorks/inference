@@ -25,9 +25,14 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
+use candle_gen::gen_core::sampling::init_time_step;
 use candle_gen::gen_core::{
-    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+    self, AdapterSpec, CancelFlag, Conditioning, GenerationRequest, Image, PidWeights, Progress,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
@@ -49,7 +54,10 @@ use crate::config::{
 };
 use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
-use crate::transformer::{model::HostConditioningIdentity, Ideogram4Transformer};
+use crate::transformer::{
+    model::{HostConditioningIdentity, PreparedConditioning},
+    Ideogram4Transformer,
+};
 
 /// The conditional DiT is the bottleneck — bf16. The Qwen3-VL encoder **computes f32** but its weights
 /// are **stored bf16** ([`TE_STORE_DTYPE`], sc-12828); the VAE runs f32.
@@ -796,6 +804,260 @@ fn resolve_edit(req: &GenerationRequest) -> CResult<Option<(&Image, Option<&Imag
     }
 }
 
+/// Forward evaluation seam for Candle Ideogram 4 flow-matching Euler denoising (`SW-6970`,
+/// `PIPE-7`).
+///
+/// Generic over conditional + optional unconditional velocity prediction so weights-free Tier 0
+/// `DriverSupport` conformance tests can drive [`IdeogramEulerDriver`] over mocked forwards
+/// without loading model weights.
+pub trait IdeogramVelocityForward {
+    /// Predict the conditional image-token velocity `[1, num_img, ch]` at clean-fraction time
+    /// `t_val` and descending schedule index `schedule_step` (`num_run - 1` down to `run_from`).
+    fn predict_cond(
+        &self,
+        z: &Tensor,
+        t_val: f32,
+        schedule_step: usize,
+        cancel: &CancelFlag,
+    ) -> CResult<Tensor>;
+
+    /// Predict the unconditional image-token velocity `[1, num_img, ch]` for asymmetric two-DiT
+    /// CFG (`Some` in quality mode, `None` in CFG-free turbo mode).
+    fn predict_uncond(
+        &self,
+        z: &Tensor,
+        t_val: f32,
+        schedule_step: usize,
+        cancel: &CancelFlag,
+    ) -> CResult<Option<Tensor>>;
+}
+
+/// Typed [`FamilyDriver`] for Candle Ideogram 4 quality (asymmetric two-DiT CFG with polish tail)
+/// and turbo (CFG-free single-DiT) flow-matching Euler denoising (`SW-6970`, `PIPE-7`, `PIPE-8`).
+pub struct IdeogramEulerDriver<F> {
+    schedule: LogitNormalSchedule,
+    step_intervals: Vec<f64>,
+    num_run: usize,
+    run_from: usize,
+    guidance: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: IdeogramVelocityForward> IdeogramEulerDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle Ideogram Euler driver does not re-noise from clean boundary estimates",
+                geometry_change:
+                    "native Candle Ideogram Euler driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native Candle Ideogram Euler driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        schedule: LogitNormalSchedule,
+        step_intervals: Vec<f64>,
+        num_run: usize,
+        run_from: usize,
+        guidance: f32,
+        forward: F,
+    ) -> CResult<Self> {
+        if run_from > num_run || step_intervals.len() <= num_run {
+            return Err(CandleError::Unsupported(format!(
+                "{driver_id}: invalid Ideogram step range run_from={run_from}, num_run={num_run}, intervals={}",
+                step_intervals.len()
+            )));
+        }
+        Ok(Self {
+            schedule,
+            step_intervals,
+            num_run,
+            run_from,
+            guidance,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    /// Total executed outer steps (`num_run - run_from`).
+    pub fn total_steps(&self) -> usize {
+        self.num_run - self.run_from
+    }
+}
+
+impl<F: IdeogramVelocityForward> FamilyDriver<Tensor> for IdeogramEulerDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let total_run = self.total_steps();
+        if input.span.end > total_run {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: slice span {:?} exceeds {total_run} steps",
+                self.support.driver_id, input.span
+            )));
+        }
+
+        let mut z = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for outer_step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            // Ideogram walks `i = num_run - 1` down to `run_from` (inverted clean-fraction).
+            let i = self.num_run - 1 - outer_step;
+            let t_val = self.schedule.eval(self.step_intervals[i + 1]) as f32;
+            let s_val = self.schedule.eval(self.step_intervals[i]) as f32;
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: t_val,
+                next_sigma: s_val,
+            };
+            hooks.observe(&info, &z)?;
+
+            let pos_v = self
+                .forward
+                .predict_cond(&z, t_val, i, input.cancel)
+                .map_err(gen_core::Error::from)?;
+            let v = match self
+                .forward
+                .predict_uncond(&z, t_val, i, input.cancel)
+                .map_err(gen_core::Error::from)?
+            {
+                Some(neg_v) => {
+                    // Per-step asymmetric CFG (`PIPE-8`): the loop runs i = num_run-1 → 0, so the
+                    // final POLISH_STEPS are i ∈ {0, 1, 2}.
+                    let gw = if i < POLISH_STEPS {
+                        POLISH_GUIDANCE
+                    } else {
+                        self.guidance
+                    };
+                    gen_core::guidance::cfg_linear_blend(
+                        &candle_gen::CandleLatentOps,
+                        &pos_v,
+                        &neg_v,
+                        gw,
+                    )?
+                }
+                // Turbo: CFG-free single DiT (TurboTime LoRA distilled guided velocity into cond).
+                None => pos_v,
+            };
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let step_delta = (v * (s_val - t_val) as f64).map_err(CandleError::from)?;
+            z = (&z + step_delta).map_err(CandleError::from)?;
+            z = hooks.post_step(&info, z)?;
+            hooks.materialize(&info, &z)?;
+            state.record_outer_step(outer_step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(z))
+    }
+}
+
+struct ProductionIdeogramForward<'a> {
+    cond: &'a Ideogram4Transformer,
+    llm_features: &'a Tensor,
+    position_ids: &'a Tensor,
+    prepared_host: HostConditioningIdentity,
+    prepared: &'a PreparedConditioning,
+    neg: Option<(
+        &'a Ideogram4Transformer,
+        &'a PreparedConditioning,
+        &'a Tensor,
+        &'a Tensor,
+        HostConditioningIdentity,
+    )>,
+    text_z_padding: &'a Tensor,
+    num_text: usize,
+    num_img: usize,
+    attention_budget: usize,
+    device: &'a Device,
+}
+
+impl IdeogramVelocityForward for ProductionIdeogramForward<'_> {
+    fn predict_cond(
+        &self,
+        z: &Tensor,
+        t_val: f32,
+        _schedule_step: usize,
+        cancel: &CancelFlag,
+    ) -> CResult<Tensor> {
+        let t = Tensor::from_vec(vec![t_val], 1, self.device)?;
+        let pos_z = Tensor::cat(&[self.text_z_padding, z], 1)?; // [1, seq, ch]
+        let pos_out = self.cond.forward_prepared(
+            &pos_z,
+            &t,
+            self.llm_features,
+            self.position_ids,
+            self.prepared_host,
+            self.prepared,
+            self.attention_budget,
+            cancel,
+        )?;
+        Ok(pos_out.narrow(1, self.num_text, self.num_img)?)
+    }
+
+    fn predict_uncond(
+        &self,
+        z: &Tensor,
+        t_val: f32,
+        _schedule_step: usize,
+        cancel: &CancelFlag,
+    ) -> CResult<Option<Tensor>> {
+        match self.neg {
+            Some((uncond, neg_prepared, neg_llm, neg_position_ids, host)) => {
+                let t = Tensor::from_vec(vec![t_val], 1, self.device)?;
+                Ok(Some(uncond.forward_prepared(
+                    z,
+                    &t,
+                    neg_llm,
+                    neg_position_ids,
+                    host,
+                    neg_prepared,
+                    self.attention_budget,
+                    cancel,
+                )?))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// One flow-matching denoise → packed image latent `[1, num_img, 128]` (f32). With `edit = Some`
 /// (img2img / inpaint) the denoise starts from the source latent noised to a strength-derived step
 /// and (with a mask) pins the keep region per step; `edit = None` is the original text-to-image path.
@@ -841,18 +1103,18 @@ fn denoise(
     // range from pure noise. (Ideogram's schedule is inverted — larger σ = cleaner, so a larger
     // num_run/strength → a smaller start σ → more change.) `init_time_step` floors strength to ≥1 step.
     let num_run = match edit {
-        Some(e) => init_time_step(steps, e.strength),
+        Some(e) => init_time_step(steps, Some(e.strength)),
         None => steps,
     };
 
     // ── Init: always draw the noise (identical RNG stream); blend with the source for an edit ──
     let noise = create_noise(seed, num_img, ch, device)?; // [1, num_img, ch] f32
-    let mut z = match edit {
+    let z0 = match edit {
         Some(e) => add_noise_by_interpolation(&e.z0, &noise, schedule.eval(si[num_run]) as f32)?,
         None => noise.clone(),
     };
     let text_z_padding = Tensor::zeros((1, num_text, ch), DType::F32, device)?;
-    let prepared_input = Tensor::cat(&[&text_z_padding, &z], 1)?;
+    let prepared_input = Tensor::cat(&[&text_z_padding, &z0], 1)?;
     let prepared_host = HostConditioningIdentity::new(&pack.indicator, &pack.segment_ids);
     let prepared = cond.prepare_from_host(
         &llm_features,
@@ -863,37 +1125,28 @@ fn denoise(
         prepared_host,
     )?;
     let neg = match uncond {
-        Some(uncond) => {
+        Some(uncond_dit) => {
             let neg_position_ids =
                 Tensor::from_vec(pack.neg_position_ids.clone(), (1, num_img, 3), device)?;
             let neg_llm = Tensor::zeros((1, num_img, llm_dim), ENC_DTYPE, device)?;
             let host = HostConditioningIdentity::new(&pack.neg_indicator, &pack.neg_segment_ids);
-            let prepared = uncond.prepare_from_host(
+            let prepared = uncond_dit.prepare_from_host(
                 &neg_llm,
-                &z,
+                &z0,
                 &pack.neg_indicator,
                 &pack.neg_segment_ids,
                 &neg_position_ids,
                 host,
             )?;
-            Some((prepared, neg_llm, neg_position_ids, host))
+            Some((uncond_dit, prepared, neg_llm, neg_position_ids, host))
         }
         None => None,
     };
 
     // Per-step latent preview (epic 16948, sc-16955). Ideogram owns a bespoke flow-match loop with no
     // shared-driver call anywhere, so it emits through `candle_gen::preview::emit_preview_at` directly
-    // rather than by handing a hook to a sampler — the `Denoise::Bespoke` shape `candle-gen-catalog`'s
-    // route inventory declares for this crate.
-    //
-    // Keyed on the **step index** rather than on a sigma: this loop walks a `LogitNormalSchedule` whose
-    // σ is inverted (larger = cleaner) and is evaluated per step rather than indexed out of a descending
-    // array, so `PreviewCounter::new(sigmas)` has nothing to key against. `with_steps` is the same
-    // counter shape the σ-less SCM driver uses, and it gives the same guarantees: monotone, bounded by
-    // `num_run`, and one frame per position even if a position were revisited.
-    //
-    // The counter is local to this call, and `render` calls this function once per seed, so a batched
-    // request starts each image's trajectory at frame 1.
+    // via `StepHooks::on_observe` rather than by handing a hook to a curated sampler — the
+    // `Denoise::Bespoke` shape `candle-gen-catalog`'s route inventory declares for this crate.
     //
     // `num_run` — not `steps` — is the total: an edit skips the noisiest leading steps, so a
     // strength-0.5 img2img genuinely runs (and previews) half as many.
@@ -916,91 +1169,101 @@ fn denoise(
             .collect::<Vec<_>>(),
         "clean-fraction-velocity",
     );
-    candle_gen::execution::runtime(z.device(), z.dtype());
+    candle_gen::execution::runtime(z0.device(), z0.dtype());
     candle_gen::execution::policy("ideogram_attention_budget", attention_budget.into());
-    for i in (0..num_run).rev() {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        // Emitted BEFORE the step, matching the shared drivers' contract: the frame shows the latent
-        // this step is about to advance, so the fully denoised state is never previewed (the finished
-        // image lands instead). The loop counts down, so iteration `i` is 0-based position
-        // `num_run - 1 - i`. Projection failures are swallowed inside — a lost decorative frame never
-        // fails a render — and an inert sink never even runs the projection.
+
+    let driver = IdeogramEulerDriver::new(
+        if neg.is_some() {
+            "candle_ideogram_euler_quality"
+        } else {
+            "candle_ideogram_euler_turbo"
+        },
+        schedule,
+        si,
+        num_run,
+        0,
+        guidance,
+        ProductionIdeogramForward {
+            cond,
+            llm_features: &llm_features,
+            position_ids: &position_ids,
+            prepared_host,
+            prepared: &prepared,
+            neg: neg
+                .as_ref()
+                .map(|(u, p, llm, pos, host)| (*u, p, llm, pos, *host)),
+            text_z_padding: &text_z_padding,
+            num_text,
+            num_img,
+            attention_budget,
+            device,
+        },
+    )?;
+
+    let mut driver_state = DriverRunState::new();
+    let mut on_observe = |info: &DriverStepInfo, latent: &Tensor| -> gen_core::Result<()> {
+        // Emitted BEFORE the step, matching the shared drivers' contract: the frame shows the
+        // latent this step is about to advance, so the fully denoised state is never previewed
+        // (the finished image lands instead). `info.outer_step` equals `num_run - 1 - i`.
         candle_gen::preview::emit_preview_at(
             &req.preview,
             &preview_counter,
-            num_run - 1 - i,
+            info.outer_step,
             || match preview_stats {
                 Some((bn_std, bn_mean)) => crate::preview::project_packed_tokens_with_stats(
-                    bn_std, bn_mean, &z, grid_h, grid_w,
+                    bn_std, bn_mean, latent, grid_h, grid_w,
                 ),
                 None => Err(CandleError::Msg(
                     "ideogram: preview BN statistics unavailable".into(),
                 )),
             },
         );
-        let t_val = schedule.eval(si[i + 1]) as f32;
-        let s_val = schedule.eval(si[i]) as f32;
-        let t = Tensor::from_vec(vec![t_val], 1, device)?;
-
-        let pos_z = Tensor::cat(&[&text_z_padding, &z], 1)?; // [1, seq, ch]
-        let pos_out = cond.forward_prepared(
-            &pos_z,
-            &t,
-            &llm_features,
-            &position_ids,
-            prepared_host,
-            &prepared,
-            attention_budget,
-            &req.cancel,
-        )?;
-        let pos_v = pos_out.narrow(1, num_text, num_img)?; // image-token velocities [1, num_img, ch]
-
-        let v = match &neg {
-            Some((neg_prepared, neg_llm, neg_position_ids, host)) => {
-                let neg_v = uncond
-                    .expect("unconditional prepared conditioning has an unconditional DiT")
-                    .forward_prepared(
-                        &z,
-                        &t,
-                        neg_llm,
-                        neg_position_ids,
-                        *host,
-                        neg_prepared,
-                        attention_budget,
-                        &req.cancel,
-                    )?;
-                // Per-step asymmetric CFG: the loop runs i = steps-1 → 0, so the final POLISH_STEPS
-                // are i ∈ {0,1,2}.
-                let gw = if i < POLISH_STEPS {
-                    POLISH_GUIDANCE
-                } else {
-                    guidance
-                };
-                ((pos_v * gw as f64)? + (neg_v * (1.0 - gw) as f64)?)?
-            }
-            // Turbo: CFG-free single DiT (TurboTime LoRA distilled the guided velocity into `cond`).
-            None => pos_v,
-        };
-        z = (&z + (v * (s_val - t_val) as f64)?)?;
-        // Inpaint: pin the keep region (mask 0) to the source re-noised to this step's σ (= s_val, the
-        // post-step time) and regenerate the white region (mask 1). At the final step s≈0 the keep
-        // region is the clean source. Mask is `[1, num_img, 1]`, broadcast over the channel axis;
-        // draws no RNG, so an all-white mask reduces to plain img2img.
+        Ok(())
+    };
+    let mut mask_blend_hook = |info: &DriverStepInfo, latent: Tensor| -> gen_core::Result<Tensor> {
+        // Inpaint: pin the keep region (mask 0) to the source re-noised to this step's σ
+        // (= s_val = info.next_sigma, the post-step time) and regenerate the white region
+        // (mask 1). At the final step s≈0 the keep region is the clean source.
         if let Some(e) = edit {
             if let Some(mask) = &e.mask {
-                let init_noised = add_noise_by_interpolation(&e.z0, &noise, s_val)?;
-                let keep = mask.affine(-1.0, 1.0)?; // 1 − mask
-                z = (z.broadcast_mul(mask)? + init_noised.broadcast_mul(&keep)?)?;
+                let init_noised = add_noise_by_interpolation(&e.z0, &noise, info.next_sigma)
+                    .map_err(gen_core::Error::from)?;
+                let keep = mask.affine(-1.0, 1.0).map_err(CandleError::from)?;
+                return (latent.broadcast_mul(mask).map_err(CandleError::from)?
+                    + init_noised
+                        .broadcast_mul(&keep)
+                        .map_err(CandleError::from)?)
+                .map_err(|err| gen_core::Error::from(CandleError::from(err)));
             }
         }
-        on_progress(Progress::Step {
-            current: (num_run - i) as u32,
-            total: num_run as u32,
-        });
+        Ok(latent)
+    };
+    let mut hooks = StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut on_observe);
+    if edit.is_some_and(|e| e.mask.is_some()) {
+        hooks.on_post_step = Some(&mut mask_blend_hook);
     }
-    Ok(z)
+    let slice = SliceSpec {
+        geometry: Some((width, height)),
+        ..SliceSpec::full(num_run)
+    };
+    let out = run_candle_driver_slices(
+        &driver,
+        [slice],
+        gen_core::BoundaryState::XSigma(z0),
+        num_run,
+        seed,
+        &req.cancel,
+        None,
+        &mut driver_state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    Ok(match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    })
 }
 
 /// De-normalize (bn) → (ph,pw,c) unpatchify → VAE decode → RGB image. When a PiD decoder resolved
@@ -1168,19 +1431,6 @@ pub struct EditInit {
     pub mask: Option<Tensor>,
     /// img2img strength in `(0, 1]` — fraction of the denoise executed from the noised source.
     pub strength: f32,
-}
-
-/// img2img start step (the flux2/fork `init_time_step`): `max(1, floor(num_steps·strength))` for a
-/// positive strength clamped to `[0,1]`, else `0`. The denoise executes the lowest `num_run` steps
-/// over the source noised to `schedule.eval(si[num_run])`.
-fn init_time_step(num_steps: usize, strength: f32) -> usize {
-    if strength > 0.0 {
-        let s = strength.clamp(0.0, 1.0);
-        // `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-        ((num_steps as f32 * s) as usize).max(1)
-    } else {
-        0
-    }
 }
 
 /// Flow-matching interpolation `z = σ·clean + (1−σ)·noise`. Ideogram's [`LogitNormalSchedule`] is
@@ -1414,12 +1664,12 @@ mod tests {
 
     #[test]
     fn init_time_step_floors_and_clamps() {
-        assert_eq!(init_time_step(48, 0.0), 0); // no strength → no edit steps
-        assert_eq!(init_time_step(48, 1.0), 48); // full strength → full range
-        assert_eq!(init_time_step(48, 0.5), 24); // floor(48·0.5)
-        assert_eq!(init_time_step(48, 0.6), 28); // floor(28.8)
-        assert_eq!(init_time_step(48, 0.001), 1); // tiny positive floors to ≥1
-        assert_eq!(init_time_step(8, 2.0), 8); // strength clamps to 1.0
+        assert_eq!(init_time_step(48, Some(0.0)), 0); // no strength → no edit steps
+        assert_eq!(init_time_step(48, Some(1.0)), 48); // full strength → full range
+        assert_eq!(init_time_step(48, Some(0.5)), 24); // floor(48·0.5)
+        assert_eq!(init_time_step(48, Some(0.6)), 28); // floor(28.8)
+        assert_eq!(init_time_step(48, Some(0.001)), 1); // tiny positive floors to ≥1
+        assert_eq!(init_time_step(8, Some(2.0)), 8); // strength clamps to 1.0
     }
 
     #[test]
@@ -1553,5 +1803,302 @@ mod tests {
             None,
         );
         assert!(resolve_edit(&r).is_err());
+    }
+
+    struct MockIdeogramForward {
+        with_uncond: bool,
+    }
+
+    impl IdeogramVelocityForward for MockIdeogramForward {
+        fn predict_cond(
+            &self,
+            z: &Tensor,
+            t_val: f32,
+            schedule_step: usize,
+            cancel: &CancelFlag,
+        ) -> CResult<Tensor> {
+            if cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            let scale = (0.15 + 0.05 * t_val + 0.01 * (schedule_step as f32)) as f64;
+            Ok(z.affine(scale, 0.25)?)
+        }
+
+        fn predict_uncond(
+            &self,
+            z: &Tensor,
+            t_val: f32,
+            schedule_step: usize,
+            cancel: &CancelFlag,
+        ) -> CResult<Option<Tensor>> {
+            if cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            if !self.with_uncond {
+                return Ok(None);
+            }
+            let scale = (-0.08 + 0.02 * t_val - 0.005 * (schedule_step as f32)) as f64;
+            Ok(Some(z.affine(scale, -0.1)?))
+        }
+    }
+
+    fn candle_tensors_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn ideogram_euler_driver_quality_passes_tier0_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let (mu, std) = preset_mu_std(6);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(6);
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 42,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(
+                    IdeogramEulerDriver::new(
+                        "candle_ideogram_euler_quality",
+                        schedule,
+                        si.clone(),
+                        6,
+                        0,
+                        7.0,
+                        MockIdeogramForward { with_uncond: true },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![0.4f32, -0.7, 0.25, 1.1], (1, 2, 2), &Device::Cpu).unwrap()
+            },
+            latents_equal: candle_tensors_bit_equal,
+        })
+        .expect("Candle Ideogram quality driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn ideogram_euler_driver_turbo_passes_tier0_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let (mu, std) = preset_mu_std(6);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(6);
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 2,
+            seed: 99,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(
+                    IdeogramEulerDriver::new(
+                        "candle_ideogram_euler_turbo",
+                        schedule,
+                        si.clone(),
+                        6,
+                        0,
+                        7.0,
+                        MockIdeogramForward { with_uncond: false },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![-0.3f32, 0.8, -0.5, 0.2], (1, 2, 2), &Device::Cpu).unwrap()
+            },
+            latents_equal: candle_tensors_bit_equal,
+        })
+        .expect("Candle Ideogram turbo driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn ideogram_euler_driver_preserves_polish_mask_blend_preview_and_early_stop_bit_exact() {
+        let dev = Device::Cpu;
+        let num_steps = 6usize;
+        let guidance = 7.0f32;
+        let (mu, std) = preset_mu_std(num_steps);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(num_steps);
+        let z0_init = Tensor::from_vec(vec![0.5f32, -0.25, 0.75, -1.0], (1, 2, 2), &dev).unwrap();
+        let clean = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], (1, 2, 2), &dev).unwrap();
+        let noise = Tensor::from_vec(vec![-0.6f32, 0.9, -0.2, 0.5], (1, 2, 2), &dev).unwrap();
+        let mask = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2, 1), &dev).unwrap();
+        let mock = MockIdeogramForward { with_uncond: true };
+        let cancel = CancelFlag::new();
+
+        // 1. Quality + inpaint mask blend over full 6 steps vs direct pre-migration reference.
+        let mut expected = z0_init.clone();
+        let mut expected_sigmas = Vec::new();
+        for i in (0..num_steps).rev() {
+            let t_val = schedule.eval(si[i + 1]) as f32;
+            let s_val = schedule.eval(si[i]) as f32;
+            expected_sigmas.push(t_val);
+            let pos_v = mock.predict_cond(&expected, t_val, i, &cancel).unwrap();
+            let neg_v = mock
+                .predict_uncond(&expected, t_val, i, &cancel)
+                .unwrap()
+                .unwrap();
+            let gw = if i < POLISH_STEPS {
+                POLISH_GUIDANCE
+            } else {
+                guidance
+            };
+            let v = ((pos_v * gw as f64).unwrap() + (neg_v * (1.0 - gw) as f64).unwrap()).unwrap();
+            expected = (&expected + (v * (s_val - t_val) as f64).unwrap()).unwrap();
+            let init_noised = add_noise_by_interpolation(&clean, &noise, s_val).unwrap();
+            let keep = mask.affine(-1.0, 1.0).unwrap();
+            expected = (expected.broadcast_mul(&mask).unwrap()
+                + init_noised.broadcast_mul(&keep).unwrap())
+            .unwrap();
+        }
+
+        let driver = IdeogramEulerDriver::new(
+            "candle_ideogram_euler_quality",
+            schedule,
+            si.clone(),
+            num_steps,
+            0,
+            guidance,
+            MockIdeogramForward { with_uncond: true },
+        )
+        .unwrap();
+        let mut state = DriverRunState::new();
+        let mut observed_positions = Vec::new();
+        let mut observed_sigmas = Vec::new();
+        let mut progress_seen = Vec::new();
+        let mut on_progress = |p: Progress| progress_seen.push(p);
+        let mut on_observe = |info: &DriverStepInfo, _z: &Tensor| -> gen_core::Result<()> {
+            observed_positions.push(info.outer_step);
+            observed_sigmas.push(info.sigma);
+            Ok(())
+        };
+        let mut on_post_step =
+            |info: &DriverStepInfo, latent: Tensor| -> gen_core::Result<Tensor> {
+                let init_noised =
+                    add_noise_by_interpolation(&clean, &noise, info.next_sigma).unwrap();
+                let keep = mask.affine(-1.0, 1.0).unwrap();
+                Ok((latent.broadcast_mul(&mask).unwrap()
+                    + init_noised.broadcast_mul(&keep).unwrap())
+                .unwrap())
+            };
+        let mut hooks = StepHooks::new(&mut on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        hooks.on_post_step = Some(&mut on_post_step);
+
+        let out = run_candle_driver_slices(
+            &driver,
+            [SliceSpec::full(num_steps)],
+            gen_core::BoundaryState::XSigma(z0_init.clone()),
+            num_steps,
+            11,
+            &cancel,
+            None,
+            &mut state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let got = match out {
+            gen_core::BoundaryState::XSigma(x) => x,
+            _ => panic!("expected XSigma"),
+        };
+        assert!(
+            candle_tensors_bit_equal(&got, &expected),
+            "Candle Ideogram driver must be bit-identical to pre-migration loop"
+        );
+        assert_eq!(observed_positions, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(observed_sigmas, expected_sigmas);
+        assert_eq!(progress_seen.len(), num_steps);
+
+        // 2. Early-stop `run_from = 2` executes only steps i={5,4,3,2} (4 steps).
+        let run_from = 2usize;
+        let total_run = num_steps - run_from;
+        let mut expected_early = z0_init.clone();
+        for i in (run_from..num_steps).rev() {
+            let t_val = schedule.eval(si[i + 1]) as f32;
+            let s_val = schedule.eval(si[i]) as f32;
+            let pos_v = mock
+                .predict_cond(&expected_early, t_val, i, &cancel)
+                .unwrap();
+            let neg_v = mock
+                .predict_uncond(&expected_early, t_val, i, &cancel)
+                .unwrap()
+                .unwrap();
+            let gw = if i < POLISH_STEPS {
+                POLISH_GUIDANCE
+            } else {
+                guidance
+            };
+            let v = ((pos_v * gw as f64).unwrap() + (neg_v * (1.0 - gw) as f64).unwrap()).unwrap();
+            expected_early = (&expected_early + (v * (s_val - t_val) as f64).unwrap()).unwrap();
+        }
+        let early_driver = IdeogramEulerDriver::new(
+            "candle_ideogram_euler_quality",
+            schedule,
+            si,
+            num_steps,
+            run_from,
+            guidance,
+            MockIdeogramForward { with_uncond: true },
+        )
+        .unwrap();
+        let mut early_state = DriverRunState::new();
+        let mut early_progress = Vec::new();
+        let mut on_early_progress = |p: Progress| early_progress.push(p);
+        let mut early_hooks = StepHooks::new(&mut on_early_progress);
+        let early_out = run_candle_driver_slices(
+            &early_driver,
+            [SliceSpec::full(total_run)],
+            gen_core::BoundaryState::XSigma(z0_init),
+            total_run,
+            11,
+            &cancel,
+            None,
+            &mut early_state,
+            &mut early_hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let got_early = match early_out {
+            gen_core::BoundaryState::XSigma(x) => x,
+            _ => panic!("expected XSigma"),
+        };
+        assert!(candle_tensors_bit_equal(&got_early, &expected_early));
+        assert_eq!(
+            early_progress,
+            vec![
+                Progress::Step {
+                    current: 1,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 3,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 4,
+                    total: 4
+                },
+            ]
+        );
     }
 }

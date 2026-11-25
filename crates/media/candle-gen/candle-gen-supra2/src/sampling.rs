@@ -1,11 +1,16 @@
-//! Upstream's sampling loop (`inference.py::generate`) on Candle — the same free functions as the MLX
-//! twin's `sampling` module (`broadcast`, `velocity`, `denoise` over a [`ContextBatch`]), so the
-//! weights-free tiny fixture exercises exactly the code the provider runs on both backends: uniform
-//! Euler integration of the flow ODE from noise (`t = 0`) to data, with batched classifier-free
-//! guidance when an unconditional context is supplied.
+//! Upstream's sampling loop (`inference.py::generate`) on Candle, routed through the typed
+//! [`FamilyDriver`] contract ([`Supra2EulerDriver`], `SW-6970`) — the same free functions as the
+//! MLX twin's `sampling` module (`broadcast`, `velocity`, `denoise` over a [`ContextBatch`]):
+//! uniform Euler integration of the flow ODE from noise (`t = 0`) to data, with batched `2B`
+//! classifier-free guidance via [`gen_core::guidance::cfg`] (`PIPE-8`) when an unconditional
+//! context is supplied.
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::{CancelFlag, Progress};
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use candle_gen::gen_core::{self, CancelFlag, Progress};
 use candle_gen::{CandleError as Error, Result};
 use gen_core_checkpoint::supra2::{euler_dt, euler_timesteps};
 
@@ -27,16 +32,30 @@ pub fn broadcast(context: &Tensor, mask01: &[f32], n: usize) -> Result<(Tensor, 
     Ok((ctx, mask))
 }
 
-/// One velocity evaluation, upstream's loop body: with `uncond`, the conditional and unconditional
-/// halves run as one `2B` batch and mix as `v_u + g·(v_c − v_u)`; without, a plain conditional pass.
-pub fn velocity(
+/// Forward evaluation seam for Candle Supra2 uniform-Euler flow denoising (`SW-6970`, `PIPE-7`).
+///
+/// Generic over raw conditional + optional unconditional velocity prediction so weights-free
+/// Tier 0 `DriverSupport` conformance tests can drive [`Supra2EulerDriver`] over mocked forwards
+/// without loading model weights.
+pub trait Supra2VelocityForward {
+    /// Predict the conditional velocity and optional unconditional velocity `[B, C, S, S]` at flow
+    /// time `t` and 0-based `step_index`. When `Some(vu)` is returned, [`Supra2EulerDriver`]
+    /// combines `(vc, vu)` through shared [`gen_core::guidance::cfg`] (`PIPE-8`).
+    fn predict_velocity(
+        &self,
+        z: &Tensor,
+        t: f32,
+        step_index: usize,
+    ) -> Result<(Tensor, Option<Tensor>)>;
+}
+
+fn predict_velocity_with_dit(
     dit: &SupraDit,
     z: &Tensor,
     t: f32,
     cond: ContextBatch<'_>,
     uncond: Option<ContextBatch<'_>>,
-    guidance: f32,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Option<Tensor>)> {
     let n = z.dim(0)?;
     match uncond {
         Some(u) => {
@@ -47,17 +66,198 @@ pub fn velocity(
             let both = dit.forward(&z2, &tf, &ctx, &mask)?;
             let vc = both.narrow(0, 0, n)?;
             let vu = both.narrow(0, n, n)?;
-            Ok((&vu + ((vc - &vu)? * guidance as f64)?)?)
+            Ok((vc, Some(vu)))
         }
         None => {
             let tf = dit.timestep_features(&vec![t; n])?;
-            dit.forward(z, &tf, cond.context, cond.mask)
+            Ok((dit.forward(z, &tf, cond.context, cond.mask)?, None))
         }
     }
 }
 
-/// Integrate `z0` over `steps` uniform Euler steps (`z += dt · v`). CFG runs iff `uncond` is
-/// supplied — callers pass it exactly when
+/// One velocity evaluation, upstream's loop body: with `uncond`, the conditional and unconditional
+/// halves run as one `2B` batch and mix via [`gen_core::guidance::cfg`] (`v_u + g·(v_c − v_u)`);
+/// without, a plain conditional pass.
+pub fn velocity(
+    dit: &SupraDit,
+    z: &Tensor,
+    t: f32,
+    cond: ContextBatch<'_>,
+    uncond: Option<ContextBatch<'_>>,
+    guidance: f32,
+) -> Result<Tensor> {
+    let (vc, vu) = predict_velocity_with_dit(dit, z, t, cond, uncond)?;
+    match vu {
+        Some(vu) => Ok(gen_core::guidance::cfg(
+            &candle_gen::CandleLatentOps,
+            &vc,
+            &vu,
+            guidance,
+        )?),
+        None => Ok(vc),
+    }
+}
+
+/// Typed [`FamilyDriver`] for Candle Supra2-IMG uniform-Euler rectified-flow denoising (`SW-6970`,
+/// `PIPE-7`, `PIPE-8`).
+pub struct Supra2EulerDriver<F> {
+    timesteps: Vec<f32>,
+    dt: f32,
+    guidance: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: Supra2VelocityForward> Supra2EulerDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle Supra2 Euler driver does not re-noise from clean boundary estimates",
+                geometry_change:
+                    "native Candle Supra2 Euler driver runs at fixed 256x256 geometry and refuses geometry changes",
+                read_only_boundary_estimate:
+                    "native Candle Supra2 Euler driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(steps: u32, guidance: f32, forward: F) -> Result<Self> {
+        if steps == 0 {
+            return Err(Error::Unsupported(
+                "supra2: steps must be at least 1".into(),
+            ));
+        }
+        Ok(Self {
+            timesteps: euler_timesteps(steps),
+            dt: euler_dt(steps),
+            guidance,
+            forward,
+            support: Self::build_support("candle_supra2_euler"),
+        })
+    }
+
+    /// Number of uniform Euler steps in this schedule.
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len()
+    }
+
+    /// The uniform flow timesteps (`0, 1/steps, ..., (steps-1)/steps`).
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
+    }
+
+    /// The uniform step size `1 / steps`.
+    pub fn dt(&self) -> f32 {
+        self.dt
+    }
+}
+
+impl<F: Supra2VelocityForward> FamilyDriver<Tensor> for Supra2EulerDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        if input.span.end > self.timesteps.len() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: slice span {:?} exceeds {} steps",
+                self.support.driver_id,
+                input.span,
+                self.timesteps.len()
+            )));
+        }
+
+        let mut z = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        let dt = self.dt as f64;
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let t = self.timesteps[step];
+            let next_t = if step + 1 < self.timesteps.len() {
+                self.timesteps[step + 1]
+            } else {
+                1.0
+            };
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: t,
+                next_sigma: next_t,
+            };
+            hooks.observe(&info, &z)?;
+
+            let (vc, vu) = self
+                .forward
+                .predict_velocity(&z, t, step)
+                .map_err(gen_core::Error::from)?;
+            let v = match vu {
+                Some(vu) => {
+                    gen_core::guidance::cfg(&candle_gen::CandleLatentOps, &vc, &vu, self.guidance)?
+                }
+                None => vc,
+            };
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let step_delta = (v * dt).map_err(Error::from)?;
+            z = (&z + step_delta).map_err(Error::from)?;
+            z = hooks.post_step(&info, z)?;
+            hooks.materialize(&info, &z)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(z))
+    }
+}
+
+struct ProductionSupra2Forward<'a> {
+    dit: &'a SupraDit,
+    cond: ContextBatch<'a>,
+    uncond: Option<ContextBatch<'a>>,
+}
+
+impl Supra2VelocityForward for ProductionSupra2Forward<'_> {
+    fn predict_velocity(
+        &self,
+        z: &Tensor,
+        t: f32,
+        _step_index: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        predict_velocity_with_dit(self.dit, z, t, self.cond, self.uncond)
+    }
+}
+
+/// Integrate `z0` over `steps` uniform Euler steps (`z += dt · v`) via [`Supra2EulerDriver`].
+/// CFG runs iff `uncond` is supplied — callers pass it exactly when
 /// [`cfg_enabled`](gen_core_checkpoint::supra2::cfg_enabled) holds for `guidance`. Checks
 /// `cancel` before every step and reports 1-based step progress.
 #[allow(clippy::too_many_arguments)]
@@ -71,29 +271,176 @@ pub fn denoise(
     cancel: &CancelFlag,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Tensor> {
-    if steps == 0 {
-        return Err(Error::Unsupported(
-            "supra2: steps must be at least 1".into(),
-        ));
-    }
-    let dt = euler_dt(steps) as f64;
+    let driver = Supra2EulerDriver::new(
+        steps,
+        guidance,
+        ProductionSupra2Forward { dit, cond, uncond },
+    )?;
+    let dt = driver.dt() as f64;
     candle_gen::execution::runtime(z0.device(), z0.dtype());
-    candle_gen::execution::schedule("supra2-euler", &euler_timesteps(steps), "flow-velocity");
+    candle_gen::execution::schedule("supra2-euler", driver.timesteps(), "flow-velocity");
     candle_gen::execution::policy(
         "supra2_guidance",
         serde_json::json!({"guidance_bits":guidance.to_bits(),"cfg":uncond.is_some(),"dt_bits":dt.to_bits()}),
     );
-    let mut z = z0;
-    for (i, t) in euler_timesteps(steps).into_iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let v = velocity(dit, &z, t, cond, uncond, guidance)?;
-        z = (&z + (v * dt)?)?;
-        progress(Progress::Step {
-            current: i as u32 + 1,
-            total: steps,
-        });
+    let total_steps = steps as usize;
+    let mut state = DriverRunState::new();
+    let mut hooks = StepHooks::new(progress);
+    let out = run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        gen_core::BoundaryState::XSigma(z0),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    Ok(match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+    use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+    struct MockSupra2Forward {
+        with_uncond: bool,
     }
-    Ok(z)
+
+    impl Supra2VelocityForward for MockSupra2Forward {
+        fn predict_velocity(
+            &self,
+            z: &Tensor,
+            t: f32,
+            step_index: usize,
+        ) -> Result<(Tensor, Option<Tensor>)> {
+            let scale_c = (0.2 + 0.1 * t + 0.01 * (step_index as f32)) as f64;
+            let vc = z.affine(scale_c, 0.15)?;
+            if !self.with_uncond {
+                return Ok((vc, None));
+            }
+            let scale_u = (-0.05 + 0.04 * t - 0.005 * (step_index as f32)) as f64;
+            let vu = z.affine(scale_u, -0.05)?;
+            Ok((vc, Some(vu)))
+        }
+    }
+
+    fn tensors_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn supra2_euler_driver_cfg_passes_tier0_conformance() {
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 13,
+            base_geometry: (256, 256),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                Box::new(
+                    Supra2EulerDriver::new(6, 3.0, MockSupra2Forward { with_uncond: true })
+                        .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![0.25f32, -0.5, 0.75, -1.0], (1, 1, 2, 2), &Device::Cpu)
+                    .unwrap()
+            },
+            latents_equal: tensors_bit_equal,
+        })
+        .expect("Candle Supra2 CFG driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn supra2_euler_driver_unguided_passes_tier0_conformance() {
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 29,
+            base_geometry: (256, 256),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                Box::new(
+                    Supra2EulerDriver::new(4, 1.0, MockSupra2Forward { with_uncond: false })
+                        .unwrap(),
+                )
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![-0.4f32, 0.6, 0.1, -0.8], (1, 1, 2, 2), &Device::Cpu).unwrap()
+            },
+            latents_equal: tensors_bit_equal,
+        })
+        .expect("Candle Supra2 unguided driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn supra2_euler_driver_preserves_euler_cfg_and_zero_step_refusal_bit_exact() {
+        assert!(matches!(
+            Supra2EulerDriver::new(0, 3.0, MockSupra2Forward { with_uncond: true }),
+            Err(Error::Unsupported(_))
+        ));
+
+        let steps = 5u32;
+        let guidance = 3.5f32;
+        let z0 =
+            Tensor::from_vec(vec![0.5f32, -0.25, 0.75, -1.25], (1, 1, 2, 2), &Device::Cpu).unwrap();
+        let mock = MockSupra2Forward { with_uncond: true };
+
+        let dt = euler_dt(steps) as f64;
+        let mut expected = z0.clone();
+        for (i, t) in euler_timesteps(steps).into_iter().enumerate() {
+            let (vc, vu) = mock.predict_velocity(&expected, t, i).unwrap();
+            let vu = vu.unwrap();
+            let v = (&vu + ((vc - &vu).unwrap() * guidance as f64).unwrap()).unwrap();
+            expected = (&expected + (v * dt).unwrap()).unwrap();
+        }
+
+        let driver =
+            Supra2EulerDriver::new(steps, guidance, MockSupra2Forward { with_uncond: true })
+                .unwrap();
+        let cancel = CancelFlag::new();
+        let mut state = DriverRunState::new();
+        let mut on_progress = |_p: Progress| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let out = run_candle_driver_slices(
+            &driver,
+            [SliceSpec::full(steps as usize)],
+            gen_core::BoundaryState::XSigma(z0),
+            steps as usize,
+            0,
+            &cancel,
+            None,
+            &mut state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let got = match out {
+            gen_core::BoundaryState::XSigma(x) => x,
+            _ => panic!("expected XSigma"),
+        };
+        assert!(
+            tensors_bit_equal(&got, &expected),
+            "Candle Supra2 driver must be bit-identical to pre-migration Euler+CFG loop"
+        );
+    }
 }

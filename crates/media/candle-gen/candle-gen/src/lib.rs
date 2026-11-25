@@ -131,6 +131,14 @@ pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecode
 // Canonical SDXL-family `scaled_linear` schedule parameters shared by inference and training.
 pub mod diffusion_schedule;
 
+// Typed bespoke-loop FamilyDriver contract bindings (PIPE-7 / B3).
+pub mod driver;
+pub use driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate,
+    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
+
 /// Attempt-local observations of completed provider execution.
 pub mod execution;
 
@@ -169,7 +177,8 @@ pub use sampler::{
     run_curated_sampler, run_curated_sampler_with_phase_transition_spans, run_flow_sampler,
     run_flow_sampler_spans, run_flow_sampler_with_phase_transition_spans, run_scm_sampler,
     run_scm_sampler_from, AvLatents, CandleAvLatentOps, CandleLatentOps, CandlePhaseTransitionFn,
-    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+    ScmDriver, ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP,
+    SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,

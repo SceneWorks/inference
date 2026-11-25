@@ -25,6 +25,12 @@ use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtr
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use mlx_gen::gen_core;
+use mlx_gen::gen_core::sampling::init_time_step;
 use mlx_gen::image::{resize_lanczos_u8, resize_nearest_u8};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
@@ -67,16 +73,216 @@ pub struct EditInit {
     pub strength: f32,
 }
 
-/// img2img start step (the flux2/fork `init_time_step`): `max(1, floor(num_steps·strength))` for a
-/// positive strength clamped to `[0,1]`, else `0`. The denoise executes the lowest `num_run` steps
-/// (the high-noise prefix is skipped) over the source noised to `schedule.eval(si[num_run])`.
-fn init_time_step(num_steps: usize, strength: f32) -> usize {
-    if strength > 0.0 {
-        let s = strength.clamp(0.0, 1.0);
-        // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-        ((num_steps as f32 * s) as usize).max(1)
-    } else {
-        0
+/// Forward evaluation seam for MLX Ideogram 4 flow-matching Euler denoising (`SW-6970`, `PIPE-7`).
+///
+/// Generic over conditional + optional unconditional velocity prediction so weights-free Tier 0
+/// `DriverSupport` conformance tests can drive [`IdeogramEulerDriver`] over mocked forwards
+/// without loading model weights.
+pub trait IdeogramVelocityForward {
+    /// Predict the conditional image-token velocity `[1, num_img, ch]` at clean-fraction time
+    /// `t_val` and descending schedule index `schedule_step` (`num_run - 1` down to `run_from`).
+    fn predict_cond(&self, z: &Array, t_val: f32, schedule_step: usize) -> Result<Array>;
+
+    /// Predict the unconditional image-token velocity `[1, num_img, ch]` for asymmetric two-DiT
+    /// CFG (`Some` in quality mode, `None` in CFG-free turbo mode).
+    fn predict_uncond(&self, z: &Array, t_val: f32, schedule_step: usize) -> Result<Option<Array>>;
+}
+
+/// Typed [`FamilyDriver`] for MLX Ideogram 4 quality (asymmetric two-DiT CFG with polish tail)
+/// and turbo (CFG-free single-DiT) flow-matching Euler denoising (`SW-6970`, `PIPE-7`, `PIPE-8`).
+pub struct IdeogramEulerDriver<F> {
+    schedule: LogitNormalSchedule,
+    step_intervals: Vec<f64>,
+    num_run: usize,
+    run_from: usize,
+    guidance: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: IdeogramVelocityForward> IdeogramEulerDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native MLX Ideogram Euler driver does not re-noise from clean boundary estimates",
+                geometry_change:
+                    "native MLX Ideogram Euler driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native MLX Ideogram Euler driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        schedule: LogitNormalSchedule,
+        step_intervals: Vec<f64>,
+        num_run: usize,
+        run_from: usize,
+        guidance: f32,
+        forward: F,
+    ) -> Result<Self> {
+        if run_from > num_run || step_intervals.len() <= num_run {
+            return Err(Error::Unsupported(format!(
+                "{driver_id}: invalid Ideogram step range run_from={run_from}, num_run={num_run}, intervals={}",
+                step_intervals.len()
+            )));
+        }
+        Ok(Self {
+            schedule,
+            step_intervals,
+            num_run,
+            run_from,
+            guidance,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    /// Total executed outer steps (`num_run - run_from`).
+    pub fn total_steps(&self) -> usize {
+        self.num_run - self.run_from
+    }
+}
+
+impl<F: IdeogramVelocityForward> FamilyDriver<Array> for IdeogramEulerDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let total_run = self.total_steps();
+        if input.span.end > total_run {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: slice span {:?} exceeds {total_run} steps",
+                self.support.driver_id, input.span
+            )));
+        }
+
+        let mut z = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+
+        for outer_step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            // Ideogram walks `i = num_run - 1` down to `run_from` (inverted clean-fraction).
+            let i = self.num_run - 1 - outer_step;
+            let t_val = self.schedule.eval(self.step_intervals[i + 1]);
+            let s_val = self.schedule.eval(self.step_intervals[i]);
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: t_val as f32,
+                next_sigma: s_val as f32,
+            };
+            hooks.observe(&info, &z)?;
+
+            let pos_v = self
+                .forward
+                .predict_cond(&z, t_val as f32, i)
+                .map_err(gen_core::Error::from)?;
+            let v = match self
+                .forward
+                .predict_uncond(&z, t_val as f32, i)
+                .map_err(gen_core::Error::from)?
+            {
+                Some(neg_v) => {
+                    // Per-step asymmetric CFG (`PIPE-8`): `v = gw·pos_v + (1−gw)·neg_v`. The
+                    // reference drops to POLISH_GUIDANCE for the final POLISH_STEPS low-noise steps
+                    // (`i ∈ {0, 1, 2}`); base `guidance` drives the main steps.
+                    let gw_i = if i < POLISH_STEPS {
+                        POLISH_GUIDANCE
+                    } else {
+                        self.guidance
+                    };
+                    gen_core::guidance::cfg_linear_blend(
+                        &mlx_gen::MlxLatentOps,
+                        &pos_v,
+                        &neg_v,
+                        gw_i,
+                    )?
+                }
+                // Turbo (issue #488): CFG-free single DiT — velocity is `pos_v` directly.
+                None => pos_v,
+            };
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let dt = Array::from_f32((s_val - t_val) as f32);
+            let step_delta = multiply(&v, dt).map_err(|e| gen_core::Error::from(Error::from(e)))?;
+            z = add(&z, &step_delta).map_err(|e| gen_core::Error::from(Error::from(e)))?;
+            z = hooks.post_step(&info, z)?;
+            hooks.materialize(&info, &z)?;
+            state.record_outer_step(outer_step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(z))
+    }
+}
+
+struct ProductionIdeogramForward<'a> {
+    cond: &'a Ideogram4Transformer,
+    cond_prep: &'a crate::transformer::model::PreparedConditioning,
+    neg: Option<(
+        &'a Ideogram4Transformer,
+        &'a crate::transformer::model::PreparedConditioning,
+    )>,
+    text_z_padding: &'a Array,
+    num_text: i32,
+}
+
+impl IdeogramVelocityForward for ProductionIdeogramForward<'_> {
+    fn predict_cond(&self, z: &Array, t_val: f32, _schedule_step: usize) -> Result<Array> {
+        let t = Array::from_slice(&[t_val], &[1]);
+        let pos_z = concatenate_axis(&[self.text_z_padding, z], 1)?;
+        let pos_out = self
+            .cond
+            .forward_prepared(&pos_z, &t, self.cond_prep, None)?;
+        // Image-token velocities = the `[num_text..seq)` suffix — a zero-copy strided split at the
+        // fixed text/image boundary, vs. an arange `take_axis` gather rebuilt every step (F-152).
+        Ok(split_sections(&pos_out, &[self.num_text], 1)?.swap_remove(1))
+    }
+
+    fn predict_uncond(
+        &self,
+        z: &Array,
+        t_val: f32,
+        _schedule_step: usize,
+    ) -> Result<Option<Array>> {
+        match self.neg {
+            Some((uncond, neg_prep)) => {
+                let t = Array::from_slice(&[t_val], &[1]);
+                Ok(Some(uncond.forward_prepared(z, &t, neg_prep, None)?))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -385,7 +591,7 @@ impl Ideogram4Heavy {
         capture_sigma: Option<f32>,
     ) -> Option<(f32, usize)> {
         let num_run = match strength {
-            Some(s) => init_time_step(num_steps, s),
+            Some(s) => init_time_step(num_steps, Some(s)),
             None => num_steps,
         };
         if num_run == 0 {
@@ -527,14 +733,14 @@ impl Ideogram4Heavy {
         // larger `num_run`/strength → a smaller start σ → more change). T2I runs the full range from
         // pure noise. `init_time_step` floors a positive strength to ≥1 step.
         let num_run = match edit {
-            Some(e) => init_time_step(num_steps, e.strength),
+            Some(e) => init_time_step(num_steps, Some(e.strength)),
             None => num_steps,
         };
 
         // ── Init: always draw the noise (identical RNG stream); blend with the source for an edit ──
         let key = random::key(seed)?;
         let noise = random::normal::<f32>(&[1, num_img, ch], None, None, Some(&key))?;
-        let mut z = match edit {
+        let z0 = match edit {
             Some(e) => {
                 add_noise_by_interpolation(&e.z0, &noise, schedule.eval(si[num_run]) as f32)?
             }
@@ -542,86 +748,104 @@ impl Ideogram4Heavy {
         };
         let text_z_padding = zeros(&[1, num_text, ch])?;
 
-        // ── Flow-matching Euler denoise (high → low noise) ──
+        // ── Flow-matching Euler denoise (high → low noise) via typed FamilyDriver (`SW-6970`) ──
         // PiD `from_ldm` early-stop (sc-8048): stop at `run_from` instead of `0`, so only the
         // `num_run − run_from` high-noise steps run and the latent is left at the capture σ (the clean
         // low-noise polish tail `i < run_from` is skipped). `run_from == 0` → the full range (byte-
-        // identical clean path). `total` counts the executed steps so progress still reaches 100%.
+        // identical clean path). `total_run` counts the executed steps so progress still reaches 100%.
         let total_run = num_run - run_from;
         let preview_sigmas: Vec<f32> = (run_from..=num_run)
             .rev()
             .map(|step| schedule.eval(si[step]) as f32)
             .collect();
         let previews = mlx_gen::preview::PreviewCounter::new(&preview_sigmas);
-        for i in (run_from..num_run).rev() {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let t_val = schedule.eval(si[i + 1]);
-            let s_val = schedule.eval(si[i]);
-            let t = Array::from_slice(&[t_val as f32], &[1]);
-
+        let cfg_active = neg.is_some();
+        let driver = IdeogramEulerDriver::new(
+            if cfg_active {
+                "mlx_ideogram_euler_quality"
+            } else {
+                "mlx_ideogram_euler_turbo"
+            },
+            schedule,
+            si.clone(),
+            num_run,
+            run_from,
+            guidance,
+            ProductionIdeogramForward {
+                cond: &self.cond,
+                cond_prep: &cond_prep,
+                neg: neg.as_ref().map(|(u, p)| (*u, p)),
+                text_z_padding: &text_z_padding,
+                num_text,
+            },
+        )?;
+        let mut driver_state = DriverRunState::new();
+        let mut on_observe = |info: &DriverStepInfo, latent: &Array| -> gen_core::Result<()> {
             mlx_gen_flux2::preview::emit_ideogram_preview(
                 preview,
                 &previews,
                 &preview_sigmas,
-                t_val as f32,
-                &z,
+                info.sigma,
+                latent,
                 grid_h,
                 grid_w,
                 &self.vae,
             );
-
-            let pos_z = concatenate_axis(&[&text_z_padding, &z], 1)?;
-            let pos_out = self.cond.forward_prepared(&pos_z, &t, &cond_prep, None)?;
-            // Image-token velocities = the `[num_text..seq)` suffix — a zero-copy strided split at the
-            // fixed text/image boundary, vs. an arange `take_axis` gather rebuilt every step (F-152).
-            let pos_v = split_sections(&pos_out, &[num_text], 1)?.swap_remove(1);
-
-            let v = match &neg {
-                Some((uncond, neg_prep)) => {
-                    let neg_v = uncond.forward_prepared(&z, &t, neg_prep, None)?;
-                    // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a
-                    // per-step guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps,
-                    // dropping to 3.0 for the final 3 "polish" steps) — a CONSTANT high guidance
-                    // over-cooks the low-noise detail steps and "splatters" the image. The loop runs
-                    // i = num_steps-1 → 0, so the final 3 polish steps are i ∈ {0,1,2}. Base guidance
-                    // (`guidance`) drives the main steps.
-                    let gw_i = if i < POLISH_STEPS {
-                        POLISH_GUIDANCE
-                    } else {
-                        guidance
-                    };
-                    add(
-                        &multiply(&pos_v, Array::from_f32(gw_i))?,
-                        &multiply(&neg_v, Array::from_f32(1.0 - gw_i))?,
-                    )?
-                }
-                // Turbo (issue #488): CFG-free single DiT. The TurboTime LoRA distilled the guided
-                // velocity into the conditional DiT, so the velocity is `pos_v` directly — no
-                // negative branch, `guidance` unused.
-                None => pos_v,
-            };
-            z = add(&z, &multiply(&v, Array::from_f32((s_val - t_val) as f32))?)?;
+            Ok(())
+        };
+        let mut mask_blend_hook = |info: &DriverStepInfo,
+                                   latent: Array|
+         -> gen_core::Result<Array> {
             // Inpaint: pin the keep region (mask 0) to the source re-noised to this step's σ
-            // (= s_val, the post-step time) and regenerate the white region (mask 1). At the final
-            // step s≈0 the keep region is the clean source. Mirrors sdxl `InpaintBlend`; draws no
-            // RNG, so an all-white mask reduces to plain img2img.
+            // (= s_val = info.next_sigma, the post-step time) and regenerate the white region
+            // (mask 1). At the final step s≈0 the keep region is the clean source. Mirrors sdxl
+            // `InpaintBlend`; draws no RNG, so an all-white mask reduces to plain img2img.
             if let Some(e) = edit {
                 if let Some(mask) = &e.mask {
-                    let init_noised = add_noise_by_interpolation(&e.z0, &noise, s_val as f32)?;
-                    z = add(
-                        &multiply(mask, &z)?,
-                        &multiply(&subtract(Array::from_f32(1.0), mask)?, &init_noised)?,
-                    )?;
+                    let init_noised = add_noise_by_interpolation(&e.z0, &noise, info.next_sigma)
+                        .map_err(gen_core::Error::from)?;
+                    let fg = multiply(mask, &latent)
+                        .map_err(|err| gen_core::Error::from(Error::from(err)))?;
+                    let inv_mask = subtract(Array::from_f32(1.0), mask)
+                        .map_err(|err| gen_core::Error::from(Error::from(err)))?;
+                    let bg = multiply(&inv_mask, &init_noised)
+                        .map_err(|err| gen_core::Error::from(Error::from(err)))?;
+                    return add(&fg, &bg).map_err(|err| gen_core::Error::from(Error::from(err)));
                 }
             }
-            eval([&z])?;
-            on_progress(Progress::Step {
-                current: (num_run - i) as u32,
-                total: total_run as u32,
-            });
+            Ok(latent)
+        };
+        let mut on_materialize = |_info: &DriverStepInfo, latent: &Array| -> gen_core::Result<()> {
+            eval([latent]).map_err(|err| gen_core::Error::from(Error::from(err)))?;
+            Ok(())
+        };
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        if edit.is_some_and(|e| e.mask.is_some()) {
+            hooks.on_post_step = Some(&mut mask_blend_hook);
         }
+        hooks.on_materialize = Some(&mut on_materialize);
+        let slice = SliceSpec {
+            geometry: Some((width, height)),
+            ..SliceSpec::full(total_run)
+        };
+        let out = run_mlx_driver_slices(
+            &driver,
+            [slice],
+            gen_core::BoundaryState::XSigma(z0),
+            total_run,
+            seed,
+            cancel,
+            None,
+            &mut driver_state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        let z = match out {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
 
         mlx_gen::image_execution::sampled_native_with_rng(
             "ideogram-euler-v4",
@@ -646,7 +870,7 @@ impl Ideogram4Heavy {
             ),
         );
         mlx_gen::image_execution::scalar("ideogram.guidance", guidance);
-        mlx_gen::image_execution::policy_debug("ideogram.cfg_active", &neg.is_some());
+        mlx_gen::image_execution::policy_debug("ideogram.cfg_active", &cfg_active);
         mlx_gen::image_execution::policy_debug("ideogram.polish_steps", &POLISH_STEPS);
         mlx_gen::image_execution::scalar("ideogram.polish_guidance", POLISH_GUIDANCE);
         mlx_gen::image_execution::policy_debug(
@@ -1075,5 +1299,306 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("zero dimension"), "unexpected error: {e}");
+    }
+
+    struct MockIdeogramForward {
+        with_uncond: bool,
+    }
+
+    impl IdeogramVelocityForward for MockIdeogramForward {
+        fn predict_cond(&self, z: &Array, t_val: f32, schedule_step: usize) -> Result<Array> {
+            let scale = Array::from_f32(0.15 + 0.05 * t_val + 0.01 * (schedule_step as f32));
+            let bias = Array::from_f32(0.25);
+            Ok(add(multiply(z, &scale)?, &bias)?)
+        }
+
+        fn predict_uncond(
+            &self,
+            z: &Array,
+            t_val: f32,
+            schedule_step: usize,
+        ) -> Result<Option<Array>> {
+            if !self.with_uncond {
+                return Ok(None);
+            }
+            let scale = Array::from_f32(-0.08 + 0.02 * t_val - 0.005 * (schedule_step as f32));
+            let bias = Array::from_f32(-0.1);
+            Ok(Some(add(multiply(z, &scale)?, &bias)?))
+        }
+    }
+
+    fn mlx_arrays_bit_equal(a: &Array, b: &Array) -> bool {
+        let a = mlx_gen::array::contiguous(a).unwrap();
+        let b = mlx_gen::array::contiguous(b).unwrap();
+        eval([&a, &b]).unwrap();
+        let sa = a.as_slice::<f32>();
+        let sb = b.as_slice::<f32>();
+        sa.len() == sb.len() && sa.iter().zip(sb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn ideogram_euler_driver_quality_passes_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let (mu, std) = preset_mu_std(6);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(6);
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 3,
+            seed: 42,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(
+                    IdeogramEulerDriver::new(
+                        "mlx_ideogram_euler_quality",
+                        schedule,
+                        si.clone(),
+                        6,
+                        0,
+                        7.0,
+                        MockIdeogramForward { with_uncond: true },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || Array::from_slice(&[0.4f32, -0.7, 0.25, 1.1], &[1, 2, 2]),
+            latents_equal: mlx_arrays_bit_equal,
+        })
+        .expect("MLX Ideogram quality driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn ideogram_euler_driver_turbo_passes_tier0_conformance() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let (mu, std) = preset_mu_std(6);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(6);
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 6,
+            split_at: 2,
+            seed: 99,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(
+                    IdeogramEulerDriver::new(
+                        "mlx_ideogram_euler_turbo",
+                        schedule,
+                        si.clone(),
+                        6,
+                        0,
+                        7.0,
+                        MockIdeogramForward { with_uncond: false },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || Array::from_slice(&[-0.3f32, 0.8, -0.5, 0.2], &[1, 2, 2]),
+            latents_equal: mlx_arrays_bit_equal,
+        })
+        .expect("MLX Ideogram turbo driver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn ideogram_euler_driver_preserves_polish_mask_blend_preview_and_pid_early_stop_bit_exact() {
+        let num_steps = 6usize;
+        let guidance = 7.0f32;
+        let (mu, std) = preset_mu_std(num_steps);
+        let schedule = LogitNormalSchedule::for_resolution(512, 512, mu, std);
+        let si = make_step_intervals(num_steps);
+        let z0_init = Array::from_slice(&[0.5f32, -0.25, 0.75, -1.0], &[1, 2, 2]);
+        let clean = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[1, 2, 2]);
+        let noise = Array::from_slice(&[-0.6f32, 0.9, -0.2, 0.5], &[1, 2, 2]);
+        let mask = Array::from_slice(&[1.0f32, 0.0], &[1, 2, 1]);
+        let mock = MockIdeogramForward { with_uncond: true };
+
+        // 1. Quality + inpaint mask blend over full 6 steps (exercises main guidance=7.0 on
+        //    i={5,4,3} and POLISH_GUIDANCE=3.0 on i={2,1,0}) vs direct pre-migration reference.
+        let mut expected = z0_init.clone();
+        let mut expected_sigmas = Vec::new();
+        for i in (0..num_steps).rev() {
+            let t_val = schedule.eval(si[i + 1]);
+            let s_val = schedule.eval(si[i]);
+            expected_sigmas.push(t_val as f32);
+            let pos_v = mock.predict_cond(&expected, t_val as f32, i).unwrap();
+            let neg_v = mock
+                .predict_uncond(&expected, t_val as f32, i)
+                .unwrap()
+                .unwrap();
+            let gw = if i < POLISH_STEPS {
+                POLISH_GUIDANCE
+            } else {
+                guidance
+            };
+            let v = add(
+                multiply(&pos_v, Array::from_f32(gw)).unwrap(),
+                multiply(&neg_v, Array::from_f32(1.0 - gw)).unwrap(),
+            )
+            .unwrap();
+            expected = add(
+                &expected,
+                multiply(&v, Array::from_f32((s_val - t_val) as f32)).unwrap(),
+            )
+            .unwrap();
+            let init_noised = add_noise_by_interpolation(&clean, &noise, s_val as f32).unwrap();
+            expected = add(
+                multiply(&mask, &expected).unwrap(),
+                multiply(subtract(Array::from_f32(1.0), &mask).unwrap(), &init_noised).unwrap(),
+            )
+            .unwrap();
+            eval([&expected]).unwrap();
+        }
+
+        let driver = IdeogramEulerDriver::new(
+            "mlx_ideogram_euler_quality",
+            schedule,
+            si.clone(),
+            num_steps,
+            0,
+            guidance,
+            MockIdeogramForward { with_uncond: true },
+        )
+        .unwrap();
+        let cancel = CancelFlag::new();
+        let mut state = DriverRunState::new();
+        let mut observed_sigmas = Vec::new();
+        let mut progress_seen = Vec::new();
+        let mut on_progress = |p: Progress| progress_seen.push(p);
+        let mut on_observe = |info: &DriverStepInfo, _z: &Array| -> gen_core::Result<()> {
+            observed_sigmas.push(info.sigma);
+            Ok(())
+        };
+        let mut on_post_step = |info: &DriverStepInfo, latent: Array| -> gen_core::Result<Array> {
+            let init_noised = add_noise_by_interpolation(&clean, &noise, info.next_sigma).unwrap();
+            let fg = multiply(&mask, &latent).unwrap();
+            let inv = subtract(Array::from_f32(1.0), &mask).unwrap();
+            let bg = multiply(&inv, &init_noised).unwrap();
+            Ok(add(&fg, &bg).unwrap())
+        };
+        let mut on_materialize = |_info: &DriverStepInfo, latent: &Array| -> gen_core::Result<()> {
+            eval([latent]).unwrap();
+            Ok(())
+        };
+        let mut hooks = StepHooks::new(&mut on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        hooks.on_post_step = Some(&mut on_post_step);
+        hooks.on_materialize = Some(&mut on_materialize);
+
+        let out = run_mlx_driver_slices(
+            &driver,
+            [SliceSpec::full(num_steps)],
+            gen_core::BoundaryState::XSigma(z0_init.clone()),
+            num_steps,
+            11,
+            &cancel,
+            None,
+            &mut state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let got = match out {
+            gen_core::BoundaryState::XSigma(x) => x,
+            _ => panic!("expected XSigma"),
+        };
+        assert!(
+            mlx_arrays_bit_equal(&got, &expected),
+            "MLX Ideogram driver must be bit-identical to pre-migration loop"
+        );
+        assert_eq!(observed_sigmas, expected_sigmas);
+        assert_eq!(progress_seen.len(), num_steps);
+
+        // 2. PiD `run_from = 2` early-stop executes only steps i={5,4,3,2} (4 steps).
+        let run_from = 2usize;
+        let total_run = num_steps - run_from;
+        let mut expected_pid = z0_init.clone();
+        for i in (run_from..num_steps).rev() {
+            let t_val = schedule.eval(si[i + 1]);
+            let s_val = schedule.eval(si[i]);
+            let pos_v = mock.predict_cond(&expected_pid, t_val as f32, i).unwrap();
+            let neg_v = mock
+                .predict_uncond(&expected_pid, t_val as f32, i)
+                .unwrap()
+                .unwrap();
+            let gw = if i < POLISH_STEPS {
+                POLISH_GUIDANCE
+            } else {
+                guidance
+            };
+            let v = add(
+                multiply(&pos_v, Array::from_f32(gw)).unwrap(),
+                multiply(&neg_v, Array::from_f32(1.0 - gw)).unwrap(),
+            )
+            .unwrap();
+            expected_pid = add(
+                &expected_pid,
+                multiply(&v, Array::from_f32((s_val - t_val) as f32)).unwrap(),
+            )
+            .unwrap();
+        }
+        let pid_driver = IdeogramEulerDriver::new(
+            "mlx_ideogram_euler_quality",
+            schedule,
+            si,
+            num_steps,
+            run_from,
+            guidance,
+            MockIdeogramForward { with_uncond: true },
+        )
+        .unwrap();
+        let mut pid_state = DriverRunState::new();
+        let mut pid_progress = Vec::new();
+        let mut on_pid_progress = |p: Progress| pid_progress.push(p);
+        let mut pid_hooks = StepHooks::new(&mut on_pid_progress);
+        let pid_out = run_mlx_driver_slices(
+            &pid_driver,
+            [SliceSpec::full(total_run)],
+            gen_core::BoundaryState::XSigma(z0_init),
+            total_run,
+            11,
+            &cancel,
+            None,
+            &mut pid_state,
+            &mut pid_hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let got_pid = match pid_out {
+            gen_core::BoundaryState::XSigma(x) => x,
+            _ => panic!("expected XSigma"),
+        };
+        assert!(mlx_arrays_bit_equal(&got_pid, &expected_pid));
+        assert_eq!(
+            pid_progress,
+            vec![
+                Progress::Step {
+                    current: 1,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 3,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 4,
+                    total: 4
+                },
+            ]
+        );
     }
 }

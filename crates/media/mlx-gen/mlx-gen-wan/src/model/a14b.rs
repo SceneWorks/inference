@@ -172,7 +172,7 @@ impl Wan14b {
     /// crossing ⇒ at most one swap; the two experts are **never co-resident** (the Pillar-1 win).
     ///
     /// **Parity:** one continuous scheduler advances across the swap and each expert drives the
-    /// identical per-step [`denoise_range`] the resident [`denoise_moe`] drives, so the prefix/suffix
+    /// identical per-step [`denoise_expert_slice`] the resident [`denoise_moe`] drives, so the prefix/suffix
     /// split reproduces the resident per-step `t ≥ boundary` choice bit-for-bit — only residency /
     /// lifetime changes. Each expert projects the raw UMT5 `context`/`context_null` through its **own**
     /// `text_embedder` after it loads (the entangled per-expert projection), so the small raw contexts
@@ -198,20 +198,19 @@ impl Wan14b {
         // sc-2957 compiled elementwise glue, active for the whole (both-expert) denoise — see
         // `denoise_moe`. Scoped + restored on drop by the RAII guard.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-        let mut sched = make_scheduler(kind, num_train_timesteps);
-        sched.set_timesteps(steps, shift);
+        let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+        let timesteps = integer_timesteps(&sigmas, num_train_timesteps);
         mlx_gen::video_execution::sampling(
             "wan_moe_swapped",
             &format!("{kind:?}"),
             "flow_velocity",
             serde_json::json!({"low_guidance_bits":low_gs.to_bits(),"high_guidance_bits":high_gs.to_bits(),"boundary_bits":boundary_timestep.to_bits()}),
         );
-        mlx_gen::video_execution::schedule("wan_moe_swapped", sched.sigmas());
+        mlx_gen::video_execution::schedule("wan_moe_swapped", &sigmas);
         mlx_gen::video_execution::policy(
             "wan_moe_residency",
             serde_json::json!({"expert_swap":true}),
         );
-        let timesteps: Vec<f32> = sched.timesteps().to_vec();
         // High runs `0..k` (`t ≥ boundary`), low runs `k..steps` — the single high→low crossing.
         let k = crossing_index(&timesteps, boundary_timestep);
         let mut latents = init_noise.clone();
@@ -223,10 +222,11 @@ impl Wan14b {
         let low_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
 
         // Build a borrowed `Expert` (per-expert `text_embedder` projection of the raw contexts) and run
-        // its step range through the shared scheduler/latents — the identical per-step math as resident.
+        // its step range through the typed `WanNativeDriver` + request-owned `DriverRunState` (`Carry`).
         let denoise_expert = |dit: &WanTransformer,
                               guidance: f32,
                               range: std::ops::Range<usize>,
+                              phase: usize,
                               st: &mut SwapState| {
             let e = Expert {
                 transformer: dit,
@@ -242,21 +242,25 @@ impl Wan14b {
                     total,
                 })
             };
-            denoise_range(
-                &mut *st.sched,
+            denoise_expert_slice(
+                kind,
+                num_train_timesteps,
+                steps,
+                shift,
                 &e,
                 grid,
                 y,
                 &mut *st.latents,
-                &timesteps,
                 range,
+                phase,
                 cancel,
+                &mut st.driver_state,
                 &mut on_step,
             )
         };
 
         let mut state = SwapState {
-            sched: &mut *sched,
+            driver_state: mlx_gen::driver::DriverRunState::new(),
             latents: &mut latents,
             on_progress: &mut *on_progress,
         };
@@ -275,7 +279,7 @@ impl Wan14b {
                 Ok(dit)
             },
             // use high over `0..k`
-            |dit, st| denoise_expert(dit, high_gs, 0..k, st),
+            |dit, st| denoise_expert(dit, high_gs, 0..k, 0, st),
             // load low
             |st| {
                 if cancel.is_cancelled() {
@@ -298,7 +302,7 @@ impl Wan14b {
                 Ok(dit)
             },
             // use low over `k..steps`
-            |dit, st| denoise_expert(dit, low_gs, k..steps, st),
+            |dit, st| denoise_expert(dit, low_gs, k..steps, 1, st),
             // evict: flush the just-dropped expert's buffers to the OS BEFORE the next loads.
             || {
                 mlx_rs::memory::clear_cache();
@@ -309,13 +313,11 @@ impl Wan14b {
     }
 }
 
-/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12736): the continuous
-/// scheduler, the in-place latents, and the progress sink. Held as `&mut` references so exclusive
-/// access moves between the load/use closures via the `&mut SwapState` param (disjoint-field borrows)
-/// rather than being captured by each closure — the borrow-checker-clean way to let the two swap
-/// stages share the scheduler/latents/progress without a `RefCell`.
+/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12736, SW-6968): the
+/// request-owned [`mlx_gen::driver::DriverRunState`] carrying solver history across the swap,
+/// the in-place latents, and the progress sink.
 pub(super) struct SwapState<'a> {
-    pub(super) sched: &'a mut dyn WanScheduler,
+    pub(super) driver_state: mlx_gen::driver::DriverRunState,
     pub(super) latents: &'a mut Array,
     pub(super) on_progress: &'a mut dyn FnMut(Progress),
 }

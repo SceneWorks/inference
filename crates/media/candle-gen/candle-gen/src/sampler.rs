@@ -891,92 +891,207 @@ pub fn run_av_curated_sampler(
 // guidance forward lives INSIDE the caller's `predict` closure, so this driver stays trunk-agnostic.
 // =================================================================================================
 
-/// diffusers `SCMScheduler` default `max_timesteps` — the Sprint default `π/2`.
-pub const SCM_DEFAULT_MAX_TIMESTEP: f32 = std::f32::consts::FRAC_PI_2;
-/// diffusers Sprint default `intermediate_timesteps` (only consulted when `num_steps == 2`).
-pub const SCM_DEFAULT_INTERMEDIATE_TIMESTEP: f32 = 1.3;
-/// diffusers `SCMScheduler` `sigma_data` — the std-dev of the multi-step renoise (`0.5` for Sprint).
-pub const SCM_SIGMA_DATA: f32 = 0.5;
+pub use gen_core::sampling::{
+    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+};
 
-/// A SANA-Sprint SCM (TrigFlow consistency) denoising schedule: the descending angle timesteps
-/// `t ∈ [max_timesteps … 0]`, length `num_steps + 1` (the trailing `0` is the clean endpoint).
+/// Typed `FamilyDriver` for Candle's SCM / TrigFlow continuous-time consistency loop (`SW-6969`).
 ///
-/// Mirrors diffusers `SCMScheduler.set_timesteps`:
-/// * `num_steps == 2` → `[max_timesteps, intermediate_timesteps, 0]`;
-/// * otherwise → `linspace(max_timesteps, 0, num_steps + 1)`.
-#[derive(Clone, Debug)]
-pub struct ScmScheduler {
-    /// Descending angle timesteps, length `num_steps + 1`.
-    pub timesteps: Vec<f32>,
-    /// `sigma_data` (the renoise std-dev; `0.5` for Sprint).
-    pub sigma_data: f32,
+/// Generic over its forward-evaluation seam so weights-free Tier 0 conformance tests can verify
+/// slicing, read-only boundary clean estimates, cancellation, and typed refusals without weights.
+pub struct ScmDriver<F> {
+    support: crate::driver::DriverSupport,
+    scheduler: ScmScheduler,
+    start_step: usize,
+    forward: std::cell::RefCell<F>,
 }
 
-impl ScmScheduler {
-    /// Build the Sprint schedule for `num_steps` (the diffusers `set_timesteps` default path:
-    /// `max_timesteps = π/2`, `intermediate_timesteps = 1.3`). 1–4 steps is the Sprint operating band.
-    pub fn new(num_steps: usize) -> Self {
-        Self::with_timesteps(
-            num_steps,
-            SCM_DEFAULT_MAX_TIMESTEP,
-            SCM_DEFAULT_INTERMEDIATE_TIMESTEP,
-        )
+impl<F> ScmDriver<F>
+where
+    F: FnMut(&Tensor, f32) -> Result<Tensor>,
+{
+    /// Construct a Candle SCM driver over `scheduler` starting at `start_step`.
+    pub fn new(scheduler: ScmScheduler, start_step: usize, forward: F) -> Self {
+        Self {
+            support: crate::driver::DriverSupport {
+                driver_id: "candle_scm_trigflow",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: true,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: true,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: crate::driver::DriverRefusalReasons {
+                    renoise_from_clean: "SCM TrigFlow owns its angle renoise and refuses external Renoise transitions",
+                    geometry_change: "SCM TrigFlow does not support mid-trajectory spatial resampling",
+                    ..crate::driver::DriverRefusalReasons::default()
+                },
+            },
+            scheduler,
+            start_step,
+            forward: std::cell::RefCell::new(forward),
+        }
     }
 
-    /// Build the schedule for `num_steps` with explicit `max_timesteps` / `intermediate_timesteps`
-    /// (the latter only used for the `num_steps == 2` two-point schedule, matching diffusers).
-    pub fn with_timesteps(
-        num_steps: usize,
-        max_timesteps: f32,
-        intermediate_timesteps: f32,
-    ) -> Self {
-        let timesteps = if num_steps == 2 {
-            vec![max_timesteps, intermediate_timesteps, 0.0]
-        } else {
-            let n = num_steps.max(1);
-            (0..=n)
-                .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
-                .collect()
+    fn trigflow_pred_x0(
+        &self,
+        latents: &Tensor,
+        abs_step: usize,
+    ) -> gen_core::Result<(Tensor, f32)> {
+        let sd = self.scheduler.sigma_data as f64;
+        let s = self.scheduler.timesteps[abs_step];
+        let t_next = self.scheduler.timesteps[abs_step + 1];
+        let scm_t = self.scheduler.scm_timestep(abs_step);
+        let in_scale = self.scheduler.input_scale(abs_step) as f64;
+
+        // model input = (latents / σ_data) · sqrt(scm_t² + (1-scm_t)²).
+        let lat_in = latents
+            .affine(in_scale / sd, 0.0)
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        let raw = (self.forward.borrow_mut())(&lat_in, scm_t).map_err(gen_core::Error::from)?;
+
+        // diffusers trigflow recombination (uses the SCALED lat_in, not the raw latent):
+        //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / in_scale · σ_data.
+        let (a, b) = ScmScheduler::trigflow_recombine_weights(scm_t);
+        let combined = lat_in
+            .affine(a as f64, 0.0)
+            .and_then(|lhs| lhs.add(&raw.affine(b as f64, 0.0)?))
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        let model_output = combined
+            .affine(sd / in_scale, 0.0)
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+
+        // SCMScheduler.step: pred_x0 = cos(s)·latents − sin(s)·model_output.
+        let pred_x0 = latents
+            .affine(s.cos() as f64, 0.0)
+            .and_then(|lhs| lhs.sub(&model_output.affine(s.sin() as f64, 0.0)?))
+            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        Ok((pred_x0, t_next))
+    }
+}
+
+impl<F> crate::driver::FamilyDriver<Tensor> for ScmDriver<F>
+where
+    F: FnMut(&Tensor, f32) -> Result<Tensor>,
+{
+    fn support(&self) -> &crate::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: crate::driver::SliceInput<'_, Tensor>,
+        state: &mut crate::driver::DriverRunState,
+        hooks: &mut crate::driver::StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        let n = self.scheduler.num_steps();
+        let start = self.start_step.min(n);
+        let active_steps = n - start;
+        if input.total_steps != active_steps {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: total_steps={} does not match active SCM step count={active_steps}",
+                self.support.driver_id, input.total_steps
+            )));
+        }
+        state.enter_slice(&input)?;
+
+        let ops = CandleLatentOps;
+        let sd = self.scheduler.sigma_data as f64;
+        let single_step = self.scheduler.is_single_step();
+        let mut latents = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
         };
-        Self {
-            timesteps,
-            sigma_data: SCM_SIGMA_DATA,
+        let mut denoised = latents.clone();
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let abs_step = start + step;
+            let s = self.scheduler.timesteps[abs_step];
+            let t_next = self.scheduler.timesteps[abs_step + 1];
+            let info = crate::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: crate::driver::DriverEvaluationKind::Trajectory,
+                sigma: s,
+                next_sigma: t_next,
+            };
+            // Best-effort observation of the running (σ_data-scaled) latent entering this step.
+            hooks.observe(&info, &latents)?;
+
+            let (pred_x0, next_angle) = self.trigflow_pred_x0(&latents, abs_step)?;
+            state.record_evaluation(crate::driver::DriverEvaluationKind::Trajectory);
+
+            // Renoise to the next angle (skipped on the final / single-step transition, matching
+            // diffusers `if len(self.timesteps) > 1`). The per-step subkey reuses the shared D6 derivation.
+            let is_terminal_step = single_step || abs_step + 1 >= n;
+            latents = if is_terminal_step {
+                pred_x0
+            } else {
+                denoised = pred_x0.clone();
+                let _draw = state.next_draw_index();
+                let noise = ops
+                    .randn_like(&latents, input.seed, abs_step)?
+                    .affine(sd, 0.0)
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                pred_x0
+                    .affine(next_angle.cos() as f64, 0.0)
+                    .and_then(|lhs| lhs.add(&noise.affine(next_angle.sin() as f64, 0.0)?))
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?
+            };
+            latents = hooks.post_step(&info, latents)?;
+            if is_terminal_step {
+                denoised = latents.clone();
+            }
+            hooks.materialize(&info, &latents)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
         }
-    }
+        state.finish_slice(input.span.end);
 
-    /// Wrap an explicit descending angle schedule (length `num_steps + 1`).
-    pub fn from_timesteps(timesteps: Vec<f32>) -> Self {
-        Self {
-            timesteps,
-            sigma_data: SCM_SIGMA_DATA,
+        if input.request_boundary_estimate {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let est = if input.span.end < input.total_steps {
+                let abs_step = start + input.span.end;
+                let (pred_x0, _) = self.trigflow_pred_x0(&latents, abs_step)?;
+                state.record_evaluation(crate::driver::DriverEvaluationKind::BoundaryEstimate);
+                pred_x0
+                    .affine(1.0 / sd, 0.0)
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?
+            } else {
+                state.record_evaluation(crate::driver::DriverEvaluationKind::BoundaryEstimate);
+                denoised
+                    .affine(1.0 / sd, 0.0)
+                    .map_err(|e| gen_core::Error::Msg(e.to_string()))?
+            };
+            return Ok(gen_core::BoundaryState::CleanEstimate {
+                latent: est,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            });
         }
-    }
 
-    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`.
-    pub fn num_steps(&self) -> usize {
-        self.timesteps.len().saturating_sub(1)
-    }
-
-    /// Whether this is a true single-step schedule (one renoise-free step). diffusers skips the
-    /// between-step noise when `num_steps == 1`.
-    pub fn is_single_step(&self) -> bool {
-        self.num_steps() <= 1
-    }
-
-    /// The **SCM conditioning timestep** the trunk embeds at step `i` (diffusers
-    /// `scm_timestep = sin(t)/(cos(t)+sin(t))` where `t` is the angle timestep). The trunk consumes
-    /// this, NOT the raw angle.
-    pub fn scm_timestep(&self, i: usize) -> f32 {
-        let t = self.timesteps[i];
-        let (s, c) = (t.sin(), t.cos());
-        s / (c + s)
-    }
-
-    /// The model-input scale at step `i` (diffusers `sqrt(scm_t² + (1 - scm_t)²)`, applied to
-    /// `latents / sigma_data`).
-    pub fn input_scale(&self, i: usize) -> f32 {
-        let st = self.scm_timestep(i);
-        (st * st + (1.0 - st) * (1.0 - st)).sqrt()
+        if input.span.end == input.total_steps {
+            let out = denoised
+                .affine(1.0 / sd, 0.0)
+                .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+            Ok(gen_core::BoundaryState::CleanEstimate {
+                latent: out,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            })
+        } else {
+            Ok(gen_core::BoundaryState::XSigma(latents))
+        }
     }
 }
 
@@ -1054,13 +1169,11 @@ pub fn run_scm_sampler_from(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: Option<&PreviewHook<'_>>,
-    mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
-    let ops = CandleLatentOps;
-    let sd = scheduler.sigma_data as f64;
     let n = scheduler.num_steps();
     let start = start_step.min(n);
-    let total = (n - start).max(1) as u32;
+    let active_steps = n - start;
     let single_step = scheduler.is_single_step();
     crate::execution::runtime(latents.device(), latents.dtype());
     crate::execution::schedule("scm", &scheduler.timesteps[start..], "TrigFlow");
@@ -1069,64 +1182,34 @@ pub fn run_scm_sampler_from(
         serde_json::json!({"sigma_data_bits":scheduler.sigma_data.to_bits(),"single_step":single_step}),
     );
     // Step-index keyed: this loop has no σ schedule for the sigma-keyed counter to search.
-    let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n - start)));
-    let mut latents = latents;
-    let mut denoised = latents.clone();
-
-    for i in start..n {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        on_progress(Progress::Step {
-            current: (i - start) as u32 + 1,
-            total,
-        });
-        // Best-effort preview of the running (σ_data-scaled) latent — see the doc note above.
+    let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(active_steps)));
+    let driver = ScmDriver::new(scheduler.clone(), start, predict);
+    let mut run_state = crate::driver::DriverRunState::new();
+    let mut on_observe = |info: &crate::driver::DriverStepInfo, latents: &Tensor| {
         if let Some((hook, counter)) = &previews {
-            hook.emit_step(counter, i - start, &latents);
+            hook.emit_step(counter, info.outer_step, latents);
         }
-
-        let s = scheduler.timesteps[i];
-        let t_next = scheduler.timesteps[i + 1];
-        let scm_t = scheduler.scm_timestep(i);
-        let in_scale = scheduler.input_scale(i) as f64;
-
-        // model input = (latents / σ_data) · sqrt(scm_t² + (1-scm_t)²).
-        let lat_in = latents.affine(in_scale / sd, 0.0)?;
-        let raw = predict(&lat_in, scm_t)?;
-
-        // diffusers trigflow recombination (uses the SCALED lat_in, not the raw latent):
-        //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / in_scale · σ_data.
-        let a = 1.0 - 2.0 * scm_t;
-        let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
-        let combined = lat_in
-            .affine(a as f64, 0.0)?
-            .add(&raw.affine(b as f64, 0.0)?)?;
-        let model_output = combined.affine(sd / in_scale, 0.0)?;
-
-        // SCMScheduler.step: pred_x0 = cos(s)·latents − sin(s)·model_output.
-        let pred_x0 = latents
-            .affine(s.cos() as f64, 0.0)?
-            .sub(&model_output.affine(s.sin() as f64, 0.0)?)?;
-        denoised = pred_x0.clone();
-
-        // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
-        // `if len(self.timesteps) > 1`). The per-step subkey reuses the shared D6 derivation.
-        latents = if single_step {
-            pred_x0
-        } else {
-            let noise = ops
-                .randn_like(&latents, seed, i)
-                .map_err(CandleError::from)?
-                .affine(sd, 0.0)?;
-            pred_x0
-                .affine(t_next.cos() as f64, 0.0)?
-                .add(&noise.affine(t_next.sin() as f64, 0.0)?)?
-        };
-    }
-
-    // diffusers: latents = denoised / sigma_data (the decode input).
-    Ok(denoised.affine(1.0 / sd, 0.0)?)
+        Ok(())
+    };
+    let mut hooks = crate::driver::StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut on_observe);
+    let out = crate::driver::run_candle_driver_slices(
+        &driver,
+        [crate::driver::SliceSpec::full(active_steps)],
+        gen_core::BoundaryState::XSigma(latents),
+        active_steps,
+        seed,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, state, _| Ok(state),
+    )?;
+    Ok(match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    })
 }
 
 #[cfg(test)]
@@ -2408,6 +2491,47 @@ mod tests {
         assert!(vec1(&out).iter().all(|v| v.is_finite()));
         assert!(crate::lock_recover(&frames).is_empty());
     }
+
+    #[test]
+    fn candle_scm_driver_passes_tier0_conformance() {
+        use crate::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 19,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(ScmDriver::new(ScmScheduler::new(4), 0, |xin, scm_t| {
+                    Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?)
+                }))
+            },
+            make_initial: || {
+                t(&[0.3, -1.1, 2.0, 0.05])
+                    .affine(SCM_SIGMA_DATA as f64, 0.0)
+                    .unwrap()
+            },
+            latents_equal: |a, b| {
+                let va = vec1(a);
+                let vb = vec1(b);
+                va.len() == vb.len()
+                    && va
+                        .iter()
+                        .zip(vb.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("Candle ScmDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
+        assert_eq!(report.unsplit_evaluations, 4);
+        assert_eq!(report.unsplit_draws, 3);
+    }
 }
 
 /// Real-backend (candle `Tensor`, CPU) parity for the gen-core guidance library over
@@ -2499,5 +2623,80 @@ mod guidance_ops_tests {
             tensor_max_abs_diff_host(&dot, &zeros) < 1e-3,
             "eta=0 not orthogonal to cond on candle"
         );
+    }
+
+    #[test]
+    fn sana_scm_driver_preserves_terminal_post_step_hook() {
+        use crate::driver::{
+            DriverHistoryPolicy, DriverRunState, FamilyDriver, SliceInput, SliceTransition,
+            StepHooks,
+        };
+        use candle_core::Device;
+
+        let sched = ScmScheduler::new(1);
+        let init = Tensor::from_vec(vec![0.4f32, -0.2, 0.8, 0.1], (1, 1, 2, 2), &Device::Cpu)
+            .unwrap()
+            .affine(SCM_SIGMA_DATA as f64, 0.0)
+            .unwrap();
+
+        let run_case = |request_boundary_estimate: bool, apply_hook: bool| -> Vec<f32> {
+            let driver = super::ScmDriver::new(sched.clone(), 0, |lat_in, scm_t| {
+                Ok(lat_in.affine(0.25 * scm_t as f64 + 0.1, 0.0)?)
+            });
+            let mut state = DriverRunState::new();
+            let cancel = gen_core::runtime::CancelFlag::new();
+            let mut progress = |_| {};
+            let mut hooks = StepHooks::new(&mut progress);
+            let mut post_step =
+                |_info: &crate::driver::DriverStepInfo, x: Tensor| -> gen_core::Result<Tensor> {
+                    x.affine(0.5, 1.25)
+                        .map_err(|e| gen_core::Error::Msg(e.to_string()))
+                };
+            if apply_hook {
+                hooks.on_post_step = Some(&mut post_step);
+            }
+            let out = driver
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..1,
+                        total_steps: 1,
+                        state: gen_core::BoundaryState::XSigma(init.clone()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 7,
+                        cancel: &cancel,
+                        request_boundary_estimate,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap();
+            let gen_core::BoundaryState::CleanEstimate { latent, .. } = out else {
+                panic!("terminal SCM slice must return CleanEstimate");
+            };
+            latent.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+
+        let baseline = run_case(false, false);
+        let expected: Vec<f32> = baseline
+            .iter()
+            .map(|&v| {
+                // `baseline = pred_x0 / sd`, hook maps `pred_x0 -> 0.5 * pred_x0 + 1.25`,
+                // then driver divides by `sd`.
+                ((v * SCM_SIGMA_DATA) * 0.5 + 1.25) / SCM_SIGMA_DATA
+            })
+            .collect();
+        for request_boundary_estimate in [false, true] {
+            let got = run_case(request_boundary_estimate, true);
+            for (a, b) in got.iter().zip(expected.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "terminal SCM post-step hook discarded (boundary={request_boundary_estimate}): got {got:?} vs expected {expected:?}"
+                );
+            }
+        }
     }
 }

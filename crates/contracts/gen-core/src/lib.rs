@@ -52,6 +52,12 @@ pub use receipt_scope::CheckpointReceiptScope;
 pub mod comfy_quant;
 pub mod control;
 pub mod convrot_int8;
+pub mod driver;
+pub use driver::{
+    run_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate,
+    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
 pub mod duration_head;
 pub mod encoder_contract;
 pub mod env_flag;

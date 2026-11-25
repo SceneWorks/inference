@@ -34,9 +34,8 @@ use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
     denoise_cfgpp_planned, denoise_cfgpp_with_preview, denoise_curated_planned,
-    denoise_curated_with_preview, denoise_inpaint_with_preview, denoise_ip_with_preview,
-    denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning_windows,
-    encode_init_latents_tiled, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
+    denoise_curated_with_preview, encode_conditioning_windows, encode_init_latents_tiled,
+    preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -81,10 +80,14 @@ pub(crate) fn collect_serial_latents(
             ],
         );
         let seed = base_seed.wrapping_add(output as u64);
-        mlx_rs::random::seed(seed)?;
-        // The closure appends BEFORE its sampler/blend locals leave scope, preserving the
-        // original inline loop's drop/retention order. No extra tensor return/clone is introduced.
-        generate(seed, &mut finals)?;
+        // B3 / PIPE-14: serialize the entire MLX global-RNG trajectory (seed -> draws -> eval)
+        // across threads so concurrent global-seed routes cannot interleave RNG draws.
+        mlx_gen::with_global_rng_trajectory(|| {
+            mlx_rs::random::seed(seed)?;
+            // The closure appends BEFORE its sampler/blend locals leave scope, preserving the
+            // original inline loop's drop/retention order. No extra tensor return/clone is introduced.
+            generate(seed, &mut finals)
+        })?;
     }
     Ok(finals)
 }
@@ -1232,7 +1235,7 @@ impl mlx_gen::gen_core::Generator for Sdxl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
-        if let Some(plan) = compile_sdxl(&self.loaded_spec, req)? {
+        if let Some(plan) = compile_sdxl_for_mode(&self.loaded_spec, req, false)? {
             return self.generate_planned(req, &plan, None, on_progress);
         }
         let output =
@@ -1281,7 +1284,7 @@ impl mlx_gen::gen_core::Generator for Sdxl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        if let Ok(Some(plan)) = compile_sdxl(&self.loaded_spec, req) {
+        if let Ok(Some(plan)) = compile_sdxl_for_mode(&self.loaded_spec, req, false) {
             return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
         }
         mlx_gen::image_execution::complete_image_report_attempt(
@@ -1373,9 +1376,7 @@ impl Sdxl {
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
-        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
-            &self.loaded_spec,
-        ))?;
+        plan.check_load_compatible(&self.loaded_spec)?;
         let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut request = self.resolve_request(req)?;
@@ -2372,58 +2373,34 @@ impl<'a, 'p, 's> SdxlRenderPlan<'a, 'p, 's> {
         let req = self.request.req;
         let cfg = self.request.sampling.guidance();
         let d = Denoiser::with_plan(self.unet, sampler, self.request.forward_plan);
-        if let Some(b) = blend {
-            return denoise_inpaint_with_preview(
-                &d,
-                latents,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                cfg,
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                b,
-            );
+        if let Some(run) = self.run {
+            run.reset_image_denoise_phases();
         }
-        match self.guidance {
-            SdxlGuidance::Ip { tokens, scale } => denoise_ip_with_preview(
-                &d,
-                latents,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                cfg,
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                tokens,
-                *scale,
-            ),
-            SdxlGuidance::Control(contexts) => denoise_multi_control_with_preview(
-                &d,
-                latents,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                cfg,
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                contexts,
-            ),
-            SdxlGuidance::Plain => denoise_with_preview(
-                &d,
-                latents,
-                self.conditioning,
-                self.pooled,
-                self.time_ids,
-                cfg,
-                &req.cancel,
-                on_progress,
-                &req.preview,
-            ),
+        let (controls, ip) = match self.guidance {
+            SdxlGuidance::Ip { tokens, scale } => (&[][..], Some((tokens, *scale))),
+            SdxlGuidance::Control(contexts) => (contexts.as_slice(), None),
+            SdxlGuidance::Plain => (&[][..], None),
+        };
+        let out = crate::pipeline::denoise_core_planned(
+            &d,
+            self.run,
+            latents,
+            self.conditioning,
+            self.pooled,
+            self.time_ids,
+            cfg,
+            &req.cancel,
+            on_progress,
+            &req.preview,
+            blend,
+            if blend.is_some() { &[] } else { controls },
+            if blend.is_some() { None } else { ip },
+            None,
+        )?;
+        if let Some(run) = self.run {
+            run.finish_image_denoise_phases()?;
         }
+        Ok(out)
     }
 }
 
@@ -2617,6 +2594,14 @@ pub fn compile_sdxl(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    compile_sdxl_for_mode(spec, req, true)
+}
+
+fn compile_sdxl_for_mode(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    seal_exact_load: bool,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     let desc = descriptor();
     validate_request(&desc.capabilities, req)?;
     let loaded_controls = spec.control.is_some() as usize + spec.extra_controls.len();
@@ -2643,100 +2628,170 @@ pub fn compile_sdxl(
         )?;
         let _ = tokenizer_root(spec)?;
     }
-    let req_controls = control_inputs(req)?;
-    let has_mask = mask_input(req)?.is_some();
-    let sampling = crate::sampling::ResolvedSampling::resolve(req)?;
-    let is_eng5 = spec.identity.is_some()
-        || spec.ip_adapter.is_some()
-        || loaded_controls > 0
-        || !req_controls.is_empty()
-        || has_mask
-        || !sampling.route().is_curated()
-        || req.scheduler.as_deref() == Some("discrete");
-    if is_eng5 {
-        if req.prompt == "feature applicability probe"
-            && spec.identity.is_none()
-            && spec.ip_adapter.is_none()
-            && loaded_controls == 0
-            && req_controls.is_empty()
-            && !has_mask
-            && req.low_res_start.is_none()
-        {
-            let cfg = DiffusionConfig::sdxl_base();
-            let alpha_schedule =
-                AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
-            let ms = DiscreteModelSampling::sdxl(&alpha_schedule);
-            let steps = sampling.steps();
-            let sigmas = mlx_gen::schedule_sigmas(mlx_gen::Scheduler::Normal, &ms, steps);
-            let executed_steps = sigmas.len().saturating_sub(1);
-            return mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
-                &desc,
-                req,
-                mlx_gen::gen_core::render::PackedImagePass {
-                    pixel_stride: SIZE_MULTIPLE,
-                    token_width: 4,
-                    sampler: "euler",
-                    guidance: sampling.guidance(),
-                    sigmas,
-                    executed_steps,
-                    capture_sigma: 0.0,
-                },
-            )
-            .map(|plan| plan.bind_load(spec))
-            .map(Some);
-        }
+    // InstantID identity loads are served by `mlx-gen-instantid`, not native `sdxl`.
+    if spec.identity.is_some() {
         return Ok(None);
     }
+
+    let req_controls = control_inputs(req)?;
+    let reference = reference_inputs(req)?;
+    let mask = mask_input(req)?;
+    let sampling = crate::sampling::ResolvedSampling::resolve(req)?;
+    let is_accel = sampling.route().is_acceleration();
+    let use_curated = sampling.route().is_curated();
+    let is_ip = uses_ip_reference(
+        spec.ip_adapter.is_some(),
+        reference.is_some(),
+        mask.is_some(),
+        req_controls.len(),
+        is_accel,
+    );
+    validate_image_roles(
+        sampling.sampler_name(),
+        is_accel,
+        use_curated,
+        reference.is_some() && !is_ip,
+        mask.is_some(),
+    )?;
+    validate_control_roles(
+        sampling.sampler_name(),
+        req.guidance,
+        req_controls.len(),
+        loaded_controls,
+        mask.is_some(),
+    )?;
 
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
         AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
-    let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
-    let reference = reference_inputs(req)?;
-    let run_sigmas = match reference {
-        Some((_, strength_opt)) => {
-            if req.low_res_start.is_some() {
-                let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
-                let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
-                    full_sigmas.len().saturating_sub(1),
-                    Some(raw_strength),
-                )?;
-                full_sigmas[start..].to_vec()
-            } else {
-                let strength = resolve_strength(strength_opt, DEFAULT_STRENGTH);
-                curated_strength_schedule(&full_sigmas, sampling.steps(), strength)
-            }
-        }
-        None => full_sigmas,
+    let true_init_strength = if is_ip {
+        None
+    } else {
+        reference.map(|(_, strength)| strength)
     };
-    let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
-        .flatten()
-    {
-        Some(p) => p.keep,
-        None => run_sigmas.len(),
-    };
-    let executed_steps = keep.saturating_sub(1);
-    let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
-    let sampler =
-        mlx_gen::sampler::canonical_solver(Some(sampling.sampler_name()), mlx_gen::Solver::Euler)
+
+    let (run_sigmas, executed_steps, capture_sigma, sampler_name): (
+        Vec<f32>,
+        usize,
+        f32,
+        &'static str,
+    ) = match sampling.route() {
+        crate::sampling::SamplingRoute::Curated(_) | crate::sampling::SamplingRoute::CfgPp(_) => {
+            let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
+            let run_sigmas = match true_init_strength {
+                Some(strength_opt) => {
+                    if req.low_res_start.is_some() {
+                        let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
+                        let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                            full_sigmas.len().saturating_sub(1),
+                            Some(raw_strength),
+                        )?;
+                        full_sigmas[start..].to_vec()
+                    } else {
+                        let strength = resolve_strength(strength_opt, DEFAULT_STRENGTH);
+                        curated_strength_schedule(&full_sigmas, sampling.steps(), strength)
+                    }
+                }
+                None => full_sigmas,
+            };
+            let keep = match req
+                .use_pid
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+                .flatten()
+            {
+                Some(p) => p.keep,
+                None => run_sigmas.len(),
+            };
+            let executed_steps = keep.saturating_sub(1);
+            let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
+            let sampler = mlx_gen::sampler::canonical_solver(
+                Some(sampling.sampler_name()),
+                mlx_gen::Solver::Euler,
+            )
             .name();
-    mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
-        &desc,
-        req,
-        mlx_gen::gen_core::render::PackedImagePass {
-            pixel_stride: SIZE_MULTIPLE,
-            token_width: 4,
-            sampler,
-            guidance: sampling.guidance(),
-            sigmas: run_sigmas,
-            executed_steps,
-            capture_sigma,
-        },
-    )
-    .map(|plan| plan.bind_load(spec))
-    .map(Some)
+            (run_sigmas, executed_steps, capture_sigma, sampler)
+        }
+        crate::sampling::SamplingRoute::Ancestral => {
+            let schedule = mlx_gen::gen_core::sampling::DiscreteAncestralSchedule::sdxl();
+            let (steps_to_run, start_time) = match true_init_strength {
+                Some(strength_opt) => {
+                    let default_strength = if mask.is_some() {
+                        INPAINT_DEFAULT_STRENGTH
+                    } else {
+                        DEFAULT_STRENGTH
+                    };
+                    let strength = resolve_strength(strength_opt, default_strength);
+                    ancestral_strength_schedule(
+                        sampling.steps(),
+                        schedule.max_time() as f32,
+                        strength,
+                    )
+                }
+                None => (sampling.steps(), schedule.max_time() as f32),
+            };
+            let run_sigmas = if steps_to_run == 0 {
+                vec![0.0]
+            } else {
+                let mut sigmas: Vec<f32> = schedule
+                    .timesteps(steps_to_run, start_time as f64)
+                    .into_iter()
+                    .map(|(t, _)| schedule.sigma(t) as f32)
+                    .collect();
+                sigmas.push(0.0);
+                sigmas
+            };
+            let keep = match (req.use_pid && mask.is_none())
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+                .flatten()
+            {
+                Some(p) => p.keep,
+                None => run_sigmas.len(),
+            };
+            let executed_steps = keep.saturating_sub(1);
+            let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
+            (run_sigmas, executed_steps, capture_sigma, "euler_ancestral")
+        }
+        crate::sampling::SamplingRoute::Lcm
+        | crate::sampling::SamplingRoute::Lightning
+        | crate::sampling::SamplingRoute::Hyper => {
+            let ms = DiscreteModelSampling::sdxl(&alpha_schedule);
+            let coeffs = sampling.acceleration_coefficients(&alpha_schedule)?;
+            let mut run_sigmas: Vec<f32> = coeffs
+                .iter()
+                .map(|c| mlx_gen::gen_core::sampling::ModelSampling::sigma(&ms, c.timestep))
+                .collect();
+            run_sigmas.push(0.0);
+            let executed_steps = run_sigmas.len().saturating_sub(1);
+            let sampler = match sampling.route() {
+                crate::sampling::SamplingRoute::Lcm => "lcm",
+                crate::sampling::SamplingRoute::Lightning => "lightning",
+                crate::sampling::SamplingRoute::Hyper => "hyper",
+                _ => unreachable!(),
+            };
+            (run_sigmas, executed_steps, 0.0, sampler)
+        }
+    };
+
+    let pass = mlx_gen::gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 4,
+        sampler: sampler_name,
+        guidance: sampling.guidance(),
+        sigmas: run_sigmas,
+        executed_steps,
+        capture_sigma,
+    };
+    let pins = spec.prepared_file_pins();
+    let use_exact_load = seal_exact_load
+        && (pins.is_finalized() || pins.is_prepared() || spec.file_source_paths().is_empty());
+    let plan = if use_exact_load {
+        mlx_gen::gen_core::RenderPlan::packed_image_trajectory_with_exact_load(
+            &desc, spec, req, pass,
+        )?
+    } else {
+        mlx_gen::gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)?.bind_load(spec)
+    };
+    Ok(Some(plan))
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral

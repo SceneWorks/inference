@@ -2,14 +2,6 @@
 
 use super::*;
 
-/// Classifier-free guidance combine: `uncond + gs·(cond − uncond)`.
-pub(super) fn cfg_combine(cond: &Array, uncond: &Array, gs: f32) -> Result<Array> {
-    Ok(add(
-        uncond,
-        &multiply(&subtract(cond, uncond)?, scalar(gs))?,
-    )?)
-}
-
 /// Per-generate caches for one transformer/expert, constant across every denoise step: the bf16 RoPE
 /// `(cos, sin)` for the (fixed) grid + each block's cross-attention K/V for the (CFG-batched) context.
 /// Mirrors the reference's `prepare_rope` / `prepare_cross_kv`, computed once before the loop.
@@ -117,8 +109,13 @@ pub(super) fn predict_approx(
         prune,
     )?;
     if cache.batch == 2 {
-        // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
-        cfg_combine(&preds[0], &preds[1], guidance)
+        // preds[0] = cond (context row 0), preds[1] = uncond (row 1) (`PIPE-8`).
+        Ok(mlx_gen::gen_core::guidance::cfg(
+            &mlx_gen::MlxLatentOps,
+            &preds[0],
+            &preds[1],
+            guidance,
+        )?)
     } else {
         preds
             .into_iter()
@@ -227,17 +224,6 @@ pub fn denoise_approx(
     mut trunk: Option<&mut crate::feature_cache::TrunkCache>,
     mut prune: Option<&mut crate::token_pruning::TokenPruner>,
 ) -> Result<Array> {
-    let mut sched = make_scheduler(kind, num_train_timesteps);
-    sched.set_timesteps(steps, shift);
-    mlx_gen::video_execution::sampling(
-        "wan",
-        &format!("{kind:?}"),
-        "flow_velocity",
-        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
-    );
-    mlx_gen::video_execution::schedule("wan", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
-
     // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
     // RoPE rotation) through `mx.compile` — bit-exact (proven `max|Δ|=0` real + tiny, perf.rs /
     // compile_parity.rs) and ~14% faster/step at production geometry. Scoped + restored on drop by the
@@ -248,19 +234,11 @@ pub fn denoise_approx(
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
 
-    let mut latents = init_noise.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract (sc-5551, the video sibling of chroma's sc-5514):
-        // a video render runs minutes, so check before each step. The per-step `eval` below makes
-        // this effective — without it MLX's lazy graph defers all compute to VAE decode and this
-        // check would pass for every step.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
+    let forward = WanMutForward::new(|latents: &Array, i: usize, t: f32| {
         // Declare the step to the feature cache before the forward: the step index lives here, in the
         // only loop that has one, so the cache never has to derive it from a timestep (sc-18322).
-        if let Some(cache) = trunk.as_deref_mut() {
-            cache.begin_step(i);
+        if let Some(trunk_cache) = trunk.as_deref_mut() {
+            trunk_cache.begin_step(i);
         }
         // Pruning declares the step for the same reason the cache does — it keys its per-block rotation
         // on it — and its warmup decision comes from the contract's own predicate, so a warmup step
@@ -272,27 +250,59 @@ pub fn denoise_approx(
             Some(pruner) if pruner.prunes_step(i) => Some(pruner),
             _ => None,
         };
-        let pred = predict_approx(
+        predict_approx(
             transformer,
-            &latents,
+            latents,
             t,
             &cache,
             guidance,
             None,
             trunk.as_deref_mut(),
             prune_this_step,
-        )?;
-        latents = sched.step(&pred, &latents)?;
-        // Force evaluation each step to bound the lazy graph's peak memory (the reference's
-        // per-step `mx.eval(latents)`).
-        //
-        // Unconditional, and outside the feature-cache branch three call levels down: a reused step is
-        // materialized and progress-reported exactly like a recomputed one, so skipping the block stack
-        // can never make the loop less cancel-responsive (sc-18322).
-        mlx_rs::transforms::eval([&latents])?;
-        on_step(i + 1);
+        )
+    });
+    let driver = WanNativeDriver::new(
+        "wan_native_dense",
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
+        forward,
+    );
+    mlx_gen::video_execution::sampling(
+        "wan",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan", driver.sigmas());
+
+    let mut state = mlx_gen::driver::DriverRunState::new();
+    let mut on_progress = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut on_progress);
+    let out = mlx_gen::driver::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec::full(steps)],
+        mlx_gen::gen_core::BoundaryState::XSigma(init_noise.clone()),
+        steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    match out {
+        mlx_gen::gen_core::BoundaryState::XSigma(latents)
+        | mlx_gen::gen_core::BoundaryState::CleanEstimate {
+            latent: latents, ..
+        }
+        | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: latents, .. } => Ok(latents),
     }
-    Ok(latents)
 }
 
 /// Wan's request grid is 1 + stride × (latent_frames - 1), including trim-extended
@@ -462,7 +472,12 @@ pub(super) fn predict_tokens(
         cache.batch,
     )?;
     if cache.batch == 2 {
-        cfg_combine(&preds[0], &preds[1], guidance)
+        Ok(mlx_gen::gen_core::guidance::cfg(
+            &mlx_gen::MlxLatentOps,
+            &preds[0],
+            &preds[1],
+            guidance,
+        )?)
     } else {
         preds
             .into_iter()
@@ -476,7 +491,8 @@ pub(super) fn predict_tokens(
 /// image `z_img` and *frozen*: every step (1) builds the per-token timestep vector `t_tokens =
 /// mask_tokens · t` (`0` for the first-frame tokens, so they carry timestep 0), (2) predicts the
 /// noise with `predict_tokens`, (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
-/// mask·latents` so the first frame stays the conditioning image while the rest denoise.
+/// mask·latents` via [`mlx_gen::driver::StepHooks::on_post_step`] so the first frame stays the
+/// conditioning image while the rest denoise.
 ///
 /// `init_latents` is the pre-blended `[C,F,H,W]` start `(1−mask)·z_img + mask·noise`; `z_img` is the
 /// VAE-encoded image `[C,1,H,W]` (broadcasts over `F`); `mask` is `[C,F,H,W]` (`0` first frame, `1`
@@ -498,17 +514,6 @@ pub fn denoise_ti2v(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(kind, num_train_timesteps);
-    sched.set_timesteps(steps, shift);
-    mlx_gen::video_execution::sampling(
-        "wan",
-        &format!("{kind:?}"),
-        "flow_velocity",
-        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
-    );
-    mlx_gen::video_execution::schedule("wan", sched.sigmas());
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
-
     // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token
     // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once. Scoped +
     // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
@@ -524,21 +529,58 @@ pub fn denoise_ti2v(
     let one_minus_mask = subtract(scalar(1.0), mask)?;
     let frozen = multiply(&one_minus_mask, z_img)?;
 
-    let mut latents = init_latents.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let driver = WanNativeDriver::new(
+        "wan_native_ti2v",
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
+        |latents: &Array, _step: usize, t: f32| {
+            // Per-token timesteps: 0 for the first-frame tokens (frozen), `t` for the rest. (The 5B's
+            // seq_len equals the patch count, so no padding is needed — matches the reference.)
+            let t_tokens = multiply(mask_tokens, scalar(t))?;
+            predict_tokens(transformer, latents, &t_tokens, &cache, guidance)
+        },
+    );
+    mlx_gen::video_execution::sampling(
+        "wan",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan", driver.sigmas());
+
+    let mut state = mlx_gen::driver::DriverRunState::new();
+    let mut on_progress = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
         }
-        // Per-token timesteps: 0 for the first-frame tokens (frozen), `t` for the rest. (The 5B's
-        // seq_len equals the patch count, so no padding is needed — matches the reference.)
-        let t_tokens = multiply(mask_tokens, scalar(t))?;
-        let pred = predict_tokens(transformer, &latents, &t_tokens, &cache, guidance)?;
-        latents = sched.step(&pred, &latents)?;
+    };
+    let mut blend_hook = |_info: &mlx_gen::driver::DriverStepInfo, latents: Array| {
         // Re-apply the mask so the first frame stays pinned to the conditioning image.
-        latents = add(&frozen, &multiply(mask, &latents)?)?;
-        mlx_rs::transforms::eval([&latents])?;
-        on_step(i + 1);
+        let masked =
+            multiply(mask, &latents).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+        add(&frozen, &masked).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+    };
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut on_progress);
+    hooks.on_post_step = Some(&mut blend_hook);
+    let out = mlx_gen::driver::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec::full(steps)],
+        mlx_gen::gen_core::BoundaryState::XSigma(init_latents.clone()),
+        steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    match out {
+        mlx_gen::gen_core::BoundaryState::XSigma(latents)
+        | mlx_gen::gen_core::BoundaryState::CleanEstimate {
+            latent: latents, ..
+        }
+        | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: latents, .. } => Ok(latents),
     }
-    Ok(latents)
 }

@@ -27,7 +27,7 @@ use mlx_gen::tiling::{
 };
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
-use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler};
+use crate::scheduler::{compute_sigmas, SolverKind, WanMutForward, WanNativeDriver};
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;

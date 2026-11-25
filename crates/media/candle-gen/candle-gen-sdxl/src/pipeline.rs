@@ -140,7 +140,7 @@ pub(crate) const LIGHTNING_SAMPLER: &str = "lightning";
 /// Lightning's few-step default when the request omits `steps` — matches `mlx-gen-sdxl`'s
 /// `accel_defaults("lightning")` (4 steps, CFG off). The worker typically sends an explicit count
 /// (the AC eyeballs ~5).
-const LIGHTNING_DEFAULT_STEPS: usize = 4;
+pub(crate) const LIGHTNING_DEFAULT_STEPS: usize = 4;
 /// Build SDXL's ε-prediction α-cumprod schedule (`scaled_linear` β over 1000 train steps) — the
 /// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
 /// txt2img [`Pipeline::denoise_curated`] (sc-7124), the Lightning policy, and the conditioned
@@ -162,6 +162,211 @@ pub(crate) fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
 pub(crate) fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
     let sched = sdxl_alpha_schedule()?;
     Ok(LightningPolicy::new(&sched, SDXL_TRAIN_STEPS, num_steps))
+}
+
+/// Forward evaluation seam for Candle SDXL-Lightning trailing-Euler denoising (`SW-6966`, `PIPE-7`).
+///
+/// Generic over model prediction so Tier 0 `DriverSupport` conformance tests can drive
+/// [`SdxlLightningDriver`] without loading weights or executing a learned forward.
+pub trait SdxlLightningForward {
+    /// Predict the noise residual ε for scaled model input `x_in` at `timestep` and 0-based
+    /// `step_index`.
+    fn predict_eps(&self, x_in: &Tensor, timestep: f64, step_index: usize) -> Result<Tensor>;
+}
+
+enum LightningPolicyOwner<'a> {
+    Borrowed(&'a LightningPolicy),
+    Owned(LightningPolicy),
+}
+
+impl LightningPolicyOwner<'_> {
+    fn as_policy(&self) -> &LightningPolicy {
+        match self {
+            Self::Borrowed(p) => p,
+            Self::Owned(p) => p,
+        }
+    }
+}
+
+/// Typed [`candle_gen::driver::FamilyDriver`] for Candle SDXL-Lightning (base and ControlNet)
+/// trajectories (`SW-6966`, `PIPE-7`).
+pub struct SdxlLightningDriver<'a, F> {
+    policy: LightningPolicyOwner<'a>,
+    compute_dtype: DType,
+    forward: F,
+    support: candle_gen::driver::DriverSupport,
+}
+
+impl<'a, F: SdxlLightningForward> SdxlLightningDriver<'a, F> {
+    fn build_support(driver_id: &'static str) -> candle_gen::driver::DriverSupport {
+        candle_gen::driver::DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: candle_gen::driver::DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle SDXL-Lightning driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native Candle SDXL-Lightning driver does not support geometry-changing low-res start",
+                read_only_boundary_estimate:
+                    "native Candle SDXL-Lightning driver does not expose read-only boundary clean estimates",
+                ..candle_gen::driver::DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        policy: &'a LightningPolicy,
+        compute_dtype: DType,
+        forward: F,
+    ) -> Self {
+        Self {
+            policy: LightningPolicyOwner::Borrowed(policy),
+            compute_dtype,
+            forward,
+            support: Self::build_support(driver_id),
+        }
+    }
+
+    pub fn new_owned(
+        driver_id: &'static str,
+        policy: LightningPolicy,
+        compute_dtype: DType,
+        forward: F,
+    ) -> SdxlLightningDriver<'static, F> {
+        SdxlLightningDriver {
+            policy: LightningPolicyOwner::Owned(policy),
+            compute_dtype,
+            forward,
+            support: SdxlLightningDriver::<'static, F>::build_support(driver_id),
+        }
+    }
+}
+
+impl<F: SdxlLightningForward> candle_gen::driver::FamilyDriver<Tensor>
+    for SdxlLightningDriver<'_, F>
+{
+    fn support(&self) -> &candle_gen::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: candle_gen::driver::SliceInput<'_, Tensor>,
+        state: &mut candle_gen::driver::DriverRunState,
+        hooks: &mut candle_gen::driver::StepHooks<'_, Tensor>,
+    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let policy = self.policy.as_policy();
+        if input.span.end > policy.num_steps() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "sdxl lightning driver '{}': slice span {:?} exceeds {} steps",
+                self.support.driver_id,
+                input.span,
+                policy.num_steps()
+            )));
+        }
+        let mut latents = match input.state {
+            gen_core::BoundaryState::XSigma(x)
+            | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        for global_step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let c = policy.coeffs(global_step);
+            let info = candle_gen::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: global_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: candle_gen::driver::DriverEvaluationKind::Trajectory,
+                sigma: policy.sigma(global_step).unwrap_or(0.0),
+                next_sigma: policy.sigma(global_step + 1).unwrap_or(0.0),
+            };
+            let scaled = latents
+                .affine(c.c_in as f64, 0.0)
+                .map_err(CandleError::from)?;
+            hooks.observe(&info, &scaled)?;
+            let x_in = scaled
+                .to_dtype(self.compute_dtype)
+                .map_err(CandleError::from)?;
+            let eps = self
+                .forward
+                .predict_eps(&x_in, c.timestep as f64, global_step)?
+                .to_dtype(DType::F32)
+                .map_err(CandleError::from)?;
+            state.record_evaluation(candle_gen::driver::DriverEvaluationKind::Trajectory);
+            latents = (latents + eps.affine(c.a_out as f64, 0.0).map_err(CandleError::from)?)
+                .map_err(CandleError::from)?;
+            latents = hooks.post_step(&info, latents)?;
+            hooks.materialize(&info, &latents)?;
+            state.record_outer_step(global_step);
+            hooks.emit_progress(&info);
+        }
+        state.finish_slice(input.span.end);
+        Ok(gen_core::BoundaryState::XSigma(latents))
+    }
+}
+
+/// Shared execution helper driving [`SdxlLightningDriver`] through [`candle_gen::run_candle_driver_slices`]
+/// for both base SDXL-Lightning (`pipeline.rs`) and ControlNet SDXL-Lightning (`control_provider.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_lightning_with_forward<F: SdxlLightningForward>(
+    latents: Tensor,
+    policy: &LightningPolicy,
+    compute_dtype: DType,
+    forward: F,
+    cancel: &gen_core::runtime::CancelFlag,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
+) -> Result<Tensor> {
+    let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
+    let sigmas: Vec<f32> = (0..=policy.num_steps())
+        .filter_map(|i| policy.sigma(i))
+        .collect();
+    candle_gen::execution::schedule("sdxl-lightning-euler", &sigmas, "epsilon");
+    candle_gen::execution::runtime(latents.device(), latents.dtype());
+    let driver = SdxlLightningDriver::new("sdxl_candle_lightning", policy, compute_dtype, forward);
+    let slices = candle_gen::driver::SliceSpec::from_render_run(run, policy.num_steps());
+    let mut observe = |info: &candle_gen::driver::DriverStepInfo, scaled: &Tensor| {
+        candle_gen::preview::emit_preview_at(preview, &preview_counter, info.outer_step, || {
+            crate::preview::project_spatial_latents(scaled)
+        });
+        Ok(())
+    };
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let mut hooks = candle_gen::driver::StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut observe);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        slices,
+        gen_core::BoundaryState::XSigma(latents),
+        policy.num_steps(),
+        0,
+        cancel,
+        run,
+        &mut state,
+        &mut hooks,
+        |_phase, boundary, _state| Ok(boundary),
+    )?;
+    let latents = match out {
+        gen_core::BoundaryState::XSigma(x)
+        | gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: x, .. } => x,
+    };
+    Ok(latents.to_dtype(compute_dtype)?)
 }
 
 /// The diffusers filename the fp16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`) ships under — the
@@ -1203,9 +1408,15 @@ impl Pipeline {
         let output_size = run.map_or((init_w, init_h), |run| run.plan().output_size());
         let text_embeddings = text_embeddings.with_sizes((init_w, init_h), output_size)?;
         let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
-        let init_clean = match &req.source_image {
-            Some(source) => Some(self.encode_source_image(source, init_w, init_h)?),
-            None => None,
+        let init_clean = if let Some(source) = &req.source_image {
+            Some(self.encode_source_image(source, init_w, init_h)?)
+        } else if run.is_some_and(|r| r.plan().produced_reference().is_some()) {
+            match crate::planned_reference_input(req).map_err(CandleError::from)? {
+                Some((image, _)) => Some(self.encode_source_image(image, init_w, init_h)?),
+                None => None,
+            }
+        } else {
+            None
         };
 
         // Lightning precompute (seed-independent): the trailing-Euler policy + the cond-only text
@@ -1240,6 +1451,7 @@ impl Pipeline {
                     policy,
                     cond,
                     unet,
+                    run,
                     &req.cancel,
                     on_progress,
                     total,
@@ -1302,52 +1514,38 @@ impl Pipeline {
         policy: &LightningPolicy,
         cond: &TextConditioning,
         unet: &SdxlUnet,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         cancel: &gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-        total: u32,
+        _total: u32,
         preview: &gen_core::PreviewSink,
     ) -> Result<Tensor> {
-        // σ-space prior: unit noise · the largest σ (init_noise_sigma for trailing spacing).
-        let mut latents = init.affine(policy.init_noise_scale() as f64, 0.0)?;
-        // Per-step latent preview (epic 16948, sc-16954). This lane owns its loop rather than driving
-        // a shared sampler, so it numbers frames itself — on the STEP INDEX, since it walks
-        // `LightningPolicy` coefficients rather than a σ array. One frame per iteration, so there is
-        // no multi-eval repeat to dedup; the counter still bounds and dedups on principle.
-        let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
-        candle_gen::execution::schedule(
-            "sdxl-lightning-euler",
-            &(0..=policy.num_steps())
-                .filter_map(|i| policy.sigma(i))
-                .collect::<Vec<_>>(),
-            "epsilon",
-        );
-        candle_gen::execution::runtime(latents.device(), latents.dtype());
-        for i in 0..policy.num_steps() {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let c = policy.coeffs(i);
-            // Model-input scaling x/√(σ²+1), cast to the UNet compute dtype (f16). CFG-off ⇒ batch 1.
-            let x_in = latents.affine(c.c_in as f64, 0.0)?.to_dtype(self.dtype)?;
-            // Preview the RENORMALIZED latent — `x·c_in`, the very coefficient this step feeds the
-            // UNet, which is also the domain the reused fit was measured in. Binding it to `c.c_in`
-            // rather than recomputing `1/√(σ²+1)` is what keeps the preview and the denoise from
-            // coming to disagree about the scaling. Failures are swallowed by `emit_preview_at`.
-            candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
-                crate::preview::project_spatial_latents(&latents.affine(c.c_in as f64, 0.0)?)
-            });
-            let eps = unet
-                .forward(&x_in, c.timestep as f64, cond)?
-                .to_dtype(DType::F32)?;
-            // Euler ε-pred step in f32: x + ε·(σ_{i+1} − σ_i) (a_x = 1, a_noise = 0, deterministic).
-            latents = (latents + eps.affine(c.a_out as f64, 0.0)?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
+        struct UnetLightningForward<'a> {
+            unet: &'a SdxlUnet,
+            cond: &'a TextConditioning,
         }
-        // The shared `decode` expects the compute dtype (f16), like the DDIM loop's latents.
-        Ok(latents.to_dtype(self.dtype)?)
+        impl SdxlLightningForward for UnetLightningForward<'_> {
+            fn predict_eps(
+                &self,
+                x_in: &Tensor,
+                timestep: f64,
+                _step_index: usize,
+            ) -> Result<Tensor> {
+                self.unet.forward(x_in, timestep, self.cond)
+            }
+        }
+        // σ-space prior: unit noise · the largest σ (init_noise_sigma for trailing spacing).
+        let latents = init.affine(policy.init_noise_scale() as f64, 0.0)?;
+        run_lightning_with_forward(
+            latents,
+            policy,
+            self.dtype,
+            UnetLightningForward { unet, cond },
+            cancel,
+            run,
+            on_progress,
+            preview,
+        )
     }
 
     /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native
@@ -1399,6 +1597,10 @@ impl Pipeline {
         };
         let latents = if let Some(clean) = init_clean {
             if sigmas.len() <= 1 {
+                if let Some(run) = run {
+                    run.begin_denoise_phase(0).map_err(CandleError::from)?;
+                    run.end_denoise_phase(0).map_err(CandleError::from)?;
+                }
                 return Ok(clean.to_dtype(self.dtype)?);
             }
             (clean + (init * sigmas[0] as f64)?)?
@@ -1456,7 +1658,12 @@ impl Pipeline {
                 let uncond = unet.forward(&model_in, t as f64, &ehs.row(0)?)?;
                 candle_gen::residency::check_cancel(&req.cancel)?;
                 let cond = unet.forward(&model_in, t as f64, &ehs.row(1)?)?;
-                (&uncond + ((cond - &uncond)? * guidance)?)?
+                gen_core::guidance::cfg(
+                    &candle_gen::CandleLatentOps,
+                    &cond,
+                    &uncond,
+                    guidance as f32,
+                )?
             } else {
                 let model_in = if use_guide {
                     Tensor::cat(&[x_in, x_in], 0)?
@@ -1466,7 +1673,12 @@ impl Pipeline {
                 let noise_pred = unet.forward(&model_in.to_dtype(self.dtype)?, t as f64, &ehs)?;
                 if use_guide {
                     let chunks = noise_pred.chunk(2, 0)?;
-                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance)?)?
+                    gen_core::guidance::cfg(
+                        &candle_gen::CandleLatentOps,
+                        &chunks[1],
+                        &chunks[0],
+                        guidance as f32,
+                    )?
                 } else {
                     noise_pred
                 }
@@ -1558,10 +1770,7 @@ impl Pipeline {
                 let chunks = noise_pred.chunk(2, 0).map_err(CandleError::from)?;
                 (chunks[0].clone(), chunks[1].clone())
             };
-            let guided = (&eps_u
-                + ((&eps_c - &eps_u).map_err(CandleError::from)? * guidance)
-                    .map_err(CandleError::from)?)
-            .map_err(CandleError::from)?;
+            let guided = gen_core::guidance::cfg(&ops, &eps_c, &eps_u, guidance as f32)?;
             Ok((guided, eps_u))
         };
 
@@ -2856,5 +3065,54 @@ mod tests {
             reset_out, unsplit_out,
             "per-span reset must differ from preserved multistep history"
         );
+    }
+
+    #[test]
+    fn sdxl_lightning_driver_passes_tier0_conformance_without_weights() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        struct FakeLinearForward;
+        impl SdxlLightningForward for FakeLinearForward {
+            fn predict_eps(
+                &self,
+                x_in: &Tensor,
+                timestep: f64,
+                step_index: usize,
+            ) -> Result<Tensor> {
+                let scale = 0.05 + 0.0001 * timestep + 0.01 * (step_index as f64);
+                Ok(x_in.affine(scale, 0.0)?)
+            }
+        }
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 9,
+            base_geometry: (1024, 1024),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                let policy = lightning_policy(4).unwrap();
+                Box::new(SdxlLightningDriver::new_owned(
+                    "sdxl_candle_lightning_tier0",
+                    policy,
+                    DType::F32,
+                    FakeLinearForward,
+                ))
+            },
+            make_initial: || {
+                Tensor::from_vec(vec![0.4f32, -0.3, 0.2, 0.8], (1, 4, 1, 1), &Device::Cpu).unwrap()
+            },
+            latents_equal: |a, b| {
+                a.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    == b.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            },
+        })
+        .expect("SdxlLightningDriver must pass Tier 0 conformance");
+        assert!(report.verified_inert_split);
+        assert!(report.verified_carry_refusal_or_support);
+        assert!(report.verified_reset_preserves_draws);
+        assert!(report.verified_boundary_estimate_readonly_or_refusal);
+        assert!(report.verified_renoise_and_resample_guards);
+        assert!(report.verified_cancellation);
     }
 }

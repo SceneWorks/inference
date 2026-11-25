@@ -98,7 +98,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1168
+              "line": 1206
             }
           ],
           "creation": [
@@ -141,7 +141,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1194
+              "line": 1246
             }
           ],
           "creation": [
@@ -184,7 +184,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1194
+              "line": 1246
             }
           ],
           "creation": [
@@ -270,7 +270,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 605
+              "line": 608
             }
           ],
           "creation": [
@@ -434,7 +434,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 57
+              "line": 49
             }
           ],
           "reads": [
@@ -448,7 +448,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 25
+              "line": 17
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -483,7 +483,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 57
+              "line": 49
             }
           ],
           "reads": [
@@ -497,7 +497,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 25
+              "line": 17
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -541,7 +541,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 57
+              "line": 49
             }
           ],
           "reads": [
@@ -555,7 +555,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 25
+              "line": 17
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -684,7 +684,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1011
+              "line": 1015
             }
           ],
           "product_residency": "sequential",

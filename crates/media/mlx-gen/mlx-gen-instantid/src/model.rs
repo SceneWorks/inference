@@ -1147,8 +1147,8 @@ impl InstantId {
         self.prepare_conditioning_phase()?;
         let cfg_on = req.guidance > 1.0;
 
-        // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
-        mlx_rs::random::seed(req.seed)?;
+        // Conditioning draws no RNG; global MLX seeding happens atomically inside
+        // `run_identity_denoise` under `mlx_gen::with_global_rng_trajectory` (B3 / PIPE-14).
         // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
         // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
         // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
@@ -1249,65 +1249,75 @@ impl InstantId {
         // (the N1 default gate). Mirrors `mlx_gen_sdxl::Sdxl::generate`'s `use_curated` decision.
         let sampler_curated =
             Solver::from_name(sampler_name).is_some() && sampler_name != "euler_ancestral";
-        if sampler_curated || scheduler_curated {
-            // Curated unified-sampler path (epic 7114, sc-7297): k-diffusion VE-σ sampling over the SDXL
-            // `DiscreteModelSampling`. The latents live in raw σ-space (`ε·σ_max`); `denoise_curated`
-            // applies the IdentityNet residuals (`controls`) + face IP tokens (`ip`/`control_encoder`)
-            // each step, exactly as the ancestral loop does — so identity conditioning is unchanged, only
-            // the integrator differs. Seeded so the first draw is the init noise (mirrors the SDXL crate).
-            let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
-            let sched = req
-                .scheduler
-                .as_deref()
-                .and_then(Scheduler::from_name)
-                .unwrap_or(Scheduler::Normal);
-            let sigmas = schedule_sigmas(sched, &ms, req.steps);
-            let latent_shape = [1, (height / 8) as i32, (width / 8) as i32, 4];
-            mlx_rs::random::seed(req.seed)?;
-            let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
-            let init = multiply(&noise, scalar(sigmas[0]))?;
-            mlx_gen::image_execution::with_primary_seed(req.seed, || {
-                denoise_curated(
-                    Self::require(&self.unet, "UNet")?,
-                    Some(sampler_name),
-                    &ms,
-                    &sigmas,
-                    init,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    req.guidance,
-                    req.seed,
-                    &req.cancel,
-                    on_progress,
-                    controls,
-                    Some((face_tokens, ip_scale)),
-                    Some(face_tokens),
-                )
-            })
-        } else {
-            // Bespoke ancestral default (byte-exact N1): InstantID's production EulerAncestral over the
-            // seeded prior, dual conditioning via `denoise_ip_multi_control`.
-            let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
-            let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
-            let d = Denoiser::new(Self::require(&self.unet, "UNet")?, &ancestral);
-            mlx_gen::image_execution::with_primary_seed(req.seed, || {
-                denoise_ip_multi_control(
-                    &d,
-                    prior,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    req.guidance,
-                    &req.cancel,
-                    on_progress,
-                    controls,
-                    face_tokens,
-                    face_tokens,
-                    ip_scale,
-                )
-            })
-        }
+        // B3 / PIPE-14: InstantID seeds MLX's process-global RNG and draws initial + ancestral
+        // step noise lazily. Serialize the whole trajectory (seed → draws → materialization) on
+        // the shared MLX global-RNG gate so concurrent requests cannot interleave seeds/draws.
+        mlx_gen::with_global_rng_trajectory(|| -> Result<Array> {
+            let latents = if sampler_curated || scheduler_curated {
+                // Curated unified-sampler path (epic 7114, sc-7297): k-diffusion VE-σ sampling over the SDXL
+                // `DiscreteModelSampling`. The latents live in raw σ-space (`ε·σ_max`); `denoise_curated`
+                // applies the IdentityNet residuals (`controls`) + face IP tokens (`ip`/`control_encoder`)
+                // each step, exactly as the ancestral loop does — so identity conditioning is unchanged, only
+                // the integrator differs. Seeded so the first draw is the init noise (mirrors the SDXL crate).
+                let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
+                let sched = req
+                    .scheduler
+                    .as_deref()
+                    .and_then(Scheduler::from_name)
+                    .unwrap_or(Scheduler::Normal);
+                let sigmas = schedule_sigmas(sched, &ms, req.steps);
+                let latent_shape = [1, (height / 8) as i32, (width / 8) as i32, 4];
+                mlx_rs::random::seed(req.seed)?;
+                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+                let init = multiply(&noise, scalar(sigmas[0]))?;
+                mlx_gen::image_execution::with_primary_seed(req.seed, || {
+                    denoise_curated(
+                        Self::require(&self.unet, "UNet")?,
+                        Some(sampler_name),
+                        &ms,
+                        &sigmas,
+                        init,
+                        conditioning,
+                        pooled,
+                        time_ids,
+                        req.guidance,
+                        req.seed,
+                        &req.cancel,
+                        on_progress,
+                        controls,
+                        Some((face_tokens, ip_scale)),
+                        Some(face_tokens),
+                    )
+                })?
+            } else {
+                // Bespoke ancestral default (byte-exact N1): InstantID's production EulerAncestral over the
+                // seeded prior, dual conditioning via `denoise_ip_multi_control` (routed through
+                // `mlx_gen_sdxl::SdxlDiscreteDriver`).
+                let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
+                let ancestral =
+                    AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
+                let d = Denoiser::new(Self::require(&self.unet, "UNet")?, &ancestral);
+                mlx_gen::image_execution::with_primary_seed(req.seed, || {
+                    denoise_ip_multi_control(
+                        &d,
+                        prior,
+                        conditioning,
+                        pooled,
+                        time_ids,
+                        req.guidance,
+                        &req.cancel,
+                        on_progress,
+                        controls,
+                        face_tokens,
+                        face_tokens,
+                        ip_scale,
+                    )
+                })?
+            };
+            // Materialize lazy MLX RNG draws before releasing the global-RNG trajectory lease.
+            latents.eval()?;
+            Ok(latents)
+        })
     }
 
     /// Build the CFG-batched face tokens from a 512-d ArcFace `embedding` (positive-first; the uncond
@@ -1468,8 +1478,8 @@ impl InstantId {
         let side = req.width;
         let cfg_on = req.guidance > 1.0;
 
-        // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
-        mlx_rs::random::seed(req.seed)?;
+        // Conditioning draws no RNG; global MLX seeding happens atomically inside
+        // `run_identity_denoise` under `mlx_gen::with_global_rng_trajectory` (B3 / PIPE-14).
         // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
         // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
         // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
@@ -2014,5 +2024,44 @@ mod tests {
             ..Default::default()
         })
         .is_ok());
+    }
+
+    #[test]
+    fn instantid_global_rng_trajectory_serialization_prevents_cross_thread_interleaving() {
+        // B3 / PIPE-14 (weights-free Tier 0): concurrent trajectories using MLX's global RNG
+        // under `mlx_gen::with_global_rng_trajectory` (seed -> multi-step draws -> eval) must
+        // match single-threaded seeded draws bit-for-bit without cross-thread interleaving.
+        fn run_seeded_draws(seed: u64) -> Vec<f32> {
+            mlx_gen::with_global_rng_trajectory(|| {
+                mlx_rs::random::seed(seed).unwrap();
+                let mut acc =
+                    mlx_rs::random::normal::<f32>(&[1, 2, 2, 4], None, None, None).unwrap();
+                for _ in 0..4 {
+                    let step_noise =
+                        mlx_rs::random::normal::<f32>(&[1, 2, 2, 4], None, None, None).unwrap();
+                    acc = acc.add(&step_noise).unwrap();
+                    std::thread::yield_now();
+                }
+                acc.eval().unwrap();
+                acc.as_slice::<f32>().to_vec()
+            })
+        }
+
+        let expected_a = run_seeded_draws(11);
+        let expected_b = run_seeded_draws(22);
+        assert_ne!(expected_a, expected_b);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            run_seeded_draws(11)
+        });
+        let h2 = std::thread::spawn(move || {
+            barrier.wait();
+            run_seeded_draws(22)
+        });
+        assert_eq!(h1.join().unwrap(), expected_a);
+        assert_eq!(h2.join().unwrap(), expected_b);
     }
 }
