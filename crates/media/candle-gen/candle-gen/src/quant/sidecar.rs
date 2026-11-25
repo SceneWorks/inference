@@ -47,6 +47,8 @@ const PREPARE_LOCK: &str = ".prepare.lock";
 const PAYLOAD_KEY: &str = "weight";
 const PAYLOAD_HASH_KEY: &str = "payload_sha256";
 const FORMAT_DOMAIN: &[u8] = b"sceneworks-candle-device-format-sidecar-v1\0";
+const MAX_RUNTIME_INDEX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RUNTIME_INDEX_ENTRIES: usize = 1_000_000;
 const HASH_CANCEL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1050,6 +1052,34 @@ fn runtime_index_geometry(
     Ok(())
 }
 
+fn read_runtime_index(path: &Path) -> Option<Vec<RuntimeIndexEntry>> {
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    decode_runtime_index(file, metadata.len(), MAX_RUNTIME_INDEX_BYTES)
+}
+
+fn decode_runtime_index(
+    reader: impl Read,
+    declared_len: u64,
+    limit: usize,
+) -> Option<Vec<RuntimeIndexEntry>> {
+    // Reject sparse/oversized files before reserving a buffer. `take` also bounds a file that
+    // grows after metadata was read; this is parsing a small index, never validating weights.
+    if declared_len > limit as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(declared_len as usize);
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    let entries: Vec<RuntimeIndexEntry> = serde_json::from_slice(&bytes).ok()?;
+    (entries.len() <= MAX_RUNTIME_INDEX_ENTRIES).then_some(entries)
+}
+
 fn trusted_runtime_cache(
     source: &MmapedSafetensors,
     component: &Path,
@@ -1079,16 +1109,12 @@ fn trusted_runtime_cache(
         directories.push(dir);
     }
     for dir in directories {
-        let mut indexed: Option<Vec<RuntimeIndexEntry>> =
-            fs::read(runtime_index_path(&dir, packed, prefix, &source_paths))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let mut indexed =
+            read_runtime_index(&runtime_index_path(&dir, packed, prefix, &source_paths));
         let had_exact_index = indexed.is_some();
         // A complete index for these exact source paths also serves a narrower selection.
         if indexed.is_none() && prefix.is_some() {
-            indexed = fs::read(runtime_index_path(&dir, packed, None, &source_paths))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Vec<RuntimeIndexEntry>>(&bytes).ok())
+            indexed = read_runtime_index(&runtime_index_path(&dir, packed, None, &source_paths))
                 .map(|entries| {
                     entries
                         .into_iter()
@@ -2572,6 +2598,30 @@ mod tests {
             first.load("layers.q8", &Device::Cpu)?.data()?.as_ref()
         );
         Ok(())
+    }
+
+    #[test]
+    fn runtime_index_size_is_bounded_before_reading_and_when_a_file_grows() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized index must be rejected before any read or allocation");
+            }
+        }
+        assert!(decode_runtime_index(
+            NeverRead,
+            MAX_RUNTIME_INDEX_BYTES as u64 + 1,
+            MAX_RUNTIME_INDEX_BYTES
+        )
+        .is_none());
+        let mut growing = std::io::Cursor::new(b"[]                    ".as_slice());
+        assert!(decode_runtime_index(&mut growing, 2, 8).is_none());
+        assert_eq!(
+            growing.position(),
+            9,
+            "a growing index must stop at the bound plus one byte"
+        );
+        assert!(decode_runtime_index(std::io::Cursor::new(b"[]"), 2, 8).is_some());
     }
 
     #[test]

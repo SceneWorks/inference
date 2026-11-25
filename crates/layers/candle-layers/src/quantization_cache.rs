@@ -3,6 +3,7 @@ use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::Result;
 use candle_core::{DType, Device, Tensor};
 use std::borrow::Cow;
+use std::io::Read;
 
 /// Install the common backend bridge after the request's backend-neutral cache context.
 /// Core quantizer calls then reuse saved weights too, without changing individual model callers.
@@ -295,31 +296,32 @@ fn materialize_runtime_weight(
         }
         // Completed artifacts are trusted. Read runtime bytes directly; no source/payload
         // digest pass belongs here. The lease protects the file until its upload completes.
-        let read = std::fs::read(artifact.path())
-            .map_err(candle_core::Error::from)
-            .and_then(|bytes| {
-                let elements = shape
-                    .iter()
-                    .try_fold(1usize, |n, &d| n.checked_mul(d))
-                    .ok_or_else(|| {
-                        candle_core::Error::Msg("runtime weight shape overflow".into())
-                    })?;
-                let expected = (elements / dtype.block_size())
-                    .checked_mul(dtype.type_size())
-                    .ok_or_else(|| {
-                        candle_core::Error::Msg("runtime weight size overflow".into())
-                    })?;
-                if !elements.is_multiple_of(dtype.block_size()) || bytes.len() != expected {
-                    candle_core::bail!(
-                        "runtime weight cannot be decoded: expected {expected} bytes, got {}",
-                        bytes.len()
-                    );
-                }
-                QTensor::new(
-                    QStorage::from_data(Cow::Borrowed(&bytes), device, dtype)?,
-                    shape,
-                )
-            });
+        let read = (|| {
+            let elements = shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| candle_core::Error::Msg("runtime weight shape overflow".into()))?;
+            let expected = (elements / dtype.block_size())
+                .checked_mul(dtype.type_size())
+                .ok_or_else(|| candle_core::Error::Msg("runtime weight size overflow".into()))?;
+            if !elements.is_multiple_of(dtype.block_size()) {
+                candle_core::bail!("runtime weight shape is not block aligned");
+            }
+            let file = std::fs::File::open(artifact.path())?;
+            if file.metadata()?.len() != expected as u64 {
+                candle_core::bail!("runtime weight cannot be decoded: expected {expected} bytes");
+            }
+            // Limit reads to the native shape even if the file grows after metadata was read.
+            let mut bytes = Vec::with_capacity(expected);
+            file.take(expected as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() != expected {
+                candle_core::bail!("runtime weight size changed while reading");
+            }
+            QTensor::new(
+                QStorage::from_data(Cow::Borrowed(&bytes), device, dtype)?,
+                shape,
+            )
+        })();
         drop(artifact);
         match read {
             Ok(tensor) => return Ok(tensor),
@@ -698,6 +700,17 @@ mod tests {
         std::fs::write(entry, b"bad")?;
         assert_eq!(data(&packed(&parts, 64)?), expected);
         assert_eq!(cache.writes.load(Ordering::Relaxed), 2);
+        let entry = std::fs::read_dir(cache.root.path())?
+            .next()
+            .unwrap()?
+            .path();
+        std::fs::File::options()
+            .write(true)
+            .open(entry)?
+            .set_len(expected.len() as u64 + 1)?;
+        assert_eq!(data(&packed(&parts, 64)?), expected);
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 3);
+
         Ok(())
     }
 }
