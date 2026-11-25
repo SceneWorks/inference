@@ -116,7 +116,7 @@ struct ValidationMemoKey {
     cache_identity: PathBuf,
     bits: usize,
     group_size: usize,
-    base_prefix: Option<String>,
+    base_prefix: Option<Vec<String>>,
     sources: Vec<FileIdentity>,
 }
 
@@ -317,7 +317,7 @@ impl PackedWeightSidecars {
             packed,
             device,
             Some(cancel),
-            Some(base_prefix),
+            Some(&[base_prefix]),
             None,
             None,
         )
@@ -343,7 +343,33 @@ impl PackedWeightSidecars {
             packed,
             device,
             Some(cancel),
-            Some(base_prefix),
+            Some(&[base_prefix]),
+            None,
+        )
+    }
+
+    /// Prepare exactly the selected tensor prefixes, retaining the path-bound validation memo.
+    /// A trimmed encoder must not convert unused layers or the co-located vision tower.
+    pub fn open_and_prepare_selected_cancelable(
+        source_paths: &[PathBuf],
+        component_dir: &Path,
+        packed: PackedConfig,
+        device: &Device,
+        cancel: &CancelFlag,
+        prefixes: &[&str],
+    ) -> Result<(MmapedSafetensors, Self)> {
+        if prefixes.is_empty() {
+            return Err(Error::Msg(
+                "device-format sidecar: selection must not be empty".into(),
+            ));
+        }
+        Self::open_and_prepare_impl(
+            source_paths,
+            component_dir,
+            packed,
+            device,
+            Some(cancel),
+            Some(prefixes),
             None,
         )
     }
@@ -355,7 +381,7 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
         cancel: Option<&CancelFlag>,
-        base_prefix: Option<&str>,
+        base_prefix: Option<&[&str]>,
         external_cache_root: Option<&Path>,
     ) -> Result<(MmapedSafetensors, Self)> {
         if source_paths.is_empty() {
@@ -419,7 +445,7 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
         cancel: Option<&CancelFlag>,
-        base_prefix: Option<&str>,
+        base_prefix: Option<&[&str]>,
         external_cache_root: Option<&Path>,
         memo_sources: Option<&[FileIdentity]>,
     ) -> Result<Self> {
@@ -738,19 +764,25 @@ fn prepare_projections(
     bits: usize,
     group_size: usize,
     cancel: Option<&CancelFlag>,
-    base_prefix: Option<&str>,
+    base_prefix: Option<&[&str]>,
 ) -> Result<Vec<PreparedProjection>> {
     let mut bases: Vec<String> = source
         .tensors()
         .into_iter()
         .filter_map(|(name, _)| name.strip_suffix(".scales").map(str::to_owned))
-        .filter(|base| base_prefix.is_none_or(|prefix| base.starts_with(prefix)))
+        .filter(|base| {
+            base_prefix.is_none_or(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| format!("{base}.").starts_with(prefix))
+            })
+        })
         .collect();
     bases.sort();
     bases.dedup();
     if bases.is_empty() {
         let selection = base_prefix
-            .map(|prefix| format!(" matching prefix `{prefix}`"))
+            .map(|prefixes| format!(" matching prefixes {prefixes:?}"))
             .unwrap_or_default();
         return Err(Error::Msg(format!(
             "device-format sidecar: packed component {} has no `.scales` triples{selection}",
@@ -1128,7 +1160,7 @@ fn validation_memo_key(
     external_cache_root: Option<&Path>,
     bits: usize,
     group_size: usize,
-    base_prefix: Option<&str>,
+    base_prefix: Option<&[&str]>,
     sources: &[FileIdentity],
 ) -> Result<ValidationMemoKey> {
     let component_dir = fs::canonicalize(component_dir).map_err(|error| {
@@ -1146,7 +1178,8 @@ fn validation_memo_key(
         cache_identity,
         bits,
         group_size,
-        base_prefix: base_prefix.map(str::to_owned),
+        base_prefix: base_prefix
+            .map(|prefixes| prefixes.iter().map(|prefix| (*prefix).to_owned()).collect()),
         sources: sources.to_vec(),
     })
 }

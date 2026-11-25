@@ -317,7 +317,7 @@ impl MiniMaxH3TierPaths {
 
 /// The component's `config.json` `quantization` block, or `None` when the component is dense (no
 /// `config.json`, or a `config.json` with no marker — the `bf16` tier).
-fn packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
+pub(crate) fn packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
     let bytes = match candle_gen::gen_core::__model_input_reader!(
 std::fs::read(&path),

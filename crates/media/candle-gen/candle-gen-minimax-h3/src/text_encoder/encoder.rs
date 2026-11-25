@@ -479,9 +479,7 @@ impl MiniMaxH3TextEncoder {
         // running concurrently on another thread would be counted here too.)
         let after = candle_gen::quant::repack::profile::snapshot();
         let (tensors, bytes) = w.keys().fold((0usize, 0usize), |(n, b), k| {
-            let bytes = w
-                .require(k)
-                .map_or(0, |t| t.elem_count() * t.dtype().size_in_bytes());
+            let bytes = w.stored_tensor_bytes(k).unwrap_or(0);
             (n + 1, b + bytes)
         });
         let (calls, parts_s, repack_s, upload_s) = (
@@ -1082,6 +1080,154 @@ mod tests {
             }
         }
         (Weights::from_map(m), grids)
+    }
+
+    #[test]
+    fn runtime_cache_encoder_constructor_preserves_all_packed_operands_and_trims_unused_layers(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use candle_gen::quant::{pack_mlx_affine, QEmbedding, QLinear, QuantWeight};
+        // Constructor-only test: no learned layer forward is executed.
+        let cfg = packable_cfg();
+        let (dense, _) = packable_weights(&cfg, false);
+        for bits in [4, 8] {
+            let dir = tempfile::tempdir()?;
+            let mut tensors = HashMap::new();
+            for name in dense.keys() {
+                let tensor = dense.require(name)?;
+                if tensor.rank() == 2 {
+                    let base = name.strip_suffix(".weight").unwrap();
+                    let (weight, scales, biases) = pack_mlx_affine(&tensor, bits, 64)?;
+                    tensors.insert(name.clone(), weight);
+                    tensors.insert(format!("{base}.scales"), scales);
+                    tensors.insert(format!("{base}.biases"), biases);
+                } else {
+                    tensors.insert(name.clone(), tensor);
+                }
+            }
+            let file = dir.path().join("model.safetensors");
+            candle_gen::candle_core::safetensors::save(&tensors, &file)?;
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::json!({"quantization":{"bits":bits,"group_size":64}}).to_string(),
+            )?;
+            let prefixes = crate::text_encoder::lm_prefixes("lm", &cfg);
+            let refs = prefixes.iter().map(String::as_str).collect::<Vec<_>>();
+            let old = Weights::from_files_filtered_host_packed(
+                std::slice::from_ref(&file),
+                &Device::Cpu,
+                DType::F32,
+                &refs,
+            )?;
+            let baseline = MiniMaxH3TextEncoder::from_weights(&old, "lm", &cfg, DType::F32)?;
+            for load in 0..2 {
+                let weights = crate::weights::load_component_weights(
+                    dir.path(),
+                    std::slice::from_ref(&file),
+                    &Device::Cpu,
+                    Some(DType::F32),
+                    &refs,
+                )?;
+                let cache = weights.packed_sidecars().unwrap();
+                assert_eq!(cache.created_count(), if load == 0 { 15 } else { 0 });
+                assert!(!cache.contains("lm.layers.2.self_attn.q_proj"));
+                if load == 1 {
+                    assert_eq!(cache.source_bytes_hashed(), 0);
+                    assert_eq!(cache.payload_bytes_hashed(), 0);
+                }
+                let encoder = MiniMaxH3TextEncoder::from_weights(&weights, "lm", &cfg, DType::F32)?;
+                assert_eq!(encoder.num_loaded_layers(), 2);
+                assert_eq!(encoder.nbytes(), baseline.nbytes());
+                for (actual, expected) in encoder.layers.iter().zip(&baseline.layers) {
+                    let payload = |proj: &Proj| match proj.inner.base_qlinear().unwrap() {
+                        QLinear::Quantized {
+                            weight: QuantWeight::Dequant(weight),
+                            ..
+                        } => weight.data().unwrap().into_owned(),
+                        _ => panic!("expected packed dequant-dense projection"),
+                    };
+                    for (a, b) in [
+                        (&actual.attn.q_proj, &expected.attn.q_proj),
+                        (&actual.attn.k_proj, &expected.attn.k_proj),
+                        (&actual.attn.v_proj, &expected.attn.v_proj),
+                        (&actual.attn.o_proj, &expected.attn.o_proj),
+                        (&actual.mlp.gate, &expected.mlp.gate),
+                        (&actual.mlp.up, &expected.mlp.up),
+                        (&actual.mlp.down, &expected.mlp.down),
+                    ] {
+                        assert_eq!(payload(a), payload(b));
+                    }
+                }
+                match (
+                    &encoder.embed_tokens.embedding,
+                    &baseline.embed_tokens.embedding,
+                ) {
+                    (
+                        QEmbedding::Quantized { row_data: a, .. },
+                        QEmbedding::Quantized { row_data: b, .. },
+                    ) => assert_eq!(a, b),
+                    _ => panic!("expected host-resident packed embedding rows"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_cache_production_conditioner_uses_bf16_scale_cache_and_fifty_layer_trim(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use candle_gen::quant::pack_mlx_affine;
+        let cfg = MiniMaxH3TeConfig {
+            num_layers: 51,
+            select_hidden: 50,
+            ..packable_cfg()
+        };
+        let (dense, _) = packable_weights(&cfg, false);
+        let dir = tempfile::tempdir()?;
+        let mut tensors = HashMap::new();
+        for name in dense.keys() {
+            let tensor = dense.require(name)?;
+            let name = name.replacen("lm.", "model.language_model.", 1);
+            if tensor.rank() == 2 {
+                let base = name.strip_suffix(".weight").unwrap();
+                let (weight, scales, biases) = pack_mlx_affine(&tensor, 8, 64)?;
+                tensors.insert(format!("{base}.weight"), weight);
+                tensors.insert(format!("{base}.scales"), scales.to_dtype(DType::BF16)?);
+                tensors.insert(format!("{base}.biases"), biases.to_dtype(DType::BF16)?);
+            } else {
+                tensors.insert(name, tensor.to_dtype(DType::BF16)?);
+            }
+        }
+        let file = dir.path().join("model.safetensors");
+        candle_gen::candle_core::safetensors::save(&tensors, &file)?;
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "text_config":{"hidden_size":64,"num_hidden_layers":51,"num_attention_heads":4,
+                    "num_key_value_heads":2,"head_dim":16,"intermediate_size":64,"vocab_size":64},
+                "quantization":{"bits":8,"group_size":64}
+            })
+            .to_string(),
+        )?;
+        for _ in 0..2 {
+            let encoder = crate::model::load_conditioner(dir.path(), &Device::Cpu)?;
+            assert_eq!(encoder.num_loaded_layers(), 50);
+            let prefixes = crate::text_encoder::lm_prefixes(crate::text_encoder::LM_PREFIX, &cfg);
+            let refs = prefixes.iter().map(String::as_str).collect::<Vec<_>>();
+            let weights = crate::weights::load_component_weights(
+                dir.path(),
+                std::slice::from_ref(&file),
+                &Device::Cpu,
+                Some(DType::BF16),
+                &refs,
+            )?;
+            let cache = weights.packed_sidecars().unwrap();
+            assert_eq!(cache.created_count(), 0);
+            assert_eq!(cache.reused_count(), 351);
+            assert_eq!(cache.source_bytes_hashed(), 0);
+            assert_eq!(cache.payload_bytes_hashed(), 0);
+            assert!(!cache.contains("model.language_model.layers.50.self_attn.q_proj"));
+        }
+        Ok(())
     }
 
     fn ids(v: &[u32]) -> Tensor {

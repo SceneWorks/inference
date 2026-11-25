@@ -245,7 +245,7 @@ impl Flux3TextEncoder {
             &["model.language_model.", "lm_head."],
             |tensor| Ok(tensor.to_device(device)?),
         )?
-        .into_checkpoint_parts();
+        .into_checkpoint_parts()?;
         let weights = LlmWeights::from_checkpoint_parts(plain, source, device.clone());
         let lm =
             CausalLm::from_weights_dtype(&weights, "", model_cfg, None, dtype).map_err(from_llm)?;

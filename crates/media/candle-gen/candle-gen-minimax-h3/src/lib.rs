@@ -156,6 +156,7 @@ pub mod vae;
 pub mod vae_encoder;
 pub mod veda;
 mod warm;
+mod weights;
 
 pub use adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
