@@ -6770,9 +6770,6 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-veda-control-flow-in-the-cuda-build-cpu-fixture.cmd
-      - name: Prove H3 runtime cache constructor reuse (CPU fixture)
-        shell: cmd
-        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-runtime-cache-constructor.cmd
       - name: Prove H3 full DitBlock model-block parity on CUDA
         shell: cmd
         env:

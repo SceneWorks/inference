@@ -752,7 +752,7 @@ impl Sources {
             &["language_model."],
             cancel,
         )?;
-        let (plain, source) = w.into_checkpoint_parts()?;
+        let (plain, source) = w.into_checkpoint_parts();
         Qwen35Model::from_weights_headless(
             &candle_llm::primitives::Weights::from_checkpoint_parts(plain, source, device.clone()),
             MOSS_TEXT_ENCODER_PREFIX,

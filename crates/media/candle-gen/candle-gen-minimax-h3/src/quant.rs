@@ -207,29 +207,6 @@ pub(crate) fn lin_shaped(
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
 
-    if let Some(device) = w.host_packed_target().or_else(|| w.device()) {
-        if let Some(weight) = w.cached_packed_tensor(base, device)? {
-            let (out, in_features) = weight.shape().dims2()?;
-            if shape.is_some_and(|expected| expected != (out, in_features)) {
-                return Err(CandleError::Msg(format!(
-                    "minimax-h3 {component} {base}: expected {shape:?}, got ({out}, {in_features})"
-                )));
-            }
-            let dense_bias = if bias {
-                Some(w.require(&bias_key)?.to_dtype(dtype)?)
-            } else {
-                None
-            };
-            let base_bytes = quant_bytes(weight.dtype(), out, in_features)
-                + dense_bias.as_ref().map(dense_bytes).unwrap_or(0);
-            let linear = QLinear::from_qtensor_dequant(std::sync::Arc::new(weight), dense_bias);
-            return Ok(TieredLinear {
-                linear: AdaptLinear::from_packed(linear, in_features, out),
-                base_bytes,
-            });
-        }
-    }
-
     if let Some(layer) = w.native_linear_shaped(base, bias, shape, dtype)? {
         let (out, inp) = layer.weight_dims()?;
         let bytes = match layer.native_resident_bytes() {
@@ -368,24 +345,6 @@ pub(crate) fn embed_shaped(
 ) -> Result<TieredEmbedding> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
-
-    if let Some(table) = w.cached_packed_tensor(base, &candle_gen::candle_core::Device::Cpu)? {
-        let (vocab, hidden) = table.shape().dims2()?;
-        if shape.is_some_and(|expected| expected != (vocab, hidden)) {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3 te {base}: expected {shape:?}, got ({vocab}, {hidden})"
-            )));
-        }
-        let embedding = QEmbedding::from_qtensor(table, dtype)?;
-        let base_bytes = embedding
-            .resident_storage()
-            .map_or(0, |s| s.device_table_bytes);
-        return Ok(TieredEmbedding {
-            embedding,
-            base_bytes,
-            hidden,
-        });
-    }
 
     if w.contains(&scales_key) {
         let wq = w.require(&weight_key)?;

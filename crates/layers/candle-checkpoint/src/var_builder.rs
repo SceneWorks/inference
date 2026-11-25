@@ -291,12 +291,13 @@ impl ProjectionSource {
         Self::from_mapped_for(st, files, dev, selected, SourceMapping::default())
     }
     fn from_mapped_for(
-        st: MmapedSafetensors,
+        mut st: MmapedSafetensors,
         files: &[PathBuf],
         dev: &Device,
         selected: impl Fn(&str) -> bool,
         mapping: SourceMapping,
     ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
+        st.bind_source_paths(files);
         // A plain checkpoint needs only the mmap's existing index. This is a conservative
         // fast path: only the portable selector resolves companion ownership, metadata and
         // physical key spelling across shards.

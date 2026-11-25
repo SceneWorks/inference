@@ -201,7 +201,18 @@ pub trait Load {
 
 impl Load for st::TensorView<'_> {
     fn load(&self, device: &Device) -> Result<Tensor> {
-        convert(self, device)
+        convert(self, device).map(|tensor| with_mapped_source(tensor, self.data()))
+    }
+}
+
+fn with_mapped_source(tensor: Tensor, data: &[u8]) -> Tensor {
+    match crate::safetensors_progress::source_range(data) {
+        Some(source) => tensor.with_checkpoint_source_cache(
+            &source.path,
+            &format!("mapped-range:{}:{}", source.offset, data.len()),
+            source.cache,
+        ),
+        None => tensor,
     }
 }
 
@@ -286,7 +297,7 @@ impl Tensor {
                 read.complete();
             }
         }
-        result
+        result.map(|tensor| with_mapped_source(tensor, data))
     }
 }
 
@@ -418,7 +429,7 @@ pub fn load<P: AsRef<Path>>(filename: P, device: &Device) -> Result<HashMap<Stri
         filename.as_ref(),
         __input_path
     ))?;
-    __model_input_inspect!(load_buffer(&data[..], device), |_| {
+    let tensors = __model_input_inspect!(load_buffer(&data[..], device), |_| {
         if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_some() {
             use sha2::Digest;
             let digest = sha2::Sha256::digest(&data);
@@ -431,7 +442,14 @@ pub fn load<P: AsRef<Path>>(filename: P, device: &Device) -> Result<HashMap<Stri
                 )],
             );
         }
-    })
+    })?;
+    Ok(tensors
+        .into_iter()
+        .map(|(name, tensor)| {
+            let tensor = tensor.with_checkpoint_source(filename.as_ref(), &name);
+            (name, tensor)
+        })
+        .collect())
 }
 
 /// Observe a shared consumer of a mapped source byte range (for example checksum hashing).
@@ -511,6 +529,9 @@ pub struct MmapedSafetensors {
     owned: Vec<BufferedSafetensors>,
     routing: Option<HashMap<String, usize>>,
     _reads: Vec<std::sync::Arc<crate::safetensors_progress::MappedRead>>,
+    buffer_paths: Vec<std::path::PathBuf>,
+    buffer_cache:
+        Option<std::sync::Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
 }
 
 impl MmapedSafetensors {
@@ -548,6 +569,8 @@ impl MmapedSafetensors {
             owned: Vec::new(),
             routing: None,
             _reads: vec![read],
+            buffer_paths: Vec::new(),
+            buffer_cache: crate::quantized::runtime_cache::capture(),
         })
     }
 
@@ -607,6 +630,8 @@ impl MmapedSafetensors {
             owned: Vec::new(),
             routing: Some(routing),
             _reads: reads,
+            buffer_paths: Vec::new(),
+            buffer_cache: crate::quantized::runtime_cache::capture(),
         })
     }
 
@@ -629,6 +654,8 @@ impl MmapedSafetensors {
             owned,
             routing: Some(routing),
             _reads: Vec::new(),
+            buffer_paths: Vec::new(),
+            buffer_cache: crate::quantized::runtime_cache::capture(),
         })
     }
 
@@ -655,8 +682,42 @@ impl MmapedSafetensors {
             })
     }
 
+    /// Name exact provider-authenticated buffers with their already-selected source files.
+    /// No path is opened or source data validated here.
+    pub fn bind_source_paths(&mut self, paths: &[std::path::PathBuf]) {
+        if self.owned.len() == paths.len() && !self.owned.is_empty() {
+            self.buffer_paths = paths.to_vec();
+        }
+    }
+
+    /// Original backing paths, without probing or reading their contents.
+    pub fn source_paths(&self) -> Vec<std::path::PathBuf> {
+        if !self.buffer_paths.is_empty() {
+            return self.buffer_paths.clone();
+        }
+        self._reads
+            .iter()
+            .map(|read| read.path().to_owned())
+            .collect()
+    }
+
     pub fn load(&self, name: &str, dev: &Device) -> Result<Tensor> {
-        self.get(name)?.load(dev)
+        let tensor = self.get(name)?.load(dev)?;
+        let index = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.get(name))
+            .copied()
+            .unwrap_or(0);
+        if !self.owned.is_empty() {
+            return Ok(match self.buffer_paths.get(index) {
+                Some(path) => {
+                    tensor.with_checkpoint_source_cache(path, name, self.buffer_cache.clone())
+                }
+                None => tensor,
+            });
+        }
+        Ok(tensor.with_checkpoint_source(self._reads[index].path(), name))
     }
 
     pub fn tensors(&self) -> Vec<(String, st::TensorView<'_>)> {

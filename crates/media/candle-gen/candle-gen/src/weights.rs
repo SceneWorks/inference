@@ -70,15 +70,6 @@ pub struct Weights {
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
     target: Option<Device>,
     projection_window_device: Option<Device>,
-    cached_packed: Option<std::sync::Arc<CachedPackedSource>>,
-    cached_packed_keys: std::collections::BTreeSet<String>,
-}
-
-struct CachedPackedSource {
-    sidecars: crate::quant::PackedWeightSidecars,
-    // Native projection sources already own their mmap; plain affine checkpoints retain it here.
-    mmap: Option<cst::MmapedSafetensors>,
-    dtype: Option<DType>,
 }
 
 /// Decode a little-endian F32 plane into its `f32` values, for value-validating native scale and
@@ -133,7 +124,6 @@ impl Weights {
             .as_ref()
             .map(|(_, dev, _)| dev)
             .or_else(|| self.map.values().next().map(|t| t.device()))
-            .or(self.target.as_ref())
     }
 
     /// Load every tensor from a `.safetensors` file onto `device`, casting to `dtype` (f16 in
@@ -268,7 +258,6 @@ impl Weights {
             "candle-gen::Weights::from_files_filtered_staged",
             || Ok(()),
             Some(&place),
-            None,
         )
     }
 
@@ -292,93 +281,7 @@ impl Weights {
             proof_site,
             || Ok(()),
             None,
-            None,
         )
-    }
-
-    /// Load packed projections directly from validated device-format sidecars. Original affine
-    /// triples remain mapped, not copied into tensors; ordinary operands retain their requested
-    /// precision (`None` preserves stored precision). Prefix selection applies to preparation too.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_files_cached_packed(
-        files: &[std::path::PathBuf],
-        component_dir: &Path,
-        packed: crate::quant::PackedConfig,
-        device: &Device,
-        dtype: Option<DType>,
-        prefixes: &[&str],
-        cancel: &gen_core::CancelFlag,
-    ) -> Result<Self> {
-        let (st, sidecars) =
-            crate::quant::PackedWeightSidecars::open_and_prepare_selected_cancelable(
-                files,
-                component_dir,
-                packed,
-                device,
-                cancel,
-                prefixes,
-            )?;
-        Self::from_selected_source(
-            st,
-            files,
-            device,
-            dtype.unwrap_or(DType::BF16),
-            prefixes,
-            true,
-            "candle-gen::Weights::from_files_cached_packed",
-            || {
-                if cancel.is_cancelled() {
-                    Err(CandleError::Canceled)
-                } else {
-                    Ok(())
-                }
-            },
-            None,
-            Some((sidecars, dtype)),
-        )
-    }
-
-    /// Prepared projections and their validation counters, without materializing source tensors.
-    pub fn packed_sidecars(&self) -> Option<&crate::quant::PackedWeightSidecars> {
-        self.cached_packed.as_ref().map(|source| &source.sidecars)
-    }
-
-    /// Materialize a prepared quantized projection directly on its execution device.
-    pub fn cached_packed_tensor(
-        &self,
-        base: &str,
-        device: &Device,
-    ) -> Result<Option<candle_core::quantized::QTensor>> {
-        let changed = ["weight", "scales", "biases"]
-            .iter()
-            .any(|suffix| self.map.contains_key(&format!("{base}.{suffix}")));
-        Ok(self
-            .packed_sidecars()
-            .filter(|cache| !changed && cache.contains(base))
-            .map(|cache| cache.load(base, device))
-            .transpose()?)
-    }
-
-    /// Physical tensor bytes from headers for cached affine operands, without reading their data.
-    pub fn stored_tensor_bytes(&self, key: &str) -> Result<usize> {
-        if self.cached_packed_keys.contains(key) {
-            return Ok(self.cached_mmap()?.get(key)?.data().len());
-        }
-        if self.encoded_keys.contains(key) || self.companion_keys.contains(key) {
-            if let Some((source, _, _)) = &self.source {
-                return Ok(source.mmap().get(key)?.data().len());
-            }
-        }
-        let tensor = self.require(key)?;
-        Ok(tensor.elem_count() * tensor.dtype().size_in_bytes())
-    }
-
-    fn cached_mmap(&self) -> Result<&cst::MmapedSafetensors> {
-        self.source
-            .as_ref()
-            .map(|(source, _, _)| source.mmap())
-            .or_else(|| self.cached_packed.as_ref()?.mmap.as_ref())
-            .ok_or_else(|| CandleError::Msg("missing cached packed source mapping".into()))
     }
 
     /// Load exact verified memory buffers supplied by the provider. Reading headers, scales and
@@ -402,7 +305,6 @@ impl Weights {
             "candle-gen::Weights::from_authenticated_buffers",
             check,
             None,
-            None,
         )
     }
 
@@ -417,7 +319,6 @@ impl Weights {
         proof_site: &'static str,
         mut check: impl FnMut() -> Result<()>,
         place_staged: Option<&dyn Fn(Tensor) -> Result<Tensor>>,
-        cached: Option<(crate::quant::PackedWeightSidecars, Option<DType>)>,
     ) -> Result<Self> {
         let mut names = std::collections::BTreeSet::new();
         let mut execution_metadata = std::collections::BTreeSet::new();
@@ -483,14 +384,6 @@ impl Weights {
                 weights.encoded_keys.insert(key);
                 continue;
             }
-            if cached.as_ref().is_some_and(|(sidecars, _)| {
-                key.rsplit_once('.').is_some_and(|(base, suffix)| {
-                    matches!(suffix, "weight" | "scales" | "biases") && sidecars.contains(base)
-                })
-            }) {
-                weights.cached_packed_keys.insert(key);
-                continue;
-            }
             let host = key.rsplit_once('.').is_some_and(|(base, suffix)| {
                 matches!(suffix, "weight" | "scales" | "biases") && packed_bases.contains(base)
             });
@@ -504,29 +397,14 @@ impl Weights {
                         .projection_bias_dtype(&format!("{base}.weight"))
                 })
                 .unwrap_or(dtype);
-            let t = if cached.as_ref().is_some_and(|(_, dtype)| dtype.is_none()) {
-                mmap.load(&key, device)?
-            } else if let Some(place) = place_staged {
+            let t = if let Some(place) = place_staged {
                 place(load_map_tensor(mmap, &key, &Device::Cpu, dtype)?)?
             } else {
                 load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?
             };
             weights.map.insert(key, t);
         }
-        let plain_mmap = match source {
-            Ok(src) => {
-                weights.source = Some((src, device.clone(), dtype));
-                None
-            }
-            Err(st) => Some(st),
-        };
-        if let Some((sidecars, source_dtype)) = cached {
-            weights.cached_packed = Some(std::sync::Arc::new(CachedPackedSource {
-                sidecars,
-                mmap: plain_mmap,
-                dtype: source_dtype,
-            }));
-        }
+        weights.source = source.ok().map(|src| (src, device.clone(), dtype));
         weights.target = host_packed.then(|| device.clone());
         #[cfg(feature = "model-inference-proof")]
         gen_core::model_input_proof::record_reader_paths(
@@ -592,18 +470,12 @@ impl Weights {
     /// Source-encoded weights have a non-affine checkpoint format.
     pub fn is_affine_codes(&self, key: &str) -> bool {
         self.map.get(key).is_some_and(|t| t.dtype() == DType::U32)
-            || (self.cached_packed_keys.contains(key)
-                && self
-                    .cached_mmap()
-                    .and_then(|mmap| Ok(mmap.get(key)?.dtype() == safetensors::Dtype::U32))
-                    .unwrap_or(false))
     }
 
     /// Replace one module operand without rebuilding other immutable native projections.
     pub fn replace_tensor(&mut self, key: String, value: Tensor) {
         self.encoded_keys.remove(&key);
         self.companion_keys.remove(&key);
-        self.cached_packed_keys.remove(&key);
         self.map.insert(key, value);
     }
 
@@ -720,13 +592,6 @@ impl Weights {
 
     /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
-        if self.cached_packed_keys.contains(key) {
-            let mmap = self.cached_mmap()?;
-            return match self.cached_packed.as_ref().and_then(|source| source.dtype) {
-                Some(dtype) => load_map_tensor(mmap, key, &Device::Cpu, dtype),
-                None => Ok(mmap.load(key, &Device::Cpu)?),
-            };
-        }
         if self.companion_keys.contains(key) {
             let (src, device, _) = self.source.as_ref().expect("owned companion source");
             let view = src.mmap().get(key)?;
@@ -751,7 +616,6 @@ impl Weights {
     /// Whether `key` is present (e.g. the ControlNet's optional `encoder_hid_proj`).
     pub fn contains(&self, key: &str) -> bool {
         self.map.contains_key(key)
-            || self.cached_packed_keys.contains(key)
             || self.encoded_keys.contains(key)
             || self.companion_keys.contains(key)
     }
@@ -761,24 +625,22 @@ impl Weights {
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.map
             .keys()
-            .chain(self.cached_packed_keys.iter())
             .chain(self.encoded_keys.iter())
             .chain(self.companion_keys.iter())
     }
 
-    /// Preserve encoded operands when transferring this selected component to another constructor.
-    /// Ordinary tensors keep their provider-selected precision. A caller explicitly requesting raw
-    /// affine tensors materializes them from the retained source mapping; read failures propagate.
+    /// Build directly from an in-memory map — tests (including cross-crate ones, e.g. the FLUX
+    /// IP-Adapter image-encoder fixtures, sc-5872) construct synthetic weights without a file, and a
+    /// caller can assemble a checkpoint programmatically.
+    /// Preserve the encoded operands when transferring this selected component to another
+    /// constructor API. Ordinary tensors keep their provider-selected compute dtype.
     pub fn into_checkpoint_parts(
-        mut self,
-    ) -> Result<(
+        self,
+    ) -> (
         HashMap<String, Tensor>,
         Option<candle_checkpoint::ProjectionSource>,
-    )> {
-        for key in &self.cached_packed_keys {
-            self.map.insert(key.clone(), self.require(key)?);
-        }
-        Ok((self.map, self.source.map(|(s, _, _)| s)))
+    ) {
+        (self.map, self.source.map(|(s, _, _)| s))
     }
 
     pub fn into_var_builder(self, dtype: DType, device: &Device) -> candle_nn::VarBuilder<'static> {
@@ -786,13 +648,6 @@ impl Weights {
             return source
                 .clone()
                 .selected_var_builder(self.keys().cloned(), dtype, device);
-        }
-        if self.cached_packed.is_some() {
-            return candle_nn::VarBuilder::from_backend(
-                Box::new(CachedWeightsBackend(self)),
-                dtype,
-                device.clone(),
-            );
         }
         candle_nn::VarBuilder::from_tensors(self.map, dtype, device)
     }
@@ -806,8 +661,6 @@ impl Weights {
             projection_resources: Default::default(),
             target: None,
             projection_window_device: None,
-            cached_packed: None,
-            cached_packed_keys: Default::default(),
         }
     }
 
@@ -1042,114 +895,12 @@ impl Weights {
     }
 }
 
-// The raw tensor escape hatch remains lazy; ordinary VarBuilder consumers see the same values.
-struct CachedWeightsBackend(Weights);
-impl candle_nn::var_builder::SimpleBackend for CachedWeightsBackend {
-    fn get(
-        &self,
-        shape: candle_core::Shape,
-        name: &str,
-        _: candle_nn::Init,
-        dtype: DType,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
-        let tensor = self.get_unchecked(name, dtype, device)?;
-        if tensor.shape() != &shape {
-            candle_core::bail!("{name}: expected {shape:?}, got {:?}", tensor.shape());
-        }
-        Ok(tensor)
-    }
-    fn get_unchecked(
-        &self,
-        name: &str,
-        dtype: DType,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
-        self.0
-            .require(name)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
-            .to_device(device)?
-            .to_dtype(dtype)
-    }
-    fn contains_tensor(&self, name: &str) -> bool {
-        self.0.contains(name)
-    }
-}
-
 pub use candle_quant_kernels::convrot_int8::ProjectionResources;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    #[test]
-    fn cached_packed_reader_keeps_source_triples_lazy_and_preserves_raw_escape_hatches(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let file = dir.path().join("model.safetensors");
-        let dense = Tensor::arange(0f32, 128f32, &Device::Cpu)?.reshape((2, 64))?;
-        let (weight, scales, biases) = crate::quant::pack_mlx_affine(&dense, 8, 64)?;
-        let tensors = HashMap::from([
-            ("proj.weight".to_owned(), weight.clone()),
-            ("proj.scales".to_owned(), scales),
-            ("proj.biases".to_owned(), biases),
-        ]);
-        cst::save(&tensors, &file)?;
-        let open = || {
-            Weights::from_files_cached_packed(
-                std::slice::from_ref(&file),
-                dir.path(),
-                crate::quant::PackedConfig {
-                    bits: 8,
-                    group_size: 64,
-                },
-                &Device::Cpu,
-                None,
-                &[""],
-                &gen_core::CancelFlag::new(),
-            )
-        };
-        let weights = open()?;
-        assert!(
-            weights.map.is_empty(),
-            "packed source triples must not be copied into tensors"
-        );
-        assert_eq!(weights.cached_packed_keys.len(), 3);
-        assert!(weights.is_affine_codes("proj.weight"));
-        assert_eq!(
-            weights.stored_tensor_bytes("proj.weight")?,
-            weight.elem_count() * 4
-        );
-        assert!(
-            weights.map.is_empty(),
-            "profiling must inspect headers only"
-        );
-        let (raw, _) = weights.into_checkpoint_parts()?;
-        assert_eq!(
-            raw["proj.weight"].to_vec2::<u32>()?,
-            weight.to_vec2::<u32>()?
-        );
-        let reopened = open()?;
-        let cache = reopened.packed_sidecars().unwrap();
-        assert_eq!(cache.created_count(), 0);
-        assert_eq!(cache.source_bytes_hashed(), 0);
-        let vb = reopened.into_var_builder(DType::F32, &Device::Cpu);
-        assert_eq!(
-            vb.get_unchecked_dtype("proj.weight", DType::U32)?
-                .to_vec2::<u32>()?,
-            weight.to_vec2::<u32>()?
-        );
-        let mut overridden = open()?;
-        overridden.replace_tensor("proj.weight".into(), weight);
-        assert!(
-            overridden
-                .cached_packed_tensor("proj", &Device::Cpu)?
-                .is_none(),
-            "an overridden operand must not use stale prepared bytes"
-        );
-        Ok(())
-    }
 
     fn write_st(path: &Path, name: &str, value: f32) {
         let t = Tensor::new(&[value], &Device::Cpu).unwrap();

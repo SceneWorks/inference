@@ -14,6 +14,7 @@ pub mod imatrix_file;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod runtime_cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
@@ -493,22 +494,24 @@ impl QTensor {
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
-        let shape = src.shape();
-        let block_size = dtype.block_size();
-        check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
-        let elem_count = shape.elem_count();
-        if !elem_count.is_multiple_of(block_size) {
-            crate::bail!(
-                "tensor size ({shape:?}) is not divisible by block size {}",
-                block_size
-            )
-        }
-        let mut storage = src.device().qzeros(elem_count, dtype)?;
-        storage.quantize(&src.storage())?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
+        runtime_cache::quantize(src, dtype, src.device(), "source-device", None, || {
+            let shape = src.shape();
+            let block_size = dtype.block_size();
+            check_shape(shape, block_size)?;
+            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let elem_count = shape.elem_count();
+            if !elem_count.is_multiple_of(block_size) {
+                crate::bail!(
+                    "tensor size ({shape:?}) is not divisible by block size {}",
+                    block_size
+                )
+            }
+            let mut storage = src.device().qzeros(elem_count, dtype)?;
+            storage.quantize(&src.storage())?;
+            Ok(Self {
+                storage,
+                shape: shape.clone(),
+            })
         })
     }
 
@@ -517,34 +520,43 @@ impl QTensor {
         imatrix_weights: &[f32],
         dtype: GgmlDType,
     ) -> Result<Self> {
-        // (n_per_row/QK_K-1)*QK_K+(QK_K/32-1)*32+32=n_per_row
-        // Size of imatrix == last dim of tensor
-        let n_per_row = src.dim(D::Minus1)?;
-        if imatrix_weights.len() != n_per_row {
-            crate::bail!(
-                "imatrix weights must have the same length {} as the last dim of src {}",
-                imatrix_weights.len(),
-                src.dim(D::Minus1)?
-            );
-        }
+        runtime_cache::quantize(
+            src,
+            dtype,
+            src.device(),
+            "source-device",
+            Some(imatrix_weights),
+            || {
+                // (n_per_row/QK_K-1)*QK_K+(QK_K/32-1)*32+32=n_per_row
+                // Size of imatrix == last dim of tensor
+                let n_per_row = src.dim(D::Minus1)?;
+                if imatrix_weights.len() != n_per_row {
+                    crate::bail!(
+                        "imatrix weights must have the same length {} as the last dim of src {}",
+                        imatrix_weights.len(),
+                        src.dim(D::Minus1)?
+                    );
+                }
 
-        let shape = src.shape();
-        let block_size = dtype.block_size();
-        check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
-        let elem_count = shape.elem_count();
-        if !elem_count.is_multiple_of(block_size) {
-            crate::bail!(
-                "tensor size ({shape:?}) is not divisible by block size {}",
-                block_size
-            );
-        }
-        let mut storage = src.device().qzeros(elem_count, dtype)?;
-        storage.quantize_imatrix(&src.storage(), imatrix_weights, n_per_row)?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
-        })
+                let shape = src.shape();
+                let block_size = dtype.block_size();
+                check_shape(shape, block_size)?;
+                let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+                let elem_count = shape.elem_count();
+                if !elem_count.is_multiple_of(block_size) {
+                    crate::bail!(
+                        "tensor size ({shape:?}) is not divisible by block size {}",
+                        block_size
+                    );
+                }
+                let mut storage = src.device().qzeros(elem_count, dtype)?;
+                storage.quantize_imatrix(&src.storage(), imatrix_weights, n_per_row)?;
+                Ok(Self {
+                    storage,
+                    shape: shape.clone(),
+                })
+            },
+        )
     }
 
     /// Quantize `src` (currently on the CPU) to a QTensor on `dev`
@@ -555,66 +567,78 @@ impl QTensor {
         dev: &Device,
     ) -> Result<Self> {
         if !src.device().is_cpu() {
-            crate::bail!(
-                "`quantize_onto` expects a `src` to be on the cpu, got {:?}.",
-                src.device()
-            )
+            crate::bail!("`quantize_onto` expects a CPU source");
         }
-        // (n_per_row/QK_K-1)*QK_K+(QK_K/32-1)*32+32=n_per_row
-        // Size of imatrix == last dim of tensor
-        let n_per_row = src.dim(D::Minus1)?;
-        if imatrix_weights.len() != n_per_row {
-            crate::bail!(
-                "imatrix weights must have the same length {} as the last dim of src {}",
-                imatrix_weights.len(),
-                src.dim(D::Minus1)?
-            );
-        }
-        let shape = src.shape();
-        let block_size = dtype.block_size();
-        check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
-        let elem_count = shape.elem_count();
-        if !elem_count.is_multiple_of(block_size) {
-            crate::bail!(
-                "tensor size ({shape:?}) is not divisible by block size {}",
-                block_size
-            )
-        }
-        // storage is on the `dev`, src is on `cpu`
-        let mut storage = dev.qzeros(elem_count, dtype)?;
-        storage.quantize_imatrix_onto(&src.storage(), imatrix_weights, n_per_row)?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
+
+        runtime_cache::quantize(src, dtype, dev, "cpu-upload", Some(imatrix_weights), || {
+            if !src.device().is_cpu() {
+                crate::bail!(
+                    "`quantize_onto` expects a `src` to be on the cpu, got {:?}.",
+                    src.device()
+                )
+            }
+            // (n_per_row/QK_K-1)*QK_K+(QK_K/32-1)*32+32=n_per_row
+            // Size of imatrix == last dim of tensor
+            let n_per_row = src.dim(D::Minus1)?;
+            if imatrix_weights.len() != n_per_row {
+                crate::bail!(
+                    "imatrix weights must have the same length {} as the last dim of src {}",
+                    imatrix_weights.len(),
+                    src.dim(D::Minus1)?
+                );
+            }
+            let shape = src.shape();
+            let block_size = dtype.block_size();
+            check_shape(shape, block_size)?;
+            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let elem_count = shape.elem_count();
+            if !elem_count.is_multiple_of(block_size) {
+                crate::bail!(
+                    "tensor size ({shape:?}) is not divisible by block size {}",
+                    block_size
+                )
+            }
+            // storage is on the `dev`, src is on `cpu`
+            let mut storage = dev.qzeros(elem_count, dtype)?;
+            storage.quantize_imatrix_onto(&src.storage(), imatrix_weights, n_per_row)?;
+            Ok(Self {
+                storage,
+                shape: shape.clone(),
+            })
         })
     }
 
     /// Quantize `src` (currently on the CPU) to a QTensor on `dev`
     pub fn quantize_onto(src: &Tensor, dtype: GgmlDType, dev: &Device) -> Result<Self> {
         if !src.device().is_cpu() {
-            crate::bail!(
-                "`quantize_onto` expects a `src` to be on the cpu, got {:?}.",
-                src.device()
-            )
+            crate::bail!("`quantize_onto` expects a CPU source");
         }
-        let shape = src.shape();
-        let block_size = dtype.block_size();
-        check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
-        let elem_count = shape.elem_count();
-        if !elem_count.is_multiple_of(block_size) {
-            crate::bail!(
-                "tensor size ({shape:?}) is not divisible by block size {}",
-                block_size
-            )
-        }
-        // storage is on the `dev`, src is on `cpu`
-        let mut storage = dev.qzeros(elem_count, dtype)?;
-        storage.quantize_onto(&src.storage())?;
-        Ok(Self {
-            storage,
-            shape: shape.clone(),
+
+        runtime_cache::quantize(src, dtype, dev, "cpu-upload", None, || {
+            if !src.device().is_cpu() {
+                crate::bail!(
+                    "`quantize_onto` expects a `src` to be on the cpu, got {:?}.",
+                    src.device()
+                )
+            }
+            let shape = src.shape();
+            let block_size = dtype.block_size();
+            check_shape(shape, block_size)?;
+            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let elem_count = shape.elem_count();
+            if !elem_count.is_multiple_of(block_size) {
+                crate::bail!(
+                    "tensor size ({shape:?}) is not divisible by block size {}",
+                    block_size
+                )
+            }
+            // storage is on the `dev`, src is on `cpu`
+            let mut storage = dev.qzeros(elem_count, dtype)?;
+            storage.quantize_onto(&src.storage())?;
+            Ok(Self {
+                storage,
+                shape: shape.clone(),
+            })
         })
     }
 

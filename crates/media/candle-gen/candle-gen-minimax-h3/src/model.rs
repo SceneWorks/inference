@@ -814,11 +814,10 @@ pub(crate) fn load_conditioner(te_dir: &Path, device: &Device) -> Result<MiniMax
     } else {
         device
     };
-    let mut w = crate::weights::load_component_weights(
-        te_dir,
+    let mut w = candle_gen::Weights::from_files_filtered_host_packed(
         &shards,
         load_device,
-        Some(TE_STORE_DTYPE),
+        TE_STORE_DTYPE,
         &refs,
     )?;
     if let Some(policy) = crate::block_stream::current() {
@@ -3531,7 +3530,7 @@ mod tests {
         "MiniMaxH3VideoVae::load_decode_only(",
         "load_vision_tower(",
         "Weights::from_files(",
-        "crate::weights::load_component_weights(",
+        "Weights::from_files_filtered_host_packed(",
         "MiniMaxH3TextEncoder::from_weights(",
         "MiniMaxH3AudioVae::from_weights(",
         "MiniMaxH3AudioVaeEncoder::from_weights(",

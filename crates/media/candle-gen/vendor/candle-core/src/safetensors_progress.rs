@@ -10,6 +10,7 @@ pub(super) struct MappedRead {
     start: usize,
     len: usize,
     context: LoadActivityContext,
+    cache: Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
     ranges: Mutex<HashMap<(u64, LoadActivityPhase), (BTreeMap<usize, usize>, u64)>>,
 }
 fn mappings() -> &'static Mutex<Vec<Weak<MappedRead>>> {
@@ -17,6 +18,9 @@ fn mappings() -> &'static Mutex<Vec<Weak<MappedRead>>> {
     MAPPINGS.get_or_init(Mutex::default)
 }
 impl MappedRead {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
     pub(super) fn new(path: &Path, bytes: &[u8]) -> Arc<Self> {
         let context = LoadActivityContext::capture();
         context.reset_file(path);
@@ -25,6 +29,7 @@ impl MappedRead {
             start: bytes.as_ptr() as usize,
             len: bytes.len(),
             context,
+            cache: crate::quantized::runtime_cache::capture(),
             ranges: Mutex::default(),
         });
         let mut mappings = mappings().lock().unwrap_or_else(|e| e.into_inner());
@@ -120,6 +125,30 @@ impl Drop for Consumption {
     fn drop(&mut self) {
         self.activity.finish();
     }
+}
+
+pub(super) struct MappedSource {
+    pub path: PathBuf,
+    pub offset: usize,
+    pub cache: Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
+}
+/// Identify an already-mapped source range without reading or verifying model bytes.
+pub(super) fn source_range(data: &[u8]) -> Option<MappedSource> {
+    let start = data.as_ptr() as usize;
+    mappings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|read| {
+            start >= read.start
+                && start.saturating_add(data.len()) <= read.start.saturating_add(read.len)
+        })
+        .map(|read| MappedSource {
+            path: read.path.clone(),
+            offset: start - read.start,
+            cache: read.cache.clone(),
+        })
 }
 
 pub(super) fn consuming(data: &[u8]) -> Option<Consumption> {

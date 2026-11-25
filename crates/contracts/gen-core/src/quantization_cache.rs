@@ -53,6 +53,12 @@ pub trait QuantizationArtifactCache: Send + Sync {
         key: &QuantizationArtifactKey,
         produce: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<Box<dyn QuantizationArtifact>>;
+
+    /// Discard an unreadable completed artifact so the shared loader can prepare it again.
+    /// Stores retaining immutable artifacts may decline; callers then return the read error.
+    fn invalidate(&self, _key: &QuantizationArtifactKey) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 thread_local! {

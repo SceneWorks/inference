@@ -525,6 +525,7 @@ dependencies = [
  "sceneworks-gen-core",
  "sceneworks-gen-core-testkit",
  "sceneworks-gen-core-train",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1281,6 +1282,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
