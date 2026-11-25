@@ -597,10 +597,8 @@ impl BooguHeavy {
 }
 
 /// Boogu residual classifier-free guidance combine (`PIPE-8`):
-/// `cond + (scale − 1)·(cond − uncond)` using `gen_core::guidance::boogu_residual_cfg_weights`,
-/// preserving Boogu's exact BF16/FP32 promotion order.
-fn boogu_residual_cfg_combine(cond: &Array, uncond: &Array, scale: f32) -> Result<Array> {
-    let (residual_weight, _) = mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
+/// `cond + residual_weight·(cond − uncond)`, preserving Boogu's exact BF16/FP32 promotion order.
+fn boogu_residual_cfg_combine(cond: &Array, uncond: &Array, residual_weight: f32) -> Result<Array> {
     Ok(add(
         cond,
         multiply(subtract(cond, uncond)?, Array::from_f32(residual_weight))?,
@@ -770,13 +768,14 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
-        let (_, negate_sign) = mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self.dit.forward(x, &t, &c.cond, &c.cond_mask)?;
         let pred = match &c.uncond {
             Some((u_hidden, u_mask)) => {
                 let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
-                boogu_residual_cfg_combine(&cond_v, &uncond_v, scale)?
+                boogu_residual_cfg_combine(&cond_v, &uncond_v, residual_weight)?
             }
             None => cond_v,
         };
@@ -796,7 +795,8 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
-        let (_, negate_sign) = mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self
             .dit
@@ -806,7 +806,7 @@ impl BooguHeavy {
                 let uncond_v = self
                     .dit
                     .forward_edit_multi(x, ref_latents, &t, u_hidden, u_mask)?;
-                boogu_residual_cfg_combine(&cond_v, &uncond_v, scale)?
+                boogu_residual_cfg_combine(&cond_v, &uncond_v, residual_weight)?
             }
             None => cond_v,
         };
@@ -1235,7 +1235,9 @@ impl BooguHeavy {
             let pred = self.dit.forward(lat, &t, &c.cond, &c.cond_mask)?;
             if let Some((negative, mask)) = &c.uncond {
                 let negative = self.dit.forward(lat, &t, negative, mask)?;
-                boogu_residual_cfg_combine(&pred, &negative, 1.0 + guidance)
+                let (residual_weight, _) =
+                    mlx_gen::gen_core::guidance::boogu_turbo_residual_cfg_weights(guidance);
+                boogu_residual_cfg_combine(&pred, &negative, residual_weight)
             } else {
                 Ok(pred)
             }

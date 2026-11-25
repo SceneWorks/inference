@@ -31,8 +31,8 @@ pub(crate) fn final_clamp_scratch(elements: u64) -> u64 {
 ///
 /// Carries the 2nd-order multistep `prev_x0` history inside request-owned [`DriverRunState`] so
 /// inert `Continue + Carry` splits match unsplit trajectories bit-for-bit, refuses `Continue + Reset`
-/// on 2nd-order plans with a typed `DEC-13` error, and runs per-step [`STEP_QUANTUM`] barriers via
-/// [`StepHooks::on_materialize`].
+/// on 2nd-order plans with a typed `DEC-13` error, and runs paired per-step `STEP_QUANTUM` iOS
+/// execution barriers when constructed with diagnostics enabled.
 pub struct IrisFlowDpmDriver<F> {
     support: DriverSupport,
     plan: Vec<DpmStep>,
@@ -186,7 +186,7 @@ where
                 .as_dtype(Dtype::Float32)
                 .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
             state.record_evaluation(DriverEvaluationKind::Trajectory);
-            if hooks.on_materialize.is_some() {
+            if self.emit_diagnostics {
                 mlx_gen::ios_quantum::before(
                     STEP_QUANTUM,
                     step_scratch(x.size() as u64, &step.update),
@@ -195,6 +195,9 @@ where
             let (next, x0) = step_update(&x, &out, step, self.prediction, prev_x0.as_ref())?;
             x = next;
             eval([&x, &x0]).map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            if self.emit_diagnostics {
+                mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[&x, &x0])?;
+            }
             hooks.materialize(&info, &x)?;
             hooks.observe(&info, &x0)?;
             x = hooks.post_step(&info, x)?;
@@ -249,15 +252,11 @@ pub fn sample(
     let driver = IrisFlowDpmDriver::with_diagnostics(plan.to_vec(), prediction, true, model_out);
     let mut run_state = DriverRunState::new();
     let mut on_progress = |_: mlx_gen::Progress| {};
-    let mut on_materialize = |_info: &DriverStepInfo, x: &Array| {
-        mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[x]).map_err(Into::into)
-    };
     let mut on_observe = |info: &DriverStepInfo, x0: &Array| {
         on_step(info.outer_step + 1, x0);
         Ok(())
     };
     let mut hooks = StepHooks::new(&mut on_progress);
-    hooks.on_materialize = Some(&mut on_materialize);
     hooks.on_observe = Some(&mut on_observe);
     let out = run_mlx_driver_slices(
         &driver,
@@ -392,5 +391,166 @@ mod driver_conformance_tests {
             assert!(report.verified_cancellation);
             assert_eq!(report.unsplit_evaluations, 4);
         }
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn iris_flow_dpm_driver_on_materialize_and_paired_quanta() {
+        const CHILD: &str = "IRIS_FLOW_DPM_DRIVER_QUANTUM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "solver::driver_conformance_tests::iris_flow_dpm_driver_on_materialize_and_paired_quanta",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "CPU quantum child test failed");
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+
+        use mlx_gen::ios_quantum::{
+            take_refusal, with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
+        };
+        use std::rc::Rc;
+
+        let plan = gen_core_iris::dpm_solver_plan(4, 2, 3.0).unwrap();
+        let initial = Array::from_slice(
+            &[
+                0.5f32, -0.25, 0.75, -0.5, 0.1, -0.3, 0.2, 0.4, -0.1, 0.3, -0.2, 0.6,
+            ],
+            &[1, 3, 2, 2],
+        );
+        let synthetic_forward = |x: &Array, step: &DpmStep| -> Result<Array> {
+            let coeff = Array::from_f32(0.15 + 0.1 * step.s_f32());
+            Ok(x.multiply(&coeff)?)
+        };
+
+        // 1. External caller attaching StepHooks::on_materialize to IrisFlowDpmDriver::new
+        // must invoke on_materialize per step without leaking any unpaired STEP_QUANTUM events.
+        let external_events = Rc::new(RefCell::new(Vec::new()));
+        let sink = external_events.clone();
+        let mut materialized_steps = Vec::new();
+        let external_out = with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(
+                move |event| sink.borrow_mut().push(event.clone()),
+                || {
+                    let driver = IrisFlowDpmDriver::new(
+                        plan.clone(),
+                        Prediction::Velocity,
+                        synthetic_forward,
+                    );
+                    let mut run_state = DriverRunState::new();
+                    let cancel = CancelFlag::new();
+                    let mut on_progress = |_: mlx_gen::Progress| {};
+                    let mut on_materialize = |info: &DriverStepInfo, _x: &Array| {
+                        materialized_steps.push(info.outer_step);
+                        Ok(())
+                    };
+                    let mut hooks = StepHooks::new(&mut on_progress);
+                    hooks.on_materialize = Some(&mut on_materialize);
+                    let out = run_mlx_driver_slices(
+                        &driver,
+                        [SliceSpec::full(plan.len())],
+                        BoundaryState::XSigma(initial.clone()),
+                        plan.len(),
+                        0,
+                        &cancel,
+                        None,
+                        &mut run_state,
+                        &mut hooks,
+                        |_, state, _| Ok(state),
+                    )?;
+                    Ok(match out {
+                        BoundaryState::XSigma(x)
+                        | BoundaryState::CleanEstimate { latent: x, .. }
+                        | BoundaryState::RouteSpecific { state: x, .. } => x,
+                    })
+                },
+            )
+        })
+        .expect("external driver with on_materialize must succeed");
+        assert_eq!(materialized_steps, vec![0, 1, 2, 3]);
+        assert!(
+            external_events.borrow().is_empty(),
+            "external IrisFlowDpmDriver::new + on_materialize must not leak STEP_QUANTUM events, got {:?}",
+            external_events.borrow()
+        );
+
+        // 2. sample() enables diagnostics and emits strictly paired Checked/Synchronized
+        // STEP_QUANTUM events per step, producing bit-identical output to the unguarded driver.
+        let sample_events = Rc::new(RefCell::new(Vec::new()));
+        let sink = sample_events.clone();
+        let mut observed_steps = Vec::new();
+        let sample_out = with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(
+                move |event| sink.borrow_mut().push(event.clone()),
+                || {
+                    let cancel = CancelFlag::new();
+                    sample(
+                        &initial,
+                        &plan,
+                        Prediction::Velocity,
+                        &cancel,
+                        synthetic_forward,
+                        |step_idx, _x0| observed_steps.push(step_idx),
+                    )
+                },
+            )
+        })
+        .expect("sample() with CPU diagnostic headroom must succeed");
+        assert_eq!(observed_steps, vec![1, 2, 3, 4]);
+        assert!(
+            arrays_bit_equal(&external_out, &sample_out),
+            "sample() output must be bit-identical to external IrisFlowDpmDriver::new"
+        );
+        let events = sample_events.borrow();
+        assert_eq!(
+            events.len(),
+            plan.len() * 2,
+            "expected strictly paired Checked/Synchronized STEP_QUANTUM per step, got {:?}",
+            &*events
+        );
+        for (step_idx, pair) in events.chunks_exact(2).enumerate() {
+            let expected_scratch = step_scratch(initial.size() as u64, &plan[step_idx].update);
+            assert!(
+                matches!(
+                    &pair[0],
+                    QuantumEvent::Checked { label, scratch }
+                        if label == STEP_QUANTUM && *scratch == expected_scratch
+                ),
+                "step {step_idx}: expected Checked({STEP_QUANTUM}, {expected_scratch}), got {:?}",
+                pair[0]
+            );
+            assert!(
+                matches!(
+                    &pair[1],
+                    QuantumEvent::Synchronized { label, .. } if label == STEP_QUANTUM
+                ),
+                "step {step_idx}: expected Synchronized({STEP_QUANTUM}), got {:?}",
+                pair[1]
+            );
+        }
+
+        // 3. A refusal on zero headroom stops cleanly at STEP_QUANTUM.
+        let _ = take_refusal();
+        let refused = with_cpu_diagnostic_headroom(0, || {
+            let cancel = CancelFlag::new();
+            sample(
+                &initial,
+                &plan,
+                Prediction::Velocity,
+                &cancel,
+                synthetic_forward,
+                |_, _| {},
+            )
+        });
+        assert!(refused.is_err());
+        assert_eq!(
+            take_refusal().expect("STEP_QUANTUM refusal recorded").label,
+            STEP_QUANTUM
+        );
     }
 }

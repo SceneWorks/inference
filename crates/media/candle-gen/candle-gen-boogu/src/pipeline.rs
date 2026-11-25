@@ -806,7 +806,7 @@ fn turbo_prediction(
         Some(negative) => {
             let negative = dit.forward(latent, timestep, negative)?;
             let (residual_weight, _) =
-                gen_core::guidance::boogu_residual_cfg_weights(1.0 + guidance);
+                gen_core::guidance::boogu_turbo_residual_cfg_weights(guidance);
             Ok((&positive + ((&positive - negative)? * residual_weight as f64)?)?)
         }
         None => Ok(positive),

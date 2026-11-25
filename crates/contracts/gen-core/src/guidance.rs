@@ -173,6 +173,14 @@ pub const fn boogu_residual_cfg_weights(scale: f32) -> (f32, f32) {
     (scale - 1.0, -1.0)
 }
 
+/// Direct residual difference weight and velocity negation sign `(residual_weight, -1.0)` for
+/// Boogu Turbo (`PIPE-8`), where `guidance` is already a residual weight (default `0.0`) and
+/// must not round-trip through `(1.0 + guidance) - 1.0`.
+pub const fn boogu_turbo_residual_cfg_weights(residual_weight: f32) -> (f32, f32) {
+    let _ = CombineVariant::BooguResidualCfgNegated;
+    (residual_weight, -1.0)
+}
+
 // =================================================================================================
 // GuidanceOps — the axis-parameterized backend op extension (sc-7437).
 // =================================================================================================
@@ -941,6 +949,29 @@ mod tests {
             assert!(pag_apply(&OPS, &eps_cfg, &cond, &perturbed, bad).is_err());
             assert!(pag_apply_slice(&eps_cfg, &cond, &perturbed, bad).is_err());
         }
+    }
+
+    #[test]
+    fn boogu_turbo_residual_cfg_weights_are_bit_exact() {
+        for guidance in [0.0_f32, 0.1_f32, 0.3_f32, 0.7_f32, 1.5_f32] {
+            let (residual_weight, negate_sign) = boogu_turbo_residual_cfg_weights(guidance);
+            assert_eq!(
+                residual_weight.to_bits(),
+                guidance.to_bits(),
+                "Boogu Turbo residual weight must stay bit-exact for guidance={guidance}"
+            );
+            assert_eq!(negate_sign.to_bits(), (-1.0_f32).to_bits());
+        }
+        // Contrast with `(1.0 + g) - 1.0` round-tripping through `boogu_residual_cfg_weights`,
+        // which loses ULPs on non-dyadic values such as 0.1 and 0.3.
+        assert_ne!(
+            boogu_residual_cfg_weights(1.0_f32 + 0.3_f32).0.to_bits(),
+            0.3_f32.to_bits()
+        );
+        assert_ne!(
+            boogu_residual_cfg_weights(1.0_f32 + 0.1_f32).0.to_bits(),
+            0.1_f32.to_bits()
+        );
     }
 
     #[test]

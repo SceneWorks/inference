@@ -206,7 +206,7 @@ where
 /// at `step.s`, read as `prediction` (`_pred_x0`: velocity `x0 = x − s·out`, or the clean image
 /// `x0 = out`); `on_step(i, x0)` fires after step `i` (1-based) completes with that step's predicted
 /// clean image. Cancellation is checked before every network evaluation and surfaces as
-/// [`Error::Canceled`] — the partial state is dropped, never returned.
+/// [`candle_gen::CandleError::Canceled`] — the partial state is dropped, never returned.
 pub fn sample(
     z: &Tensor,
     plan: &[DpmStep],
