@@ -61,6 +61,24 @@ struct SidecarEntry {
     payload_bytes: usize,
 }
 
+struct RuntimeSidecarPayload {
+    mapped: MmapedSafetensors,
+    entry: SidecarEntry,
+}
+impl RuntimeSidecarPayload {
+    fn upload(self, device: &Device) -> Result<QTensor> {
+        let payload = self.mapped.get(PAYLOAD_KEY)?;
+        let storage = QStorage::from_data(Cow::Borrowed(payload.data()), device, self.entry.dtype)
+            .map_err(|e| {
+                Error::Msg(format!(
+                    "device-format sidecar: transfer {} to {device:?}: {e}",
+                    self.entry.path.display()
+                ))
+            })?;
+        QTensor::new(storage, (self.entry.out_dim, self.entry.in_dim))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedProjection {
     entry_base: String,
@@ -652,11 +670,20 @@ impl PackedWeightSidecars {
     /// No source tensor or conversion parameter is accepted here by design: a caller cannot
     /// accidentally put the MLX-affine repack back into a block-window loop.
     pub fn load(&self, base: &str, device: &Device) -> Result<QTensor> {
+        self.load_with_upload(base, &mut |payload| payload.upload(device))
+    }
+
+    fn load_with_upload(
+        &self,
+        base: &str,
+        upload: &mut dyn FnMut(RuntimeSidecarPayload) -> Result<QTensor>,
+    ) -> Result<QTensor> {
         if let Some(cache) = self.replacement.get() {
-            return cache.load(base, device);
+            return cache.load_with_upload(base, upload);
         }
-        match self.load_runtime(base, device) {
-            Ok(weight) => Ok(weight),
+        match self.read_runtime(base) {
+            // Native upload failures are device errors, not evidence of an unreadable cache.
+            Ok(payload) => upload(payload),
             Err(error) => {
                 let Some(rebuild) = &self.rebuild else {
                     return Err(error);
@@ -677,14 +704,14 @@ impl PackedWeightSidecars {
                     rebuild.external.as_deref(),
                     false,
                 )?;
-                let weight = cache.load_runtime(base, device)?;
+                let payload = cache.read_runtime(base)?;
                 let _ = self.replacement.set(Box::new(cache));
-                Ok(weight)
+                upload(payload)
             }
         }
     }
 
-    fn load_runtime(&self, base: &str, device: &Device) -> Result<QTensor> {
+    fn read_runtime(&self, base: &str) -> Result<RuntimeSidecarPayload> {
         let entry = self.entries.get(base).ok_or_else(|| {
             Error::Msg(format!(
                 "device-format sidecar: no prepared projection `{base}` in {}",
@@ -714,14 +741,10 @@ impl PackedWeightSidecars {
                 entry.payload_bytes
             )));
         }
-        let storage = QStorage::from_data(Cow::Borrowed(payload.data()), device, entry.dtype)
-            .map_err(|e| {
-                Error::Msg(format!(
-                    "device-format sidecar: transfer {} to {device:?}: {e}",
-                    entry.path.display()
-                ))
-            })?;
-        QTensor::new(storage, (entry.out_dim, entry.in_dim))
+        Ok(RuntimeSidecarPayload {
+            mapped,
+            entry: entry.clone(),
+        })
     }
 
     /// Materialize one slice of a rank-3 packed projection (for example one MoE expert).
@@ -2596,6 +2619,41 @@ mod tests {
         assert_eq!(
             reopened.load("layers.q8", &Device::Cpu)?.data()?.as_ref(),
             first.load("layers.q8", &Device::Cpu)?.data()?.as_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn device_upload_failure_does_not_reopen_sources_or_repair_a_valid_sidecar() -> Result<()> {
+        let dir = TestDir::new("upload-failure");
+        let file = write_source(dir.path(), 8, 0.)?;
+        let source = open(&file)?;
+        let cache = PackedWeightSidecars::prepare(
+            &source,
+            dir.path(),
+            PackedConfig {
+                bits: 8,
+                group_size: 64,
+            },
+            &Device::Cpu,
+        )?;
+        drop(source);
+        fs::remove_file(file)?;
+        let failure = cache.load_with_upload("layers.0.proj", &mut |_| {
+            Err(Error::Msg("simulated device OOM".into()))
+        });
+        assert!(failure
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("simulated device OOM"));
+        assert_eq!(
+            cache.load("layers.0.proj", &Device::Cpu)?.shape().dims(),
+            &[2, 64]
+        );
+        assert!(
+            cache.replacement.get().is_none(),
+            "device failures must not enter cache repair"
         );
         Ok(())
     }

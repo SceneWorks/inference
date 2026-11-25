@@ -273,6 +273,22 @@ fn materialize_runtime_weight(
     device: &Device,
     produce: impl FnOnce() -> Result<QTensor>,
 ) -> Result<QTensor> {
+    materialize_runtime_weight_with_upload(cache, key, shape, dtype, produce, &mut |bytes| {
+        QTensor::new(
+            QStorage::from_data(Cow::Borrowed(&bytes), device, dtype)?,
+            shape,
+        )
+    })
+}
+
+fn materialize_runtime_weight_with_upload(
+    cache: &dyn gen_core::QuantizationArtifactCache,
+    key: &gen_core::QuantizationArtifactKey,
+    shape: &[usize],
+    dtype: GgmlDType,
+    produce: impl FnOnce() -> Result<QTensor>,
+    upload: &mut dyn FnMut(Vec<u8>) -> Result<QTensor>,
+) -> Result<QTensor> {
     let mut produce = Some(produce);
     for attempt in 0..2 {
         let mut produced = None;
@@ -317,15 +333,14 @@ fn materialize_runtime_weight(
             if bytes.len() != expected {
                 candle_core::bail!("runtime weight size changed while reading");
             }
-            QTensor::new(
-                QStorage::from_data(Cow::Borrowed(&bytes), device, dtype)?,
-                shape,
-            )
+            Ok(bytes)
         })();
-        drop(artifact);
         match read {
-            Ok(tensor) => return Ok(tensor),
+            // Upload errors (including OOM) say nothing about the cache contents. Retain the
+            // artifact lease through upload and propagate the device error without invalidation.
+            Ok(bytes) => return upload(bytes),
             Err(error) => {
+                drop(artifact);
                 if attempt != 0
                     || !cache
                         .invalidate(key)
@@ -681,6 +696,51 @@ mod tests {
         assert_eq!(run(owned)?, expected);
         assert_eq!(cache.writes.load(Ordering::Relaxed), 1);
         assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn device_upload_failure_never_invalidates_or_rebuilds_valid_runtime_weights() -> Result<()> {
+        let cache = Cache::new();
+        let source = Tensor::ones((2, 64), DType::F32, &Device::Cpu)?;
+        let key = gen_core::QuantizationArtifactKey::new(
+            "upload-failure-v1",
+            source.dims(),
+            b"source",
+            "ggml",
+        );
+        let expected = materialize_runtime_weight(
+            cache.as_ref(),
+            &key,
+            source.dims(),
+            GgmlDType::Q8_0,
+            &Device::Cpu,
+            || QTensor::quantize_onto(&source, GgmlDType::Q8_0, &Device::Cpu),
+        )?;
+        let failure = materialize_runtime_weight_with_upload(
+            cache.as_ref(),
+            &key,
+            source.dims(),
+            GgmlDType::Q8_0,
+            || panic!("valid cache must not invoke the producer after upload failure"),
+            &mut |_| Err(candle_core::Error::Msg("simulated device OOM".into())),
+        );
+        assert!(failure
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("simulated device OOM"));
+        let retry = materialize_runtime_weight(
+            cache.as_ref(),
+            &key,
+            source.dims(),
+            GgmlDType::Q8_0,
+            &Device::Cpu,
+            || panic!("a device error must preserve the ready artifact"),
+        )?;
+        assert_eq!(data(&retry), data(&expected));
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 2);
         Ok(())
     }
 
