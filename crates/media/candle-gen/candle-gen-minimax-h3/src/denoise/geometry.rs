@@ -46,21 +46,21 @@
 //! | 141 | 5.8750 s | 5.8750 s | 0 |
 //! | 158 | 6.5833 s | 6.5750 s | **−8.33 ms** |
 //!
-//! …cycling with period 3 over the 14 legal durations ([`LEGAL_FRAME_COUNTS`]); 141, 192, 243, 294
-//! and 345 are exactly aligned. [`JointGeometry::av_drift_seconds`] reports it and
+//! …cycling with period 3 over the 22 supported durations ([`LEGAL_FRAME_COUNTS`]); 141, 192, 243, 294
+//! 345, 396 and 447 are exactly aligned. [`JointGeometry::av_drift_seconds`] reports it and
 //! [`MAX_AV_DRIFT_SECONDS`] bounds it. This is a **muxing** concern, not a denoise one — the
 //! delivered mp4 needs a pad/trim policy.
 //!
 //! Which five are exact is **derived, not tabulated**: [`av_grids_align_exactly`] asks whether
 //! `num_frames · 40 / 24` needs the `round` at all, which reduces to `3 | num_frames`. A hardcoded
 //! `[141, 192, 243, 294, 345]` would pass for any policy that happened to fit those five and says
-//! nothing about the other nine — the exact case that makes an AV test a false green (sc-19425).
+//! nothing about the other fifteen — the exact case that makes an AV test a false green (sc-19425).
 //!
 //! # The mux policy lives here, in the counts, not in either backend's pipeline
 //!
 //! [`delivered_audio_samples`] is the length the delivered soundtrack **must** be: the picture's,
 //! `round(num_frames / 24 · 32000)`. [`decoded_audio_samples`] is what the audio VAE actually emits.
-//! They differ at nine of the fourteen, by at most [`MAX_AV_DRIFT_SECONDS`], and **the audio is the
+//! They differ at fifteen of the twenty-two, by at most [`MAX_AV_DRIFT_SECONDS`], and **the audio is the
 //! side corrected** — the picture's frame count is on the model's own `17n + 5` lattice and its
 //! duration is exact, while the audio count is a `round` of it, so correcting the audio corrects the
 //! side that carries the error. Trimming or silence-padding at the tail costs at most 400 samples of
@@ -127,15 +127,11 @@ pub const AUDIO_SAMPLES_PER_LATENT: u32 = AUDIO_SAMPLE_RATE / AUDIO_TOKEN_RATE_H
 /// derived from the decoder's output rather than from `num_frames`.
 pub const MAX_DELIVERED_AV_RESIDUAL_SECONDS: f64 = 0.5 / AUDIO_SAMPLE_RATE as f64;
 
-/// Every frame count the released model accepts — `17n + 5` clamped to the hardcoded 5–15 s
-/// duration range. Nothing else is legal.
-///
-/// The advertised duration envelope is **derived from this lattice**, not from the 5–15 s prose:
-/// the shortest legal render is 124 frames = 5.1667 s and the longest is 345 = 14.375 s, so a
-/// request for a flat 15.0 s has no legal frame count and must be refused rather than silently
-/// delivered as 14.375 (sc-17152).
-pub const LEGAL_FRAME_COUNTS: [usize; 14] = [
-    124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345,
+/// Supported output counts on the 17n + 5 lattice, through 481 frames (20.0417 seconds).
+/// Kept equal to gen-core's shared inventory by the cross-backend geometry check.
+pub const LEGAL_FRAME_COUNTS: [usize; 22] = [
+    124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, 362, 379, 396, 413, 430,
+    447, 464, 481,
 ];
 
 /// Whether the video and audio grids advance the shared rotary clock at the same rate.
@@ -168,7 +164,7 @@ pub fn align_num_frames(num_frames: usize) -> usize {
 pub fn video_latent_num_frames(num_frames: usize) -> Result<usize> {
     if num_frames < LATENTS_PER_CHUNK || num_frames % FRAMES_PER_CHUNK != LATENTS_PER_CHUNK {
         return Err(CandleError::Msg(format!(
-            "minimax-h3 geometry: num_frames must be 17n + 5 (124, 141, 158, … 345), got \
+            "minimax-h3 geometry: num_frames must be 17n + 5 (124, 141, 158, … 481), got \
              {num_frames}"
         )));
     }
@@ -367,22 +363,23 @@ mod tests {
             assert!(g.av_drift_seconds().abs() <= MAX_AV_DRIFT_SECONDS + 1e-12);
         }
         assert_eq!(LEGAL_FRAME_COUNTS[0], 124);
-        assert_eq!(LEGAL_FRAME_COUNTS[13], 345);
+        assert_eq!(LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1], 481);
     }
 
-    /// The advertised envelope is **derived from the lattice**: 5.1667 s to 14.375 s, 14 points.
-    /// A flat 15.0 s has no legal frame count (sc-17152).
+    /// The advertised envelope is **derived from the lattice**: 5.1667 s to 20.0417 s, 22 points.
+    /// A flat 20.0 s aligns upward to 481 frames (sc-17152).
     #[test]
     fn the_duration_envelope_is_derived_from_the_lattice() {
         let shortest = JointGeometry::new(LEGAL_FRAME_COUNTS[0], 20, 36).unwrap();
-        let longest = JointGeometry::new(LEGAL_FRAME_COUNTS[13], 20, 36).unwrap();
+        let longest =
+            JointGeometry::new(LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1], 20, 36).unwrap();
         assert!((shortest.duration_seconds() - 5.166_666).abs() < 1e-4);
-        assert!((longest.duration_seconds() - 14.375).abs() < 1e-9);
-        assert_eq!(LEGAL_FRAME_COUNTS.len(), 14);
-        // 15.0 s would be 360 frames, which is not on the lattice and is past the longest legal
-        // count — so it is refused, not silently delivered as 14.375.
+        assert!((longest.duration_seconds() - 481.0 / 24.0).abs() < 1e-9);
+        assert_eq!(LEGAL_FRAME_COUNTS.len(), 22);
+        // An explicit off-lattice frame count still refuses; duration alignment rounds upward.
         assert!(video_latent_num_frames(360).is_err());
-        assert!(!LEGAL_FRAME_COUNTS.contains(&align_num_frames(346)));
+        assert_eq!(align_num_frames(480), 481);
+        assert!(!LEGAL_FRAME_COUNTS.contains(&align_num_frames(482)));
     }
 
     /// The measured ±8.33 ms / 0 cycle, reproduced exactly — and the five exactly-aligned durations
@@ -404,7 +401,7 @@ mod tests {
             .copied()
             .filter(|&f| ms(f).abs() < 1e-9)
             .collect();
-        assert_eq!(aligned, vec![141, 192, 243, 294, 345]);
+        assert_eq!(aligned, vec![141, 192, 243, 294, 345, 396, 447]);
 
         // 124 frames is 5.1667 s of picture against 207 audio latents = 5.1750 s of sound.
         let g = JointGeometry::new(124, 20, 36).unwrap();
@@ -415,7 +412,7 @@ mod tests {
     }
 
     /// **The exactly-aligned set is derived, not tabulated.** [`av_grids_align_exactly`] is asked
-    /// about all fourteen and must agree, count by count, with the residual actually measured off
+    /// about all twenty-two and must agree, count by count, with the residual actually measured off
     /// [`JointGeometry::av_drift_seconds`] — which is what makes it a derivation of the two grid
     /// rates rather than a restatement of the five counts it is true at.
     #[test]
@@ -448,10 +445,10 @@ mod tests {
                 exact.push(frames);
             }
         }
-        assert_eq!(exact, vec![141, 192, 243, 294, 345]);
-        // ...and the other NINE are off by the full ±8.33 ms, not by something negligible. Without
+        assert_eq!(exact, vec![141, 192, 243, 294, 345, 396, 447]);
+        // ...and the other FIFTEEN are off by the full ±8.33 ms, not by something negligible. Without
         // this the predicate could be true everywhere and the assertion above would still hold.
-        assert_eq!(LEGAL_FRAME_COUNTS.len() - exact.len(), 9);
+        assert_eq!(LEGAL_FRAME_COUNTS.len() - exact.len(), 15);
         for &frames in LEGAL_FRAME_COUNTS
             .iter()
             .filter(|&&f| !av_grids_align_exactly(f))
@@ -473,7 +470,7 @@ mod tests {
     }
 
     /// **The AV mux policy, stated in counts.** The soundtrack is DELIVERED at the picture's length
-    /// at every one of the fourteen — including the nine where the decoder hands back a different
+    /// at every supported duration — including the fifteen where the decoder hands back a different
     /// one — and the residual that survives is under half a sample.
     ///
     /// Held here even though this crate ships no pipeline: sc-17156's delivery path must trim/pad to
@@ -514,7 +511,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(corrected, 9, "nine of the fourteen need a correction");
+        assert_eq!(corrected, 15, "fifteen of the twenty-two need a correction");
         // The measured pair from the spike: 124 frames is 5.1667 s of picture, 207 latents =
         // 165 600 decoded samples = 5.175 s of sound, delivered as 165 333.
         assert_eq!(decoded_audio_samples(124), 165_600);

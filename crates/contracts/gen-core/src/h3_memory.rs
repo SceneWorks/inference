@@ -89,10 +89,15 @@ pub struct NativeAllocationFacts {
 }
 /// The frame rate every MiniMax-H3 duration is expressed at.
 pub const FPS: f64 = 24.0;
-/// The shortest legal render (the `17n + 5` lattice floor, 5.1667 s).
-pub const MIN_FRAMES: u32 = 124;
-/// The longest legal render (the lattice ceiling, 14.375 s).
-pub const MAX_FRAMES: u32 = 345;
+/// Supported output counts, extending the 17n + 5 lattice through the first rung at 20 seconds.
+pub const LEGAL_FRAME_COUNTS: [u32; 22] = [
+    124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345, 362, 379, 396, 413, 430,
+    447, 464, 481,
+];
+/// The shortest legal render (5.1667 s at 24 fps).
+pub const MIN_FRAMES: u32 = LEGAL_FRAME_COUNTS[0];
+/// The longest legal render: 481 frames, approximately 20.0417 seconds at 24 fps.
+pub const MAX_FRAMES: u32 = LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1];
 /// The duration a request naming neither `frames` nor `duration` renders at — the lattice floor.
 pub const DEFAULT_DURATION_SECONDS: f32 = 5.1667;
 /// Align a requested `duration` **upward** onto the `17n + 5` lattice, refusing one outside the
@@ -106,11 +111,12 @@ pub fn align_frames_for_duration(seconds: f32) -> Result<u32> {
     }
     let (min_s, max_s) = (f64::from(MIN_FRAMES) / FPS, f64::from(MAX_FRAMES) / FPS);
     let seconds = f64::from(seconds);
-    if !(min_s - 1e-6..=max_s + 1e-6).contains(&seconds) {
+    // Match the four-decimal duration precision advertised by clients.
+    let declared = |seconds: f64| (seconds * 10_000.0).round();
+    if declared(seconds) < declared(min_s) || declared(seconds) > declared(max_s) {
         return Err(Error::Msg(format!(
             "minimax_h3: duration {seconds} s is outside the model's {min_s}-{max_s} s range (the \
-             legal frame counts {MIN_FRAMES}-{MAX_FRAMES} at {FPS} fps; the reference pipeline \
-             advertises 5-15 s but its own 17n+5 lattice tops out at 14.375 s)"
+             legal frame counts {MIN_FRAMES}-{MAX_FRAMES} at {FPS} fps)"
         )));
     }
     let requested = (seconds * FPS).round().max(1.0) as u32;
@@ -298,3 +304,18 @@ pub mod window;
 /// choose a smaller bound through the same policy as attention; never assume the old
 /// i32-only one-billion-element guard is still the runtime's working set.
 pub const FFN_INTERMEDIATE_BUDGET: u64 = crate::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;
+
+#[cfg(test)]
+mod extended_duration_tests {
+    use super::*;
+    #[test]
+    fn twenty_seconds_aligns_up_and_the_declared_ceiling_roundtrips() {
+        for (seconds, frames) in [(15.0, 362), (20.0, 481), (20.0417, 481)] {
+            assert_eq!(align_frames_for_duration(seconds).unwrap(), frames);
+        }
+        for seconds in [5.0, 20.0418, 21.0, f32::NAN, f32::INFINITY] {
+            assert!(align_frames_for_duration(seconds).is_err(), "{seconds}");
+        }
+        assert_eq!(resolve_request_frames(Some(481), Some(8.0)).unwrap(), 481);
+    }
+}
