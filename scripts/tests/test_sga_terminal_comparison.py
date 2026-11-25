@@ -704,6 +704,22 @@ class TerminalTests(unittest.TestCase):
                 comparison.terminal_hub_root("mlx", ltx, {"HF_HUB_CACHE": str(unavailable)})
             generic.assert_not_called()
 
+    def test_wan_head_overlay_instruments_native_driver_steps(self):
+        def read(path):
+            return (comparison.ROOT / path).read_bytes()
+
+        mlx_overlay = wan.overlay(read, "head", "mlx", "fixture")
+        mlx_sched = mlx_overlay["crates/media/mlx-gen/mlx-gen-wan/src/scheduler.rs"]
+        self.assertEqual(mlx_sched.count(b"SGA_WAN_OUTER_STEP"), 1)
+        self.assertEqual(mlx_sched.count(b"sga_step_start = std::time::Instant::now()"), 1)
+
+        cuda_overlay = wan.overlay(read, "head", "candle-cuda", "fixture")
+        cuda_wan14b = cuda_overlay["crates/media/candle-gen/candle-gen-wan/src/wan14b.rs"]
+        cuda_sched = cuda_overlay["crates/media/candle-gen/candle-gen-wan/src/scheduler.rs"]
+        self.assertEqual(cuda_wan14b.count(b"SGA_WAN_EXPERT_ADAPTERS"), 1)
+        self.assertEqual(cuda_sched.count(b"SGA_WAN_OUTER_STEP"), 1)
+        self.assertEqual(cuda_sched.count(b"latents.device().synchronize()"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
