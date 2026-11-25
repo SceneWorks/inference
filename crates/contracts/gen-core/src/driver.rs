@@ -355,6 +355,47 @@ impl SliceSpec {
             request_boundary_estimate: false,
         }
     }
+
+    /// Build planned trajectory slices from an active [`RenderRun`]'s compiled `denoise_spans()`,
+    /// falling back to a single full-trajectory slice when `run` is `None` or the compiled spans
+    /// do not partition `0..total_steps`.
+    ///
+    /// Preserves every compiled phase index so [`run_driver_slices`] enters and finishes every
+    /// phase (including inert splits created via `RenderPlan::with_inert_split_at`).
+    pub fn from_render_run(run: Option<&RenderRun<'_, '_>>, total_steps: usize) -> Vec<Self> {
+        match run {
+            Some(run) => {
+                let plan_spans = run.plan().denoise_spans();
+                let covered: usize = plan_spans.iter().map(|s| s.len()).sum();
+                if covered == total_steps && !plan_spans.is_empty() {
+                    plan_spans
+                        .into_iter()
+                        .enumerate()
+                        .map(|(phase, span)| Self {
+                            pass: run.plan().pass_index(),
+                            phase,
+                            span,
+                            transition: if phase == 0 {
+                                SliceTransition::Start
+                            } else {
+                                SliceTransition::Continue
+                            },
+                            history: if phase == 0 {
+                                DriverHistoryPolicy::Reset
+                            } else {
+                                DriverHistoryPolicy::Carry
+                            },
+                            geometry: Some(run.plan().phase_output_size(phase)),
+                            request_boundary_estimate: false,
+                        })
+                        .collect()
+                } else {
+                    vec![Self::full(total_steps)]
+                }
+            }
+            None => vec![Self::full(total_steps)],
+        }
+    }
 }
 
 /// Request-owned, owner-local execution state that outlives individual phase slices (`PIPE-3`, `B3`).

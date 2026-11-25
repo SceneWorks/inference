@@ -1052,8 +1052,12 @@ where
                 },
                 renoise_key.as_ref(),
             )?;
-            denoised = pred_x0;
             latents = hooks.post_step(&info, next)?;
+            denoised = if renoise_key.is_none() {
+                latents.clone()
+            } else {
+                pred_x0
+            };
             previous_renoise = renoise_key.is_some();
             state.record_outer_step(step);
             if self.emit_ios_diagnostics {
@@ -3707,5 +3711,84 @@ mod quantum_tests {
         assert!(report.verified_cancellation);
         assert_eq!(report.unsplit_evaluations, 4);
         assert_eq!(report.unsplit_draws, 3);
+    }
+
+    #[test]
+    fn sana_scm_driver_preserves_terminal_post_step_hook() {
+        use mlx_gen::driver::{
+            DriverHistoryPolicy, DriverRunState, DriverStepInfo, FamilyDriver, SliceInput,
+            SliceTransition, StepHooks,
+        };
+        use mlx_gen::gen_core::BoundaryState;
+
+        let sched = ScmScheduler::new(1);
+        let sd = crate::scm::SIGMA_DATA;
+        let init = multiply(
+            Array::from_slice(&[0.4f32, -0.2, 0.8, 0.1], &[1, 1, 2, 2]),
+            arr1(sd),
+        )
+        .unwrap();
+
+        let run_case = |request_boundary_estimate: bool, apply_hook: bool| -> Vec<f32> {
+            let driver = SanaScmDriver::new(sched.clone(), 0, |lat_in, scm_t, _step| {
+                let scale = arr1(0.25 * scm_t + 0.1);
+                Ok(multiply(lat_in, &scale)?)
+            });
+            let mut state = DriverRunState::new();
+            let cancel = CancelFlag::new();
+            let mut progress = |_| {};
+            let mut hooks = StepHooks::new(&mut progress);
+            let mut post_step =
+                |_info: &DriverStepInfo, x: Array| -> mlx_gen::gen_core::Result<Array> {
+                    add(
+                        &multiply(&x, arr1(0.5))
+                            .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?,
+                        arr1(1.25f32),
+                    )
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+                };
+            if apply_hook {
+                hooks.on_post_step = Some(&mut post_step);
+            }
+            let out = driver
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..1,
+                        total_steps: 1,
+                        state: BoundaryState::XSigma(init.clone()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 7,
+                        cancel: &cancel,
+                        request_boundary_estimate,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap();
+            let BoundaryState::CleanEstimate { latent, .. } = out else {
+                panic!("terminal SCM slice must return CleanEstimate");
+            };
+            latent.eval().unwrap();
+            latent.as_slice::<f32>().to_vec()
+        };
+
+        let baseline = run_case(false, false);
+        let expected: Vec<f32> = baseline
+            .iter()
+            .map(|&v| ((v * sd) * 0.5 + 1.25) / sd)
+            .collect();
+        for request_boundary_estimate in [false, true] {
+            let got = run_case(request_boundary_estimate, true);
+            for (a, b) in got.iter().zip(expected.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "terminal SCM post-step hook discarded (boundary={request_boundary_estimate}): got {got:?} vs expected {expected:?}"
+                );
+            }
+        }
     }
 }

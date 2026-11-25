@@ -665,6 +665,7 @@ fn denoise_lightning_control(
             controls,
         },
         cancel,
+        None,
         on_progress,
         preview,
     )

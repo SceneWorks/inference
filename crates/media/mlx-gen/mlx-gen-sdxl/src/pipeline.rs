@@ -14,9 +14,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{
-    CancelFlag, DiffusionSampler, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
-    DriverRunState, DriverStepInfo, DriverSupport, Error, FamilyDriver, Image, LatentDecoder,
-    MlxLatentOps, PreviewSink, Progress, Result, SliceInput, SliceSpec, SliceTransition, StepHooks,
+    CancelFlag, DiffusionSampler, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, Error, FamilyDriver, Image, LatentDecoder, MlxLatentOps,
+    PreviewSink, Progress, Result, SliceInput, SliceSpec, StepHooks,
 };
 
 use crate::inpaint::InpaintBlend;
@@ -1115,7 +1115,7 @@ fn denoise_core(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn denoise_core_planned(
+pub fn denoise_core_planned(
     d: &Denoiser,
     run: Option<&gen_core::RenderRun<'_, '_>>,
     latents: Array,
@@ -1188,38 +1188,7 @@ pub(crate) fn denoise_core_planned(
     )
     .with_inpaint_quantum(inpaint.is_some());
 
-    let spans: Vec<SliceSpec> = match run {
-        Some(run) => {
-            let plan_spans = run.plan().denoise_spans();
-            let covered: usize = plan_spans.iter().map(|s| s.len()).sum();
-            if covered == steps && !plan_spans.is_empty() {
-                plan_spans
-                    .into_iter()
-                    .enumerate()
-                    .map(|(phase, span)| SliceSpec {
-                        pass: run.plan().pass_index(),
-                        phase,
-                        span,
-                        transition: if phase == 0 {
-                            SliceTransition::Start
-                        } else {
-                            SliceTransition::Continue
-                        },
-                        history: if phase == 0 {
-                            DriverHistoryPolicy::Reset
-                        } else {
-                            DriverHistoryPolicy::Carry
-                        },
-                        geometry: Some(run.plan().phase_output_size(phase)),
-                        request_boundary_estimate: false,
-                    })
-                    .collect()
-            } else {
-                vec![SliceSpec::full(steps)]
-            }
-        }
-        None => vec![SliceSpec::full(steps)],
-    };
+    let spans = SliceSpec::from_render_run(run, steps);
 
     let mut state = DriverRunState::new();
     let mut on_observe = |info: &DriverStepInfo, x_in: &Array| -> gen_core::Result<()> {

@@ -513,10 +513,7 @@ impl Pipeline {
                     Some(init) => sampler.add_noise(init, &noise)?,
                     None => (&noise * sampler.init_noise_sigma() as f64)?,
                 };
-                if let Some(run) = run {
-                    run.begin_denoise_phase(0).map_err(CandleError::from)?;
-                }
-                let result = denoise_native_with_unet(
+                denoise_native_with_unet(
                     &sampler,
                     latents,
                     &components.unet,
@@ -526,13 +523,10 @@ impl Pipeline {
                     use_guide,
                     guidance,
                     &req.cancel,
+                    run,
                     on_progress,
                     &req.preview,
-                );
-                if let Some(run) = run {
-                    run.end_denoise_phase(0).map_err(CandleError::from)?;
-                }
-                result?
+                )?
             };
             if let Some(run) = run {
                 run.finish_image_denoise_phases()
@@ -673,10 +667,7 @@ impl Pipeline {
                     Some(init) => sampler.add_noise(init, &noise)?,
                     None => (&noise * sampler.init_noise_sigma() as f64)?,
                 };
-                if let Some(run) = run {
-                    run.begin_denoise_phase(0).map_err(CandleError::from)?;
-                }
-                let result = denoise_native_with_unet(
+                denoise_native_with_unet(
                     &sampler,
                     current,
                     &unet,
@@ -686,13 +677,10 @@ impl Pipeline {
                     use_guide,
                     guidance,
                     &req.cancel,
+                    run,
                     on_progress,
                     &req.preview,
-                );
-                if let Some(run) = run {
-                    run.end_denoise_phase(0).map_err(CandleError::from)?;
-                }
-                result?
+                )?
             };
             if let Some(run) = run {
                 run.finish_image_denoise_phases()
@@ -1054,6 +1042,7 @@ fn denoise_native_with_unet(
     use_guide: bool,
     guidance: f32,
     cancel: &gen_core::runtime::CancelFlag,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
     on_progress: &mut dyn FnMut(Progress),
     preview: &gen_core::PreviewSink,
 ) -> Result<Tensor> {
@@ -1091,6 +1080,7 @@ fn denoise_native_with_unet(
             time_ids,
         },
         cancel,
+        run,
         on_progress,
         preview,
     )

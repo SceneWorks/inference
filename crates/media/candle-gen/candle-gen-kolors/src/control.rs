@@ -947,6 +947,7 @@ fn denoise_control_native(
             control_scale,
         },
         cancel,
+        None,
         on_progress,
         preview,
     )

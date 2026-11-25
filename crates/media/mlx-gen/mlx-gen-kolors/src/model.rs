@@ -32,7 +32,7 @@ use mlx_gen::{
 
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise,
-    denoise_control_with_preview as denoise_control_registered,
+    denoise_control_with_preview as denoise_control_registered, denoise_core_planned,
     denoise_curated_planned as denoise_curated_planned_registered,
     denoise_curated_with_preview as denoise_curated_registered,
     denoise_ip_control_with_preview as denoise_ip_control_registered,
@@ -1312,6 +1312,85 @@ impl KolorsHeavy {
             &conditioning,
             &tokens,
             ip_scale,
+        )
+    }
+
+    /// Planned native leading-Euler denoise that drives every compiled `RenderPlan::denoise_spans()`
+    /// slice through [`denoise_core_planned`] so inert splits enter and finish every compiled phase
+    /// (`SW-6966` / `SW-6971`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_native_planned(
+        &self,
+        init_latents: Option<&Array>,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: Option<f32>,
+        cfg: f32,
+        control: Option<(&ControlNet, &Image, f32)>,
+        ip_tokens: Option<(&Array, f32)>,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: SdxlForwardPlan<'_>,
+        cfg_batching: CfgBatching,
+    ) -> Result<Array> {
+        let sampler = match (init_latents, strength) {
+            (Some(_), Some(s)) => KolorsEulerSampler::kolors_img2img(num_steps, s, self.dtype)?,
+            _ => KolorsEulerSampler::kolors(num_steps, self.dtype)?,
+        };
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
+        let latents = match (init_latents, strength) {
+            (Some(init), Some(_)) => sampler.add_noise(init, init_noise)?,
+            _ => sampler.scale_initial_noise(init_noise)?,
+        };
+        let controls: Vec<ControlContext> = match control {
+            Some((controlnet, control_image, control_scale)) => {
+                let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
+                let cimg = cfg_batch_control_image(&cimg, cfg, cfg_batching)?;
+                vec![ControlContext {
+                    cond_embed: controlnet.embed_cond(&cimg)?,
+                    controlnet,
+                    scale: control_scale,
+                }]
+            }
+            None => Vec::new(),
+        };
+        let ip_batched = match ip_tokens {
+            Some((tokens, scale)) => Some((cfg_batch_ip_tokens(tokens, cfg, cfg_batching)?, scale)),
+            None => None,
+        };
+        let control_encoder = if !controls.is_empty() && ip_batched.is_some() {
+            Some(&conditioning)
+        } else {
+            None
+        };
+        let d = Denoiser::with_plan(&self.unet, &sampler, plan);
+        denoise_core_planned(
+            &d,
+            run,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            cancel,
+            on_progress,
+            preview,
+            None,
+            &controls,
+            ip_batched.as_ref().map(|(tokens, scale)| (tokens, *scale)),
+            control_encoder,
         )
     }
 }

@@ -114,7 +114,7 @@ pub use model::{
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
     denoise_cfgpp_planned, denoise_cfgpp_with_preview, denoise_control,
-    denoise_control_with_preview, denoise_curated, denoise_curated_planned,
+    denoise_control_with_preview, denoise_core_planned, denoise_curated, denoise_curated_planned,
     denoise_curated_with_preview, denoise_inpaint, denoise_inpaint_with_preview, denoise_ip,
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,

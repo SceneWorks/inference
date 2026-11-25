@@ -321,12 +321,14 @@ impl<F: SdxlLightningForward> candle_gen::driver::FamilyDriver<Tensor>
 
 /// Shared execution helper driving [`SdxlLightningDriver`] through [`candle_gen::run_candle_driver_slices`]
 /// for both base SDXL-Lightning (`pipeline.rs`) and ControlNet SDXL-Lightning (`control_provider.rs`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_lightning_with_forward<F: SdxlLightningForward>(
     latents: Tensor,
     policy: &LightningPolicy,
     compute_dtype: DType,
     forward: F,
     cancel: &gen_core::runtime::CancelFlag,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
     on_progress: &mut dyn FnMut(Progress),
     preview: &gen_core::PreviewSink,
 ) -> Result<Tensor> {
@@ -337,7 +339,7 @@ pub(crate) fn run_lightning_with_forward<F: SdxlLightningForward>(
     candle_gen::execution::schedule("sdxl-lightning-euler", &sigmas, "epsilon");
     candle_gen::execution::runtime(latents.device(), latents.dtype());
     let driver = SdxlLightningDriver::new("sdxl_candle_lightning", policy, compute_dtype, forward);
-    let slices = [candle_gen::driver::SliceSpec::full(policy.num_steps())];
+    let slices = candle_gen::driver::SliceSpec::from_render_run(run, policy.num_steps());
     let mut observe = |info: &candle_gen::driver::DriverStepInfo, scaled: &Tensor| {
         candle_gen::preview::emit_preview_at(preview, &preview_counter, info.outer_step, || {
             crate::preview::project_spatial_latents(scaled)
@@ -354,7 +356,7 @@ pub(crate) fn run_lightning_with_forward<F: SdxlLightningForward>(
         policy.num_steps(),
         0,
         cancel,
-        None,
+        run,
         &mut state,
         &mut hooks,
         |_phase, boundary, _state| Ok(boundary),
@@ -1534,22 +1536,16 @@ impl Pipeline {
         }
         // σ-space prior: unit noise · the largest σ (init_noise_sigma for trailing spacing).
         let latents = init.affine(policy.init_noise_scale() as f64, 0.0)?;
-        if let Some(run) = run {
-            run.begin_denoise_phase(0).map_err(CandleError::from)?;
-        }
-        let result = run_lightning_with_forward(
+        run_lightning_with_forward(
             latents,
             policy,
             self.dtype,
             UnetLightningForward { unet, cond },
             cancel,
+            run,
             on_progress,
             preview,
-        );
-        if let Some(run) = run {
-            run.end_denoise_phase(0).map_err(CandleError::from)?;
-        }
-        result
+        )
     }
 
     /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native

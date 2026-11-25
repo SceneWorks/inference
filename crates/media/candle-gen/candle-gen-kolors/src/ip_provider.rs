@@ -797,6 +797,7 @@ fn denoise_ip_native(
             time_ids,
         },
         cancel,
+        None,
         on_progress,
         preview,
     )

@@ -1409,10 +1409,7 @@ impl KolorsRenderPlan<'_, '_, '_> {
         let request = self.request;
         let req = request.req;
         let (h, w) = (req.height as i32, req.width as i32);
-        if let Some(run) = self.run {
-            run.begin_denoise_phase(0)?;
-        }
-        let result = match (self.mode, x0) {
+        let (init_latents, strength, control, ip_tokens) = match (self.mode, x0) {
             (
                 &KolorsMode::PoseIp {
                     net,
@@ -1424,27 +1421,11 @@ impl KolorsRenderPlan<'_, '_, '_> {
                     ..
                 },
                 Some(init_latents),
-            ) => self.heavy.denoise_controlnet_ip_latents_with_preview(
-                net,
-                tokens,
-                init_latents,
-                noise,
-                skeleton,
-                self.pos,
-                self.neg,
-                request.steps,
-                init_strength,
-                request.cfg,
-                control_scale,
-                ip_scale,
-                h,
-                w,
-                self.run_steps(),
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                request.forward_plan,
-                request.cfg_batching,
+            ) => (
+                Some(init_latents),
+                Some(init_strength),
+                Some((net, skeleton, control_scale)),
+                Some((tokens, ip_scale)),
             ),
             (
                 &KolorsMode::Control {
@@ -1457,84 +1438,33 @@ impl KolorsRenderPlan<'_, '_, '_> {
                     ..
                 },
                 _,
-            ) => self.heavy.denoise_controlnet_latents_with_preview(
-                net,
-                noise,
-                image,
-                self.pos,
-                self.neg,
-                request.steps,
-                request.cfg,
-                scale,
-                h,
-                w,
-                self.run_steps(),
-                &req.cancel,
-                on_progress,
-                &req.preview,
-                request.forward_plan,
-                request.cfg_batching,
-            ),
-            (KolorsMode::Ip { tokens, scale, .. }, _) => {
-                self.heavy.denoise_ip_latents_with_preview(
-                    tokens,
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    request.cfg,
-                    *scale,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
-            }
+            ) => (None, None, Some((net, image, scale)), None),
+            (KolorsMode::Ip { tokens, scale, .. }, _) => (None, None, None, Some((tokens, *scale))),
             (&KolorsMode::Img2Img { strength, .. }, Some(x0)) => {
-                self.heavy.denoise_img2img_latents_with_preview(
-                    x0,
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    strength,
-                    request.cfg,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
+                (Some(x0), Some(strength), None, None)
             }
-            (KolorsMode::Img2Img { .. } | KolorsMode::Txt2Img, _) => {
-                self.heavy.denoise_latents_with_preview(
-                    noise,
-                    self.pos,
-                    self.neg,
-                    request.steps,
-                    request.cfg,
-                    h,
-                    w,
-                    self.run_steps(),
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    request.forward_plan,
-                    request.cfg_batching,
-                )
-            }
+            (KolorsMode::Img2Img { .. } | KolorsMode::Txt2Img, _) => (None, None, None, None),
         };
-        if let Some(run) = self.run {
-            run.end_denoise_phase(0)?;
-        }
-        result
+        self.heavy.denoise_native_planned(
+            init_latents,
+            noise,
+            self.pos,
+            self.neg,
+            request.steps,
+            strength,
+            request.cfg,
+            control,
+            ip_tokens,
+            h,
+            w,
+            self.run_steps(),
+            self.run,
+            &req.cancel,
+            on_progress,
+            &req.preview,
+            request.forward_plan,
+            request.cfg_batching,
+        )
     }
 }
 

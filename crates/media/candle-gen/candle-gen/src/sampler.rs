@@ -1030,13 +1030,14 @@ where
 
             let (pred_x0, next_angle) = self.trigflow_pred_x0(&latents, abs_step)?;
             state.record_evaluation(crate::driver::DriverEvaluationKind::Trajectory);
-            denoised = pred_x0.clone();
 
             // Renoise to the next angle (skipped on the final / single-step transition, matching
             // diffusers `if len(self.timesteps) > 1`). The per-step subkey reuses the shared D6 derivation.
-            latents = if single_step || abs_step + 1 >= n {
+            let is_terminal_step = single_step || abs_step + 1 >= n;
+            latents = if is_terminal_step {
                 pred_x0
             } else {
+                denoised = pred_x0.clone();
                 let _draw = state.next_draw_index();
                 let noise = ops
                     .randn_like(&latents, input.seed, abs_step)?
@@ -1048,6 +1049,9 @@ where
                     .map_err(|e| gen_core::Error::Msg(e.to_string()))?
             };
             latents = hooks.post_step(&info, latents)?;
+            if is_terminal_step {
+                denoised = latents.clone();
+            }
             hooks.materialize(&info, &latents)?;
             state.record_outer_step(step);
             hooks.emit_progress(&info);
@@ -2619,5 +2623,80 @@ mod guidance_ops_tests {
             tensor_max_abs_diff_host(&dot, &zeros) < 1e-3,
             "eta=0 not orthogonal to cond on candle"
         );
+    }
+
+    #[test]
+    fn sana_scm_driver_preserves_terminal_post_step_hook() {
+        use crate::driver::{
+            DriverHistoryPolicy, DriverRunState, FamilyDriver, SliceInput, SliceTransition,
+            StepHooks,
+        };
+        use candle_core::Device;
+
+        let sched = ScmScheduler::new(1);
+        let init = Tensor::from_vec(vec![0.4f32, -0.2, 0.8, 0.1], (1, 1, 2, 2), &Device::Cpu)
+            .unwrap()
+            .affine(SCM_SIGMA_DATA as f64, 0.0)
+            .unwrap();
+
+        let run_case = |request_boundary_estimate: bool, apply_hook: bool| -> Vec<f32> {
+            let driver = super::ScmDriver::new(sched.clone(), 0, |lat_in, scm_t| {
+                Ok(lat_in.affine(0.25 * scm_t as f64 + 0.1, 0.0)?)
+            });
+            let mut state = DriverRunState::new();
+            let cancel = gen_core::runtime::CancelFlag::new();
+            let mut progress = |_| {};
+            let mut hooks = StepHooks::new(&mut progress);
+            let mut post_step =
+                |_info: &crate::driver::DriverStepInfo, x: Tensor| -> gen_core::Result<Tensor> {
+                    x.affine(0.5, 1.25)
+                        .map_err(|e| gen_core::Error::Msg(e.to_string()))
+                };
+            if apply_hook {
+                hooks.on_post_step = Some(&mut post_step);
+            }
+            let out = driver
+                .run_slice(
+                    SliceInput {
+                        pass: 0,
+                        phase: 0,
+                        span: 0..1,
+                        total_steps: 1,
+                        state: gen_core::BoundaryState::XSigma(init.clone()),
+                        transition: SliceTransition::Start,
+                        history: DriverHistoryPolicy::Reset,
+                        geometry: None,
+                        seed: 7,
+                        cancel: &cancel,
+                        request_boundary_estimate,
+                    },
+                    &mut state,
+                    &mut hooks,
+                )
+                .unwrap();
+            let gen_core::BoundaryState::CleanEstimate { latent, .. } = out else {
+                panic!("terminal SCM slice must return CleanEstimate");
+            };
+            latent.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+
+        let baseline = run_case(false, false);
+        let expected: Vec<f32> = baseline
+            .iter()
+            .map(|&v| {
+                // `baseline = pred_x0 / sd`, hook maps `pred_x0 -> 0.5 * pred_x0 + 1.25`,
+                // then driver divides by `sd`.
+                ((v * SCM_SIGMA_DATA) * 0.5 + 1.25) / SCM_SIGMA_DATA
+            })
+            .collect();
+        for request_boundary_estimate in [false, true] {
+            let got = run_case(request_boundary_estimate, true);
+            for (a, b) in got.iter().zip(expected.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "terminal SCM post-step hook discarded (boundary={request_boundary_estimate}): got {got:?} vs expected {expected:?}"
+                );
+            }
+        }
     }
 }

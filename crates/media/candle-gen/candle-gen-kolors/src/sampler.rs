@@ -286,6 +286,10 @@ impl<F: KolorsLeadingEulerForward> candle_gen::driver::FamilyDriver<Tensor>
 
 /// Shared execution helper driving [`KolorsLeadingEulerDriver`] through
 /// [`candle_gen::run_candle_driver_slices`] across all six native Candle Kolors routes.
+///
+/// When `run` is `Some`, executes every compiled `denoise_spans()` slice through the shared
+/// driver runner so inert splits (e.g. `RenderPlan::with_inert_split_at`) enter and finish every
+/// compiled phase before `finish_image_denoise_phases()`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_leading_euler<F: KolorsLeadingEulerForward>(
     sampler: &KolorsEulerSampler,
@@ -294,10 +298,11 @@ pub(crate) fn run_leading_euler<F: KolorsLeadingEulerForward>(
     guidance: f32,
     forward: F,
     cancel: &gen_core::runtime::CancelFlag,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
     on_progress: &mut dyn FnMut(Progress),
     preview: &gen_core::PreviewSink,
 ) -> CandleResult<Tensor> {
-    if sampler.num_steps() == 0 {
+    if sampler.num_steps() == 0 && run.is_none() {
         return Ok(latents);
     }
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
@@ -308,7 +313,7 @@ pub(crate) fn run_leading_euler<F: KolorsLeadingEulerForward>(
         guidance,
         forward,
     );
-    let slices = [candle_gen::driver::SliceSpec::full(sampler.num_steps())];
+    let slices = candle_gen::driver::SliceSpec::from_render_run(run, sampler.num_steps());
     let mut observe = |info: &candle_gen::driver::DriverStepInfo, scaled: &Tensor| {
         candle_gen::preview::emit_preview_at(preview, &preview_counter, info.outer_step, || {
             crate::preview::project_spatial_latents(scaled)
@@ -325,7 +330,7 @@ pub(crate) fn run_leading_euler<F: KolorsLeadingEulerForward>(
         sampler.num_steps(),
         0,
         cancel,
-        None,
+        run,
         &mut state,
         &mut hooks,
         |_phase, boundary, _state| Ok(boundary),
@@ -456,5 +461,100 @@ mod tests {
         assert!(report.verified_boundary_estimate_readonly_or_refusal);
         assert!(report.verified_renoise_and_resample_guards);
         assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn native_kolors_planned_inert_split_finishes_every_compiled_phase() {
+        use candle_gen::candle_core::Device;
+
+        struct FakeLinearForward;
+        impl KolorsLeadingEulerForward for FakeLinearForward {
+            fn predict_eps(
+                &self,
+                model_in: &Tensor,
+                timestep: f64,
+                step_index: usize,
+            ) -> CandleResult<Tensor> {
+                let chunks = model_in.chunk(2, 0)?;
+                let uncond = chunks[0].affine(0.03 + 0.0001 * timestep, 0.0)?;
+                let cond =
+                    chunks[1].affine(0.07 + 0.0001 * timestep + 0.005 * step_index as f64, 0.0)?;
+                Ok(Tensor::cat(&[&uncond, &cond], 0)?)
+            }
+        }
+
+        let sampler = KolorsEulerSampler::new(6).unwrap();
+        let init =
+            Tensor::from_vec(vec![0.4f32, -0.3, 0.2, 0.8], (1, 4, 1, 1), &Device::Cpu).unwrap();
+        let cancel = gen_core::runtime::CancelFlag::new();
+        let preview = gen_core::PreviewSink::default();
+
+        let registry = crate::provider_registry().unwrap();
+        let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir("/tmp/kolors".into()));
+        let req = gen_core::GenerationRequest {
+            prompt: "a lantern over water".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(6),
+            guidance: Some(5.0),
+            sampler: Some("euler_discrete".into()),
+            seed: Some(19),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(crate::MODEL_ID, &spec, &req)
+            .expect("compile native kolors render plan")
+            .expect("native kolors produces a RenderPlan")
+            .with_inert_split_at(3)
+            .expect("inert split at step 3");
+        assert_eq!(plan.denoise_spans(), vec![0..3, 3..6]);
+
+        let unsplit = run_leading_euler(
+            &sampler,
+            init.clone(),
+            true,
+            5.0,
+            FakeLinearForward,
+            &cancel,
+            None,
+            &mut |_| {},
+            &preview,
+        )
+        .unwrap();
+
+        let run = gen_core::RenderRun::new(&plan, &cancel, None);
+        run.encode(|| Ok::<_, CandleError>(())).unwrap();
+        run.begin_rendering().unwrap();
+        run.reset_image_denoise_phases();
+        let mut progress_steps = Vec::new();
+        let split = run_leading_euler(
+            &sampler,
+            init,
+            true,
+            5.0,
+            FakeLinearForward,
+            &cancel,
+            Some(&run),
+            &mut |p| {
+                if let Progress::Step { current, total } = p {
+                    progress_steps.push((current, total));
+                }
+            },
+            &preview,
+        )
+        .unwrap();
+        run.finish_image_denoise_phases()
+            .expect("planned inert split must complete every compiled denoise phase");
+        run.finish_rendering();
+
+        assert_eq!(
+            progress_steps,
+            vec![(1, 6), (2, 6), (3, 6), (4, 6), (5, 6), (6, 6)]
+        );
+        assert_eq!(
+            split.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            unsplit.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "planned inert split must be bit-identical to unsplit native Kolors trajectory"
+        );
     }
 }
