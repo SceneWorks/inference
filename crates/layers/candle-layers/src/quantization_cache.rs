@@ -72,25 +72,14 @@ pub fn quantize_cached(src: &Tensor, dtype: GgmlDType, device: &Device) -> Resul
         device,
         "cpu-upload",
         None,
-        || QTensor::quantize_onto(&cpu_quantization_input(src)?, dtype, device),
+        || {
+            QTensor::quantize_onto(
+                &src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?,
+                dtype,
+                device,
+            )
+        },
     )
-}
-
-fn cpu_quantization_input(src: &Tensor) -> Result<Tensor> {
-    let cpu = src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let covers_storage = {
-        let (storage, layout) = cpu.storage_and_layout();
-        let length = match &*storage {
-            candle_core::Storage::Cpu(storage) => storage.as_slice::<f32>()?.len(),
-            _ => 0,
-        };
-        layout.start_offset() == 0 && cpu.is_contiguous() && length == cpu.elem_count()
-    };
-    if covers_storage {
-        Ok(cpu)
-    } else {
-        cpu.force_contiguous()
-    }
 }
 
 fn quantize_with_cache(
@@ -128,7 +117,8 @@ fn quantize_with_cache(
         let cpu = src
             .to_device(&Device::Cpu)?
             .to_dtype(DType::F32)?
-            .flatten_all()?;
+            .flatten_all()?
+            .contiguous()?;
         let (storage, layout) = cpu.storage_and_layout();
         let candle_core::Storage::Cpu(storage) = &*storage else {
             candle_core::bail!("quantization identity requires CPU storage");
@@ -155,7 +145,13 @@ pub fn quantize_on_source_device_cached(src: &Tensor, dtype: GgmlDType) -> Resul
         src.device(),
         "cpu-upload",
         None,
-        || QTensor::quantize_onto(&cpu_quantization_input(src)?, dtype, src.device()),
+        || {
+            QTensor::quantize_onto(
+                &src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?,
+                dtype,
+                src.device(),
+            )
+        },
     )
 }
 
@@ -510,6 +506,49 @@ mod tests {
         );
         assert_eq!(cache.writes.load(Ordering::Relaxed), 2);
         assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn strided_and_broadcast_rank_one_inputs_use_logical_values_without_collisions() -> Result<()> {
+        let contiguous = Tensor::arange(0f32, 64f32, &Device::Cpu)?;
+        let strided = Tensor::arange(0f32, 128f32, &Device::Cpu)?
+            .reshape((64, 2))?
+            .narrow(1, 0, 1)?
+            .squeeze(1)?;
+        let broadcast = Tensor::new(2f32, &Device::Cpu)?.broadcast_as(64)?;
+        let expected = [strided.clone(), broadcast.clone()].map(|value| {
+            data(
+                &QTensor::quantize_onto(
+                    &value.force_contiguous().unwrap(),
+                    GgmlDType::Q8_0,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )
+        });
+        let cache = Cache::new();
+        let _scope = gen_core::QuantizationCacheContext::new(cache.clone()).install();
+        let ordinary = data(&quantize_cached(
+            &contiguous,
+            GgmlDType::Q8_0,
+            &Device::Cpu,
+        )?);
+        for (view, expected) in [strided, broadcast].iter().zip(expected) {
+            let actual = data(&quantize_cached(view, GgmlDType::Q8_0, &Device::Cpu)?);
+            assert_eq!(actual, expected);
+            assert_ne!(actual, ordinary);
+            assert_eq!(
+                data(&quantize_cached(
+                    &view.force_contiguous()?,
+                    GgmlDType::Q8_0,
+                    &Device::Cpu
+                )?),
+                expected
+            );
+        }
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 2);
         Ok(())
     }
 

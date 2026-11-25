@@ -486,6 +486,25 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Quantizers consume storage directly, so compact logical views before passing their backing
+/// buffer to a native kernel. Full contiguous operands keep their existing allocation.
+fn quantization_input(src: &Tensor) -> Result<Tensor> {
+    let flat = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+    let needs_copy = {
+        let (storage, layout) = flat.storage_and_layout();
+        let padded = match &*storage {
+            crate::Storage::Cpu(values) => values.as_slice::<f32>()?.len() != flat.elem_count(),
+            _ => false,
+        };
+        !flat.is_contiguous() || layout.start_offset() != 0 || padded
+    };
+    if needs_copy {
+        flat.force_contiguous()
+    } else {
+        Ok(flat)
+    }
+}
+
 impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
@@ -498,7 +517,7 @@ impl QTensor {
             let shape = src.shape();
             let block_size = dtype.block_size();
             check_shape(shape, block_size)?;
-            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let src = quantization_input(src)?;
             let elem_count = shape.elem_count();
             if !elem_count.is_multiple_of(block_size) {
                 crate::bail!(
@@ -541,7 +560,7 @@ impl QTensor {
                 let shape = src.shape();
                 let block_size = dtype.block_size();
                 check_shape(shape, block_size)?;
-                let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+                let src = quantization_input(src)?;
                 let elem_count = shape.elem_count();
                 if !elem_count.is_multiple_of(block_size) {
                     crate::bail!(
@@ -590,7 +609,7 @@ impl QTensor {
             let shape = src.shape();
             let block_size = dtype.block_size();
             check_shape(shape, block_size)?;
-            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let src = quantization_input(src)?;
             let elem_count = shape.elem_count();
             if !elem_count.is_multiple_of(block_size) {
                 crate::bail!(
@@ -624,7 +643,7 @@ impl QTensor {
             let shape = src.shape();
             let block_size = dtype.block_size();
             check_shape(shape, block_size)?;
-            let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+            let src = quantization_input(src)?;
             let elem_count = shape.elem_count();
             if !elem_count.is_multiple_of(block_size) {
                 crate::bail!(

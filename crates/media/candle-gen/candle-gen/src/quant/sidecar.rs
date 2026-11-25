@@ -127,6 +127,7 @@ fn run_after_source_open_hook() {
 #[derive(Debug)]
 pub struct PackedWeightSidecars {
     entries: HashMap<String, SidecarEntry>,
+    replacement: std::sync::OnceLock<Box<PackedWeightSidecars>>,
     prepared: Vec<PreparedProjection>,
     cache_dir: PathBuf,
     created: usize,
@@ -630,6 +631,7 @@ impl PackedWeightSidecars {
             payload_bytes_hashed,
             sidecar_bytes,
             rebuild: None,
+            replacement: Default::default(),
         };
         write_runtime_index(&cache, packed, base_prefix, &source.source_paths());
         Ok(with_runtime_rebuild(
@@ -648,6 +650,9 @@ impl PackedWeightSidecars {
     /// No source tensor or conversion parameter is accepted here by design: a caller cannot
     /// accidentally put the MLX-affine repack back into a block-window loop.
     pub fn load(&self, base: &str, device: &Device) -> Result<QTensor> {
+        if let Some(cache) = self.replacement.get() {
+            return cache.load(base, device);
+        }
         match self.load_runtime(base, device) {
             Ok(weight) => Ok(weight),
             Err(error) => {
@@ -670,7 +675,9 @@ impl PackedWeightSidecars {
                     rebuild.external.as_deref(),
                     false,
                 )?;
-                cache.load_runtime(base, device)
+                let weight = cache.load_runtime(base, device)?;
+                let _ = self.replacement.set(Box::new(cache));
+                Ok(weight)
             }
         }
     }
@@ -726,6 +733,9 @@ impl PackedWeightSidecars {
     }
 
     pub fn cache_dir(&self) -> &Path {
+        if let Some(cache) = self.replacement.get() {
+            return cache.cache_dir();
+        }
         &self.cache_dir
     }
 
@@ -752,6 +762,9 @@ impl PackedWeightSidecars {
 
     /// The exact content-addressed artifact for `base`, useful to diagnostics and evidence harnesses.
     pub fn path_for(&self, base: &str) -> Option<&Path> {
+        if let Some(cache) = self.replacement.get() {
+            return cache.path_for(base);
+        }
         self.entries.get(base).map(|entry| entry.path.as_path())
     }
 }
@@ -1279,6 +1292,7 @@ fn reused_cache(
         payload_bytes_hashed,
         sidecar_bytes,
         rebuild: None,
+        replacement: Default::default(),
     }
 }
 
@@ -2663,6 +2677,17 @@ mod tests {
         assert_eq!(
             full.load("layers.0.proj", &Device::Cpu)?.data()?.as_ref(),
             expected
+        );
+        assert!(full
+            .path_for("layers.0.proj")
+            .unwrap()
+            .starts_with(external.path()));
+        drop(source);
+        fs::remove_file(&file)?;
+        assert_eq!(
+            full.load("layers.0.proj", &Device::Cpu)?.data()?.as_ref(),
+            expected,
+            "subsequent windows must load the repaired runtime cache without reopening sources"
         );
         let output = external_cache_dir(dir.path(), Some(external.path()))?;
         assert!(output
