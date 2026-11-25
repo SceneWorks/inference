@@ -240,6 +240,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "complete synthetic DiT construction; explicit H3 model-proof workflow"]
     fn runtime_cache_transformer_constructor_reuses_both_video_partitions() -> TestResult<()> {
         use crate::dit::MiniMaxH3Dit;
         let fixture =

@@ -218,6 +218,12 @@ GATED = {
 # on the same manual routes. `filter` is the libtest path prefix; `skip` is the
 # explicit set of ignored non-model bodies sharing that filter (pinned).
 LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
+    ("candle", "weights::tests"): {
+        "file": CANDLE_SRC / "weights.rs",
+        "filter": "weights::tests::",
+        "names": ["runtime_cache_transformer_constructor_reuses_both_video_partitions"],
+        "skip": [],
+    },
     ("mlx", "veda_fixture"): {
         "file": MLX_SRC / "veda_fixture.rs",
         "filter": "veda_fixture::",
@@ -240,6 +246,7 @@ LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
 }
 
 LIB_ROUTES = [
+    ("synthetic-w4a8-cuda", "candle", "weights::tests"),
     ("synthetic-w4a8-mlx", "mlx", "veda_fixture"),
     ("synthetic-w4a8-cuda", "candle", "dit::model::veda_controls_tests"),
 ]
