@@ -33,8 +33,32 @@ pub(crate) fn load_component_weights(
                     || (dtype == DType::F32 && matches!(stored.as_str(), "F16" | "BF16"))
             })
         });
+        // The converter can retain Q8 AdaLN projections inside a Q4 component. The shared
+        // sidecar format currently takes one bit width; keep the existing per-tensor repacker
+        // for those mixed components instead of validating every triple as the tier width.
+        let uniform_bit_width = !matches!(packed.bits, 4 | 8)
+            || packed.group_size <= 0
+            || headers.tensors().iter().all(|(name, scales)| {
+                let Some(base) = name.strip_suffix(".scales") else {
+                    return true;
+                };
+                if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                    return true;
+                }
+                let Ok(weight) = headers.get(&format!("{base}.weight")) else {
+                    return false;
+                };
+                weight
+                    .shape()
+                    .last()
+                    .and_then(|cols| cols.checked_mul((32 / packed.bits) as usize))
+                    == scales
+                        .shape()
+                        .last()
+                        .and_then(|cols| cols.checked_mul(packed.group_size as usize))
+            });
         drop(headers);
-        if has_affine && scale_precision_matches {
+        if has_affine && scale_precision_matches && uniform_bit_width {
             let cancel = crate::block_stream::current()
                 .map(|policy| policy.cancel.clone())
                 .unwrap_or_default();
@@ -275,6 +299,42 @@ mod tests {
             assert_eq!(cache.reused_count(), 1);
             assert_eq!(cache.source_bytes_hashed(), 0);
             assert_eq!(cache.payload_bytes_hashed(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q4_component_preserves_q8_adaln_with_the_per_tensor_repacker() -> TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let file = fixture(dir.path(), 4, 0.0)?;
+        let mut tensors = safetensors::load(&file, &Device::Cpu)?;
+        let base = "transformer_blocks.0.adaln_proj.linear";
+        let dense = Tensor::arange(0f32, 128f32, &Device::Cpu)?.reshape((1, 128))?;
+        let (weight, scales, biases) = pack_mlx_affine(&dense, 8, 64)?;
+        tensors.insert(format!("{base}.weight"), weight);
+        tensors.insert(format!("{base}.scales"), scales);
+        tensors.insert(format!("{base}.biases"), biases);
+        safetensors::save(&tensors, &file)?;
+        let loaded = load_component_weights(
+            dir.path(),
+            std::slice::from_ref(&file),
+            &Device::Cpu,
+            None,
+            &[""],
+        )?;
+        assert!(loaded.packed_sidecars().is_none());
+        let prior = Weights::from_files_native_int8(&[file], &Device::Cpu)?;
+        for (key, expected_dtype) in [
+            (DIT, candle_gen::candle_core::quantized::GgmlDType::Q4_1),
+            (base, candle_gen::candle_core::quantized::GgmlDType::Q8_0),
+        ] {
+            let actual = crate::quant::lin(&loaded, crate::quant::DIT, key, false, DType::F32)?;
+            let expected = crate::quant::lin(&prior, crate::quant::DIT, key, false, DType::F32)?;
+            assert_eq!(
+                actual.linear.base_qlinear().unwrap().quant_dtype(),
+                Some(expected_dtype)
+            );
+            assert_eq!(bytes(&actual.linear), bytes(&expected.linear));
         }
         Ok(())
     }
