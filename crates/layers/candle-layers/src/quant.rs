@@ -512,6 +512,34 @@ impl ComponentFold<'_> {
 }
 
 impl QLinear {
+    /// Weight storage eligible for warm admission credit. Bias and transient allocations
+    /// are excluded. Packed formats without a qualified weight-only allowance get no credit.
+    pub fn resident_weight_bytes(&self) -> usize {
+        let tensor = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        match self {
+            Self::Dense(DenseLinear::Linear(l)) => l.native_resident_bytes().map_or_else(
+                || tensor(l.weight()),
+                |bytes| usize::try_from(bytes).unwrap_or(0),
+            ),
+            Self::Dense(DenseLinear::Transposed { weight_t, .. }) => tensor(weight_t),
+            Self::Quantized {
+                weight: QuantWeight::Dequant(q),
+                ..
+            }
+            | Self::Quantized {
+                weight: QuantWeight::Matmul(QMatMul::QTensor(q)),
+                ..
+            } => q.storage_size_in_bytes(),
+            Self::Quantized {
+                weight: QuantWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)),
+                ..
+            } => tensor(t),
+            Self::W4A8(_) | Self::ConvRot(_) => 0,
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => 0,
+        }
+    }
+
     /// Apply a component's tier to eligible dense leaves. A stored native matrix follows
     /// the target device through its original operator and keeps its source precision.
     pub fn quantize_component(&mut self, quant: Quant, fold: ComponentFold<'_>) -> Result<()> {

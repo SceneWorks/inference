@@ -30,11 +30,11 @@ pub struct MochiConfig {
 impl Default for MochiConfig {
     fn default() -> Self {
         Self {
-            t5_dim: 4096,
+            t5_dim: gen_core_family::mochi::TEXT_EMBED_DIM,
             t5_layers: 24,
             t5_heads: 64,
             t5_head_dim: 64,
-            text_len: 256,
+            text_len: crate::tokenizer::MAX_SEQUENCE_LENGTH,
         }
     }
 }

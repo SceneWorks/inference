@@ -95,6 +95,19 @@ pub fn staged(request: &GenerationRequest) -> bool {
     request.memory.is_some_and(|memory| memory.stage_residency)
 }
 
+/// The configured request may stage a normally resident load. Generation and both
+/// memory guards must account for the expert residency this request will actually use.
+pub(crate) fn effective_offload(
+    load: gen_core::OffloadPolicy,
+    request: &GenerationRequest,
+) -> gen_core::OffloadPolicy {
+    if staged(request) {
+        gen_core::OffloadPolicy::Sequential
+    } else {
+        load
+    }
+}
+
 pub fn decode_tiling(
     request: &GenerationRequest,
     width: u32,

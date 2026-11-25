@@ -1,0 +1,32 @@
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env(FQN, "VIDEO_PAIR")?;
+    assert_eq!(pair.case, "mlx-mochi-masked-euler");
+    let cfg = MochiDitConfig {
+        num_layers: 2,
+        ..Default::default()
+    };
+    let weights = crate::load_transformer_weights(&pair.root)?;
+    assert_eq!(
+        weights.require("patch_embed.proj.weight")?.dtype(),
+        Dtype::Bfloat16
+    );
+    let model = MochiTransformer3DModel::from_weights(&weights, &cfg, Dtype::Bfloat16)?;
+    weights.materialize_accessed()?;
+    let inputs = Weights::from_file(pair.root.join("inputs.safetensors"))?;
+    let (noise, context, mask) = (
+        inputs.require("noise")?,
+        inputs.require("context")?,
+        inputs.require("mask")?,
+    );
+    eval([noise, context, mask])?;
+    let dims = |x: &Array| x.shape().iter().map(|&n| n as usize).collect::<Vec<_>>();
+    let settings = mochi_settings(&cfg, &dims(noise), &dims(context), &f32_values(mask)?);
+    let cancel = CancelFlag::new();
+    measure(&pair, noise, settings, |p| {
+        crate::denoise(
+            &model, noise, context, mask, STEPS, GUIDANCE, SHIFT, &cancel, p,
+        )
+    })
+}

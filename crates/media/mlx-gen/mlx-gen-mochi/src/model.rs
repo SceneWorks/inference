@@ -14,6 +14,9 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
 
+use gen_core_family::mochi::{MochiVideo, LATENT_CHANNELS, MOCHI_SHIFT};
+use mlx_gen::gen_core::MemoryRequestScope;
+use mlx_gen::gen_core::{self, RenderLoadBinding, VideoPlanLayout};
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
@@ -28,7 +31,7 @@ use crate::tokenizer::{load_tokenizer, MochiTokenizer};
 use crate::transformer::{
     load_transformer_weights, MochiDitConfig, MochiQuant, MochiTransformer3DModel,
 };
-use crate::vae::{load_vae_decoder, MochiVaeDecoder};
+use crate::vae::{load_vae_decoder_with_config, MochiVaeDecoder};
 
 /// Public provider id: `"mochi_1"`.
 pub const MODEL_ID: &str = "mochi_1";
@@ -36,20 +39,10 @@ pub const MODEL_ID: &str = "mochi_1";
 /// The request width/height multiple `validate_request` enforces (Mochi's AsymmVAE spatial grid).
 /// Exposed as the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587);
 /// mirrors candle's `candle_gen_mochi::SIZE_MULTIPLE` and `wan::config::SIZE_MULTIPLE_14B`.
-pub const SIZE_MULTIPLE: u32 = 16;
+pub use gen_core_family::mochi::SIZE_MULTIPLE;
 
-/// AsymmVAE latent channels fed to the DiT / seeded as init noise.
-const LATENT_CHANNELS: i32 = 12;
-/// Resolution `shift` for the flow-match schedule — Mochi config `shift = 1.0` (no shift).
-const MOCHI_SHIFT: f32 = 1.0;
-
-// Production defaults when the request leaves a knob unset (the fixture point overrides these).
-/// Diffusers `MochiPipeline` default `num_inference_steps` for the preview.
-const DEFAULT_STEPS: u32 = 64;
 /// Diffusers `MochiPipeline` default `guidance_scale`.
 const DEFAULT_GUIDANCE: f32 = 4.5;
-/// A safe default frame count on the `6·k + 1` lattice (`6·3 + 1`).
-const DEFAULT_FRAMES: u32 = 19;
 /// Mochi renders ~30 fps.
 const DEFAULT_FPS: u32 = 30;
 
@@ -91,6 +84,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// AsymmVAE decoder, all held resident for the whole generation. (Sequential residency is a follow-on;
 /// A4 loads everything up front — the milestone is a working end-to-end path, not a memory-minimal one.)
 pub struct Mochi {
+    load_binding: RenderLoadBinding,
     compute_dtype: Dtype,
     descriptor: ModelDescriptor,
     tokenizer: MochiTokenizer,
@@ -105,6 +99,47 @@ pub struct Mochi {
 /// default) loads the bf16 on-disk shards as-is for the production-speed path; `Fp32` upcasts them to
 /// the parity-verified f32 regime (see `tests/dit_parity.rs`). The AsymmVAE decode stays f32 either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let (root, vae_root, quant, vae_config) = read_layout(spec)?;
+    let te_root = resolve_component_root(&root, "text_encoder");
+    let dit_cfg = MochiDitConfig {
+        quantization: quant,
+        ..Default::default()
+    };
+
+    // DiT compute precision. `Precision::Bf16` (the LoadSpec default) → **bf16** — the reference's
+    // native precision and the Wan/LTX production-speed path; loading the ~10 B-param AsymmDiT at f32
+    // would double its resident weights (~40 GB) and force swap on all but the largest Macs.
+    // `Precision::Fp32` → the f32 high-precision path the parity goldens are captured against. Both are
+    // driven through the same `from_weights(w, cfg, dtype)` seam (every matmul/SDPA casts to `dtype`);
+    // the VAE decode stays f32 in both (a post-sampling quality island — the Wan/LTX stance).
+    let compute_dtype = match spec.precision {
+        Precision::Bf16 => Dtype::Bfloat16,
+        Precision::Fp32 => Dtype::Float32,
+    };
+
+    let tokenizer = load_tokenizer()?;
+    let t5 = load_t5_encoder(&te_root)?;
+    let dit_w = load_transformer_weights(&root)?;
+    let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, compute_dtype)?;
+    // Materialize at load: left lazy, the first denoise step's command buffers wait on the ~20 GB
+    // DiT read — past the GPU watchdog on a cold page cache (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    dit_w.materialize_accessed()?;
+    let vae = load_vae_decoder_with_config(&vae_root, &vae_config)?;
+
+    Ok(Box::new(Mochi {
+        load_binding: RenderLoadBinding::from_video_spec(spec),
+        compute_dtype,
+        descriptor: descriptor(),
+        tokenizer,
+        t5,
+        transformer,
+        vae,
+        vae_config,
+    }))
+}
+
+fn read_layout(spec: &LoadSpec) -> Result<(PathBuf, PathBuf, Option<MochiQuant>, MochiVaeConfig)> {
     let root =
         match &spec.weights {
             WeightsSource::Dir(p) => p.clone(),
@@ -147,44 +182,35 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // tier dir carries only `transformer/` + the manifest. A fully self-contained dir (the raw
     // snapshot) resolves to itself, so the parity suites are unaffected.
     let vae_root = resolve_component_root(&root, "vae");
-    let te_root = resolve_component_root(&root, "text_encoder");
 
     let vae_config = MochiVaeConfig::from_model_dir(&vae_root)?;
-    let dit_cfg = MochiDitConfig {
-        quantization: quant,
-        ..Default::default()
-    };
+    Ok((root, vae_root, quant, vae_config))
+}
 
-    // DiT compute precision. `Precision::Bf16` (the LoadSpec default) → **bf16** — the reference's
-    // native precision and the Wan/LTX production-speed path; loading the ~10 B-param AsymmDiT at f32
-    // would double its resident weights (~40 GB) and force swap on all but the largest Macs.
-    // `Precision::Fp32` → the f32 high-precision path the parity goldens are captured against. Both are
-    // driven through the same `from_weights(w, cfg, dtype)` seam (every matmul/SDPA casts to `dtype`);
-    // the VAE decode stays f32 in both (a post-sampling quality island — the Wan/LTX stance).
-    let compute_dtype = match spec.precision {
-        Precision::Bf16 => Dtype::Bfloat16,
-        Precision::Fp32 => Dtype::Float32,
-    };
+pub(crate) fn compile_video_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<VideoPlanLayout>> {
+    validate_request(&descriptor().capabilities, req)?;
+    let (_, _, _, cfg) = read_layout(spec)?;
+    video_layout(req, &cfg).map(Some)
+}
 
-    let tokenizer = load_tokenizer()?;
-    let t5 = load_t5_encoder(&te_root)?;
-    let dit_w = load_transformer_weights(&root)?;
-    let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, compute_dtype)?;
-    // Materialize at load: left lazy, the first denoise step's command buffers wait on the ~20 GB
-    // DiT read — past the GPU watchdog on a cold page cache (sc-24245; see
-    // `mlx_gen_qwen_image::loader::load_transformer_with`).
-    dit_w.materialize_accessed()?;
-    let vae = load_vae_decoder(&vae_root)?;
-
-    Ok(Box::new(Mochi {
-        compute_dtype,
-        descriptor: descriptor(),
-        tokenizer,
-        t5,
-        transformer,
-        vae,
-        vae_config,
-    }))
+fn video_layout(
+    req: &GenerationRequest,
+    cfg: &MochiVaeConfig,
+) -> gen_core::Result<VideoPlanLayout> {
+    let video = MochiVideo::new(
+        req,
+        &cfg.temporal_expansions,
+        &cfg.spatial_expansions,
+        req.seed.unwrap_or_default(),
+    )?;
+    video.layout(
+        crate::DEFAULT_DECODE_CHUNK_FRAMES,
+        gen_core_family::mochi::MochiDecoder::Mlx,
+        gen_core::MemoryBudgetDomain::UnifiedMemory,
+    )
 }
 
 /// Resolve the directory that actually holds a shared component (`vae` / `text_encoder`): the tier
@@ -206,25 +232,7 @@ fn resolve_component_root(root: &Path, component: &str) -> PathBuf {
 /// negative/guidance/true_cfg gating, sampler/scheduler membership, conditioning allowlist) plus the
 /// model-specific constraints — non-empty prompt, 16-divisible width/height, and `num_frames = 1 + 6·k`.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
-    if req.prompt.is_empty() {
-        return Err(Error::Msg("mochi_1: prompt must not be empty".into()));
-    }
-    caps.validate_request(MODEL_ID, req)?;
-    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-        return Err(Error::Msg(format!(
-            "mochi_1: width/height must be divisible by {SIZE_MULTIPLE} (got {}x{})",
-            req.width, req.height
-        )));
-    }
-    if let Some(frames) = req.frames {
-        // The AsymmVAE has a 6× temporal ratio, so a valid clip length is `1 + 6·k` latent-aligned.
-        if frames % 6 != 1 {
-            return Err(Error::Msg(format!(
-                "mochi_1: num_frames must be 1 + 6·k (got {frames})"
-            )));
-        }
-    }
-    Ok(())
+    gen_core_family::mochi::validate_request(caps, req).map_err(Into::into)
 }
 
 impl Mochi {
@@ -235,6 +243,7 @@ impl Mochi {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
@@ -243,9 +252,20 @@ impl Mochi {
             return Err(Error::Canceled);
         }
 
+        let seed = req.seed.unwrap_or_else(default_seed);
+        let video = MochiVideo::new(
+            req,
+            &self.vae_config.temporal_expansions,
+            &self.vae_config.spatial_expansions,
+            seed,
+        )?;
+        let phase = &video.phase;
+        let active = phase.enter(&req.cancel, scope)?;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch (the
         // reference encodes the negative prompt, or "" when unset, with `do_classifier_free_guidance`).
-        let (_pos, _neg, enc, enc_mask) = mlx_gen::gen_core::with_prompt_encoding(
+        let (pos, neg, enc, enc_mask) = mlx_gen::gen_core::with_prompt_encoding(
             on_progress,
             || -> std::result::Result<_, mlx_gen::Error> {
                 let pos = encode_prompt(&self.tokenizer, &self.t5, &req.prompt)?;
@@ -259,21 +279,9 @@ impl Mochi {
                 Ok((pos, neg, enc, enc_mask))
             },
         )?;
-        // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
-        // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
-        let t_ratio = self.vae_config.temporal_compression_ratio() as u32;
-        let s_ratio = self.vae_config.spatial_compression_ratio() as u32;
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let lf = 1 + (frames - 1) / t_ratio;
-        let lh = req.height / s_ratio;
-        let lw = req.width / s_ratio;
-
         // Seeded init noise. FlowMatchEuler `init_noise_sigma = 1`, so the seeded standard-normal latent
         // is used unscaled (RNG is not portable to the reference; the e2e parity gate teacher-forces the
         // init latents instead of matching MLX's RNG).
-        let seed = req.seed.unwrap_or_else(default_seed);
         let key = random::key(seed)?;
         mlx_gen::video_execution::policy(
             "mochi_precision",
@@ -281,26 +289,35 @@ impl Mochi {
         );
         mlx_gen::video_execution::draw(0, "mochi_initial_normal", seed);
         let init = random::normal::<f32>(
-            &[1, LATENT_CHANNELS, lf as i32, lh as i32, lw as i32],
+            &[
+                1,
+                LATENT_CHANNELS as i32,
+                phase.latent_frames as i32,
+                video.latent_height as i32,
+                video.latent_width as i32,
+            ],
             None,
             None,
             Some(&key),
         )?;
 
-        let latents = crate::pipeline::denoise(
+        let latents = crate::pipeline::denoise_schedule(
             &self.transformer,
             &init,
             &enc,
             &enc_mask,
-            steps,
+            &phase.sigmas,
             guidance,
             MOCHI_SHIFT,
             &req.cancel,
             on_progress,
         )?;
 
+        drop((pos, neg, enc, enc_mask, init));
+        active.finish()?;
         on_progress(Progress::Decoding);
         let frames_arr = crate::pipeline::decode_to_frames(&self.vae, &latents, &req.cancel)?;
+        drop(latents);
         let images: Vec<Image> = crate::pipeline::frames_to_images(&frames_arr)?;
         Ok(GenerationOutput::Video {
             frames: images,
@@ -310,27 +327,41 @@ impl Mochi {
     }
 }
 
-impl Mochi {
-    fn generate_execution_attempt(
-        &self,
-        req: &mlx_gen::GenerationRequest,
-        on_progress: &mut dyn FnMut(mlx_gen::Progress),
-    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
 impl mlx_gen::Generator for Mochi {
+    fn video_load_binding(&self) -> Option<&RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        self.validate(req)?;
+        gen_core_family::mochi::check_layout(plan, &video_layout(req, &self.vae_config)?)
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_impl(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
+            .map_err(Into::into)
         })
     }
 
@@ -347,7 +378,8 @@ impl mlx_gen::Generator for Mochi {
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_impl(req, None, on_progress)
+                .map_err(Into::into)
         })
     }
 }

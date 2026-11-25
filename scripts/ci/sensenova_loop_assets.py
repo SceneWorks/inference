@@ -12,12 +12,16 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from scripts.ci.model_inference_proofs import repository_identity
-from scripts.ci.model_proof_resources import execution_claim, shared_owned_completion
+from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, CudaClaimRejected, choose_card,
+                                              claim_chosen_card, record_selection_refusal,
+                                              executed_card_policy, execution_claim, require_claimed_card,
+                                              shared_owned_completion)
 from scripts.ci.sensenova_loop_reference import validate_cuda_witness
 from scripts.media_campaign_supervisor import (
     SupervisionError, canonical, load_policy, run_guarded, validate_admission,
@@ -116,19 +120,57 @@ def offline_environment() -> dict[str, str]:
     return env
 
 
-def guarded(argv, backend, policy, work, env, *, label):
+def refused_selection_kept(path, select):
+    """Run a card selection; when no card fits before the deadline, keep the refusal (its per-card
+    reasons) in the stage report as an unsuccessful receipt before failing the stage."""
+    try:
+        return select()
+    except CudaClaimRejected as error:
+        record = {}
+        if record_selection_refusal(record, error):
+            write(path, {"accepted": False, "failure": str(error), **record})
+        raise
+
+
+def registered_index(uuid):
+    """The physical index the claim binds for a registered card; any other card is refused."""
+    if uuid not in REGISTERED_CUDA_CARDS:
+        raise ValueError(f"SenseNova CUDA policy names unregistered card {uuid}")
+    return REGISTERED_CUDA_CARDS[uuid]
+
+
+def guarded(argv, backend, policy, work, env, *, label, request_payload=None, selection=None, record=None,
+            deadline_monotonic=None):
+    """Run one stage under its claim. A card-free request (`selection`) whose card is taken before
+    the claim switches to the other registered card when that fits now; `record` then holds the
+    new `cuda_card_selection`. `argv` may be a function of the policy of the card in force."""
     cuda = backend == "candle-cuda"
-    constraints = {}
+    bound = {"policy": policy}
+
+    def bind(chosen):
+        path = work / f"{label}-policy.json"
+        write(path, chosen)
+        bound["policy"] = load_policy(path)
+        if cuda:
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            env["CUDA_VISIBLE_DEVICES"] = bound["policy"].cuda_device_uuid
+
     if cuda:
+        registered_index(policy.cuda_device_uuid)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = policy.cuda_device_uuid
-        # Both Windows real-weights listeners share this host. Keep GPU 0 free for its other lane.
-        constraints["required_cuda_physical_index"] = 1
+    payload = json.loads(policy.canonical_bytes)
     primary = None
     release_error = None
+    claim = {}
     try:
-        with execution_claim(backend, policy, work, env, constraints=constraints,
-                             require_owned_completion=cuda) as claim:
+        # The claim binds the registered physical index of the card the policy names or selected.
+        with claim_chosen_card(backend, request_payload or payload, payload, selection if cuda else None, work, env,
+                               claim_policy=lambda chosen: bound["policy"], rebind=bind, record=record,
+                               constraints=(lambda chosen: {"required_cuda_physical_index": registered_index(chosen["cudaDeviceUuid"])})
+                               if cuda else {}, claim_with=execution_claim, require_owned_completion=cuda,
+                               **({"original_deadline_monotonic": deadline_monotonic} if deadline_monotonic else {})) as claim:
+            policy = bound["policy"]
             kwargs = {}
             if cuda:
                 kwargs = {"retain_owned_completion": True,
@@ -140,7 +182,7 @@ def guarded(argv, backend, policy, work, env, *, label):
                 # samples. The existing device free/reserve watchdog remains active. The
                 # reference additionally requires its own CUDA allocator/identity receipt.
                 result = run_guarded(
-                    argv, cwd=ROOT, env=env, policy=policy, stdout_path=work / f"{label}.stdout.log",
+                    argv(policy) if callable(argv) else argv, cwd=ROOT, env=env, policy=policy, stdout_path=work / f"{label}.stdout.log",
                     stderr_path=work / f"{label}.stderr.log", event_path=work / f"{label}.events.jsonl",
                     require_gpu_sample=False, **kwargs,
                 )
@@ -183,14 +225,14 @@ def reference_measurements(payload, policy_data, supervision):
     cap = policy_data["childGpuCapBytes"]
     validate_cuda_witness(witness, expected_uuid, cap)
     claim, process = supervision["device_claim"], supervision["process"]
-    if (claim["device_uuid"] != expected_uuid or claim["physical_index"] != 1
+    if (claim["device_uuid"] != expected_uuid or claim["physical_index"] != REGISTERED_CUDA_CARDS.get(expected_uuid)
             or claim["lease_released"] is not True or claim["post_execution_verified"] is not True
             or not shared_owned_completion(claim)
             or claim["owned_execution_completion"] != process["owned_completion"]
             or process["owned_completion"].get("root_returncode") != 0
             or process["owned_completion"].get("root_pid") != process["pid"]
             or process["returncode"] != 0):
-        raise ValueError("reference lacks a successful exact GPU1 claim and owned Windows Job exit")
+        raise ValueError("reference lacks a successful exact registered-GPU claim and owned Windows Job exit")
     policy_sha = hashlib.sha256(canonical(policy_data)).hexdigest()
     admission = validate_admission(process["admission"], policy_sha256=policy_sha)
     reserve = policy_data["gpuFreeReserveBytes"]
@@ -217,7 +259,12 @@ def reference_measurements(payload, policy_data, supervision):
 
 
 def reference(args, source, source_sha, snapshot, work, report, request):
-    policy_data = request["sensenova_reference_policy"]
+    # A reference policy that names no card runs on the registered card with the most free memory that
+    # fits; selection and claim share one wait budget.
+    deadline = time.monotonic() + request["sensenova_reference_policy"]["deadlineSeconds"]
+    policy_data, selection = refused_selection_kept(
+        report / "reference-card-refusal.json",
+        lambda: choose_card(request["sensenova_reference_policy"], work, deadline_monotonic=deadline))
     path = work / "reference-policy.json"
     write(path, policy_data)
     policy = load_policy(path)
@@ -231,16 +278,22 @@ def reference(args, source, source_sha, snapshot, work, report, request):
     env["HF_MODULES_CACHE"] = str(work / "reference-modules")
     oracle = report / "oracle.json"
     reference_python = args.reference_python.resolve(strict=True)
+    record = {} if selection is None else {"cuda_card_selection": selection}
     receipt = guarded(
-        [str(reference_python), "-I", str(ROOT / "scripts/ci/sensenova_loop_reference.py"),
-         str(snapshot), source_sha, str(oracle), policy.cuda_device_uuid, str(policy.child_gpu_cap_bytes)],
+        lambda held: [str(reference_python), "-I", str(ROOT / "scripts/ci/sensenova_loop_reference.py"),
+                      str(snapshot), source_sha, str(oracle), held.cuda_device_uuid, str(held.child_gpu_cap_bytes)],
         "candle-cuda", policy, work, env, label="reference",
+        request_payload=request["sensenova_reference_policy"], selection=selection, record=record,
+        deadline_monotonic=deadline if selection is not None else None,
     )
+    selection = record.get("cuda_card_selection")
+    policy_data = executed_card_policy(request["sensenova_reference_policy"], selection)
     measurements = reference_measurements(json.loads(oracle.read_bytes()), policy_data, receipt)
     write(report / "reference.json", {
         "source_sha": args.expected_sha, "source_manifest_sha256": source_sha,
         "revision": source["revision"], "oracle_sha256": digest(oracle),
-        "policy": policy_data, "supervision": receipt, "cuda_measurements": measurements,
+        "policy": request["sensenova_reference_policy"], "supervision": receipt, "cuda_measurements": measurements,
+        **({"cuda_card_selection": selection} if selection is not None else {}),
     })
 
 
@@ -258,7 +311,8 @@ def native(args, source, source_sha, snapshot, work, report, request):
         1, source["revision"], source_sha
     ):
         raise ValueError("oracle payload identifies different model bytes")
-    if reference_measurements(payload, reference_receipt["policy"], reference_receipt["supervision"]) != reference_receipt["cuda_measurements"]:
+    executed = executed_card_policy(reference_receipt["policy"], reference_receipt.get("cuda_card_selection"))
+    if reference_measurements(payload, executed, reference_receipt["supervision"]) != reference_receipt["cuda_measurements"]:
         raise ValueError("reference CUDA measurements differ from the exact oracle and physical lease")
     if shutil.disk_usage(work).free < 36 * GIB:
         raise RuntimeError("need at least 36 GiB of free temporary space for native q8/q4 and build inputs")
@@ -270,14 +324,27 @@ def native(args, source, source_sha, snapshot, work, report, request):
     subprocess.run(["cargo", "build", "--locked", "--release", "-p", package, "--example", "prepare_snapshot"],
                    cwd=ROOT, env=env, check=True, timeout=2700)
     exe = target / "release/examples" / ("prepare_snapshot.exe" if os.name == "nt" else "prepare_snapshot")
+    native_deadline = time.monotonic() + request["policy"]["deadlineSeconds"]
+    native_policy, native_selection = refused_selection_kept(
+        report / "native-card-refusal.json",
+        lambda: choose_card(request["policy"], work, deadline_monotonic=native_deadline))
     policy_path = work / "native-policy.json"
-    write(policy_path, request["policy"])
+    write(policy_path, native_policy)
     policy = load_policy(policy_path)
     tiers = {}
+    native_record = {} if native_selection is None else {"cuda_card_selection": native_selection}
     for tier in ("q8", "q4"):
         directory = work / tier
+        # Only the first tier may switch a taken card; the second runs on the card the first used.
         supervision = guarded([str(exe), str(snapshot), str(directory), tier], backend, policy, work, env,
-                              label=tier)
+                              label=tier, request_payload=request["policy"],
+                              selection=native_record.get("cuda_card_selection") if tier == "q8" else None,
+                              record=native_record,
+                              deadline_monotonic=native_deadline if tier == "q8" and native_selection is not None else None)
+        if tier == "q8" and backend == "candle-cuda" and "cuda_card_selection" in native_record:
+            native_policy = executed_card_policy(request["policy"], native_record["cuda_card_selection"])
+            write(policy_path, native_policy)
+            policy = load_policy(policy_path)
         lines = (work / f"{tier}.stdout.log").read_text(encoding="utf-8").splitlines()
         conversion = json.loads(lines[-1])
         config = json.loads((directory / "config.json").read_bytes())
@@ -292,6 +359,7 @@ def native(args, source, source_sha, snapshot, work, report, request):
         "source": repository_identity(args.expected_sha), "backend": backend,
         "hf_revision": source["revision"], "source_manifest_sha256": source_sha,
         "oracle_sha256": digest(oracle), "tiers": tiers,
+        **native_record,
     })
     variables = {
         "SENSENOVA_LOOP_BF16_SNAPSHOT": snapshot,

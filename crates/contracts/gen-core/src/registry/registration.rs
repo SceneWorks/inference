@@ -243,6 +243,19 @@ pub struct ImportedModelCompatibilityProjectionRegistration {
     pub family: &'static str,
 }
 
+/// Reuse a built-in provider with an authenticated replacement for one component.
+/// The ordinary snapshot still owns config and companion assets. The replacement is
+/// passed through `LoadSpec::with_checkpoint_component`, so file pinning, cache identity,
+/// and source-inventory checks use the same machinery as other named components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointLoaderReuseRegistration {
+    pub provider_id: &'static str,
+    pub component_role: &'static str,
+    pub base_component_role: &'static str,
+    /// Source codecs exercised by this provider's replacement-component loader.
+    pub supported_source_codecs: &'static [&'static str],
+}
+
 /// The complete portable checkpoint-adapter authority for one model family.
 ///
 /// Platform catalogs register this metadata together with only the bindings they actually ship.
@@ -251,6 +264,7 @@ pub struct ImportedModelCompatibilityProjectionRegistration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointAdapterRegistration {
     pub adapter_id: &'static str,
+    pub loader_reuse: Option<CheckpointLoaderReuseRegistration>,
     pub family: &'static str,
     pub compatibility_projection: ImportedModelCompatibilityProjectionRegistration,
     pub signatures: &'static [CheckpointSignatureRegistration],
@@ -272,6 +286,7 @@ impl CheckpointAdapterRegistration {
     /// asymmetric between MLX and Candle, while every other field remains shared family authority.
     pub fn has_same_portable_metadata(&self, other: &Self) -> bool {
         self.adapter_id == other.adapter_id
+            && self.loader_reuse == other.loader_reuse
             && self.family == other.family
             && self.compatibility_projection == other.compatibility_projection
             && self.signatures == other.signatures

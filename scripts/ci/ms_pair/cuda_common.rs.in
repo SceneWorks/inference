@@ -1,0 +1,42 @@
+use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+use candle_gen::gen_core::{CancelFlag, Progress};
+
+const FQN: &str = "video_pair_fixture::curated_tier1";
+
+fn f32_values(x: &Tensor) -> ProofResult<Vec<f32>> {
+    assert_eq!(x.dtype(), DType::F32);
+    assert!(x.device().is_cuda());
+    Ok(x.flatten_all()?.to_vec1::<f32>()?)
+}
+
+fn measure(
+    pair: &Pair,
+    initial: &Tensor,
+    settings: Value,
+    mut denoise: impl FnMut(&mut dyn FnMut(Progress)) -> candle_gen::Result<Tensor>,
+) -> ProofResult<()> {
+    let device = initial.device();
+    pair.measure(
+        f32_values(initial)?,
+        settings,
+        || {
+            let mut trace = Vec::new();
+            let mut progress = |p| {
+                if let Progress::Step { current, total } = p {
+                    trace.push(step(current, total));
+                }
+            };
+            device.synchronize()?;
+            let start = Instant::now();
+            let latent = denoise(&mut progress)?;
+            device.synchronize()?;
+            let elapsed = start.elapsed().as_nanos().try_into()?;
+            assert_eq!(latent.dims(), initial.dims());
+            Ok((elapsed, trace, latent.dims().to_vec(), f32_values(&latent)?))
+        },
+        || pool_proof(pair),
+    )?;
+    println!("\nMODEL_INFERENCE_DEVICE {FQN} candle-cuda");
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_pair_fixture::curated_tier1");
+    Ok(())
+}

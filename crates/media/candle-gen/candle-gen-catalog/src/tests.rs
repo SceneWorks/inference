@@ -156,6 +156,7 @@ fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bin
     let expected = [
         &FLUX2_CHECKPOINT_ADAPTER,
         &KREA_2_CHECKPOINT_ADAPTER,
+        &candle_gen::gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER,
         &QWEN_IMAGE_CHECKPOINT_ADAPTER,
         &SDXL_CHECKPOINT_ADAPTER,
         // The Wan 2.2 ComfyUI expert pair (sc-20644). Registering it widened this frozen
@@ -282,6 +283,14 @@ fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bin
             provider_id: candle_gen_krea::KREA_2_RAW_ID,
             required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
             inherit_adapters: true,
+        },
+        ImportedModelRegistration {
+            family: "moss-image",
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "moss_image_base",
+            required_components: None,
+            inherit_adapters: false,
         },
         ImportedModelRegistration {
             family: "qwen-image",

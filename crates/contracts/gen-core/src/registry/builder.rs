@@ -9,6 +9,7 @@ use super::*;
 pub struct ProviderRegistryBuilder {
     pub(super) generators: Vec<ModelRegistration>,
     pub(super) render_plans: Vec<crate::RenderPlanRegistration>,
+    pub(super) video_plans: Vec<crate::VideoPlanRegistration>,
     pub(super) feature_routes: Vec<FeatureRouteRegistration>,
     pub(super) checkpoint_adapters: Vec<CheckpointAdapterRegistration>,
     pub(super) checkpoint_codecs: Vec<CheckpointCodecRegistration>,
@@ -241,6 +242,35 @@ pub(super) fn validate_checkpoint_adapters(
                 return Err(Error::Msg(format!(
                     "checkpoint-adapter '{}' repeats a compatible base family for role '{}'",
                     adapter.adapter_id, base.component_role
+                )));
+            }
+        }
+
+        if let Some(reuse) = adapter.loader_reuse {
+            if !is_registry_ident(reuse.provider_id)
+                || !component_roles.contains(reuse.component_role)
+                || !base_roles.contains(reuse.base_component_role)
+                || reuse.component_role == reuse.base_component_role
+                || reuse.supported_source_codecs.is_empty()
+                || reuse
+                    .supported_source_codecs
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != reuse.supported_source_codecs.len()
+                || reuse.supported_source_codecs.iter().any(|id| {
+                    !crate::checkpoint_codec::BASELINE_CHECKPOINT_CODECS
+                        .iter()
+                        .any(|codec| codec.codec_id == *id)
+                })
+                || adapter
+                    .backend_bindings
+                    .iter()
+                    .any(|binding| binding.provider_id != reuse.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has invalid loader reuse metadata",
+                    adapter.adapter_id
                 )));
             }
         }
@@ -486,6 +516,11 @@ impl ProviderRegistryBuilder {
         crate::RenderPlanRegistration
     );
     builder_registration_method!(
+        register_video_plan,
+        video_plans,
+        crate::VideoPlanRegistration
+    );
+    builder_registration_method!(
         register_feature_route,
         feature_routes,
         FeatureRouteRegistration
@@ -625,16 +660,21 @@ impl ProviderRegistryBuilder {
         }
         ensure_unique!(generators, "generator");
         let mut plan_ids = std::collections::BTreeSet::new();
-        for planner in &self.render_plans {
-            if !plan_ids.insert(planner.provider_id)
+        for provider_id in self
+            .render_plans
+            .iter()
+            .map(|p| p.provider_id)
+            .chain(self.video_plans.iter().map(|p| p.provider_id))
+        {
+            if !plan_ids.insert(provider_id)
                 || !self
                     .generators
                     .iter()
-                    .any(|provider| (provider.descriptor)().id == planner.provider_id)
+                    .any(|provider| (provider.descriptor)().id == provider_id)
             {
                 return Err(Error::Msg(format!(
                     "duplicate or unbound render-plan registration for {}",
-                    planner.provider_id
+                    provider_id
                 )));
             }
         }
@@ -872,6 +912,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             render_plans: self.render_plans.into_boxed_slice(),
+            video_plans: self.video_plans.into_boxed_slice(),
             feature_routes: self.feature_routes.into_boxed_slice(),
             checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
             checkpoint_codecs,

@@ -35,6 +35,25 @@ class ComparisonContract(unittest.TestCase):
                                  'deadlineSeconds':plan['case_deadline_seconds']},
                       'training_comparison': {k: plan[k] for k in ('protocol', 'stages', 'max_physical_updates')}}
 
+    def test_a_card_free_comparison_runs_the_registered_recipe_of_the_card_it_selects(self):
+        base, named = self.request()
+        free = dict(named, configuration=comparison.CARD_FREE_RECIPE,
+                    policy={k: v for k, v in named['policy'].items() if k != 'cudaDeviceUuid'})
+        self.assertTrue(comparison.is_card_free(free))
+        self.assertFalse(comparison.is_card_free(named))
+        self.assertEqual(comparison.planning_configuration(free), 'fixed_cuda_comparison_gpu0')
+        plan = comparison.validate_request((base,), free, 'candle-cuda')
+        self.assertEqual((plan['cuda_uuid'], plan['physical_index']), (None, None))
+        gpu1_uuid = comparison.DEVICES['gpu1'][0]
+        concrete = comparison.concrete_request(free, gpu1_uuid)
+        gpu1 = proof.configured_case(self.cases['sdxl'], 'fixed_cuda_comparison_gpu1')
+        self.assertEqual((concrete['configuration'], concrete['policy']['cudaDeviceUuid']),
+                         ('fixed_cuda_comparison_gpu1', gpu1_uuid))
+        self.assertEqual(comparison.validate_request((gpu1,), concrete, 'candle-cuda')['cuda_uuid'], gpu1_uuid)
+        # A card-free configuration with a named card, or a named configuration without one, is refused.
+        with self.assertRaises(ValueError):
+            comparison.validate_request((base,), dict(free, policy=named['policy']), 'candle-cuda')
+
     def fixture(self, row):
         plan = comparison.spec(row)
         stage, n, warm = row['training_comparison_stage'], plan['updates_per_stage'], plan['warmups_per_stage']
@@ -378,6 +397,74 @@ class ComparisonContract(unittest.TestCase):
             if inspect is not None:
                 inspect(root,value,base,receipt)
             return code,receipt,observed
+
+    def test_a_card_free_comparison_switches_cards_when_its_first_stage_card_is_taken(self):
+        from scripts.ci import model_proof_resources as resources
+        base, named = self.request()
+        named['policy'].update(pollMillis=100, termGraceMillis=100)
+        free = dict(named, configuration=comparison.CARD_FREE_RECIPE,
+                    policy={k: v for k, v in named['policy'].items() if k != 'cudaDeviceUuid'})
+        gpu0, gpu1 = comparison.DEVICES['gpu0'][0], comparison.DEVICES['gpu1'][0]
+        first = {'rule': resources.CARD_SELECTION_RULE, 'chosen_uuid': gpu0}
+        second = {'rule': resources.CARD_SELECTION_RULE, 'chosen_uuid': gpu1, 'superseded': [{'left_uuid': gpu0}]}
+        rows = {uuid: (proof.configured_case(self.cases['sdxl'], comparison.recipe_for(uuid)),) for uuid in (gpu0, gpu1)}
+        calls = []
+
+        def native_mock(rows_, backend, child, expected, destination, *, comparison_work,
+                        comparison_deadline_monotonic, abandon_wait=None):
+            calls.append((child['configuration'], child['policy']['cudaDeviceUuid'], abandon_wait is not None))
+            destination.mkdir(parents=True)
+            comparison_work.mkdir(parents=True)
+            # apply_stage makes the stage's owned runtime directory before the claim; a rerun after a
+            # switch makes it again (exist_ok=False), which fails unless the switch reset it.
+            (runtime_parent / ('comparison-' + rows_[0]['training_comparison_stage'])).mkdir(exist_ok=False)
+            if len(calls) == 1:
+                raise resources.CudaCardTaken({'abandoned_wait': 'lock held'})
+            raise ValueError('MOCK stage stops after the switch')
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'proof'
+            runtime_parent = Path(directory) / 'runtime'
+            runtime_parent.mkdir()
+            (runtime_parent / '.sc-26850-owned-runtime').write_text('owned', encoding='utf-8')
+            with patch.dict(os.environ, {'RUNNER_TEMP': directory, 'BESPOKE_RUNTIME_DIR': str(runtime_parent)}), \
+                    patch.object(proof, 'repository_identity', return_value={'revision': 'f' * 40}), \
+                    patch.object(proof, 'run', side_effect=native_mock), \
+                    patch.object(resources, 'choose_card', return_value=(dict(free['policy'], cudaDeviceUuid=gpu0), first)), \
+                    patch.object(resources, 'card_switcher', return_value=(lambda reason: True, {'selection': second})):
+                comparison.run(rows[gpu0], 'candle-cuda', free, 'f' * 40, root, rows_for=rows.__getitem__)
+            receipt = json.loads((root / 'receipt.json').read_text(encoding='utf-8'))
+        # The taken GPU 0 stage never started; the stage reran under GPU 1's recipe.
+        self.assertEqual(calls[0], ('fixed_cuda_comparison_gpu0', gpu0, True))
+        self.assertEqual(calls[1][:2], ('fixed_cuda_comparison_gpu1', gpu1))
+        # The rerun reached its stage (and its mock stop) instead of FileExistsError on the runtime.
+        self.assertIn('MOCK stage stops after the switch', receipt['error'])
+        self.assertEqual(receipt['cuda_card_selection'], second)
+        self.assertEqual(receipt['request'], free)
+
+    def test_a_card_free_comparison_with_no_card_fitting_publishes_a_verifiable_refusal(self):
+        from scripts.ci import model_proof_resources as resources
+        base, named = self.request()
+        named['policy'].update(pollMillis=100, termGraceMillis=100)
+        free = dict(named, configuration=comparison.CARD_FREE_RECIPE,
+                    policy={k: v for k, v in named['policy'].items() if k != 'cudaDeviceUuid'})
+        refusal = {'rule': resources.CARD_SELECTION_RULE, 'polls': 5, 'admission_error': 'none fits',
+                   'cards': [{'uuid': uuid, 'index': index, 'refusal': '1 MiB free < 93 GiB required'}
+                             for uuid, index in resources.REGISTERED_CUDA_CARDS.items()]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'proof'
+            with patch.dict(os.environ, {'RUNNER_TEMP': directory}), \
+                    patch.object(proof, 'repository_identity', return_value={'revision': 'f' * 40}), \
+                    patch.object(proof, 'run') as stage, \
+                    patch.object(resources, 'choose_card', side_effect=resources.CudaClaimRejected(refusal)):
+                code = comparison.run((base,), 'candle-cuda', free, 'f' * 40, root, rows_for=lambda uuid: (base,))
+                verified = comparison.verify_artifacts(root, Path(directory), free, 'f' * 40, (base,), 'candle-cuda',
+                                                       rows_for=lambda uuid: (base,))
+            stage.assert_not_called()
+            receipt = json.loads((root / 'receipt.json').read_text(encoding='utf-8'))
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt[resources.SELECTION_REFUSAL], refusal)
+        self.assertFalse(verified['accepted'])
 
     def test_driver_one_fresh_namespace_each_stage_same_original_deadline(self):
         code,receipt,observed=self.mocked_driver()

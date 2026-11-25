@@ -22,7 +22,10 @@ from scripts.ci import stage_pinned_hub_snapshots as hub_snapshots
 from scripts.ci.flux1_conditional_asset_inventory import confined, fetch_pinned
 from scripts.ci.flux1_pair import evidence, fixture, overlay, performance
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
-from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
+from scripts.ci.model_proof_resources import (CudaClaimRejected, CudaReleaseRejected, choose_card,
+                                              claim_chosen_card, executed_card_policy, execution_claim,
+                                              planned_card_policy, record_selection_refusal,
+                                              require_claimed_card, SELECTION_REFUSAL)
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
@@ -114,7 +117,7 @@ def plan(backend, value, head, tier):
         raise ValueError("resource policy differs from lane")
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.json"
-        write(path, value["policy"])
+        write(path, planned_card_policy(value["policy"]))
         policy = load_policy(path)
         deadline = performance.MAX_CHILD_SECONDS if measured else 1200
         if policy.deadline_seconds > deadline or policy.child_footprint_cap_bytes > 24 * 1024**3:
@@ -275,10 +278,10 @@ def retained_phase_limits(phase, policy):
     return limits
 
 
-def retain_logs(work, artifact, receipt):
+def retain_logs(work, artifact, receipt, phases=None):
     records = receipt["logs"]
     errors = []
-    for phase in phase_names(receipt["tier"]):
+    for phase in phase_names(receipt["tier"]) if phases is None else phases:
         limits = retained_phase_limits(phase, receipt["request"]["policy"])
         for suffix, cap in limits.items():
             source = work / phase / suffix
@@ -297,7 +300,8 @@ def retain_logs(work, artifact, receipt):
 
 
 def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, measure=False, last_child_start=None,
-           retain_windows_footprint=False):
+           arguments=(), capture_cuda_basis=False, dedicated_adapter=None, observer=None, retain_owned_completion=False,
+           completion_claim=None, retain_windows_footprint=False, admission_estimate=None):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -307,20 +311,29 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
         env["SCENEWORKS_METAL_EXECUTION_LOCK_FD"] = fd
         fds = (int(fd),)
     stderr_path = out / "stderr.log"
+    cuda_probe = (PairCudaProbe(policy, out / "cuda-pool.json", dedicated_adapter=dedicated_adapter,
+                                retain_windows_footprint=retain_windows_footprint)
+                  if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
+    probe = cuda_probe if observer is None else observer(cuda_probe, policy)
     try:
         mode = ["--preflight"] if preflight else ["--measure"] if measure else []
-        cuda_probe = (PairCudaProbe(policy, out / "cuda-pool.json", retain_windows_footprint=retain_windows_footprint)
-                      if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
-        guard = run_guarded([str(binary), *mode],
+        guard = run_guarded([str(binary), *mode, *arguments],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
-                            probe=cuda_probe)
+                            probe=probe, retain_owned_completion=retain_owned_completion or completion_claim is not None,
+                            claim_deadline_monotonic=completion_claim["claim_deadline_monotonic"] if completion_claim is not None else None,
+                            **(admission_estimate or {}))
+        if completion_claim is not None:
+            completion_claim["owned_execution_completion"] = guard.owned_completion
     except SupervisionError as error:
+        if completion_claim is not None and isinstance(getattr(error, "owned_completion", None), dict):
+            completion_claim["owned_execution_completion"] = error.owned_completion
         proof.write_json(out / "supervisor.json", {
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
             "host_memory": error.watchdog_host_memory, "child_footprint": error.watchdog_child_footprint,
             "device_memory": error.watchdog_device_memory,
+            **({"fit_observation": probe.fit_observation()} if observer is not None else {}),
         }, owned=out.parent)
         # The supervisor can refuse before spawn. Preserve its reason whether or not
         # it created a log; a failing child may have filled its entire stderr budget.
@@ -336,7 +349,14 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
         if tail:
             print(proof.redact(tail, env), file=sys.stderr)
         raise
+    finally:
+        if probe is not None:
+            probe.close()
     summary = asdict(guard)
+    if observer is not None:
+        summary["fit_observation"] = probe.fit_observation()
+    if capture_cuda_basis and probe is not None:
+        summary["cuda_attribution"] = probe.measurement()
     if retain_windows_footprint:
         if cuda_probe is None:
             raise ValueError("retaining Windows CUDA host counters requires the supervised Windows route")
@@ -345,7 +365,7 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, me
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 
-def hardware(backend, policy):
+def hardware(backend, policy, *, pci_bus=False):
     if backend == "mlx":
         def sysctl(name):
             return subprocess.check_output(["/usr/sbin/sysctl", "-n", name], text=True, timeout=10).strip()
@@ -353,6 +373,8 @@ def hardware(backend, policy):
                 "os_build": sysctl("kern.osversion")}
     from scripts.media_campaign_windows import trusted_nvidia_smi
     fields = ["name", "uuid", "index", "memory.total", "driver_version"]
+    if pci_bus:
+        fields.append("pci.bus_id")
     command = [trusted_nvidia_smi(), "--id=" + policy.cuda_device_uuid, "--query-gpu=" + ",".join(fields),
                "--format=csv,noheader,nounits"]
     values = subprocess.check_output(command, text=True, timeout=15).strip().split(", ")
@@ -435,10 +457,12 @@ def execute(args, contract):
             raise ValueError("ENG-4b baseline tree differs from the reviewed merge")
         paths, receipt["fixtures"] = snapshots(
             work, tier, download_missing=contract["request"].get("download_missing", False))
+        request_policy = contract["request"]["policy"]
+        # Builds never touch a GPU: a request that names no card builds first, then chooses (and if
+        # need be switches) its card in the claim's own admission window.
         policy_path = work / "policy.json"
-        write(policy_path, contract["request"]["policy"])
+        write(policy_path, planned_card_policy(request_policy))
         policy = load_policy(policy_path)
-        receipt["hardware"] = hardware(backend, policy)
         # Both executables finish linking before either arm's first render.
         exes, environments = {}, {}
         for arm in evidence.ARMS:
@@ -466,16 +490,37 @@ def execute(args, contract):
         claim_dir = work / "claim"
         claim_dir.mkdir()
         lease_env = environments["base"]
-        claim_policy = policy
-        claim_deadline = last_child_start = None
+        claim_deadline = last_child_start = budget = None
         if backend == "candle-cuda":
             budget, reserve = cuda_claim_budget(policy, tier)
-            write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
-            claim_policy = load_policy(claim_dir / "policy.json")
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
-        with execution_claim(backend, claim_policy, claim_dir, lease_env,
-                             original_deadline_monotonic=claim_deadline) as claim:
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(request_policy, work, deadline_monotonic=last_child_start)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
+        bound = {}
+
+        def bind(chosen):
+            """Bind the run to the card in force: its policy, hardware and child visibility."""
+            write(policy_path, chosen)
+            bound["policy"] = load_policy(policy_path)
+            receipt["hardware"] = hardware(backend, bound["policy"])
+            if backend == "candle-cuda":
+                for arm_env in environments.values():
+                    arm_env["CUDA_VISIBLE_DEVICES"] = chosen["cudaDeviceUuid"]
+
+        def claim_policy(chosen):
+            if budget is None:
+                return bound["policy"]
+            write(claim_dir / "policy.json", dict(chosen, deadlineSeconds=budget))
+            return load_policy(claim_dir / "policy.json")
+
+        bind(payload)
+        with claim_chosen_card(backend, request_policy, payload, selection, claim_dir, lease_env,
+                               claim_policy=claim_policy, rebind=bind, record=receipt, claim_with=execution_claim,
+                               original_deadline_monotonic=claim_deadline) as claim:
+            policy = bound["policy"]
             receipt["physical_claim"] = claim
             receipt["preflight"] = {}
             for arm in planned_arms(tier):
@@ -532,6 +577,7 @@ def execute(args, contract):
     except BaseException as exc:
         primary_error = exc
         receipt["failure"] = str(exc)
+        record_selection_refusal(receipt, exc)
         if isinstance(exc, (CudaClaimRejected, CudaReleaseRejected)):
             receipt["cuda_diagnostic"] = exc.diagnostic
         raise
@@ -603,6 +649,15 @@ def verify(args, contract):
             allowed.add(name)
     if {p.name for p in args.output.iterdir()} != allowed:
         raise ValueError("unexpected upload file")
+    # A card-free request ran on the card its recorded selection chose (and claimed); a named card
+    # records no selection and verifies as before.
+    executed = executed_card_policy(contract["request"]["policy"], r.get("cuda_card_selection"),
+                                    refusal=r.get(SELECTION_REFUSAL),
+                                    unstarted=not r["accepted"] and "physical_claim" not in r)
+    if executed is None and (r["accepted"] or "physical_claim" in r or r["logs"]):
+        raise ValueError("a refused card selection cannot report a claim, child logs or acceptance")
+    if "cuda_card_selection" in r and "physical_claim" in r:
+        require_claimed_card(r["physical_claim"], executed)
     if completed:
         if not r["physical_claim"]["post_execution_verified"]:
             raise ValueError("unreleased accepted comparison")
@@ -623,7 +678,7 @@ def verify(args, contract):
 def read_measured_sample(receipt, name, variant, arm, directory, *, published=False):
     preflight = receipt["preflight"][preflight_key(ENG4B_REAL, arm, variant)]
     reference = receipt["arms"][arm]["renders"][variant]
-    policy = receipt["request"]["policy"]
+    policy = executed_card_policy(receipt["request"]["policy"], receipt.get("cuda_card_selection"))
     limits = retained_phase_limits(name, policy)
 
     def read(suffix):

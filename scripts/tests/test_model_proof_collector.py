@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -419,7 +420,7 @@ class Collector(unittest.TestCase):
                 proof.publish_file(source, destination / 'hard.png', root, 100)
             self.assertEqual(victim.read_bytes(), b'private')
 
-    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None, backend='mlx', supervisor_module=None):
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None, backend='mlx', supervisor_module=None, card_free=False):
         row = case() if row_override is None else row_override
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
@@ -428,7 +429,10 @@ class Collector(unittest.TestCase):
         source.write_text('// test fixture; no actual Rust execution', encoding='utf-8')
         mock_request = request('windows-cuda' if backend == 'candle-cuda' else 'darwin-mlx')
         if backend == 'candle-cuda':
-            mock_request['policy'].update(cudaDeviceUuid=row['required_cuda_device_uuid'], gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
+            card = next(iter(resources.fixed_cards((row,))))  # by UUID or by physical index alone
+            mock_request['policy'].update(cudaDeviceUuid=card, gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
+            if card_free:
+                del mock_request['policy']['cudaDeviceUuid']
         source_safety = supervisor_module or safety
         def toolchain(env, **_kwargs):
             if backend == 'mlx':
@@ -490,7 +494,7 @@ class Collector(unittest.TestCase):
         @contextlib.contextmanager
         def shared_controller(*_args, **_kwargs):
             physical = {'activity_profile': resources.SHARED_CUDA_HEADROOM_ACTIVITY,
-                'device_uuid':row['required_cuda_device_uuid'],'physical_index':1,
+                'device_uuid':next(iter(resources.fixed_cards((row,)))),'physical_index':1,
                 'post_execution_verified':False,'lease_released':False,
                 'claim_deadline_monotonic':100000000000.0}
             try:
@@ -519,6 +523,111 @@ class Collector(unittest.TestCase):
             verified = proof.verify_artifacts(output, root, mock_request, expected, (row,))
             receipt = json.loads((output / 'receipt.json').read_text(encoding="utf-8"))
             return status, receipt, verified, guard.call_count, output
+
+    def test_no_card_fitting_before_the_deadline_publishes_a_verifiable_unsuccessful_receipt(self):
+        fqn = 'train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient'
+        source = next(row for row in proof.load_registry() if row['fqn'] == fqn)
+        row = proof.configured_case(source, 'fixed_cuda')
+        uuid = row['required_cuda_device_uuid']
+        refusal = {'rule': resources.CARD_SELECTION_RULE, 'polls': 3,
+                   'cards': [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid],
+                              'refusal': '100 MiB free < 1 MiB required'}],
+                   'admission_error': 'no registered CUDA card had estimate plus reserve free'}
+        rejected = resources.CudaClaimRejected(refusal, 'no registered CUDA card fits this proof; no model execution')
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', side_effect=rejected):
+            status, receipt, verified, runs, output = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 1)
+        self.assertFalse(receipt['accepted'])
+        self.assertEqual(receipt[resources.SELECTION_REFUSAL], refusal)
+        self.assertEqual(receipt['cases'][0]['cuda_claim_diagnostic'], refusal)
+        self.assertNotIn('cuda_card_selection', receipt)
+        self.assertEqual(runs, 1)  # discovery only; no body child
+        # The refusal verifies only as a complete refusal of every candidate.
+        bad = dict(refusal, cards=[dict(refusal['cards'][0], refusal='')])
+        with self.assertRaisesRegex(ValueError, 'invalid card selection refusal'):
+            resources.executed_card_policy({'backend': 'windows-cuda'}, None, named=uuid, refusal=bad)
+
+    def _fixed_cuda_row(self):
+        fqn = 'train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient'
+        source = next(row for row in proof.load_registry() if row['fqn'] == fqn)
+        return proof.configured_case(source, 'fixed_cuda')
+
+    def test_a_card_free_run_records_the_visibility_of_the_card_it_claimed(self):
+        row = self._fixed_cuda_row()
+        uuid = row['required_cuda_device_uuid']
+        # The planner fills a card-free policy with GPU 0; this case fixes GPU 1.
+        self.assertNotEqual(next(iter(resources.REGISTERED_CUDA_CARDS)), uuid)
+        selection = {'rule': resources.CARD_SELECTION_RULE, 'chosen_uuid': uuid,
+                     'chosen_index': resources.REGISTERED_CUDA_CARDS[uuid], 'polls': 1, 'wait_seconds': 0.,
+                     'cards': [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid],
+                                'estimate_source': resources.LEGACY_CAP_CLAIM_ESTIMATE_SOURCE,
+                                'estimate_bytes': 1000000, 'required_free_bytes': 1000100,
+                                'total_mib': 97887, 'used_mib': 0, 'free_mib': 97887}]}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', return_value=(uuid, selection)):
+            status, receipt, verified, _, _ = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 0)
+        case = receipt['cases'][0]
+        self.assertEqual(case['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'], uuid)
+        self.assertEqual(receipt['resource_policy']['cudaDeviceUuid'], uuid)
+        # A recorded visibility that still names the planner's card is refused.
+        stale = copy.deepcopy(receipt)
+        stale['cases'][0]['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'] = next(iter(resources.REGISTERED_CUDA_CARDS))
+        request = {'policy': receipt['request_resource_policy']}
+        with self.assertRaisesRegex(ValueError, 'visibility differs'):
+            proof.executed_policy(stale, request, (row,))
+
+    def test_an_index_only_case_selects_its_card_even_when_the_other_is_freer(self):
+        # A registry case restricted by physical index alone (GPU 1), with no UUID.
+        row = next(row for row in proof.load_registry()
+                   if row['fqn'] == 'transformer::edit::tests::frozen_edit_oracle_cuda')
+        self.assertNotIn('required_cuda_device_uuid', row)
+        gpu1 = next(uuid for uuid, index in resources.REGISTERED_CUDA_CARDS.items() if index == row['required_cuda_physical_index'])
+        self.assertEqual(row['required_cuda_physical_index'], 1)
+        self.assertEqual(resources.fixed_cards((row,)), {gpu1})
+        read = []
+
+        def reader(uuid, _deadline):
+            read.append(uuid)
+            used = 1000 if resources.REGISTERED_CUDA_CARDS[uuid] == 0 else 60000  # GPU 0 is freer
+            return [{'uuid': uuid, 'index': resources.REGISTERED_CUDA_CARDS[uuid], 'total_mib': 97887,
+                     'used_mib': used, 'free_mib': 97887 - used, 'utilization_percent': 0}]
+
+        real = resources.select_cuda_card
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card',
+                             side_effect=lambda *args, **kwargs: real(*args, **dict(kwargs, reader=reader))), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status, receipt, verified, _, _ = self._mock_run(
+                Path(temporary).resolve(), row_override=row, backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(set(read), {gpu1})
+        self.assertEqual(receipt['cuda_card_selection']['chosen_uuid'], gpu1)
+        self.assertEqual(receipt['resource_policy']['cudaDeviceUuid'], gpu1)
+        self.assertEqual(receipt['cases'][0]['configuration_environment']['CUDA_VISIBLE_DEVICES']['value'], gpu1)
+        # A recorded selection of the freer GPU 0 does not verify for this index-1 case.
+        gpu0 = next(uuid for uuid, index in resources.REGISTERED_CUDA_CARDS.items() if index == 0)
+        wrong = copy.deepcopy(receipt)
+        wrong['cuda_card_selection']['cards'][0].update(uuid=gpu0, index=0)
+        wrong['cuda_card_selection'].update(chosen_uuid=gpu0, chosen_index=0)
+        with self.assertRaises(ValueError):
+            proof.executed_policy(wrong, {'policy': receipt['request_resource_policy']}, (row,))
+        with self.assertRaisesRegex(ValueError, 'unregistered CUDA physical index'):
+            resources.fixed_cards((dict(row, required_cuda_physical_index=7),))
+
+    def test_a_card_free_run_that_fails_before_selection_still_verifies(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(resources, 'select_cuda_card', side_effect=AssertionError('no selection before a body')):
+            status, receipt, verified, calls, _ = self._mock_run(
+                Path(temporary).resolve(), missing=True, row_override=self._fixed_cuda_row(),
+                backend='candle-cuda', card_free=True)
+        self.assertEqual(status, 1)
+        self.assertFalse(receipt['accepted'])
+        self.assertNotIn('cuda_card_selection', receipt)
+        self.assertNotIn(resources.SELECTION_REFUSAL, receipt)
 
     def test_shared_owned_result_cross_module_identity_and_failed_closed_body(self):
         # The real collector loader imports canonical scripts.media_campaign_supervisor;

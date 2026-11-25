@@ -542,6 +542,17 @@ impl GenerationRequest {
     pub fn memory_reference_count(&self) -> u32 {
         match self.video_mode.as_deref() {
             Some("animation" | "replacement") if self.scail2_animation_conditioning().is_ok() => 1,
+            Some("animation") if self.control_clip().is_some() && self.conditioning.len() > 3 => {
+                Scail2CharacterReferences::from_request("scail2", self)
+                    .ok()
+                    .filter(|characters| {
+                        self.conditioning.len() == 2 * characters.reference_count() as usize + 1
+                    })
+                    .map_or_else(
+                        || self.image_reference_count(),
+                        |characters| characters.reference_count(),
+                    )
+            }
             Some("video_bridge") => 0,
             Some("extend_clip")
                 if matches!(

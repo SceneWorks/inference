@@ -20,7 +20,9 @@ from scripts.ci import flux1_comparison as paired
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci import sga_adapter_comparison as source_pair
 from scripts.ci.flux1_pair.fixture import sha
-from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.model_proof_resources import (REGISTERED_CUDA_CARDS, choose_card, claim_chosen_card,
+                                              executed_card_policy, execution_claim, planned_card_policy,
+                                              record_selection_refusal, require_claimed_card, SELECTION_REFUSAL)
 from scripts.ci.pinned_hub_source import verify_file_inventory_receipt
 from scripts.ci.sga_paired_performance import PAIRS, compare_peaks, compare_timing
 from scripts.ci.stage_pinned_hub_snapshots import hub_root
@@ -60,9 +62,14 @@ PREFLIGHT_SECONDS = 180
 
 def profile_for(backend, request):
     binding = DEVICE_KEY.get(backend)
-    keys = {"selection", "profile", "variant", binding, "download_missing"}
     diagnostic = isinstance(request, dict) and "diagnostic" in request
     dev_process_cap = isinstance(request, dict) and WINDOWS_DEV_PROCESS_CAP_REQUEST in request
+    if (backend == "candle-cuda" and isinstance(request, dict) and binding not in request
+            and not diagnostic and not dev_process_cap):
+        # A scored CUDA comparison that names no card runs on the most free registered card;
+        # validate it as it will run, with a registered card filled in.
+        request = dict(request, **{binding: next(iter(REGISTERED_CUDA_CARDS))})
+    keys = {"selection", "profile", "variant", binding, "download_missing"}
     if diagnostic:
         keys.add("diagnostic")
     if dev_process_cap:
@@ -146,13 +153,15 @@ def plan(backend, request, head):
     if head == BASE or subprocess.run(["git", "merge-base", "--is-ancestor", BASE, head],
                                       cwd=ROOT, timeout=30).returncode != 0:
         raise ValueError("terminal head must descend from the pinned native-format main baseline")
-    binding = request[DEVICE_KEY[backend]]
+    binding = request.get(DEVICE_KEY[backend])
     policy = profile.policy(request["variant"], binding)
+    if backend == "candle-cuda" and binding is None:
+        del policy["cudaDeviceUuid"]
     if WINDOWS_DEV_PROCESS_CAP_REQUEST in request:
         policy["childFootprintCapBytes"] = WINDOWS_DEV_PROCESS_CAP_GIB * 1024**3
     with TemporaryDirectory(prefix="sga-terminal-policy-") as directory:
         checked_policy = Path(directory) / "policy.json"
-        proof.write_json(checked_policy, policy)
+        proof.write_json(checked_policy, planned_card_policy(policy))
         load_policy(checked_policy)
     overlays = {}
     make_overlay, provenance = terminal_overlay(profile, backend, request, head)
@@ -214,6 +223,19 @@ def collect_sample(name, root, limits, out, work, *, skip=()):
 
 def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+
+
+def ran_contract(contract, selection, refusal=None, unstarted=False):
+    """The contract as the comparison ran it: a card-free CUDA request bound to the card its
+    recorded most-free selection chose (a named card records no selection); None when no card fit
+    before the deadline and nothing ran."""
+    executed = executed_card_policy(contract["policy"], selection, refusal=refusal, unstarted=unstarted)
+    if executed is None:
+        return None
+    if executed is contract["policy"]:
+        return contract
+    request = dict(contract["request"], **{DEVICE_KEY["candle-cuda"]: executed["cudaDeviceUuid"]})
+    return dict(contract, policy=executed, request=request)
 
 
 def read_sample(name, directory, profile, contract, *, upload=False):
@@ -359,13 +381,12 @@ def execute(args, contract, profile):
     try:
         if paired.git(baseline, "rev-parse", "HEAD") != BASE:
             raise ValueError("terminal baseline checkout does not match the workflow pin")
+        # Builds never touch a GPU: a request that names no card builds first, then chooses (and if
+        # need be switches) its card in the claim's own admission window.
         policy_path = work / "policy.json"
-        proof.write_json(policy_path, contract["policy"])
+        proof.write_json(policy_path, planned_card_policy(contract["policy"]))
         policy = load_policy(policy_path)
-        binding, variant = request[DEVICE_KEY[args.backend]], request["variant"]
-        receipt["hardware"] = paired.hardware(args.backend, policy)
-        if cuda:
-            receipt["hardware"]["capability"] = require_sm120(binding)
+        binding, variant = policy.cuda_device_uuid if cuda else request[DEVICE_KEY[args.backend]], request["variant"]
         model_hub = terminal_hub_root(args.backend, profile, env)
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
         verify_assets(contract, receipt["assets"])
@@ -399,21 +420,44 @@ def execute(args, contract, profile):
                 raise ValueError("terminal source arms have different compiler identities")
         claim_dir = work / "claim"
         claim_dir.mkdir()
-        claim_policy, claim_deadline, last_child_start = policy, None, None
+        claim_deadline = last_child_start = budget = None
         if cuda:
             reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
             budget = (len(samples) + 1) * policy.deadline_seconds + reserve
-            claim_file = claim_dir / "policy.json"
-            proof.write_json(claim_file, dict(contract["policy"], deadlineSeconds=budget))
-            claim_policy = load_policy(claim_file)
             claim_deadline = time.monotonic() + budget
             last_child_start = claim_deadline - reserve - policy.deadline_seconds
+        # A request that names no card runs on the registered card with the most free memory that fits.
+        payload, selection = choose_card(contract["policy"], work, deadline_monotonic=last_child_start)
+        if selection is not None:
+            receipt["cuda_card_selection"] = selection
+        bound = {}
+
+        def bind(chosen):
+            """Bind the run to the card in force: policy, hardware, capability and child visibility."""
+            bound["ran"] = ran_contract(contract, receipt.get("cuda_card_selection"))
+            proof.write_json(policy_path, bound["ran"]["policy"])
+            bound["policy"] = load_policy(policy_path)
+            receipt["hardware"] = paired.hardware(args.backend, bound["policy"])
+            if cuda:
+                receipt["hardware"]["capability"] = require_sm120(chosen["cudaDeviceUuid"])
+                for _, arm_env in executables.values():
+                    arm_env["CUDA_VISIBLE_DEVICES"] = chosen["cudaDeviceUuid"]
+
+        def claim_policy(chosen):
+            if budget is None:
+                return bound["policy"]
+            proof.write_json(claim_dir / "policy.json", dict(chosen, deadlineSeconds=budget))
+            return load_policy(claim_dir / "policy.json")
+
+        bind(payload)
         observations = {}
         limits = sample_limits(profile, contract["policy"])
         profile_artifacts = getattr(profile, "ARTIFACT_LIMITS", {})
         prepare_artifacts = getattr(profile, "prepare_artifacts", None)
-        with execution_claim(args.backend, claim_policy, claim_dir, env,
-                             original_deadline_monotonic=claim_deadline) as claim:
+        with claim_chosen_card(args.backend, contract["policy"], payload, selection, claim_dir, env,
+                               claim_policy=claim_policy, rebind=bind, record=receipt, claim_with=execution_claim,
+                               original_deadline_monotonic=claim_deadline) as claim:
+            policy, ran = bound["policy"], bound["ran"]
             receipt["physical_claim"] = claim
             options = {"retain_windows_footprint": True} if diagnostic == WAN_MEMORY_DIAGNOSTIC else {}
             for name, arm in samples:
@@ -426,7 +470,7 @@ def execute(args, contract, profile):
                     for leaf, cap in limits.items():
                         if leaf != "guard.jsonl":
                             source_pair.bounded_owned_file(run / leaf, work, cap)
-                    observations[name] = read_sample(name, run, profile, contract)
+                    observations[name] = read_sample(name, run, profile, ran)
                 finally:
                     unverified = () if name in observations else profile_artifacts
                     receipt["files"].update(collect_sample(name, run, limits, artifact, work, skip=unverified))
@@ -444,6 +488,7 @@ def execute(args, contract, profile):
             receipt["accepted"] = True
     except BaseException as error:
         receipt["failure"] = proof.redact(str(error), env)[:4096]
+        record_selection_refusal(receipt, error)
         raise
     finally:
         try:
@@ -467,6 +512,10 @@ def verify(args, contract, profile):
     if (any(receipt.get(key) != value for key, value in {**contract, **source_pair.attempt_identity(os.environ)}.items())
             or type(receipt.get("accepted")) is not bool):
         raise ValueError("terminal receipt differs from the current exact plan or attempt")
+    if ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL),
+                    unstarted=not receipt["accepted"] and "physical_claim" not in receipt) is None and (
+            receipt["accepted"] or "physical_claim" in receipt or receipt["files"]):
+        raise ValueError("a refused card selection cannot report a claim, child files or acceptance")
     limits = sample_limits(profile, contract["policy"])
     samples = sample_schedule(contract["request"])
     allowed = {f"{name}.{leaf}": cap for name, _ in samples for leaf, cap in limits.items()}
@@ -506,7 +555,12 @@ def verify(args, contract, profile):
         raise ValueError("retained terminal source arms resolved different preflight metadata")
     if source_pair.compiler_identity(receipt["arms"]["base"]) != source_pair.compiler_identity(receipt["arms"]["head"]):
         raise ValueError("terminal artifact compiler identity changed")
-    observations = {name: read_sample(name, args.output, profile, contract, upload=True) for name, _ in samples}
+    ran = ran_contract(contract, receipt.get("cuda_card_selection"), receipt.get(SELECTION_REFUSAL))
+    if ran is None:
+        raise ValueError("a refused card selection cannot report completed terminal samples")
+    if "cuda_card_selection" in receipt:
+        require_claimed_card(receipt["physical_claim"], ran["policy"])
+    observations = {name: read_sample(name, args.output, profile, ran, upload=True) for name, _ in samples}
     if summarize_diagnostic is not None:
         if summarize_diagnostic(observations, preflight_rows[0]) != receipt["diagnostic_result"]:
             raise ValueError("terminal upload does not reproduce its diagnostic observations")

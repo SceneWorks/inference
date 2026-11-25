@@ -104,6 +104,11 @@ impl FlowScheduler {
         }
     }
 
+    /// Native f64 nodes, including the terminal zero, used by this scheduler instance.
+    pub fn sigmas(&self) -> &[f64] {
+        &self.sigmas
+    }
+
     pub fn num_steps(&self) -> usize {
         self.sigmas.len() - 1
     }

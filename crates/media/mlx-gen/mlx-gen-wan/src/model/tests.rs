@@ -161,6 +161,7 @@ fn validate_rejects_out_of_range_conditioning_strengths_5b() {
 #[test]
 fn validate_refuses_conditioning_strength_on_a14b_i2v() {
     let wan = Wan14b {
+        load_binding: None,
         descriptor: descriptor_i2v_14b(),
         config: WanModelConfig::wan22_i2v_14b(),
         root: PathBuf::new(),
@@ -443,6 +444,7 @@ fn wan14b_adapter_residency_tracks_packed_folded_and_expert_routing() {
 
 fn wan_5b() -> Wan {
     Wan {
+        load_binding: None,
         descriptor: descriptor(),
         config: WanModelConfig::wan22_ti2v_5b(),
         root: PathBuf::new(),
@@ -458,6 +460,7 @@ fn wan_5b() -> Wan {
 
 fn wan_t2v_14b() -> Wan14b {
     Wan14b {
+        load_binding: None,
         descriptor: descriptor_t2v_14b(),
         config: WanModelConfig::wan22_t2v_14b(),
         root: PathBuf::new(),
@@ -915,6 +918,7 @@ fn wan_5b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan {
         group_size: 64,
     });
     Wan {
+        load_binding: None,
         descriptor: descriptor(),
         config: cfg,
         root: tmp_dir(tmp),
@@ -936,6 +940,7 @@ fn wan_14b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan1
         group_size: 64,
     });
     Wan14b {
+        load_binding: None,
         descriptor: descriptor_t2v_14b(),
         config: cfg,
         root: tmp_dir(tmp),
@@ -1101,6 +1106,7 @@ fn site_14b_dense_fold_still_works() {
     let model = wan_14b_prequant(&tmp, vec![lora_spec(lora)]);
     // Use a DENSE config for the fold path (quantization None).
     let dense = Wan14b {
+        load_binding: None,
         config: {
             let mut c = model.config.clone();
             c.quantization = None;
@@ -1116,4 +1122,79 @@ fn site_14b_dense_fold_still_works() {
         !array_eq(after, &before, false).unwrap().item::<bool>(),
         "dense fold must change the q weight"
     );
+}
+
+#[test]
+fn video_plan_freezes_padded_wan_decode_and_curated_routes_without_weights() {
+    let scratch = tempfile::tempdir().unwrap();
+    let spec = LoadSpec::new(WeightsSource::Dir(scratch.path().into()));
+    let registry = crate::provider_registry().unwrap();
+    let mut request = GenerationRequest {
+        frames: Some(5),
+        steps: Some(2),
+        sampler: Some("heun".into()),
+        trim_first_frames: Some(1),
+        ..req(512, 512)
+    };
+    let resolve = |id, r: &GenerationRequest| registry.compile_video_plan(id, &spec, r);
+    let dense = resolve(MODEL_ID, &request).unwrap().unwrap();
+    let p = &dense.layout().phases[0];
+    assert_eq!(
+        (
+            dense.geometry().frames,
+            p.latent_frames,
+            p.decoded_frames,
+            dense.layout().output.frames
+        ),
+        (9, 3, 9, 5)
+    );
+    assert_eq!(p.latent_bytes, 4 * 48 * 3 * 32 * 32);
+    std::fs::write(
+        scratch.path().join("config.json"),
+        r#"{"model_type":"t2v","dual_model":true}"#,
+    )
+    .unwrap();
+    let t2v = resolve(MODEL_ID_T2V_14B, &request).unwrap().unwrap();
+    let p = &t2v.layout().phases[0];
+    assert_eq!(
+        (
+            t2v.geometry().frames,
+            p.latent_frames,
+            p.decoded_frames,
+            t2v.layout().output.frames
+        ),
+        (9, 3, 12, 8)
+    );
+    assert_eq!(p.latent_bytes, 4 * 16 * 3 * 64 * 64);
+    request.trim_first_frames = None;
+    request.conditioning.push(Conditioning::Reference {
+        image: dummy_image(),
+        strength: Some(1.0),
+    });
+    std::fs::write(
+        scratch.path().join("config.json"),
+        r#"{"model_type":"i2v","dual_model":true,"quantization":{"bits":4,"group_size":64}}"#,
+    )
+    .unwrap();
+    let i2v = resolve(MODEL_ID_I2V_14B, &request).unwrap().unwrap();
+    assert_eq!(i2v.layout().references[0].width, 512);
+    assert_eq!(i2v.layout().phases[0].retained_bytes, 4 * 20 * 2 * 64 * 64);
+    assert_eq!(
+        i2v.layout()
+            .packed_components
+            .iter()
+            .map(|c| c.bits)
+            .collect::<Vec<_>>(),
+        [4, 8]
+    );
+    std::fs::write(
+        scratch.path().join("config.json"),
+        r#"{"model_type":"i2v","dual_model":true}"#,
+    )
+    .unwrap();
+    assert!(i2v.bind_admission(&spec, None, &request).is_err());
+    for name in ["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"] {
+        request.sampler = Some(name.into());
+        assert!(resolve(MODEL_ID_I2V_14B, &request).unwrap().is_none());
+    }
 }

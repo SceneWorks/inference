@@ -1,0 +1,45 @@
+use candle_gen::gen_core;
+const BACKEND: &str = "candle-cuda";
+const EXPECTED_FRAMES: usize = 45;
+fn configure(spec: &mut LoadSpec) {
+    spec.quantize = Some(gen_core::Quant::Q4);
+}
+fn text_len(root: &Path, prompt: &str) -> Result<usize> {
+    let tok = crate::generate::build_tokenizer_from_path(
+        root.join("tokenizer.json"),
+        &candle_gen_wan::config::TextEncoderConfig::umt5_xxl(),
+    )?;
+    Ok(tok.tokenize(prompt)?.ids.len())
+}
+#[cfg(feature = "cuda")]
+fn start_allocator() -> Result<u64> {
+    Ok(candle_gen::cuda_mempool::MemPool::device_current(0)
+        .ok_or("missing baseline pool")?
+        .reserved()
+        .ok_or("missing pool baseline")?)
+}
+#[cfg(not(feature = "cuda"))]
+fn start_allocator() -> Result<u64> {
+    Err("requires CUDA".into())
+}
+struct Pair {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    out: PathBuf,
+}
+type ProofResult<T> = Result<T>;
+fn finish_allocator(out: &Path) -> Result<u64> {
+    pool_proof(&Pair {
+        out: out.to_owned(),
+    })
+}
+#[cfg(feature = "cuda")]
+fn allocator_state() -> serde_json::Value {
+    candle_gen::cuda_mempool::MemPool::device_current(0).map_or(serde_json::Value::Null, |pool| {
+        json!({"used": pool.used(), "reserved":pool.reserved(), "used_high":pool.used_high(), "reserved_high":pool.reserved_high()})
+    })
+}
+#[cfg(not(feature = "cuda"))]
+fn allocator_state() -> serde_json::Value {
+    serde_json::Value::Null
+}
+@POOL@

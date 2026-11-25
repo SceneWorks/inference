@@ -7,12 +7,11 @@
 //! **driving video + per-frame color masks** are a [`Conditioning::ControlClip`]; `video_mode ==
 //! "replacement"` toggles the cross-identity `replace_flag` (else animation). Inference LoRA(s) from
 //! [`LoadSpec::adapters`] (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
-//! LoRA, sc-5451) install onto the DiT as forward-time residuals. Multi-reference (extra characters,
-//! each needing its own paired mask) awaits the sc-5583 request contract; the [`crate::generate()`]
-//! core already supports extra characters via [`crate::CharacterRef`].
+//! LoRA, sc-5451) install onto the DiT as forward-time residuals. Animation accepts up to six ordered character/mask pairs.
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core;
 use mlx_gen::{
     default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
@@ -23,11 +22,9 @@ use mlx_gen_wan::pipeline::reject_over_area_dims;
 use mlx_gen_wan::SolverKind;
 
 use crate::config::Scail2Config;
-use crate::generate::{align, CharacterRef, Scail2Job, DIM_ALIGN};
+use crate::generate::{align, Scail2Job, DIM_ALIGN};
 
-/// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
-const SEGMENT_LEN: usize = 81;
-const SEGMENT_OVERLAP: usize = 5;
+use gen_core_family::scail2::{SEGMENT_LEN, SEGMENT_OVERLAP};
 /// Upstream `generate()` sampler defaults: 40 steps, shift 5.0 (3.0 at 480p), guide 5.0, 16 fps.
 const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
@@ -108,6 +105,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// The loaded SCAIL-2 model: resolved config + snapshot dir + optional load-time quant. The heavy
 /// components (DiT / VAE / UMT5 / CLIP) are staged per-stage inside [`crate::generate()`].
 pub struct Scail2 {
+    load_binding: gen_core::RenderLoadBinding,
     descriptor: ModelDescriptor,
     config: Scail2Config,
     root: PathBuf,
@@ -148,6 +146,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory.ensure_unchanged(&spec.adapters)?;
     }
     Ok(Box::new(Scail2 {
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         descriptor: descriptor(),
         config,
         root,
@@ -165,13 +164,14 @@ impl Scail2 {
     fn generate_execution_attempt(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         if let Some(memory) = &self.memory_strategy {
             memory.ensure_unchanged(&self.adapters)?;
         }
-        let output = self.run(req, on_progress)?;
+        let output = self.run(req, scope, on_progress)?;
         if let Some(memory) = &self.memory_strategy {
             memory.ensure_unchanged(&self.adapters)?;
         }
@@ -179,14 +179,153 @@ impl Scail2 {
     }
 }
 
+fn registered_inputs<'a>(
+    descriptor: &ModelDescriptor,
+    req: &'a GenerationRequest,
+) -> Result<(
+    gen_core::generator::Scail2CharacterReferences<'a>,
+    gen_core::ControlClipRef<'a>,
+    (u32, u32),
+)> {
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    let characters =
+        gen_core::generator::Scail2CharacterReferences::from_request(descriptor.id, req)?;
+    let driving = req.control_clip().ok_or_else(|| {
+        Error::Msg(
+            "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
+                .into(),
+        )
+    })?;
+    reject_unimplemented_control_clip_knobs(req)?;
+
+    // Explicit geometry is already on the advertised 32-pixel grid. A `0x0` sentinel first
+    // resolves to the driving frame's native size, then is aligned below while that source-media
+    // origin is still known.
+    let first: &Image = driving
+        .frames
+        .first()
+        .ok_or_else(|| Error::Msg("scail2: the ControlClip has no driving frames".into()))?;
+    let (resolved_width, resolved_height) = resolve_target_size(req, first);
+    // The second half of `SizeFloor::ResolvedDownstream` (sc-16167). `impl_generator!`'s
+    // `generate` does not call `validate`, so this must run here and not only there — the same
+    // reason the shared floor is re-checked at the top of this function.
+    reject_unrenderable_geometry(
+        &descriptor.capabilities,
+        req,
+        resolved_width,
+        resolved_height,
+    )?;
+    // Preserve the source-media origin distinction exactly once: a sentinel-resolved geometry
+    // may be floored to the render lattice, while an explicit off-grid request has already been
+    // rejected by the advertised floor above. `Scail2Job` itself accepts exact geometry only.
+    let (width, height) = if req.width == 0 && req.height == 0 {
+        (align(resolved_width) as u32, align(resolved_height) as u32)
+    } else {
+        (resolved_width, resolved_height)
+    };
+
+    Ok((characters, driving, (width, height)))
+}
+
+pub(crate) fn compile_video_plan(
+    _spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    registered_layout(req).map(Some)
+}
+
+fn registered_layout(req: &GenerationRequest) -> gen_core::Result<gen_core::VideoPlanLayout> {
+    let descriptor = descriptor();
+    let (characters, driving, size) = registered_inputs(&descriptor, req)?;
+    gen_core_family::scail2::video_layout(
+        gen_core_family::scail2::SegmentTail::FullWindows,
+        gen_core::MemoryBudgetDomain::UnifiedMemory,
+        size,
+        1 + characters.additional.len(),
+        driving,
+    )
+}
+
 impl Generator for Scail2 {
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        if &registered_layout(req)? != plan.layout() {
+            return Err(gen_core::Error::Unsupported(
+                "scail2: compiled video layout differs from this decoder and source".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+        self.validate_video_plan(plan, req)?;
+        Ok(self
+            .memory_strategy
+            .as_ref()
+            .filter(|_| crate::memory_strategy::validate_generation_request(req).is_ok())
+            .map(|memory| memory.structural_evidence.tier))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        context: &mut gen_core::MemoryRunContext,
+    ) -> gen_core::Result<bool> {
+        self.validate_video_plan(plan, req)?;
+        let Some(memory) = &self.memory_strategy else {
+            return Ok(false);
+        };
+        if crate::memory_strategy::validate_generation_request(req).is_err() {
+            return Ok(false);
+        }
+        plan.check_inputs(req)?;
+        memory.ensure_unchanged(&self.adapters)?;
+        let revision = crate::memory_strategy::request_evidence_revision(
+            &memory.structural_evidence,
+            req,
+            context.selection,
+        )?;
+        gen_core_family::scail2::project_catalog_context(
+            self.descriptor.backend,
+            req,
+            plan.geometry(),
+            &memory.structural_evidence,
+            revision,
+            context,
+        )
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -214,6 +353,18 @@ impl Generator for Scail2 {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
+        // Preflight also accepts incomplete requests for geometry-only probes. Once character
+        // entries are supplied, they must form the same ordered pairs the renderer consumes.
+        if req.conditioning.iter().any(|entry| {
+            matches!(
+                entry,
+                Conditioning::Reference { .. }
+                    | Conditioning::Mask { .. }
+                    | Conditioning::MultiReference { .. }
+            )
+        }) {
+            gen_core::generator::Scail2CharacterReferences::from_request(self.descriptor.id, req)?;
+        }
         // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
         // silently dropping them. Runs on BOTH seams (`impl_generator!`'s `generate` does not call
         // `validate`), same as the geometry gate below.
@@ -240,7 +391,7 @@ impl Generator for Scail2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_execution_attempt(req, None, on_progress)
         })
     }
 
@@ -527,113 +678,23 @@ fn suggest_in_envelope(w: u32, h: u32, min_size: u32, max_size: u32) -> Option<(
     None
 }
 
-/// The first conditioning input matching `f`.
-fn find_conditioning<'a, T>(
-    req: &'a GenerationRequest,
-    f: impl Fn(&'a Conditioning) -> Option<T>,
-) -> Option<T> {
-    req.conditioning.iter().find_map(f)
-}
-
 impl Scail2 {
     /// Map the request conditioning onto a [`Scail2Job`] and run the denoise pipeline.
     fn run(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        // Self-validate the shared floor first (F-158). `impl_generator!`'s `generate` does NOT call
-        // `validate`, so a direct `Generator::generate` on scail2 (the only provider that skipped
-        // this) otherwise bypassed count, sampler membership, conditioning allowlist, and the
-        // F-053 finiteness guard — `guidance: Some(NAN)` would NaN-poison a multi-minute render into
-        // garbage-as-success. Every other provider re-validates at the top of its generate impl.
-        //
-        // scail2 supports a "match the driving-video size" convention (`width`/`height == 0` → resolved
-        // from the driving frames below), which the floor's size-range check would wrongly reject. That
-        // exemption used to be hand-rolled here as `if req.width > 0 && req.height > 0 { … } else {
-        // validate_request_skip_size }`; it is now ADVERTISED as
-        // `SizeFloor::ResolvedDownstreamExplicitGrid` on the descriptor, so this single call applies
-        // exactly that policy — and a weights-free consumer holding these `Capabilities` computes
-        // the same verdict this line does, instead of having to guess which entry point the provider
-        // happens to call. Every other floor check is unchanged and still fires on the auto-size
-        // path: count/frame caps, sampler membership, the conditioning allowlist, support gating,
-        // and the F-053 finiteness guard.
-        //
-        // The advertised floor is also **stricter** than the branch it replaces, deliberately. `0 > 0`
-        // is false, so the old condition sent a HALF-sentinel (`0x512`, `4096x0`) down the
-        // size-skipping path: the non-zero axis carried a real, checkable size and was never
-        // range-checked, and `run` then took it verbatim into `Scail2Job` (only the zero axis is filled
-        // from the driving frame below). An explicit `0x4096` against declared bounds of 32..=1280 was
-        // accepted and rendered, with nothing downstream to catch it — `min_size`/`max_size` appear
-        // nowhere in this crate outside `descriptor()`. `ResolvedDownstream` treats only
-        // `width == 0 && height == 0` as the sentinel, which is what the convention actually means:
-        // a half-sentinel is a malformed request, not "resolve from the driving media".
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        let reference = find_conditioning(req, |c| match c {
-            Conditioning::Reference { image, .. } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| Error::Msg("scail2: a Reference character image is required".into()))?;
-        let ref_mask = find_conditioning(req, |c| match c {
-            Conditioning::Mask { image } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            Error::Msg(
-                "scail2: a Mask (the reference character's color-coded segmentation mask) is required"
-                    .into(),
-            )
-        })?;
-        let driving = req.control_clip().ok_or_else(|| {
-            Error::Msg(
-                "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
-                    .into(),
-            )
-        })?;
-        // sc-20262 — the same refusal `validate` runs, re-checked here because `impl_generator!`'s
-        // `generate` does not call `validate` (F-158, the reason the shared floor is re-checked at
-        // the top of this function too).
-        reject_unimplemented_control_clip_knobs(req)?;
-
-        // Explicit geometry is already on the advertised 32-pixel grid. A `0x0` sentinel first
-        // resolves to the driving frame's native size, then is aligned below while that source-media
-        // origin is still known.
-        let first: &Image = driving
-            .frames
-            .first()
-            .ok_or_else(|| Error::Msg("scail2: the ControlClip has no driving frames".into()))?;
-        let (resolved_width, resolved_height) = resolve_target_size(req, first);
-        // The second half of `SizeFloor::ResolvedDownstream` (sc-16167). `impl_generator!`'s
-        // `generate` does not call `validate`, so this must run here and not only there — the same
-        // reason the shared floor is re-checked at the top of this function.
-        reject_unrenderable_geometry(
-            &self.descriptor.capabilities,
-            req,
-            resolved_width,
-            resolved_height,
-        )?;
-        // Preserve the source-media origin distinction exactly once: a sentinel-resolved geometry
-        // may be floored to the render lattice, while an explicit off-grid request has already been
-        // rejected by the advertised floor above. `Scail2Job` itself accepts exact geometry only.
-        let (width, height) = if req.width == 0 && req.height == 0 {
-            (align(resolved_width) as u32, align(resolved_height) as u32)
-        } else {
-            (resolved_width, resolved_height)
-        };
-
+        let (characters, driving, (width, height)) = registered_inputs(&self.descriptor, req)?;
         let neg = req.negative_prompt.clone().unwrap_or_default();
         let job = Scail2Job {
             prompt: &req.prompt,
             negative_prompt: &neg,
             width,
             height,
-            reference: CharacterRef {
-                image: reference,
-                mask: ref_mask,
-            },
-            additional: Vec::new(),
+            reference: characters.primary,
+            additional: characters.additional,
             driving_frames: driving.frames,
             driving_masks: driving.mask,
             replace_flag: replace_flag_for_request(req),
@@ -648,13 +709,14 @@ impl Scail2 {
             // sc-18317: carry the request's typed execution selections into the engine-internal job.
             memory: req.memory,
         };
-        crate::generate::generate(
+        crate::generate::generate_scoped(
             &self.root,
             &self.config,
             &job,
             self.quant,
             &self.adapters,
             &req.cancel,
+            scope,
             on_progress,
         )
     }
@@ -669,6 +731,36 @@ fn replace_flag_for_request(req: &GenerationRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scail2_video_plan_projects_only_the_sealed_worker_request() {
+        use crate::memory_strategy::{tests, PreparedMemory};
+        let (_temp, spec) = tests::fixture_spec("bf16", None);
+        let memory = PreparedMemory::prepare(&spec).unwrap();
+        let req = tests::request("animation", 832, 480, 45);
+        let context = tests::admitted_context(&memory, &req, gen_core::MemoryCacheState::Warm);
+        let mut generator = unloaded();
+        generator.load_binding = gen_core::RenderLoadBinding::from_video_spec(&spec);
+        generator.adapters = spec.adapters.clone();
+        generator.memory_strategy = Some(memory);
+        gen_core_testkit::scail2::assert_projected_context(
+            crate::provider_registry().unwrap(),
+            &generator,
+            &spec,
+            &req,
+            context,
+        );
+    }
+
+    #[test]
+    fn scail2_video_plan_tracks_registered_characters_and_backend_windows() {
+        let generator = unloaded();
+        gen_core_testkit::scail2::assert_registered_characters_and_windows(
+            crate::provider_registry().unwrap(),
+            &generator,
+            |req| registered_inputs(generator.descriptor(), req).unwrap().0,
+        );
+    }
+
     use super::*;
     use mlx_gen::ReplacementMode;
 
@@ -788,6 +880,9 @@ mod tests {
     /// ([`CLEARED_THE_FLOOR`] / [`CLEARED_THE_GEOMETRY_GATE`]), never a bare `is_err`.
     fn unloaded() -> Scail2 {
         Scail2 {
+            load_binding: gen_core::RenderLoadBinding::from_video_spec(&LoadSpec::new(
+                WeightsSource::Dir(PathBuf::from("/nonexistent-scail2-snapshot")),
+            )),
             descriptor: descriptor(),
             config: Scail2Config::default(),
             root: PathBuf::from("/nonexistent-scail2-snapshot"),
@@ -814,7 +909,7 @@ mod tests {
             ..Default::default()
         };
         let err = m
-            .run(&bad_count, &mut noop)
+            .run(&bad_count, None, &mut noop)
             .expect_err("oversized count must be rejected on the auto-size path");
         assert!(
             err.to_string().contains("count"),
@@ -831,7 +926,7 @@ mod tests {
             ..Default::default()
         };
         let err = m
-            .run(&bad_sampler, &mut noop)
+            .run(&bad_sampler, None, &mut noop)
             .expect_err("unadvertised sampler must be rejected on the auto-size path");
         assert!(
             err.to_string().contains("sampler"),
@@ -890,7 +985,7 @@ mod tests {
                 ..Default::default()
             };
             let err = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("an out-of-range explicit size must never reach the pipeline")
                 .to_string();
             assert!(
@@ -910,7 +1005,7 @@ mod tests {
                 ..Default::default()
             };
             let err = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1004,7 +1099,7 @@ mod tests {
             // (3) and what the floor inside `generate` actually enforces. `run` always errors without
             // weights, so "the floor accepted it" is read off the message, not off `is_ok`.
             let enforced_ok = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string()
                 .contains(CLEARED_THE_FLOOR);
@@ -1073,6 +1168,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_adapter_refuses_before_pixel_or_component_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut model = unloaded();
+        model.root = root.path().to_owned();
+        model.adapters.push(mlx_gen::AdapterSpec::new(
+            model.root.join("missing-adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        // The empty root cannot supply any component, and the sized input contains
+        // no RGB bytes. The first error must identify the unreadable adapter.
+        let error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("prepared an invalid request")
+            })
+            .unwrap_err()
+            .to_string();
+        let header_error = crate::lora::has_diff_patch_keys(&model.adapters[0].path).unwrap_err();
+        assert_eq!(
+            error,
+            mlx_gen::gen_core::Error::from(header_error).to_string()
+        );
+        model.adapters.clear();
+        let pixel_error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("encoded invalid pixels")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pixel_error.contains(CLEARED_THE_GEOMETRY_GATE),
+            "{pixel_error}"
+        );
+        assert_ne!(error, pixel_error);
+    }
+
     /// The substring that identifies this gate's refusal, distinct from the shared floor's
     /// "outside supported range".
     const REFUSED: &str = "advertised size envelope";
@@ -1124,7 +1256,7 @@ mod tests {
             );
 
             let ran = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("the render path must refuse it too")
                 .to_string();
             assert!(
@@ -1178,7 +1310,7 @@ mod tests {
             // having got past the gate — not merely the absence of its message, which a request
             // that died earlier would also satisfy.
             let ran = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1350,7 +1482,7 @@ mod tests {
             let req = auto_sized(w, h);
             let validate_ok = Generator::validate(&m, &req).is_ok();
             let generate_ok = !m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string()
                 .contains(REFUSED);
@@ -1432,7 +1564,7 @@ mod tests {
 
             // The `generate` seam refuses it too, rather than only the pre-flight.
             let msg = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1454,7 +1586,7 @@ mod tests {
 
         Generator::validate(&m, &req).expect("a default-valued ControlClip must still validate");
         let msg = m
-            .run(&req, &mut noop)
+            .run(&req, None, &mut noop)
             .expect_err("no request renders without weights")
             .to_string();
         assert!(

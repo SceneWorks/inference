@@ -243,7 +243,7 @@ pub fn cfg<G: GuidanceOps>(
 /// Linearly-weighted classifier-free guidance combine (`PIPE-8`):
 /// `scale·cond + (1 − scale)·uncond`.
 ///
-/// Algebraically equivalent to [`cfg`] (`uncond + scale·(cond − uncond)`), but preserves the
+/// Algebraically equivalent to [`cfg()`] (`uncond + scale·(cond − uncond)`), but preserves the
 /// exact `scale·cond + (1 − scale)·uncond` floating-point evaluation order required for
 /// bit-exact parity (`AP13 class (a)`) on families such as Ideogram 4's asymmetric two-DiT CFG.
 pub fn cfg_linear_blend<L: LatentOps>(

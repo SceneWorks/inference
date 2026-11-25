@@ -36,7 +36,8 @@ pub fn with_global_rng_trajectory<T>(body: impl FnOnce() -> T) -> T {
 }
 
 /// Drive an MLX [`FamilyDriver<Array>`] across one or more planned slices, automatically holding
-/// [`MLX_GLOBAL_RNG_TRAJECTORY_GATE`] when `driver.support().uses_global_rng` is `true` (`B3`).
+/// the process-wide global-RNG gate via [`with_global_rng_trajectory`] when
+/// `driver.support().uses_global_rng` is `true` (`B3`).
 #[allow(clippy::too_many_arguments)]
 pub fn run_mlx_driver_slices<D: FamilyDriver<Array> + ?Sized>(
     driver: &D,

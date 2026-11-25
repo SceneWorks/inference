@@ -7,6 +7,7 @@ use super::*;
 /// [`Wan14b::generate`] — loaded, used, then dropped in turn — to bound peak memory (mirrors
 /// `generate_wan.py`, which never holds the T5 encoder and both 27 GB experts resident at once).
 pub struct Wan14b {
+    pub(super) load_binding: Option<mlx_gen::gen_core::RenderLoadBinding>,
     pub(super) descriptor: ModelDescriptor,
     pub(super) config: WanModelConfig,
     pub(super) root: PathBuf,
@@ -427,6 +428,7 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         None
     };
     Ok(Box::new(Wan14b {
+        load_binding: Some(mlx_gen::gen_core::RenderLoadBinding::from_video_spec(spec)),
         descriptor: descriptor_t2v_14b(),
         config,
         root,
@@ -485,6 +487,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         None
     };
     Ok(Box::new(Wan14b {
+        load_binding: Some(mlx_gen::gen_core::RenderLoadBinding::from_video_spec(spec)),
         descriptor: descriptor_i2v_14b(),
         config,
         root,

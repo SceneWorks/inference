@@ -374,15 +374,22 @@ fn a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique() {
         let uncond = transformer.embed_text(&multiply(&raw, scalar(0.5))?)?;
         Ok((transformer, cond, Some(uncond), 5.0))
     };
+    let phase = curated_phase(
+        "euler",
+        compute_sigmas(4, 1.0, 1000),
+        7,
+        latent.shape(),
+        WanVae::VAE_TILING,
+        0,
+        wan_expert_rule(1000, 500.0),
+    )
+    .unwrap();
     denoise_moe_curated_swapped(
-        500.0,
+        &phase,
         "euler",
         1000,
-        4,
-        1.0,
         &latent,
         None,
-        7,
         &CancelFlag::new(),
         &mut |progress| obs::observe_progress(&progress),
         load,

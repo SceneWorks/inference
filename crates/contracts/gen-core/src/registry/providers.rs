@@ -6,6 +6,7 @@ use super::*;
 pub struct ProviderRegistry {
     pub(super) generators: Box<[ModelRegistration]>,
     pub(super) render_plans: Box<[crate::RenderPlanRegistration]>,
+    pub(super) video_plans: Box<[crate::VideoPlanRegistration]>,
     pub(super) feature_routes: Box<[FeatureRouteRegistration]>,
     pub(super) checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
     pub(super) checkpoint_codecs: CheckpointCodecRegistry,
@@ -195,6 +196,31 @@ impl ProviderRegistry {
         };
         self.ensure_quant_supported(id, spec, "generator")?;
         Ok((planner.compile)(spec, request)?.map(|plan| plan.bind_load(spec)))
+    }
+
+    /// Resolve physical video execution and decode windows with the provider's metadata-only compiler.
+    pub fn compile_video_plan(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        request: &crate::GenerationRequest,
+    ) -> Result<Option<crate::VideoRenderPlan>> {
+        let Some(registration) = self
+            .video_plans
+            .iter()
+            .find(|entry| entry.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        self.ensure_quant_supported(id, spec, "generator")?;
+        let backend = self
+            .generators
+            .iter()
+            .map(|entry| (entry.descriptor)())
+            .find(|desc| desc.id == id)
+            .expect("registered video plan has an owning generator")
+            .backend;
+        crate::VideoRenderPlan::compile(registration, backend, spec, request)
     }
 
     /// Compile an ordered multi-pass request (Hires.fix: a base pass, then a pass whose reference
@@ -516,6 +542,73 @@ impl ProviderRegistry {
             descriptor.required_components = required_components;
         }
         Some(descriptor)
+    }
+
+    /// Load an imported component through its registered ordinary provider.
+    pub fn load_imported(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+        spec: &LoadSpec,
+    ) -> Result<Box<dyn Generator>> {
+        let adapter = self
+            .checkpoint_adapters
+            .iter()
+            .find(|adapter| {
+                adapter.family == family || adapter.compatibility_projection.family == family
+            })
+            .ok_or_else(|| Error::Unsupported(format!("no checkpoint adapter for {family}")))?;
+        if let Some(reuse) = adapter.loader_reuse {
+            let replacement = spec
+                .checkpoint_component(reuse.component_role)
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "{family}: missing imported {} replacement",
+                        reuse.component_role
+                    ))
+                })?;
+            let shape_matches = matches!(
+                (source, replacement),
+                (ImportedModelSource::TransformerFile, WeightsSource::File(_))
+                    | (
+                        ImportedModelSource::TransformerDirectory,
+                        WeightsSource::Dir(_)
+                    )
+            );
+            if !shape_matches
+                || !matches!(spec.weights, WeightsSource::Dir(_))
+                || spec.components.keys().any(|key| {
+                    key.starts_with("checkpoint-")
+                        && key != &format!("checkpoint-{}", reuse.component_role)
+                })
+            {
+                return Err(Error::Unsupported(format!(
+                    "{family}: imported component shape does not match registered loader reuse"
+                )));
+            }
+        } else if spec
+            .components
+            .keys()
+            .any(|key| key.starts_with("checkpoint-"))
+        {
+            return Err(Error::Unsupported(format!(
+                "{family}: this loader does not declare component replacement"
+            )));
+        }
+        let descriptor = self
+            .imported_model_descriptor(adapter.compatibility_projection.family, source, operation)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "no imported provider for {family}/{source:?}/{operation:?}"
+                ))
+            })?;
+        crate::reject_unsupported_adapters(
+            descriptor.id,
+            &descriptor.capabilities,
+            spec.adapters.len(),
+        )?;
+        self.load(descriptor.id, spec)
     }
 
     /// Provider-owned warm 1024² activation transient for `id`.

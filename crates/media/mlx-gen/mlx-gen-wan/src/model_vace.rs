@@ -1105,13 +1105,12 @@ impl WanVaceFun {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
         let base = &self.config.base;
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || crate::i2v_memory_strategy::staged(req);
+        let offload = crate::i2v_memory_strategy::effective_offload(self.offload_policy, req);
+        let sequential = offload == OffloadPolicy::Sequential;
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
         // BEFORE the UMT5 encode, the VAE conditioning encode, and the 27–54 GB dual-expert load.
-        // Both experts stay resident through the denoise (mirroring the dense A14B, model.rs), so
-        // their weight files are summed. Batch factor 1 (`cfg_enabled: false`): VACE CFG runs
+        // Price both resident experts or the larger staged expert. VACE CFG runs
         // cond/uncond as two sequential B=1 forwards (vace.rs F-073), not the dense lanes' B=2.
         //
         // Known under-fit: the 72 B/token/dim activation coefficient was fit on the DENSE forward
@@ -1129,12 +1128,7 @@ impl WanVaceFun {
         );
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            moe_denoise_resident_bytes(
-                self.offload_policy,
-                req.sampler.as_deref(),
-                low_bytes,
-                high_bytes,
-            ),
+            moe_denoise_resident_bytes(offload, req.sampler.as_deref(), low_bytes, high_bytes),
             vace_denoise_tokens(&self.config, req)?,
             base.dim,
             false,
@@ -1401,7 +1395,7 @@ pub(crate) fn vace_denoise_facts(
         MODEL_ID_VACE_FUN => (
             WanVaceConfig::vace_fun_from_model_dir(root)?,
             moe_denoise_resident_bytes(
-                spec.offload_policy,
+                crate::i2v_memory_strategy::effective_offload(spec.offload_policy, req),
                 req.sampler.as_deref(),
                 vace_dit_resident_bytes(
                     &vace_fun_expert_weights_path(root, MoeExpert::Low),

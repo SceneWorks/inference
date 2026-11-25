@@ -538,6 +538,41 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         self.assertEqual(timeline.job_closes, [True])
         self.assertEqual(timeline.stopped, [])
 
+    def test_single_wddm_short_child_completes_from_pdh_and_preserves_separate_pool_and_nvidia_evidence(self):
+        from scripts.ci import wddm_process_memory as wddm
+        from scripts.ci import video_tier1_evidence as evidence
+        from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
+        policy = self.windows_policies()[0]
+        timeline = Timeline(root_exit=2, empty=2)
+        adapter = {"cuda_uuid": policy.cuda_device_uuid, "luid": "luid_0x00000000_0x00000001",
+                   "node_mask": 1, "physical_node": 0, "counter": wddm.COUNTER}
+        system = DeviceProbe(policy, timeline, 0, use=300)
+        system.gpu_usage_basis = "global-used-upper-bound"
+        system.last_global_used_upper_bound_bytes = 400
+        pool_path = self.root / "cuda-pool.json"
+        def wait(timeout=None):
+            # The child emits the allocator receipt and exits between live NVIDIA polls.
+            pool_path.write_text(json.dumps({"pid": 1000, "cudaDeviceUuid": policy.cuda_device_uuid,
+                "poolUsedBytes": 100, "poolUsedHighBytes": 120, "poolReservedBytes": 128,
+                "poolReservedHighBytes": 140}), encoding="utf-8")
+            return 0
+        timeline.child.wait = wait
+        with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=system), \
+             patch.object(wddm, "_creation_time", return_value=10), patch.object(wddm, "_query") as query:
+            query.return_value.__enter__.return_value.side_effect = [[20, 130], [21, 160]]
+            probe = PairCudaProbe(policy, pool_path, dedicated_adapter=adapter)
+            result = self.run_fake(timeline, [probe], [policy])
+        self.assertIsNone(result.peak_gpu_bytes)
+        guard = dict(dataclasses.asdict(result), cuda_attribution=probe.measurement())
+        pool = json.loads(pool_path.read_text(encoding="utf-8"))
+        self.assertEqual((pool["pid"], pool["cudaDeviceUuid"]), (result.pid, policy.cuda_device_uuid))
+        observed = evidence.cuda_process(guard, pool["poolReservedHighBytes"], adapter)
+        self.assertEqual(observed["pool_fallback_peak_bytes"], 0)
+        self.assertEqual(observed["dedicated"]["sampled_peak_bytes"], 160)
+        guard["cuda_attribution"]["wddm_dedicated"]["missing_active_polls"] = 1
+        with self.assertRaisesRegex(ValueError, "missing attributable GPU sample"):
+            evidence.cuda_process(guard, pool["poolReservedHighBytes"], adapter)
+
     def test_primary_host_guard_and_shared_event_cap_still_abort_the_same_owned_tree(self):
         timeline = Timeline()
         probes = [DeviceProbe(p, timeline, role) for role, p in enumerate(self.policies[:2])]

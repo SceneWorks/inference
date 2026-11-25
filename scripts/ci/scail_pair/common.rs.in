@@ -1,0 +1,86 @@
+use super::*;
+use serde_json::{json, Value};
+use std::{cell::RefCell, env, fs, path::PathBuf, time::Instant};
+
+type ProofResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const FQN: &str = "generate::scail_pair_fixture::curated_tier1";
+const SEED: u64 = 104729;
+struct Pair {
+    case: String,
+    root: PathBuf,
+    out: PathBuf,
+}
+
+#[derive(Default)]
+pub(crate) struct Packing {
+    pub(crate) tokens: Vec<&'static str>,
+    pub(crate) rope: Vec<Value>,
+    pub(crate) refvid: Vec<&'static str>,
+}
+
+struct Conditioning {
+    ref_latent: State,
+    additional_ref_latent: Option<State>,
+    additional_ref_masks: Option<State>,
+    clip_fea: State,
+    context: State,
+    context_null: State,
+}
+
+struct Forward<'a, const OBSERVE: bool> {
+    inner: &'a Scail2Dit,
+    condition: &'a Conditioning,
+    history: Option<&'a State>,
+    trace: &'a RefCell<Vec<Value>>,
+}
+impl<const OBSERVE: bool> Forward<'_, OBSERVE> {
+    fn forward(&self, inp: &Scail2Inputs) -> ForwardResult<State> {
+        if OBSERVE {
+            let cond = std::ptr::eq(inp.context, &self.condition.context);
+            assert!(cond || std::ptr::eq(inp.context, &self.condition.context_null));
+            assert_eq!(inp.history_mask.is_some(), self.history.is_some());
+            if let Some(history) = self.history {
+                assert_prefix(&values(inp.x)?, &values(history)?);
+            }
+            let mut trace = self.trace.borrow_mut();
+            let first = trace.len() == 1;
+            trace.push(
+                json!({"event":"forward","context":if cond {"positive"} else {"negative"},
+                              "history":self.history.is_some(),"t_bits":inp.t.to_bits()}),
+            );
+            if first {
+                let mut packing = Packing::default();
+                let value = self.inner.forward_observed(inp, &mut packing)?;
+                trace.push(json!({"event":"packing","tokens":packing.tokens,"ref_video":packing.refvid,"rope":packing.rope}));
+                return Ok(value);
+            }
+        }
+        self.inner.forward(inp)
+    }
+}
+
+fn assert_prefix(latent: &[f32], history: &[f32]) {
+    assert_eq!(latent.len(), 16 * 2 * 4 * 8);
+    assert_eq!(history.len(), 16 * 4 * 8);
+    for (channel, pinned) in latent.chunks_exact(64).zip(history.chunks_exact(32)) {
+        assert!(channel[..32]
+            .iter()
+            .zip(pinned)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+}
+
+fn bits(values: &[f32]) -> Vec<u8> {
+    assert!(values.iter().all(|x| x.is_finite()));
+    assert!(values.windows(2).any(|xs| xs[0] != xs[1]));
+    values.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+#[derive(Default)]
+struct Sweep {
+    initial: Vec<u8>,
+    terminal: Vec<u8>,
+    trace: Vec<Value>,
+    elapsed_ns: u64,
+    completed: u32,
+}

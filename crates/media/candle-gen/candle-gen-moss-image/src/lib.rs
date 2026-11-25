@@ -871,6 +871,17 @@ candle_gen::register_generators! {pub(crate) const SFT_REGISTRATION=descriptor_s
 /// Compose both frozen generator, footprint and memory registrations.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     registry
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
+                backend: gen_core::CheckpointBackend::Candle,
+                source: gen_core::ImportedModelSource::TransformerFile,
+                operation: gen_core::ImportedModelOperation::Generate,
+                provider_id: "moss_image_base",
+                required_components: None,
+                inherit_adapters: false,
+            }],
+            ..gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER
+        })
         .register_generator(BASE_REGISTRATION)
         .register_generator(SFT_REGISTRATION)
         .register_trainer(training::BASE_REGISTRATION)

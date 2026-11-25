@@ -305,6 +305,65 @@ pub fn denoise_approx(
     }
 }
 
+/// Wan's request grid is 1 + stride × (latent_frames - 1), including trim-extended
+/// runs. The z16 and z48 VAEs have different spatial strides.
+pub fn curated_phase<S>(
+    sampler: &str,
+    sigmas: Vec<f32>,
+    seed: u64,
+    noise_shape: &[i32],
+    vae: VaeTiling,
+    references: u32,
+    models: mlx_gen::gen_core::render::video::VideoModelRule<S>,
+) -> Result<mlx_gen::gen_core::render::video::VideoDenoisePhase<S>> {
+    use mlx_gen::gen_core::{render::video::VideoDenoisePhase, sampling::Solver};
+    let (identity, latent_frames) = curated_phase_geometry(noise_shape, vae, references)?;
+    let phase = VideoDenoisePhase {
+        identity,
+        latent_frames,
+        models,
+        solver: mlx_gen::sampler::canonical_solver(Some(sampler), Solver::Euler),
+        sigmas,
+        seed,
+    };
+    phase.validate_descending_schedule(None)?;
+    Ok(phase)
+}
+
+pub(crate) fn curated_phase_geometry(
+    noise_shape: &[i32],
+    vae: VaeTiling,
+    references: u32,
+) -> Result<(mlx_gen::gen_core::render::RenderPhaseIdentity, u32)> {
+    use mlx_gen::gen_core::{render::RenderPhaseIdentity, MemoryGeometry};
+    let &[_, frames, height, width] = noise_shape else {
+        return Err(Error::Msg("Wan expects C,F,H,W noise".into()));
+    };
+    let pixels = |dim: i32, stride: i32| {
+        dim.checked_mul(stride)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Error::Msg("Wan video phase geometry overflows".into()))
+    };
+    let latent_frames = u32::try_from(frames)
+        .ok()
+        .filter(|&f| f > 0)
+        .ok_or_else(|| Error::Msg("Wan expects positive latent frames".into()))?;
+    Ok((
+        RenderPhaseIdentity {
+            pass: 0,
+            phase: 0,
+            geometry: MemoryGeometry {
+                width: pixels(width, vae.spatial_scale)?,
+                height: pixels(height, vae.spatial_scale)?,
+                frames: pixels(frames - 1, vae.temporal_scale)? + 1,
+                batch: 1,
+                reference_count: references,
+            },
+        },
+        latent_frames,
+    ))
+}
+
 /// The dense denoise loop driven by a **curated unified solver** (epic 7114, sc-7121) — the additive
 /// fold onto the shared gen-core solver library, alongside the native [`denoise`]. Routes any curated
 /// [`mlx_gen::Solver`] (`euler` / `euler_ancestral` / `heun` / `dpmpp_sde` / `ddim` / …) through
@@ -332,29 +391,60 @@ pub fn denoise_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    let phase = curated_phase(
+        sampler_name,
+        compute_sigmas(steps, shift, num_train_timesteps),
+        seed,
+        init_noise.shape(),
+        Wan22Vae::VAE_TILING,
+        0,
+        mlx_gen::gen_core::render::video::VideoModelRule::Fixed(()),
+    )?;
+    denoise_curated_prepared(
+        transformer,
+        &phase,
+        sampler_name,
+        num_train_timesteps,
+        guidance,
+        ctx_cond,
+        ctx_uncond,
+        init_noise,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_curated_prepared(
+    transformer: &WanTransformer,
+    phase: &VideoDenoisePhase<()>,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
-    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     mlx_gen::video_execution::curated_sampling(
         "wan_curated",
         sampler_name,
         "flow_velocity",
         serde_json::json!({"guidance_bits":guidance.to_bits()}),
     );
-    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
+    mlx_gen::video_execution::schedule("wan_curated", &phase.sigmas);
     let nt = num_train_timesteps as f32;
-    mlx_gen::run_flow_sampler(
-        mlx_gen::SamplerRun {
-            sampler_name: Some(sampler_name),
-            sigmas: &sigmas,
-            seed,
-            cancel,
-            on_progress,
-        },
-        mlx_gen::TimestepConvention::Sigma,
+    mlx_gen::sampler::run_video_flow_sampler(
+        phase,
+        None,
         init_noise.clone(),
-        |x, sigma| {
+        cancel,
+        on_progress,
+        |x, sigma, ()| {
             // Wan feeds the DiT the integer-valued timestep `(σ·num_train).trunc()`, not raw σ.
             let t = (sigma * nt).trunc();
             predict(transformer, x, t, &cache, guidance, None)

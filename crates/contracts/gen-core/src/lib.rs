@@ -118,6 +118,10 @@ pub mod numeric;
 pub mod phase;
 pub mod registry;
 pub mod render;
+pub use render::video_plan::{
+    VideoOutputConversion, VideoPackedComponent, VideoPhaseLayout, VideoPlanLayout,
+    VideoPlanRegistration, VideoReferenceLayout, VideoRenderPlan,
+};
 pub use render::{
     MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,
     RenderPlanRegistration, RenderRun, RenderStage,
@@ -308,20 +312,20 @@ pub use registry::{
     CheckpointBackend, CheckpointBackendBindingRegistration,
     CheckpointBaseCompatibilityRegistration, CheckpointCanonicalMappingRegistration,
     CheckpointComponentRegistration, CheckpointConfigRecoveryRegistration,
-    CheckpointDialectRegistration, CheckpointSignatureRegistration,
-    EncoderContractRouteRegistration, FeatureRouteRegistration, ImageEmbedderRegistration,
-    ImportedModelCompatibilityProjectionRegistration, ImportedModelOperation,
-    ImportedModelRegistration, ImportedModelSource, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
-    MemoryContractSurface, MemoryContractSurfaceResolverRegistration,
-    MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, ReferenceWorkspaceRegistration,
+    CheckpointDialectRegistration, CheckpointLoaderReuseRegistration,
+    CheckpointSignatureRegistration, EncoderContractRouteRegistration, FeatureRouteRegistration,
+    ImageEmbedderRegistration, ImportedModelCompatibilityProjectionRegistration,
+    ImportedModelOperation, ImportedModelRegistration, ImportedModelSource,
+    MemoryBehaviorBeginRequest, MemoryBehaviorFixture, MemoryBehaviorRegistration,
+    MemoryContractFixtureRegistration, MemoryContractSurface,
+    MemoryContractSurfaceResolverRegistration, MemoryContractSurfaceSelector,
+    MemoryContractSurfaceSpec, MemoryContractSurfaceTier, MemoryRegistration, ModelRegistration,
+    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder, ReferenceWorkspaceRegistration,
     ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration, TrainerRegistration,
-    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration, CHECKPOINT_ADAPTERS,
     FLUX2_CHECKPOINT_ADAPTER, KREA_2_CHECKPOINT_ADAPTER, MAGE_FLOW_CHECKPOINT_ADAPTER,
-    QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER, WAN_CHECKPOINT_ADAPTER,
-    Z_IMAGE_CHECKPOINT_ADAPTER,
+    MOSS_IMAGE_CHECKPOINT_ADAPTER, QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER,
+    WAN_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{

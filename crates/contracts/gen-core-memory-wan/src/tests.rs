@@ -2152,3 +2152,30 @@ fn a14b_weights_free_fixture_geometry_is_admissible() {
         );
     }
 }
+
+#[test]
+fn video_plan_wan_projection_preserves_selected_rung_and_seals_real_pixels() {
+    let (_tmp, spec) = mlx_fixture(WanI2vRoute::I2v14b, Some(Quant::Q4));
+    let prepared =
+        PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+    let mut request = request(WanI2vRoute::I2v14b);
+    request.sampler = Some("heun".into());
+    let selected = selection(&prepared, MemoryStrategy::BoundedDecode);
+    let mut ctx = context(&prepared, &request, selected, "catalog".into());
+    ctx.overlay = None;
+    assert!(project_video_context(&prepared, &request, &mut ctx).unwrap());
+    assert_eq!(ctx.selection, selected);
+    assert_eq!(
+        ctx.evidence_revision,
+        request_evidence_revision_for_selection(&prepared, &request, &selected).unwrap()
+    );
+    let old = ctx.evidence_revision.clone();
+    let Conditioning::Reference { image, .. } = &mut request.conditioning[0] else {
+        unreachable!()
+    };
+    image.pixels[0] ^= 1;
+    assert!(project_video_context(&prepared, &request, &mut ctx).unwrap());
+    assert_ne!(ctx.evidence_revision, old);
+    ctx.overlay = Some("unrelated".into());
+    assert!(!project_video_context(&prepared, &request, &mut ctx).unwrap());
+}

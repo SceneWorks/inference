@@ -46,7 +46,12 @@ pub use vae::{load_vae_decoder, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_video_plan(mlx_gen::gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: model::compile_video_plan,
+        })
 }
 
 /// Build the complete explicit MLX Mochi 1 provider catalog.
@@ -56,6 +61,63 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    #[test]
+    fn registered_video_plan_reads_shared_codec_metadata_before_weights() {
+        use mlx_gen::gen_core::{GenerationRequest, LoadSpec, WeightsSource};
+        let root = tempfile::tempdir().unwrap();
+        let tier = root.path().join("bf16");
+        std::fs::create_dir_all(tier.join("transformer")).unwrap();
+        std::fs::write(tier.join("split_model.json"), r#"{"quantized":false}"#).unwrap();
+        std::fs::create_dir(root.path().join("text_encoder")).unwrap();
+        std::fs::create_dir(root.path().join("vae")).unwrap();
+        // Non-default metadata detects accidental hard-coding of the real 6x8 checkpoint.
+        std::fs::write(
+            root.path().join("vae/config.json"),
+            r#"{"temporal_expansions":[1,1,3],"spatial_expansions":[1,2,2]}"#,
+        )
+        .unwrap();
+        let req = GenerationRequest {
+            prompt: "kitten".into(),
+            width: 64,
+            height: 48,
+            frames: Some(7),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(tier));
+        let registry = super::provider_registry().unwrap();
+        let plan = registry
+            .compile_video_plan(super::MODEL_ID, &spec, &req)
+            .unwrap()
+            .unwrap();
+        let phase = &plan.layout().phases[0];
+        assert_eq!(
+            plan.minimum_denoise_live_bytes(plan.layout().domain)
+                .unwrap(),
+            16_891_904
+        );
+        assert_eq!(
+            (phase.latent_frames, phase.latent_bytes),
+            (3, 3 * 12 * 16 * 12 * 4)
+        );
+        assert_eq!((phase.decoded_frames, phase.decode_chunk_frames), (9, 3));
+        assert_eq!(plan.layout().output.frames, 7);
+        // All seven cropped f32 frames are live beside their concatenation. The two
+        // contiguous RGB copies (one array and the returned vectors) are a smaller peak.
+        let rgb_frame = 64 * 48 * 3;
+        assert_eq!(
+            plan.minimum_decode_live_bytes(mlx_gen::gen_core::MemoryBudgetDomain::UnifiedMemory)
+                .unwrap(),
+            14 * 4 * rgb_frame
+        );
+        let invalid = GenerationRequest {
+            frames: Some(8),
+            ..req
+        };
+        assert!(registry
+            .compile_video_plan(super::MODEL_ID, &spec, &invalid)
+            .is_err());
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();

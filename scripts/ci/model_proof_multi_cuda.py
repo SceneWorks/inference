@@ -188,9 +188,8 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
     guard.time = SimpleNamespace(monotonic=time.monotonic, sleep=bounded_sleep)
     devices = []; handles = []; baselines = {}; record = None; body_error = None
     try:
-        # Admission = each policy's reserve + child cap free, stable under the lock; foreign tenants allowed.
-        required = {policy.cuda_device_uuid: policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes
-                    for policy in policies}
+        # Admission = each policy's reserve + claim estimate free, stable under the lock; foreign tenants allowed.
+        required = {policy.cuda_device_uuid: resources.claim_required_free_bytes(policy) for policy in policies}
         devices, handles, baselines, waited = primitives.claim_uuids(
             uuids, guard, output, deadline, public, locker, required, sleep=bounded_sleep)
         # Fresh context-free driver mapping in EXACT actual child visibility/order, after both leases.
@@ -200,7 +199,8 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
         binding = primitives.resolve_binding(guard, output, deadline, env, cuda_ordinals='0,1')
         validate_driver_binding(binding, uuids, env)
         record = {'mechanism': 'existing PUBLIC UUID leases; sorted lock order, preserved CUDA source role order',
-                  'admission_policy': 'per-UUID reserve plus child cap free across stable samples; foreign contexts/utilization diagnostic',
+                  'admission_policy': 'per-UUID reserve plus claim estimate free across stable samples; foreign contexts/utilization diagnostic',
+                  'claim_gpu_estimates': {policy.cuda_device_uuid: resources.claim_estimate_record(policy) for policy in policies},
                   'approved_uuid_roles': list(uuids), 'lock_order': [device['uuid'] for device in devices],
                   'actual_ordinal_binding': binding, 'admission_baselines': baselines,
                   'wait_seconds': waited, 'post_execution_verified': False, 'post_idle_devices': []}

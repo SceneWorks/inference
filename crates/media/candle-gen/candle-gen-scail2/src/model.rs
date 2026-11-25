@@ -272,6 +272,31 @@ pub struct Scail2Dit {
 type ScailRopeGeom = (usize, usize, usize, usize, usize);
 
 impl Scail2Dit {
+    /// All independently owned block projection weights. RoPE caches, activations and
+    /// uncounted non-block weights cannot be credited as these retained allocations.
+    pub(crate) fn resident_block_weight_bytes(&self) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|block| {
+                [
+                    &block.self_attn.q,
+                    &block.self_attn.k,
+                    &block.self_attn.v,
+                    &block.self_attn.o,
+                    &block.cross.q,
+                    &block.cross.k,
+                    &block.cross.v,
+                    &block.cross.o,
+                    &block.cross.k_img,
+                    &block.cross.v_img,
+                    &block.ffn0,
+                    &block.ffn2,
+                ]
+            })
+            .map(QLinear::resident_weight_bytes)
+            .sum()
+    }
+
     /// Load the DiT from a `VarBuilder` over the converted `SCAIL2Model` parameters (raw param names:
     /// `patch_embedding{,_pose,_mask}`, `blocks.{i}.{self_attn,cross_attn,...}`, `img_emb.proj.*`,
     /// `time_*`, `text_embedding.*`, `head.*`). The `VarBuilder` should be f32.

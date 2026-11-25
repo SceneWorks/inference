@@ -97,35 +97,3 @@ pub struct ControlClipRef<'a> {
     pub start_frame: i32,
     pub mode: ReplacementMode,
 }
-
-/// Exact SCAIL-2 public animation/replacement carrier: one character image, its paired color mask, and one
-/// driving clip with a one-to-one frame/mask sequence. The three physical conditioning entries are
-/// one conceptual character reference for memory-evidence geometry.
-#[derive(Clone, Copy, Debug)]
-pub struct Scail2AnimationConditioningRef<'a> {
-    pub character: &'a Image,
-    pub character_mask: &'a Image,
-    pub driving_frames: &'a [Image],
-    pub driving_masks: &'a [Image],
-}
-
-impl Scail2AnimationConditioningRef<'_> {
-    pub const fn reference_count(&self) -> u32 {
-        1
-    }
-
-    pub fn identity_shape(&self, mode: &str) -> crate::Result<String> {
-        let control = self
-            .driving_frames
-            .first()
-            .ok_or_else(|| Error::Unsupported("scail2 carrier has no driving frames".to_owned()))?;
-        Ok(format!(
-            "{mode}:reference:{}x{}:control:{}x{}x{}",
-            self.character.width,
-            self.character.height,
-            control.width,
-            control.height,
-            self.driving_frames.len()
-        ))
-    }
-}

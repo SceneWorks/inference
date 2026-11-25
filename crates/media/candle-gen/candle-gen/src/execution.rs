@@ -348,18 +348,10 @@ pub fn capture_with<G: Generator + ?Sized>(
     on_progress: &mut dyn FnMut(Progress),
     loaded_policy: impl FnOnce(),
 ) -> gen_core::Result<CompletedGeneration> {
-    let attempt = Attempt::begin();
-    loaded_policy();
-    let generation = generator.generate_with_report(req, &mut |progress| {
-        outside_attempt(|| on_progress(progress));
-    })?;
-    if req.cancel.is_cancelled() {
-        return Err(gen_core::Error::Canceled);
-    }
-    let observations = attempt.finish();
-    let images = output_facts(generation.output.as_ref());
-    let execution = observations.identity(generator.descriptor(), &images);
-    CompletedGeneration::new(generation, execution, generator.descriptor())
+    capture_generation(generator.descriptor(), req, on_progress, |on_progress| {
+        loaded_policy();
+        generator.generate_with_report(req, on_progress)
+    })
 }
 
 /// The admitted-runner counterpart of [`capture_with`]: one attempt around the provider's
@@ -373,18 +365,29 @@ pub fn capture_planned_with<G: Generator + ?Sized>(
     on_progress: &mut dyn FnMut(Progress),
     loaded_policy: impl FnOnce(),
 ) -> gen_core::Result<CompletedGeneration> {
+    capture_generation(generator.descriptor(), req, on_progress, |on_progress| {
+        loaded_policy();
+        generator.generate_planned(req, plan, scope, on_progress)
+    })
+}
+
+/// Capture one provider-owned execution body, including its already configured request
+/// scope. Progress callbacks run outside capture and cancellation precedes publication.
+pub fn capture_generation(
+    descriptor: &gen_core::ModelDescriptor,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    run: impl FnOnce(&mut dyn FnMut(Progress)) -> gen_core::Result<gen_core::GenerationReport>,
+) -> gen_core::Result<CompletedGeneration> {
     let attempt = Attempt::begin();
-    loaded_policy();
-    let generation = generator.generate_planned(req, plan, scope, &mut |progress| {
-        outside_attempt(|| on_progress(progress));
-    })?;
+    let generation = run(&mut |progress| outside_attempt(|| on_progress(progress)))?;
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
     let observations = attempt.finish();
     let images = output_facts(generation.output.as_ref());
-    let execution = observations.identity(generator.descriptor(), &images);
-    CompletedGeneration::new(generation, execution, generator.descriptor())
+    let execution = observations.identity(descriptor, &images);
+    CompletedGeneration::new(generation, execution, descriptor)
 }
 
 fn output_facts(output: Option<&GenerationOutput>) -> Vec<Value> {

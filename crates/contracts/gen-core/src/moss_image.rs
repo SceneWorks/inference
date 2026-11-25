@@ -510,7 +510,23 @@ pub struct MossImageAssetReceipt {
     pub relative_path: String,
     pub sha256: String,
 }
+/// Content-addressed caller-owned transformer identity; never a published model asset.
+pub const IMPORTED_TRANSFORMER_REPOSITORY: &str = "user-checkpoint";
+pub const IMPORTED_TRANSFORMER_REVISION: &str = "content-addressed-v1";
+pub const IMPORTED_TRANSFORMER_PATH: &str = "transformer/imported.safetensors";
+
 impl MossImageAssetReceipt {
+    pub fn from_imported_transformer(pin: &crate::PinnedWeightsFile) -> Result<Self> {
+        pin.ensure_unchanged()?;
+        Ok(Self {
+            role: MossImageAssetRole::Transformer,
+            repository: IMPORTED_TRANSFORMER_REPOSITORY.into(),
+            revision: IMPORTED_TRANSFORMER_REVISION.into(),
+            relative_path: IMPORTED_TRANSFORMER_PATH.into(),
+            sha256: hex_digest(pin.content_sha256()),
+        })
+    }
+
     /// Construct from an approved logical asset and retained pin, independent of physical basename.
     /// Frozen repository/revision/path, size and digest must all authenticate; labels alone fail.
     pub fn from_pin(
@@ -760,7 +776,27 @@ fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
         "selected MLX stream device cannot be attached to another backend",
     )?;
     let r = &data.resolved;
-    let expected = receipt_asset_paths(r.acceleration);
+    let mut expected = receipt_asset_paths(r.acceleration);
+    let imported = data
+        .assets
+        .iter()
+        .any(|asset| asset.repository == IMPORTED_TRANSFORMER_REPOSITORY);
+    if imported {
+        require(
+            r.acceleration == MossImageAcceleration::Off,
+            "imported transformer cannot be replaced by a published DMD transformer",
+        )?;
+        expected.retain(|(role, path), _| {
+            *role != MossImageAssetRole::Transformer || path == "transformer/config.json"
+        });
+        expected.insert(
+            (
+                MossImageAssetRole::Transformer,
+                IMPORTED_TRANSFORMER_PATH.into(),
+            ),
+            (),
+        );
+    }
     let mut seen = BTreeSet::new();
     for asset in &data.assets {
         let key = (asset.role, asset.relative_path.clone());
@@ -768,6 +804,16 @@ fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
             expected.contains_key(&key) && seen.insert(key),
             "receipt has unexpected/duplicate consumed assets",
         )?;
+        if asset.repository == IMPORTED_TRANSFORMER_REPOSITORY {
+            require(
+                asset.role == MossImageAssetRole::Transformer
+                    && asset.relative_path == IMPORTED_TRANSFORMER_PATH
+                    && asset.revision == IMPORTED_TRANSFORMER_REVISION
+                    && valid_digest(&asset.sha256),
+                "invalid imported transformer receipt",
+            )?;
+            continue;
+        }
         let (repo, revision) = match asset.role {
             MossImageAssetRole::Transformer
                 if matches!(
@@ -1265,6 +1311,37 @@ mod execution_receipt_tests {
             "MOSS-Image: skip layers must be zero-based indices in 0..42"
         );
     }
+    #[test]
+    fn imported_transformer_receipt_replaces_only_weights_and_never_claims_publisher_identity() {
+        let mut data = example(MossImageAcceleration::Off);
+        data.assets.retain(|asset| {
+            asset.role != MossImageAssetRole::Transformer
+                || asset.relative_path == "transformer/config.json"
+        });
+        data.assets.push(MossImageAssetReceipt {
+            role: MossImageAssetRole::Transformer,
+            repository: IMPORTED_TRANSFORMER_REPOSITORY.into(),
+            revision: IMPORTED_TRANSFORMER_REVISION.into(),
+            relative_path: IMPORTED_TRANSFORMER_PATH.into(),
+            sha256: HASH.into(),
+        });
+        let report = MossImageExecutionReport::new(data.clone()).unwrap();
+        let wire = serde_json::to_value(report).unwrap();
+        assert!(serde_json::from_value::<MossImageExecutionReport>(wire).is_ok());
+        let mut bad = data.clone();
+        bad.assets.last_mut().unwrap().relative_path = "transformer/config.json".into();
+        assert!(MossImageExecutionReport::new(bad).is_err());
+        let mut omitted = data.clone();
+        omitted
+            .assets
+            .retain(|asset| asset.role != MossImageAssetRole::Vae);
+        assert!(MossImageExecutionReport::new(omitted).is_err());
+        let accelerated = example(MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32));
+        data.resolved = accelerated.resolved;
+        data.sampling = accelerated.sampling;
+        assert!(MossImageExecutionReport::new(data).is_err());
+    }
+
     #[test]
     fn receipt_round_trips_all_policies_and_refuses_crossed_execution_facts() {
         for mode in [

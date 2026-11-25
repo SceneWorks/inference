@@ -1126,6 +1126,31 @@ pub fn run_flow_sampler_with_latent_hook(
     Ok(output)
 }
 
+/// Sample inside an admitted video phase with raw flow sigma conditioning. The solver requests its
+/// own evaluation coordinates, including Heun correctors and off-grid DPM++ SDE midpoints.
+pub fn run_video_flow_sampler<S: Copy>(
+    phase: &gen_core::render::video::VideoDenoisePhase<S>,
+    first_before_guard: Option<f32>,
+    latents: Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Array, f32, S) -> Result<Array>,
+) -> Result<Array> {
+    phase.validate_descending_schedule(first_before_guard)?;
+    run_flow_sampler(
+        SamplerRun {
+            sampler_name: Some(phase.solver.name()),
+            sigmas: &phase.sigmas,
+            seed: phase.seed,
+            cancel,
+            on_progress,
+        },
+        TimestepConvention::Sigma,
+        latents,
+        |x, sigma| predict(x, sigma, phase.models.slot(sigma)),
+    )
+}
+
 pub fn run_flow_sampler_with_latent_hook_spans(
     run: SamplerRun<'_>,
     conv: TimestepConvention,

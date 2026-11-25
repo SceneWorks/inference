@@ -215,11 +215,24 @@ pub fn auto_tiling_budgeted_z16_quality_overlap(
     width: i32,
     out_frames: i32,
 ) -> Result<Option<TilingConfig>> {
+    capped_z16_quality_overlap(height, width, out_frames, None)
+}
+
+/// Use the native quality-overlap candidates and free-memory check with an optional
+/// upper bound from a measured render. The ordinary Wan selector has no additional cap.
+pub fn capped_z16_quality_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    ceiling_bytes: Option<u64>,
+) -> Result<Option<TilingConfig>> {
+    let live = wan_vae_safe_budget_gib();
+    let safe_gib = ceiling_bytes.map_or(live, |bytes| live.min(bytes as f64 / 1_073_741_824.0));
     plan_z16_tiling_with_overlap(
         height,
         width,
         out_frames,
-        wan_vae_safe_budget_gib(),
+        safe_gib,
         TemporalOverlapPolicy::HalfTile,
     )
 }

@@ -6,14 +6,20 @@ impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
     /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     pub(super) fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
+        Self::validate_metadata(&self.descriptor, &self.config, req)
+    }
+
+    pub(super) fn validate_metadata(
+        descriptor: &ModelDescriptor,
+        config: &WanModelConfig,
+        req: &GenerationRequest,
+    ) -> Result<()> {
         // Shared capability floor: size range (the advertised `min_size` = MIN_SIZE = 480 is the
         // 5B coherence floor below which the z48 vae22 renders garbage, sc-10306/sc-12636 — NOT the
         // 32-px grid stride, which `reject_off_grid` enforces below; `max_size` caps the long edge),
         // count, guidance/negative/true_cfg, sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and
         // conditioning (`Reference`/`Keyframe`).
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
+        descriptor.capabilities.validate_request(MODEL_ID, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -32,9 +38,9 @@ impl Wan {
         // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
         // via `is_multiple_of(SIZE_MULTIPLE)`). sc-12308: the 5B's OWN 901 120 area budget — its 32-px
         // grid makes 1280×704 the geometry it genuinely renders.
-        let (dw, dh) = grid(&self.config, Ti2vProviderVae::VAE_TILING);
+        let (dw, dh) = grid(config, Ti2vProviderVae::VAE_TILING);
         reject_off_grid(MODEL_ID, req, dw, dh)?;
-        reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
+        reject_over_area(MODEL_ID, req, dw, dh, config.max_area)?;
         // sc-19571: the conditioning strengths now reach the mask builder, so their range is load
         // bearing — reject out-of-range/non-finite here rather than letting `1 − strength` become a
         // negative mask deep in the denoise.
@@ -60,7 +66,7 @@ impl Wan {
         // hook. (The 14B sibling has no mask-blend path: its I2V is channel-concat, which the
         // curated solvers DO serve via `denoise_moe_curated`.)
         if is_wan_curated(req.sampler.as_deref()) && image_conditioned {
-            return Err(Error::Msg(
+            return Err(Error::Unsupported(
                 "wan2_2_ti2v_5b: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                  supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
                     .into(),
@@ -93,6 +99,7 @@ impl Wan {
     pub(super) fn generate_impl(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Reject anything outside the advertised surface before doing expensive work — in particular
@@ -121,16 +128,18 @@ impl Wan {
         // freed UMT5 TE / VAE-encoder don't linger in MLX's buffer cache (RSS / wired footprint) through
         // the denoise + decode that follow. `Resident` (default) leaves the cache warm — the
         // byte-identical pre-offload path (residency/lifetime change only, numerics untouched).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || crate::i2v_memory_strategy::staged(req);
+        let offload = crate::i2v_memory_strategy::effective_offload(self.offload_policy, req);
+        let sequential = offload == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
-        let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
-        let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let vae_stride = provider_vae_stride(Ti2vProviderVae::VAE_TILING);
-        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim_out;
-        let (width, height) = resolve_capped_dims(req, cfg, Ti2vProviderVae::VAE_TILING);
+        let vae = Ti2vProviderVae::VAE_TILING;
+        let VideoDimensions {
+            frames: _,
+            trim_out,
+            width,
+            height,
+            lat,
+        } = video_dimensions(req, cfg, vae)?;
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
@@ -144,8 +153,6 @@ impl Wan {
             .negative_prompt
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
-
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12796: this is policy-INdependent for the dense 5B (unlike the A14B's `moe_denoise_resident_bytes`,
@@ -270,6 +277,26 @@ impl Wan {
         }
 
         // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
+        let curated = req
+            .sampler
+            .as_deref()
+            .filter(|name| is_wan_curated(Some(name)))
+            .map(|name| {
+                crate::pipeline::curated_phase(
+                    name,
+                    crate::scheduler::compute_sigmas(steps, shift, cfg.num_train_timesteps),
+                    seed,
+                    &lat,
+                    Ti2vProviderVae::VAE_TILING,
+                    0,
+                    mlx_gen::gen_core::render::video::VideoModelRule::Fixed(()),
+                )
+            })
+            .transpose()?;
+        let active = curated
+            .as_ref()
+            .map(|phase| phase.enter(&req.cancel, scope))
+            .transpose()?;
         let latents = {
             let mut w = Weights::from_file(self.root.join("model.safetensors"))?;
             // Adapter routing (sc-2683 / sc-2393 / sc-10045), two mutually-exclusive paths:
@@ -309,17 +336,17 @@ impl Wan {
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
             // single-eval curated-sampler hook, so it stays native-only.
-            match (&ti2v, is_wan_curated(req.sampler.as_deref())) {
-                (Some(_), true) => {
+            match (&ti2v, &curated) {
+                (Some(_), Some(_)) => {
                     // Unreachable via requests — `validate_impl` rejects curated × mask-blend up
                     // front (F-074a); kept as a defensive backstop for direct callers.
-                    return Err(Error::Msg(
+                    return Err(Error::Unsupported(
                         "wan: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                          supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
                             .into(),
                     ));
                 }
-                (Some((z_img, mask, mask_tokens)), false) => {
+                (Some((z_img, mask, mask_tokens)), None) => {
                     // Unwired for the denoise feature cache: the mask-blend re-mixes the conditioning
                     // latent into the trajectory after every step (sc-18322).
                     refuse_unwired_approximation(
@@ -350,7 +377,7 @@ impl Wan {
                         &mut on_step,
                     )?
                 }
-                (None, true) => {
+                (None, Some(phase)) => {
                     // Unwired: a curated solver evaluates the model 1..N times per solver step, so
                     // "the previous step's residual" has no single meaning (sc-18322).
                     refuse_unwired_approximation(
@@ -358,22 +385,20 @@ impl Wan {
                         "curated unified solver",
                         &approximation,
                     )?;
-                    denoise_curated(
+                    crate::pipeline::denoise_curated_prepared(
                         &dit,
-                        req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                        phase,
+                        req.sampler.as_deref().expect("curated sampler"),
                         cfg.num_train_timesteps,
-                        steps,
-                        shift,
                         guidance,
                         &ctx_cond,
                         ctx_uncond.as_ref(),
                         &latents_init,
-                        seed,
                         &req.cancel,
                         on_progress,
                     )?
                 }
-                (None, false) => {
+                (None, None) => {
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
                             current: i as u32,
@@ -420,6 +445,11 @@ impl Wan {
         // `vae22` decode is the heavy stage, so keeping its dead buffers off-GPU is the point.
         if sequential {
             mlx_rs::memory::clear_cache();
+        }
+
+        if let Some(active) = active {
+            drop((context, context_null, latents_init, init_noise, ti2v));
+            active.finish()?;
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---

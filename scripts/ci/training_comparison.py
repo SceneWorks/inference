@@ -16,6 +16,8 @@ import re
 import statistics
 import time
 
+from scripts.ci import model_proof_resources
+
 PROTOCOL = 'conditional-v1'
 STAGES = ('legacy', 'current', 'minus-e1', 'minus-e2', 'minus-e3',
           'minus-reference-owner', 'plus-streaming')
@@ -24,6 +26,9 @@ DEVICES = {
     'gpu1': ('GPU-e4b79931-7be6-f216-460a-f5405cfafffe', 1),
 }
 RECIPES = {f'fixed_cuda_comparison_{name}': name for name in DEVICES}
+# A request naming this configuration and a policy with no card runs on whichever registered card
+# has the most free memory that fits, through that card's own registered recipe.
+CARD_FREE_RECIPE = 'fixed_cuda_comparison'
 SHA = re.compile(r'[0-9a-f]{64}')
 
 
@@ -136,6 +141,26 @@ def is_recipe(name: object) -> bool:
     return name in RECIPES if isinstance(name, str) else False
 
 
+def is_card_free(value: dict) -> bool:
+    from scripts.ci.model_proof_resources import card_free_policy
+    return value.get('configuration') == CARD_FREE_RECIPE and card_free_policy(value.get('policy'))
+
+
+def recipe_for(uuid: str) -> str:
+    """The registered comparison recipe that runs on physical card `uuid`."""
+    return next(name for name, binding in RECIPES.items() if DEVICES[binding][0] == uuid)
+
+
+def planning_configuration(value: dict):
+    """The configuration a card-free request is planned and validated under (its first card's recipe)."""
+    return recipe_for(DEVICES['gpu0'][0]) if is_card_free(value) else value.get('configuration')
+
+
+def concrete_request(value: dict, uuid: str) -> dict:
+    """A card-free request bound to card `uuid`: that card's recipe and policy."""
+    return dict(value, configuration=recipe_for(uuid), policy=dict(value['policy'], cudaDeviceUuid=uuid))
+
+
 def recipe_binding(row: dict, name: str, recipe: dict) -> tuple[str, int]:
     plan = spec(row)
     binding = RECIPES.get(name)
@@ -154,6 +179,10 @@ def recipe_binding(row: dict, name: str, recipe: dict) -> tuple[str, int]:
 
 
 def validate_request(rows: tuple[dict, ...], value: dict, backend: str) -> dict:
+    if is_card_free(value):
+        from scripts.ci.model_proof_resources import CARD_SELECTION_RULE
+        plan = validate_request(rows, concrete_request(value, DEVICES['gpu0'][0]), backend)
+        return {**plan, 'device_binding': CARD_SELECTION_RULE, 'cuda_uuid': None, 'physical_index': None}
     if backend != 'candle-cuda' or len(rows) != 1 or not is_recipe(value.get('configuration')):
         raise ValueError('comparison requires one exact CUDA training case and reviewed comparison recipe')
     row = rows[0]
@@ -244,6 +273,25 @@ def apply_stage(row: dict, env: dict) -> None:
         runtime.mkdir(exist_ok=False)
         (runtime / marker.name).write_bytes(marker_bytes)
         env['BESPOKE_RUNTIME_DIR'] = str(runtime)
+
+
+def reset_stage_runtime(stage: str, environment=None) -> None:
+    """Remove a stage's owned runtime subdirectory (made by apply_stage before its claim) so a
+    stage rerun after a card switch can create it afresh; its parent must carry the owned marker."""
+    environment = os.environ if environment is None else environment
+    if not environment.get('BESPOKE_RUNTIME_DIR'):
+        return
+    from scripts.ci import model_inference_proofs as proof
+    parent = Path(environment['BESPOKE_RUNTIME_DIR'])
+    runtime = parent / ('comparison-' + stage)
+    marker = parent / '.sc-26850-owned-runtime'
+    if not runtime.exists() and not runtime.is_symlink():
+        return
+    proof.unlinked_path(runtime, parent)
+    if proof.linked(marker) or not marker.is_file() or not runtime.is_dir():
+        raise ValueError('comparison stage runtime is not an owned directory')
+    import shutil
+    shutil.rmtree(runtime)
 
 
 def _finite(value: object, *, positive=False) -> bool:
@@ -526,7 +574,7 @@ def _inventory(root: Path) -> dict:
     return result
 
 
-def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path) -> int:
+def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path, *, rows_for=None) -> int:
     from scripts.ci import model_inference_proofs as proof
     # This clock starts before discovery/compilation/admission of the first child.
     # All readiness waits and subsequent children consume this SAME budget.
@@ -546,6 +594,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                'terminal_model_evidence': False}
     receipt['comparison_started_monotonic'] = started
     receipt['comparison_deadline_monotonic'] = started + value['policy']['deadlineSeconds']
+    request_value, abandon, switched = value, None, None
     results = []
     inherited_target = os.environ.get('CARGO_TARGET_DIR')
     # One fresh owned compile namespace for the whole model comparison. Later
@@ -553,7 +602,24 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     # no cross-listener rebuild can replace it between bounded stages.
     os.environ['CARGO_TARGET_DIR'] = str(work / 'cargo-target')
     try:
-        for stage in plan['execution_order']:
+        if is_card_free(value):
+            # Run every stage on the registered card with the most free memory that fits, under that
+            # card's own registered recipe. If that card is taken before the first stage's claim, the
+            # first stage switches to the other card when it fits (see card_switcher). A refusal
+            # (no card fit before the deadline) is kept in the unsuccessful receipt.
+            try:
+                chosen, receipt['cuda_card_selection'] = model_proof_resources.choose_card(
+                    value['policy'], work, deadline_monotonic=receipt['comparison_deadline_monotonic'])
+            except model_proof_resources.CudaClaimRejected as error:
+                model_proof_resources.record_selection_refusal(receipt, error)
+                raise
+            abandon, switched = model_proof_resources.card_switcher(value['policy'], work, receipt['cuda_card_selection'])
+            value = concrete_request(value, chosen['cudaDeviceUuid'])
+            rows = rows_for(chosen['cudaDeviceUuid'])
+            validate_request(rows, value, backend)
+        queue = list(plan['execution_order'])
+        while queue:
+            stage = queue[0]
             elapsed = time.monotonic() - started
             remaining = value['policy']['deadlineSeconds'] - elapsed
             if remaining <= max(value['policy']['pollMillis'], value['policy']['termGraceMillis']) / 1000:
@@ -567,9 +633,26 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                       'elapsed_before_stage_seconds': elapsed,
                       'remaining_original_deadline_seconds': remaining}
             receipt['stage_records'].append(record)
-            code = proof.run((selected,), backend, child_value, expected, destination,
-                             comparison_work=work / stage,
-                             comparison_deadline_monotonic=receipt['comparison_deadline_monotonic'])
+            first = not results and len(receipt['stage_records']) == 1
+            try:
+                switch = {'abandon_wait': abandon} if first and abandon is not None else {}
+                code = proof.run((selected,), backend, child_value, expected, destination,
+                                 comparison_work=work / stage,
+                                 comparison_deadline_monotonic=receipt['comparison_deadline_monotonic'],
+                                 **switch)
+            except model_proof_resources.CudaCardTaken:
+                # The first stage's card was taken before its claim and the other card fits now:
+                # discard the unstarted stage and rerun it on the other card's recipe.
+                import shutil
+                receipt['stage_records'].pop()
+                shutil.rmtree(destination)
+                shutil.rmtree(work / stage)
+                reset_stage_runtime(stage)
+                receipt['cuda_card_selection'] = switched['selection']
+                value = concrete_request(request_value, switched['selection']['chosen_uuid'])
+                rows = rows_for(switched['selection']['chosen_uuid'])
+                validate_request(rows, value, backend)
+                continue
             record['returncode'] = code
             child_receipt = json.loads((destination / 'receipt.json').read_text(encoding='utf-8'))
             case = child_receipt.get('cases', [{}])[0]
@@ -586,6 +669,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             results.append(case['training_comparison'])
             if len({x['executable_sha256'] for x in receipt['stage_records']}) != 1:
                 raise ValueError('stage compiled native executable identity changed')
+            queue.pop(0)
         receipt['measurement'] = aggregate(plan, results)
         receipt['accepted'] = True
     except (ValueError, OSError, KeyError, IndexError) as error:
@@ -609,7 +693,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
 
 
 def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
-                     rows: tuple[dict, ...], backend: str) -> dict:
+                     rows: tuple[dict, ...], backend: str, *, rows_for=None) -> dict:
     from scripts.ci import model_inference_proofs as proof
     plan = validate_request(rows, value, backend)
     proof.unlinked_path(output, temporary)
@@ -625,6 +709,26 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             or receipt.get('acceptance_scope') != 'controlled-training-timing-supplement'
             or any(receipt.get(k) is not False for k in ('checkpoint_byte_integrity_attested', 'verified_named_revision', 'terminal_model_evidence'))):
         raise ValueError('comparison source/request/plan binding mismatch')
+    from scripts.ci.model_proof_resources import executed_card_policy
+    if is_card_free(value):
+        # Replay against the card the comparison's recorded most-free selection chose.
+        executed = executed_card_policy(value['policy'], receipt.get('cuda_card_selection'),
+                                        refusal=receipt.get(model_proof_resources.SELECTION_REFUSAL),
+                                        unstarted=not receipt.get('accepted') and not receipt.get('stage_records'))
+        if executed is None:
+            # No card fit before the deadline: an unsuccessful comparison that ran no stage.
+            if receipt['accepted'] or receipt.get('stage_records') or 'measurement' in receipt or not receipt.get('error'):
+                raise ValueError('a refused card selection cannot report stages or measurements')
+            if _inventory(output) != receipt.get('artifacts'):
+                raise ValueError('comparison artifact hash/file inventory mismatch')
+            return {'protocol': PROTOCOL, 'source_revision': expected, 'accepted': False, 'files': 2,
+                    'bytes': sum((output / n).stat().st_size for n in ('receipt.json', 'summary.md')),
+                    'conservative_updates_charged': 0, 'automatic_retry': False, 'production_promotion': False}
+        value = concrete_request(value, executed['cudaDeviceUuid'])
+        rows = rows_for(executed['cudaDeviceUuid'])
+        validate_request(rows, value, backend)
+    elif 'cuda_card_selection' in receipt:
+        raise ValueError('a named-card comparison records no card selection')
     records = receipt.get('stage_records')
     original_start = receipt.get('comparison_started_monotonic')
     original_deadline = receipt.get('comparison_deadline_monotonic')

@@ -604,6 +604,37 @@ class FluxPairTests(unittest.TestCase):
             self.assertEqual(receipt["cleanup_failure"], str(locked))
             comparison.verify(args, contract)
 
+    def test_no_card_fitting_before_the_deadline_publishes_a_verifiable_refusal(self):
+        from scripts.ci import model_proof_resources as resources
+        with TemporaryDirectory() as temp, ExitStack() as mocks:
+            root = Path(temp).resolve()
+            args = SimpleNamespace(backend="candle-cuda", output=root / "artifact")
+            policy = json.loads((comparison.ROOT / "docs/evidence/sga-eng-1a/cuda-route-plan.json")
+                                .read_text(encoding="utf-8"))["request"]["policy"]
+            policy = {key: value for key, value in policy.items() if key != "cudaDeviceUuid"}
+            contract = {"tier": "tier1", "request": {"policy": policy}}
+            refusal = {"rule": resources.CARD_SELECTION_RULE, "polls": 4, "admission_error": "none fits",
+                       "cards": [{"uuid": uuid, "index": index, "refusal": "1 MiB free < 2 MiB required"}
+                                 for uuid, index in resources.REGISTERED_CUDA_CARDS.items()]}
+            rejection = CudaClaimRejected(refusal, "no registered CUDA card fits this proof; no model execution")
+            mocks.enter_context(patch.dict(os.environ, RUNNER_TEMP=str(root), GITHUB_RUN_ID="7",
+                                           GITHUB_RUN_ATTEMPT="1", RUNNER_NAME="mock"))
+            mocks.enter_context(patch.object(comparison.proof, "require_host"))
+            for name, value in (("git", comparison.BASE), ("hardware", {}), ("build", (root / "probe", {})),
+                                ("snapshots", ({v: root for v in evidence.VARIANTS}, {}))):
+                mocks.enter_context(patch.object(comparison, name, return_value=value))
+            mocks.enter_context(patch.object(comparison, "choose_card", side_effect=rejection))
+            claim = mocks.enter_context(patch.object(comparison, "execution_claim"))
+            guard = mocks.enter_context(patch.object(comparison, "run_guarded"))
+            with self.assertRaises(CudaClaimRejected):
+                comparison.execute(args, contract)
+            guard.assert_not_called()
+            claim.assert_not_called()
+            receipt = json.loads((args.output / "receipt.json").read_text(encoding="utf-8"))
+            self.assertFalse(receipt["accepted"])
+            self.assertEqual(receipt[resources.SELECTION_REFUSAL], refusal)
+            comparison.verify(args, contract)
+
     def test_late_cuda_phase_refuses_before_spawn(self):
         with TemporaryDirectory() as tmp, patch.object(comparison, "run_guarded") as guard:
             with patch.object(comparison.time, "monotonic", return_value=200.0):

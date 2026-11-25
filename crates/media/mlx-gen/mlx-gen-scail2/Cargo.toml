@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 mlx-gen = { path = ".." }
 # SCAIL-2 is Wan2.1-14B I2V: the DiT blocks, z16 VAE, UMT5, RoPE table, flow/UniPC scheduler, and
 # patchify all come from mlx-gen-wan. The SCAIL-2 deltas (3 patch-embed stems + additive mask/pose

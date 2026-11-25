@@ -1373,3 +1373,134 @@ fn encode_peak_model_covers_the_measured_encodes() {
         None
     );
 }
+
+#[test]
+fn curated_video_phase_uses_the_same_wan_grid_and_expert_times_as_the_native_reference() {
+    use mlx_gen::MoeExpert::{High, Low};
+    let (steps, train, shift) = (4, 1000, 5.0);
+    for (vae, reference_count, boundary) in
+        [(WanVae::VAE_TILING, 0, 875.), (WanVae::VAE_TILING, 1, 900.)]
+    {
+        let stride = vae.spatial_scale as usize;
+        let shape = latent_shape(17, 128, 192, 16, (4, stride, stride)).unwrap();
+        let phase = curated_phase(
+            "heun",
+            compute_sigmas(steps, shift, train),
+            29,
+            &shape,
+            vae,
+            reference_count,
+            wan_expert_rule(train, boundary),
+        )
+        .unwrap();
+        let geom = phase.identity.geometry;
+        assert_eq!(
+            (
+                geom.width,
+                geom.height,
+                geom.frames,
+                geom.reference_count,
+                phase.latent_frames
+            ),
+            (192, 128, 17, reference_count, 5)
+        );
+        let mut native = crate::scheduler::make_scheduler(SolverKind::UniPC, train);
+        native.set_timesteps(steps, shift);
+        let crossing = crossing_index(native.timesteps(), boundary);
+        for (i, &sigma) in phase.sigmas[..steps].iter().enumerate() {
+            assert_eq!(
+                phase.models.slot(sigma),
+                if i < crossing { High } else { Low }
+            );
+        }
+        assert_eq!(phase.models.slot(boundary / train as f32), High);
+        // Quantization before the boundary comparison matters for fractional thresholds.
+        assert_eq!(wan_expert_rule(train, 875.5).slot(0.8759), Low);
+    }
+}
+
+#[test]
+fn dense_curated_video_phase_uses_z48_geometry() {
+    let phase = curated_phase(
+        "ddim",
+        compute_sigmas(4, 5., 1000),
+        29,
+        &[48, 5, 8, 12],
+        Wan22Vae::VAE_TILING,
+        0,
+        mlx_gen::gen_core::render::video::VideoModelRule::Fixed(()),
+    )
+    .unwrap();
+    let geometry = phase.identity.geometry;
+    assert_eq!(
+        (
+            geometry.width,
+            geometry.height,
+            geometry.frames,
+            phase.latent_frames
+        ),
+        (192, 128, 17, 5)
+    );
+}
+
+#[test]
+fn curated_video_phase_cancellation_after_evict_precedes_the_incoming_load() {
+    use mlx_gen::MoeExpert::{High, Low};
+    let cancel = CancelFlag::new();
+    let tracker = LiveTracker::new();
+    let mut active = None;
+    let load = |_| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high"));
+    moe::select_curated_expert(&mut active, High, &cancel, drop, load).unwrap();
+    moe::select_curated_expert(&mut active, High, &cancel, drop, |_| {
+        panic!("already resident")
+    })
+    .unwrap();
+    let selected = moe::select_curated_expert(
+        &mut active,
+        Low,
+        &cancel,
+        |outgoing| {
+            drop(outgoing);
+            tracker.note("evict");
+            cancel.cancel();
+        },
+        |_| panic!("cancelled before low load"),
+    );
+    assert!(matches!(selected, Err(Error::Canceled)));
+    assert!(active.is_none());
+    assert_eq!(tracker.peak.get(), 1);
+    assert_eq!(*tracker.log.borrow(), ["load-high", "drop-high", "evict"]);
+}
+
+#[test]
+fn curated_video_phase_first_low_still_validates_high_adapters() {
+    let phase = curated_phase(
+        "heun",
+        compute_sigmas(4, 0.001, 1000),
+        41,
+        &[16, 1, 1, 1],
+        WanVae::VAE_TILING,
+        0,
+        wan_expert_rule(1000, 875.0),
+    )
+    .unwrap();
+    assert_eq!(phase.models.slot(phase.sigmas[0]), mlx_gen::MoeExpert::Low);
+    let sigil = "high adapter validation";
+    let result = denoise_moe_curated_swapped(
+        &phase,
+        "heun",
+        1000,
+        &Array::from_f32(0.),
+        None,
+        &CancelFlag::new(),
+        &mut |_| panic!("no solver evaluation"),
+        |high| {
+            assert!(
+                high,
+                "validate High before selecting Low for the first prediction"
+            );
+            Err(Error::Msg(sigil.into()))
+        },
+    );
+    assert!(matches!(result, Err(Error::Msg(message)) if message == sigil));
+}

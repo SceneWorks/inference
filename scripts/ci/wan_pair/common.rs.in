@@ -1,0 +1,107 @@
+// Included only in the two same-job proof builds.
+use serde_json::{json, Value};
+use std::{env, error::Error as StdError, fs, path::PathBuf, time::Instant};
+
+type ProofResult<T> = Result<T, Box<dyn StdError>>;
+const SEED: u64 = 104729;
+const STEPS: usize = 4;
+
+struct Pair {
+    case: String,
+    root: PathBuf,
+    out: PathBuf,
+}
+
+impl Pair {
+    fn from_env(fqn: &str, prefix: &str) -> ProofResult<Self> {
+        assert_eq!(env::var("MODEL_INFERENCE_CASE_FQN")?, fqn);
+        Ok(Self {
+            case: env::var(format!("{prefix}_CASE"))?,
+            root: env::var_os(format!("{prefix}_FIXTURE"))
+                .ok_or("missing fixture")?
+                .into(),
+            out: env::var_os("PAIR_OUT").ok_or("missing output")?.into(),
+        })
+    }
+
+    // Every call uses the same live model, inputs and synchronized denoise boundary.
+    fn measure(
+        &self,
+        initial: Vec<f32>,
+        settings: Value,
+        mut run: impl FnMut() -> ProofResult<(u64, Vec<Value>, Vec<usize>, Vec<f32>)>,
+        allocator_peak: impl FnOnce() -> ProofResult<u64>,
+    ) -> ProofResult<()> {
+        assert!(initial.iter().all(|x| x.is_finite()));
+        assert!(initial.windows(2).any(|xs| xs[0] != xs[1]));
+        let initial_bytes: Vec<u8> = initial.into_iter().flat_map(f32::to_le_bytes).collect();
+        fs::write(self.out.join("state-0.f32"), &initial_bytes)?;
+        let (_, warm_trace, warm_shape, warm_values) = run()?;
+        let (elapsed_ns, trace, shape, values) = run()?;
+        assert_eq!(trace, warm_trace);
+        assert_eq!(shape, warm_shape);
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        assert!(values.iter().all(|x| x.is_finite()));
+        assert!(values.windows(2).any(|xs| xs[0] != xs[1]));
+        assert!(
+            warm_values
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(values.iter().map(|x| x.to_bits())),
+            "terminal differs across fixed-seed repeats"
+        );
+        let steps: Vec<_> = trace
+            .iter()
+            .filter(|e| e["event"] == "step")
+            .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
+            .collect();
+        let expected: &[u64] = if settings["sampler"] == "heun" {
+            &[1, 2, 2, 3, 3, 4, 4]
+        } else {
+            &[1, 2, 3, 4]
+        };
+        assert!(steps
+            .iter()
+            .copied()
+            .eq(expected.iter().map(|&i| (i, STEPS as u64))));
+        assert!(elapsed_ns > 0);
+        let completed = steps.last().unwrap().0;
+        let mut samples = vec![json!({"elapsed_ns":elapsed_ns,"outer_steps":completed})];
+        let calls = match env::var("VIDEO_TIER1_GROUPED_TIMING").as_deref() {
+            Err(env::VarError::NotPresent) => 1,
+            Ok("1") => 16,
+            Ok("targeted-cuda") if self.case == "cuda-ti2v5b-t2v-heun" => 256,
+            Ok("targeted-cuda") if self.case == "cuda-svd-euler-cfg" => 32,
+            _ => return Err("unregistered grouped timing case".into()),
+        };
+        for _ in 1..calls {
+            let (ns, next_trace, next_shape, next_values) = run()?;
+            assert!(ns > 0);
+            assert_eq!(next_trace, trace);
+            assert_eq!(next_shape, shape);
+            assert!(values.iter().map(|v| v.to_bits()).eq(next_values.iter().map(|v| v.to_bits())));
+            samples.push(json!({"elapsed_ns":ns,"outer_steps":completed}));
+        }
+        let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(bytes.len(), initial_bytes.len());
+        assert!(
+            bytes != initial_bytes,
+            "sampler did not change the initial noise"
+        );
+        let peak = allocator_peak()?;
+        assert!(peak > 0);
+        fs::write(self.out.join("state-4.f32"), bytes)?;
+        fs::write(
+            self.out.join("result.json"),
+            serde_json::to_vec(&json!({
+                "case":self.case,"settings":settings,"trace":trace,"tensor_shape":shape,
+                "warmups":1,"samples":samples,"allocator_peak_bytes":peak
+            }))?,
+        )?;
+        Ok(())
+    }
+}
+
+fn step(current: u32, total: u32) -> Value {
+    json!({"event":"step","current":current,"total":total})
+}

@@ -1,0 +1,52 @@
+@COMMON@
+
+use crate::config::Scail2Config;
+const LANE: &str = "cuda";
+type State = Tensor;
+type Inputs = std::collections::HashMap<String, Tensor>;
+type Resource = Device;
+type NativeResult<T> = CResult<T>;
+type ForwardResult<T> = candle_gen::candle_core::Result<T>;
+struct Components<'a, const OBSERVE: bool> {
+    dit: Forward<'a, OBSERVE>,
+}
+
+fn parse(s: &str) -> Sampler {
+    Sampler::parse(Some(s))
+}
+fn shape(x: &Tensor) -> &[usize] {
+    x.dims()
+}
+fn sync(device: &Device) -> ProofResult<()> {
+    Ok(device.synchronize()?)
+}
+fn peak(pair: &Pair) -> ProofResult<u64> {
+    pool_proof(pair)
+}
+fn input(inputs: &Inputs, k: &str) -> ProofResult<Tensor> {
+    Ok(inputs.get(k).ok_or_else(|| format!("missing {k}"))?.clone())
+}
+fn values(x: &Tensor) -> ForwardResult<Vec<f32>> {
+    assert!(x.device().is_cuda());
+    assert_eq!(x.dtype(), DType::F32);
+    x.flatten_all()?.to_vec1::<f32>()
+}
+fn carry(x: &Tensor) -> NativeResult<Tensor> {
+    Ok(x.narrow(1, 1, 1)?.contiguous()?)
+}
+fn load(pair: &Pair) -> ProofResult<(Scail2Dit, Inputs, Resource, Value)> {
+    let dev = Device::new_cuda(0)?;
+    let mut cfg = Scail2Config::scail2_14b();
+    cfg.num_layers = 1;
+    let model = crate::pipeline::scail_pair_dit(pair.root.join("dit.safetensors"), &cfg, &dev)?;
+    let inputs =
+        candle_gen::candle_core::safetensors::load(pair.root.join("inputs.safetensors"), &dev)?;
+    assert!(inputs["positive"].device().is_cuda());
+    println!("\nMODEL_INFERENCE_DEVICE {FQN} candle-cuda");
+    let settings = json!({"depth":cfg.num_layers,"heads":cfg.num_heads,"width_channels":cfg.dim,
+                          "patch":cfg.patch,"compute_dtype":"F32","weight_dtype":"BF16"});
+    Ok((model, inputs, dev, settings))
+}
+
+@POOL@
+@RUN@

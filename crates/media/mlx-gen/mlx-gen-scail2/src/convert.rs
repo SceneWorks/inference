@@ -29,20 +29,7 @@ use mlx_rs::Array;
 /// `time_projection`, modulation tables, qk-/`norm3`-/LayerNorm norms, and the output head stay dense
 /// (small + precision-sensitive — the reference skips them). Must stay in lockstep with the
 /// quant-aware call sites in [`crate::model`].
-pub const SCAIL2_QUANT_SUFFIXES: &[&str] = &[
-    ".self_attn.q",
-    ".self_attn.k",
-    ".self_attn.v",
-    ".self_attn.o",
-    ".cross_attn.q",
-    ".cross_attn.k",
-    ".cross_attn.v",
-    ".cross_attn.o",
-    ".cross_attn.k_img",
-    ".cross_attn.v_img",
-    ".ffn.0",
-    ".ffn.2",
-];
+pub use mlx_gen::gen_core::generator::scail2_fit::SCAIL2_QUANT_SUFFIXES;
 
 /// `true` iff `weight_key` (an `…​.weight` tensor name) names a [`SCAIL2_QUANT_SUFFIXES`] Linear.
 fn is_quant_target(weight_key: &str) -> bool {

@@ -321,9 +321,25 @@ impl Weights {
         place_staged: Option<&dyn Fn(Tensor) -> Result<Tensor>>,
     ) -> Result<Self> {
         let mut names = std::collections::BTreeSet::new();
+        let mut execution_metadata = std::collections::BTreeSet::new();
         let mut packed_bases = std::collections::HashSet::new();
-        for (key, _) in st.tensors() {
+        for (key, view) in st.tensors() {
             if !prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+                continue;
+            }
+            if gen_core::checkpoint_codec::checkpoint_execution_metadata(
+                &key,
+                &format!("{:?}", view.dtype()),
+                view.shape(),
+                view.data(),
+            )
+            .map_err(|error| CandleError::Msg(error.to_string()))?
+            {
+                if !execution_metadata.insert(key.clone()) {
+                    return Err(CandleError::Msg(format!(
+                        "duplicate execution metadata {key:?}"
+                    )));
+                }
                 continue;
             }
             if !names.insert(key.clone()) {
@@ -340,6 +356,7 @@ impl Weights {
         let source =
             candle_checkpoint::ProjectionSource::from_mapped_selected(st, paths, device, |key| {
                 prefixes.iter().any(|prefix| key.starts_with(prefix))
+                    && !execution_metadata.contains(key)
             })?;
         let mmap = match &source {
             Ok(src) => src.mmap(),
@@ -397,6 +414,45 @@ impl Weights {
         );
         let _ = proof_site;
         Ok(weights)
+    }
+
+    /// Split a fused output matrix without changing its source codec or reading it again.
+    /// Native codes/scales follow the shared logical row transform; dense matrices use views.
+    pub fn split_projection_rows(&mut self, key: &str, targets: &[String]) -> Result<()> {
+        if targets.is_empty()
+            || targets.iter().any(|target| self.contains(target))
+            || targets
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != targets.len()
+        {
+            return Err(CandleError::Msg(format!(
+                "{key}: invalid or colliding projection targets"
+            )));
+        }
+        if self.encoded_keys.contains(key) {
+            let (source, dev, dtype) = self.source.as_ref().expect("encoded projection source");
+            let source = source.split_projection_rows(key, targets)?;
+            self.encoded_keys.remove(key);
+            self.encoded_keys.extend(targets.iter().cloned());
+            self.source = Some((source, dev.clone(), *dtype));
+        } else {
+            let weight = self.require(key)?;
+            let (rows, _) = weight.dims2()?;
+            if !rows.is_multiple_of(targets.len()) {
+                return Err(CandleError::Msg(format!(
+                    "{key}: uneven projection row split"
+                )));
+            }
+            let width = rows / targets.len();
+            for (index, target) in targets.iter().enumerate() {
+                self.map
+                    .insert(target.clone(), weight.narrow(0, index * width, width)?);
+            }
+            self.map.remove(key);
+        }
+        Ok(())
     }
 
     /// Build a stock Linear through the same projection route used by VarBuilder.

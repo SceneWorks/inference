@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts import media_campaign_windows as windows
+from scripts.ci import wddm_process_memory as wddm
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.wan_adapter_tier2_fixture import observe_windows_host
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
@@ -24,6 +25,7 @@ class FakeSystem:
         self.global_used = global_used
 
     def gpu_free_and_tree_bytes(self, owner):
+        self.last_global_used_upper_bound_bytes = self.global_used
         return 1000 * MIB, self.global_used
 
 
@@ -33,11 +35,8 @@ class PairCudaProbeTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "cuda-pool.json"
         policy = SimpleNamespace(cuda_device_uuid=UUID, child_gpu_cap_bytes=256 * MIB)
-        self.probe = PairCudaProbe.__new__(PairCudaProbe)
-        self.probe.policy = policy
-        self.probe.proof_path = self.path
-        self.probe.system = FakeSystem()
-        self.probe.gpu_usage_basis = "owned-process-attributed"
+        with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=FakeSystem()):
+            self.probe = PairCudaProbe(policy, self.path)
         self.owner = SimpleNamespace(members=lambda: {123})
 
     def write(self, **changes):
@@ -55,6 +54,26 @@ class PairCudaProbeTests(unittest.TestCase):
         self.write()
         self.assertEqual(self.probe.gpu_free_and_tree_bytes(self.owner)[1], 120 * MIB)
         self.assertEqual(self.probe.gpu_usage_basis, "owned-process-attributed")
+
+    def test_pdh_collects_on_failed_nvidia_tick_between_two_valid_samples(self):
+        adapter = {"cuda_uuid": UUID, "luid": "luid_0x00000000_0x00000001", "node_mask": 1,
+                   "physical_node": 0, "counter": wddm.COUNTER}
+        self.owner.root_identity = lambda pid: (11, False)
+        for middle, complete in ((None, False), ([21, 150], True)):
+            with self.subTest(middle=middle), patch.object(wddm, "_query") as query:
+                system = FakeSystem()
+                with patch("scripts.ci.flux1_pair.cuda_probe.SystemProbe", return_value=system):
+                    probe = PairCudaProbe(self.probe.policy, self.path, dedicated_adapter=adapter)
+                query.return_value.__enter__.return_value.side_effect = [[20, 120], middle, [22, 130]]
+                probe.gpu_free_and_tree_bytes(self.owner)
+                with patch.object(system, "gpu_free_and_tree_bytes", side_effect=SupervisionError("probe-failure", "NVIDIA timeout")):
+                    with self.assertRaisesRegex(SupervisionError, "NVIDIA timeout"):
+                        probe.gpu_free_and_tree_bytes(self.owner)
+                probe.gpu_free_and_tree_bytes(self.owner)
+                self.assertEqual(probe.completed_process_gpu_sample(123), complete)
+                record = probe.measurement()["wddm_dedicated"]
+                self.assertEqual(record["missing_active_polls"], int(not complete))
+                self.assertEqual(wddm.sampled_peak(record, pid=123, adapter=adapter), 150 if complete else None)
 
     def test_opt_in_host_peaks_reuse_distinct_existing_windows_job_counters(self):
         self.probe.windows_footprint_peaks = {}

@@ -123,6 +123,8 @@ def _apis():
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
     kernel.IsProcessInJob.restype = wintypes.BOOL
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
     kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
@@ -169,6 +171,7 @@ class WindowsJob:
 
     def __init__(self):
         self.kernel, self.psapi = _apis()
+        self._root = None
         self.handle = self.kernel.CreateJobObjectW(None, None)
         if not self.handle:
             raise _failed("CreateJobObjectW")
@@ -182,6 +185,7 @@ class WindowsJob:
     def assign_and_resume(self, child: subprocess.Popen[bytes]) -> None:
         if not self.kernel.AssignProcessToJobObject(self.handle, child._handle):
             raise _failed("AssignProcessToJobObject")
+        self._root = child
         snapshot = self.kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
         if not snapshot or snapshot == ctypes.c_void_p(-1).value:
             raise _failed("CreateToolhelp32Snapshot")
@@ -210,6 +214,30 @@ class WindowsJob:
                 self.kernel.CloseHandle(thread)
         finally:
             self.kernel.CloseHandle(snapshot)
+
+    def root_identity(self, pid: int) -> tuple[int, bool]:
+        """Read the creation FILETIME and exit signal on the handle assigned to this Job."""
+        child = self._root
+        if child is None or child.pid != pid:
+            raise WindowsJobError("observed PID is not the assigned Job root")
+        # The process object, and therefore its PID, is pinned by Popen for the
+        # whole observation. Reopening by PID or requiring an image path can
+        # fail during teardown even though the original handle remains valid.
+        handle = child._handle
+        native_pid = self.kernel.GetProcessId(handle)
+        if not native_pid:
+            raise _failed("GetProcessId/Job-root")
+        if native_pid != pid:
+            raise WindowsJobError("retained Job root handle belongs to a different PID")
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not self.kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                           ctypes.byref(kernel), ctypes.byref(user)):
+            raise _failed("GetProcessTimes/Job-root")
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime, child.poll() is not None
+
+    def exited_root_and_empty(self, pid: int) -> bool:
+        """Check the original Popen process handle and the same non-breakaway Job."""
+        return self._root is not None and self._root.pid == pid and self._root.poll() is not None and not self.members()
 
     def members(self) -> set[int]:
         for capacity in (16, 64, 256, 1024):
@@ -277,7 +305,7 @@ class WindowsJob:
         pids = self.members()
         if not pids:
             raise WindowsJobError("owned Job disappeared during memory sample")
-        total = 0
+        total = working_peak = private_peak = 0
         count = 0
         readings = []
         for pid in sorted(pids):
@@ -295,6 +323,8 @@ class WindowsJob:
                         continue  # Exited during the sample.
                     raise _failed(f"GetProcessMemoryInfo({pid})")
                 total += max(counters.WorkingSetSize, counters.PrivateUsage)
+                working_peak += counters.PeakWorkingSetSize
+                private_peak += counters.PeakPagefileUsage
                 count += 1
                 if len(readings) < 32:
                     readings.append({"pid": pid, "workingSetBytes": counters.WorkingSetSize,
@@ -305,6 +335,10 @@ class WindowsJob:
         if not self.kernel.QueryInformationJobObject(self.handle, 9, ctypes.byref(limits),
                                                       ctypes.sizeof(limits), None):
             raise _failed("QueryInformationJobObject/peak-memory")
+        self.last_memory_counters = {
+            "owned_process_count": len(pids), "peak_working_set_bytes": working_peak,
+            "peak_private_commit_bytes": private_peak, "peak_job_commit_bytes": limits.PeakJobMemoryUsed,
+        }
         self.last_footprint_details = {"processContributionBytes": total,
                                        "jobPeakMemoryUsedBytes": limits.PeakJobMemoryUsed,
                                        "sampledProcessCount": count, "processes": readings}
