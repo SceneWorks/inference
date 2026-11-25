@@ -72,14 +72,25 @@ pub fn quantize_cached(src: &Tensor, dtype: GgmlDType, device: &Device) -> Resul
         device,
         "cpu-upload",
         None,
-        || {
-            QTensor::quantize_onto(
-                &src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?,
-                dtype,
-                device,
-            )
-        },
+        || QTensor::quantize_onto(&cpu_quantization_input(src)?, dtype, device),
     )
+}
+
+fn cpu_quantization_input(src: &Tensor) -> Result<Tensor> {
+    let cpu = src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+    let covers_storage = {
+        let (storage, layout) = cpu.storage_and_layout();
+        let length = match &*storage {
+            candle_core::Storage::Cpu(storage) => storage.as_slice::<f32>()?.len(),
+            _ => 0,
+        };
+        layout.start_offset() == 0 && cpu.is_contiguous() && length == cpu.elem_count()
+    };
+    if covers_storage {
+        Ok(cpu)
+    } else {
+        cpu.force_contiguous()
+    }
 }
 
 fn quantize_with_cache(
@@ -92,34 +103,42 @@ fn quantize_with_cache(
     produce: impl FnOnce() -> Result<QTensor>,
 ) -> Result<QTensor> {
     let origin = src.checkpoint_source_identity();
-    let mut identity = if let Some(source) = &origin {
-        source.clone()
-    } else {
-        let cpu = src
-            .to_device(&Device::Cpu)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        bytemuck::cast_slice(&cpu).to_vec()
-    };
-    if let Some(weights) = imatrix {
-        identity.extend_from_slice(&(weights.len() as u64).to_le_bytes());
-        identity.extend_from_slice(bytemuck::cast_slice(weights));
-    }
     let source = if origin.is_some() {
         "checkpoint"
     } else {
         "content"
     };
-    let key = gen_core::QuantizationArtifactKey::new(
-        &format!(
-            "candle-{source}-ggml-{dtype:?}-{mode}-imatrix{}-v2",
-            imatrix.is_some()
-        ),
-        src.dims(),
-        &identity,
-        "ggml",
+    let recipe = format!(
+        "candle-{source}-ggml-{dtype:?}-{mode}-imatrix{}-v2",
+        imatrix.is_some()
     );
+    let identify = |input: &[u8]| {
+        gen_core::QuantizationArtifactKey::from_slices(
+            &recipe,
+            src.dims(),
+            [input, imatrix.map(bytemuck::cast_slice).unwrap_or(&[])],
+            "ggml",
+        )
+    };
+    let key = if let Some(source) = &origin {
+        identify(source)
+    } else {
+        // Contiguous CPU weights are hashed in their existing storage. Other layouts/devices
+        // require only the normal CPU/F32 staging, never a second copy just to form the key.
+        let cpu = src
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?;
+        let (storage, layout) = cpu.storage_and_layout();
+        let candle_core::Storage::Cpu(storage) = &*storage else {
+            candle_core::bail!("quantization identity requires CPU storage");
+        };
+        let values = storage.as_slice::<f32>()?;
+        let start = layout.start_offset();
+        identify(bytemuck::cast_slice(
+            &values[start..start + cpu.elem_count()],
+        ))
+    };
     materialize_runtime_weight(cache, &key, src.dims(), dtype, device, produce)
 }
 
@@ -136,13 +155,7 @@ pub fn quantize_on_source_device_cached(src: &Tensor, dtype: GgmlDType) -> Resul
         src.device(),
         "cpu-upload",
         None,
-        || {
-            QTensor::quantize_onto(
-                &src.to_device(&Device::Cpu)?.to_dtype(DType::F32)?,
-                dtype,
-                src.device(),
-            )
-        },
+        || QTensor::quantize_onto(&cpu_quantization_input(src)?, dtype, src.device()),
     )
 }
 
@@ -464,6 +477,39 @@ mod tests {
             data(&quantize_cached(&adapted, GgmlDType::Q8_0, &Device::Cpu)?),
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mutable_contiguous_subviews_hash_only_their_logical_storage_range() -> Result<()> {
+        let source = Tensor::arange(0f32, 256f32, &Device::Cpu)?.reshape((4, 64))?;
+        let first = source.narrow(0, 1, 1)?;
+        let second = source.narrow(0, 2, 1)?;
+        let expected = data(&QTensor::quantize_onto(
+            &first.force_contiguous()?,
+            GgmlDType::Q8_0,
+            &Device::Cpu,
+        )?);
+        let cache = Cache::new();
+        let _scope = gen_core::QuantizationCacheContext::new(cache.clone()).install();
+        assert_eq!(
+            data(&quantize_cached(&first, GgmlDType::Q8_0, &Device::Cpu)?),
+            expected
+        );
+        assert_ne!(
+            data(&quantize_cached(&second, GgmlDType::Q8_0, &Device::Cpu)?),
+            expected
+        );
+        assert_eq!(
+            data(&quantize_cached(
+                &first.force_contiguous()?,
+                GgmlDType::Q8_0,
+                &Device::Cpu
+            )?),
+            expected
+        );
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
         Ok(())
     }
 

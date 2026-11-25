@@ -167,7 +167,16 @@ impl PackedWeightSidecars {
         packed: PackedConfig,
         device: &Device,
     ) -> Result<Self> {
-        Self::prepare_impl(source, component_dir, packed, device, None, None, None)
+        Self::prepare_impl(
+            source,
+            component_dir,
+            packed,
+            device,
+            None,
+            None,
+            None,
+            true,
+        )
     }
 
     /// Open the exact source paths and reuse their published runtime index.
@@ -210,6 +219,7 @@ impl PackedWeightSidecars {
             None,
             None,
             Some(external_cache_root),
+            true,
         )
     }
 
@@ -249,6 +259,7 @@ impl PackedWeightSidecars {
             Some(cancel),
             None,
             None,
+            true,
         )
     }
 
@@ -297,6 +308,7 @@ impl PackedWeightSidecars {
             Some(cancel),
             Some(base_prefix),
             None,
+            true,
         )
     }
 
@@ -373,6 +385,7 @@ impl PackedWeightSidecars {
             cancel,
             base_prefix,
             external_cache_root,
+            true,
         )?;
         let after_prepare = file_identities(source_paths)?;
         if after_open.is_some() && after_open != after_prepare {
@@ -392,6 +405,7 @@ impl PackedWeightSidecars {
         cancel: Option<&CancelFlag>,
         base_prefix: Option<&str>,
         external_cache_root: Option<&Path>,
+        trust_ready: bool,
     ) -> Result<Self> {
         check_cancel(cancel)?;
         let bits = usize::try_from(packed.bits).map_err(|_| {
@@ -413,15 +427,17 @@ impl PackedWeightSidecars {
             )));
         }
 
-        if let Some(cache) = trusted_runtime_cache(
-            source,
-            component_dir,
-            packed,
-            device,
-            base_prefix,
-            external_cache_root,
-        )? {
-            return Ok(cache);
+        if trust_ready {
+            if let Some(cache) = trusted_runtime_cache(
+                source,
+                component_dir,
+                packed,
+                device,
+                base_prefix,
+                external_cache_root,
+            )? {
+                return Ok(cache);
+            }
         }
         let projections =
             prepare_projections(source, component_dir, bits, group_size, cancel, base_prefix)?;
@@ -638,27 +654,11 @@ impl PackedWeightSidecars {
                 let Some(rebuild) = &self.rebuild else {
                     return Err(error);
                 };
-                let Some(entry) = self.entries.get(base) else {
+                if !self.entries.contains_key(base) {
                     return Err(error);
-                };
-                let lock = open_writable_cache(&self.cache_dir)?;
-                FileExt::lock_exclusive(&lock)?;
-                if let Ok(weight) = self.load_runtime(base, device) {
-                    return Ok(weight);
                 }
-                match fs::remove_file(&entry.path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-                let _ = fs::remove_file(runtime_index_path(
-                    &self.cache_dir,
-                    rebuild.packed,
-                    rebuild.prefix.as_deref(),
-                    &rebuild.paths,
-                ));
-                drop(lock);
-                // An unreadable cache is a miss, not a reason to validate every normal load.
+                // Bypass every trusted index during repair. The existing preparation path
+                // selects a writable adjacent/external cache and serializes recovery there.
                 let source = crate::loader::mmap_safetensors_multi(&rebuild.paths)?;
                 let cache = Self::prepare_impl(
                     &source,
@@ -668,6 +668,7 @@ impl PackedWeightSidecars {
                     None,
                     rebuild.prefix.as_deref(),
                     rebuild.external.as_deref(),
+                    false,
                 )?;
                 cache.load_runtime(base, device)
             }
@@ -985,6 +986,57 @@ fn write_runtime_index(
     }
 }
 
+/// Decode runtime geometry from already-mapped headers, never source/payload contents. Cached
+/// bytes are trusted, but their shape must still be representable by the native GGML decoder.
+fn runtime_index_geometry(
+    source: &MmapedSafetensors,
+    entry: &RuntimeIndexEntry,
+    group: usize,
+) -> Result<()> {
+    if entry.group != group {
+        candle_core::bail!("runtime index group does not match its selection");
+    }
+    let (base, index) = if source.get(&format!("{}.weight", entry.base)).is_ok() {
+        (entry.base.as_str(), None)
+    } else {
+        let (base, index) = entry
+            .base
+            .rsplit_once('[')
+            .ok_or_else(|| Error::Msg("runtime index has no source projection".into()))?;
+        let index = index
+            .strip_suffix(']')
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| Error::Msg("runtime index has an invalid expert slice".into()))?;
+        (base, Some(index))
+    };
+    let (leading, geometry) = source_geometry(
+        base,
+        &source.get(&format!("{base}.weight"))?,
+        &source.get(&format!("{base}.scales"))?,
+        &source.get(&format!("{base}.biases"))?,
+        entry.bits,
+        group,
+    )?;
+    let slice_matches = match (leading, index) {
+        (None, None) => true,
+        (Some(n), Some(i)) => i < n,
+        _ => false,
+    };
+    let dtype = if entry.bits == 4 {
+        GgmlDType::Q4_1
+    } else {
+        GgmlDType::Q8_0
+    };
+    if !slice_matches
+        || entry.rows != geometry.out_dim
+        || entry.cols != geometry.in_dim
+        || entry.bytes != payload_len(dtype, geometry.out_dim, geometry.in_dim)?
+    {
+        candle_core::bail!("runtime index geometry cannot decode its source projection");
+    }
+    Ok(())
+}
+
 fn trusted_runtime_cache(
     source: &MmapedSafetensors,
     component: &Path,
@@ -1155,6 +1207,7 @@ fn trusted_runtime_cache(
             if entry.source_hex.len() != 64
                 || !entry.source_hex.bytes().all(|b| b.is_ascii_hexdigit())
                 || !matches!(entry.bits, 4 | 8)
+                || runtime_index_geometry(source, &entry, packed.group_size as usize).is_err()
             {
                 return Ok(None);
             }
@@ -1465,14 +1518,14 @@ fn sidecar_entry_key(base: &str, index: Option<usize>) -> String {
     }
 }
 
-fn validate_source_shapes(
+fn source_geometry(
     base: &str,
     weight: &safetensors::tensor::TensorView<'_>,
     scales: &safetensors::tensor::TensorView<'_>,
     biases: &safetensors::tensor::TensorView<'_>,
     bits: usize,
     group_size: usize,
-) -> Result<Vec<SourceProjection>> {
+) -> Result<(Option<usize>, SourceProjection)> {
     if weight.dtype() != SafeDtype::U32 {
         return Err(Error::Msg(format!(
             "device-format sidecar: `{base}.weight` must be U32, got {:?}",
@@ -1530,12 +1583,30 @@ fn validate_source_shapes(
         .ok_or_else(|| {
             Error::Msg("device-format sidecar: source byte count overflow".to_owned())
         })?;
-    Ok((0..slices)
-        .map(|index| SourceProjection {
-            index: leading.map(|_| index),
+    Ok((
+        leading,
+        SourceProjection {
+            index: None,
             out_dim,
             in_dim,
             source_bytes,
+        },
+    ))
+}
+
+fn validate_source_shapes(
+    base: &str,
+    weight: &safetensors::tensor::TensorView<'_>,
+    scales: &safetensors::tensor::TensorView<'_>,
+    biases: &safetensors::tensor::TensorView<'_>,
+    bits: usize,
+    group_size: usize,
+) -> Result<Vec<SourceProjection>> {
+    let (leading, projection) = source_geometry(base, weight, scales, biases, bits, group_size)?;
+    Ok((0..leading.unwrap_or(1))
+        .map(|index| SourceProjection {
+            index: leading.map(|_| index),
+            ..projection
         })
         .collect())
 }
@@ -2186,6 +2257,7 @@ mod tests {
                 None,
                 None,
                 Some(external.path()),
+                true,
             )?;
             assert_eq!(first.created_count(), 2, "fixture must be non-vacuous");
             assert!(first.contains("layers.0.proj"));
@@ -2209,6 +2281,7 @@ mod tests {
                 Some(&cancel),
                 None,
                 Some(external.path()),
+                true,
             )?;
             CANCEL_VALIDATION_AFTER_CHUNKS.with(|remaining| remaining.set(None));
 
@@ -2484,6 +2557,117 @@ mod tests {
             reopened.load("layers.q8", &Device::Cpu)?.data()?.as_ref(),
             first.load("layers.q8", &Device::Cpu)?.data()?.as_ref()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_runtime_index_geometry_never_reaches_native_allocation() -> Result<()> {
+        let dir = TestDir::new("index-geometry");
+        let file = write_source(dir.path(), 8, 0.)?;
+        let source = open(&file)?;
+        let packed = PackedConfig {
+            bits: 8,
+            group_size: 64,
+        };
+        let first = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
+        let path = runtime_index_path(&first.cache_dir, packed, None, &source.source_paths());
+        let original = fs::read(&path)?;
+        for (field, value) in [
+            ("rows", usize::MAX),
+            ("cols", usize::MAX),
+            ("bytes", 1),
+            ("group", 0),
+            ("bits", 4),
+        ] {
+            let mut index: Vec<RuntimeIndexEntry> =
+                serde_json::from_slice(&original).map_err(Error::wrap)?;
+            match field {
+                "rows" => index[0].rows = value,
+                "cols" => index[0].cols = value,
+                "bytes" => index[0].bytes = value,
+                "group" => index[0].group = value,
+                _ => index[0].bits = value,
+            }
+            fs::write(&path, serde_json::to_vec(&index).map_err(Error::wrap)?)?;
+            let repaired =
+                PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
+            assert_eq!(
+                repaired.load("layers.0.proj", &Device::Cpu)?.shape().dims(),
+                &[2, 64]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_repair_bypasses_the_full_component_ready_index() -> Result<()> {
+        let dir = TestDir::new("prefix-repair");
+        let file = write_multi_source(dir.path(), 4)?;
+        let source = open(&file)?;
+        let packed = PackedConfig {
+            bits: 4,
+            group_size: 64,
+        };
+        let full = PackedWeightSidecars::prepare(&source, dir.path(), packed, &Device::Cpu)?;
+        let expected = full
+            .load("layers.0.proj", &Device::Cpu)?
+            .data()?
+            .into_owned();
+        let prefix = PackedWeightSidecars::prepare_prefix_cancelable(
+            &source,
+            dir.path(),
+            packed,
+            &Device::Cpu,
+            &CancelFlag::default(),
+            "layers.0.",
+        )?;
+        fs::write(&full.entries["layers.0.proj"].path, b"truncated")?;
+        assert_eq!(
+            prefix.load("layers.0.proj", &Device::Cpu)?.data()?.as_ref(),
+            expected
+        );
+        assert_eq!(
+            full.load("layers.1.proj", &Device::Cpu)?.dtype(),
+            GgmlDType::Q4_1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_adjacent_cache_without_writer_access_repairs_in_external_cache() -> Result<()> {
+        let dir = TestDir::new("external-repair");
+        let external = TestDir::new("external-repair-output");
+        let file = write_source(dir.path(), 8, 0.)?;
+        let source = open(&file)?;
+        let packed = PackedConfig {
+            bits: 8,
+            group_size: 64,
+        };
+        let full = PackedWeightSidecars::prepare_with_external_cache_root(
+            &source,
+            dir.path(),
+            packed,
+            &Device::Cpu,
+            external.path(),
+        )?;
+        let expected = full
+            .load("layers.0.proj", &Device::Cpu)?
+            .data()?
+            .into_owned();
+        fs::remove_file(&full.entries["layers.0.proj"].path)?;
+        // Make opening an adjacent writer fail deterministically on both Windows and Unix.
+        // Read-only filesystems reach the same existing writable-cache selection path.
+        let lock = full.cache_dir.join(PREPARE_LOCK);
+        fs::remove_file(&lock)?;
+        fs::create_dir(&lock)?;
+        assert_eq!(
+            full.load("layers.0.proj", &Device::Cpu)?.data()?.as_ref(),
+            expected
+        );
+        let output = external_cache_dir(dir.path(), Some(external.path()))?;
+        assert!(output
+            .join(full.entries["layers.0.proj"].path.file_name().unwrap())
+            .is_file());
         Ok(())
     }
 
