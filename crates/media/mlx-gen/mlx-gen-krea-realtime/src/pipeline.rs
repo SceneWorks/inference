@@ -24,167 +24,16 @@ use mlx_gen::{
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
+use crate::plan::{KreaRealtimeRenderPlan, KreaRealtimeRoute};
 use crate::t2v::{
-    bounded_latent_frame_count, generate_i2v_reported, generate_t2v_reported,
-    generate_v2v_reported, KreaRealtimeJob,
+    emit_whole_clip_to_sink, generate_i2v_reported, generate_t2v_reported, generate_v2v_reported,
+    KreaRealtimeJob,
 };
 
 /// The Self-Forcing few-step sampler name Krea Realtime advertises (a fixed short per-block flow-match
 /// renoise schedule, not a selectable classic solver). Distinct from Wan's UniPC/DPM++ so a consumer
 /// knows this model runs the AR few-step regime.
 pub const SELF_FORCING_SAMPLER: &str = "self_forcing";
-
-/// Default output cadence when a request omits `fps` (the reference realtime-video default).
-const DEFAULT_FPS: u32 = 16;
-/// Default requested **output** frame count when a request omits `frames`/`duration`. The AR path turns
-/// this into `(81 − 1)/4 + 1 = 21` latent frames; the non-causal z16 Wan VAE decode then yields
-/// `4 · 21 = 84` output frames (`output = 4 · latent`, not `(latent − 1)·4 + 1`), which the pipeline
-/// trims back to this requested 81 (see [`crate::t2v::decode_latents_to_video`]). 81 is the reference
-/// realtime-video canonical clip length.
-const DEFAULT_FRAMES: u32 = 81;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ResolvedFrames {
-    fps: u32,
-    output: u32,
-    output_latent: usize,
-    generation_latent: usize,
-}
-
-/// Resolve the output cadence/count and its z16 latent count exactly once for provider validation and
-/// execution. Keeping explicit-frames, duration-derived, and default precedence here prevents the
-/// preflight and run paths from disagreeing about the model-local allocation cap.
-fn resolve_frames(req: &GenerationRequest) -> Result<ResolvedFrames> {
-    let fps = req.fps.unwrap_or(DEFAULT_FPS);
-    let output = req.frames.unwrap_or_else(|| {
-        req.duration
-            .map(|duration| ((duration * fps as f32).round() as u32).max(1))
-            .unwrap_or(DEFAULT_FRAMES)
-    });
-    let output_latent = bounded_latent_frame_count("requested output", output as usize)?;
-    // V2V derives its actual full-noise allocation from the source clip, then trims decode to the
-    // separately resolved requested output. Cap both dimensions without changing that output/trim
-    // contract. Route selection below uses the same first VideoClip.
-    let generation_latent = if let Some(source_frames) =
-        req.conditioning
-            .iter()
-            .find_map(|conditioning| match conditioning {
-                Conditioning::VideoClip { frames, .. } => Some(frames.as_slice()),
-                _ => None,
-            }) {
-        bounded_latent_frame_count("V2V source", source_frames.len())?
-    } else {
-        output_latent
-    };
-    Ok(ResolvedFrames {
-        fps,
-        output,
-        output_latent,
-        generation_latent,
-    })
-}
-
-/// Refuse the [`Conditioning::VideoClip`] knob Krea Realtime does not implement (sc-20265).
-///
-/// The variant's `strength` **is** honored here — it drives the strength-controlled AR init
-/// ([`crate::t2v::generate_v2v`]), which is why `run` binds it on the v2v route. `frame_idx` is the
-/// other half of the payload and it is **not**: it names the output latent frame an in-context clip
-/// is appended at, and Krea Realtime is autoregressive — the source clip seeds the rolling causal KV
-/// cache from step zero and the model generates forward from there. There is no output timeline to
-/// splice a clip into partway through, so an offset has nothing to mean.
-///
-/// Until sc-20265 it was read past silently: `run`'s route match binds `VideoClip { frames,
-/// strength, .. }` and the `..` swallowed it. The sc-19571 rule is that a control either works or is
-/// refused with a clear error, so this is the refusal for the half that does not work.
-///
-/// It fires **only on a non-default value** — `frame_idx = 0` (the contract default, and what
-/// SceneWorks sends today) passes through unchanged, and `strength` is untouched at any value.
-///
-/// Checked over **every** clip rather than the first: `run` routes on the first `VideoClip`, so a
-/// bad value on clip two would otherwise be the one silently dropped.
-///
-/// Typed [`Error::Unsupported`], not [`Error::Msg`]: the worker classifies `Unsupported` as a
-/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
-fn reject_unimplemented_video_clip_knobs(req: &GenerationRequest) -> Result<()> {
-    for clip in req.video_clips() {
-        if clip.frame_idx != 0 {
-            return Err(Error::Unsupported(format!(
-                "{MODEL_ID} does not implement VideoClip frame_idx (got {}); remove it or leave it \
-                 at the default 0 — Krea Realtime is autoregressive: the source clip seeds the \
-                 rolling causal KV cache from step zero, so there is no output position to splice \
-                 it at. (VideoClip strength IS honored and is unaffected.)",
-                clip.frame_idx
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Krea V2V has exactly one conditioning carrier. Multiple clips, a clip plus a still, malformed
-/// strength, or a source shorter than the requested output used to pass validation and let `run`
-/// silently choose the first clip. Refuse that ambiguity before any staging or source allocation.
-fn validate_v2v_contract(req: &GenerationRequest, resolved: ResolvedFrames) -> Result<()> {
-    let clips = req
-        .conditioning
-        .iter()
-        .filter_map(|conditioning| match conditioning {
-            Conditioning::VideoClip {
-                frames,
-                strength,
-                frame_idx,
-            } => Some((frames, *strength, *frame_idx)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let explicitly_v2v = req.video_mode.as_deref() == Some("video_to_video");
-    if clips.is_empty() {
-        if explicitly_v2v {
-            return Err(Error::Unsupported(format!(
-                "{MODEL_ID} video_to_video requires exactly one VideoClip carrier"
-            )));
-        }
-        return Ok(());
-    }
-    if !explicitly_v2v {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: a VideoClip carrier requires video_mode=video_to_video"
-        )));
-    }
-    if clips.len() != 1 || req.conditioning.len() != 1 {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID} video_to_video requires exactly one VideoClip and no other conditioning carriers"
-        )));
-    }
-    let (frames, strength, _) = clips[0];
-    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID} VideoClip strength must be finite in [0, 1], got {strength}"
-        )));
-    }
-    if frames.len() < resolved.output as usize {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID} video_to_video source has {} frames but the requested output requires {}",
-            frames.len(),
-            resolved.output
-        )));
-    }
-    let Some(first) = frames.first() else {
-        unreachable!("the source-length check rejects an empty clip")
-    };
-    if first.width == 0
-        || first.height == 0
-        || frames.iter().any(|frame| {
-            frame.width != first.width
-                || frame.height != first.height
-                || frame.pixels.len()
-                    != (u64::from(frame.width) * u64::from(frame.height) * 3) as usize
-        })
-    {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID} VideoClip frames must carry one non-zero, RGB8 effective geometry"
-        )));
-    }
-    Ok(())
-}
 
 /// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,
 /// autoregressive self-forcing **text-to-video**; **CFG off** → no negative prompt / no guidance; a
@@ -457,7 +306,7 @@ impl Generator for KreaRealtime {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        self.validate_and_resolve_frames(req)
+        self.validate_and_compile_plan(req)
             .map(|_| ())
             .map_err(Into::into)
     }
@@ -474,17 +323,33 @@ impl Generator for KreaRealtime {
 }
 
 impl KreaRealtime {
-    fn validate_and_resolve_frames(&self, req: &GenerationRequest) -> Result<ResolvedFrames> {
+    fn validate_and_compile_plan(&self, req: &GenerationRequest) -> Result<KreaRealtimeRenderPlan> {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
-        // sc-20265 — refuse the per-clip knob this engine does not implement rather than binding it
-        // under a `..` and dropping it. Both `validate` and `run` route through here, so the
-        // pre-flight and the render cannot disagree.
-        reject_unimplemented_video_clip_knobs(req)?;
-        let frames = resolve_frames(req)?;
-        validate_v2v_contract(req, frames)?;
-        Ok(frames)
+        // sc-20265 & PIPE-16: compile and validate the complete pre-load render/residency plan
+        // before opening or allocating any weights. Both `validate` and `run` route through here.
+        KreaRealtimeRenderPlan::from_generation_request(&self.config, req)
+    }
+
+    /// Validate `req` and compile its pre-load [`KreaRealtimeRenderPlan`] without touching model
+    /// weights (`PIPE-16`, `§6.9`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> Result<KreaRealtimeRenderPlan> {
+        self.validate_and_compile_plan(req)
+    }
+
+    #[cfg(test)]
+    fn validate_and_resolve_frames(
+        &self,
+        req: &GenerationRequest,
+    ) -> Result<crate::plan::ResolvedFrames> {
+        let plan = self.validate_and_compile_plan(req)?;
+        Ok(crate::plan::ResolvedFrames {
+            fps: plan.fps,
+            output: plan.output_frames,
+            output_latent: plan.output_latent_frames,
+            generation_latent: plan.generation_latent_frames,
+        })
     }
 
     fn finish_reported_generation(
@@ -499,20 +364,38 @@ impl KreaRealtime {
         Ok(output)
     }
 
-    /// Execute every advertised modality through the same report-publishing finish seam. Keeping the
-    /// route match inside this method makes it impossible for a T2V/I2V/V2V call site to consume a
-    /// reported generation while forgetting to expose its adapter outcome.
-    fn finish_routed_generation(
+    fn finish_routed_generation_to_sink(
         &self,
         route: GenerationRoute<'_>,
         generation: &mut impl ReportedGeneration,
-    ) -> Result<GenerationOutput> {
+        sink: &mut dyn mlx_gen::gen_core::ChunkSink<GenerationOutput>,
+        causal_codec_policy: Option<mlx_gen::gen_core::CausalCodecStatePolicy>,
+    ) -> mlx_gen::gen_core::Result<()> {
         let reported = match route {
             GenerationRoute::T2v => generation.t2v(),
             GenerationRoute::I2v(image) => generation.i2v(image),
             GenerationRoute::V2v { frames, strength } => generation.v2v(frames, strength),
         };
-        self.finish_reported_generation(reported)
+        let output = self
+            .finish_reported_generation(reported)
+            .map_err(mlx_gen::gen_core::Error::from)?;
+        emit_whole_clip_to_sink(output, causal_codec_policy, sink)
+    }
+
+    /// Execute every advertised modality through the same report-publishing finish seam and deliver
+    /// the whole clip as one terminal chunk (`sequence = 0`, `is_final = true`) without cloning
+    /// decoded frames. Keeping the route match inside this method makes it impossible for a
+    /// T2V/I2V/V2V call site to consume a reported generation while forgetting to expose its adapter
+    /// outcome.
+    #[cfg(test)]
+    fn finish_routed_generation(
+        &self,
+        route: GenerationRoute<'_>,
+        generation: &mut impl ReportedGeneration,
+    ) -> Result<GenerationOutput> {
+        let mut collector = mlx_gen::gen_core::TerminalChunkCollector::new(CancelFlag::default());
+        self.finish_routed_generation_to_sink(route, generation, &mut collector, None)?;
+        collector.into_output().map_err(Into::into)
     }
 
     /// Map the text-to-video request onto a [`KreaRealtimeJob`] and run the AR pipeline. Self-validates
@@ -530,58 +413,86 @@ impl KreaRealtime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        let frames = self.validate_and_resolve_frames(req)?;
+        let plan = self.validate_and_compile_plan(req)?;
 
         let job = KreaRealtimeJob {
             prompt: &req.prompt,
-            width: req.width,
-            height: req.height,
-            num_frames: frames.output,
-            fps: frames.fps,
+            width: plan.width,
+            height: plan.height,
+            num_frames: plan.output_frames,
+            fps: plan.fps,
             seed: req.seed.unwrap_or_else(default_seed),
             steps: req.steps.map(|s| s as usize),
             memory: req.memory.unwrap_or_default(),
         };
 
-        // Route on the advertised conditioning (sc-8440 S7): a `VideoClip` source → v2v; else a
-        // `Reference` still → i2v; else text-to-video. Advertising `Reference`/`VideoClip` in the
-        // descriptor makes `validate_request` accept them, so `run` MUST honor them (capability honesty)
-        // rather than silently generating t2v. The worker's mapping of its own reference inputs onto
-        // these `GenerationRequest` conditioning entries is S10.
-        let route = if let Some((frames, strength)) =
-            req.conditioning.iter().find_map(|c| match c {
-                Conditioning::VideoClip {
-                    frames, strength, ..
-                } => Some((frames.as_slice(), *strength)),
-                _ => None,
-            }) {
-            GenerationRoute::V2v { frames, strength }
-        } else if let Some(image) = req.conditioning.iter().find_map(|c| match c {
-            Conditioning::Reference { image, .. } => Some(image),
-            _ => None,
-        }) {
-            GenerationRoute::I2v(image)
-        } else {
-            GenerationRoute::T2v
+        // Route on the pre-load `plan.route` (sc-8440 S7): a `VideoClip` source -> v2v; else a
+        // `Reference` still -> i2v; else text-to-video.
+        let route = match plan.route {
+            KreaRealtimeRoute::V2v { strength, .. } => {
+                let frames = req
+                    .conditioning
+                    .iter()
+                    .find_map(|c| match c {
+                        Conditioning::VideoClip { frames, .. } => Some(frames.as_slice()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "{MODEL_ID} video_to_video requires a VideoClip carrier"
+                        ))
+                    })?;
+                GenerationRoute::V2v { frames, strength }
+            }
+            KreaRealtimeRoute::I2v { .. } => {
+                let image = req
+                    .conditioning
+                    .iter()
+                    .find_map(|c| match c {
+                        Conditioning::Reference { image, .. } => Some(image),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "{MODEL_ID} image_to_video requires a Reference carrier"
+                        ))
+                    })?;
+                GenerationRoute::I2v(image)
+            }
+            KreaRealtimeRoute::T2v => GenerationRoute::T2v,
         };
         let mut generation = ProductReportedGeneration {
             root: &self.root,
             config: &self.config,
             job: &job,
-            output_latent: frames.output_latent,
-            generation_latent: frames.generation_latent,
+            output_latent: plan.output_latent_frames,
+            generation_latent: match plan.route {
+                KreaRealtimeRoute::V2v {
+                    source_latent_frames,
+                    ..
+                } => source_latent_frames,
+                _ => plan.generation_latent_frames,
+            },
             adapters: &self.adapters,
             quant: self.quant,
             cancel: &req.cancel,
             on_progress,
         };
-        self.finish_routed_generation(route, &mut generation)
+        let mut collector = mlx_gen::gen_core::TerminalChunkCollector::new(req.cancel.clone());
+        self.finish_routed_generation_to_sink(
+            route,
+            &mut generation,
+            &mut collector,
+            Some(plan.causal_codec_state),
+        )?;
+        collector.into_output().map_err(Into::into)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{resolve_frames, ResolvedFrames};
     use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
     use mlx_gen::{AdapterKind, GenerationOutput};
     use mlx_rs::Array;
@@ -1247,5 +1158,381 @@ mod tests {
                 "{crossed_mode:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn preload_render_plan_compiles_ar_geometry_kv_residency_and_refuses_invalid_requests() {
+        use mlx_gen::gen_core::{CausalCodecStatePolicy, ChunkResidencyPolicy};
+
+        let provider = unloaded();
+        let req = GenerationRequest {
+            width: 832,
+            height: 480,
+            count: 1,
+            ..Default::default()
+        };
+        Generator::validate(&provider, &req).unwrap();
+        let plan = provider.render_plan(&req).unwrap();
+
+        assert_eq!(plan.route, KreaRealtimeRoute::T2v);
+        assert_eq!(plan.width, 832);
+        assert_eq!(plan.height, 480);
+        assert_eq!(plan.fps, 16);
+        assert_eq!(plan.output_frames, 81);
+        assert_eq!(plan.output_latent_frames, 21);
+        assert_eq!(plan.context_latent_frames, 0);
+        assert_eq!(plan.generation_latent_frames, 21);
+        assert_eq!(plan.frame_seq_length, 1560);
+        assert_eq!(plan.seq_length, 21 * 1560);
+        assert_eq!(plan.frames_per_block, 3);
+        assert_eq!(plan.chunk_frame_counts, vec![3, 3, 3, 3, 3, 3, 3]);
+        assert!(plan.context_chunk_frame_counts.is_empty());
+        assert_eq!(plan.num_chunks, 7);
+        assert_eq!(plan.n_steps, 5);
+        assert_eq!(plan.total_outer_steps, 35);
+        assert_eq!(
+            plan.step_timesteps_f64,
+            vec![1000.0, 937.5, 833.333_312_988_281_2, 625.0, 0.0]
+        );
+        assert_eq!(plan.execution_sigmas_f64.len(), 6);
+        assert_eq!(plan.execution_sigmas_f64.last().copied(), Some(0.0));
+        assert_eq!(plan.kv_residency.local_attn_frames, 6);
+        assert_eq!(plan.kv_residency.max_attention_size, 6 * 1560);
+        assert_eq!(plan.kv_residency.sink_frames, 0);
+        assert_eq!(plan.kv_residency.sink_tokens, 0);
+        assert_eq!(plan.kv_residency.steady_retained_kv_tokens, 6 * 1560);
+        assert!(plan.kv_residency.do_kv_recomp);
+        assert_eq!(plan.kv_residency.commits_per_generated_chunk, 1);
+        assert_eq!(plan.kv_residency.context_commits, 0);
+        assert_eq!(
+            plan.chunk_residency,
+            ChunkResidencyPolicy::TerminalWholeClip
+        );
+        assert_eq!(
+            plan.causal_codec_state,
+            CausalCodecStatePolicy::RollingKvWindow {
+                max_attention_tokens: 6 * 1560,
+                sink_tokens: 0,
+            }
+        );
+
+        // I2V compiles context warm + remaining generated frames pre-load.
+        let i2v_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let i2v_plan = provider.render_plan(&i2v_req).unwrap();
+        assert_eq!(
+            i2v_plan.route,
+            KreaRealtimeRoute::I2v {
+                reference_latent_frames: 1
+            }
+        );
+        assert_eq!(i2v_plan.output_latent_frames, 3);
+        assert_eq!(i2v_plan.context_latent_frames, 1);
+        assert_eq!(i2v_plan.generation_latent_frames, 2);
+        assert_eq!(i2v_plan.context_chunk_frame_counts, vec![1]);
+        assert_eq!(i2v_plan.chunk_frame_counts, vec![2]);
+        assert_eq!(i2v_plan.kv_residency.context_commits, 1);
+
+        // V2V compiles source latent count + strength pre-load.
+        let v2v_req = v2v_request(13); // 4 latent frames
+        let v2v_plan = provider.render_plan(&v2v_req).unwrap();
+        assert_eq!(
+            v2v_plan.route,
+            KreaRealtimeRoute::V2v {
+                source_frames: 13,
+                source_latent_frames: 4,
+                strength: 0.5,
+            }
+        );
+        assert_eq!(v2v_plan.chunk_frame_counts, vec![3, 1]);
+        assert_eq!(v2v_plan.num_chunks, 2);
+
+        // Pre-load refusals trigger before snapshot/weight access.
+        let too_short_i2v = GenerationRequest {
+            frames: Some(4),
+            ..i2v_req
+        };
+        assert!(matches!(
+            Generator::validate(&provider, &too_short_i2v),
+            Err(mlx_gen::gen_core::Error::Unsupported(_))
+        ));
+        let zero_fps = GenerationRequest {
+            fps: Some(0),
+            ..req.clone()
+        };
+        assert!(matches!(
+            Generator::validate(&provider, &zero_fps),
+            Err(mlx_gen::gen_core::Error::Msg(_))
+        ));
+        assert!(matches!(
+            KreaRealtimeRenderPlan::from_generation_request(&provider.config, &zero_fps),
+            Err(Error::Unsupported(_))
+        ));
+        let zero_steps = GenerationRequest {
+            steps: Some(0),
+            ..req
+        };
+        assert!(matches!(
+            Generator::validate(&provider, &zero_steps),
+            Err(mlx_gen::gen_core::Error::Msg(_))
+        ));
+        assert!(matches!(
+            KreaRealtimeRenderPlan::from_generation_request(&provider.config, &zero_steps),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn routed_terminal_chunk_emit_preserves_video_output_events_and_zero_copy_ptr() {
+        use mlx_gen::gen_core::{
+            CausalCodecStatePolicy, ChunkResidencyPolicy, GenerationReport, TerminalChunkCollector,
+        };
+        use mlx_gen::LoadPhase;
+
+        struct ZeroCopyMockGeneration<'a> {
+            report: AdapterApplyReport,
+            frame_pixels_ptr: *const u8,
+            frames_vec_ptr: *const Image,
+            total_steps: u32,
+            on_progress: &'a mut dyn FnMut(Progress),
+        }
+
+        impl ReportedGeneration for ZeroCopyMockGeneration<'_> {
+            fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                (self.on_progress)(Progress::Loading(LoadPhase::TextEncoder));
+                (self.on_progress)(Progress::PromptEncodingComplete);
+                (self.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                for current in 1..=self.total_steps {
+                    (self.on_progress)(Progress::Step {
+                        current,
+                        total: self.total_steps,
+                    });
+                }
+                (self.on_progress)(Progress::Decoding);
+
+                let pixels = vec![123u8; 32 * 32 * 3];
+                self.frame_pixels_ptr = pixels.as_ptr();
+                let frames = vec![
+                    Image {
+                        width: 32,
+                        height: 32,
+                        pixels,
+                    },
+                    Image {
+                        width: 32,
+                        height: 32,
+                        pixels: vec![7u8; 32 * 32 * 3],
+                    },
+                ];
+                self.frames_vec_ptr = frames.as_ptr();
+                Ok((
+                    GenerationOutput::Video {
+                        frames,
+                        fps: 16,
+                        audio: None,
+                    },
+                    vec![self.report.clone()],
+                ))
+            }
+
+            fn i2v(
+                &mut self,
+                _image: &Image,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+
+            fn v2v(
+                &mut self,
+                _frames: &[Image],
+                _strength: f32,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+        }
+
+        let provider = unloaded();
+        let req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            ..Default::default()
+        };
+        let plan = provider.render_plan(&req).unwrap();
+        let report = AdapterApplyReport {
+            adapter_path: PathBuf::from("/models/lora.safetensors"),
+            applied: 3,
+            skipped: vec![],
+        };
+        let mut events = Vec::new();
+        let mut on_progress = |p: Progress| events.push(p);
+        let mut mock = ZeroCopyMockGeneration {
+            report: report.clone(),
+            frame_pixels_ptr: std::ptr::null(),
+            frames_vec_ptr: std::ptr::null(),
+            total_steps: plan.total_outer_steps as u32,
+            on_progress: &mut on_progress,
+        };
+        let mut collector = TerminalChunkCollector::new(CancelFlag::new());
+        provider
+            .finish_routed_generation_to_sink(
+                GenerationRoute::T2v,
+                &mut mock,
+                &mut collector,
+                Some(plan.causal_codec_state),
+            )
+            .unwrap();
+        let expected_frames_ptr = mock.frames_vec_ptr;
+        let expected_pixel_ptr = mock.frame_pixels_ptr;
+        assert_eq!(Generator::adapter_apply_reports(&provider), vec![report]);
+
+        let expected_events: Vec<Progress> = [
+            Progress::Loading(LoadPhase::TextEncoder),
+            Progress::PromptEncodingComplete,
+            Progress::Loading(LoadPhase::Renderer),
+        ]
+        .into_iter()
+        .chain(
+            (1..=plan.total_outer_steps as u32).map(|current| Progress::Step {
+                current,
+                total: plan.total_outer_steps as u32,
+            }),
+        )
+        .chain(std::iter::once(Progress::Decoding))
+        .collect();
+        assert_eq!(events, expected_events);
+
+        let chunk = collector.chunk().unwrap();
+        assert_eq!(chunk.sequence, 0);
+        assert!(chunk.is_final);
+        assert_eq!(
+            chunk.residency_policy,
+            Some(ChunkResidencyPolicy::TerminalWholeClip)
+        );
+        assert_eq!(
+            chunk.causal_codec_policy,
+            Some(CausalCodecStatePolicy::RollingKvWindow {
+                max_attention_tokens: plan.kv_residency.max_attention_size,
+                sink_tokens: 0,
+            })
+        );
+        let output = collector.into_output().unwrap();
+        let completed = GenerationReport::from_output(output);
+        match completed.output {
+            Some(GenerationOutput::Video { frames, fps, audio }) => {
+                assert_eq!(fps, 16);
+                assert!(audio.is_none());
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames.as_ptr(), expected_frames_ptr);
+                assert_eq!(frames[0].pixels.as_ptr(), expected_pixel_ptr);
+            }
+            other => panic!("expected Some(Video) output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_routed_generation_to_sink_preserves_backpressure_error_on_saturated_bounded_sink() {
+        use mlx_gen::gen_core::{BackpressureError, BoundedChunkSink, ChunkSink, OutputChunk};
+
+        struct SequenceAdvancingSink<'a>(&'a mut BoundedChunkSink<GenerationOutput>);
+
+        impl ChunkSink<GenerationOutput> for SequenceAdvancingSink<'_> {
+            fn emit(
+                &mut self,
+                mut chunk: OutputChunk<GenerationOutput>,
+            ) -> mlx_gen::gen_core::Result<()> {
+                chunk.sequence = self.0.next_sequence();
+                self.0.emit(chunk)
+            }
+        }
+
+        struct SimpleMockGeneration {
+            report: AdapterApplyReport,
+        }
+
+        impl ReportedGeneration for SimpleMockGeneration {
+            fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                Ok((
+                    GenerationOutput::Video {
+                        frames: Vec::new(),
+                        fps: 16,
+                        audio: None,
+                    },
+                    vec![self.report.clone()],
+                ))
+            }
+
+            fn i2v(
+                &mut self,
+                _image: &Image,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+
+            fn v2v(
+                &mut self,
+                _frames: &[Image],
+                _strength: f32,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+        }
+
+        let provider = unloaded();
+        let report = AdapterApplyReport {
+            adapter_path: PathBuf::from("/models/lora.safetensors"),
+            applied: 1,
+            skipped: vec![],
+        };
+        let mut bounded = BoundedChunkSink::new(1, CancelFlag::new()).unwrap();
+        bounded
+            .emit(OutputChunk::new(
+                0,
+                false,
+                GenerationOutput::Video {
+                    frames: Vec::new(),
+                    fps: 16,
+                    audio: None,
+                },
+            ))
+            .unwrap();
+
+        let err = {
+            let mut mock = SimpleMockGeneration {
+                report: report.clone(),
+            };
+            let mut adapter = SequenceAdvancingSink(&mut bounded);
+            provider
+                .finish_routed_generation_to_sink(
+                    GenerationRoute::T2v,
+                    &mut mock,
+                    &mut adapter,
+                    None,
+                )
+                .expect_err("saturated BoundedChunkSink must return typed BackpressureError")
+        };
+        assert_eq!(
+            BackpressureError::from_error(&err),
+            Some(&BackpressureError {
+                sequence: 1,
+                buffered: 1,
+                max_buffered_chunks: 1,
+            })
+        );
+        assert_eq!(bounded.backpressure_events(), 1);
+        assert_eq!(Generator::adapter_apply_reports(&provider), vec![report]);
     }
 }
