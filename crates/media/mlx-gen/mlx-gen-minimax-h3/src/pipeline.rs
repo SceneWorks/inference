@@ -189,9 +189,8 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 /// The requested **duration** is range-checked against
 /// [`MIN_DURATION_SECONDS`]–[`MAX_DURATION_SECONDS`], which are the lattice's own two ends, and the
 /// count is then aligned **upward** onto a rung. Because the range is the lattice's, the walk can
-/// never leave it: the largest in-range duration is exactly 345 frames, so no ceiling clamp is
-/// needed and there is no duration in range that silently renders shorter than it asked for
-/// (sc-17152 — see [`MAX_DURATION_SECONDS`] for why 15.0 s is not in range).
+/// never leave it: the largest in-range duration is exactly 481 frames, so no ceiling clamp is
+/// needed and there is no duration in range that silently renders shorter than it asked for.
 ///
 /// Alignment is upward within the range, so a caller that asks for 5.2 s gets 141 frames (5.875 s)
 /// and one that asks for 14.3 s gets 345 (14.375 s) — always at or above the request, never below.
@@ -1220,8 +1219,8 @@ mod tests {
             );
         }
         assert_eq!(
-            corrected, 9,
-            "9 of the 14 legal durations need a correction; 141/192/243/294/345 are exact"
+            corrected, 15,
+            "15 of the 22 legal durations need a correction; multiples of three are exact"
         );
 
         // Stems are delivered at the picture's length too — including one whose length is not a

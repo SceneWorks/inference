@@ -918,7 +918,11 @@ mod tests {
         neither.frames = None;
         assert_eq!(Request::from(&neither).frames, 124);
         neither.duration = Some(30.0);
-        assert_eq!(Request::from(&neither).frames, 345);
+        assert_eq!(Request::from(&neither).frames, 481);
+        by_duration.duration = Some(20.0);
+        by_frames.frames = Some(481);
+        assert_eq!(Request::from(&by_duration).frames, 481);
+        assert_eq!(price(&by_duration), price(&by_frames));
     }
 
     #[test]

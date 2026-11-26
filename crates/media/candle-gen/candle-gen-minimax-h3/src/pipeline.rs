@@ -158,7 +158,7 @@ impl RequestGeometry {
 ///
 /// Errors — never rounds — on a canvas that is not a multiple of [`SPATIAL_STRIDE`], on a canvas
 /// over [`CANVAS_MAX_PIXELS`], on a frame count that is not `17n + 5`, and on a duration outside the
-/// model's own 5.1667–14.375 s range.
+/// supported 5.1667–20.0417 s range.
 pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<RequestGeometry> {
     gen_core_h3::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
         .map_err(|error| CandleError::Msg(error.to_string()))?;
