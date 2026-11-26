@@ -19,9 +19,10 @@
 use serde::{Deserialize, Serialize};
 
 use gen_core::h3_image::{
-    edit_reference_images, generation_canvas, minimax_h3_image_pag_capability, request_sampler,
-    request_scheduler, validate_min_generation_area, validate_request as validate_image_contract,
-    FIXED_STEPS as H3_IMAGE_FIXED_STEPS, MIN_GENERATION_AREA_DEFAULT, SIZE_STRIDE as IMAGE_STRIDE,
+    edit_reference_images, generation_canvas, minimax_h3_image_pag_capability, reference_vae_size,
+    request_sampler, request_scheduler, validate_min_generation_area,
+    validate_request as validate_image_contract, FIXED_STEPS as H3_IMAGE_FIXED_STEPS,
+    MIN_GENERATION_AREA_DEFAULT, SIZE_STRIDE as IMAGE_STRIDE,
 };
 use gen_core::h3_memory::window::WindowAllocation;
 use gen_core::multistream::{
@@ -31,7 +32,8 @@ use gen_core::multistream::{
 };
 use gen_core::veda::workspace::WorkspaceBound;
 use gen_core::{
-    resolve_pag, validate_reference_image_short_edge, Conditioning, Error, GenerationRequest,
+    effective_reference_image_resize_mode, effective_reference_image_short_edge, resolve_pag,
+    validate_reference_image_short_edge, Conditioning, Error, GenerationRequest,
     MemoryBudgetDomain, MemoryPhase, PagPolicyErrorKind, PricedAllocation, RequestLiveSetPlan,
     Result, TransformerComponent, VedaRequest,
 };
@@ -43,7 +45,7 @@ use crate::h3_memory::{
 };
 use crate::h3_reference::{
     normalized_clip_frame_count, reference_audio_max_samples_per_channel, AudioReference,
-    Ref2VaReference, Ref2VaReferences, VideoReference,
+    Ref2VaReference, Ref2VaReferences, VideoReference, REFERENCE_IMAGE_MULTIPLE,
 };
 use crate::h3_schedule::{
     JointSchedule, SigmaSchedule, AUDIO_SIGMA_SHIFT, MIN_INFERENCE_STEPS, VIDEO_SIGMA_SHIFT,
@@ -727,10 +729,18 @@ impl H3RenderPlan {
                 for item in ref_list.as_slice() {
                     match item {
                         Ref2VaReference::Image(img) => {
-                            let rw = ((img.width.max(SPATIAL_STRIDE)) / SPATIAL_STRIDE) as usize;
-                            let rh = ((img.height.max(SPATIAL_STRIDE)) / SPATIAL_STRIDE) as usize;
-                            ref_video_tokens =
-                                ref_video_tokens.saturating_add(rw.max(1) * rh.max(1));
+                            let (rw, rh) = crate::resolve_reference_image_size(
+                                img.width,
+                                img.height,
+                                width,
+                                height,
+                                effective_reference_image_resize_mode(req),
+                                effective_reference_image_short_edge(req),
+                                REFERENCE_IMAGE_MULTIPLE,
+                            )?;
+                            let gw = ((rw / SPATIAL_STRIDE) as usize).max(1);
+                            let gh = ((rh / SPATIAL_STRIDE) as usize).max(1);
+                            ref_video_tokens = ref_video_tokens.saturating_add(gw * gh);
                         }
                         Ref2VaReference::Video(v) => {
                             let kept = normalized_clip_frame_count(
@@ -860,8 +870,8 @@ impl H3RenderPlan {
         let ref_tokens: usize = refs
             .iter()
             .map(|r| {
-                ((r.width / IMAGE_STRIDE).max(1) as usize)
-                    * ((r.height / IMAGE_STRIDE).max(1) as usize)
+                let (rw, rh) = reference_vae_size(r.width, r.height);
+                ((rw / IMAGE_STRIDE).max(1) as usize) * ((rh / IMAGE_STRIDE).max(1) as usize)
             })
             .sum();
 
@@ -1863,5 +1873,101 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok_img.pag_active_steps, 4);
+    }
+
+    #[test]
+    fn oversized_reference_image_is_priced_at_resized_vae_dimensions() {
+        let oversized = gen_core::Image {
+            width: 4096,
+            height: 3000,
+            pixels: Vec::new(),
+        };
+
+        // Video Ref2VA: default `Match` resize mode prices against resolved 1344x768 canvas -> 1184x864.
+        let video_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: H3_CANVAS_DEFAULT_WIDTH,
+            height: H3_CANVAS_DEFAULT_HEIGHT,
+            frames: Some(124),
+            conditioning: vec![Conditioning::Reference {
+                image: oversized.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let (expected_vw, expected_vh) = crate::resolve_reference_image_size(
+            4096,
+            3000,
+            H3_CANVAS_DEFAULT_WIDTH,
+            H3_CANVAS_DEFAULT_HEIGHT,
+            effective_reference_image_resize_mode(&video_req),
+            effective_reference_image_short_edge(&video_req),
+            REFERENCE_IMAGE_MULTIPLE,
+        )
+        .unwrap();
+        assert_eq!((expected_vw, expected_vh), (1184, 864));
+        let expected_video_tokens =
+            (expected_vw / SPATIAL_STRIDE) as usize * (expected_vh / SPATIAL_STRIDE) as usize;
+        let raw_tokens = (4096 / SPATIAL_STRIDE) as usize * (3000 / SPATIAL_STRIDE) as usize;
+        let video_plan = H3RenderPlan::from_video_generation_request(
+            &video_req,
+            H3BudgetDomainKey::UnifiedMemory,
+            H3EnvelopeSpec::m5_24gib(),
+        )
+        .unwrap();
+        assert_eq!(video_plan.route, H3RouteKind::Ref2va);
+        assert_eq!(video_plan.condition_video_tokens, expected_video_tokens);
+        assert!(video_plan.condition_video_tokens < raw_tokens);
+
+        // Video Ref2VA with `Max` mode (short edge capped at 2048 -> 2784x2048).
+        let mut video_max_req = video_req;
+        video_max_req.reference_image_resize_mode = Some(gen_core::ReferenceImageResizeMode::Max);
+        let (max_vw, max_vh) = crate::resolve_reference_image_size(
+            4096,
+            3000,
+            H3_CANVAS_DEFAULT_WIDTH,
+            H3_CANVAS_DEFAULT_HEIGHT,
+            effective_reference_image_resize_mode(&video_max_req),
+            effective_reference_image_short_edge(&video_max_req),
+            REFERENCE_IMAGE_MULTIPLE,
+        )
+        .unwrap();
+        assert_eq!((max_vw, max_vh), (2784, 2048));
+        let video_max_plan = H3RenderPlan::from_video_generation_request(
+            &video_max_req,
+            H3BudgetDomainKey::UnifiedMemory,
+            H3EnvelopeSpec::m5_24gib(),
+        )
+        .unwrap();
+        assert_eq!(
+            video_max_plan.condition_video_tokens,
+            (max_vw / SPATIAL_STRIDE) as usize * (max_vh / SPATIAL_STRIDE) as usize
+        );
+        assert!(video_max_plan.condition_video_tokens < raw_tokens);
+
+        // Image edit: `reference_vae_size(4096, 3000)` caps short edge at 2048 -> (2784, 2048).
+        let (expected_iw, expected_ih) = reference_vae_size(4096, 3000);
+        assert_eq!((expected_iw, expected_ih), (2784, 2048));
+        let expected_image_tokens =
+            (expected_iw / IMAGE_STRIDE) as usize * (expected_ih / IMAGE_STRIDE) as usize;
+        let image_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 2048,
+            height: 2048,
+            conditioning: vec![Conditioning::Reference {
+                image: oversized,
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let image_plan = H3RenderPlan::from_image_generation_request(
+            &image_req,
+            H3BudgetDomainKey::UnifiedMemory,
+            H3EnvelopeSpec::m5_24gib(),
+        )
+        .unwrap();
+        assert_eq!(image_plan.route, H3RouteKind::ImageEdit);
+        assert_eq!(image_plan.condition_video_tokens, expected_image_tokens);
+        assert!(image_plan.condition_video_tokens < raw_tokens);
     }
 }
