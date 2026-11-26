@@ -1,8 +1,8 @@
 //! Durable, backend-neutral storage for the result of a weight quantizer.
 //!
 //! Backends own the quantization and payload format; the consumer owns artifact storage,
-//! publication, leases and retention. The key includes the actual input bytes, shape and the
-//! versioned quantizer configuration, so an adapted or replaced weight cannot reuse stale codes.
+//! publication, leases and retention. Keys combine checkpoint identity (or mutable input bytes),
+//! shape and the versioned quantizer recipe. Ready runtime payloads are trusted after publication.
 use crate::Result;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -16,6 +16,15 @@ pub struct QuantizationArtifactKey {
 }
 impl QuantizationArtifactKey {
     pub fn new(recipe: &str, shape: &[usize], input: &[u8], extension: &'static str) -> Self {
+        Self::from_slices(recipe, shape, [input], extension)
+    }
+    /// Hash borrowed identity parts incrementally without concatenating large weight buffers.
+    pub fn from_slices<'a>(
+        recipe: &str,
+        shape: &[usize],
+        inputs: impl IntoIterator<Item = &'a [u8]>,
+        extension: &'static str,
+    ) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"sceneworks-weight-quantization-v1\0");
         hash.update((extension.len() as u64).to_le_bytes());
@@ -26,8 +35,10 @@ impl QuantizationArtifactKey {
         for dimension in shape {
             hash.update((*dimension as u64).to_le_bytes());
         }
-        hash.update((input.len() as u64).to_le_bytes());
-        hash.update(input);
+        for input in inputs {
+            hash.update((input.len() as u64).to_le_bytes());
+            hash.update(input);
+        }
         Self {
             digest: format!("{:x}", hash.finalize()),
             extension,
@@ -53,6 +64,12 @@ pub trait QuantizationArtifactCache: Send + Sync {
         key: &QuantizationArtifactKey,
         produce: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<Box<dyn QuantizationArtifact>>;
+
+    /// Discard an unreadable completed artifact so the shared loader can prepare it again.
+    /// Stores retaining immutable artifacts may decline; callers then return the read error.
+    fn invalidate(&self, _key: &QuantizationArtifactKey) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 thread_local! {
@@ -126,6 +143,19 @@ mod tests {
         }
         assert!(QuantizationCacheContext::capture().cache().is_none());
     }
+    #[test]
+    fn borrowed_identity_parts_keep_their_boundaries_and_single_part_compatibility() {
+        let key = |parts: &[&[u8]]| {
+            QuantizationArtifactKey::from_slices("r", &[4], parts.iter().copied(), "ggml")
+        };
+        assert_eq!(
+            key(&[b"abcd"]),
+            QuantizationArtifactKey::new("r", &[4], b"abcd", "ggml")
+        );
+        assert_ne!(key(&[b"ab", b"cd"]), key(&[b"a", b"bcd"]));
+        assert_ne!(key(&[b"abcd"]), key(&[b"ab", b"cd"]));
+    }
+
     #[test]
     fn identity_covers_bytes_shape_recipe_and_boundaries() {
         let key = |recipe, shape: &[usize], bytes: &[u8]| {

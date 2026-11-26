@@ -276,6 +276,7 @@ pub mod architecture_facts;
 pub mod testkit;
 
 pub extern crate candle_layers;
+pub use candle_layers::quantization_cache;
 pub use candle_layers::{CandleError, CandleWeightSource, Linear, Result, ScaleContext};
 
 #[inline]
