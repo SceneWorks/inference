@@ -81,7 +81,11 @@ use distill::{resolve_distill_lora, DistillLora, DISTILL_LORA_FILE, DISTILL_MERG
 pub use config::NeoChatConfig;
 pub use runtime::Sampler;
 pub use t2i::{
-    interleave_resolution_for, smart_resize, tensor_to_image, CfgNorm, InterleaveOutput, T2iModel,
+    compile_interleave_conditional_plan, compile_interleave_conditional_plan_from_shape,
+    default_interleave_ceilings, interleave_resolution_for, pre_load_interleave_conditional_plan,
+    run_sensenova_interleave_ops, smart_resize, source_image_geometry, tensor_to_image, CfgNorm,
+    InterleaveContext, InterleaveOutput, InterleavePrefill, SenseNovaCfgMode, SenseNovaFmDriver,
+    SenseNovaInterleaveExecutor, SenseNovaInterleaveOps, SenseNovaVelocityForward, T2iModel,
     T2iOptions, INTERLEAVE_RESOLUTIONS,
 };
 pub use text::{SenseNovaTokenizer, INTERLEAVE_SYSTEM_MESSAGE};
@@ -958,8 +962,11 @@ impl SenseNovaUnderstanding {
         Ok((output, execution))
     }
 
+    /// Interleave executed on an explicit pre-load [`ConditionalPlan`](gen_core::render::conditional::ConditionalPlan),
+    /// returning the realized [`ConditionalReceipt`](gen_core::render::conditional::ConditionalReceipt) alongside
+    /// [`InterleaveOutput`].
     #[allow(clippy::too_many_arguments)]
-    pub fn run_interleave_with_progress(
+    pub fn run_interleave_with_conditional_plan(
         &self,
         context: &gen_core::MemoryRunContext,
         mut request: GenerationRequest,
@@ -971,9 +978,25 @@ impl SenseNovaUnderstanding {
         system_message: &str,
         max_new_tokens: usize,
         max_images: usize,
+        precompiled_plan: Option<(
+            &gen_core::render::conditional::ConditionalInput,
+            &gen_core::render::conditional::ConditionalPlan,
+        )>,
+        ceilings: Option<gen_core::render::conditional::ConditionalCeilings>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<InterleaveOutput> {
+    ) -> Result<(
+        InterleaveOutput,
+        gen_core::render::conditional::ConditionalReceipt,
+    )> {
+        if let Some((input, _)) = precompiled_plan {
+            if input.provider_id != MODEL_ID {
+                return Err(CandleError::Msg(format!(
+                    "sensenova: precompiled conditional plan targets {:?}, loaded generator is {:?}",
+                    input.provider_id, MODEL_ID
+                )));
+            }
+        }
         validate_interleave_count(&request, max_images)?;
         if request.width != width as u32 || request.height != height as u32 {
             return Err(CandleError::Msg(format!(
@@ -993,7 +1016,8 @@ impl SenseNovaUnderstanding {
         Self::run_direct_scope(&mut *scope, &mut request, |configured_request| {
             Self::apply_request_memory(configured_request, &mut options);
             self.with_runtime(|model, tokenizer| {
-                model.interleave_gen_with_progress(
+                model.interleave_gen_for_provider_with_conditional_receipt(
+                    MODEL_ID,
                     tokenizer,
                     prompt,
                     input_images,
@@ -1003,11 +1027,48 @@ impl SenseNovaUnderstanding {
                     system_message,
                     max_new_tokens,
                     max_images,
+                    precompiled_plan,
+                    ceilings,
                     cancel,
                     on_progress,
                 )
             })
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_progress(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<InterleaveOutput> {
+        self.run_interleave_with_conditional_plan(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            None,
+            None,
+            cancel,
+            on_progress,
+        )
+        .map(|(out, _receipt)| out)
     }
 }
 

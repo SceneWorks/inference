@@ -1,11 +1,16 @@
-//! Weight-free bounded conditional execution fixture for SenseNova interleave.
+//! Bounded conditional execution contract for SenseNova interleave (`§6.10`, `B2`, `PIPE-12`).
 //!
-//! This contract prices every possible rollout, image pass, and feedback before a provider
-//! loads weights. MLX/Candle production interleave remains on its established path until its
-//! separately tracked migration; the executor here is an intentionally tensor-free seam.
+//! Prices every possible rollout, image pass, and feedback before a provider loads weights and
+//! drives SenseNova's interleaved AR rollout, flow-matching denoise steps, and vision feedback
+//! within compiled stage templates and hard cache/memory bounds.
+
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::thread::ThreadId;
 
 use crate::{CancelFlag, Error, Progress, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const CACHE_COUNT: usize = 3;
 const IMAGE_CHANNELS: u64 = 3;
@@ -91,6 +96,39 @@ pub struct PrefillModelShape {
     pub vocab_size: u32,
 }
 
+impl PrefillModelShape {
+    /// Conservative per-token f32 KV storage bound for a single SenseNova cache.
+    pub fn cache_token_bytes_bound(self) -> u64 {
+        u64::from(self.layers)
+            .saturating_mul(2)
+            .saturating_mul(u64::from(self.kv_heads))
+            .saturating_mul(u64::from(self.head_dim))
+            .saturating_mul(F32_BYTES)
+    }
+
+    /// Conservative per-step scratch byte bound for a `(width, height)` flow-matching step.
+    pub fn estimate_step_scratch_bytes(self, image_tokens: u64, width: u32, height: u32) -> u64 {
+        let hidden = u64::from(self.hidden_width);
+        let inter = u64::from(self.intermediate_width);
+        let q_dim = u64::from(self.attention_heads).saturating_mul(u64::from(self.head_dim));
+        let kv_dim = u64::from(self.kv_heads).saturating_mul(u64::from(self.head_dim));
+        let rgb = u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(IMAGE_CHANNELS);
+        image_tokens
+            .saturating_mul(
+                hidden
+                    .saturating_mul(4)
+                    .saturating_add(inter.saturating_mul(3))
+                    .saturating_add(q_dim)
+                    .saturating_add(kv_dim.saturating_mul(2)),
+            )
+            .saturating_add(rgb.saturating_mul(4))
+            .saturating_mul(4)
+            .max(1)
+    }
+}
+
 /// All output-affecting request facts and conservative upper bounds are frozen pre-load.
 /// `step_scratch_bytes` is an admission upper bound for all simultaneously live step tensors;
 /// `cache_token_bytes` is the upper bound for each retained KV token across the three caches.
@@ -151,6 +189,39 @@ pub struct ConditionalCeilings {
     pub max_total_work: u64,
 }
 
+impl ConditionalCeilings {
+    /// Conservative ceilings for standalone SenseNova interleave runs when no tighter host
+    /// admission bounds are provided.
+    pub fn sensenova_default() -> Self {
+        Self {
+            max_width: 4096,
+            max_height: 4096,
+            max_input_images: 16,
+            max_source_width: 4096,
+            max_source_height: 4096,
+            max_source_token_grid: 16_384,
+            max_source_live_bytes: 16_000_000_000,
+            max_prefill_hidden_width: 8192,
+            max_prefill_intermediate_width: 32_768,
+            max_prefill_vision_hidden_width: 4096,
+            max_prefill_attention_heads: 128,
+            max_prefill_kv_heads: 64,
+            max_prefill_head_dim: 256,
+            max_prefill_layers: 128,
+            max_prefill_vocab_size: 262_144,
+            max_source_merge_size: 8,
+            max_prefill_scratch_bytes: u64::MAX / 4,
+            max_token_grid: 16_384,
+            max_new_tokens: 32_768,
+            max_images: 16,
+            max_steps_per_image: 256,
+            max_cache_tokens_per_cache: 131_072,
+            max_peak_bytes: u64::MAX / 4,
+            max_total_work: u64::MAX / 4,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionalBudget {
     pub image_tokens: u64,
@@ -178,8 +249,10 @@ pub struct ConditionalPlan {
 
 impl ConditionalPlan {
     pub fn compile(input: ConditionalInput, ceilings: ConditionalCeilings) -> Result<Self> {
-        if input.provider_id != "sensenova_u1_8b"
-            || input.width == 0
+        if !matches!(
+            input.provider_id.as_str(),
+            "sensenova_u1_8b" | "sensenova_u1_8b_fast"
+        ) || input.width == 0
             || input.height == 0
             || input.cell == 0
             || !input.width.is_multiple_of(input.cell)
@@ -594,6 +667,10 @@ impl ConditionalPlan {
         &self.input
     }
 
+    pub fn ceilings(&self) -> &ConditionalCeilings {
+        &self.ceilings
+    }
+
     pub fn templates(&self) -> &[StageTemplate; 4] {
         &self.templates
     }
@@ -604,6 +681,70 @@ impl ConditionalPlan {
 
     pub fn budget(&self) -> &ConditionalBudget {
         &self.budget
+    }
+
+    /// Compile a pre-load SenseNova interleave [`ConditionalPlan`] from pure geometry, prefix
+    /// token counts, and architectural shape before deserializing model weights (`§6.10`, `B2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_sensenova_interleave(
+        provider_id: &str,
+        prompt: &str,
+        seed: u64,
+        width: u32,
+        height: u32,
+        source_images: Vec<SourceImageGeometry>,
+        prefill_tokens: [u32; CACHE_COUNT],
+        shape: PrefillModelShape,
+        max_new_tokens: usize,
+        max_images: usize,
+        steps_per_image: usize,
+        model_resident_bytes: u64,
+        cache_token_bytes: u64,
+        ceilings: Option<ConditionalCeilings>,
+    ) -> Result<(ConditionalInput, Self)> {
+        let cell = shape
+            .source_patch_size
+            .checked_mul(shape.source_merge_size)
+            .ok_or_else(overflow)?;
+        if cell == 0 || !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
+            return Err(refused(&format!(
+                "width/height must be multiples of {cell}, got {width}x{height}"
+            )));
+        }
+        let image_tokens = u64::from(width / cell).saturating_mul(u64::from(height / cell));
+        let step_scratch_bytes = shape.estimate_step_scratch_bytes(image_tokens, width, height);
+        let input = ConditionalInput {
+            provider_id: provider_id.to_owned(),
+            prompt_sha256: Sha256::digest(prompt.as_bytes()).into(),
+            seed,
+            width,
+            height,
+            cell,
+            input_images: u32::try_from(source_images.len()).map_err(|_| overflow())?,
+            source_images,
+            prefill_tokens,
+            prefill_hidden_width: shape.hidden_width,
+            prefill_intermediate_width: shape.intermediate_width,
+            prefill_vision_hidden_width: shape.vision_hidden_width,
+            source_patch_size: shape.source_patch_size,
+            source_merge_size: shape.source_merge_size,
+            prefill_attention_heads: shape.attention_heads,
+            prefill_kv_heads: shape.kv_heads,
+            prefill_head_dim: shape.head_dim,
+            prefill_layers: shape.layers,
+            prefill_vocab_size: shape.vocab_size,
+            max_new_tokens: u32::try_from(max_new_tokens).map_err(|_| overflow())?,
+            max_images: u32::try_from(max_images).map_err(|_| overflow())?,
+            steps_per_image: u32::try_from(steps_per_image).map_err(|_| overflow())?,
+            model_resident_bytes,
+            cache_token_bytes,
+            step_scratch_bytes,
+        };
+        let plan = Self::compile(
+            input.clone(),
+            ceilings.unwrap_or_else(ConditionalCeilings::sensenova_default),
+        )?;
+        Ok((input, plan))
     }
 }
 
@@ -670,6 +811,15 @@ pub struct ConditionalOutput<I> {
     pub receipt: ConditionalReceipt,
 }
 
+impl From<ConditionalOutput<crate::Image>> for crate::GenerationOutput {
+    fn from(output: ConditionalOutput<crate::Image>) -> Self {
+        Self::Interleaved {
+            text: output.text,
+            images: output.images,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     BeforePrefill,
@@ -686,10 +836,11 @@ enum Action {
     Terminal(TerminalReason),
 }
 
-/// Owner-local meter. Every public transition validates the compiled stage and remaining
-/// budget before a driver may invoke its corresponding provider callback.
+/// Owner-local meter (`!Send + !Sync`). Every public transition validates owner-thread locality,
+/// compiled stage, and remaining budget before a driver may invoke its provider callback.
 pub struct ConditionalGuard<'p> {
     plan: &'p ConditionalPlan,
+    owner_thread: ThreadId,
     state: State,
     text_draws: u32,
     rollout_calls: u32,
@@ -697,6 +848,7 @@ pub struct ConditionalGuard<'p> {
     feedback_calls: u32,
     actual_outer_steps: u32,
     stages: Vec<RealizedStage>,
+    _owner_local: PhantomData<Rc<()>>,
 }
 
 impl<'p> ConditionalGuard<'p> {
@@ -704,6 +856,7 @@ impl<'p> ConditionalGuard<'p> {
         plan.validate()?;
         Ok(Self {
             plan,
+            owner_thread: std::thread::current().id(),
             state: State::BeforePrefill,
             text_draws: 0,
             rollout_calls: 0,
@@ -711,10 +864,27 @@ impl<'p> ConditionalGuard<'p> {
             feedback_calls: 0,
             actual_outer_steps: 0,
             stages: Vec::new(),
+            _owner_local: PhantomData,
         })
     }
 
+    pub fn owner_thread(&self) -> ThreadId {
+        self.owner_thread
+    }
+
+    pub fn assert_owner_thread(&self) -> Result<()> {
+        let current = std::thread::current().id();
+        if current != self.owner_thread {
+            return Err(refused(&format!(
+                "conditional guard accessed from thread {current:?} instead of owner {:?}",
+                self.owner_thread
+            )));
+        }
+        Ok(())
+    }
+
     fn expect(&self, expected: State) -> Result<()> {
+        self.assert_owner_thread()?;
         if self.state != expected {
             return Err(refused("transition is absent or has already been spent"));
         }
@@ -749,6 +919,7 @@ impl<'p> ConditionalGuard<'p> {
     }
 
     fn finish_rollout(&mut self, segment: &TextRollout) -> Result<Action> {
+        self.assert_owner_thread()?;
         let State::Rollout { granted } = self.state else {
             return Err(refused("text rollout was not admitted"));
         };
@@ -900,6 +1071,45 @@ pub trait ConditionalExecutor {
         image: u32,
         output: &Self::Image,
     ) -> Result<()>;
+
+    /// Placeholder inserted into the composed interleaved text when an image pass begins
+    /// (for example `"<image>"` on SenseNova). Defaults to empty for weight-free mocks.
+    fn image_placeholder(&self) -> &'static str {
+        ""
+    }
+
+    /// Progress-reporting prefill hook (defaults to [`Self::prefill`]).
+    fn prefill_with_progress(
+        &mut self,
+        plan: &ConditionalPlan,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Self::Context, [Self::Cache; CACHE_COUNT])> {
+        self.prefill(plan)
+    }
+
+    /// Progress-reporting per-step denoise hook (defaults to [`Self::denoise_step`]).
+    fn denoise_step_with_progress(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; CACHE_COUNT],
+        image: u32,
+        step: u32,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        self.denoise_step(context, caches, image, step)
+    }
+
+    /// Progress-reporting feedback hook (defaults to [`Self::feedback`]).
+    fn feedback_with_progress(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; CACHE_COUNT],
+        image: u32,
+        output: &Self::Image,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        self.feedback(context, caches, image, output)
+    }
 }
 
 pub fn run_conditional<E: ConditionalExecutor>(
@@ -917,7 +1127,7 @@ pub fn run_conditional<E: ConditionalExecutor>(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let (mut context, mut caches) = executor.prefill(plan)?;
+    let (mut context, mut caches) = executor.prefill_with_progress(plan, progress)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -945,12 +1155,19 @@ pub fn run_conditional<E: ConditionalExecutor>(
         match action {
             Action::Terminal(reason) => break reason,
             Action::Image(image) => {
+                text.push_str(executor.image_placeholder());
                 for step in 0..plan.input.steps_per_image {
                     if cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
                     guard.check_step(image, step)?;
-                    executor.denoise_step(&mut context, &mut caches, image, step)?;
+                    executor.denoise_step_with_progress(
+                        &mut context,
+                        &mut caches,
+                        image,
+                        step,
+                        progress,
+                    )?;
                     if cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
@@ -968,7 +1185,13 @@ pub fn run_conditional<E: ConditionalExecutor>(
                 if cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
-                executor.feedback(&mut context, &mut caches, image, &output)?;
+                executor.feedback_with_progress(
+                    &mut context,
+                    &mut caches,
+                    image,
+                    &output,
+                    progress,
+                )?;
                 if cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }

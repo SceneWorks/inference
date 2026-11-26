@@ -4237,7 +4237,8 @@ mod integration_tests {
                 // a future output variant still breaks this match.
                 GenerationOutput::ImagesRgba(_)
                 | GenerationOutput::Video { .. }
-                | GenerationOutput::Audio(_) => {
+                | GenerationOutput::Audio(_)
+                | GenerationOutput::Interleaved { .. } => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };

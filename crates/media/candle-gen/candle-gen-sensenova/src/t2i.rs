@@ -22,10 +22,21 @@
 //! Deterministic, launch-portable initial noise from a fixed-algorithm CPU RNG (`StdRng`, sc-3673) —
 //! same-backend determinism only; cross-backend pixel-equality vs `mlx-gen-sensenova` is NOT a goal.
 
+use std::cell::RefCell;
+
 use candle_gen::candle_core::{Device, IndexOp, Result as CResult, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec,
+    SliceTransition, StepHooks,
+};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
-use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::gen_core::render::conditional::{
+    run_conditional, ConditionalCeilings, ConditionalExecutor, ConditionalInput, ConditionalPlan,
+    ConditionalReceipt, PrefillModelShape, RolloutStop, SourceImageGeometry, TextRollout,
+};
+use candle_gen::gen_core::{BoundaryState, CancelFlag, GenerationOutput, Image, Progress};
 use candle_gen::preview::{PreviewCounter, PreviewHook};
 use candle_gen::{CandleError, Result};
 use candle_llm::core_llm::token_execution as execution;
@@ -114,6 +125,342 @@ pub struct InterleaveOutput {
     pub images: Vec<Tensor>,
 }
 
+impl InterleaveOutput {
+    /// Convert composed text and model-space `[1, 3, H, W]` images into typed
+    /// [`GenerationOutput::Interleaved`].
+    pub fn into_generation_output(self) -> Result<GenerationOutput> {
+        let mut decoded = Vec::with_capacity(self.images.len());
+        for image in &self.images {
+            decoded.push(tensor_to_image(image)?);
+        }
+        Ok(GenerationOutput::Interleaved {
+            text: self.text,
+            images: decoded,
+        })
+    }
+}
+
+impl TryFrom<InterleaveOutput> for GenerationOutput {
+    type Error = CandleError;
+
+    fn try_from(output: InterleaveOutput) -> Result<Self> {
+        output.into_generation_output()
+    }
+}
+
+/// Guidance regime for [`SenseNovaFmDriver`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SenseNovaCfgMode {
+    /// Text-to-image: 2-cache CFG (condition / uncondition) with inclusive `[i0, i1]` gate.
+    T2i,
+    /// Image-conditioned / interleave: 3-cache dual CFG (condition / text-uncond / image-uncond)
+    /// with exclusive `(i0, i1) || i0 == 0` gate and post-blend `Global`/`Channel` norm.
+    It2i,
+}
+
+/// Weights-free velocity forward seam for [`SenseNovaFmDriver`] (`PIPE-7`, `SW-6974`).
+pub trait SenseNovaVelocityForward {
+    /// Prepare step latent `z` and conditioned token embedding from model-space `image` at `t`.
+    fn prepare_step(&self, image: &Tensor, t: f32) -> Result<(Tensor, Tensor)>;
+    /// Conditional velocity prediction.
+    fn predict_cond(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor>;
+    /// Image-conditioned / text-unconditioned velocity prediction (`cache_img` / `cache_tu`).
+    fn predict_img(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor>;
+    /// Unconditional velocity prediction (`cache_uncond` / `cache_iu`).
+    fn predict_uncond(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor>;
+    /// Unpatchify stepped latent `next_z` back to `[1, 3, H, W]` model space.
+    fn unpatchify_step(&self, next_z: &Tensor) -> Result<Tensor>;
+}
+
+/// Typed [`FamilyDriver`] for Candle SenseNova-U1 flow-matching Euler denoising across both T2I and
+/// IT2I / interleave passes (`PIPE-7`, `PIPE-14`, `B3`, `SW-6974`).
+pub struct SenseNovaFmDriver<F> {
+    timesteps: Vec<f32>,
+    mode: SenseNovaCfgMode,
+    cfg_scale: f32,
+    img_cfg_scale: f32,
+    has_uncond: bool,
+    cfg_norm: CfgNorm,
+    cfg_interval: (f32, f32),
+    t_eps: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: SenseNovaVelocityForward> SenseNovaFmDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            // Candle SenseNova uses request-scoped explicit `StdRng` rather than global RNG state.
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle SenseNova FM driver does not re-noise from clean boundary estimates",
+                geometry_change:
+                    "native Candle SenseNova FM driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native Candle SenseNova FM driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        driver_id: &'static str,
+        timesteps: Vec<f32>,
+        mode: SenseNovaCfgMode,
+        opts: &T2iOptions,
+        has_img: bool,
+        has_uncond: bool,
+        forward: F,
+    ) -> Result<Self> {
+        if opts.num_steps == 0 || timesteps.len() != opts.num_steps + 1 {
+            return Err(CandleError::Msg(format!(
+                "{driver_id}: invalid SenseNova schedule len {} for num_steps={}",
+                timesteps.len(),
+                opts.num_steps
+            )));
+        }
+        if mode == SenseNovaCfgMode::It2i {
+            let (needs_img, needs_uncond) =
+                it2i_cache_requirements(opts.cfg_scale, opts.img_cfg_scale);
+            if needs_img && !has_img {
+                return Err(img_cache_err());
+            }
+            if needs_uncond && !has_uncond {
+                return Err(uncond_cache_err());
+            }
+            if opts.cfg_norm == CfgNorm::CfgZeroStar {
+                return Err(cfg_zero_star_it2i_err());
+            }
+        }
+        Ok(Self {
+            timesteps,
+            mode,
+            cfg_scale: opts.cfg_scale,
+            img_cfg_scale: opts.img_cfg_scale,
+            has_uncond,
+            cfg_norm: opts.cfg_norm,
+            cfg_interval: opts.cfg_interval,
+            t_eps: opts.t_eps,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    pub fn total_steps(&self) -> usize {
+        self.timesteps.len().saturating_sub(1)
+    }
+
+    fn guided_velocity(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+        let out_cond = self.forward.predict_cond(z, cond_emb, t)?;
+        match self.mode {
+            SenseNovaCfgMode::T2i => {
+                let needs_cfg = self.cfg_scale > 1.0 && self.has_uncond;
+                if needs_cfg && t >= self.cfg_interval.0 && t <= self.cfg_interval.1 {
+                    let v_uncond = self.forward.predict_uncond(z, cond_emb, t)?;
+                    Ok(cfg_blend(&out_cond, &v_uncond, self.cfg_scale)?)
+                } else {
+                    Ok(out_cond)
+                }
+            }
+            SenseNovaCfgMode::It2i => {
+                let (cfg, img_cfg) = (self.cfg_scale, self.img_cfg_scale);
+                let (i0, i1) = self.cfg_interval;
+                let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
+                candle_gen::execution::policy(
+                    "sensenova/t2i/use_cfg",
+                    format!("{use_cfg:?}").into(),
+                );
+                let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
+                    out_cond.clone()
+                } else if img_cfg == 1.0 {
+                    let oi = self.forward.predict_img(z, cond_emb, t)?;
+                    (&oi + ((&out_cond - &oi)? * cfg as f64)?)?
+                } else if cfg == img_cfg {
+                    let ou = self.forward.predict_uncond(z, cond_emb, t)?;
+                    (&ou + ((&out_cond - &ou)? * cfg as f64)?)?
+                } else {
+                    let oi = self.forward.predict_img(z, cond_emb, t)?;
+                    let ou = self.forward.predict_uncond(z, cond_emb, t)?;
+                    let a = ((&out_cond - &oi)? * cfg as f64)?;
+                    let b = ((&oi - &ou)? * img_cfg as f64)?;
+                    ((&ou + &a)? + &b)?
+                };
+                if (cfg > 1.0 || img_cfg > 1.0) && use_cfg {
+                    v_pred = apply_cfg_norm(v_pred, &out_cond, self.cfg_norm)?;
+                }
+                Ok(v_pred)
+            }
+        }
+    }
+}
+
+impl<F: SenseNovaVelocityForward> FamilyDriver<Tensor> for SenseNovaFmDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<BoundaryState<Tensor>> {
+        let _ = self.t_eps;
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let total = self.total_steps();
+        if input.span.end > total {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice span {:?} exceeds {total} steps",
+                self.support.driver_id, input.span
+            )));
+        }
+
+        let mut image = match input.state {
+            BoundaryState::XSigma(img)
+            | BoundaryState::CleanEstimate { latent: img, .. }
+            | BoundaryState::RouteSpecific { state: img, .. } => img,
+        };
+
+        for outer_step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            let t = self.timesteps[outer_step];
+            let t_next = self.timesteps[outer_step + 1];
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: t,
+                next_sigma: t_next,
+            };
+            hooks.observe(&info, &image)?;
+
+            let (z, cond_emb) = self
+                .forward
+                .prepare_step(&image, t)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            let v_pred = self
+                .guided_velocity(&z, &cond_emb, t)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let next_z = euler_step(&v_pred, &z, t, t_next)
+                .map_err(|e| candle_gen::gen_core::Error::from(CandleError::from(e)))?;
+            image = self
+                .forward
+                .unpatchify_step(&next_z)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            image = hooks.post_step(&info, image)?;
+            hooks.materialize(&info, &image)?;
+            state.record_outer_step(outer_step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(image))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StepPreview<'a> {
+    carrier: &'a PreviewHook<'a>,
+    counter: &'a PreviewCounter,
+}
+
+struct ProductionSenseNovaForward<'a> {
+    model: &'a T2iModel,
+    grid_h: usize,
+    grid_w: usize,
+    l: usize,
+    cell: usize,
+    token_h: usize,
+    token_w: usize,
+    noise_embed: &'a Option<Tensor>,
+    t_eps: f32,
+    attention: AttentionPlan<'a>,
+    transformer_window: Option<usize>,
+    cache_cond: RefCell<&'a mut KvCache>,
+    rm_cond: &'a RopeMask,
+    cache_img: Option<(RefCell<&'a mut KvCache>, &'a RopeMask)>,
+    cache_uncond: Option<(RefCell<&'a mut KvCache>, &'a RopeMask)>,
+}
+
+impl SenseNovaVelocityForward for ProductionSenseNovaForward<'_> {
+    fn prepare_step(&self, image: &Tensor, t: f32) -> Result<(Tensor, Tensor)> {
+        Ok(self.model.step_cond_embeds(
+            image,
+            self.grid_h,
+            self.grid_w,
+            self.l,
+            t,
+            self.noise_embed,
+        )?)
+    }
+
+    fn predict_cond(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+        let mut cache = self.cache_cond.borrow_mut();
+        self.model.predict_v(
+            cond_emb,
+            self.rm_cond,
+            *cache,
+            z,
+            t,
+            self.t_eps,
+            self.attention,
+            self.transformer_window,
+        )
+    }
+
+    fn predict_img(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+        let (cache_cell, rm) = self.cache_img.as_ref().ok_or_else(img_cache_err)?;
+        let mut cache = cache_cell.borrow_mut();
+        self.model.predict_v(
+            cond_emb,
+            rm,
+            *cache,
+            z,
+            t,
+            self.t_eps,
+            self.attention,
+            self.transformer_window,
+        )
+    }
+
+    fn predict_uncond(&self, z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+        let (cache_cell, rm) = self.cache_uncond.as_ref().ok_or_else(uncond_cache_err)?;
+        let mut cache = cache_cell.borrow_mut();
+        self.model.predict_v(
+            cond_emb,
+            rm,
+            *cache,
+            z,
+            t,
+            self.t_eps,
+            self.attention,
+            self.transformer_window,
+        )
+    }
+
+    fn unpatchify_step(&self, next_z: &Tensor) -> Result<Tensor> {
+        Ok(unpatchify(next_z, self.cell, self.token_h, self.token_w)?)
+    }
+}
+
 /// The interleave resolution buckets (`examples/interleave/inference.py::SUPPORTED_RESOLUTIONS`) —
 /// `(width, height)` per aspect ratio. Document Studio picks one of these. Default `"16:9"`.
 pub const INTERLEAVE_RESOLUTIONS: &[(&str, (i32, i32))] = &[
@@ -160,6 +507,9 @@ pub struct T2iModel {
     img_start_id: i32,
     img_end_id: i32,
     device: Device,
+    prefill_shape: PrefillModelShape,
+    cache_token_bytes: u64,
+    resident_bytes_estimate: u64,
 }
 
 impl T2iModel {
@@ -232,6 +582,9 @@ impl T2iModel {
             noise_scale_base_image_seq_len: cfg.noise_scale_base_image_seq_len as f32,
             noise_scale_max_value: cfg.noise_scale_max_value,
             device: vb.device().clone(),
+            prefill_shape: cfg.prefill_model_shape(),
+            cache_token_bytes: cfg.cache_token_bytes_bound(),
+            resident_bytes_estimate: cfg.estimated_resident_bytes(),
         })
     }
 
@@ -247,6 +600,11 @@ impl T2iModel {
     /// The patch·merge cell — every image side must be a multiple of this.
     pub fn cell(&self) -> usize {
         self.patch_size * self.merge_size
+    }
+
+    /// Pre-load / loaded architectural shape used by [`ConditionalPlan`].
+    pub fn prefill_model_shape(&self) -> PrefillModelShape {
+        self.prefill_shape
     }
 
     fn attention_plan<'a>(
@@ -582,14 +940,8 @@ impl T2iModel {
         )
     }
 
-    /// The flow-matching denoise loop. Returns the final model-space image `[1,3,H,W]`.
-    ///
-    /// This is SenseNova-U1's **only registered denoise lane** and it is genuinely bespoke: the crate
-    /// drives no `candle_gen::run_flow_sampler` / `run_curated_sampler` / `run_scm_sampler` anywhere,
-    /// because the unified AR backbone's per-step `KvCache` mutation makes a multi-eval curated solver
-    /// unsound (see [`crate::descriptor`]'s empty sampler menu). So the per-step preview seam is a
-    /// **direct** [`PreviewHook::emit_step`] from inside this loop rather than a hook handed to a
-    /// driver — the `Denoise::Bespoke` shape `candle-gen-catalog`'s route inventory declares.
+    /// The flow-matching denoise loop, driven via [`SenseNovaFmDriver`] and [`run_candle_driver_slices`].
+    /// Returns the final model-space image `[1,3,H,W]`.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
@@ -614,12 +966,12 @@ impl T2iModel {
         let l = token_h * token_w;
 
         let noise_scale = self.noise_scale_for(grid_h, grid_w);
-        let mut image = (base_noise * noise_scale as f64)?;
+        let init_image = (base_noise * noise_scale as f64)?;
 
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
         candle_gen::execution::schedule("sensenova-euler", &timesteps, "pixel-velocity");
-        candle_gen::execution::runtime(image.device(), image.dtype());
+        candle_gen::execution::runtime(init_image.device(), init_image.dtype());
         candle_gen::execution::policy("sensenova_denoise", format!("{opts:?}").into());
         execution::observe_image_schedule(&timesteps);
         execution::observe_document_policy(
@@ -635,70 +987,65 @@ impl T2iModel {
             None => None,
         };
 
-        // Per-step preview numbering (epic 16948, sc-16960). Keyed on the **step index**, because this
-        // loop walks an ascending `t` boundary grid (`step_schedule`: `0 → 1`, noise → image) rather
-        // than a descending σ array — `PreviewCounter::new(sigmas)` has nothing to key against, exactly
-        // as it has nothing to key against on the σ-less SCM driver. The counter is local to this call
-        // and `generate` is called once per seed, so a batched request starts each image at frame 1.
         let preview_counter = PreviewCounter::with_steps(steps);
-
-        for i in 0..steps {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
+        let forward = ProductionSenseNovaForward {
+            model: self,
+            grid_h,
+            grid_w,
+            l,
+            cell,
+            token_h,
+            token_w,
+            noise_embed: &noise_embed,
+            t_eps: opts.t_eps,
+            attention,
+            transformer_window: opts.transformer_window_size,
+            cache_cond: RefCell::new(cache_cond),
+            rm_cond: &rm_cond,
+            cache_img: None,
+            cache_uncond: cache_uncond
+                .as_mut()
+                .zip(rm_uncond.as_ref())
+                .map(|(cu, rm)| (RefCell::new(&mut **cu), rm)),
+        };
+        let driver = SenseNovaFmDriver::new(
+            "sensenova_t2i_euler",
+            timesteps,
+            SenseNovaCfgMode::T2i,
+            opts,
+            false,
+            needs_cfg,
+            forward,
+        )?;
+        let mut state = DriverRunState::new();
+        let mut hooks = StepHooks::new(on_progress);
+        let mut on_observe = |info: &DriverStepInfo, image: &Tensor| {
             // Emitted BEFORE the step, matching the shared drivers' contract and Ideogram's bespoke
-            // loop: the frame shows the state this step is about to advance, so the fully denoised
-            // state is never previewed (the finished image lands instead). `image` is the running
-            // model-space latent `[1, 3, H, W]`; `crate::preview` owns the pool to the token grid.
-            // Projection failures are swallowed inside — a lost decorative frame never fails a render
-            // — and an inert sink never even runs the projection.
-            preview.emit_step(&preview_counter, i, &image);
-            let t = timesteps[i];
-            let t_next = timesteps[i + 1];
-
-            let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let v_cond = self.predict_v(
-                &cond,
-                &rm_cond,
-                cache_cond,
-                &z,
-                t,
-                opts.t_eps,
-                attention,
-                opts.transformer_window_size,
-            )?;
-
-            // CFG-interval gate (inclusive both ends — the reference T2I gate).
-            let v_pred = if needs_cfg && t >= opts.cfg_interval.0 && t <= opts.cfg_interval.1 {
-                let cache_u = cache_uncond
-                    .as_deref_mut()
-                    .expect("needs_cfg ⇒ uncond cache");
-                let rm_u = rm_uncond.as_ref().expect("needs_cfg ⇒ uncond rope-mask");
-                // `cond` here is the image/timestep token embedding (from `step_cond_embeds`), NOT the
-                // text conditioning — it is identical for both passes. The cond/uncond split lives
-                // entirely in `cache_u` (uncond text cache) and `rm_u`, so reusing `cond` is correct.
-                let v_uncond = self.predict_v(
-                    &cond,
-                    rm_u,
-                    cache_u,
-                    &z,
-                    t,
-                    opts.t_eps,
-                    attention,
-                    opts.transformer_window_size,
-                )?;
-                cfg_blend(&v_cond, &v_uncond, opts.cfg_scale)?
-            } else {
-                v_cond
-            };
-
-            image = unpatchify(&euler_step(&v_pred, &z, t, t_next)?, cell, token_h, token_w)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total: steps as u32,
-            });
-        }
-        Ok(image)
+            // loop: the frame shows the state this step is about to advance.
+            preview.emit_step(&preview_counter, info.outer_step, image);
+            Ok(())
+        };
+        hooks.on_observe = Some(&mut on_observe);
+        let out_state = run_candle_driver_slices(
+            &driver,
+            [SliceSpec {
+                geometry: Some((width as u32, height as u32)),
+                ..SliceSpec::full(steps)
+            }],
+            BoundaryState::XSigma(init_image),
+            steps,
+            opts.seed,
+            cancel,
+            None,
+            &mut state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        Ok(match out_state {
+            BoundaryState::XSigma(img)
+            | BoundaryState::CleanEstimate { latent: img, .. }
+            | BoundaryState::RouteSpecific { state: img, .. } => img,
+        })
     }
 
     // ===================== understanding path (VQA + interleave) =====================
@@ -1215,10 +1562,9 @@ impl T2iModel {
         Ok((last, t_idx + 2))
     }
 
-    /// The dual-guidance denoise loop (`it2i_generate`'s body) shared by the interleave image steps.
-    /// `cache_img` / `cache_uncond` (with their image-block temporal indices) are the optional
-    /// image-condition / uncondition caches; the per-step blend follows the reference's
-    /// `cfg_scale`/`img_cfg_scale` cases, then optional `cfg_norm`. Returns the final image
+    /// The dual-guidance denoise loop (`it2i_generate`'s body) driven via [`SenseNovaFmDriver`] and
+    /// [`run_candle_driver_slices`]. `cache_img` / `cache_uncond` (with their image-block temporal
+    /// indices) are the optional image-condition / uncondition caches. Returns the final image
     /// `[1,3,H,W]`. Aborts on `cancel` and reports per-step [`Progress`].
     #[allow(clippy::too_many_arguments)]
     fn it2i_denoise(
@@ -1254,19 +1600,15 @@ impl T2iModel {
         }
         // CFG-Zero* is a T2I-only blend mode; reject it on the it2i/interleave path (F-131).
         if opts.cfg_norm == CfgNorm::CfgZeroStar {
-            return Err(CandleError::Msg(
-                "sensenova it2i: cfg_norm=cfg_zero_star is T2I-only — the it2i/interleave path \
-                 supports only none/global/channel"
-                    .into(),
-            ));
+            return Err(cfg_zero_star_it2i_err());
         }
 
         let noise_scale = self.noise_scale_for(grid_h, grid_w);
-        let mut image = (base_noise * noise_scale as f64)?;
+        let init_image = (base_noise * noise_scale as f64)?;
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
         candle_gen::execution::schedule("sensenova-euler", &timesteps, "pixel-velocity");
-        candle_gen::execution::runtime(image.device(), image.dtype());
+        candle_gen::execution::runtime(init_image.device(), init_image.dtype());
         candle_gen::execution::policy("sensenova_denoise", format!("{opts:?}").into());
         execution::observe_image_schedule(&timesteps);
         execution::observe_document_policy(
@@ -1274,8 +1616,6 @@ impl T2iModel {
         );
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
-        let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
-        let (i0, i1) = opts.cfg_interval;
         // RoPE tables + block mask are invariant across steps for a given cache — build once (F-139).
         let rm_cond = self.prepare_gen(token_h, token_w, cond_t, cache_cond.len())?;
         let rm_img = match cache_img.as_deref() {
@@ -1287,109 +1627,130 @@ impl T2iModel {
             None => None,
         };
         let preview_counter = PreviewCounter::with_steps(steps);
+        let step_preview = StepPreview {
+            carrier: preview,
+            counter: &preview_counter,
+        };
+        let mut driver_state = DriverRunState::new();
+        self.run_it2i_driver_slice(
+            cache_cond,
+            &rm_cond,
+            cache_img
+                .as_mut()
+                .zip(rm_img.as_ref())
+                .map(|(c, rm)| (&mut **c, rm)),
+            cache_uncond
+                .as_mut()
+                .zip(rm_uncond.as_ref())
+                .map(|(c, rm)| (&mut **c, rm)),
+            &noise_embed,
+            timesteps,
+            grid_h,
+            grid_w,
+            l,
+            token_h,
+            token_w,
+            width,
+            height,
+            opts,
+            SliceSpec::full(steps),
+            steps,
+            init_image,
+            opts.seed,
+            cancel,
+            step_preview,
+            &mut driver_state,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn run_it2i_driver_slice(
+        &self,
+        cache_cond: &mut KvCache,
+        rm_cond: &RopeMask,
+        mut cache_img: Option<(&mut KvCache, &RopeMask)>,
+        mut cache_uncond: Option<(&mut KvCache, &RopeMask)>,
+        noise_embed: &Option<Tensor>,
+        timesteps: Vec<f32>,
+        grid_h: usize,
+        grid_w: usize,
+        l: usize,
+        token_h: usize,
+        token_w: usize,
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        slice: SliceSpec,
+        total_steps: usize,
+        init_image: Tensor,
+        seed: u64,
+        cancel: &CancelFlag,
+        step_preview: StepPreview<'_>,
+        driver_state: &mut DriverRunState,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
         let attention = self.attention_plan(opts, Some(cancel));
-
-        for i in 0..steps {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            preview.emit_step(&preview_counter, i, &image);
-            let t = timesteps[i];
-            let t_next = timesteps[i + 1];
-            // it2i CFG-interval gate: **exclusive** `(i0, i1)` OR an `i0 == 0` always-on override —
-            // the reference `modeling_neo_chat.py` it2i gate (the T2I `denoise` uses the inclusive
-            // form; they diverge only for a custom `cfg_interval`, F-130).
-            let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
-            candle_gen::execution::policy("sensenova/t2i/use_cfg", format!("{use_cfg:?}").into());
-
-            let (z, cond_emb) =
-                self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let out_cond = self.predict_v(
-                &cond_emb,
-                &rm_cond,
-                cache_cond,
-                &z,
-                t,
-                opts.t_eps,
-                attention,
-                opts.transformer_window_size,
-            )?;
-
-            let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
-                out_cond.clone()
-            } else if img_cfg == 1.0 {
-                let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
-                let c = cache_img.as_deref_mut().ok_or_else(img_cache_err)?;
-                let oi = self.predict_v(
-                    &cond_emb,
-                    rm_i,
-                    c,
-                    &z,
-                    t,
-                    opts.t_eps,
-                    attention,
-                    opts.transformer_window_size,
-                )?;
-                (&oi + ((&out_cond - &oi)? * cfg as f64)?)?
-            } else if cfg == img_cfg {
-                let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
-                let c = cache_uncond.as_deref_mut().ok_or_else(uncond_cache_err)?;
-                let ou = self.predict_v(
-                    &cond_emb,
-                    rm_u,
-                    c,
-                    &z,
-                    t,
-                    opts.t_eps,
-                    attention,
-                    opts.transformer_window_size,
-                )?;
-                (&ou + ((&out_cond - &ou)? * cfg as f64)?)?
-            } else {
-                let oi = {
-                    let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
-                    let c = cache_img.as_deref_mut().ok_or_else(img_cache_err)?;
-                    self.predict_v(
-                        &cond_emb,
-                        rm_i,
-                        c,
-                        &z,
-                        t,
-                        opts.t_eps,
-                        attention,
-                        opts.transformer_window_size,
-                    )?
-                };
-                let ou = {
-                    let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
-                    let c = cache_uncond.as_deref_mut().ok_or_else(uncond_cache_err)?;
-                    self.predict_v(
-                        &cond_emb,
-                        rm_u,
-                        c,
-                        &z,
-                        t,
-                        opts.t_eps,
-                        attention,
-                        opts.transformer_window_size,
-                    )?
-                };
-                let a = ((&out_cond - &oi)? * cfg as f64)?;
-                let b = ((&oi - &ou)? * img_cfg as f64)?;
-                ((&ou + &a)? + &b)?
-            };
-
-            if (cfg > 1.0 || img_cfg > 1.0) && use_cfg {
-                v_pred = apply_cfg_norm(v_pred, &out_cond, opts.cfg_norm)?;
-            }
-
-            image = unpatchify(&euler_step(&v_pred, &z, t, t_next)?, cell, token_h, token_w)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total: steps as u32,
-            });
-        }
-        Ok(image)
+        let has_img = cache_img.is_some();
+        let has_uncond = cache_uncond.is_some();
+        let forward = ProductionSenseNovaForward {
+            model: self,
+            grid_h,
+            grid_w,
+            l,
+            cell: self.cell(),
+            token_h,
+            token_w,
+            noise_embed,
+            t_eps: opts.t_eps,
+            attention,
+            transformer_window: opts.transformer_window_size,
+            cache_cond: RefCell::new(cache_cond),
+            rm_cond,
+            cache_img: cache_img
+                .as_mut()
+                .map(|(c, rm)| (RefCell::new(&mut **c), *rm)),
+            cache_uncond: cache_uncond
+                .as_mut()
+                .map(|(c, rm)| (RefCell::new(&mut **c), *rm)),
+        };
+        let driver = SenseNovaFmDriver::new(
+            "sensenova_it2i_euler",
+            timesteps,
+            SenseNovaCfgMode::It2i,
+            opts,
+            has_img,
+            has_uncond,
+            forward,
+        )?;
+        let preview = step_preview.carrier;
+        let preview_counter = step_preview.counter;
+        let mut on_observe = |info: &DriverStepInfo, image: &Tensor| {
+            preview.emit_step(preview_counter, info.outer_step, image);
+            Ok(())
+        };
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_observe = Some(&mut on_observe);
+        let out_state = run_candle_driver_slices(
+            &driver,
+            [SliceSpec {
+                geometry: Some((width as u32, height as u32)),
+                ..slice
+            }],
+            BoundaryState::XSigma(init_image),
+            total_steps,
+            seed,
+            cancel,
+            None,
+            driver_state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        Ok(match out_state {
+            BoundaryState::XSigma(img)
+            | BoundaryState::CleanEstimate { latent: img, .. }
+            | BoundaryState::RouteSpecific { state: img, .. } => img,
+        })
     }
 
     /// Interleaved text-image generation (`interleave_gen`) — the **Document Studio** deliverable. A
@@ -1515,27 +1876,204 @@ impl T2iModel {
         preview: &PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
+        let (output, _receipt) = self
+            .interleave_gen_for_provider_with_preview_and_conditional_receipt(
+                crate::MODEL_ID,
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                preview,
+                None,
+                None,
+                on_progress,
+            )?;
+        Ok(output)
+    }
+
+    /// Interleaved generation executed on an explicit pre-load [`ConditionalPlan`] and returning the
+    /// realized [`ConditionalReceipt`] alongside [`InterleaveOutput`] (`§6.10`, `B2`, `SW-6974`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_conditional_receipt(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        precompiled_plan: Option<(&ConditionalInput, &ConditionalPlan)>,
+        ceilings: Option<ConditionalCeilings>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(InterleaveOutput, ConditionalReceipt)> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |carrier| {
+            self.interleave_gen_for_provider_with_preview_and_conditional_receipt(
+                crate::MODEL_ID,
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                carrier,
+                precompiled_plan,
+                ceilings,
+                on_progress,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn interleave_gen_for_provider_with_conditional_receipt(
+        &self,
+        provider_id: &str,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        precompiled_plan: Option<(&ConditionalInput, &ConditionalPlan)>,
+        ceilings: Option<ConditionalCeilings>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(InterleaveOutput, ConditionalReceipt)> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |carrier| {
+            self.interleave_gen_for_provider_with_preview_and_conditional_receipt(
+                provider_id,
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                carrier,
+                precompiled_plan,
+                ceilings,
+                on_progress,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn interleave_gen_for_provider_with_preview_and_conditional_receipt(
+        &self,
+        provider_id: &str,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        carrier: &PreviewHook<'_>,
+        precompiled_plan: Option<(&ConditionalInput, &ConditionalPlan)>,
+        ceilings: Option<ConditionalCeilings>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(InterleaveOutput, ConditionalReceipt)> {
         execution::observe_document_policy(
             serde_json::json!({"effective_options":format!("{opts:?}"),"native_route":"sensenova_understanding"}),
         );
+        if opts.cfg_norm == CfgNorm::CfgZeroStar {
+            return Err(cfg_zero_star_it2i_err());
+        }
         let cell = self.cell();
-        if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
+        if width == 0 || height == 0 || !width.is_multiple_of(cell) || !height.is_multiple_of(cell)
+        {
             return Err(CandleError::Msg(format!(
-                "sensenova interleave: width/height must be multiples of {cell}, got {width}x{height}"
+                "sensenova interleave: width/height must be positive multiples of {cell}, got {width}x{height}"
             )));
         }
+        let width_u32 = u32::try_from(width)
+            .map_err(|_| CandleError::Msg("sensenova interleave: width overflow".into()))?;
+        let height_u32 = u32::try_from(height)
+            .map_err(|_| CandleError::Msg("sensenova interleave: height overflow".into()))?;
+        let mut source_geometries = Vec::with_capacity(input_images.len());
+        for img in input_images {
+            source_geometries.push(source_image_geometry(img, cell)?);
+        }
+
         let token_h = height / cell;
         let token_w = width / cell;
-        let attention = self.attention_plan(opts, Some(cancel));
 
-        // Source images (optional).
+        let grids_from_sources: Vec<(usize, usize)> = source_geometries
+            .iter()
+            .map(|g| {
+                (
+                    (g.height as usize) / self.patch_size,
+                    (g.width as usize) / self.patch_size,
+                )
+            })
+            .collect();
+        let ([cond_ids, tu_ids, iu_ids], grids) = build_interleave_prefix_ids(
+            tokenizer,
+            prompt,
+            system_message,
+            opts.think_mode,
+            &grids_from_sources,
+            self.merge_size,
+        )?;
+        let prefill_tokens = [
+            u32::try_from(cond_ids.len())
+                .map_err(|_| CandleError::Msg("cond prefix overflow".into()))?,
+            u32::try_from(tu_ids.len())
+                .map_err(|_| CandleError::Msg("tu prefix overflow".into()))?,
+            u32::try_from(iu_ids.len())
+                .map_err(|_| CandleError::Msg("iu prefix overflow".into()))?,
+        ];
+        let (compiled_input, compiled_plan) = match precompiled_plan {
+            Some((input, plan)) => (input.clone(), plan.clone()),
+            None => compile_interleave_conditional_plan_from_shape(
+                provider_id,
+                prompt,
+                opts.seed,
+                width_u32,
+                height_u32,
+                source_geometries.clone(),
+                prefill_tokens,
+                self.prefill_shape,
+                max_new_tokens,
+                max_images,
+                opts.num_steps,
+                self.resident_bytes_estimate,
+                self.cache_token_bytes,
+                ceilings,
+            )?,
+        };
+
+        // Source images (optional) preprocessed only after the pre-load plan admits them.
         let mut pv_parts = Vec::with_capacity(input_images.len());
-        let mut grids = Vec::with_capacity(input_images.len());
+        let mut actual_grids = Vec::with_capacity(input_images.len());
         for img in input_images {
             let (p, g) = self.preprocess_image(img)?;
             pv_parts.push(p);
-            grids.push(g);
+            actual_grids.push(g);
         }
+        debug_assert_eq!(actual_grids, grids);
         let pixel_values = if pv_parts.is_empty() {
             None
         } else {
@@ -1543,192 +2081,859 @@ impl T2iModel {
             Some(Tensor::cat(&refs, 0)?)
         };
 
-        // ---- Three prefixes / caches ----
-        let mut cond_query = build_neo1_query(prompt, system_message);
-        if !opts.think_mode {
-            cond_query.push_str("<think>\n\n</think>\n\n");
-        }
-        let cond_ids = if input_images.is_empty() {
-            tokenizer.encode_ids(&cond_query, true)?
-        } else {
-            self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
+        let ops = ProductionInterleaveOps {
+            model: self,
+            tokenizer,
+            opts,
+            carrier,
+            width,
+            height,
+            token_h,
+            token_w,
+            source_geometries,
+            prefill_tokens,
+            cond_ids,
+            tu_ids,
+            iu_ids,
+            pixel_values,
+            grids,
         };
-        let (mut cache_cond, cond_logits, mut t_cond, mut cache_tu, mut t_tu, mut cache_iu, iu_max) =
-            candle_gen::gen_core::with_prompt_encoding(
-                on_progress,
-                || -> std::result::Result<_, candle_gen::CandleError> {
-                    let (cache_cond, cond_logits, t_cond) = self.prefill_it2i_logits_planned(
-                        &cond_ids,
-                        pixel_values.as_ref(),
-                        &grids,
-                        attention,
-                    )?;
-
-                    let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
-                    let tu_ids = if input_images.is_empty() {
-                        tokenizer.encode_ids(&tu_query, true)?
-                    } else {
-                        self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
-                    };
-                    let (cache_tu, _, t_tu) = self.prefill_it2i_logits_planned(
-                        &tu_ids,
-                        pixel_values.as_ref(),
-                        &grids,
-                        attention,
-                    )?;
-
-                    let iu_query = format!("{}<img>", build_neo1_query("", ""));
-                    let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
-                    let (cache_iu, _, iu_max) =
-                        self.prefill_it2i_logits_planned(&iu_ids, None, &[], attention)?;
-                    Ok((
-                        cache_cond,
-                        cond_logits,
-                        t_cond,
-                        cache_tu,
-                        t_tu,
-                        cache_iu,
-                        iu_max,
-                    ))
-                },
-            )?;
-        let mut text = String::new();
-        let mut images: Vec<Tensor> = Vec::new();
-        let mut total_tokens = 0usize;
-        // The condition cache's last-position row: each text segment's first draw.
-        let mut segment_logits = cond_logits;
-
-        loop {
-            on_progress(Progress::ConditioningComplete);
-            // ---- Text generation on the condition cache ----
-            // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8,
-            // the host argmax of every row) until `<|im_end|>` / `<img>` or the request's remaining
-            // budget. The pre-engine segment always emitted a first non-stop token before it checked
-            // the budget, hence `max(1)`; it checked `cancel` before every token, as the rollout's
-            // draw does.
-            let rollout = self.backbone.rollout_planned(
-                &segment_logits,
-                &mut cache_cond,
-                t_cond as i32,
-                &[tokens::IM_END, self.img_start_id],
-                max_new_tokens.saturating_sub(total_tokens).max(1),
-                Sampler::Greedy,
-                Some(cancel),
-                attention,
-            )?;
-            let gen_tokens = rollout.tokens;
-            total_tokens += gen_tokens.len();
-            t_cond += gen_tokens.len();
-            // A budget end ends the interleave (the pre-engine `hit_max`). The condition cache is not
-            // used again, so the engine not feeding the budget's last token changes nothing.
-            let hit_max = rollout.stop.is_none();
-            if !gen_tokens.is_empty() {
-                let u32s: Vec<u32> = gen_tokens.iter().map(|&i| i as u32).collect();
-                text.push_str(&tokenizer.decode(&u32s, true)?);
-            }
-            if rollout.stop == Some(tokens::IM_END) || hit_max || images.len() >= max_images {
-                break;
-            }
-            if rollout.stop != Some(self.img_start_id) {
-                break;
-            }
-
-            // ---- Image generation ----
-            text.push_str("<image>");
-            // Append `<img>` to the condition + text-uncondition caches.
-            self.backbone.decode_logits_planned(
-                self.img_start_id,
-                (t_cond + 1) as i32,
-                &mut cache_cond,
-                attention,
-            )?;
-            t_cond += 1;
-            self.backbone.decode_logits_planned(
-                self.img_start_id,
-                (t_tu + 1) as i32,
-                &mut cache_tu,
-                attention,
-            )?;
-            t_tu += 1;
-
-            let base_noise = gaussian(
-                (1, 3, height, width),
-                opts.seed.wrapping_add(images.len() as u64),
-                &self.device,
-            )?;
-            execution::observe_document_image(
-                images.len(),
-                "rand-StdRng-seeded-normal-v1",
-                Some(opts.seed.wrapping_add(images.len() as u64)),
-                None,
-            );
-            let offset = images.len().saturating_mul(opts.num_steps) as u32;
-            let total = max_images.saturating_mul(opts.num_steps) as u32;
-            let mut progress = |event| match event {
-                Progress::Step { current, .. } => on_progress(Progress::Step {
-                    current: offset.saturating_add(current),
-                    total,
-                }),
-                event => on_progress(event),
-            };
-            let image = self.it2i_denoise(
-                &mut cache_cond,
-                t_cond + 1,
-                Some(&mut cache_tu),
-                t_tu + 1,
-                Some(&mut cache_iu),
-                iu_max + 1,
-                width,
-                height,
-                &base_noise,
-                opts,
-                cancel,
-                &mut progress,
-                preview,
-            )?;
-
-            // Re-encode the generated image back into the condition + text-uncondition caches.
-            let cond_next = candle_gen::gen_core::with_prompt_encoding(
-                on_progress,
-                || -> std::result::Result<_, candle_gen::CandleError> {
-                    let (cond_next, nt_cond) = self.append_generated_image_planned(
-                        &image,
-                        token_h,
-                        token_w,
-                        t_cond,
-                        &mut cache_cond,
-                        attention,
-                    )?;
-                    t_cond = nt_cond;
-                    let (_, nt_tu) = self.append_generated_image_planned(
-                        &image,
-                        token_h,
-                        token_w,
-                        t_tu,
-                        &mut cache_tu,
-                        attention,
-                    )?;
-                    t_tu = nt_tu;
-                    Ok(cond_next)
-                },
-            )?;
-            images.push(image);
-            segment_logits = cond_next;
-        }
-
-        if !images.is_empty() {
-            if images.len() < max_images {
-                let total = max_images.saturating_mul(opts.num_steps) as u32;
-                on_progress(Progress::Step {
-                    current: total,
-                    total,
-                });
-            }
-            on_progress(Progress::Decoding);
-        }
-
-        Ok(InterleaveOutput { text, images })
+        let mut executor = SenseNovaInterleaveExecutor::new(ops, cancel);
+        let output = run_conditional(
+            &compiled_plan,
+            &compiled_input,
+            cancel,
+            &mut executor,
+            on_progress,
+        )
+        .map_err(CandleError::from)?;
+        Ok((
+            InterleaveOutput {
+                text: output.text,
+                images: output.images,
+            },
+            output.receipt,
+        ))
     }
+}
+
+/// Default conservative ceilings for unbounded standalone SenseNova interleave calls.
+pub fn default_interleave_ceilings() -> ConditionalCeilings {
+    ConditionalCeilings::sensenova_default()
+}
+
+/// Pre-load / admission source geometry extractor for `[3, H, W]` Candle tensors.
+pub fn source_image_geometry(rgb: &Tensor, cell: usize) -> Result<SourceImageGeometry> {
+    let (c, h, w) = rgb.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!(
+            "sensenova: expected source image [3,H,W], got [{c},{h},{w}]"
+        )));
+    }
+    if h == 0 || w == 0 || cell == 0 || !h.is_multiple_of(cell) || !w.is_multiple_of(cell) {
+        return Err(CandleError::Msg(format!(
+            "sensenova: source image H/W must be positive multiples of {cell}, got {h}x{w}"
+        )));
+    }
+    let h_u32 =
+        u32::try_from(h).map_err(|_| CandleError::Msg("source image height overflow".into()))?;
+    let w_u32 =
+        u32::try_from(w).map_err(|_| CandleError::Msg("source image width overflow".into()))?;
+    let storage_bytes =
+        (rgb.elem_count() as u64).saturating_mul(rgb.dtype().size_in_bytes() as u64);
+    Ok(SourceImageGeometry {
+        width: w_u32,
+        height: h_u32,
+        storage_bytes,
+    })
+}
+
+fn build_interleave_query_ids(
+    tokenizer: &SenseNovaTokenizer,
+    base_query: &str,
+    grids: &[(usize, usize)],
+    merge_size: usize,
+) -> Result<Vec<i32>> {
+    if merge_size == 0 {
+        return Err(CandleError::Msg(
+            "sensenova interleave: merge_size must be > 0".into(),
+        ));
+    }
+    let mut query = base_query.to_owned();
+    for &(gh, gw) in grids {
+        let n = (gh / merge_size) * (gw / merge_size);
+        let block = format!("<img>{}</img>", "<IMG_CONTEXT>".repeat(n));
+        query = query.replacen("<image>", &block, 1);
+    }
+    tokenizer.encode_ids(&query, true)
+}
+
+#[allow(clippy::type_complexity)]
+fn build_interleave_prefix_ids(
+    tokenizer: &SenseNovaTokenizer,
+    prompt: &str,
+    system_message: &str,
+    think_mode: bool,
+    grids: &[(usize, usize)],
+    merge_size: usize,
+) -> Result<([Vec<i32>; 3], Vec<(usize, usize)>)> {
+    let mut cond_query = build_neo1_query(prompt, system_message);
+    if !think_mode {
+        cond_query.push_str("<think>\n\n</think>\n\n");
+    }
+    let cond_ids = if grids.is_empty() {
+        tokenizer.encode_ids(&cond_query, true)?
+    } else {
+        build_interleave_query_ids(tokenizer, &cond_query, grids, merge_size)?
+    };
+    let tu_query = build_neo1_query(&"<image>".repeat(grids.len()), "");
+    let tu_ids = if grids.is_empty() {
+        tokenizer.encode_ids(&tu_query, true)?
+    } else {
+        build_interleave_query_ids(tokenizer, &tu_query, grids, merge_size)?
+    };
+    let iu_query = format!("{}<img>", build_neo1_query("", ""));
+    let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
+    Ok(([cond_ids, tu_ids, iu_ids], grids.to_vec()))
+}
+
+/// Compile a pre-load [`ConditionalPlan`] from pure geometry, token counts, and architectural shape
+/// without loading model weights (`§6.10`, `B2`, `SW-6974`).
+#[allow(clippy::too_many_arguments)]
+pub fn compile_interleave_conditional_plan_from_shape(
+    provider_id: &str,
+    prompt: &str,
+    seed: u64,
+    width: u32,
+    height: u32,
+    source_images: Vec<SourceImageGeometry>,
+    prefill_tokens: [u32; 3],
+    shape: PrefillModelShape,
+    max_new_tokens: usize,
+    max_images: usize,
+    steps_per_image: usize,
+    model_resident_bytes: u64,
+    cache_token_bytes: u64,
+    ceilings: Option<ConditionalCeilings>,
+) -> Result<(ConditionalInput, ConditionalPlan)> {
+    ConditionalPlan::compile_sensenova_interleave(
+        provider_id,
+        prompt,
+        seed,
+        width,
+        height,
+        source_images,
+        prefill_tokens,
+        shape,
+        max_new_tokens,
+        max_images,
+        steps_per_image,
+        model_resident_bytes,
+        cache_token_bytes,
+        ceilings,
+    )
+    .map_err(CandleError::from)
+}
+
+/// Compile a pre-load [`ConditionalPlan`] from `NeoChatConfig` + `SenseNovaTokenizer` (zero
+/// weights loaded).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn compile_interleave_conditional_plan(
+    provider_id: &str,
+    cfg: &NeoChatConfig,
+    tokenizer: &SenseNovaTokenizer,
+    prompt: &str,
+    source_images: Vec<SourceImageGeometry>,
+    width: u32,
+    height: u32,
+    opts: &T2iOptions,
+    system_message: &str,
+    max_new_tokens: usize,
+    max_images: usize,
+    model_resident_bytes: u64,
+    ceilings: Option<ConditionalCeilings>,
+) -> Result<(
+    ConditionalInput,
+    ConditionalPlan,
+    [Vec<i32>; 3],
+    Vec<(usize, usize)>,
+)> {
+    let cell = u32::try_from(cfg.cell())
+        .map_err(|_| CandleError::Msg("sensenova interleave: config cell overflow".into()))?;
+    for source in &source_images {
+        if source.width == 0
+            || source.height == 0
+            || cell == 0
+            || !source.width.is_multiple_of(cell)
+            || !source.height.is_multiple_of(cell)
+        {
+            return Err(CandleError::Msg(format!(
+                "sensenova interleave: source image geometry {}x{} must be multiples of {cell}",
+                source.width, source.height
+            )));
+        }
+    }
+    let grids_in: Vec<(usize, usize)> = source_images
+        .iter()
+        .map(|s| {
+            (
+                s.height as usize / cfg.patch_size,
+                s.width as usize / cfg.patch_size,
+            )
+        })
+        .collect();
+    let ([cond_ids, tu_ids, iu_ids], grids) = build_interleave_prefix_ids(
+        tokenizer,
+        prompt,
+        system_message,
+        opts.think_mode,
+        &grids_in,
+        cfg.merge_size(),
+    )?;
+    let prefill_tokens = [
+        u32::try_from(cond_ids.len())
+            .map_err(|_| CandleError::Msg("cond prefix overflow".into()))?,
+        u32::try_from(tu_ids.len()).map_err(|_| CandleError::Msg("tu prefix overflow".into()))?,
+        u32::try_from(iu_ids.len()).map_err(|_| CandleError::Msg("iu prefix overflow".into()))?,
+    ];
+    let resident = if model_resident_bytes > 0 {
+        model_resident_bytes
+    } else {
+        cfg.estimated_resident_bytes()
+    };
+    let (input, plan) = compile_interleave_conditional_plan_from_shape(
+        provider_id,
+        prompt,
+        opts.seed,
+        width,
+        height,
+        source_images,
+        prefill_tokens,
+        cfg.prefill_model_shape(),
+        max_new_tokens,
+        max_images,
+        opts.num_steps,
+        resident,
+        cfg.cache_token_bytes_bound(),
+        ceilings,
+    )?;
+    Ok((input, plan, [cond_ids, tu_ids, iu_ids], grids))
+}
+
+/// Compile a pre-load [`ConditionalPlan`] directly from a SenseNova snapshot directory before
+/// deserializing any `.safetensors` weights (`§6.10`). Reads only `config.json`, `tokenizer.json`,
+/// and snapshot byte metadata.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn pre_load_interleave_conditional_plan(
+    provider_id: &str,
+    snapshot_dir: &std::path::Path,
+    prompt: &str,
+    source_images: Vec<SourceImageGeometry>,
+    width: u32,
+    height: u32,
+    opts: &T2iOptions,
+    system_message: &str,
+    max_new_tokens: usize,
+    max_images: usize,
+    ceilings: Option<ConditionalCeilings>,
+) -> Result<(
+    ConditionalInput,
+    ConditionalPlan,
+    [Vec<i32>; 3],
+    Vec<(usize, usize)>,
+)> {
+    let cfg = NeoChatConfig::from_dir(snapshot_dir)?;
+    let tokenizer = SenseNovaTokenizer::from_dir(snapshot_dir)?;
+    let resident = candle_gen::gen_core::weightsmeta::safetensors_dir_bytes(snapshot_dir);
+    compile_interleave_conditional_plan(
+        provider_id,
+        &cfg,
+        &tokenizer,
+        prompt,
+        source_images,
+        width,
+        height,
+        opts,
+        system_message,
+        max_new_tokens,
+        max_images,
+        resident,
+        ceilings,
+    )
+}
+
+/// Prefilled 3-cache interleave state returned by [`SenseNovaInterleaveOps::prefill_all`].
+pub struct InterleavePrefill<C> {
+    pub caches: [C; 3],
+    pub segment_logits: Vec<f32>,
+    pub t_cond: usize,
+    pub t_tu: usize,
+    pub iu_max: usize,
+}
+
+/// Backend operation seam for [`SenseNovaInterleaveExecutor`] (`ConditionalExecutor` impl),
+/// enabling both production [`T2iModel`] execution and weights-free Tier 0 runner verification
+/// over the exact same state machine and [`SenseNovaFmDriver`] slice contract (`§6.10`, `B2`).
+pub trait SenseNovaInterleaveOps {
+    type Cache;
+    type ImageState;
+
+    fn source_images(&self) -> Result<Vec<SourceImageGeometry>>;
+    fn prefill_model_shape(&self) -> Result<PrefillModelShape>;
+    fn prefill_token_counts(&self) -> Result<[u32; 3]>;
+
+    fn prefill_all(&mut self, cancel: &CancelFlag) -> Result<InterleavePrefill<Self::Cache>>;
+
+    fn rollout_segment(
+        &mut self,
+        segment_logits: &[f32],
+        cond_cache: &mut Self::Cache,
+        t_cond: usize,
+        granted_draws: u32,
+        cancel: &CancelFlag,
+    ) -> Result<(TextRollout, usize)>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_image(
+        &mut self,
+        caches: &mut [Self::Cache; 3],
+        t_cond: &mut usize,
+        t_tu: &mut usize,
+        iu_max: usize,
+        image_idx: u32,
+        cancel: &CancelFlag,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Self::ImageState>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_step(
+        &mut self,
+        caches: &mut [Self::Cache; 3],
+        state: &mut Self::ImageState,
+        image_idx: u32,
+        step: u32,
+        cancel: &CancelFlag,
+    ) -> Result<()>;
+
+    fn finish_image(&mut self, state: Self::ImageState) -> Result<Tensor>;
+
+    fn append_feedback(
+        &mut self,
+        caches: &mut [Self::Cache; 3],
+        t_cond: &mut usize,
+        t_tu: &mut usize,
+        output: &Tensor,
+        cancel: &CancelFlag,
+    ) -> Result<Vec<f32>>;
+}
+
+pub struct InterleaveContext<ImageState> {
+    segment_logits: Vec<f32>,
+    t_cond: usize,
+    t_tu: usize,
+    iu_max: usize,
+    active_image: Option<ImageState>,
+}
+
+pub struct SenseNovaInterleaveExecutor<'c, O> {
+    ops: O,
+    cancel: &'c CancelFlag,
+}
+
+impl<'c, O> SenseNovaInterleaveExecutor<'c, O> {
+    pub fn new(ops: O, cancel: &'c CancelFlag) -> Self {
+        Self { ops, cancel }
+    }
+}
+
+impl<O: SenseNovaInterleaveOps> ConditionalExecutor for SenseNovaInterleaveExecutor<'_, O> {
+    type Cache = O::Cache;
+    type Context = InterleaveContext<O::ImageState>;
+    type Image = Tensor;
+
+    fn source_images(&self) -> candle_gen::gen_core::Result<Vec<SourceImageGeometry>> {
+        self.ops.source_images().map_err(Into::into)
+    }
+
+    fn prefill_model_shape(&self) -> candle_gen::gen_core::Result<PrefillModelShape> {
+        self.ops.prefill_model_shape().map_err(Into::into)
+    }
+
+    fn prefill_token_counts(&self) -> candle_gen::gen_core::Result<[u32; 3]> {
+        self.ops.prefill_token_counts().map_err(Into::into)
+    }
+
+    fn image_placeholder(&self) -> &'static str {
+        "<image>"
+    }
+
+    fn prefill(
+        &mut self,
+        plan: &ConditionalPlan,
+    ) -> candle_gen::gen_core::Result<(Self::Context, [Self::Cache; 3])> {
+        self.prefill_with_progress(plan, &mut |_| {})
+    }
+
+    fn prefill_with_progress(
+        &mut self,
+        _plan: &ConditionalPlan,
+        progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<(Self::Context, [Self::Cache; 3])> {
+        candle_gen::gen_core::with_prompt_encoding(progress, || {
+            let prefill = self
+                .ops
+                .prefill_all(self.cancel)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok((
+                InterleaveContext {
+                    segment_logits: prefill.segment_logits,
+                    t_cond: prefill.t_cond,
+                    t_tu: prefill.t_tu,
+                    iu_max: prefill.iu_max,
+                    active_image: None,
+                },
+                prefill.caches,
+            ))
+        })
+    }
+
+    fn rollout(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; 3],
+        granted_draws: u32,
+    ) -> candle_gen::gen_core::Result<TextRollout> {
+        let (segment, next_t_cond) = self
+            .ops
+            .rollout_segment(
+                &context.segment_logits,
+                &mut caches[0],
+                context.t_cond,
+                granted_draws,
+                self.cancel,
+            )
+            .map_err(candle_gen::gen_core::Error::from)?;
+        context.t_cond = next_t_cond;
+        Ok(segment)
+    }
+
+    fn denoise_step(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; 3],
+        image: u32,
+        step: u32,
+    ) -> candle_gen::gen_core::Result<()> {
+        self.denoise_step_with_progress(context, caches, image, step, &mut |_| {})
+    }
+
+    fn denoise_step_with_progress(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; 3],
+        image: u32,
+        step: u32,
+        progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<()> {
+        if step == 0 {
+            let state = self
+                .ops
+                .begin_image(
+                    caches,
+                    &mut context.t_cond,
+                    &mut context.t_tu,
+                    context.iu_max,
+                    image,
+                    self.cancel,
+                    progress,
+                )
+                .map_err(candle_gen::gen_core::Error::from)?;
+            context.active_image = Some(state);
+        }
+        let active = context.active_image.as_mut().ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(
+                "sensenova interleave: missing active image state".into(),
+            )
+        })?;
+        self.ops
+            .denoise_step(caches, active, image, step, self.cancel)
+            .map_err(candle_gen::gen_core::Error::from)
+    }
+
+    fn finish_image(
+        &mut self,
+        context: &mut Self::Context,
+        _image: u32,
+    ) -> candle_gen::gen_core::Result<Self::Image> {
+        let active = context.active_image.take().ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(
+                "sensenova interleave: finish_image called before denoise".into(),
+            )
+        })?;
+        self.ops
+            .finish_image(active)
+            .map_err(candle_gen::gen_core::Error::from)
+    }
+
+    fn feedback(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; 3],
+        image: u32,
+        output: &Self::Image,
+    ) -> candle_gen::gen_core::Result<()> {
+        self.feedback_with_progress(context, caches, image, output, &mut |_| {})
+    }
+
+    fn feedback_with_progress(
+        &mut self,
+        context: &mut Self::Context,
+        caches: &mut [Self::Cache; 3],
+        _image: u32,
+        output: &Self::Image,
+        progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<()> {
+        candle_gen::gen_core::with_prompt_encoding(progress, || {
+            context.segment_logits = self
+                .ops
+                .append_feedback(
+                    caches,
+                    &mut context.t_cond,
+                    &mut context.t_tu,
+                    output,
+                    self.cancel,
+                )
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(())
+        })
+    }
+}
+
+struct ProductionDenoiseState {
+    image: Tensor,
+    grid_h: usize,
+    grid_w: usize,
+    l: usize,
+    timesteps: Vec<f32>,
+    noise_embed: Option<Tensor>,
+    rm_cond: RopeMask,
+    rm_tu: RopeMask,
+    rm_iu: RopeMask,
+    driver_state: DriverRunState,
+    counter: PreviewCounter,
+}
+
+struct ProductionInterleaveOps<'a> {
+    model: &'a T2iModel,
+    tokenizer: &'a SenseNovaTokenizer,
+    opts: &'a T2iOptions,
+    carrier: &'a PreviewHook<'a>,
+    width: usize,
+    height: usize,
+    token_h: usize,
+    token_w: usize,
+    source_geometries: Vec<SourceImageGeometry>,
+    prefill_tokens: [u32; 3],
+    cond_ids: Vec<i32>,
+    tu_ids: Vec<i32>,
+    iu_ids: Vec<i32>,
+    pixel_values: Option<Tensor>,
+    grids: Vec<(usize, usize)>,
+}
+
+impl SenseNovaInterleaveOps for ProductionInterleaveOps<'_> {
+    type Cache = KvCache;
+    type ImageState = ProductionDenoiseState;
+
+    fn source_images(&self) -> Result<Vec<SourceImageGeometry>> {
+        Ok(self.source_geometries.clone())
+    }
+
+    fn prefill_model_shape(&self) -> Result<PrefillModelShape> {
+        Ok(self.model.prefill_model_shape())
+    }
+
+    fn prefill_token_counts(&self) -> Result<[u32; 3]> {
+        Ok(self.prefill_tokens)
+    }
+
+    fn prefill_all(&mut self, cancel: &CancelFlag) -> Result<InterleavePrefill<KvCache>> {
+        let attention = self.model.attention_plan(self.opts, Some(cancel));
+        let (cache_cond, cond_logits, t_cond) = self.model.prefill_it2i_logits_planned(
+            &self.cond_ids,
+            self.pixel_values.as_ref(),
+            &self.grids,
+            attention,
+        )?;
+        let (cache_tu, _, t_tu) = self.model.prefill_it2i_logits_planned(
+            &self.tu_ids,
+            self.pixel_values.as_ref(),
+            &self.grids,
+            attention,
+        )?;
+        let (cache_iu, _, iu_max) =
+            self.model
+                .prefill_it2i_logits_planned(&self.iu_ids, None, &[], attention)?;
+        Ok(InterleavePrefill {
+            caches: [cache_cond, cache_tu, cache_iu],
+            segment_logits: cond_logits,
+            t_cond,
+            t_tu,
+            iu_max,
+        })
+    }
+
+    fn rollout_segment(
+        &mut self,
+        segment_logits: &[f32],
+        cond_cache: &mut KvCache,
+        t_cond: usize,
+        granted_draws: u32,
+        cancel: &CancelFlag,
+    ) -> Result<(TextRollout, usize)> {
+        let attention = self.model.attention_plan(self.opts, Some(cancel));
+        let rollout = self.model.backbone.rollout_planned(
+            segment_logits,
+            cond_cache,
+            t_cond as i32,
+            &[tokens::IM_END, self.model.img_start_id],
+            granted_draws as usize,
+            Sampler::Greedy,
+            Some(cancel),
+            attention,
+        )?;
+        let gen_tokens = rollout.tokens;
+        let emitted = u32::try_from(gen_tokens.len())
+            .map_err(|_| CandleError::Msg("sensenova rollout token count overflow".into()))?;
+        let text = if gen_tokens.is_empty() {
+            String::new()
+        } else {
+            let u32s: Vec<u32> = gen_tokens.iter().map(|&i| i as u32).collect();
+            self.tokenizer.decode(&u32s, true)?
+        };
+        let stop = if rollout.stop == Some(self.model.img_start_id) {
+            RolloutStop::Image
+        } else if rollout.stop.is_some() {
+            RolloutStop::End
+        } else {
+            RolloutStop::Exhausted
+        };
+        Ok((
+            TextRollout {
+                text,
+                emitted,
+                stop,
+            },
+            t_cond + gen_tokens.len(),
+        ))
+    }
+
+    fn begin_image(
+        &mut self,
+        caches: &mut [KvCache; 3],
+        t_cond: &mut usize,
+        t_tu: &mut usize,
+        iu_max: usize,
+        image_idx: u32,
+        cancel: &CancelFlag,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<ProductionDenoiseState> {
+        let attention = self.model.attention_plan(self.opts, Some(cancel));
+        self.model.backbone.decode_logits_planned(
+            self.model.img_start_id,
+            (*t_cond + 1) as i32,
+            &mut caches[0],
+            attention,
+        )?;
+        *t_cond += 1;
+        self.model.backbone.decode_logits_planned(
+            self.model.img_start_id,
+            (*t_tu + 1) as i32,
+            &mut caches[1],
+            attention,
+        )?;
+        *t_tu += 1;
+
+        let idx = image_idx as usize;
+        let base_noise = gaussian(
+            (1, 3, self.height, self.width),
+            self.opts.seed.wrapping_add(idx as u64),
+            &self.model.device,
+        )?;
+        execution::observe_document_image(
+            idx,
+            "rand-StdRng-seeded-normal-v1",
+            Some(self.opts.seed.wrapping_add(idx as u64)),
+            None,
+        );
+        let grid_h = self.height / self.model.patch_size;
+        let grid_w = self.width / self.model.patch_size;
+        let l = self.token_h * self.token_w;
+        let noise_scale = self.model.noise_scale_for(grid_h, grid_w);
+        let image = (&base_noise * noise_scale as f64)?;
+        let timesteps = step_schedule(self.opts)?;
+        candle_gen::execution::schedule("sensenova-euler", &timesteps, "pixel-velocity");
+        candle_gen::execution::runtime(image.device(), image.dtype());
+        candle_gen::execution::policy("sensenova_denoise", format!("{:?}", self.opts).into());
+        execution::observe_image_schedule(&timesteps);
+        execution::observe_document_policy(
+            serde_json::json!({"denoise_options":format!("{:?}", self.opts),"noise_scale_bits":noise_scale.to_bits(),"width":self.width,"height":self.height}),
+        );
+        let noise_embed = self.model.noise_scale_embed(noise_scale, l)?;
+        let rm_cond =
+            self.model
+                .prepare_gen(self.token_h, self.token_w, *t_cond + 1, caches[0].len())?;
+        let rm_tu =
+            self.model
+                .prepare_gen(self.token_h, self.token_w, *t_tu + 1, caches[1].len())?;
+        let rm_iu =
+            self.model
+                .prepare_gen(self.token_h, self.token_w, iu_max + 1, caches[2].len())?;
+        Ok(ProductionDenoiseState {
+            image,
+            grid_h,
+            grid_w,
+            l,
+            timesteps,
+            noise_embed,
+            rm_cond,
+            rm_tu,
+            rm_iu,
+            driver_state: DriverRunState::new(),
+            counter: PreviewCounter::with_steps(self.opts.num_steps),
+        })
+    }
+
+    fn denoise_step(
+        &mut self,
+        caches: &mut [KvCache; 3],
+        state: &mut ProductionDenoiseState,
+        image_idx: u32,
+        step: u32,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        let [cache_cond, cache_tu, cache_iu] = caches;
+        let current = std::mem::replace(
+            &mut state.image,
+            Tensor::zeros(
+                (1,),
+                candle_gen::candle_core::DType::F32,
+                &self.model.device,
+            )?,
+        );
+        let step_usize = step as usize;
+        let slice = SliceSpec {
+            pass: image_idx as usize,
+            phase: 0,
+            span: step_usize..step_usize + 1,
+            transition: if step == 0 {
+                SliceTransition::Start
+            } else {
+                SliceTransition::Continue
+            },
+            history: DriverHistoryPolicy::Carry,
+            geometry: Some((self.width as u32, self.height as u32)),
+            request_boundary_estimate: false,
+        };
+        let mut noop_progress = |_: Progress| {};
+        state.image = self.model.run_it2i_driver_slice(
+            cache_cond,
+            &state.rm_cond,
+            Some((cache_tu, &state.rm_tu)),
+            Some((cache_iu, &state.rm_iu)),
+            &state.noise_embed,
+            state.timesteps.clone(),
+            state.grid_h,
+            state.grid_w,
+            state.l,
+            self.token_h,
+            self.token_w,
+            self.width,
+            self.height,
+            self.opts,
+            slice,
+            self.opts.num_steps,
+            current,
+            self.opts.seed.wrapping_add(u64::from(image_idx)),
+            cancel,
+            StepPreview {
+                carrier: self.carrier,
+                counter: &state.counter,
+            },
+            &mut state.driver_state,
+            &mut noop_progress,
+        )?;
+        Ok(())
+    }
+
+    fn finish_image(&mut self, state: ProductionDenoiseState) -> Result<Tensor> {
+        Ok(state.image)
+    }
+
+    fn append_feedback(
+        &mut self,
+        caches: &mut [KvCache; 3],
+        t_cond: &mut usize,
+        t_tu: &mut usize,
+        output: &Tensor,
+        cancel: &CancelFlag,
+    ) -> Result<Vec<f32>> {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let attention = self.model.attention_plan(self.opts, Some(cancel));
+        let (cond_next, nt_cond) = self.model.append_generated_image_planned(
+            output,
+            self.token_h,
+            self.token_w,
+            *t_cond,
+            &mut caches[0],
+            attention,
+        )?;
+        *t_cond = nt_cond;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let (_, nt_tu) = self.model.append_generated_image_planned(
+            output,
+            self.token_h,
+            self.token_w,
+            *t_tu,
+            &mut caches[1],
+            attention,
+        )?;
+        *t_tu = nt_tu;
+        Ok(cond_next)
+    }
+}
+
+/// Drive any [`SenseNovaInterleaveOps`] implementation through the bounded `gen-core`
+/// [`run_conditional`] contract (`§6.10`, `B2`, `SW-6974`).
+pub fn run_sensenova_interleave_ops<O: SenseNovaInterleaveOps>(
+    plan: &ConditionalPlan,
+    input: &ConditionalInput,
+    cancel: &CancelFlag,
+    ops: O,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(InterleaveOutput, ConditionalReceipt)> {
+    let mut executor = SenseNovaInterleaveExecutor::new(ops, cancel);
+    let output = run_conditional(plan, input, cancel, &mut executor, on_progress)
+        .map_err(CandleError::from)?;
+    Ok((
+        InterleaveOutput {
+            text: output.text,
+            images: output.images,
+        },
+        output.receipt,
+    ))
+}
+
+fn cfg_zero_star_it2i_err() -> CandleError {
+    CandleError::Msg(
+        "sensenova it2i: cfg_norm=cfg_zero_star is T2I-only — the it2i/interleave path \
+         supports only none/global/channel"
+            .into(),
+    )
 }
 
 /// `(needs_img, needs_uncond)`: which extra caches [`T2iModel::it2i_denoise`] requires for the given
@@ -2050,5 +3255,892 @@ mod tests {
         );
         // CFG-Zero* is rejected on the it2i/interleave path (T2I-only blend mode).
         assert!(apply_cfg_norm(cond.clone(), &cond, CfgNorm::CfgZeroStar).is_err());
+    }
+
+    struct MockVelocityForward {
+        cell: usize,
+        token_h: usize,
+        token_w: usize,
+    }
+
+    impl SenseNovaVelocityForward for MockVelocityForward {
+        fn prepare_step(&self, image: &Tensor, t: f32) -> Result<(Tensor, Tensor)> {
+            let z = patchify(image, self.cell)?;
+            let cond_emb = (&z * (t as f64 + 1.0))?;
+            Ok((z, cond_emb))
+        }
+
+        fn predict_cond(&self, _z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+            Ok((cond_emb + (0.1 * (1.0 + t as f64)))?)
+        }
+
+        fn predict_img(&self, _z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+            Ok((cond_emb + (0.05 * (1.0 + t as f64)))?)
+        }
+
+        fn predict_uncond(&self, _z: &Tensor, cond_emb: &Tensor, t: f32) -> Result<Tensor> {
+            Ok((cond_emb - (0.02 * (1.0 + t as f64)))?)
+        }
+
+        fn unpatchify_step(&self, next_z: &Tensor) -> Result<Tensor> {
+            Ok(unpatchify(next_z, self.cell, self.token_h, self.token_w)?)
+        }
+    }
+
+    fn candle_tensors_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        if a.dims() != b.dims() {
+            return false;
+        }
+        let va = flat(a);
+        let vb = flat(b);
+        va.len() == vb.len()
+            && va
+                .iter()
+                .zip(vb.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn sensenova_fm_driver_t2i_and_it2i_pass_tier0_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let opts_t2i = T2iOptions {
+            cfg_scale: 4.0,
+            img_cfg_scale: 1.0,
+            cfg_norm: CfgNorm::None,
+            num_steps: 4,
+            enable_timestep_shift: false,
+            ..T2iOptions::default()
+        };
+        let ts_t2i = step_schedule(&opts_t2i).unwrap();
+        let report_t2i = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 19,
+            base_geometry: (16, 16),
+            alt_geometry: (32, 32),
+            make_driver: || {
+                Box::new(
+                    SenseNovaFmDriver::new(
+                        "sensenova_t2i_euler",
+                        ts_t2i.clone(),
+                        SenseNovaCfgMode::T2i,
+                        &opts_t2i,
+                        false,
+                        true,
+                        MockVelocityForward {
+                            cell: 4,
+                            token_h: 4,
+                            token_w: 4,
+                        },
+                    )
+                    .expect("valid T2I driver"),
+                )
+            },
+            make_initial: || gaussian((1, 3, 16, 16), 19, &Device::Cpu).unwrap(),
+            latents_equal: candle_tensors_bit_equal,
+        })
+        .expect("Candle SenseNova T2I driver passes Tier 0 conformance");
+        assert!(report_t2i.verified_inert_split);
+        assert!(report_t2i.verified_cancellation);
+        assert!(report_t2i.verified_renoise_and_resample_guards);
+
+        let opts_it2i = T2iOptions {
+            cfg_scale: 4.0,
+            img_cfg_scale: 2.0,
+            cfg_norm: CfgNorm::Global,
+            num_steps: 4,
+            enable_timestep_shift: false,
+            ..T2iOptions::default()
+        };
+        let ts_it2i = step_schedule(&opts_it2i).unwrap();
+        let report_it2i = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 23,
+            base_geometry: (16, 16),
+            alt_geometry: (32, 32),
+            make_driver: || {
+                Box::new(
+                    SenseNovaFmDriver::new(
+                        "sensenova_it2i_euler",
+                        ts_it2i.clone(),
+                        SenseNovaCfgMode::It2i,
+                        &opts_it2i,
+                        true,
+                        true,
+                        MockVelocityForward {
+                            cell: 4,
+                            token_h: 4,
+                            token_w: 4,
+                        },
+                    )
+                    .expect("valid IT2I driver"),
+                )
+            },
+            make_initial: || gaussian((1, 3, 16, 16), 23, &Device::Cpu).unwrap(),
+            latents_equal: candle_tensors_bit_equal,
+        })
+        .expect("Candle SenseNova IT2I driver passes Tier 0 conformance");
+        assert!(report_it2i.verified_inert_split);
+        assert!(report_it2i.verified_cancellation);
+
+        // Missing guidance caches and T2I-only CfgZeroStar must be refused on IT2I driver construction.
+        assert!(SenseNovaFmDriver::new(
+            "sensenova_it2i_euler",
+            ts_it2i.clone(),
+            SenseNovaCfgMode::It2i,
+            &opts_it2i,
+            false,
+            true,
+            MockVelocityForward {
+                cell: 4,
+                token_h: 4,
+                token_w: 4,
+            },
+        )
+        .is_err());
+        let opts_zero = T2iOptions {
+            cfg_norm: CfgNorm::CfgZeroStar,
+            ..opts_it2i
+        };
+        assert!(SenseNovaFmDriver::new(
+            "sensenova_it2i_euler",
+            ts_it2i,
+            SenseNovaCfgMode::It2i,
+            &opts_zero,
+            true,
+            true,
+            MockVelocityForward {
+                cell: 4,
+                token_h: 4,
+                token_w: 4,
+            },
+        )
+        .is_err());
+    }
+
+    #[derive(Default)]
+    struct MockInterleaveTrace {
+        drops: std::rc::Rc<std::cell::Cell<usize>>,
+        prefill_count: usize,
+        rollout_calls: Vec<u32>,
+        denoise_steps: Vec<(u32, u32)>,
+        feedback_calls: Vec<(u32, [bool; 3])>,
+        cache_tokens: [usize; 3],
+    }
+
+    struct TrackingCache {
+        slot: usize,
+        tokens: usize,
+        drops: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Drop for TrackingCache {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct MockDenoiseImageState {
+        image: Tensor,
+        timesteps: Vec<f32>,
+        driver_state: DriverRunState,
+        counter: PreviewCounter,
+    }
+
+    struct MockInterleaveOps<'p> {
+        segments: std::collections::VecDeque<TextRollout>,
+        prefill_tokens: [u32; 3],
+        source_geometries: Vec<SourceImageGeometry>,
+        shape: PrefillModelShape,
+        width: usize,
+        height: usize,
+        cell: usize,
+        opts: T2iOptions,
+        carrier: Option<&'p PreviewHook<'p>>,
+        cancel_after_denoise_step: Option<(u32, u32)>,
+        cancel_during_feedback: Option<u32>,
+        trace: std::rc::Rc<RefCell<MockInterleaveTrace>>,
+        feedback_idx: u32,
+    }
+
+    impl<'p> MockInterleaveOps<'p> {
+        fn new(
+            segments: Vec<TextRollout>,
+            steps_per_image: usize,
+            carrier: Option<&'p PreviewHook<'p>>,
+            cancel_after_denoise_step: Option<(u32, u32)>,
+            cancel_during_feedback: Option<u32>,
+        ) -> (Self, std::rc::Rc<RefCell<MockInterleaveTrace>>) {
+            let trace = std::rc::Rc::new(RefCell::new(MockInterleaveTrace::default()));
+            let ops = Self {
+                segments: segments.into(),
+                prefill_tokens: [12, 6, 4],
+                source_geometries: Vec::new(),
+                shape: PrefillModelShape {
+                    hidden_width: 128,
+                    intermediate_width: 256,
+                    vision_hidden_width: 64,
+                    source_patch_size: 16,
+                    source_merge_size: 2,
+                    attention_heads: 4,
+                    kv_heads: 2,
+                    head_dim: 32,
+                    layers: 2,
+                    vocab_size: 64,
+                },
+                width: 64,
+                height: 64,
+                cell: 32,
+                opts: T2iOptions {
+                    cfg_scale: 3.0,
+                    img_cfg_scale: 1.5,
+                    cfg_norm: CfgNorm::Global,
+                    num_steps: steps_per_image,
+                    enable_timestep_shift: false,
+                    ..T2iOptions::default()
+                },
+                carrier,
+                cancel_after_denoise_step,
+                cancel_during_feedback,
+                trace: std::rc::Rc::clone(&trace),
+                feedback_idx: 0,
+            };
+            (ops, trace)
+        }
+    }
+
+    impl SenseNovaInterleaveOps for MockInterleaveOps<'_> {
+        type Cache = TrackingCache;
+        type ImageState = MockDenoiseImageState;
+
+        fn source_images(&self) -> Result<Vec<SourceImageGeometry>> {
+            Ok(self.source_geometries.clone())
+        }
+
+        fn prefill_model_shape(&self) -> Result<PrefillModelShape> {
+            Ok(self.shape)
+        }
+
+        fn prefill_token_counts(&self) -> Result<[u32; 3]> {
+            Ok(self.prefill_tokens)
+        }
+
+        fn prefill_all(&mut self, _cancel: &CancelFlag) -> Result<InterleavePrefill<Self::Cache>> {
+            let mut tr = self.trace.borrow_mut();
+            tr.prefill_count += 1;
+            let drops = std::rc::Rc::clone(&tr.drops);
+            tr.cache_tokens = [
+                self.prefill_tokens[0] as usize,
+                self.prefill_tokens[1] as usize,
+                self.prefill_tokens[2] as usize,
+            ];
+            let caches = [
+                TrackingCache {
+                    slot: 0,
+                    tokens: self.prefill_tokens[0] as usize,
+                    drops: std::rc::Rc::clone(&drops),
+                },
+                TrackingCache {
+                    slot: 1,
+                    tokens: self.prefill_tokens[1] as usize,
+                    drops: std::rc::Rc::clone(&drops),
+                },
+                TrackingCache {
+                    slot: 2,
+                    tokens: self.prefill_tokens[2] as usize,
+                    drops,
+                },
+            ];
+            Ok(InterleavePrefill {
+                caches,
+                segment_logits: vec![0.1, 0.2],
+                t_cond: self.prefill_tokens[0] as usize,
+                t_tu: self.prefill_tokens[1] as usize,
+                iu_max: self.prefill_tokens[2] as usize,
+            })
+        }
+
+        fn rollout_segment(
+            &mut self,
+            _segment_logits: &[f32],
+            cond_cache: &mut Self::Cache,
+            t_cond: usize,
+            granted_draws: u32,
+            _cancel: &CancelFlag,
+        ) -> Result<(TextRollout, usize)> {
+            let seg = self
+                .segments
+                .pop_front()
+                .ok_or_else(|| CandleError::Msg("mock ran out of segments".into()))?;
+            let draws = seg.emitted + u32::from(seg.stop != RolloutStop::Exhausted);
+            cond_cache.tokens += draws as usize;
+            let mut tr = self.trace.borrow_mut();
+            tr.rollout_calls.push(granted_draws);
+            tr.cache_tokens[cond_cache.slot] = cond_cache.tokens;
+            Ok((seg, t_cond + draws as usize))
+        }
+
+        fn begin_image(
+            &mut self,
+            caches: &mut [Self::Cache; 3],
+            t_cond: &mut usize,
+            t_tu: &mut usize,
+            _iu_max: usize,
+            image_idx: u32,
+            _cancel: &CancelFlag,
+            _progress: &mut dyn FnMut(Progress),
+        ) -> Result<Self::ImageState> {
+            caches[0].tokens += 1;
+            caches[1].tokens += 1;
+            *t_cond += 1;
+            *t_tu += 1;
+            let image = gaussian(
+                (1, 3, self.height, self.width),
+                self.opts.seed.wrapping_add(u64::from(image_idx)),
+                &Device::Cpu,
+            )?;
+            let timesteps = step_schedule(&self.opts)?;
+            Ok(MockDenoiseImageState {
+                image,
+                timesteps,
+                driver_state: DriverRunState::new(),
+                counter: PreviewCounter::with_steps(self.opts.num_steps),
+            })
+        }
+
+        fn denoise_step(
+            &mut self,
+            _caches: &mut [Self::Cache; 3],
+            state: &mut Self::ImageState,
+            image_idx: u32,
+            step: u32,
+            cancel: &CancelFlag,
+        ) -> Result<()> {
+            self.trace
+                .borrow_mut()
+                .denoise_steps
+                .push((image_idx, step));
+            let token_h = self.height / self.cell;
+            let token_w = self.width / self.cell;
+            let driver = SenseNovaFmDriver::new(
+                "sensenova_it2i_euler",
+                state.timesteps.clone(),
+                SenseNovaCfgMode::It2i,
+                &self.opts,
+                true,
+                true,
+                MockVelocityForward {
+                    cell: self.cell,
+                    token_h,
+                    token_w,
+                },
+            )?;
+            let current = std::mem::replace(
+                &mut state.image,
+                Tensor::zeros((1,), candle_gen::candle_core::DType::F32, &Device::Cpu)?,
+            );
+            let step_us = step as usize;
+            let mut noop = |_: Progress| {};
+            let mut hooks = StepHooks::new(&mut noop);
+            let mut on_observe = |info: &DriverStepInfo, image: &Tensor| {
+                if let Some(hook) = self.carrier {
+                    hook.emit_step(&state.counter, info.outer_step, image);
+                }
+                Ok(())
+            };
+            hooks.on_observe = Some(&mut on_observe);
+            let out_state = run_candle_driver_slices(
+                &driver,
+                [SliceSpec {
+                    pass: image_idx as usize,
+                    phase: 0,
+                    span: step_us..step_us + 1,
+                    transition: if step == 0 {
+                        SliceTransition::Start
+                    } else {
+                        SliceTransition::Continue
+                    },
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((self.width as u32, self.height as u32)),
+                    request_boundary_estimate: false,
+                }],
+                BoundaryState::XSigma(current),
+                self.opts.num_steps,
+                self.opts.seed,
+                cancel,
+                None,
+                &mut state.driver_state,
+                &mut hooks,
+                |_, out, _| Ok(out),
+            )?;
+            state.image = match out_state {
+                BoundaryState::XSigma(img)
+                | BoundaryState::CleanEstimate { latent: img, .. }
+                | BoundaryState::RouteSpecific { state: img, .. } => img,
+            };
+            if self.cancel_after_denoise_step == Some((image_idx, step)) {
+                cancel.cancel();
+            }
+            Ok(())
+        }
+
+        fn finish_image(&mut self, state: Self::ImageState) -> Result<Tensor> {
+            Ok(state.image)
+        }
+
+        fn append_feedback(
+            &mut self,
+            caches: &mut [Self::Cache; 3],
+            t_cond: &mut usize,
+            t_tu: &mut usize,
+            _output: &Tensor,
+            cancel: &CancelFlag,
+        ) -> Result<Vec<f32>> {
+            let idx = self.feedback_idx;
+            self.feedback_idx += 1;
+            if self.cancel_during_feedback == Some(idx) {
+                cancel.cancel();
+                return Err(CandleError::Canceled);
+            }
+            let n_img = (self.height / self.cell) * (self.width / self.cell);
+            caches[0].tokens += n_img + 1;
+            caches[1].tokens += n_img + 1;
+            *t_cond += 2;
+            *t_tu += 2;
+            let mut tr = self.trace.borrow_mut();
+            tr.cache_tokens = [caches[0].tokens, caches[1].tokens, caches[2].tokens];
+            tr.feedback_calls.push((idx, [true, true, false]));
+            Ok(vec![idx as f32, 0.5])
+        }
+    }
+
+    fn mock_plan(
+        ops: &MockInterleaveOps<'_>,
+        max_new_tokens: usize,
+        max_images: usize,
+    ) -> (ConditionalInput, ConditionalPlan) {
+        let mut c = default_interleave_ceilings();
+        c.max_new_tokens = max_new_tokens as u32;
+        c.max_images = max_images as u32;
+        c.max_steps_per_image = ops.opts.num_steps as u32;
+        compile_interleave_conditional_plan_from_shape(
+            crate::MODEL_ID,
+            "interleave test",
+            ops.opts.seed,
+            ops.width as u32,
+            ops.height as u32,
+            ops.source_geometries.clone(),
+            ops.prefill_tokens,
+            ops.shape,
+            max_new_tokens,
+            max_images,
+            ops.opts.num_steps,
+            1_024 * 1_024,
+            2 * 2 * 2 * 32 * 4,
+            Some(c),
+        )
+        .expect("mock plan compiles")
+    }
+
+    #[test]
+    fn sensenova_interleave_executor_zero_images_no_bar_no_decode_and_drops_caches() {
+        use candle_gen::gen_core::LoadPhase;
+
+        let (ops, trace) = MockInterleaveOps::new(
+            vec![TextRollout {
+                text: "text only".into(),
+                emitted: 4,
+                stop: RolloutStop::End,
+            }],
+            4,
+            None,
+            None,
+            None,
+        );
+        let (input, plan) = mock_plan(&ops, 32, 3);
+        let cancel = CancelFlag::default();
+        let mut events = Vec::new();
+        let (out, receipt) =
+            run_sensenova_interleave_ops(&plan, &input, &cancel, ops, &mut |e| events.push(e))
+                .expect("zero-image interleave succeeds");
+        assert_eq!(out.text, "text only");
+        assert!(out.images.is_empty());
+        assert_eq!(receipt.images, 0);
+        assert_eq!(receipt.feedback_calls, 0);
+        assert_eq!(receipt.actual_outer_steps, 0);
+        assert_eq!(receipt.reported_final_steps, None);
+        assert_eq!(
+            receipt.terminal,
+            candle_gen::gen_core::render::conditional::TerminalReason::EndToken
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Progress::Step { .. } | Progress::Decoding)));
+        assert!(events.contains(&Progress::Loading(LoadPhase::EncodingPrompt)));
+        assert!(events.contains(&Progress::PromptEncodingComplete));
+        assert!(events.contains(&Progress::ConditioningComplete));
+        let tr = trace.borrow();
+        assert_eq!(tr.drops.get(), 3, "all 3 caches must drop cleanly");
+        assert!(tr.feedback_calls.is_empty());
+    }
+
+    #[test]
+    fn sensenova_interleave_executor_two_of_three_images_fills_progress_caches_feedback_and_previews(
+    ) {
+        use candle_gen::gen_core::{PreviewFrame, PreviewSink};
+        use std::sync::{Arc, Mutex};
+
+        let frames = Arc::new(Mutex::new(Vec::<PreviewFrame>::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
+        let hook = crate::preview::t2i_hook(&sink, 32);
+
+        let (ops, trace) = MockInterleaveOps::new(
+            vec![
+                TextRollout {
+                    text: "A".into(),
+                    emitted: 2,
+                    stop: RolloutStop::Image,
+                },
+                TextRollout {
+                    text: "B".into(),
+                    emitted: 2,
+                    stop: RolloutStop::Image,
+                },
+                TextRollout {
+                    text: "C".into(),
+                    emitted: 2,
+                    stop: RolloutStop::End,
+                },
+            ],
+            4,
+            Some(&hook),
+            None,
+            None,
+        );
+        let (input, plan) = mock_plan(&ops, 32, 3);
+        let cancel = CancelFlag::default();
+        let mut events = Vec::new();
+        let (out, receipt) =
+            run_sensenova_interleave_ops(&plan, &input, &cancel, ops, &mut |e| events.push(e))
+                .expect("two-of-three interleave succeeds");
+
+        assert_eq!(out.text, "A<image>B<image>C");
+        assert_eq!(out.images.len(), 2);
+        assert_eq!(receipt.images, 2);
+        assert_eq!(receipt.feedback_calls, 2);
+        assert_eq!(receipt.actual_outer_steps, 8);
+        assert_eq!(receipt.reported_final_steps, Some(12));
+        assert_eq!(
+            receipt.terminal,
+            candle_gen::gen_core::render::conditional::TerminalReason::EndToken
+        );
+
+        let steps: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|e| match *e {
+                Progress::Step { current, total } => Some((current, total)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (1, 12),
+                (2, 12),
+                (3, 12),
+                (4, 12),
+                (5, 12),
+                (6, 12),
+                (7, 12),
+                (8, 12),
+                (12, 12),
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Progress::Decoding))
+                .count(),
+            1
+        );
+        assert!(matches!(events.last(), Some(Progress::Decoding)));
+
+        // Both generated images emitted 1..=4 preview frames over the 2x2 token grid.
+        let recorded_frames = candle_gen::lock_recover(&frames);
+        assert_eq!(recorded_frames.len(), 8);
+        assert_eq!(
+            recorded_frames
+                .iter()
+                .map(|f| (f.current, f.total))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 4),
+                (2, 4),
+                (3, 4),
+                (4, 4),
+                (1, 4),
+                (2, 4),
+                (3, 4),
+                (4, 4),
+            ]
+        );
+        assert_eq!(
+            (
+                recorded_frames[0].image.width,
+                recorded_frames[0].image.height
+            ),
+            (2, 2)
+        );
+
+        let tr = trace.borrow();
+        assert_eq!(tr.drops.get(), 3, "all 3 caches must drop cleanly");
+        assert_eq!(
+            tr.feedback_calls,
+            vec![(0, [true, true, false]), (1, [true, true, false])]
+        );
+        assert_eq!(tr.cache_tokens, [12 + 9 + 2 + 10, 6 + 2 + 10, 4]);
+    }
+
+    #[test]
+    fn sensenova_interleave_executor_cancel_mid_second_image_and_no_cache_bleed() {
+        let (ops, trace) = MockInterleaveOps::new(
+            vec![
+                TextRollout {
+                    text: "A".into(),
+                    emitted: 1,
+                    stop: RolloutStop::Image,
+                },
+                TextRollout {
+                    text: "B".into(),
+                    emitted: 1,
+                    stop: RolloutStop::Image,
+                },
+                TextRollout {
+                    text: "SHOULD_NOT_RUN".into(),
+                    emitted: 1,
+                    stop: RolloutStop::End,
+                },
+            ],
+            4,
+            None,
+            Some((1, 1)),
+            None,
+        );
+        let (input, plan) = mock_plan(&ops, 32, 3);
+        let cancel = CancelFlag::default();
+        let mut events = Vec::new();
+        let err =
+            run_sensenova_interleave_ops(&plan, &input, &cancel, ops, &mut |e| events.push(e))
+                .err()
+                .expect("cancel mid second image must fail closed");
+        assert!(matches!(err, CandleError::Canceled));
+        assert!(!events.iter().any(|e| matches!(e, Progress::Decoding)));
+        {
+            let tr = trace.borrow();
+            assert_eq!(
+                tr.drops.get(),
+                3,
+                "cancelled attempt must drop all 3 caches"
+            );
+            assert_eq!(
+                tr.denoise_steps,
+                vec![(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)],
+                "cancellation during 2nd image must stop remaining steps"
+            );
+            assert_eq!(
+                tr.feedback_calls.len(),
+                1,
+                "2nd image feedback must be suppressed after cancellation"
+            );
+        }
+
+        // Subsequent clean run must see fresh caches with zero bleed from cancelled attempt.
+        let (fresh_ops, fresh_trace) = MockInterleaveOps::new(
+            vec![TextRollout {
+                text: "clean".into(),
+                emitted: 1,
+                stop: RolloutStop::End,
+            }],
+            4,
+            None,
+            None,
+            None,
+        );
+        let (fresh_input, fresh_plan) = mock_plan(&fresh_ops, 32, 3);
+        let fresh_cancel = CancelFlag::default();
+        let (out, receipt) = run_sensenova_interleave_ops(
+            &fresh_plan,
+            &fresh_input,
+            &fresh_cancel,
+            fresh_ops,
+            &mut |_| {},
+        )
+        .expect("next request runs cleanly after canceled attempt");
+        assert_eq!(out.text, "clean");
+        assert_eq!(receipt.images, 0);
+        assert_eq!(fresh_trace.borrow().cache_tokens, [12 + 2, 6, 4]);
+    }
+
+    #[test]
+    fn sensenova_interleave_executor_cancel_mid_feedback_drops_caches() {
+        let (ops, trace) = MockInterleaveOps::new(
+            vec![
+                TextRollout {
+                    text: "A".into(),
+                    emitted: 1,
+                    stop: RolloutStop::Image,
+                },
+                TextRollout {
+                    text: "NEVER".into(),
+                    emitted: 1,
+                    stop: RolloutStop::End,
+                },
+            ],
+            4,
+            None,
+            None,
+            Some(0),
+        );
+        let (input, plan) = mock_plan(&ops, 32, 3);
+        let cancel = CancelFlag::default();
+        let err = run_sensenova_interleave_ops(&plan, &input, &cancel, ops, &mut |_| {})
+            .err()
+            .expect("cancel during feedback must fail closed");
+        assert!(matches!(err, CandleError::Canceled));
+        let tr = trace.borrow();
+        assert_eq!(tr.drops.get(), 3);
+        assert_eq!(tr.rollout_calls.len(), 1);
+    }
+
+    #[test]
+    fn preload_conditional_plan_from_dir_without_weights_and_invalid_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"llm_config":{},"vision_config":{}}"#,
+        )
+        .unwrap();
+        let tok_json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 151643, "content": "<|endoftext|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151644, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151645, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151667, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151668, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151669, "content": "<IMG_CONTEXT>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151670, "content": "<img>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 151671, "content": "</img>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "hello": 1, "world": 2},
+                "unk_token": "<unk>"
+            }
+        });
+        std::fs::write(dir.path().join("tokenizer.json"), tok_json.to_string()).unwrap();
+
+        let opts = T2iOptions {
+            num_steps: 4,
+            ..T2iOptions::default()
+        };
+        let (input, plan, _, _) = pre_load_interleave_conditional_plan(
+            crate::MODEL_ID,
+            dir.path(),
+            "<image> hello world",
+            vec![SourceImageGeometry {
+                width: 64,
+                height: 64,
+                storage_bytes: 64 * 64 * 3 * 4,
+            }],
+            64,
+            64,
+            &opts,
+            crate::INTERLEAVE_SYSTEM_MESSAGE,
+            64,
+            2,
+            None,
+        )
+        .expect("pre-load conditional plan must compile with zero .safetensors weights");
+        assert_eq!(input.provider_id, crate::MODEL_ID);
+        assert!(plan.budget().peak_live_bytes > 0);
+
+        let (_fast_in, fast_plan, _, _) = pre_load_interleave_conditional_plan(
+            crate::MODEL_ID_FAST,
+            dir.path(),
+            "hello world",
+            vec![],
+            64,
+            64,
+            &opts,
+            crate::INTERLEAVE_SYSTEM_MESSAGE,
+            64,
+            2,
+            None,
+        )
+        .expect("fast variant pre-load conditional plan compiles");
+        assert_eq!(fast_plan.input().provider_id, crate::MODEL_ID_FAST);
+
+        assert!(pre_load_interleave_conditional_plan(
+            crate::MODEL_ID,
+            dir.path(),
+            "hello",
+            vec![],
+            500,
+            64,
+            &opts,
+            crate::INTERLEAVE_SYSTEM_MESSAGE,
+            64,
+            2,
+            None,
+        )
+        .is_err());
+
+        let mut tight = default_interleave_ceilings();
+        tight.max_peak_bytes = fast_plan.budget().peak_live_bytes - 1;
+        assert!(pre_load_interleave_conditional_plan(
+            crate::MODEL_ID,
+            dir.path(),
+            "hello world",
+            vec![],
+            64,
+            64,
+            &opts,
+            crate::INTERLEAVE_SYSTEM_MESSAGE,
+            64,
+            2,
+            Some(tight),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn interleave_output_converts_to_generation_output_interleaved() {
+        let out = InterleaveOutput {
+            text: "one<image>two".into(),
+            images: vec![Tensor::zeros(
+                (1, 3, 2, 4),
+                candle_gen::candle_core::DType::F32,
+                &Device::Cpu,
+            )
+            .unwrap()],
+        };
+        let gen_out = GenerationOutput::try_from(out).expect("convert to GenerationOutput");
+        match gen_out {
+            GenerationOutput::Interleaved { text, images } => {
+                assert_eq!(text, "one<image>two");
+                assert_eq!(images.len(), 1);
+                assert_eq!((images[0].width, images[0].height), (4, 2));
+                assert_eq!(images[0].pixels.len(), 4 * 2 * 3);
+            }
+            other => panic!("expected Interleaved variant, got {other:?}"),
+        }
     }
 }
