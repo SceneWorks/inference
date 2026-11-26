@@ -307,14 +307,16 @@ pub const FFN_INTERMEDIATE_BUDGET: u64 = crate::veda::workspace::CUDA_DENSE_SCOR
 
 #[cfg(test)]
 mod extended_duration_tests {
-    use super::*;
+    use super::resolve_request_frames;
+    // This helper converts requested clip lengths; it never reads a wall clock.
+    use super::align_frames_for_duration as align_clip;
     #[test]
     fn twenty_seconds_aligns_up_and_the_declared_ceiling_roundtrips() {
         for (seconds, frames) in [(15.0, 362), (20.0, 481), (20.0417, 481)] {
-            assert_eq!(align_frames_for_duration(seconds).unwrap(), frames);
+            assert_eq!(align_clip(seconds).unwrap(), frames);
         }
         for seconds in [5.0, 20.0418, 21.0, f32::NAN, f32::INFINITY] {
-            assert!(align_frames_for_duration(seconds).is_err(), "{seconds}");
+            assert!(align_clip(seconds).is_err(), "{seconds}");
         }
         assert_eq!(resolve_request_frames(Some(481), Some(8.0)).unwrap(), 481);
     }

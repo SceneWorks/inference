@@ -995,11 +995,13 @@ mod tests {
     /// The duration bounds are the lattice's own ends, and alignment is upward at both of them.
     #[test]
     fn duration_alignment_walks_up_onto_a_rung() {
+        // Literal requested clip lengths, not elapsed wall-clock measurements.
+        use super::align_frames_for_duration as align_clip;
         assert_eq!(align_frames_for_duration(5.1667).unwrap(), 124);
         assert_eq!(align_frames_for_duration(5.2).unwrap(), 141);
         assert_eq!(align_frames_for_duration(14.3).unwrap(), 345);
-        assert_eq!(align_frames_for_duration(20.0).unwrap(), 481);
-        assert_eq!(align_frames_for_duration(20.0417).unwrap(), 481);
+        assert_eq!(align_clip(20.0).unwrap(), 481);
+        assert_eq!(align_clip(20.0417).unwrap(), 481);
         // Out-of-range requests refuse instead of being shortened.
         assert!(align_frames_for_duration(21.0).is_err());
         assert!(align_frames_for_duration(5.0).is_err());
