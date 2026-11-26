@@ -45,6 +45,11 @@ pub mod block_window;
 pub mod caption;
 pub mod checkpoint_codec;
 pub mod checkpoint_facts;
+pub mod chunk;
+pub use chunk::{
+    emit_terminal_chunk, BackpressureError, BackpressurePolicy, BoundedChunkSink,
+    CausalCodecStatePolicy, ChunkResidencyPolicy, ChunkSink, OutputChunk, TerminalChunkCollector,
+};
 mod read_accounting;
 mod receipt_scope;
 pub use read_accounting::CheckpointReadAccounting;
