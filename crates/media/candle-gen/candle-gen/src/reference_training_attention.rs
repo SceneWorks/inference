@@ -87,7 +87,7 @@ pub(crate) fn try_forward(
     // Same per-query standard-softmax arithmetic/dtype. Internal query tiles
     // respect (and can be smaller than) the caller's scratch upper limit.
     let plan = reference_plan(plan);
-    let out = crate::attention::sdpa_planned_bhsd(
+    let out = crate::attention::sdpa_planned_bhsd_materialized(
         &q.detach(),
         &k.detach(),
         &v.detach(),
@@ -166,7 +166,7 @@ mod tests {
         scale: f64,
         budget: usize,
     ) -> candle_core::Result<Tensor> {
-        crate::attention::sdpa_budgeted_bhsd(
+        crate::attention::sdpa_budgeted_bhsd_materialized(
             q,
             k,
             v,
@@ -322,7 +322,7 @@ mod tests {
                 // [5,3] fixture mistake caught by the first manual proof.
                 if plan.budget.query_block_rows((b * h * sk) as u64, sq as u64) < sq as u64 {
                     let mask = Tensor::zeros((sq, sk), dtype, &dev)?;
-                    let legacy_error = crate::attention::sdpa_planned_bhsd(
+                    let legacy_error = crate::attention::sdpa_planned_bhsd_materialized(
                         &qview,
                         &kr,
                         &vr,
@@ -543,7 +543,7 @@ mod cpu_tests {
                 let actual = crate::fused_attention::training_sdpa_standard_bhsd(
                     &q, &k, &v, scale, None, plan,
                 )?;
-                let reference = crate::attention::sdpa_budgeted_bhsd(
+                let reference = crate::attention::sdpa_budgeted_bhsd_materialized(
                     &q,
                     &k,
                     &v,

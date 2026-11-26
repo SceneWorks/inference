@@ -91,20 +91,26 @@ pub use loader::{
 // with i32; a scores tensor over `i32::MAX` silently corrupts its tail at large render sizes.
 pub mod attention;
 pub use attention::{
-    sdpa_budgeted_bhsd, sdpa_budgeted_flat, sdpa_planned_bhsd, sdpa_planned_flat,
-    ATTN_SCORES_BUDGET,
+    sdpa_budgeted_bhsd, sdpa_budgeted_bhsd_materialized, sdpa_budgeted_flat,
+    sdpa_budgeted_flat_materialized, sdpa_planned_bhsd, sdpa_planned_bhsd_materialized,
+    sdpa_planned_flat, sdpa_planned_flat_materialized, ATTN_SCORES_BUDGET,
 };
 
 // Shared interleaved-RoPE application + sinusoidal timestep embedding (sc-27286), hoisted from the
 // byte-identical lens / qwen-image / flux2 / wan copies.
 pub mod rope;
 
-// Fused-attention dispatch (sc-26691): FlashAttention-2 for unmasked bf16/f16 CUDA attention when the
-// build enables `flash-attn`, the planned budgeted path above for everything else.
+// Fused-attention dispatch (sc-26691, SW-6130): the one router the shared attention helpers above
+// consult — FlashAttention-2 for unmasked bf16/f16 CUDA attention when the build enables
+// `flash-attn` and the process-wide toggle is on, the materialized budgeted path for everything else —
+// plus the toggle and the per-path call counters.
 pub mod fused_attention;
 mod reference_training_attention;
 pub mod training_attention;
-pub use fused_attention::{sdpa_dispatch_bhsd, AttentionKernel, FlashRefusal};
+pub use fused_attention::{
+    attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
+    take_attention_path_counts, AttentionKernel, AttentionPathCounts, FlashRefusal,
+};
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The

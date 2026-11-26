@@ -56,7 +56,7 @@ default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
 # FlashAttention-2 for the DiT joint attention and the video VAE decoder's attention (sc-26691):
-# forwards `candle-gen/flash-attn`, whose `sdpa_dispatch_bhsd` takes the fused kernel for unmasked
+# forwards `candle-gen/flash-attn`, whose shared attention router takes the fused kernel for unmasked
 # bf16/f16 CUDA attention. Implies `cuda`; needs the CUDA toolkit and `CUDA_COMPUTE_CAP`.
 flash-attn = ["cuda", "candle-gen/flash-attn"]
 

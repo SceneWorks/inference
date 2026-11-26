@@ -450,15 +450,18 @@ impl ZImageAttention {
     ) -> candle_gen::Result<Tensor> {
         if self.execution == Execution::Differentiable {
             let mask = Self::additive_mask(mask, q.dtype())?;
-            return candle_gen::fused_attention::training_sdpa_bhsd(
-                q,
-                k,
-                v,
-                scale,
-                mask.as_ref(),
-                |scores| candle_nn::ops::softmax(scores, D::Minus1),
-                attention_plan,
-            );
+            // Pinned to the materialized path (SW-6130; the fused kernel has no backward).
+            return candle_gen::fused_attention::with_materialized_attention(|| {
+                candle_gen::fused_attention::training_sdpa_bhsd(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    mask.as_ref(),
+                    |scores| candle_nn::ops::softmax(scores, D::Minus1),
+                    attention_plan,
+                )
+            });
         }
         if self.use_accelerated_attn && q.device().is_metal() {
             Ok(self.attention_metal(q, k, v, mask, scale)?)

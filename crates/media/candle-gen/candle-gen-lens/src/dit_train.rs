@@ -183,16 +183,19 @@ impl TrainJointAttention {
         // math is identical to the inference twin), so the shared budgeted helper chunks over the query
         // rows (byte-identical for common sizes). The softmax closure preserves the exact f32-upcast
         // composable `softmax(_, D::Minus1)` so the backward is unchanged.
+        // Training-only: pinned to the materialized path (SW-6130; the fused kernel has no backward).
         let qd = q.dtype();
-        let o = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            mask,
-            |s| softmax(&s.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(qd),
-            candle_gen::ATTN_SCORES_BUDGET,
-        )?; // [B, heads, joint, head_dim]
+        let o = candle_gen::fused_attention::with_materialized_attention(|| {
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                scale,
+                mask,
+                |s| softmax(&s.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(qd),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )
+        })?; // [B, heads, joint, head_dim]
         let joint = img_seq + txt_seq;
         let o = o.transpose(1, 2)?.reshape((b, joint, h * hd))?;
 
