@@ -17,8 +17,8 @@
 //! * **spatial stride 32** — [`SPATIAL_STRIDE`], the VAE's 16× compression times the DiT's width
 //!   patch of 2. A canvas that survives the VAE but is not a whole number of patch columns wide has
 //!   no packed representation at all;
-//! * **frames `17n + 5`** — [`crate::denoise::LEGAL_FRAME_COUNTS`], 124…345 under the hardcoded
-//!   5–15 s duration clamp. This is *not* the `4k + 1` a 4× temporal downsample suggests: the video
+//! * **frames `17n + 5`** — [`crate::denoise::LEGAL_FRAME_COUNTS`], 124…481 under the supported
+//!   duration range. This is *not* the `4k + 1` a 4× temporal downsample suggests: the video
 //!   VAE decodes in 17-frame chunks producing 5 latents each, so `5k + 2` latents cover `17k + 5`
 //!   frames and every other count desynchronizes the picture from the soundtrack.
 //!
@@ -106,20 +106,8 @@ pub const MAX_CANVAS_EDGE: u32 = 2016;
 /// Shortest clip the released model generates, in seconds — **the lattice floor**, 124 frames.
 pub const MIN_DURATION_SECONDS: f64 = LEGAL_FRAME_COUNTS[0] as f64 / MINIMAX_H3_FPS;
 
-/// Longest clip the released model generates, in seconds — **the lattice ceiling**, 345 frames.
-///
-/// # 14.375 s, not the advertised 15.0
-///
-/// The reference pipeline's `max_duration` is **15.0 s**, but its `align_num_frames` walks the
-/// `17n + 5` lattice and the largest rung inside that declaration is `LEGAL_FRAME_COUNTS[13] = 345`
-/// = **14.375 s**. The next rung, 362 frames, is 15.083 s and past it. **No lattice point sits in
-/// `[14.375, 15.0]`**, so a caller asking for the documented maximum has nothing exact to land on —
-/// and the floor had the mirror-image gap at 5.0 s against 124 frames' 5.1667 s.
-///
-/// Both bounds are therefore **derived from the lattice** rather than declared alongside it, so the
-/// declaration and the lattice cannot drift apart. The consequence is that
-/// [`align_frames_for_duration`] needs no ceiling clamp: every duration in range aligns *upward*
-/// onto a real rung, at both ends.
+/// Longest supported clip, derived from the shared 481-frame ceiling (about 20.04 seconds).
+/// The original 15-second policy is extended; temporal spacing, canvas and memory checks remain.
 pub const MAX_DURATION_SECONDS: f64 =
     LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1] as f64 / MINIMAX_H3_FPS;
 
@@ -170,7 +158,7 @@ impl RequestGeometry {
 ///
 /// Errors — never rounds — on a canvas that is not a multiple of [`SPATIAL_STRIDE`], on a canvas
 /// over [`CANVAS_MAX_PIXELS`], on a frame count that is not `17n + 5`, and on a duration outside the
-/// model's own 5.1667–14.375 s range.
+/// supported 5.1667–20.0417 s range.
 pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<RequestGeometry> {
     gen_core_h3::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
         .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -1007,11 +995,15 @@ mod tests {
     /// The duration bounds are the lattice's own ends, and alignment is upward at both of them.
     #[test]
     fn duration_alignment_walks_up_onto_a_rung() {
+        // Literal requested clip lengths, not elapsed wall-clock measurements.
+        use super::align_frames_for_duration as align_clip;
         assert_eq!(align_frames_for_duration(5.1667).unwrap(), 124);
         assert_eq!(align_frames_for_duration(5.2).unwrap(), 141);
         assert_eq!(align_frames_for_duration(14.3).unwrap(), 345);
-        // 15.0 s is REFUSED, not clamped down to 14.375 s.
-        assert!(align_frames_for_duration(15.0).is_err());
+        assert_eq!(align_clip(20.0).unwrap(), 481);
+        assert_eq!(align_clip(20.0417).unwrap(), 481);
+        // Out-of-range requests refuse instead of being shortened.
+        assert!(align_frames_for_duration(21.0).is_err());
         assert!(align_frames_for_duration(5.0).is_err());
         assert!(align_frames_for_duration(f32::NAN).is_err());
         for &f in &LEGAL_FRAME_COUNTS {

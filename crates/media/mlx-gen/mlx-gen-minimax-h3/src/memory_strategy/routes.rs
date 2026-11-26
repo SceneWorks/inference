@@ -82,7 +82,7 @@ pub(super) fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Resul
     let geometry = context.geometry;
     if !LEGAL_FRAME_COUNTS.contains(&(geometry.frames as i32)) {
         return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: {} frames is off the 17n+5 lattice (124..=345); T=1 does not render",
+            "{MODEL_ID}: {} frames is off the 17n+5 lattice (124..=481); T=1 does not render",
             geometry.frames
         )));
     }

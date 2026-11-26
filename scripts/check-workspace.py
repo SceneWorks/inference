@@ -823,7 +823,7 @@ CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS: dict[tuple[str, str], dict[str, str]] =
 #   TOKEN_DROP        = vae/config.json token_drop      = 3
 #   CLIP_LENGTH       = vae/config.json clip_length     = 17
 #   MINIMAX_H3_FPS    = modular_pipeline.py:31          = 24
-#   LEGAL_FRAME_COUNTS = the 14 `17n + 5` counts inside the 5.0-15.0 s envelope at 24 fps.
+#   LEGAL_FRAME_COUNTS = the 22 supported `17n + 5` counts from 124 through 481 at 24 fps.
 CROSS_BACKEND_GEOMETRY_REFERENCE: dict[str, dict[str, tuple[float, ...]]] = {
     "minimax-h3": {
         "SIZE_MULTIPLE": (32.0,),
@@ -838,7 +838,7 @@ CROSS_BACKEND_GEOMETRY_REFERENCE: dict[str, dict[str, tuple[float, ...]]] = {
         "ENCODER_SPATIAL_DOWNSAMPLE_FACTORS": (2.0, 2.0, 2.0, 2.0, 1.0, 1.0),
         "ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS": (1.0, 2.0, 2.0, 1.0, 1.0, 1.0),
         "LEGAL_FRAME_COUNTS": tuple(
-            float(17 * n + 5) for n in range(60) if 120 <= 17 * n + 5 <= 360
+            float(17 * n + 5) for n in range(60) if 124 <= 17 * n + 5 <= 481
         ),
     },
 }
