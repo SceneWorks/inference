@@ -9,7 +9,12 @@
 //! vision tower + clip-diff modules it needs) is the follow-up beyond this slice — see the crate docs.
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::CancelFlag;
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec,
+    SliceTransition, StepHooks,
+};
+use candle_gen::gen_core::{BoundaryState, CancelFlag, Progress};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::clip_diff::DiffLossFm;
@@ -227,6 +232,287 @@ fn stream_for_vit(
     connector.for_vit(&take_seq(&hidden, &s.gen_idx)?)
 }
 
+/// Forward-evaluation seam for [`BerniniMarPlannerDriver`] (`PIPE-7`, `DEC-13`).
+pub trait BerniniMarForward {
+    /// Run the 3 planner streams `[cond, uncond, imgcond]` over the current partially-filled
+    /// `target` `[1, n_query, H]` and return `[cond_vit, uncond_vit, imgcond_vit]`.
+    fn forward_streams(&self, target: &Tensor) -> CResult<[Tensor; 3]>;
+
+    /// Run triple-CFG `clip_diff.sample` on `z` `[3 * np, H_vit]` with base noise `noise`.
+    fn sample_clip_diff(
+        &self,
+        z: &Tensor,
+        txt_cfg: f32,
+        steps: usize,
+        img_cfg: Option<f32>,
+        noise: &Tensor,
+    ) -> CResult<Tensor>;
+}
+
+struct PlannerMarForward<'a> {
+    backbone: &'a Qwen25VlText,
+    connector: &'a MlpConnector,
+    clip_diff: std::cell::RefCell<&'a mut DiffLossFm>,
+    cond: &'a StreamState,
+    uncond: &'a StreamState,
+    imgcond: &'a StreamState,
+}
+
+impl BerniniMarForward for PlannerMarForward<'_> {
+    fn forward_streams(&self, target: &Tensor) -> CResult<[Tensor; 3]> {
+        Ok([
+            stream_for_vit(self.backbone, self.connector, self.cond, target)?,
+            stream_for_vit(self.backbone, self.connector, self.uncond, target)?,
+            stream_for_vit(self.backbone, self.connector, self.imgcond, target)?,
+        ])
+    }
+
+    fn sample_clip_diff(
+        &self,
+        z: &Tensor,
+        txt_cfg: f32,
+        steps: usize,
+        img_cfg: Option<f32>,
+        noise: &Tensor,
+    ) -> CResult<Tensor> {
+        self.clip_diff
+            .borrow_mut()
+            .sample(z, txt_cfg, steps, img_cfg, noise)
+    }
+}
+
+struct BerniniMarHistory {
+    n_query: usize,
+    planning_step: usize,
+    order: Vec<i32>,
+    hidden: usize,
+    expected_next_step: usize,
+}
+
+/// Typed [`FamilyDriver`] for Candle Bernini's MaskGIT/MAR semantic planning stage (`PIPE-7`, `DEC-13`).
+pub struct BerniniMarPlannerDriver<F> {
+    n_query: usize,
+    hidden: usize,
+    cfg: VitCfg,
+    order: Vec<i32>,
+    schedule: Vec<Vec<i32>>,
+    step_noise: Vec<Tensor>,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: BerniniMarForward> BerniniMarPlannerDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle Bernini MAR driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native Candle Bernini MAR driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native Candle Bernini MAR driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        n_query: usize,
+        hidden: usize,
+        cfg: VitCfg,
+        order: Vec<i32>,
+        step_noise: Vec<Tensor>,
+        forward: F,
+    ) -> CResult<Self> {
+        if n_query == 0 || order.len() != n_query {
+            return Err(CandleError::Msg(format!(
+                "{driver_id}: order len {} must match positive n_query {n_query}",
+                order.len()
+            )));
+        }
+        if cfg.planning_step == 0 || step_noise.len() < cfg.planning_step {
+            return Err(CandleError::Msg(format!(
+                "{driver_id}: step_noise len {} must cover planning_step={}",
+                step_noise.len(),
+                cfg.planning_step
+            )));
+        }
+        let schedule = mar_schedule(n_query as i32, cfg.planning_step, &order);
+        Ok(Self {
+            n_query,
+            hidden,
+            cfg,
+            order,
+            schedule,
+            step_noise,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    fn mask_ratio(planning_step: usize, step: usize) -> f32 {
+        (std::f64::consts::PI / 2.0 * step as f64 / planning_step.max(1) as f64).cos() as f32
+    }
+}
+
+impl<F: BerniniMarForward> FamilyDriver<Tensor> for BerniniMarPlannerDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        let total_steps = self.cfg.planning_step;
+        if input.total_steps != total_steps || input.span.end > total_steps {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with MAR planning steps {total_steps}",
+                self.support.driver_id, input.span, input.total_steps
+            )));
+        }
+
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<BerniniMarHistory>() else {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Bernini MAR history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.n_query != self.n_query
+                || existing.planning_step != self.cfg.planning_step
+                || existing.order != self.order
+                || existing.hidden != self.hidden
+            {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Bernini MAR schedule or permutation",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous MAR step {} (expected {})",
+                    self.support.driver_id, input.span.start, existing.expected_next_step
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        if !carrying {
+            state.set_history(BerniniMarHistory {
+                n_query: self.n_query,
+                planning_step: self.cfg.planning_step,
+                order: self.order.clone(),
+                hidden: self.hidden,
+                expected_next_step: input.span.start,
+            });
+        }
+
+        let mut target = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        if target.dims() != [1, self.n_query, self.hidden] {
+            return Err(candle_gen::gen_core::Error::Msg(format!(
+                "{}: expected MAR target shape [1, {}, {}], got {:?}",
+                self.support.driver_id,
+                self.n_query,
+                self.hidden,
+                target.dims()
+            )));
+        }
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(candle_gen::gen_core::Error::Canceled);
+            }
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: Self::mask_ratio(total_steps, step),
+                next_sigma: Self::mask_ratio(total_steps, step + 1),
+            };
+            hooks.observe(&info, &target)?;
+
+            let revealed = &self.schedule[step];
+            // `nonzero().sum() == 0` -> nothing to predict this step (empty, or {token 0} only).
+            // Hoisted above the 3 backbone passes (F-144) as well as clip_diff.
+            if revealed.iter().sum::<i32>() != 0 {
+                let [cond_vit, uncond_vit, imgcond_vit] = self
+                    .forward
+                    .forward_streams(&target)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+                let np = revealed.len();
+                let hv = cond_vit
+                    .dim(2)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                let rev: Vec<u32> = revealed.iter().map(|&x| x as u32).collect();
+
+                let c = take_seq(&cond_vit, &rev)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                let u = take_seq(&uncond_vit, &rev)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                let ic = take_seq(&imgcond_vit, &rev)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                let z = Tensor::cat(&[&c, &u, &ic], 1)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?
+                    .reshape((3 * np, hv))
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+
+                let sampled = self
+                    .forward
+                    .sample_clip_diff(
+                        &z,
+                        self.cfg.vit_txt_cfg,
+                        self.cfg.vit_denoising_step,
+                        Some(self.cfg.vit_img_cfg),
+                        &self.step_noise[step],
+                    )
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                let cur = take_first_rows(&sampled, np)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?
+                    .reshape((1, np, self.hidden))
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                target = scatter_rows(&target, &rev, &cur)
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))?;
+                target = hooks.post_step(&info, target)?;
+            }
+
+            hooks.materialize(&info, &target)?;
+            if let Some(history) = state.history_mut::<BerniniMarHistory>() {
+                history.expected_next_step = step + 1;
+            }
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(target))
+    }
+}
+
 /// The MAR planning loop (`sample_vit_embed`): fill the target ViT tokens over `cfg.planning_step`
 /// MaskGIT steps, then run the planner→renderer handoff ([`four_streams`]).
 ///
@@ -249,56 +535,85 @@ pub fn sample_vit_embed(
     cancel: &CancelFlag,
     mask_token: &Tensor,
 ) -> CResult<SampledStreams> {
+    sample_vit_embed_with_progress(
+        backbone,
+        connector,
+        clip_diff,
+        cond,
+        uncond,
+        imgcond,
+        cfg,
+        order,
+        step_noise,
+        cancel,
+        &mut |_| {},
+        mask_token,
+    )
+}
+
+/// [`sample_vit_embed`] reporting 1-based planner step progress (`1..=cfg.planning_step`).
+#[allow(clippy::too_many_arguments)]
+pub fn sample_vit_embed_with_progress(
+    backbone: &Qwen25VlText,
+    connector: &MlpConnector,
+    clip_diff: &mut DiffLossFm,
+    cond: &StreamState,
+    uncond: &StreamState,
+    imgcond: &StreamState,
+    cfg: &VitCfg,
+    order: &[i32],
+    step_noise: &[Tensor],
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    mask_token: &Tensor,
+) -> CResult<SampledStreams> {
     let n_query = order.len();
     let h = mask_token.dim(2)?;
-    let schedule = mar_schedule(n_query as i32, cfg.planning_step, order);
-
-    // Single shared target buffer, init = mask_token broadcast over the n_query target slots.
-    let mut target = mask_token.broadcast_as((1, n_query, h))?.contiguous()?;
-
-    for (step, revealed) in schedule.iter().enumerate() {
-        // Honor the engine cancellation contract (F-003): the MAR planning loop runs 3 backbone passes
-        // per step over `planning_step` (default 25) steps — check before each.
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
+    let initial_target = mask_token.broadcast_as((1, n_query, h))?.contiguous()?;
+    let forward = PlannerMarForward {
+        backbone,
+        connector,
+        clip_diff: std::cell::RefCell::new(clip_diff),
+        cond,
+        uncond,
+        imgcond,
+    };
+    let driver = BerniniMarPlannerDriver::new(
+        "bernini_candle_mar_planner_driver",
+        n_query,
+        h,
+        VitCfg {
+            planning_step: cfg.planning_step,
+            vit_denoising_step: cfg.vit_denoising_step,
+            vit_txt_cfg: cfg.vit_txt_cfg,
+            vit_img_cfg: cfg.vit_img_cfg,
+        },
+        order.to_vec(),
+        step_noise.to_vec(),
+        forward,
+    )?;
+    let mut state = DriverRunState::new();
+    let mut progress_adapter = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
         }
-        // `nonzero().sum() == 0` → nothing to predict this step (empty, or {token 0} only). This is a
-        // schedule-only decision (independent of the backbone outputs), so hoist it above the three
-        // backbone forwards (F-144): when `n_query < planning_step` the trailing schedule chunks are
-        // empty, and running cond/uncond/imgcond `stream_for_vit` there burns three discarded 7B
-        // forwards. The skipped step scatters nothing and consumes no `step_noise`, so hoisting the
-        // check is output-identical — it only avoids the wasted passes.
-        if revealed.iter().sum::<i32>() == 0 {
-            continue;
-        }
-
-        // Every non-empty step runs all 3 backbones over the current (partially-filled) embeds.
-        let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
-        let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;
-        let imgcond_vit = stream_for_vit(backbone, connector, imgcond, &target)?;
-
-        let np = revealed.len();
-        let hv = cond_vit.dim(2)?;
-        let rev: Vec<u32> = revealed.iter().map(|&x| x as u32).collect();
-
-        // z = cat([cond, uncond, imgcond], dim=1)[0] → [3·np, H_vit] (pre-tiled triple-CFG cond).
-        let c = take_seq(&cond_vit, &rev)?;
-        let u = take_seq(&uncond_vit, &rev)?;
-        let ic = take_seq(&imgcond_vit, &rev)?;
-        let z = Tensor::cat(&[&c, &u, &ic], 1)?.reshape((3 * np, hv))?;
-
-        // Triple-CFG denoise; take the first third (the cond tile) → [1, np, H].
-        let sampled = clip_diff.sample(
-            &z,
-            cfg.vit_txt_cfg,
-            cfg.vit_denoising_step,
-            Some(cfg.vit_img_cfg),
-            &step_noise[step],
-        )?;
-        let cur = take_first_rows(&sampled, np)?.reshape((1, np, h))?;
-
-        target = scatter_rows(&target, &rev, &cur)?;
-    }
+    };
+    let mut hooks = StepHooks::new(&mut progress_adapter);
+    let out = run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(cfg.planning_step)],
+        BoundaryState::XSigma(initial_target),
+        cfg.planning_step,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    let BoundaryState::XSigma(target) = out else {
+        unreachable!("BerniniMarPlannerDriver always emits BoundaryState::XSigma");
+    };
 
     // ---- handoff: final cond + uncond forwards → feat_from_planner_to_renderer → 4 streams ----
     let cond_embeds = splice_target(cond, &target)?;
@@ -328,7 +643,7 @@ pub fn sample_vit_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::candle_core::Device;
+    use candle_gen::candle_core::{DType, Device};
 
     /// The reveal schedule chunks are disjoint and cover every token exactly once (ascending order).
     #[test]
@@ -380,5 +695,202 @@ mod tests {
         let out = post_process_input_embeds(&emb, &[false, true, false], &mask_token).unwrap();
         let v: Vec<f32> = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v, vec![1.0, 2.0, -1.0, -2.0, 5.0, 6.0]);
+    }
+
+    struct MockCandleMarForward {
+        forward_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        clip_diff_calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl BerniniMarForward for MockCandleMarForward {
+        fn forward_streams(&self, target: &Tensor) -> CResult<[Tensor; 3]> {
+            self.forward_calls.set(self.forward_calls.get() + 1);
+            let c = target.affine(1.0, 0.1)?;
+            let u = target.affine(0.5, 0.0)?;
+            let ic = target.affine(1.0, -0.05)?;
+            Ok([c, u, ic])
+        }
+
+        fn sample_clip_diff(
+            &self,
+            z: &Tensor,
+            txt_cfg: f32,
+            steps: usize,
+            img_cfg: Option<f32>,
+            noise: &Tensor,
+        ) -> CResult<Tensor> {
+            self.clip_diff_calls.set(self.clip_diff_calls.get() + 1);
+            let np = z.dim(0)? / 3;
+            let hv = z.dim(1)?;
+            let cond = take_first_rows(z, np)?;
+            let scale = txt_cfg + img_cfg.unwrap_or(1.0) + steps as f32 * 0.01;
+            let blended = (cond.affine(0.25, 0.0)?
+                + noise.reshape((np, hv))?.affine(0.1 * scale as f64, 0.0)?)?;
+            Ok(Tensor::cat(&[&blended, &blended, &blended], 0)?)
+        }
+    }
+
+    fn tensor_f32_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        if a.dims() != b.dims() {
+            return false;
+        }
+        let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn mar_planner_driver_passes_conformance() {
+        use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let dev = Device::Cpu;
+        // Order ensuring every step reveals at least one non-zero token so conformance verifies
+        // `internal_evaluations >= total_steps`.
+        let order = vec![0i32, 7, 6, 5, 4, 3, 2, 1];
+        let n_query = order.len();
+        let hidden = 4usize;
+        let planning_step = 4usize;
+        let schedule = mar_schedule(n_query as i32, planning_step, &order);
+        assert!(schedule.iter().all(|chunk| chunk.iter().sum::<i32>() != 0));
+
+        let mask_token =
+            Tensor::from_vec(vec![-1.0f32, -0.5, 0.5, 1.0], (1, 1, hidden), &dev).unwrap();
+        let init_target = mask_token
+            .broadcast_as((1, n_query, hidden))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let step_noise: Vec<Tensor> = schedule
+            .iter()
+            .enumerate()
+            .map(|(s, rev)| {
+                let np = rev.len().max(1);
+                let vals: Vec<f32> = (0..(np * hidden))
+                    .map(|k| 0.01 * (s as f32 + 1.0) + 0.001 * k as f32)
+                    .collect();
+                Tensor::from_vec(vals, (np, hidden), &dev).unwrap()
+            })
+            .collect();
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: planning_step,
+            split_at: 2,
+            seed: 42,
+            base_geometry: (256, 256),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                Box::new(
+                    BerniniMarPlannerDriver::new(
+                        "bernini_candle_mar_test",
+                        n_query,
+                        hidden,
+                        VitCfg {
+                            planning_step,
+                            vit_denoising_step: 3,
+                            vit_txt_cfg: 1.4,
+                            vit_img_cfg: 1.2,
+                        },
+                        order.clone(),
+                        step_noise.clone(),
+                        MockCandleMarForward {
+                            forward_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                            clip_diff_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                        },
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || init_target.clone(),
+            latents_equal: tensor_f32_bit_equal,
+        })
+        .unwrap();
+        assert_eq!(report.total_steps, planning_step);
+        assert!(report.verified_inert_split);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn mar_planner_preserves_f144_lone_zero_skip_without_consuming_noise() {
+        let dev = Device::Cpu;
+        let order = vec![4i32, 1, 5, 2, 3, 0];
+        let n_query = order.len();
+        let hidden = 4usize;
+        let planning_step = 4usize;
+        let schedule = mar_schedule(n_query as i32, planning_step, &order);
+        assert_eq!(schedule[0], vec![0]);
+
+        let mask_token =
+            Tensor::from_vec(vec![-1.0f32, -0.5, 0.5, 1.0], (1, 1, hidden), &dev).unwrap();
+        let init_target = mask_token
+            .broadcast_as((1, n_query, hidden))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let mut step_noise: Vec<Tensor> = schedule
+            .iter()
+            .enumerate()
+            .map(|(s, rev)| {
+                let np = rev.len().max(1);
+                let vals: Vec<f32> = (0..(np * hidden))
+                    .map(|k| 0.02 * (s as f32 + 1.0) + 0.001 * k as f32)
+                    .collect();
+                Tensor::from_vec(vals, (np, hidden), &dev).unwrap()
+            })
+            .collect();
+        // Sentinel incompatible shape at step 0 proves `step_noise[0]` is never read.
+        step_noise[0] = Tensor::zeros((1, 1), DType::F32, &dev).unwrap();
+
+        let forward_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clip_diff_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let drv = BerniniMarPlannerDriver::new(
+            "bernini_candle_mar_skip_probe",
+            n_query,
+            hidden,
+            VitCfg {
+                planning_step,
+                vit_denoising_step: 3,
+                vit_txt_cfg: 1.4,
+                vit_img_cfg: 1.2,
+            },
+            order,
+            step_noise,
+            MockCandleMarForward {
+                forward_calls: forward_calls.clone(),
+                clip_diff_calls: clip_diff_calls.clone(),
+            },
+        )
+        .unwrap();
+        let mut st = DriverRunState::new();
+        let cancel = CancelFlag::default();
+        let mut progress = Vec::new();
+        let mut on_p = |p: Progress| progress.push(p);
+        let mut hooks = StepHooks::new(&mut on_p);
+        let out = run_candle_driver_slices(
+            &drv,
+            [SliceSpec::full(planning_step)],
+            BoundaryState::XSigma(init_target),
+            planning_step,
+            0,
+            &cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let BoundaryState::XSigma(final_target) = out else {
+            panic!("expected XSigma");
+        };
+        let slot0 = final_target
+            .narrow(1, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(slot0, vec![-1.0, -0.5, 0.5, 1.0]);
+        assert_eq!(progress.len(), planning_step);
+        assert_eq!(forward_calls.get(), planning_step - 1);
+        assert_eq!(clip_diff_calls.get(), planning_step - 1);
     }
 }

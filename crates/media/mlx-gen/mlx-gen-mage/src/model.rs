@@ -48,6 +48,9 @@ use std::path::Path;
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
 use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample};
+use gen_core_family::mage_plan::{
+    build_mage_render_plan, MageBackendKind, MageBatchSemantics, MageRenderPlan,
+};
 use mlx_gen::residency::{Residency, StagedHeavy};
 
 /// The weights-free registry-conformance identity family (sc-22733, epic sc-22723 E1/E4).
@@ -1475,7 +1478,7 @@ impl Generator for MageFlow {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        validate_generation_request(&self.descriptor, req)
+        self.render_plan(req).map(|_| ())
     }
 
     fn generate(
@@ -1514,12 +1517,24 @@ impl Generator for MageFlow {
 }
 
 impl MageFlow {
+    /// Validate `req` and construct the pre-load serializable [`MageRenderPlan`] before loading weights.
+    pub(crate) fn render_plan(
+        &self,
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<MageRenderPlan> {
+        build_mage_render_plan(&self.descriptor, MageBackendKind::Mlx, req, true)
+    }
+
     fn generate_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
+        let render_plan = self.render_plan(req)?;
+        debug_assert!(
+            render_plan.watermark.mandatory && render_plan.watermark.forbid_plain_randn,
+            "Mage requires Gaussian-Shading watermarked initial noise"
+        );
         if req.memory.is_none() {
             crate::memory::ensure_generation_fits(
                 self.tier,
@@ -1532,10 +1547,9 @@ impl MageFlow {
         if req.cancel.is_cancelled() {
             return Err(mlx_gen::gen_core::Error::Canceled);
         }
-        let steps = req.steps.unwrap_or(self.variant.default_steps());
-        let cfg = req.guidance.unwrap_or(self.variant.default_cfg());
+        let steps = render_plan.steps as u32;
+        let cfg = render_plan.guidance;
         mlx_gen::image_execution::scalar("mage.cfg", cfg);
-        let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
         let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
         let memory = req.memory.unwrap_or_default();
@@ -1543,10 +1557,20 @@ impl MageFlow {
         mlx_gen::image_execution::policy_debug("mage.stage_residency", &stage_residency);
         let streamable = memory.stream_transformer_blocks;
         if self.variant.is_edit() {
+            let sample_seeds = match &render_plan.batch_semantics {
+                MageBatchSemantics::SequentialSingleSample { sample_seeds, .. } => {
+                    sample_seeds.as_slice()
+                }
+                other => {
+                    return Err(mlx_gen::gen_core::Error::Msg(format!(
+                        "mage_flow edit expected SequentialSingleSample plan, got {other:?}"
+                    )));
+                }
+            };
             let references = edit_references(req)?;
-            let mut images = Vec::with_capacity(req.count as usize);
-            for index in 0..req.count {
-                let run_seed = seed.wrapping_add(index as i64);
+            let mut images = Vec::with_capacity(sample_seeds.len());
+            for &sample_seed in sample_seeds {
+                let run_seed = sample_seed as i64;
                 let trace = self.residency.run_staged_request_scoped(
                     stage_residency,
                     streamable,
@@ -1581,7 +1605,7 @@ impl MageFlow {
                             cfg,
                             run_seed,
                             &key,
-                            req.scheduler_shift,
+                            render_plan.scheduler_shift,
                             req.memory,
                             &req.cancel,
                             progress,
@@ -1619,15 +1643,24 @@ impl MageFlow {
             }
             return Ok(GenerationOutput::Images(images));
         }
-        let samples = (0..req.count)
-            .map(|index| GenerationSample {
-                prompt: &req.prompt,
-                negative_prompt,
-                height: req.height,
-                width: req.width,
-                seed: seed.wrapping_add(index as i64),
-            })
-            .collect::<Vec<_>>();
+        let samples = match &render_plan.batch_semantics {
+            MageBatchSemantics::PackedNativeResolution { packs, .. } => packs
+                .iter()
+                .flat_map(|pack| &pack.sample_seeds)
+                .map(|&sample_seed| GenerationSample {
+                    prompt: &req.prompt,
+                    negative_prompt,
+                    height: req.height,
+                    width: req.width,
+                    seed: sample_seed as i64,
+                })
+                .collect::<Vec<_>>(),
+            other => {
+                return Err(mlx_gen::gen_core::Error::Msg(format!(
+                    "mage_flow generation expected PackedNativeResolution plan, got {other:?}"
+                )));
+            }
+        };
         let traces = self
             .residency
             .run_staged_request_scoped(
@@ -1653,7 +1686,7 @@ impl MageFlow {
                         steps as usize,
                         cfg,
                         &key,
-                        req.scheduler_shift,
+                        render_plan.scheduler_shift,
                         req.memory,
                         &req.cancel,
                         progress,
@@ -1730,35 +1763,14 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<image::RgbImage>> {
         .collect()
 }
 
+#[cfg(test)]
 fn validate_generation_request(
     descriptor: &ModelDescriptor,
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<()> {
-    descriptor
-        .capabilities
-        .validate_request(descriptor.id, req)?;
-    let guidance = req.guidance.unwrap_or_else(|| {
-        MageVariant::from_id(descriptor.id).map_or(1.0, MageVariant::default_cfg)
-    });
-    if guidance == 1.0
-        && req
-            .negative_prompt
-            .as_ref()
-            .is_some_and(|text| !text.trim().is_empty())
-    {
-        return Err(mlx_gen::gen_core::Error::Msg(format!(
-            "{}: a negative prompt requires guidance != 1.0",
-            descriptor.id
-        )));
-    }
-    if !req.width.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
-        || !req.height.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
-    {
-        return Err(mlx_gen::gen_core::Error::Msg(format!(
-            "mage_flow dimensions must be divisible by {REQUIRED_SIZE_MULTIPLE}"
-        )));
-    }
-    Ok(())
+    // Low-level descriptor surface test helper; public Generator::validate uses `render_plan` with
+    // `require_edit_references = true`.
+    build_mage_render_plan(descriptor, MageBackendKind::Mlx, req, false).map(|_| ())
 }
 
 /// Every side of a Mage-Flow request must be a multiple of this (the VAE's 16× downsample;
@@ -3608,13 +3620,15 @@ mod tests {
         );
         let gen = descriptor_for(MageVariant::Rl);
         assert!(gen.capabilities.conditioning.is_empty());
-        // Distillation, not task, drives the CFG surface.
+        // Experimental CFG overrides are supported on Turbo variants too (SW-6929), while default
+        // CFG still depends on distillation rather than task.
         assert!(gen.capabilities.supports_guidance);
         assert!(
-            !descriptor_for(MageVariant::Turbo)
+            descriptor_for(MageVariant::Turbo)
                 .capabilities
                 .supports_guidance
         );
+        assert_eq!(MageVariant::Turbo.default_cfg(), 1.0);
         assert!(
             descriptor_for(MageVariant::Edit)
                 .capabilities
@@ -4391,5 +4405,86 @@ mod fingerprint_pin_tests {
             production_calibration_fingerprint("mage_flow_edit", Some(Quant::Q4)).as_deref(),
             Some("mage-flow-mage-flow-edit-q4-mlx-shared-ladder-v1")
         );
+    }
+}
+
+#[cfg(test)]
+mod render_plan_tests {
+    use super::*;
+
+    #[test]
+    fn mage_mlx_pre_load_plan_matches_pipe13_packed_semantics_and_refusals() {
+        let req = GenerationRequest {
+            prompt: "a stone bridge in rain".into(),
+            width: 2048,
+            height: 2048,
+            count: 4,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let plan = build_mage_render_plan(
+            &descriptor_for(MageVariant::Rl),
+            MageBackendKind::Mlx,
+            &req,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.steps, 20);
+        assert_eq!(plan.guidance, 5.0);
+        assert!(plan.use_neg);
+        assert_eq!(plan.static_shift, 6.0);
+        assert!(plan.watermark.mandatory);
+        assert!(plan.watermark.forbid_plain_randn);
+        let MageBatchSemantics::PackedNativeResolution { packs, .. } = &plan.batch_semantics else {
+            panic!("expected MLX PackedNativeResolution semantics");
+        };
+        let samples = (0..req.count)
+            .map(|i| GenerationSample {
+                prompt: &req.prompt,
+                negative_prompt: " ",
+                height: req.height,
+                width: req.width,
+                seed: (42i64).wrapping_add(i as i64),
+            })
+            .collect::<Vec<_>>();
+        let planned_packs = crate::pipeline::plan_generation_packs(&samples).unwrap();
+        assert_eq!(packs.len(), planned_packs.len());
+        for (plan_pack, pipe_pack) in packs.iter().zip(&planned_packs) {
+            assert_eq!(
+                plan_pack.sample_range_start..plan_pack.sample_range_end,
+                pipe_pack.sample_range
+            );
+            assert_eq!(plan_pack.image_tokens as i32, pipe_pack.image_tokens);
+        }
+
+        // Pre-load refusal on invalid combos (edit without refs, turbo with negative at cfg=1).
+        let edit_missing_refs = GenerationRequest {
+            prompt: "edit".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        assert!(build_mage_render_plan(
+            &descriptor_for(MageVariant::Edit),
+            MageBackendKind::Mlx,
+            &edit_missing_refs,
+            true,
+        )
+        .is_err());
+
+        let turbo_neg = GenerationRequest {
+            prompt: "turbo".into(),
+            width: 1024,
+            height: 1024,
+            negative_prompt: Some("bad".into()),
+            ..Default::default()
+        };
+        assert!(build_mage_render_plan(
+            &descriptor_for(MageVariant::Turbo),
+            MageBackendKind::Mlx,
+            &turbo_neg,
+            true,
+        )
+        .is_err());
     }
 }

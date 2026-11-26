@@ -35,7 +35,12 @@
 
 use image::{imageops::FilterType, RgbImage};
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
-use mlx_gen::gen_core::GenerationMemory;
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec,
+    SliceTransition, StepHooks,
+};
+use mlx_gen::gen_core::{BoundaryState, GenerationMemory};
 use mlx_gen::tiling::{SpatialTiling, TilingConfig};
 use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
@@ -247,7 +252,7 @@ pub(crate) fn denoise_generation_phase(
         let tokens = concatenate_axis(&refs, 1)?;
         let layout = generation_layout(&encoded.pack.grids, encoded.positive_lens)?;
         let mut trajectories = Vec::new();
-        let tokens = denoise_capture(
+        let tokens = denoise_capture_with_progress(
             transformer,
             tokens,
             &encoded.cond,
@@ -265,10 +270,13 @@ pub(crate) fn denoise_generation_phase(
                 if step < 2 {
                     trajectories.push(latent.clone());
                 }
-                on_progress(Progress::Step {
-                    current: (pack_index * steps + step + 1) as u32,
+            },
+            &mut |progress_event| match progress_event {
+                Progress::Step { current, .. } => on_progress(Progress::Step {
+                    current: (pack_index * steps) as u32 + current,
                     total: total_steps as u32,
-                });
+                }),
+                other => on_progress(other),
             },
         )?;
         mlx_gen::image_execution::policy_debug("mage.memory", &memory);
@@ -420,11 +428,10 @@ pub(crate) fn denoise_edit_phase(
         .transpose_axes(&[0, 2, 3, 1])?
         .reshape(&[1, references.len() as i32 * gh * gw, LATENT_CHANNELS])?
         .as_dtype(Dtype::Bfloat16)?;
-    let mut target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
+    let target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
     let shapes = std::iter::repeat_n(ImgShape::latent(gh, gw), references.len() + 1).collect();
     let total_tokens = (references.len() as i32 + 1) * gh * gw;
     let layout = PackLayout::new(shapes, vec![total_tokens], vec![encoded.cond_len])?;
-    let cond_ctx = transformer.pack_context(layout.clone())?;
     let native = mage_flow_sigmas(steps)?;
     let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
         None,
@@ -434,57 +441,26 @@ pub(crate) fn denoise_edit_phase(
         &native,
     )?;
     let mut trajectories = Vec::with_capacity(2);
-    for (step, pair) in sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let sequence = assemble_edit_sequence(&target, &reference_tokens)?;
-        if step < 2 {
-            trajectories.push(if encoded.negative.is_some() {
-                concatenate_axis(&[&sequence, &sequence], 1)?
-            } else {
-                sequence.clone()
-            });
-        }
-        let velocity = if let Some((negative, neg_len)) = &encoded.negative {
-            let fused_ctx = transformer.pack_context(layout.fused_cfg(&[*neg_len])?)?;
-            let fused_img = concatenate_axis(&[&sequence, &sequence], 1)?;
-            let fused_txt = concatenate_axis(&[&encoded.cond, negative], 1)?;
-            let sigma = Array::from_slice(
-                &vec![pair[0]; fused_ctx.segments()],
-                &[fused_ctx.segments() as i32],
-            );
-            let output = transformer_forward(
-                transformer,
-                &fused_img,
-                &fused_txt,
-                &sigma,
-                &fused_ctx,
-                memory,
-                cancel,
-            )?;
-            let split = output.split_axis(&[total_tokens], 1)?;
-            cfg_velocity(&split[0], &split[1], cfg, false)?
-        } else {
-            let sigma = Array::from_slice(&[pair[0]], &[1]);
-            transformer_forward(
-                transformer,
-                &sequence,
-                &encoded.cond,
-                &sigma,
-                &cond_ctx,
-                memory,
-                cancel,
-            )?
-        };
-        let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
-        target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
-        mlx_rs::transforms::eval([&target])?;
-        on_progress(Progress::Step {
-            current: (step + 1) as u32,
-            total: steps as u32,
-        });
-    }
+    let target = run_mage_mlx_driver(
+        "mage_mlx_edit_driver",
+        transformer,
+        target,
+        gh * gw,
+        Some(reference_tokens.clone()),
+        &encoded.cond,
+        layout,
+        encoded
+            .negative
+            .as_ref()
+            .map(|(txt, len)| (txt, vec![*len])),
+        cfg,
+        false,
+        &sigmas,
+        memory,
+        cancel,
+        Some(&mut trajectories),
+        on_progress,
+    )?;
     mlx_gen::image_execution::policy_debug("mage.memory", &memory);
     mlx_gen::image_execution::scalar("mage.cfg", cfg);
     mlx_gen::image_execution::sampled_native_with_rng("mage-edit-euler-v1", "noise-fraction", target.dtype(), &sigmas, seed as u64,
@@ -1035,7 +1011,7 @@ impl MageFlowPipeline {
             )));
         }
         let reference_tokens = reference_tokens.as_dtype(Dtype::Bfloat16)?;
-        let mut target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
+        let target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
 
         let positive = self.text_encoder.encode_edit(instruction, references)?;
         let cond = positive
@@ -1062,56 +1038,23 @@ impl MageFlowPipeline {
         )?;
         let sigmas = mage_flow_sigmas(steps)?;
         let mut trajectories = Vec::with_capacity(2);
-        let cond_ctx = self.transformer.pack_context(layout.clone())?;
-        for (step, pair) in sigmas.windows(2).enumerate() {
-            let sequence = assemble_edit_sequence(&target, &reference_tokens)?;
-            if step < 2 {
-                trajectories.push(if negative.is_some() {
-                    concatenate_axis(&[&sequence, &sequence], 1)?
-                } else {
-                    sequence.clone()
-                });
-            }
-            let velocity = if let Some((neg, neg_len)) = &negative {
-                let fused_layout = layout.fused_cfg(&[*neg_len])?;
-                let fused_ctx = self.transformer.pack_context(fused_layout)?;
-                let fused_img = concatenate_axis(&[&sequence, &sequence], 1)?;
-                let fused_txt = concatenate_axis(&[&cond, neg], 1)?;
-                let sigma = Array::from_slice(
-                    &vec![pair[0]; fused_ctx.segments()],
-                    &[fused_ctx.segments() as i32],
-                );
-                let output = transformer_forward(
-                    &self.transformer,
-                    &fused_img,
-                    &fused_txt,
-                    &sigma,
-                    &fused_ctx,
-                    memory,
-                    cancel,
-                )?;
-                let split = output.split_axis(&[total_tokens], 1)?;
-                cfg_velocity(&split[0], &split[1], cfg, renormalize)?
-            } else {
-                let sigma = Array::from_slice(&[pair[0]], &[1]);
-                transformer_forward(
-                    &self.transformer,
-                    &sequence,
-                    &cond,
-                    &sigma,
-                    &cond_ctx,
-                    memory,
-                    cancel,
-                )?
-            };
-            let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
-            target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
-            mlx_rs::transforms::eval([&target])?;
-            on_progress(Progress::Step {
-                current: (step + 1) as u32,
-                total: steps as u32,
-            });
-        }
+        let target = run_mage_mlx_driver(
+            "mage_mlx_edit_driver",
+            &self.transformer,
+            target,
+            gh * gw,
+            Some(reference_tokens.clone()),
+            &cond,
+            layout,
+            negative.as_ref().map(|(txt, len)| (txt, vec![*len])),
+            cfg,
+            renormalize,
+            &sigmas,
+            memory,
+            cancel,
+            Some(&mut trajectories),
+            on_progress,
+        )?;
         let image_u8 = decode_with_memory(&self.vae, &target, gh, gw, memory, cancel)?;
         Ok(EditTrace {
             final_tokens: target,
@@ -1239,7 +1182,7 @@ impl MageFlowPipeline {
             let tokens = concatenate_axis(&initial_refs, 1)?;
             let layout = generation_layout(&pack.grids, positive_lens)?;
             let mut trajectories = Vec::with_capacity(2);
-            let out = denoise_capture(
+            let out = denoise_capture_with_progress(
                 &self.transformer,
                 tokens,
                 &cond,
@@ -1254,10 +1197,13 @@ impl MageFlowPipeline {
                     if sample_count == 1 && step < 2 {
                         trajectories.push(latent.clone());
                     }
-                    on_progress(Progress::Step {
-                        current: (pack_index * steps + step + 1) as u32,
+                },
+                &mut |progress_event| match progress_event {
+                    Progress::Step { current, .. } => on_progress(Progress::Step {
+                        current: (pack_index * steps) as u32 + current,
                         total: total_steps as u32,
-                    });
+                    }),
+                    other => on_progress(other),
                 },
             )?;
 
@@ -1554,6 +1500,391 @@ fn flow_euler_step(sample: &Array, model_output: &Array, delta: f32) -> Result<A
         .as_dtype(model_dtype)?)
 }
 
+/// Forward-evaluation seam for [`MageMlxDriver`] (`PIPE-7`, `DEC-13`).
+pub trait MageMlxForward {
+    /// Whether this forward evaluates fused `[cond, uncond]` CFG branches along axis 1.
+    fn uses_cfg(&self) -> bool;
+
+    /// Predict transformer velocity for `fused_or_single_sequence` at noise level `sigma` and
+    /// outer step `step`.
+    fn forward_sequence(
+        &self,
+        fused_or_single_sequence: &Array,
+        sigma: f32,
+        step: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array>;
+}
+
+struct TransformerMageMlxForward<'a> {
+    transformer: &'a MageTransformer,
+    cond_txt: &'a Array,
+    cond_ctx: PackContext,
+    negative: Option<(Array, PackContext)>,
+    memory: Option<GenerationMemory>,
+}
+
+impl MageMlxForward for TransformerMageMlxForward<'_> {
+    fn uses_cfg(&self) -> bool {
+        self.negative.is_some()
+    }
+
+    fn forward_sequence(
+        &self,
+        sequence: &Array,
+        sigma: f32,
+        _step: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        if let Some((fused_txt, fused_ctx)) = &self.negative {
+            let sigma_arr = Array::from_slice(
+                &vec![sigma; fused_ctx.segments()],
+                &[fused_ctx.segments() as i32],
+            );
+            transformer_forward(
+                self.transformer,
+                sequence,
+                fused_txt,
+                &sigma_arr,
+                fused_ctx,
+                self.memory,
+                cancel,
+            )
+        } else {
+            let sigma_arr = Array::from_slice(
+                &vec![sigma; self.cond_ctx.segments()],
+                &[self.cond_ctx.segments() as i32],
+            );
+            transformer_forward(
+                self.transformer,
+                sequence,
+                self.cond_txt,
+                &sigma_arr,
+                &self.cond_ctx,
+                self.memory,
+                cancel,
+            )
+        }
+    }
+}
+
+struct MageMlxDriverHistory {
+    total_steps: usize,
+    sigmas_bits: Vec<u32>,
+    expected_next_step: usize,
+}
+
+/// Typed [`FamilyDriver`] for MLX Mage-Flow rectified-flow Euler denoising across packed T2I
+/// batches and target-first clean-reference Edit sequences (`PIPE-7`, `DEC-13`).
+pub struct MageMlxDriver<F> {
+    sigmas: Vec<f32>,
+    sigmas_bits: Vec<u32>,
+    cfg: f32,
+    renormalize: bool,
+    target_tokens: i32,
+    reference_tokens: Option<Array>,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: MageMlxForward> MageMlxDriver<F> {
+    pub fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native MLX Mage flow driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native MLX Mage flow driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native MLX Mage flow driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        sigmas: Vec<f32>,
+        cfg: f32,
+        renormalize: bool,
+        target_tokens: i32,
+        reference_tokens: Option<Array>,
+        forward: F,
+    ) -> Result<Self> {
+        if sigmas.len() < 2 {
+            return Err(Error::Msg(
+                "mage_flow: scheduler needs a terminal sigma".into(),
+            ));
+        }
+        if target_tokens <= 0 {
+            return Err(Error::Msg(
+                "mage_flow: target token count must be positive".into(),
+            ));
+        }
+        let sigmas_bits = sigmas.iter().map(|s| s.to_bits()).collect();
+        Ok(Self {
+            sigmas,
+            sigmas_bits,
+            cfg,
+            renormalize,
+            target_tokens,
+            reference_tokens,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+}
+
+impl<F: MageMlxForward> FamilyDriver<Array> for MageMlxDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        let total_steps = self.sigmas.len() - 1;
+        if input.total_steps != total_steps || input.span.end > total_steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with Mage schedule length {total_steps}",
+                self.support.driver_id, input.span, input.total_steps
+            )));
+        }
+
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<MageMlxDriverHistory>() else {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Mage driver history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.total_steps != input.total_steps || existing.sigmas_bits != self.sigmas_bits
+            {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Mage sigma schedule",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous step {} (expected {})",
+                    self.support.driver_id, input.span.start, existing.expected_next_step
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        if !carrying {
+            state.set_history(MageMlxDriverHistory {
+                total_steps,
+                sigmas_bits: self.sigmas_bits.clone(),
+                expected_next_step: input.span.start,
+            });
+        }
+
+        let mut target = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        if target.shape().get(1).copied() != Some(self.target_tokens) {
+            return Err(mlx_gen::gen_core::Error::Msg(format!(
+                "{}: expected target tokens length {}, got {:?}",
+                self.support.driver_id,
+                self.target_tokens,
+                target.shape()
+            )));
+        }
+
+        let use_cfg = self.forward.uses_cfg();
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: self.sigmas[step],
+                next_sigma: self.sigmas[step + 1],
+            };
+            hooks.observe(&info, &target)?;
+
+            let sequence = if let Some(refs) = &self.reference_tokens {
+                assemble_edit_sequence(&target, refs).map_err(mlx_gen::gen_core::Error::from)?
+            } else {
+                target.clone()
+            };
+            let seq_tokens = sequence.shape()[1];
+            let model_input = if use_cfg {
+                concatenate_axis(&[&sequence, &sequence], 1)
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+            } else {
+                sequence
+            };
+
+            let raw_out = self
+                .forward
+                .forward_sequence(&model_input, self.sigmas[step], step, input.cancel)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let velocity = if use_cfg {
+                let parts = raw_out
+                    .split_axis(&[seq_tokens], 1)
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+                cfg_velocity(&parts[0], &parts[1], self.cfg, self.renormalize)
+                    .map_err(mlx_gen::gen_core::Error::from)?
+            } else {
+                raw_out
+            };
+
+            let target_velocity = if self.reference_tokens.is_some() {
+                velocity
+                    .split_axis(&[self.target_tokens], 1)
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+                    .swap_remove(0)
+            } else {
+                velocity
+            };
+
+            // Diffusers' FlowMatchEulerDiscreteScheduler upcasts the sample, performs the complete
+            // Euler addition in f32, then casts the result back to model_output.dtype.
+            target = flow_euler_step(
+                &target,
+                &target_velocity,
+                self.sigmas[step + 1] - self.sigmas[step],
+            )
+            .map_err(mlx_gen::gen_core::Error::from)?;
+            target = hooks.post_step(&info, target)?;
+            mlx_rs::transforms::eval([&target])
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            hooks.materialize(&info, &target)?;
+            if let Some(history) = state.history_mut::<MageMlxDriverHistory>() {
+                history.expected_next_step = step + 1;
+            }
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(target))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mage_mlx_driver(
+    driver_id: &'static str,
+    transformer: &MageTransformer,
+    initial_target: Array,
+    target_tokens: i32,
+    reference_tokens: Option<Array>,
+    cond_txt: &Array,
+    cond_layout: PackLayout,
+    negative: Option<(&Array, Vec<i32>)>,
+    cfg: f32,
+    renormalize: bool,
+    sigmas: &[f32],
+    memory: Option<GenerationMemory>,
+    cancel: &CancelFlag,
+    mut capture_trajectories: Option<&mut Vec<Array>>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    if sigmas.len() < 2 {
+        return Err(Error::Msg(
+            "mage_flow: scheduler needs a terminal sigma".into(),
+        ));
+    }
+    let use_cfg = uses_cfg(cfg);
+    if use_cfg && negative.is_none() {
+        return Err(Error::Msg(
+            "mage_flow: cfg > 1 requires negative conditioning".into(),
+        ));
+    }
+    let cond_ctx = transformer.pack_context(cond_layout.clone())?;
+    let neg_packed = if use_cfg {
+        let (neg_txt, neg_lens) = negative.as_ref().unwrap();
+        let fused_ctx = transformer.pack_context(cond_layout.fused_cfg(neg_lens)?)?;
+        let fused_txt = concatenate_axis(&[cond_txt, neg_txt], 1)?;
+        Some((fused_txt, fused_ctx))
+    } else {
+        None
+    };
+    let forward = TransformerMageMlxForward {
+        transformer,
+        cond_txt,
+        cond_ctx,
+        negative: neg_packed,
+        memory,
+    };
+    let driver = MageMlxDriver::new(
+        driver_id,
+        sigmas.to_vec(),
+        cfg,
+        renormalize,
+        target_tokens,
+        reference_tokens.clone(),
+        forward,
+    )?;
+    let total_steps = sigmas.len() - 1;
+    let mut state = DriverRunState::new();
+    let mut observe = |info: &DriverStepInfo, target: &Array| -> mlx_gen::gen_core::Result<()> {
+        if let Some(trajectories) = capture_trajectories.as_deref_mut() {
+            if info.outer_step < 2 {
+                let seq = if let Some(refs) = &reference_tokens {
+                    assemble_edit_sequence(target, refs).map_err(mlx_gen::gen_core::Error::from)?
+                } else {
+                    target.clone()
+                };
+                let observed = if use_cfg {
+                    concatenate_axis(&[&seq, &seq], 1)
+                        .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+                } else {
+                    seq
+                };
+                trajectories.push(observed);
+            }
+        }
+        Ok(())
+    };
+    let mut hooks = StepHooks::new(on_progress);
+    hooks.on_observe = Some(&mut observe);
+    let out = run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(initial_target),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    let BoundaryState::XSigma(final_target) = out else {
+        unreachable!("MageMlxDriver always emits BoundaryState::XSigma");
+    };
+    Ok(final_target)
+}
+
 /// Run Mage's rectified-flow Euler loop over already-packed text and image streams.
 ///
 /// At `cfg > 1`, conditional and unconditional branches are packed into one transformer
@@ -1570,7 +1901,7 @@ pub fn denoise(
     renormalize: bool,
     sigmas: &[f32],
 ) -> Result<Array> {
-    denoise_capture(
+    denoise_capture_with_progress(
         transformer,
         img,
         cond_txt,
@@ -1582,13 +1913,14 @@ pub fn denoise(
         None,
         &CancelFlag::default(),
         &mut |_, _| {},
+        &mut |_| {},
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn denoise_capture(
+fn denoise_capture_with_progress(
     transformer: &MageTransformer,
-    mut img: Array,
+    img: Array,
     cond_txt: &Array,
     cond_layout: PackLayout,
     negative: Option<(&Array, Vec<i32>)>,
@@ -1598,66 +1930,31 @@ fn denoise_capture(
     memory: Option<GenerationMemory>,
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize, &Array),
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    if sigmas.len() < 2 {
-        return Err(Error::Msg(
-            "mage_flow: scheduler needs a terminal sigma".into(),
-        ));
+    let target_tokens = img.shape()[1];
+    let mut trajectories = Vec::new();
+    let out = run_mage_mlx_driver(
+        "mage_mlx_generation_driver",
+        transformer,
+        img,
+        target_tokens,
+        None,
+        cond_txt,
+        cond_layout,
+        negative,
+        cfg,
+        renormalize,
+        sigmas,
+        memory,
+        cancel,
+        Some(&mut trajectories),
+        on_progress,
+    )?;
+    for (step, latent) in trajectories.iter().enumerate() {
+        on_step(step, latent);
     }
-    let use_cfg = uses_cfg(cfg);
-    if use_cfg && negative.is_none() {
-        return Err(Error::Msg(
-            "mage_flow: cfg > 1 requires negative conditioning".into(),
-        ));
-    }
-    let cond_ctx = transformer.pack_context(cond_layout.clone())?;
-    for (step, pair) in sigmas.windows(2).enumerate() {
-        let velocity = if use_cfg {
-            let (neg_txt, neg_lens) = negative.as_ref().unwrap();
-            let fused_layout = cond_layout.fused_cfg(neg_lens)?;
-            let fused_ctx = transformer.pack_context(fused_layout)?;
-            let fused_img = concatenate_axis(&[&img, &img], 1)?;
-            on_step(step, &fused_img);
-            let fused_txt = concatenate_axis(&[cond_txt, neg_txt], 1)?;
-            let sigma = Array::from_slice(
-                &vec![pair[0]; fused_ctx.segments()],
-                &[fused_ctx.segments() as i32],
-            );
-            let out = transformer_forward(
-                transformer,
-                &fused_img,
-                &fused_txt,
-                &sigma,
-                &fused_ctx,
-                memory,
-                cancel,
-            )?;
-            let n = img.shape()[1];
-            let parts = out.split_axis(&[n], 1)?;
-            cfg_velocity(&parts[0], &parts[1], cfg, renormalize)?
-        } else {
-            on_step(step, &img);
-            let sigma = Array::from_slice(
-                &vec![pair[0]; cond_ctx.segments()],
-                &[cond_ctx.segments() as i32],
-            );
-            transformer_forward(
-                transformer,
-                &img,
-                cond_txt,
-                &sigma,
-                &cond_ctx,
-                memory,
-                cancel,
-            )?
-        };
-        // Diffusers' FlowMatchEulerDiscreteScheduler upcasts the sample, performs the complete
-        // Euler addition in f32, then casts the result back to model_output.dtype. Casting the
-        // scaled velocity before the add introduces an extra bf16 rounding at every step.
-        img = flow_euler_step(&img, &velocity, pair[1] - pair[0])?;
-        mlx_rs::transforms::eval([&img])?;
-    }
-    Ok(img)
+    Ok(out)
 }
 
 /// Decode a final token stream and apply the reference's clamp/range conversion.
@@ -2124,5 +2421,261 @@ mod tests {
         assert!(matches!(events[0], Progress::Decoding));
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::the_edit_decode_phase_opens_before_the_decode");
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type SeenLog = Rc<RefCell<Vec<(usize, Vec<i32>, f32, Array)>>>;
+
+    struct MockMageMlxForward {
+        use_cfg: bool,
+        target_tokens: i32,
+        seen: SeenLog,
+    }
+
+    impl MageMlxForward for MockMageMlxForward {
+        fn uses_cfg(&self) -> bool {
+            self.use_cfg
+        }
+
+        fn forward_sequence(
+            &self,
+            sequence: &Array,
+            sigma: f32,
+            step: usize,
+            _cancel: &CancelFlag,
+        ) -> Result<Array> {
+            mlx_rs::transforms::eval([sequence])?;
+            self.seen
+                .borrow_mut()
+                .push((step, sequence.shape().to_vec(), sigma, sequence.clone()));
+            let seq_f32 = sequence.as_dtype(Dtype::Float32)?;
+            let scaled = if self.use_cfg {
+                let half = sequence.shape()[1] / 2;
+                let parts = seq_f32.split_axis(&[half], 1)?;
+                let cond = parts[0]
+                    .multiply(Array::from_f32(-0.5 - 0.1 * sigma))?
+                    .add(Array::from_f32(0.05 * (step as f32 + 1.0)))?;
+                let unc = parts[1]
+                    .multiply(Array::from_f32(-0.25))?
+                    .add(Array::from_f32(-0.02 * self.target_tokens as f32))?;
+                concatenate_axis(&[&cond, &unc], 1)?
+            } else {
+                seq_f32
+                    .multiply(Array::from_f32(-0.4 - 0.1 * sigma))?
+                    .add(Array::from_f32(0.03 * (step as f32 + 1.0)))?
+            };
+            Ok(scaled.as_dtype(sequence.dtype())?)
+        }
+    }
+
+    fn mlx_bf16_bit_equal(a: &Array, b: &Array) -> bool {
+        let af = a.as_dtype(Dtype::Float32).unwrap();
+        let bf = b.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&af, &bf]).unwrap();
+        if af.shape() != bf.shape() {
+            return false;
+        }
+        let sa = af.as_slice::<f32>();
+        let sb = bf.as_slice::<f32>();
+        sa.len() == sb.len()
+            && sa
+                .iter()
+                .zip(sb.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn mage_mlx_driver_passes_conformance_t2i_turbo_and_edit() {
+        let target_tokens = 4i32;
+        let ref_tokens =
+            Array::from_slice(&[9.0f32, -8.0, 7.0, -6.0, 5.0, -4.0, 3.0, -2.0], &[1, 4, 2])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+        let init_target = Array::from_slice(
+            &[0.5f32, -0.25, 1.0, -1.5, 0.25, 0.75, -0.5, 0.125],
+            &[1, 4, 2],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        for (name, cfg, refs) in [
+            ("mage_mlx_t2i_cfg", 5.0f32, None),
+            ("mage_mlx_t2i_turbo_nocfg", 1.0f32, None),
+            ("mage_mlx_edit_cfg", 5.0f32, Some(ref_tokens.clone())),
+        ] {
+            let sigmas = mage_flow_sigmas(4).unwrap();
+            let report = verify_driver_conformance(ConformanceCase {
+                total_steps: 4,
+                split_at: 2,
+                seed: 77,
+                base_geometry: (64, 64),
+                alt_geometry: (128, 128),
+                make_driver: || {
+                    let forward = MockMageMlxForward {
+                        use_cfg: uses_cfg(cfg),
+                        target_tokens,
+                        seen: Rc::new(RefCell::new(Vec::new())),
+                    };
+                    Box::new(
+                        MageMlxDriver::new(
+                            name,
+                            sigmas.clone(),
+                            cfg,
+                            false,
+                            target_tokens,
+                            refs.clone(),
+                            forward,
+                        )
+                        .unwrap(),
+                    )
+                },
+                make_initial: || init_target.clone(),
+                latents_equal: mlx_bf16_bit_equal,
+            })
+            .unwrap_or_else(|err| panic!("{name} conformance failed: {err}"));
+            assert_eq!(report.total_steps, 4);
+            assert!(report.verified_inert_split);
+            assert!(report.verified_cancellation);
+        }
+    }
+
+    #[test]
+    fn mage_mlx_edit_driver_reconcatenates_clean_references_and_switches_cfg() {
+        let target_tokens = 3i32;
+        let init = Array::from_slice(&[0.5f32, -0.5, 0.25, -0.25, 1.0, -1.0], &[1, 3, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let refs = Array::from_slice(&[10.0f32, 11.0, 20.0, 21.0], &[1, 2, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let sigmas = mage_flow_sigmas(4).unwrap();
+        let cancel = CancelFlag::default();
+
+        // CFG=5.0: fused [target, refs, target, refs], references clean on every step.
+        let seen_cfg: SeenLog = Rc::new(RefCell::new(Vec::new()));
+        let drv_cfg = MageMlxDriver::new(
+            "mage_mlx_edit_invariant",
+            sigmas.clone(),
+            5.0,
+            false,
+            target_tokens,
+            Some(refs.clone()),
+            MockMageMlxForward {
+                use_cfg: true,
+                target_tokens,
+                seen: seen_cfg.clone(),
+            },
+        )
+        .unwrap();
+        let mut st = DriverRunState::new();
+        let mut progress = Vec::new();
+        let mut on_progress = |p: Progress| progress.push(p);
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let out = run_mlx_driver_slices(
+            &drv_cfg,
+            [SliceSpec::full(4)],
+            BoundaryState::XSigma(init.clone()),
+            4,
+            0,
+            &cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let BoundaryState::XSigma(final_target) = out else {
+            panic!("expected XSigma");
+        };
+        assert_eq!(final_target.shape(), [1, 3, 2]);
+        assert_eq!(final_target.dtype(), Dtype::Bfloat16);
+        assert_eq!(progress.len(), 4);
+
+        let log = seen_cfg.borrow();
+        assert_eq!(log.len(), 4);
+        for (step, shape, _, seq) in log.iter() {
+            assert_eq!(shape.as_slice(), &[1, 10, 2], "step {step} fused CFG edit");
+            let parts = seq.split_axis(&[3, 5, 8], 1).unwrap();
+            assert!(
+                mlx_bf16_bit_equal(&parts[1], &refs),
+                "step {step} cond clean refs modified"
+            );
+            assert!(
+                mlx_bf16_bit_equal(&parts[3], &refs),
+                "step {step} uncond clean refs modified"
+            );
+            assert!(
+                mlx_bf16_bit_equal(&parts[0], &parts[2]),
+                "step {step} cond/uncond targets must match before forward"
+            );
+        }
+
+        // Turbo CFG=1.0: single branch [seq] without duplication.
+        let seen_turbo: SeenLog = Rc::new(RefCell::new(Vec::new()));
+        let drv_turbo = MageMlxDriver::new(
+            "mage_mlx_turbo_invariant",
+            sigmas,
+            1.0,
+            false,
+            target_tokens,
+            Some(refs),
+            MockMageMlxForward {
+                use_cfg: false,
+                target_tokens,
+                seen: seen_turbo.clone(),
+            },
+        )
+        .unwrap();
+        let mut st_t = DriverRunState::new();
+        let mut noop = |_: Progress| {};
+        let mut hooks_t = StepHooks::new(&mut noop);
+        let _ = run_mlx_driver_slices(
+            &drv_turbo,
+            [SliceSpec::full(4)],
+            BoundaryState::XSigma(init),
+            4,
+            0,
+            &cancel,
+            None,
+            &mut st_t,
+            &mut hooks_t,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        for (step, shape, _, _) in seen_turbo.borrow().iter() {
+            assert_eq!(
+                shape.as_slice(),
+                &[1, 5, 2],
+                "step {step} cfg==1.0 must not duplicate uncond branch"
+            );
+        }
+    }
+
+    #[test]
+    fn mage_mlx_initial_tokens_preserve_gaussian_shading_watermark() {
+        let key = GsKey::default();
+        let a = initial_tokens_for_grid(2, 2, 42, &key, Dtype::Bfloat16).unwrap();
+        let b = initial_tokens_for_grid(2, 2, 42, &key, Dtype::Bfloat16).unwrap();
+        let c = initial_tokens_for_grid(2, 2, 43, &key, Dtype::Bfloat16).unwrap();
+        assert_eq!(a.shape(), [1, 4, LATENT_CHANNELS]);
+        assert_eq!(a.dtype(), Dtype::Bfloat16);
+        assert!(mlx_bf16_bit_equal(&a, &b));
+        assert!(!mlx_bf16_bit_equal(&a, &c));
+
+        // Direct match against `encode_noise` (never plain `randn` or zeros).
+        let encoded = encode_noise((LATENT_CHANNELS as usize, 2, 2), &key, 42, Dtype::Bfloat16)
+            .unwrap()
+            .transpose_axes(&[0, 2, 3, 1])
+            .unwrap()
+            .reshape(&[1, 4, LATENT_CHANNELS])
+            .unwrap();
+        assert!(mlx_bf16_bit_equal(&a, &encoded));
     }
 }
