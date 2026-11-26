@@ -20,8 +20,18 @@ impl TensorId {
     }
 }
 
+#[derive(Clone)]
+struct CheckpointSource {
+    identity: Arc<Vec<u8>>,
+    changed: Arc<std::sync::atomic::AtomicBool>,
+    cache: Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
+}
+
 pub struct Tensor_ {
     id: TensorId,
+    // Only file reads and value-preserving views/copies carry this identity. Arithmetic and
+    // trainable variables deliberately discard it, so adapted weights use content identities.
+    checkpoint_source: Option<CheckpointSource>,
     // As we provide inner mutability on the tensor content, the alternatives are:
     // - Using a mutex, this would have the highest cost when retrieving the storage but would
     //   prevent errors when concurrent access takes place. Mutex would also be subject to
@@ -166,6 +176,7 @@ pub(crate) fn from_storage<S: Into<Shape>>(
     let device = storage.device();
     let tensor_ = Tensor_ {
         id: TensorId::new(),
+        checkpoint_source: None,
         storage: Arc::new(RwLock::new(storage)),
         layout: Layout::contiguous(shape),
         op,
@@ -177,6 +188,77 @@ pub(crate) fn from_storage<S: Into<Shape>>(
 }
 
 impl Tensor {
+    /// Stable identity of an immutable checkpoint operand, including views and precision changes.
+    /// This reads metadata only. Quantizers can look up already-prepared runtime weights before
+    /// copying, widening or hashing model data. A value-changing operation removes the identity.
+    pub fn checkpoint_source_identity(&self) -> Option<Vec<u8>> {
+        let source = self.checkpoint_source.as_ref()?;
+        if source.changed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let mut identity = source.identity.as_ref().clone();
+        let layout = format!(
+            "/{:?}/{:?}/{:?}/{}",
+            self.dtype(),
+            self.dims(),
+            self.stride(),
+            self.layout.start_offset()
+        );
+        identity.extend_from_slice(&(layout.len() as u64).to_le_bytes());
+        identity.extend_from_slice(layout.as_bytes());
+        Some(identity)
+    }
+
+    pub(crate) fn with_checkpoint_source(self, path: &std::path::Path, key: &str) -> Self {
+        let cache =
+            crate::quantized::runtime_cache::capture().or_else(|| self.checkpoint_runtime_cache());
+        self.with_checkpoint_source_cache(path, key, cache)
+    }
+
+    pub(crate) fn with_checkpoint_source_cache(
+        self,
+        path: &std::path::Path,
+        key: &str,
+        cache: Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
+    ) -> Self {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+        let mut identity = b"candle-checkpoint-operand-v1\0".to_vec();
+        for bytes in [path.as_os_str().as_encoded_bytes(), key.as_bytes()] {
+            identity.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            identity.extend_from_slice(bytes);
+        }
+        self.with_checkpoint_identity(Some(identity), cache)
+    }
+
+    pub(crate) fn checkpoint_runtime_cache(
+        &self,
+    ) -> Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>> {
+        self.checkpoint_source.as_ref()?.cache.clone()
+    }
+
+    fn with_checkpoint_identity(
+        self,
+        identity: Option<Vec<u8>>,
+        cache: Option<Arc<dyn crate::quantized::runtime_cache::RuntimeQuantizationCache>>,
+    ) -> Self {
+        let Some(identity) = identity else {
+            return self;
+        };
+        Self(Arc::new(Tensor_ {
+            id: self.id,
+            checkpoint_source: Some(CheckpointSource {
+                identity: Arc::new(identity),
+                changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cache,
+            }),
+            storage: self.storage.clone(),
+            layout: self.layout.clone(),
+            op: self.op.clone(),
+            is_variable: self.is_variable,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        }))
+    }
     pub(crate) fn ones_impl<S: Into<Shape>>(
         shape: S,
         dtype: DType,
@@ -903,6 +985,7 @@ impl Tensor {
             let layout = self.layout().narrow(dim, start, len)?;
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
+                checkpoint_source: self.checkpoint_source.clone(),
                 storage: self.storage.clone(),
                 layout,
                 op,
@@ -2271,6 +2354,7 @@ impl Tensor {
         let op = BackpropOp::new1(self, |t| Op::Transpose(t, dim1, dim2));
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: self.storage.clone(),
             layout: self.layout.transpose(dim1, dim2)?,
             op,
@@ -2307,6 +2391,7 @@ impl Tensor {
         let op = BackpropOp::new1(self, |t| Op::Permute(t, dims.clone()));
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: self.storage.clone(),
             layout: self.layout.permute(&dims)?,
             op,
@@ -2333,6 +2418,7 @@ impl Tensor {
         let op = BackpropOp::new1(self, Op::Copy);
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: Arc::new(RwLock::new(self.storage().try_clone(self.layout())?)),
             layout: self.layout.clone(),
             op,
@@ -2353,6 +2439,7 @@ impl Tensor {
         } else {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
+                checkpoint_source: self.checkpoint_source.clone(),
                 storage: self.storage.clone(),
                 layout: self.layout.clone(),
                 op: BackpropOp::none(),
@@ -2395,6 +2482,7 @@ impl Tensor {
             let op = BackpropOp::new1(self, Op::ToDevice);
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
+                checkpoint_source: self.checkpoint_source.clone(),
                 storage: Arc::new(RwLock::new(storage)),
                 layout: self.layout.clone(),
                 op,
@@ -2425,6 +2513,7 @@ impl Tensor {
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: self.storage.clone(),
             layout: self.layout.broadcast_as(shape)?,
             op: BackpropOp::new1(self, Op::Broadcast),
@@ -2457,7 +2546,12 @@ impl Tensor {
             let shape = self.shape();
             let storage = self.storage().to_dtype(self.layout(), dtype)?;
             let op = BackpropOp::new1(self, Op::ToDType);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(
+                from_storage(storage, shape.clone(), op, false).with_checkpoint_identity(
+                    self.checkpoint_source_identity(),
+                    self.checkpoint_runtime_cache(),
+                ),
+            )
         }
     }
 
@@ -2472,7 +2566,12 @@ impl Tensor {
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
             let op = BackpropOp::new1(self, Op::Copy);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            Ok(
+                from_storage(storage, shape.clone(), op, false).with_checkpoint_identity(
+                    self.checkpoint_source_identity(),
+                    self.checkpoint_runtime_cache(),
+                ),
+            )
         }
     }
 
@@ -2483,7 +2582,12 @@ impl Tensor {
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let op = BackpropOp::new1(self, Op::Copy);
-        Ok(from_storage(storage, shape.clone(), op, false))
+        Ok(
+            from_storage(storage, shape.clone(), op, false).with_checkpoint_identity(
+                self.checkpoint_source_identity(),
+                self.checkpoint_runtime_cache(),
+            ),
+        )
     }
 
     /// Create a variable based on the values currently stored in a tensor. The storage is always
@@ -2534,6 +2638,7 @@ impl Tensor {
         if self.is_contiguous() {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
+                checkpoint_source: self.checkpoint_source.clone(),
                 storage: self.storage.clone(),
                 layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
                 op,
@@ -2546,7 +2651,12 @@ impl Tensor {
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
-            Ok(from_storage(storage, shape, op, false))
+            Ok(
+                from_storage(storage, shape, op, false).with_checkpoint_identity(
+                    self.checkpoint_source_identity(),
+                    self.checkpoint_runtime_cache(),
+                ),
+            )
         }
     }
 
@@ -2575,6 +2685,7 @@ impl Tensor {
             strides.remove(dim);
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
+                checkpoint_source: self.checkpoint_source.clone(),
                 storage: self.storage.clone(),
                 layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
                 op: BackpropOp::new1(self, Op::Reshape),
@@ -2613,6 +2724,7 @@ impl Tensor {
         strides.insert(dim, stride);
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: self.storage.clone(),
             layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
             op: BackpropOp::new1(self, Op::Reshape),
@@ -2734,6 +2846,11 @@ impl Tensor {
     }
 
     pub(crate) fn storage_mut(&self) -> std::sync::RwLockWriteGuard<'_, Storage> {
+        if let Some(source) = &self.checkpoint_source {
+            source
+                .changed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.storage.write().unwrap()
     }
 
@@ -2742,7 +2859,7 @@ impl Tensor {
     pub(crate) fn storage_mut_and_layout(
         &self,
     ) -> (std::sync::RwLockWriteGuard<'_, Storage>, &Layout) {
-        let storage = self.storage.write().unwrap();
+        let storage = self.storage_mut();
         (storage, &self.layout)
     }
 
@@ -2959,6 +3076,7 @@ impl Tensor {
 
         let tensor_ = Tensor_ {
             id: TensorId::new(),
+            checkpoint_source: self.checkpoint_source.clone(),
             storage: self.storage.clone(),
             layout: Layout::new(sizes.into(), strides, self.layout.start_offset()),
             op: BackpropOp::new1(self, Op::Reshape),
