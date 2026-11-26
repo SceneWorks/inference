@@ -75,6 +75,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             }
         }
     }
+    let _plan = crate::drivers::render_video_plan_for_request_geometry(
+        req,
+        geometry.width,
+        geometry.height,
+        geometry.joint.num_frames.max(0) as u32,
+    )?;
     Ok(())
 }
 

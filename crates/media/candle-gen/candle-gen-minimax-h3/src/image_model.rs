@@ -942,7 +942,9 @@ pub fn validate_image_request(
     sized.guidance = None;
     descriptor
         .capabilities
-        .validate_request(IMAGE_MODEL_ID, &sized)
+        .validate_request(IMAGE_MODEL_ID, &sized)?;
+    let _plan = crate::drivers::render_image_plan_for_request_size(req, width, height)?;
+    Ok(())
 }
 
 /// Registry entry point: refuse every `LoadSpec` slot this provider does not read, then load.

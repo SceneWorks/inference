@@ -2590,6 +2590,12 @@ impl Generator for MiniMaxH3 {
                 }
             }
         }
+        let _plan = crate::drivers::render_video_plan_for_request_geometry(
+            req,
+            geometry.width,
+            geometry.height,
+            geometry.joint.num_frames as u32,
+        )?;
         Ok(())
     }
 
