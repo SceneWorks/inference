@@ -132,6 +132,12 @@ pub fn training_sdpa_bhsd(
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
     }
+    if q.track_op() || k.track_op() || v.track_op() {
+        // A real training call: the materialized path, counted as such (not as a leak).
+        return with_materialized_attention(|| {
+            sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
+        });
+    }
     sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
 }
 
@@ -151,6 +157,11 @@ pub fn training_sdpa_budgeted_bhsd(
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
     }
+    if q.track_op() || k.track_op() || v.track_op() {
+        return with_materialized_attention(|| {
+            sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+        });
+    }
     sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
 }
 
@@ -162,8 +173,9 @@ pub const TRAINING_SCORE_TILE_ELEMENTS: u64 =
 
 /// Known standard composable-softmax training contract. Reference uses a single
 /// dense autograd owner instead of retaining every score intermediate per layer.
-/// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above. Training-only, so the final
-/// fallback is the always-materialized [`crate::attention::sdpa_planned_bhsd_materialized`].
+/// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above. An untracked call the router would
+/// fuse (an inference forward) takes the fused kernel; every other call keeps the streaming / reference
+/// owners and the always-materialized [`crate::attention::sdpa_planned_bhsd_materialized`] fallback.
 pub fn training_sdpa_standard_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -174,6 +186,20 @@ pub fn training_sdpa_standard_bhsd(
 ) -> crate::Result<Tensor> {
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
+    }
+    // An inference forward through this training-shaped entry point (Krea control runs its frozen
+    // DiT and branch through it): when the shared router would fuse the call, do so. Under autograd
+    // or a training scope the router refuses and the owners below run exactly as before.
+    if route_attention_kernel(q, k, v, mask) == AttentionKernel::Flash {
+        return sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            mask,
+            |s| candle_nn::ops::softmax(s, candle_core::D::Minus1),
+            plan,
+        );
     }
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
@@ -590,10 +616,60 @@ pub fn route_attention_kernel(
     }
 }
 
+/// Which flash-eligible helper a call came through: the category the `GradTracked` leak warning is
+/// throttled by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionSite {
+    BudgetedBhsd = 0,
+    PlannedBhsd = 1,
+    BudgetedFlat = 2,
+    PlannedFlat = 3,
+}
+
+const ATTENTION_SITES: usize = 4;
+static GRAD_TRACKED_WARNED: [AtomicBool; ATTENTION_SITES] =
+    [const { AtomicBool::new(false) }; ATTENTION_SITES];
+
+/// Whether this `GradTracked` refusal is the first for `site` in the process (then the caller
+/// warns). One relaxed load once a site has warned.
+fn first_grad_tracked_refusal(site: AttentionSite) -> bool {
+    let flag = &GRAD_TRACKED_WARNED[site as usize];
+    !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::Relaxed)
+}
+
+/// A `GradTracked` refusal outside a training scope means an inference path leaked autograd-tracked
+/// tensors (a `Var` built at inference, an un-detached adapter) and silently lost the fused kernel.
+#[cold]
+fn warn_grad_tracked(site: AttentionSite, caller: &'static std::panic::Location<'static>) {
+    tracing::warn!(
+        target: "candle_gen::fused_attention",
+        ?site,
+        %caller,
+        "attention operands are on the autograd tape outside a training scope: the call takes the \
+         materialized path instead of FlashAttention-2 (counted as grad_tracked). Detach inference \
+         tensors, or pin a training call with with_materialized_attention. Warned once per helper \
+         kind per process."
+    );
+}
+
 /// Route one helper call and count it. `true` = take the fused kernel.
-pub(crate) fn take_flash(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> bool {
+#[track_caller]
+pub(crate) fn take_flash(
+    site: AttentionSite,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> bool {
     let kernel = route_attention_kernel(q, k, v, mask);
     record_attention_path(kernel);
+    // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
+    // `Materialized` first.
+    if kernel == AttentionKernel::Budgeted(FlashRefusal::GradTracked)
+        && first_grad_tracked_refusal(site)
+    {
+        warn_grad_tracked(site, std::panic::Location::caller());
+    }
     kernel == AttentionKernel::Flash
 }
 
@@ -715,6 +791,10 @@ pub fn record_attention_path(kernel: AttentionKernel) {
 
 fn counts_from(read: impl Fn(&AtomicU64) -> u64) -> AttentionPathCounts {
     let c: [u64; PATH_SLOTS] = std::array::from_fn(|i| read(&PATH_COUNTS[i]));
+    counts_from_slots(&c)
+}
+
+fn counts_from_slots(c: &[u64; PATH_SLOTS]) -> AttentionPathCounts {
     AttentionPathCounts {
         flash: c[0],
         not_compiled: c[1],
@@ -1376,6 +1456,17 @@ mod tests {
             AttentionKernel::Budgeted(FlashRefusal::HeadDim(512))
         );
         Ok(())
+    }
+
+    /// The inference-leak warning fires once per helper kind, then costs one relaxed load.
+    #[test]
+    fn the_grad_tracked_leak_warning_is_throttled_per_site() {
+        // A dedicated site so other tests' routing cannot pre-arm it.
+        let site = AttentionSite::PlannedFlat;
+        GRAD_TRACKED_WARNED[site as usize].store(false, Ordering::Relaxed);
+        assert!(first_grad_tracked_refusal(site));
+        assert!(!first_grad_tracked_refusal(site));
+        assert!(!first_grad_tracked_refusal(site));
     }
 
     /// On the CPU every call refuses (`NotCuda` or `NotCompiled`), and the flash-eligible helper is

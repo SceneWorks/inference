@@ -20,6 +20,8 @@ sceneworks-gen-core-train = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true, optional = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+# The one-per-process inference-leak warning of the shared attention router (SW-6130).
+tracing = "0.1"
 # Fused FlashAttention-2 CUDA kernels behind the `flash-attn` feature (sc-26691): the shared
 # `attention::sdpa_*` helpers take them for unmasked bf16/f16 attention on CUDA (SW-6130). Optional
 # — it compiles a large CUDA/CUTLASS kernel set — and pinned to the SAME candle rev candle-llm uses.

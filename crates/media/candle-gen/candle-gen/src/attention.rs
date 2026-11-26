@@ -187,6 +187,7 @@ pub fn attention_budget_from_usize(budget: usize) -> AttentionBudget {
 /// different order at a different `M`; the two agree to a tolerance (~1 ULP in practice, `1e-5` in this
 /// crate's tests) rather than exactly. SC-15943 is the defect a sibling crate hit by asserting `== 0.0`
 /// on that difference. Do not build an exact-equality assertion on this path.
+#[track_caller]
 pub fn sdpa_budgeted_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -196,7 +197,8 @@ pub fn sdpa_budgeted_bhsd(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
-    if crate::fused_attention::take_flash(q, k, v, mask) {
+    use crate::fused_attention::AttentionSite;
+    if crate::fused_attention::take_flash(AttentionSite::BudgetedBhsd, q, k, v, mask) {
         return crate::fused_attention::flash_bhsd(q, k, v, scale);
     }
     budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
@@ -244,6 +246,7 @@ fn budgeted_bhsd(
 /// exactly the historical one-call fast path and does not inspect the flag. When the call takes the
 /// fused kernel (see the module docs) the flag is checked once, before the single launch, whatever
 /// the plan's budget.
+#[track_caller]
 pub fn sdpa_planned_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -254,7 +257,8 @@ pub fn sdpa_planned_bhsd(
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
-    if crate::fused_attention::take_flash(q, k, v, mask) {
+    use crate::fused_attention::AttentionSite;
+    if crate::fused_attention::take_flash(AttentionSite::PlannedBhsd, q, k, v, mask) {
         if plan.is_cancelled() {
             return Err(crate::CandleError::Canceled);
         }
@@ -459,6 +463,7 @@ pub fn sdpa_planned_bhsd_key_prefix(
 /// Flash-eligible like [`sdpa_budgeted_bhsd`]: the `N` independent rows are routed as the free
 /// `[B = N, H = 1, S, D]` view (no copy), so the same rule applies — including the head-dim
 /// ceiling, which keeps a 512-channel single-head VAE attention on the materialized path.
+#[track_caller]
 pub fn sdpa_budgeted_flat(
     q: &Tensor,
     k: &Tensor,
@@ -467,7 +472,9 @@ pub fn sdpa_budgeted_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
-    if let Some((q4, k4, v4)) = flat_flash_operands(q, k, v)? {
+    if let Some((q4, k4, v4)) =
+        flat_flash_operands(crate::fused_attention::AttentionSite::BudgetedFlat, q, k, v)?
+    {
         return crate::fused_attention::flash_bhsd(&q4, &k4, &v4, scale)?.squeeze(1);
     }
     budgeted_flat(q, k, v, scale, softmax, budget)
@@ -510,7 +517,9 @@ fn budgeted_flat(
 /// views when it takes the fused kernel. `None` = run the materialized path. A non-rank-3 operand is
 /// not this helper's shape: it is counted as a shape refusal and the materialized path raises its
 /// own error.
+#[track_caller]
 fn flat_flash_operands(
+    site: crate::fused_attention::AttentionSite,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -525,11 +534,12 @@ fn flat_flash_operands(
         return Ok(None);
     }
     let (q4, k4, v4) = (flat_as_bhsd(q)?, flat_as_bhsd(k)?, flat_as_bhsd(v)?);
-    Ok(take_flash(&q4, &k4, &v4, None).then_some((q4, k4, v4)))
+    Ok(take_flash(site, &q4, &k4, &v4, None).then_some((q4, k4, v4)))
 }
 
 /// Request-scoped variant of [`sdpa_budgeted_flat`], with the same typed between-chunk cancellation
 /// contract as [`sdpa_planned_bhsd`] (including the single pre-launch check on the fused path).
+#[track_caller]
 pub fn sdpa_planned_flat(
     q: &Tensor,
     k: &Tensor,
@@ -538,7 +548,9 @@ pub fn sdpa_planned_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
-    if let Some((q4, k4, v4)) = flat_flash_operands(q, k, v)? {
+    if let Some((q4, k4, v4)) =
+        flat_flash_operands(crate::fused_attention::AttentionSite::PlannedFlat, q, k, v)?
+    {
         if plan.is_cancelled() {
             return Err(crate::CandleError::Canceled);
         }
