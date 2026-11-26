@@ -9,7 +9,11 @@
 //! without the 22B DiT; [`denoise_dfr_tile`] is the production tile closure body.
 
 use candle_gen::candle_core::{Error, Result, Tensor};
-use candle_gen::gen_core::{CancelFlag, Progress};
+use candle_gen::driver::StreamId;
+use candle_gen::gen_core::multistream::{
+    LearnedUpsamplerComponent, StreamTransition, StreamTransitionKind, TransitionBoundaryGuard,
+};
+use candle_gen::gen_core::{BoundaryState, CancelFlag, EstimateSource, Progress};
 use gen_core_ltx::ltx_dfr as gen_core_dfr;
 use gen_core_ltx::ltx_dfr::DfrTileRange;
 use rand::rngs::StdRng;
@@ -20,6 +24,7 @@ use crate::conditioning::{
 };
 use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE, TEMPORAL_SIGMAS};
 use crate::dev_sampler::{ExecutionPlan, TransformerVariant};
+use crate::drivers::apply_candle_stream_transition;
 use crate::pipeline::{
     denoise_av_conditioned_with_scales, denoise_av_dev_conditioned_with_scales,
     denoise_tokens_rf_ancestral, unflatten_latent, BASE_DENOISE_SCALES, REFINEMENT_DENOISE_SCALES,
@@ -244,7 +249,32 @@ pub fn run_temporal_rounds(
                 "ltx dfr: temporal round {round}: missing carry-forward keyframes"
             )));
         }
-        video = upsample(&video)?;
+        let round_upsample_tr = StreamTransition::new(
+            format!("temporal_upsample_round_{round}"),
+            vec![StreamId::Video],
+            StreamTransitionKind::LatentResample {
+                upsampler: Some(LearnedUpsamplerComponent {
+                    name: gen_core_ltx::LTX_TEMPORAL_UPSAMPLER_COMPONENT_NAME.into(),
+                    normalization: gen_core_ltx::LTX_UPSAMPLER_NORMALIZATION.into(),
+                    workspace_bytes: 1,
+                }),
+                spatial_factor: (1, 1),
+                temporal_factor: 2,
+            },
+        )?;
+        let BoundaryState::CleanEstimate { latent, .. } = apply_candle_stream_transition(
+            StreamId::Video,
+            &round_upsample_tr,
+            BoundaryState::CleanEstimate {
+                latent: video,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            |clean| Ok(upsample(&clean)?),
+        )?
+        else {
+            unreachable!();
+        };
+        video = latent;
         num_frames = gen_core_dfr::temporal_upsampled_frames(num_frames);
         fps *= 2.0;
         let expected_t = (num_frames - 1) / temporal_scale + 1;
@@ -475,7 +505,18 @@ pub fn denoise_dfr_tile(
     let (_b, c, t, h, w) = job.tile_video.dims5()?;
     let spatial_scale = SPATIAL_SCALE as i64;
 
-    // Tile-entry re-noise: noise·σ₀ + latent·(1 − σ₀), seeded per tile.
+    // Tile-entry re-noise: noise·σ₀ + latent·(1 − σ₀), seeded per tile, guarded as an explicit
+    // `StreamTransition::Renoise` on `StreamId::Video` (PIPE-4).
+    let tile_renoise_tr = StreamTransition::new(
+        format!(
+            "temporal_tile_entry_round_{}_tile_{}",
+            job.round, job.tile_index
+        ),
+        vec![StreamId::Video],
+        StreamTransitionKind::Renoise {
+            sigma: TEMPORAL_SIGMAS[0],
+        },
+    )?;
     let dims = job.tile_video.dims();
     let n: usize = dims.iter().product();
     candle_gen::execution::stream("ltx_dfr_tile_noise", job.noise_seed);
@@ -486,31 +527,54 @@ pub fn denoise_dfr_tile(
         job.tile_video.device(),
     )?
     .to_dtype(job.tile_video.dtype())?;
-    let mut state = if job.image_keyframes.is_empty() {
-        let renoised = crate::pipeline::renoise(&job.tile_video, &noise, TEMPORAL_SIGMAS[0])?;
-        VideoTokenState::base(&renoised, positions)?
-    } else {
-        // Window-local image anchors: the replace-latent state pins the image frames instead of
-        // re-noising them (the reference's per-tile image conditionings + the stage noiser).
-        let dt = job.tile_video.dtype();
-        let cast: Vec<Tensor> = job
-            .image_keyframes
-            .iter()
-            .map(|image| image.latent.to_dtype(dt))
-            .collect::<Result<_>>()?;
-        let keyframes: Vec<crate::conditioning::Keyframe> = job
-            .image_keyframes
-            .iter()
-            .zip(&cast)
-            .map(|(image, latent)| crate::conditioning::Keyframe {
-                latent,
-                frame_idx: image.local_latent_index,
-                strength: image.strength,
-            })
-            .collect();
-        let i2v = crate::conditioning::apply_keyframes(&job.tile_video, &keyframes)?
-            .noised(&noise, TEMPORAL_SIGMAS[0])?;
-        VideoTokenState::from_i2v(&i2v, positions)?
+    let mut state = match TransitionBoundaryGuard::new(
+        StreamId::Video,
+        BoundaryState::CleanEstimate {
+            latent: job.tile_video.clone(),
+            source: EstimateSource::EndpointEvaluation,
+        },
+    )
+    .apply(&tile_renoise_tr, |state| match state {
+        BoundaryState::CleanEstimate {
+            latent: tile_clean, ..
+        } => {
+            let st = (|| -> candle_gen::candle_core::Result<VideoTokenState> {
+                if job.image_keyframes.is_empty() {
+                    let renoised =
+                        crate::pipeline::renoise(&tile_clean, &noise, TEMPORAL_SIGMAS[0])?;
+                    VideoTokenState::base(&renoised, positions)
+                } else {
+                    // Window-local image anchors: the replace-latent state pins the image frames instead of
+                    // re-noising them (the reference's per-tile image conditionings + the stage noiser).
+                    let dt = tile_clean.dtype();
+                    let cast: Vec<Tensor> = job
+                        .image_keyframes
+                        .iter()
+                        .map(|image| image.latent.to_dtype(dt))
+                        .collect::<Result<_>>()?;
+                    let keyframes: Vec<crate::conditioning::Keyframe> = job
+                        .image_keyframes
+                        .iter()
+                        .zip(&cast)
+                        .map(|(image, latent)| crate::conditioning::Keyframe {
+                            latent,
+                            frame_idx: image.local_latent_index,
+                            strength: image.strength,
+                        })
+                        .collect();
+                    let i2v = crate::conditioning::apply_keyframes(&tile_clean, &keyframes)?
+                        .noised(&noise, TEMPORAL_SIGMAS[0])?;
+                    VideoTokenState::from_i2v(&i2v, positions)
+                }
+            })()
+            .map_err(|e| candle_gen::gen_core::Error::from(candle_gen::CandleError::from(e)))?;
+            Ok(BoundaryState::XSigma(st))
+        }
+        _ => unreachable!(),
+    }) {
+        Ok(BoundaryState::XSigma(st)) => st,
+        Err(err) => return Err(err.into()),
+        _ => unreachable!(),
     };
     if let (false, Some(anchors)) = (
         job.anchor_positions_local.is_empty(),
@@ -765,32 +829,71 @@ pub fn generate_dfr_av_latents(
     let reserved_half_res = unflatten_latent(&grid_tokens, g.t, g.h1, g.w1)?;
     let slot_keyframes = crate::conditioning::take_generated_keyframes(&state, g.h1, g.w1)?;
 
-    // Spatial x2 of video and slots (slots' K rides the frame axis, untouched by the spatial
-    // checkpoint).
-    let upscaled_video = normalize_upsample(parts.spatial_upsampler, &reserved_half_res)?;
-    let upscaled_slots = normalize_upsample(parts.spatial_upsampler, &slot_keyframes)?;
+    // Spatial x2 + Stage 2 renoise guarded by explicit `StreamTransition` boundaries (PIPE-4).
+    let s2_video_upsample_tr =
+        crate::pipeline::stage2_video_upsample_transition(384 * 1024 * 1024)?;
+    let s2_video_renoise_tr = crate::pipeline::stage2_stream_renoise_transition(
+        StreamId::Video,
+        "dfr_stage1_to_stage2_video_renoise",
+    )?;
+    let s2_audio_renoise_tr = crate::pipeline::stage2_stream_renoise_transition(
+        StreamId::Audio,
+        "dfr_stage1_to_stage2_audio_renoise",
+    )?;
+    let s2_combined_tr = StreamTransition::new(
+        "dfr_stage1_to_stage2_video_upsample_renoise",
+        vec![StreamId::Video],
+        StreamTransitionKind::Composed(vec![s2_video_upsample_tr.kind, s2_video_renoise_tr.kind]),
+    )?;
 
     // --- Stage 2: full-res detailing -------------------------------------------------------------
     let s2_entry = STAGE2_SIGMAS[0];
     let vnoise2 = create_noise(req.seed.wrapping_add(1), g.t, g.h2, g.w2, &device)?;
     let anoise2 = create_audio_noise(req.seed.wrapping_add(3), parts.audio_frames, &device)?;
     let grid2 = crate::rope::create_position_grid(g.t, g.h2, g.w2, req.fps, &device)?;
-    let mut state2 = if req.video_keyframes.is_empty() {
-        let renoised = renoise(&upscaled_video, &vnoise2, s2_entry)?;
-        VideoTokenState::base(&renoised, &grid2)?
-    } else {
-        let borrowed: Vec<crate::conditioning::Keyframe> = req
-            .video_keyframes
-            .iter()
-            .map(|k| crate::conditioning::Keyframe {
-                latent: &k.stage2,
-                frame_idx: k.frame_idx,
-                strength: k.strength,
-            })
-            .collect();
-        let i2v = crate::conditioning::apply_keyframes(&upscaled_video, &borrowed)?
-            .noised(&vnoise2, s2_entry)?;
-        VideoTokenState::from_i2v(&i2v, &grid2)?
+    let (mut state2, upscaled_slots) = match TransitionBoundaryGuard::new(
+        StreamId::Video,
+        BoundaryState::CleanEstimate {
+            latent: (reserved_half_res.clone(), slot_keyframes),
+            source: EstimateSource::EndpointEvaluation,
+        },
+    )
+    .apply(&s2_combined_tr, |state| match state {
+        BoundaryState::CleanEstimate {
+            latent: (half_res, slots),
+            ..
+        } => {
+            let upscaled_video = normalize_upsample(parts.spatial_upsampler, &half_res)
+                .map_err(candle_gen::CandleError::from)?;
+            let upscaled_slots = normalize_upsample(parts.spatial_upsampler, &slots)
+                .map_err(candle_gen::CandleError::from)?;
+            let st2 = if req.video_keyframes.is_empty() {
+                let renoised = renoise(&upscaled_video, &vnoise2, s2_entry)
+                    .map_err(candle_gen::CandleError::from)?;
+                VideoTokenState::base(&renoised, &grid2).map_err(candle_gen::CandleError::from)?
+            } else {
+                let borrowed: Vec<crate::conditioning::Keyframe> = req
+                    .video_keyframes
+                    .iter()
+                    .map(|k| crate::conditioning::Keyframe {
+                        latent: &k.stage2,
+                        frame_idx: k.frame_idx,
+                        strength: k.strength,
+                    })
+                    .collect();
+                let i2v = crate::conditioning::apply_keyframes(&upscaled_video, &borrowed)
+                    .map_err(candle_gen::CandleError::from)?
+                    .noised(&vnoise2, s2_entry)
+                    .map_err(candle_gen::CandleError::from)?;
+                VideoTokenState::from_i2v(&i2v, &grid2).map_err(candle_gen::CandleError::from)?
+            };
+            Ok(BoundaryState::XSigma((st2, upscaled_slots)))
+        }
+        _ => unreachable!(),
+    }) {
+        Ok(BoundaryState::XSigma(out)) => out,
+        Err(err) => return Err(err.into()),
+        _ => unreachable!(),
     };
     state2 = append_generated_keyframe_slots(
         &state2,
@@ -812,7 +915,18 @@ pub fn generate_dfr_av_latents(
             req.fps,
         )?;
     }
-    let audio2 = renoise(&stage1_audio_latent, &anoise2, s2_entry)?;
+    let BoundaryState::XSigma(audio2) = apply_candle_stream_transition(
+        StreamId::Audio,
+        &s2_audio_renoise_tr,
+        BoundaryState::CleanEstimate {
+            latent: stage1_audio_latent.clone(),
+            source: EstimateSource::EndpointEvaluation,
+        },
+        |clean_a| Ok(renoise(&clean_a, &anoise2, s2_entry)?),
+    )?
+    else {
+        unreachable!();
+    };
 
     let mut on_forward = || Ok(());
     let (state2, _audio2) = denoise_av_conditioned_with_scales(

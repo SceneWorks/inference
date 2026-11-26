@@ -62,6 +62,7 @@ pub mod dev_sampler;
 pub mod dfr;
 pub mod diff_vae;
 pub mod dit_train;
+pub mod drivers;
 pub mod duration_head;
 pub mod gemma;
 pub mod gemma4_te;
@@ -1157,6 +1158,19 @@ impl Pipeline {
             &mut predict,
         )?
         .unwrap_or(DEFAULT_FRAMES);
+        let family = if self.split_bundle.is_some() {
+            gen_core_ltx::LtxModelFamily::Ltx25
+        } else {
+            gen_core_ltx::LtxModelFamily::Ltx23
+        };
+        let _render_plan = drivers::render_plan_for_request(
+            family,
+            self.transformer_variant,
+            req,
+            frames,
+            fps as f32,
+            comps.temporal_upsampler.is_some(),
+        )?;
         let uses_dfr = req.num_generated_keyframes.is_some_and(|count| count > 0)
             || req
                 .temporal_upsample_rounds
@@ -1382,14 +1396,38 @@ impl Pipeline {
 
         // The denoised half-resolution latent enters the learned upsampler in
         // VAE space, then returns to DiT-normalized space before fresh stage-two
-        // video/audio re-noise. Never substitute interpolation or a second pass
-        // on the stage-one model output.
+        // video/audio re-noise. Guard both boundaries with explicit `StreamTransition`
+        // contracts (`PIPE-4`) alongside `TwoStageOrchestration`.
+        let v_upsample_tr = pipeline::stage2_video_upsample_transition(384 * 1024 * 1024)?;
+        let v_renoise_tr = pipeline::stage2_stream_renoise_transition(
+            candle_gen::driver::StreamId::Video,
+            "stage1_to_stage2_video_renoise",
+        )?;
+        let a_renoise_tr = pipeline::stage2_stream_renoise_transition(
+            candle_gen::driver::StreamId::Audio,
+            "stage1_to_stage2_audio_renoise",
+        )?;
         let upsampled = orchestration.learned_upsample(|| {
-            Ok(comps.vae.normalize_latents(
-                &comps
-                    .upsampler
-                    .forward(&comps.vae.denormalize_latents(&vlat)?)?,
-            )?)
+            let candle_gen::gen_core::BoundaryState::CleanEstimate { latent, .. } =
+                drivers::apply_candle_stream_transition(
+                    candle_gen::driver::StreamId::Video,
+                    &v_upsample_tr,
+                    candle_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: vlat,
+                        source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                    },
+                    |clean| {
+                        Ok(comps.vae.normalize_latents(
+                            &comps
+                                .upsampler
+                                .forward(&comps.vae.denormalize_latents(&clean)?)?,
+                        )?)
+                    },
+                )?
+            else {
+                unreachable!();
+            };
+            Ok(latent)
         })?;
         let stage2_video_noise = pipeline::create_noise(
             stage_seeds.video_stage2,
@@ -1409,10 +1447,45 @@ impl Pipeline {
         )?;
         let (stage2_initial, stage2_scales) =
             orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
-                Ok(AvLatents {
-                    video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
-                    audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
-                })
+                let candle_gen::gen_core::BoundaryState::XSigma(video) =
+                    drivers::apply_candle_stream_transition(
+                        candle_gen::driver::StreamId::Video,
+                        &v_renoise_tr,
+                        candle_gen::gen_core::BoundaryState::CleanEstimate {
+                            latent: upsampled.clone(),
+                            source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                        },
+                        |clean| {
+                            Ok(pipeline::renoise(
+                                &clean,
+                                &stage2_video_noise,
+                                STAGE2_SIGMAS[0],
+                            )?)
+                        },
+                    )?
+                else {
+                    unreachable!();
+                };
+                let candle_gen::gen_core::BoundaryState::XSigma(audio) =
+                    drivers::apply_candle_stream_transition(
+                        candle_gen::driver::StreamId::Audio,
+                        &a_renoise_tr,
+                        candle_gen::gen_core::BoundaryState::CleanEstimate {
+                            latent: alat,
+                            source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                        },
+                        |clean| {
+                            Ok(pipeline::renoise(
+                                &clean,
+                                &stage2_audio_noise,
+                                STAGE2_SIGMAS[0],
+                            )?)
+                        },
+                    )?
+                else {
+                    unreachable!();
+                };
+                Ok(AvLatents { video, audio })
             })?;
         let mut stage2_fold = pipeline::StageProgressFold::new(stage1_steps, 3, total_steps);
         let mut stage2_progress = |event: Progress| {

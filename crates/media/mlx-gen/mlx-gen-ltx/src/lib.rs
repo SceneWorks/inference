@@ -47,6 +47,7 @@ pub mod convert;
 pub mod dev_sampler;
 pub mod dfr;
 pub mod diff_vae;
+pub mod drivers;
 pub mod duration_head;
 pub mod enhance;
 pub mod gemma;
