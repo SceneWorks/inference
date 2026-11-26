@@ -6,10 +6,11 @@
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::LatentSpace;
-use candle_gen::{LatentDecoder, Result};
+use candle_gen::gen_core::{LatentSpace, RenderRun};
+use candle_gen::{CandleError, LatentDecoder, Result};
 
 use crate::lq::PidNet;
+use crate::plan::{PidDecodePlan, PidTilingPlan};
 use crate::sampler::Sampler;
 
 /// A PiD decoder bound to one generation's caption + σ + scale.
@@ -37,6 +38,8 @@ pub struct PidDecoder {
     /// exceeds `tile_edge` on either axis (which on CUDA is what avoids the sysmem-fallback silent hang),
     /// else takes the exact whole-image path. `None` ⇒ always whole-image.
     tile: Option<(i32, i32)>,
+    /// Validated pre-decode plan used when creating standalone S10 (`RenderStage::Decode`) runs.
+    plan: PidDecodePlan,
 }
 
 impl PidDecoder {
@@ -50,6 +53,8 @@ impl PidDecoder {
         vae_compression: i32,
         seed: u64,
     ) -> Self {
+        let plan =
+            PidDecodePlan::from_decoder_parts(&sampler, sigma, scale, vae_compression, seed, None);
         Self {
             net,
             sampler,
@@ -61,7 +66,18 @@ impl PidDecoder {
             seed,
             cancel: None,
             tile: None,
+            plan,
         }
+    }
+
+    pub(crate) fn with_plan(mut self, plan: PidDecodePlan) -> Self {
+        self.plan = plan;
+        self
+    }
+
+    /// The compiled [`PidDecodePlan`] backing this decoder.
+    pub fn plan(&self) -> &PidDecodePlan {
+        &self.plan
     }
 
     /// Bind a cooperative cancellation handle (F-006). Callers that go through
@@ -82,6 +98,12 @@ impl PidDecoder {
     /// [`crate::resolve_pid_decoder`] get this wired from [`crate::budget::plan_tile_edge`] automatically.
     pub fn with_tiling(mut self, tile_edge: i32, overlap: i32) -> Self {
         self.tile = Some((tile_edge, overlap));
+        self.plan.tiling = PidTilingPlan {
+            tile_edge_px: tile_edge,
+            overlap_px: overlap,
+            whole_fits: false,
+            selected_by_request: self.plan.tiling.selected_by_request,
+        };
         self
     }
 
@@ -97,44 +119,20 @@ impl PidDecoder {
     /// the whole-image `PidNet::forward` VRAM peak never materializes. `tile`/`overlap` are output-pixel
     /// units. Used above the budget threshold at the decode seam, and by the A/B harness.
     pub fn decode_tiled(&self, latents: &Tensor, tile: i32, overlap: i32) -> Result<Tensor> {
-        candle_gen::execution::policy(
-            "pid_degrade",
-            format!(
-                "sigma_bits={};scale={};vae_compression={}",
-                self.sigma.to_bits(),
-                self.scale,
-                self.vae_compression
-            )
-            .into(),
-        );
-        let b = latents.dim(0)?;
-        let (th, tw) = self.target_hw(latents)?;
-        let latents = latents.to_dtype(DType::F32)?;
-        let sigma = Tensor::from_vec(vec![self.sigma; b], (b,), latents.device())?;
-        self.sampler.sample_tiled(
-            &self.net,
-            &self.caption_embs,
-            &latents,
-            &sigma,
-            b,
-            th,
-            tw,
-            self.seed,
-            tile,
-            overlap,
-            self.cancel.as_ref(),
-        )
-    }
-}
-
-impl LatentDecoder for PidDecoder {
-    fn input_latent_space(&self) -> Option<&LatentSpace> {
-        self.input_latent_space.as_ref()
+        self.decode_in_run_impl(latents, Some((tile, overlap)), None, None)
     }
 
-    /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
-    /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]` (f32).
-    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+    fn decode_in_run_impl(
+        &self,
+        latents: &Tensor,
+        tile_override: Option<(i32, i32)>,
+        run: Option<&RenderRun<'_, '_>>,
+        cancel_override: Option<&CancelFlag>,
+    ) -> Result<Tensor> {
+        let cancel = cancel_override.or(self.cancel.as_ref());
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(CandleError::Canceled);
+        }
         candle_gen::execution::policy(
             "pid_degrade",
             format!(
@@ -151,35 +149,78 @@ impl LatentDecoder for PidDecoder {
         // when already f32). Matches the validated `from_clean` handoff (the normalized VAE latent).
         let latents = latents.to_dtype(DType::F32)?;
         let sigma = Tensor::from_vec(vec![self.sigma; b], (b,), latents.device())?;
-        // Tile when a policy is set and the output exceeds one tile on either axis (sc-10087); otherwise
-        // the exact whole-image path — byte-identical to the pre-tiling decode for small outputs.
-        if let Some((edge, overlap)) = self.tile {
-            if th as i32 > edge || tw as i32 > edge {
-                return self.sampler.sample_tiled(
+        let tiling = match tile_override {
+            Some((tile, overlap)) => {
+                if tile <= 0 || overlap < 0 || overlap >= tile {
+                    return Err(CandleError::Msg(format!(
+                        "pid decode: invalid tile ({tile}) / overlap ({overlap}) geometry"
+                    )));
+                }
+                Some((tile, overlap))
+            }
+            None => self.tile.and_then(|(edge, overlap)| {
+                (th as i32 > edge || tw as i32 > edge).then_some((edge, overlap))
+            }),
+        };
+        let (noise, eps) = self
+            .sampler
+            .draw_noise_eps(latents.device(), b, th, tw, self.seed)?;
+        match run {
+            Some(render_run) => self.sampler.run_in_render_run(
+                &self.net,
+                &noise,
+                eps,
+                &self.caption_embs,
+                &latents,
+                &sigma,
+                self.seed,
+                tiling,
+                cancel,
+                render_run,
+            ),
+            None => {
+                let s10_plan = self
+                    .plan
+                    .render_plan(tw.max(1) as u32, th.max(1) as u32, b.max(1) as u32)
+                    .map_err(CandleError::from)?;
+                let fallback_cancel = CancelFlag::default();
+                let run_cancel = cancel.unwrap_or(&fallback_cancel);
+                let local_run = RenderRun::new(&s10_plan, run_cancel, None);
+                let decoded = self.sampler.run_in_render_run(
                     &self.net,
+                    &noise,
+                    eps,
                     &self.caption_embs,
                     &latents,
                     &sigma,
-                    b,
-                    th,
-                    tw,
                     self.seed,
-                    edge,
-                    overlap,
-                    self.cancel.as_ref(),
-                );
+                    tiling,
+                    Some(run_cancel),
+                    &local_run,
+                )?;
+                local_run.finish_output::<_, CandleError>(decoded)
             }
         }
-        self.sampler.sample(
-            &self.net,
-            &self.caption_embs,
-            &latents,
-            &sigma,
-            b,
-            th,
-            tw,
-            self.seed,
-            self.cancel.as_ref(),
-        )
+    }
+}
+
+impl LatentDecoder for PidDecoder {
+    fn input_latent_space(&self) -> Option<&LatentSpace> {
+        self.input_latent_space.as_ref()
+    }
+
+    /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
+    /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]` (f32).
+    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        self.decode_in_run_impl(latents, None, None, None)
+    }
+
+    fn decode_in_run(
+        &self,
+        latents: &Tensor,
+        run: Option<&RenderRun<'_, '_>>,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Tensor> {
+        self.decode_in_run_impl(latents, None, run, cancel)
     }
 }

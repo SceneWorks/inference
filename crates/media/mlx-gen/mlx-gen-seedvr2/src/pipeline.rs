@@ -9,6 +9,13 @@
 //! The negative-prompt conditioning is a precomputed embedding (`pos_emb.safetensors`, no runtime
 //! text encoder), bundled in the crate (`data/neg_embed.safetensors`) and loaded at construction.
 
+use std::cell::RefCell;
+
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverRefusalReasons, DriverRunState,
+    DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec, StepHooks,
+};
+use mlx_gen::gen_core::{self, BoundaryState};
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::vae_tiling::accumulate_along_axis;
 use mlx_gen::weights::Weights;
@@ -20,13 +27,158 @@ use mlx_rs::{random, Array, Dtype};
 use crate::config::DitConfig;
 use crate::dit::Seedvr2Transformer;
 use crate::vae::Seedvr2Vae;
-use crate::video::{self, Chunk, ChunkPlan};
+use crate::video::{self, Chunk, ChunkPlan, Seedvr2Route};
 use crate::{color, convert};
 
 /// The 1-step Euler timestep (= `num_train_steps`, which the SeedVR2 scheduler defaults to 1000).
-const TIMESTEP: f32 = 1000.0;
+pub const TIMESTEP: f32 = 1000.0;
 /// Post-decode color-correction luminance weight (the reference `apply_color_correction` default).
 const LUMINANCE_WEIGHT: f32 = 0.8;
+
+fn core_err(err: Error) -> gen_core::Error {
+    err.into()
+}
+
+/// Forward prediction seam for [`Seedvr2Driver`], allowing production DiT forwards across all
+/// five SeedVR2 routes and weights-free Tier 0 conformance tests to share one [`FamilyDriver`].
+pub trait Seedvr2Forward {
+    /// Prepare unit noise entering restoration unit `unit_index` (defaults to reusing `current`).
+    fn prepare_unit_noise(&self, _unit_index: usize, current: &Array) -> Result<Array> {
+        Ok(current.clone())
+    }
+
+    /// Predict `dit_out` for `noise` at `unit_index` so `Seedvr2Driver` evaluates `noise − dit_out`.
+    fn predict(&self, unit_index: usize, noise: &Array) -> Result<Array>;
+}
+
+impl<F> Seedvr2Forward for F
+where
+    F: Fn(usize, &Array) -> Result<Array>,
+{
+    fn predict(&self, unit_index: usize, noise: &Array) -> Result<Array> {
+        self(unit_index, noise)
+    }
+}
+
+struct UnitForward<P, F> {
+    prepare: P,
+    predict: F,
+}
+
+impl<P, F> Seedvr2Forward for UnitForward<P, F>
+where
+    P: Fn(usize, &Array) -> Result<Array>,
+    F: Fn(usize, &Array) -> Result<Array>,
+{
+    fn prepare_unit_noise(&self, unit_index: usize, current: &Array) -> Result<Array> {
+        (self.prepare)(unit_index, current)
+    }
+
+    fn predict(&self, unit_index: usize, noise: &Array) -> Result<Array> {
+        (self.predict)(unit_index, noise)
+    }
+}
+
+/// Typed [`FamilyDriver`] executing SeedVR2's 1-step Euler restoration (`x_clean = noise − dit_out`).
+pub struct Seedvr2Driver<F> {
+    sigmas: Vec<f32>,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F> Seedvr2Driver<F> {
+    /// Construct a SeedVR2 driver with an explicit restoration schedule (`len == total_steps + 1`).
+    pub fn new(sigmas: Vec<f32>, forward: F) -> Self {
+        Self {
+            sigmas,
+            forward,
+            support: DriverSupport {
+                driver_id: "mlx_seedvr2",
+                arbitrary_slice: false,
+                carry_history: false,
+                reset_history: false,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: false,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons::default(),
+            },
+        }
+    }
+
+    /// Construct a SeedVR2 driver over `unit_count` 1-step restoration units at `TIMESTEP -> 0.0`.
+    pub fn for_units(unit_count: usize, forward: F) -> Self {
+        let mut sigmas = vec![TIMESTEP; unit_count];
+        sigmas.push(0.0);
+        Self::new(sigmas, forward)
+    }
+}
+
+impl<F: Seedvr2Forward> FamilyDriver<Array> for Seedvr2Driver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        if input.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        if self.sigmas.len() <= input.span.end {
+            return Err(gen_core::Error::Msg(format!(
+                "seedvr2 driver: schedule length {} too short for span {:?}",
+                self.sigmas.len(),
+                input.span
+            )));
+        }
+        state.enter_slice(&input)?;
+        let mut current = match input.state {
+            BoundaryState::XSigma(latent)
+            | BoundaryState::CleanEstimate { latent, .. }
+            | BoundaryState::RouteSpecific { state: latent, .. } => latent,
+        };
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: self.sigmas[step],
+                next_sigma: self.sigmas[step + 1],
+            };
+            hooks.observe(&info, &current)?;
+            let unit_noise = self
+                .forward
+                .prepare_unit_noise(step, &current)
+                .map_err(core_err)?;
+            let dit_out = self.forward.predict(step, &unit_noise).map_err(core_err)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+            let denoised = subtract(&unit_noise, &dit_out)
+                .map_err(Error::from)
+                .map_err(core_err)?;
+            current = hooks.post_step(&info, denoised)?;
+            hooks.materialize(&info, &current)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+            if input.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+        }
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(current))
+    }
+}
 
 pub struct Seedvr2Pipeline {
     pub vae: Seedvr2Vae,
@@ -156,6 +308,11 @@ impl Seedvr2Pipeline {
         Ok(())
     }
 
+    /// Resident weight bytes (VAE + DiT at `dtype`) used by the budget & route planners.
+    pub fn weights_bytes(&self) -> usize {
+        self.weights_bytes
+    }
+
     /// Encode the preprocessed image to the conditioning latent `(B,16,T',h,w)` (scaled mean).
     pub fn encode(&self, processed: &Array) -> Result<Array> {
         self.vae.encode(processed)
@@ -169,8 +326,7 @@ impl Seedvr2Pipeline {
         Ok(concatenate_axis(&[latent, &mask], 1)?)
     }
 
-    /// One denoise step: `vid = [noise, condition]` → DiT → `noise − DiT_out`.
-    pub fn denoise(
+    fn dit_forward(
         &self,
         noise: &Array,
         condition: &Array,
@@ -178,10 +334,42 @@ impl Seedvr2Pipeline {
         timestep: &Array,
     ) -> Result<Array> {
         let model_input = concatenate_axis(&[noise, condition], 1)?; // (B,33,T',h,w)
-        let dit_out = self
-            .transformer
-            .forward(&model_input, neg_embed, timestep)?;
-        Ok(subtract(noise, &dit_out)?)
+        self.transformer.forward(&model_input, neg_embed, timestep)
+    }
+
+    /// One denoise step driven through [`Seedvr2Driver`] (`[TIMESTEP, 0.0]`): `noise − DiT_out`.
+    pub fn denoise(
+        &self,
+        noise: &Array,
+        condition: &Array,
+        neg_embed: &Array,
+        timestep: &Array,
+    ) -> Result<Array> {
+        let driver = Seedvr2Driver::for_units(1, |_step, current_noise: &Array| {
+            self.dit_forward(current_noise, condition, neg_embed, timestep)
+        });
+        let cancel = CancelFlag::new();
+        let mut st = DriverRunState::new();
+        let mut on_progress = |_| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let out = run_mlx_driver_slices(
+            &driver,
+            [SliceSpec::full(1)],
+            BoundaryState::XSigma(noise.clone()),
+            1,
+            0,
+            &cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        let BoundaryState::XSigma(latents) = out else {
+            return Err(Error::Msg(
+                "seedvr2 driver returned non-XSigma state".into(),
+            ));
+        };
+        Ok(latents)
     }
 
     /// Decode latents and crop to `(true_h, true_w)` → `(B,3,true_h,true_w)`.
@@ -286,9 +474,7 @@ impl Seedvr2Pipeline {
     }
 
     /// [`Self::generate_budgeted`] with the per-tile progress hook threaded through (F-162/F-164):
-    /// the tiled branch reports `(tile_idx, n_tiles)` per tile; the single-pass branch reports a lone
-    /// `(1, 1)` (and, like the pre-fix registry, checks cancel right after so a cancel tripped at that
-    /// step returns the typed error before the pass).
+    /// the tiled branch reports `(tile_idx, n_tiles)` per tile; the single-pass branch reports `(1, 1)`.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_budgeted_with_progress(
         &self,
@@ -319,20 +505,57 @@ impl Seedvr2Pipeline {
                 image, width, height, seed, softness, safe_gib, cancel, on_step,
             );
         }
+        self.generate_single_pass_unit(image, width, height, seed, softness, cancel, on_step)
+    }
 
-        // Single-pass path: one logical "tile". Report it, then honor a cancel tripped at that step
-        // boundary before the (1-step) pass — mirroring the pre-fix registry's emit-then-check order.
-        on_step(1, 1);
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    /// Execute one single-pass still image upscale (or one `VideoPerFrame` frame) through
+    /// [`Seedvr2Driver`] and [`run_mlx_driver_slices`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_still_for_route(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        route: &Seedvr2Route,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Image> {
+        match route {
+            Seedvr2Route::StillSinglePass => self
+                .generate_single_pass_unit(image, width, height, seed, softness, cancel, on_step),
+            Seedvr2Route::StillSpatialTiled {
+                tile_edge_px,
+                overlap_px,
+                ..
+            } => self.generate_tiled_with_params(
+                image,
+                width,
+                height,
+                seed,
+                softness,
+                *tile_edge_px,
+                *overlap_px,
+                cancel,
+                on_step,
+            ),
+            _ => Err(Error::Msg(
+                "seedvr2: expected a still route for image generation".into(),
+            )),
         }
+    }
 
-        let neg = self
-            .neg_embed
-            .as_ref()
-            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?;
-        let processed = self.preprocess(image, width, height, softness)?; // (1,3,H,W) in dtype
-
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_frame_unit(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+    ) -> Result<(Array, Array, Array)> {
+        let processed = self.preprocess(image, width, height, softness)?; // (1,3,H,W)
         let latent = self.encode(&processed)?;
         let sh = latent.shape();
         let key = random::key(seed)?;
@@ -347,10 +570,17 @@ impl Seedvr2Pipeline {
         let noise = random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
             .as_dtype(self.dtype)?;
         let cond = Self::condition(&latent)?;
-        let latents = self.denoise(&noise, &cond, neg, &Array::from_f32(TIMESTEP))?;
-        let decoded = self.decode_crop(&latents, height, width)?; // (1,3,H,W)
+        Ok((processed, noise, cond))
+    }
 
-        // color correction uses the bicubic-upscaled LR (the "style") at the same crop.
+    fn finish_frame_unit(
+        &self,
+        latents: &Array,
+        processed: &Array,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        let decoded = self.decode_crop(latents, height, width)?; // (1,3,H,W)
         let style = processed
             .take_axis(
                 Array::from_slice(&(0..height).collect::<Vec<i32>>(), &[height]),
@@ -368,11 +598,133 @@ impl Seedvr2Pipeline {
         decoded_to_image(&corrected)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_driver_units(
+        units: usize,
+        width: i32,
+        height: i32,
+        seed: u64,
+        cancel: &CancelFlag,
+        prepare: impl Fn(usize, &Array) -> Result<Array>,
+        predict: impl Fn(usize, &Array) -> Result<Array>,
+        on_post_step: &mut dyn FnMut(&DriverStepInfo, Array) -> gen_core::Result<Array>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<()> {
+        let driver = Seedvr2Driver::for_units(units, UnitForward { prepare, predict });
+        let mut st = DriverRunState::new();
+        let mut hooks = StepHooks::new(on_progress);
+        hooks.on_post_step = Some(on_post_step);
+        let mut spec = SliceSpec::full(units);
+        spec.geometry = Some((width as u32, height as u32));
+        run_mlx_driver_slices(
+            &driver,
+            [spec],
+            BoundaryState::XSigma(Array::from_f32(0.0)),
+            units,
+            seed,
+            cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_single_pass_unit(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Image> {
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?;
+        let ts = Array::from_f32(TIMESTEP);
+        let active: RefCell<Option<(Array, Array)>> = RefCell::new(None);
+        let result_img: RefCell<Option<Image>> = RefCell::new(None);
+        let mut progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                on_step(current as usize, total as usize);
+            }
+        };
+        let mut post_step = |_info: &DriverStepInfo, latents: Array| -> gen_core::Result<Array> {
+            let (processed, _) = active
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| gen_core::Error::Msg("seedvr2: missing frame state".into()))?;
+            let img = self
+                .finish_frame_unit(&latents, &processed, height, width)
+                .map_err(core_err)?;
+            *result_img.borrow_mut() = Some(img);
+            Ok(latents)
+        };
+        Self::run_driver_units(
+            1,
+            width,
+            height,
+            seed,
+            cancel,
+            |_unit, _cur| {
+                let (processed, noise, cond) =
+                    self.prepare_frame_unit(image, width, height, seed, softness)?;
+                *active.borrow_mut() = Some((processed, cond));
+                Ok(noise)
+            },
+            |_unit, noise| {
+                let (_, cond) = active
+                    .borrow()
+                    .as_ref()
+                    .map(|(p, c)| (p.clone(), c.clone()))
+                    .ok_or_else(|| Error::Msg("seedvr2: unit not prepared".into()))?;
+                self.dit_forward(noise, &cond, neg, &ts)
+            },
+            &mut post_step,
+            &mut progress,
+        )?;
+        Ok(result_img
+            .into_inner()
+            .expect("one single-pass still image produced"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_tiled_with_params(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        tile: i32,
+        overlap: i32,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Image> {
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
+            .clone();
+        let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
+        let decoded = self.run_frame_tiled_with_progress(
+            &processed, seed, tile, overlap, &neg, cancel, on_step,
+        )?;
+        Ok(self
+            .frames_from_decoded(&decoded, &processed, 1, cancel)?
+            .into_iter()
+            .next()
+            .expect("one tiled frame"))
+    }
+
     /// Spatial-tiling still-image path (sc-6067): upscale one LR image by feather-blended spatial
     /// tiling — the image analog of the [`Self::generate_video_tiled`] per-frame branch. Reuses the
-    /// budget tile sizer + parity-gated [`Self::run_frame_tiled`] + per-frame color correction, so peak
-    /// stays bounded at any resolution (no single allocation exceeds the budget-sized tile). `safe_gib`
-    /// sizes the tile.
+    /// budget tile sizer + parity-gated [`Self::run_frame_tiled`] + per-frame color correction.
     #[allow(clippy::too_many_arguments)]
     fn generate_tiled(
         &self,
@@ -385,22 +737,11 @@ impl Seedvr2Pipeline {
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize, usize),
     ) -> Result<Image> {
-        let neg = self
-            .neg_embed
-            .as_ref()
-            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
-            .clone();
         let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-        let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
-        let decoded = self.run_frame_tiled_with_progress(
-            &processed, seed, tile, overlap, &neg, cancel, on_step,
-        )?;
-        Ok(self
-            .frames_from_decoded(&decoded, &processed, 1, cancel)?
-            .into_iter()
-            .next()
-            .expect("one tiled frame"))
+        self.generate_tiled_with_params(
+            image, width, height, seed, softness, tile, overlap, cancel, on_step,
+        )
     }
 
     /// Preprocess one LR `Image` to a single-frame clip `(1,3,1,height,width)` in `[-1,1]` at the model
@@ -544,10 +885,10 @@ impl Seedvr2Pipeline {
 
     /// End-to-end **video** upscale: a sequence of LR `frames` → upscaled `(width, height)` RGB8
     /// frames (same count). Sizes the temporal chunk against the memory budget (or `chunk_override`),
-    /// processes each chunk through the 5-D model path with one-step Euler, per-frame color-corrects,
-    /// and cross-fades chunk overlaps to close the causal-VAE seam ([`crate::video`]). Falls back to
-    /// the per-frame (`T=1`) path under tight memory, and to per-frame **spatial tiling** when even one
-    /// full-resolution frame exceeds the budget (HD — sc-5201), so peak stays bounded at any resolution.
+    /// processes each chunk through the 5-D model path with one-step Euler via [`Seedvr2Driver`],
+    /// per-frame color-corrects, and cross-fades chunk overlaps to close the causal-VAE seam
+    /// ([`crate::video`]). Falls back to per-frame (`T=1`) under tight memory, and to per-frame
+    /// **spatial tiling** when even one full-resolution frame exceeds the budget (HD — sc-5201).
     #[allow(clippy::too_many_arguments)]
     pub fn generate_video(
         &self,
@@ -568,12 +909,16 @@ impl Seedvr2Pipeline {
         // at the full `width×height` per frame, which corrupts above ~1536² regardless of memory. Above
         // the cap, force the per-frame spatial tiler (tiles capped at `VAE_SAFE_DECODE_EDGE_PX`).
         if width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX {
-            return self.generate_video_tiled(
+            let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
+            let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
+            return self.generate_video_tiled_with_params(
                 frames,
                 width,
                 height,
                 seed,
                 softness,
+                tile,
+                overlap,
                 cancel,
                 on_progress,
             );
@@ -582,9 +927,6 @@ impl Seedvr2Pipeline {
             chunk_override,
             video::plan_chunk_size(self.weights_bytes, height, width),
         ) {
-            // Clamp an override DOWN to the budget-safe chunk so it can't bypass the planner and OOM
-            // (SIGKILL); a smaller-than-safe override is honored as-is. PerFrame/OverBudget route to
-            // the safe paths regardless of the override, since forcing a chunk there would OOM (F-075).
             (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
             (_, ChunkPlan::Chunked(c)) => c,
             (_, ChunkPlan::PerFrame) => {
@@ -598,235 +940,155 @@ impl Seedvr2Pipeline {
                     on_progress,
                 )
             }
-            // Even one full-resolution frame exceeds the budget → spatially tile each frame
-            // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
             (_, ChunkPlan::OverBudget { .. }) => {
-                return self.generate_video_tiled(
+                let tile =
+                    video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
+                let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
+                return self.generate_video_tiled_with_params(
                     frames,
                     width,
                     height,
                     seed,
                     softness,
+                    tile,
+                    overlap,
                     cancel,
                     on_progress,
-                )
+                );
             }
         };
-
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
+        self.generate_video_temporal_chunked(
+            frames,
+            width,
+            height,
+            seed,
+            softness,
+            chunk,
+            video::DEFAULT_OVERLAP,
+            &plan,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Execute a compiled [`Seedvr2Route`] video upscale via [`Seedvr2Driver`] and [`run_mlx_driver_slices`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_video_for_route(
+        &self,
+        frames: &[Image],
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        route: &Seedvr2Route,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        match route {
+            Seedvr2Route::VideoTemporalChunked {
+                chunk_frames,
+                overlap_frames,
+                chunks,
+            } => self.generate_video_temporal_chunked(
+                frames,
+                width,
+                height,
+                seed,
+                softness,
+                *chunk_frames,
+                *overlap_frames,
+                chunks,
+                cancel,
+                on_progress,
+            ),
+            Seedvr2Route::VideoPerFrame { .. } => self.generate_video_per_frame(
+                frames,
+                width,
+                height,
+                seed,
+                softness,
+                cancel,
+                on_progress,
+            ),
+            Seedvr2Route::VideoSpatialTiled {
+                tile_edge_px,
+                overlap_px,
+                ..
+            } => self.generate_video_tiled_with_params(
+                frames,
+                width,
+                height,
+                seed,
+                softness,
+                *tile_edge_px,
+                *overlap_px,
+                cancel,
+                on_progress,
+            ),
+            _ => Err(Error::Msg(
+                "seedvr2: expected a video route for video clip generation".into(),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_video_temporal_chunked(
+        &self,
+        frames: &[Image],
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        chunk: i32,
+        overlap: i32,
+        plan: &[Chunk],
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let n = frames.len() as i32;
+        if n == 0 || plan.is_empty() {
+            return Ok(Vec::new());
+        }
         mlx_gen::video_execution::policy(
             "seedvr2_video_chunks",
-            serde_json::json!({"chunk":chunk,"overlap":video::DEFAULT_OVERLAP,"plan":format!("{plan:?}"),"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits,"softness_bits":softness.to_bits()}),
+            serde_json::json!({"chunk":chunk,"overlap":overlap,"plan":format!("{plan:?}"),"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits,"softness_bits":softness.to_bits()}),
         );
         let neg = self
             .neg_embed
             .as_ref()
-            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
-            .clone();
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?;
         let ts = Array::from_f32(TIMESTEP);
-        let total_chunks = plan.len() as u32;
-        // Stream decoded chunks directly into the assembled output. Retaining every chunk would
-        // duplicate the full clip (plus overlap frames) in host RAM; only `out` and one current
-        // chunk are live here, and the output order/cross-fade schedule are unchanged (F-165).
-        let mut out = Vec::with_capacity(n as usize);
-        for (chunk_idx, Chunk { start, len }) in plan.iter().enumerate() {
-            // F-099: per-chunk progress — a minutes-long N-chunk run used to report a single
-            // Step{1,1}. Emitted before the chunk's compute, mirroring the image path's
-            // emit-then-work ordering in `registry.rs`.
-            on_progress(Progress::Step {
-                current: chunk_idx as u32 + 1,
-                total: total_chunks,
-            });
-            // sc-5551 video-cancel: each chunk materializes via decoded_to_image→as_slice, so
-            // this check observes the prior chunk's completed compute and bails before the next.
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let clip = self.preprocess_chunk(frames, *start, *len, width, height, softness)?;
-            let latent = self.encode(&clip)?;
-            let sh = latent.shape();
-            // Same noise key for every chunk (the reference chunk-overlap test) → deterministic blend.
-            let key = random::key(seed)?;
-            mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
-            mlx_gen::video_execution::sampling(
-                "seedvr2",
-                "one_step_euler",
-                "flow_velocity",
-                serde_json::json!({"timestep_bits":TIMESTEP.to_bits()}),
-            );
-            mlx_gen::video_execution::schedule("seedvr2", &[1.0, 0.0]);
-            let noise =
-                random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
-                    .as_dtype(self.dtype)?;
-            let cond = Self::condition(&latent)?;
-            let latents = self.denoise(&noise, &cond, &neg, &ts)?;
-            let decoded = self.decode_crop_5d(&latents, height, width)?;
-            // The final chunk is temporally padded to a VAE-valid length. Its padding would be
-            // dropped by assembly, so skip its expensive host color correction entirely.
-            let real_count = video::real_frame_count(*start, *len, n);
-            let chunk_frames = self.frames_from_decoded(&decoded, &clip, real_count, cancel)?;
-            video::assemble_overlap_chunk(
-                &mut out,
-                *start,
-                chunk_frames,
-                n,
-                video::DEFAULT_OVERLAP,
-            );
-        }
-        Ok(out)
-    }
+        let total_chunks = plan.len();
+        let active: RefCell<Option<(Array, Array, Chunk)>> = RefCell::new(None);
+        let out: RefCell<Vec<Image>> = RefCell::new(Vec::with_capacity(n as usize));
 
-    /// Per-frame (`T=1`) video fallback: each frame through the still path with a fixed (anchored)
-    /// seed — intrinsically temporally stable (spike sc-4812). Used when even an 8-frame chunk
-    /// exceeds the memory budget.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_video_per_frame(
-        &self,
-        frames: &[Image],
-        width: i32,
-        height: i32,
-        seed: u64,
-        softness: f32,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
-        let total = frames.len() as u32;
-        let mut out = Vec::with_capacity(frames.len());
-        for (i, f) in frames.iter().enumerate() {
-            // F-099: per-frame progress on the fallback path (its "chunk" is one frame).
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            out.push(self.generate(f, width, height, seed, softness, cancel)?);
-        }
-        Ok(out)
-    }
-
-    /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) but **spatially
-    /// tiled** — the budget sizer picks the largest square tile that fits, and the decoded tiles are
-    /// feather-blended. Used when even one full-resolution frame exceeds the memory budget; bounds peak
-    /// at any resolution. The numeric tiling fidelity is gated in `tests/tiling_parity.rs`.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_video_tiled(
-        &self,
-        frames: &[Image],
-        width: i32,
-        height: i32,
-        seed: u64,
-        softness: f32,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
-        let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
-        let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-        let neg = self
-            .neg_embed
-            .as_ref()
-            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
-            .clone();
-        let total = frames.len() as u32;
-        let mut out = Vec::with_capacity(frames.len());
-        for (i, f) in frames.iter().enumerate() {
-            // F-099: per-frame progress on the HD tiling path (its "chunk" is one frame).
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let processed = self
-                .preprocess(f, width, height, softness)?
-                .expand_dims(2)?; // (1,3,1,H,W)
-            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
-            let imgs = self.frames_from_decoded(&decoded, &processed, 1, cancel)?;
-            out.push(imgs.into_iter().next().expect("one frame"));
-        }
-        Ok(out)
-    }
-
-    /// Upscale one preprocessed frame `(1,3,1,H,W)` by spatial tiling: run the full encode → DiT →
-    /// decode path on each overlapping `tile`-px tile (one-step Euler, same-seed noise) and feather-
-    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame via the crate-private `fold_spatial_tiles`.
-    ///
-    /// Every accumulator is evaluated per tile, so tile activations never stack (sc-6894) and the
-    /// resident set is the **two full-frame f32 accumulators** — `acc` `(1,3,1,H,W)` + `wsum`
-    /// `(1,1,1,H,W)` = `4·H·W·f32` — held across the whole loop, **plus the two row accumulators**
-    /// `row_acc` `(1,3,1,th,W)` + `row_wsum` `(1,1,1,th,W)` = `4·th·W·f32`, live only while a row of
-    /// tiles is open (sc-18320). The bound is therefore
-    /// `max-tile working set + 4·(H + th)·W·f32` — at the shipped square tiles `th ≈ tile`, so the
-    /// row pair adds `tile/H` of the frame pair, not a second copy of it.
-    ///
-    /// The *transient* peak improved even so: the predecessor padded each weighted tile **and** its
-    /// feather weight to the full frame and added both, so it allocated four extra frame-sized buffers
-    /// per tile on top of that resident set; the fold's per-tile placements are row-sized. Public for
-    /// the gate.
-    pub fn run_frame_tiled(
-        &self,
-        processed: &Array,
-        seed: u64,
-        tile: i32,
-        overlap: i32,
-        neg: &Array,
-        cancel: &CancelFlag,
-    ) -> Result<Array> {
-        // Progress-free wrapper (unchanged public API): the still-image path threads a real per-tile
-        // reporter via `run_frame_tiled_with_progress` (F-164); parity/video callers don't need one.
-        self.run_frame_tiled_with_progress(
-            processed,
-            seed,
-            tile,
-            overlap,
-            neg,
-            cancel,
-            &mut |_, _| {},
-        )
-    }
-
-    /// [`Self::run_frame_tiled`] with a per-tile progress hook (F-164, sc-11133): `on_step(tile_idx,
-    /// n_tiles)` fires once per completed tile (1-based `tile_idx`), so the minutes-long HD upscale —
-    /// the *normal* path for 2048²+ stills since the sc-8261 VAE cap — reports liveness instead of
-    /// appearing frozen behind a single `Step{1,1}`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_frame_tiled_with_progress(
-        &self,
-        processed: &Array,
-        seed: u64,
-        tile: i32,
-        overlap: i32,
-        neg: &Array,
-        cancel: &CancelFlag,
-        on_step: &mut dyn FnMut(usize, usize),
-    ) -> Result<Array> {
-        let sh = processed.shape(); // (1,3,1,H,W)
-        let (height, width) = (sh[3], sh[4]);
-        let plan = video::plan_spatial_tiles(height, width, tile, overlap);
-        let ts = Array::from_f32(TIMESTEP);
-        fold_spatial_tiles(
-            &plan,
-            height,
+        let mut post_step = |_info: &DriverStepInfo, latents: Array| -> gen_core::Result<Array> {
+            let (clip, _, c) = active
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| gen_core::Error::Msg("seedvr2: missing chunk state".into()))?;
+            let decoded = self
+                .decode_crop_5d(&latents, height, width)
+                .map_err(core_err)?;
+            let real_count = video::real_frame_count(c.start, c.len, n);
+            let chunk_frames = self
+                .frames_from_decoded(&decoded, &clip, real_count, cancel)
+                .map_err(core_err)?;
+            video::assemble_overlap_chunk(&mut out.borrow_mut(), c.start, chunk_frames, n, overlap);
+            Ok(latents)
+        };
+        Self::run_driver_units(
+            total_chunks,
             width,
-            |t| {
-                // Per-tile cancel — the per-tile `eval` inside the fold materializes the prior tile's
-                // compute, so this check is effective (sc-5551).
-                if cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
-                mlx_gen::video_execution::policy(
-                    "seedvr2_spatial_tile",
-                    serde_json::json!({"rect":[t.x0,t.y0,t.x1,t.y1],"overlap":overlap,"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits}),
-                );
-                let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
-                let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
-                let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?; // (1,3,1,th,tw)
-
-                // full model path on the tile (one-step Euler), same noise key as the other tiles.
-                let latent = self.encode(&tile_clip)?;
+            height,
+            seed,
+            cancel,
+            |chunk_idx, _cur| {
+                let c = plan[chunk_idx];
+                let clip =
+                    self.preprocess_chunk(frames, c.start, c.len, width, height, softness)?;
+                let latent = self.encode(&clip)?;
                 let sh = latent.shape();
                 let key = random::key(seed)?;
                 mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
@@ -841,39 +1103,356 @@ impl Seedvr2Pipeline {
                     random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
                         .as_dtype(self.dtype)?;
                 let cond = Self::condition(&latent)?;
-                let latents = self.denoise(&noise, &cond, neg, &ts)?;
-                let decoded = self.decode_crop_5d(&latents, th, tw)?; // (1,3,1,th,tw)
-
-                // feather weight tapering on edges that abut a neighbor; placed at (y0,x0).
-                let wvec = video::feather_weight(
-                    th,
-                    tw,
-                    t.y0 > 0,
-                    t.y1 < height,
-                    t.x0 > 0,
-                    t.x1 < width,
-                    overlap,
-                );
-                let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]).as_dtype(self.dtype)?;
-                Ok((multiply(&decoded, &weight)?, weight))
+                *active.borrow_mut() = Some((clip, cond, c));
+                Ok(noise)
             },
-            on_step,
+            |_chunk_idx, noise| {
+                let (_, cond, _) = active
+                    .borrow()
+                    .as_ref()
+                    .map(|(clip, cond, c)| (clip.clone(), cond.clone(), *c))
+                    .ok_or_else(|| Error::Msg("seedvr2: chunk unit not prepared".into()))?;
+                self.dit_forward(noise, &cond, neg, &ts)
+            },
+            &mut post_step,
+            on_progress,
+        )?;
+        Ok(out.into_inner())
+    }
+
+    /// Per-frame (`T=1`) video fallback driven through [`Seedvr2Driver`] + [`run_mlx_driver_slices`].
+    #[allow(clippy::too_many_arguments)]
+    fn generate_video_per_frame(
+        &self,
+        frames: &[Image],
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let total = frames.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?;
+        let ts = Array::from_f32(TIMESTEP);
+        let active: RefCell<Option<(Array, Array)>> = RefCell::new(None);
+        let out: RefCell<Vec<Image>> = RefCell::new(Vec::with_capacity(total));
+        let mut post_step = |_info: &DriverStepInfo, latents: Array| -> gen_core::Result<Array> {
+            let (processed, _) = active
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| gen_core::Error::Msg("seedvr2: missing frame state".into()))?;
+            let img = self
+                .finish_frame_unit(&latents, &processed, height, width)
+                .map_err(core_err)?;
+            out.borrow_mut().push(img);
+            Ok(latents)
+        };
+        Self::run_driver_units(
+            total,
+            width,
+            height,
+            seed,
+            cancel,
+            |frame_idx, _cur| {
+                let (processed, noise, cond) =
+                    self.prepare_frame_unit(&frames[frame_idx], width, height, seed, softness)?;
+                *active.borrow_mut() = Some((processed, cond));
+                Ok(noise)
+            },
+            |_frame_idx, noise| {
+                let (_, cond) = active
+                    .borrow()
+                    .as_ref()
+                    .map(|(p, c)| (p.clone(), c.clone()))
+                    .ok_or_else(|| Error::Msg("seedvr2: per-frame unit not prepared".into()))?;
+                self.dit_forward(noise, &cond, neg, &ts)
+            },
+            &mut post_step,
+            on_progress,
+        )?;
+        Ok(out.into_inner())
+    }
+
+    /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) with its
+    /// spatial tiles driven through [`Seedvr2Driver`].
+    #[allow(clippy::too_many_arguments)]
+    fn generate_video_tiled_with_params(
+        &self,
+        frames: &[Image],
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        tile: i32,
+        overlap: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
+            .clone();
+        let total = frames.len() as u32;
+        let mut out = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let processed = self
+                .preprocess(f, width, height, softness)?
+                .expand_dims(2)?; // (1,3,1,H,W)
+            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
+            let imgs = self.frames_from_decoded(&decoded, &processed, 1, cancel)?;
+            out.push(imgs.into_iter().next().expect("one frame"));
+            on_progress(Progress::Step {
+                current: i as u32 + 1,
+                total,
+            });
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Upscale one preprocessed frame `(1,3,1,H,W)` by spatial tiling through [`Seedvr2Driver`].
+    pub fn run_frame_tiled(
+        &self,
+        processed: &Array,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        neg: &Array,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        self.run_frame_tiled_with_progress(
+            processed,
+            seed,
+            tile,
+            overlap,
+            neg,
+            cancel,
+            &mut |_, _| {},
         )
+    }
+
+    /// [`Self::run_frame_tiled`] with a per-tile progress hook driven by [`Seedvr2Driver`] +
+    /// [`run_mlx_driver_slices`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_frame_tiled_with_progress(
+        &self,
+        processed: &Array,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        neg: &Array,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
+        let sh = processed.shape(); // (1,3,1,H,W)
+        let (height, width) = (sh[3], sh[4]);
+        let plan = video::plan_spatial_tiles(height, width, tile, overlap);
+        let n_tiles = plan.len();
+        let ts = Array::from_f32(TIMESTEP);
+        let fold = RefCell::new(TileFoldAccumulator::new(&plan, height, width));
+        let active: RefCell<Option<(video::SpatialTile, i32, i32, Array)>> = RefCell::new(None);
+        let mut progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                on_step(current as usize, total as usize);
+            }
+        };
+        let mut post_step = |info: &DriverStepInfo, latents: Array| -> gen_core::Result<Array> {
+            let (t, th, tw, _) = active
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| gen_core::Error::Msg("seedvr2: missing tile state".into()))?;
+            let decoded = self.decode_crop_5d(&latents, th, tw).map_err(core_err)?;
+            let wvec = video::feather_weight(
+                th,
+                tw,
+                t.y0 > 0,
+                t.y1 < height,
+                t.x0 > 0,
+                t.x1 < width,
+                overlap,
+            );
+            let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw])
+                .as_dtype(self.dtype)
+                .map_err(Error::from)
+                .map_err(core_err)?;
+            let weighted = multiply(&decoded, &weight)
+                .map_err(Error::from)
+                .map_err(core_err)?;
+            fold.borrow_mut()
+                .push_tile(info.outer_step, &t, weighted, weight)
+                .map_err(core_err)?;
+            Ok(decoded)
+        };
+        Self::run_driver_units(
+            n_tiles,
+            width,
+            height,
+            seed,
+            cancel,
+            |tile_idx, _cur| {
+                let t = plan[tile_idx];
+                let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+                mlx_gen::video_execution::policy(
+                    "seedvr2_spatial_tile",
+                    serde_json::json!({"rect":[t.x0,t.y0,t.x1,t.y1],"overlap":overlap,"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits}),
+                );
+                let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
+                let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
+                let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?;
+                let latent = self.encode(&tile_clip)?;
+                let lsh = latent.shape();
+                let key = random::key(seed)?;
+                mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
+                mlx_gen::video_execution::sampling(
+                    "seedvr2",
+                    "one_step_euler",
+                    "flow_velocity",
+                    serde_json::json!({"timestep_bits":TIMESTEP.to_bits()}),
+                );
+                mlx_gen::video_execution::schedule("seedvr2", &[1.0, 0.0]);
+                let noise = random::normal::<f32>(
+                    &[1, 16, lsh[2], lsh[3], lsh[4]],
+                    None,
+                    None,
+                    Some(&key),
+                )?
+                .as_dtype(self.dtype)?;
+                let cond = Self::condition(&latent)?;
+                *active.borrow_mut() = Some((t, th, tw, cond));
+                Ok(noise)
+            },
+            |_tile_idx, noise| {
+                let (_, _, _, cond) = active
+                    .borrow()
+                    .as_ref()
+                    .map(|(t, th, tw, cond)| (*t, *th, *tw, cond.clone()))
+                    .ok_or_else(|| Error::Msg("seedvr2: tile unit not prepared".into()))?;
+                self.dit_forward(noise, &cond, neg, &ts)
+            },
+            &mut post_step,
+            &mut progress,
+        )?;
+        fold.into_inner().finish()
+    }
+}
+
+struct TileFoldAccumulator {
+    height: i32,
+    width: i32,
+    row_len: usize,
+    acc: Option<Array>,
+    wsum: Option<Array>,
+    row_acc: Option<Array>,
+    row_wsum: Option<Array>,
+}
+
+impl TileFoldAccumulator {
+    fn new(plan: &[video::SpatialTile], height: i32, width: i32) -> Self {
+        let row_len = plan
+            .first()
+            .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
+            .unwrap_or(1);
+        Self {
+            height,
+            width,
+            row_len,
+            acc: None,
+            wsum: None,
+            row_acc: None,
+            row_wsum: None,
+        }
+    }
+
+    fn push_tile(
+        &mut self,
+        tile_idx: usize,
+        t: &video::SpatialTile,
+        weighted: Array,
+        weight: Array,
+    ) -> Result<()> {
+        let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+        self.row_acc = Some(accumulate_along_axis(
+            self.row_acc.take(),
+            &weighted,
+            4,
+            t.x0,
+            tw,
+            self.width,
+        )?);
+        self.row_wsum = Some(accumulate_along_axis(
+            self.row_wsum.take(),
+            &weight,
+            4,
+            t.x0,
+            tw,
+            self.width,
+        )?);
+        if (tile_idx + 1).is_multiple_of(self.row_len) {
+            let strip = self.row_acc.take().expect("the row opened above");
+            let strip_weight = self.row_wsum.take().expect("the row opened above");
+            self.acc = Some(accumulate_along_axis(
+                self.acc.take(),
+                &strip,
+                3,
+                t.y0,
+                th,
+                self.height,
+            )?);
+            self.wsum = Some(accumulate_along_axis(
+                self.wsum.take(),
+                &strip_weight,
+                3,
+                t.y0,
+                th,
+                self.height,
+            )?);
+        }
+        let live: Vec<&Array> = [
+            self.row_acc.as_ref(),
+            self.row_wsum.as_ref(),
+            self.acc.as_ref(),
+            self.wsum.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        eval(live)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Array> {
+        if self.row_acc.is_some() || self.row_wsum.is_some() {
+            return Err(Error::Msg(
+                "seedvr2 tiled upscale: the tile plan left a row unclosed — it is not the row-major \
+                 product grid `plan_spatial_tiles` emits"
+                    .into(),
+            ));
+        }
+        let acc = self
+            .acc
+            .ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
+        let wsum = self
+            .wsum
+            .ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
+        Ok(divide(&acc, &wsum)?)
     }
 }
 
 /// Fold each tile's weighted decode into the full frame, **x axis first** (sc-18320).
-///
-/// `plan` is the product grid [`video::plan_spatial_tiles`] emits — x varies fastest — so a row of
-/// tiles closes every `row_len` entries. The assembly accumulates a row into a `(1, 3, 1, th, W)`
-/// strip and only then folds the strip into the frame, so each placement zero-pads **one** axis and
-/// the full-frame accumulators are written once per row instead of once per tile. The predecessor
-/// padded every weighted tile *and* its feather weight to the full frame, twice per tile.
-///
-/// `weighted_tile` returns that tile's `(weighted_decode, weight)` and owns the cancel check. Every
-/// live accumulator is evaluated once per tile — without that the whole tiled graph would materialize
-/// at once and the cancel check would observe nothing — and `on_step` then reports the completed tile
-/// (F-164).
+#[cfg(test)]
 fn fold_spatial_tiles(
     plan: &[video::SpatialTile],
     height: i32,
@@ -882,81 +1461,13 @@ fn fold_spatial_tiles(
     on_step: &mut dyn FnMut(usize, usize),
 ) -> Result<Array> {
     let n_tiles = plan.len();
-    let row_len = plan
-        .first()
-        .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
-        .unwrap_or(1);
-    let mut acc: Option<Array> = None; // (1,3,1,H,W)
-    let mut wsum: Option<Array> = None; // (1,1,1,H,W)
-    let mut row_acc: Option<Array> = None; // (1,3,1,th,W)
-    let mut row_wsum: Option<Array> = None; // (1,1,1,th,W)
+    let mut fold = TileFoldAccumulator::new(plan, height, width);
     for (tile_idx, t) in plan.iter().enumerate() {
         let (weighted, weight) = weighted_tile(t)?;
-        let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
-        row_acc = Some(accumulate_along_axis(
-            row_acc.take(),
-            &weighted,
-            4,
-            t.x0,
-            tw,
-            width,
-        )?);
-        row_wsum = Some(accumulate_along_axis(
-            row_wsum.take(),
-            &weight,
-            4,
-            t.x0,
-            tw,
-            width,
-        )?);
-        if (tile_idx + 1) % row_len == 0 {
-            let strip = row_acc.take().expect("the row opened above");
-            let strip_weight = row_wsum.take().expect("the row opened above");
-            acc = Some(accumulate_along_axis(
-                acc.take(),
-                &strip,
-                3,
-                t.y0,
-                th,
-                height,
-            )?);
-            wsum = Some(accumulate_along_axis(
-                wsum.take(),
-                &strip_weight,
-                3,
-                t.y0,
-                th,
-                height,
-            )?);
-        }
-        // materialize so the just-processed tile's activations (and prior graph) are freed.
-        let live: Vec<&Array> = [
-            row_acc.as_ref(),
-            row_wsum.as_ref(),
-            acc.as_ref(),
-            wsum.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        eval(live)?;
+        fold.push_tile(tile_idx, t, weighted, weight)?;
         on_step(tile_idx + 1, n_tiles);
     }
-    // A plan that is not the expected product grid — or a misderived `row_len` — would leave a row
-    // open, and the trailing band would vanish from BOTH accumulators, so the divide would still
-    // succeed and quietly return a frame missing its last strip. Refuse instead. (The shared fold
-    // carries the same invariant as a `debug_assert`; this one is checked in release too, because
-    // `row_len` here is derived from the plan's layout rather than handed down by the loop bounds.)
-    if row_acc.is_some() || row_wsum.is_some() {
-        return Err(Error::Msg(
-            "seedvr2 tiled upscale: the tile plan left a row unclosed — it is not the row-major \
-             product grid `plan_spatial_tiles` emits"
-                .into(),
-        ));
-    }
-    let acc = acc.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
-    let wsum = wsum.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
-    Ok(divide(&acc, &wsum)?)
+    fold.finish()
 }
 
 #[cfg(test)]
@@ -1343,5 +1854,99 @@ mod tests {
                 < tol,
             "reorder must save ~one bf16 copy (~1.15 GB): old {old_bytes} new {new_bytes}"
         );
+    }
+}
+
+#[cfg(test)]
+mod driver_conformance_tests {
+    use super::*;
+    use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+    fn make_constant(val: f32) -> Array {
+        Array::from_slice(&[val; 16 * 2 * 2], &[1, 16, 1, 2, 2])
+    }
+
+    fn eval_and_vec(a: &Array) -> Vec<f32> {
+        a.eval().unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn seedvr2_driver_passes_tier0_conformance_without_weights() {
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: 4,
+            split_at: 2,
+            seed: 7,
+            base_geometry: (512, 512),
+            alt_geometry: (1024, 1024),
+            make_driver: || {
+                Box::new(Seedvr2Driver::for_units(4, |_step, noise: &Array| {
+                    Ok(multiply(noise, Array::from_f32(0.25))?)
+                }))
+            },
+            make_initial: || make_constant(1.0),
+            latents_equal: |a, b| {
+                let va = eval_and_vec(a);
+                let vb = eval_and_vec(b);
+                va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+            },
+        })
+        .expect("MLX Seedvr2Driver passes Tier 0 conformance");
+        assert_eq!(report.driver_id, "mlx_seedvr2");
+        assert_eq!(report.total_steps, 4);
+        assert!(report.verified_cancellation);
+    }
+
+    #[test]
+    fn seedvr2_driver_computes_one_step_euler_restoration_and_unit_cancellation() {
+        // 1-step Euler: x_clean = noise - dit_out -> 1.0 - 0.375 = 0.625.
+        let driver = Seedvr2Driver::for_units(1, |_unit, _noise: &Array| Ok(make_constant(0.375)));
+        let cancel = CancelFlag::new();
+        let mut st = DriverRunState::new();
+        let mut on_progress = |_| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let out = run_mlx_driver_slices(
+            &driver,
+            [SliceSpec::full(1)],
+            BoundaryState::XSigma(make_constant(1.0)),
+            1,
+            5,
+            &cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let BoundaryState::XSigma(arr) = out else {
+            panic!("expected XSigma");
+        };
+        let vals = eval_and_vec(&arr);
+        assert!(vals.iter().all(|&v| (v - 0.625).abs() < 1e-6));
+
+        // Mid-unit cancel on 1-step restoration stops cleanly after step progress emits.
+        let c1 = CancelFlag::new();
+        let c1_hook = c1.clone();
+        let mut st1 = DriverRunState::new();
+        let mut ticks = 0usize;
+        let mut on_p1 = |_: Progress| {
+            ticks += 1;
+            c1_hook.cancel();
+        };
+        let mut hooks1 = StepHooks::new(&mut on_p1);
+        let canceled = run_mlx_driver_slices(
+            &driver,
+            [SliceSpec::full(1)],
+            BoundaryState::XSigma(make_constant(1.0)),
+            1,
+            5,
+            &c1,
+            None,
+            &mut st1,
+            &mut hooks1,
+            |_, out, _| Ok(out),
+        );
+        assert!(matches!(canceled, Err(Error::Canceled)));
+        assert_eq!(ticks, 1);
     }
 }

@@ -194,7 +194,7 @@ pub fn resolve_pid_decoder_at_sigma(
     model_id: &str,
     capture_sigma: f32,
 ) -> Result<Option<PidDecoder>> {
-    resolve_pid_decoder_for_fields(
+    resolve_pid_decoder_for_fields_with_tiling(
         pid,
         req.use_pid,
         &req.prompt,
@@ -205,22 +205,28 @@ pub fn resolve_pid_decoder_at_sigma(
         base_seed,
         model_id,
         capture_sigma,
+        req.use_pid.then(|| selected_decode_tiling(req)).flatten(),
     )
 }
 
-/// Field-parameterized sibling of [`resolve_pid_decoder_at_sigma`] for the providers that carry a
-/// bespoke request type instead of a [`GenerationRequest`] (InstantID / PuLID / z-image-control /
-/// sdxl-IP, plus the flux2-control / flux2-edit / kolors-control / sdxl-edit siblings). It applies the
-/// **same** memory-budget guard (F-013 sc-9095) and spatial-tiling plan (sc-10087) as the registered
-/// seam — the whole point of sc-11242 / F-091: before this, every bespoke `pid_decoder_for` copy minted
-/// the decoder via `engine.decoder(…).with_cancel(…)` with no `budget::guard` and no `with_tiling`, so a
-/// large `use_pid` decode (e.g. 1536² → 6144² at 4×) ran the whole-image forward and reproduced the CUDA
-/// sysmem-fallback silent hang the guard/tiling were built to prevent. Route all such copies through
-/// here so they are budgeted and tiled, and the copy-drift collapses to one implementation.
-///
-/// `capture_sigma` is `0.0` for a clean-latent decode (every current bespoke caller runs a full denoise
-/// to σ=0). Returns `None` when `use_pid` is unset; errors loudly when `use_pid` is set but no engine is
-/// loaded (never a silent VAE fallback).
+/// The decode tile geometry a request explicitly selected, or `None` for the auto-plan.
+pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
+    let memory = req.memory?;
+    if !memory.tile_vae_decode {
+        return None;
+    }
+    let edge = memory.decode_tile_edge?;
+    debug_assert!(
+        crate::budget::is_tile_edge_candidate(edge as i32),
+        "PiD decode seam received tile edge {edge}, which is not one of the student's candidates {:?}",
+        crate::budget::tile_edge_candidates(),
+    );
+    let overlap = memory
+        .decode_overlap
+        .unwrap_or(crate::budget::DEFAULT_TILE_OVERLAP as u32);
+    Some((edge as i32, overlap as i32))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_pid_decoder_for_fields(
     pid: Option<&PidEngine>,
@@ -234,6 +240,35 @@ pub fn resolve_pid_decoder_for_fields(
     model_id: &str,
     capture_sigma: f32,
 ) -> Result<Option<PidDecoder>> {
+    resolve_pid_decoder_for_fields_with_tiling(
+        pid,
+        use_pid,
+        prompt,
+        count,
+        width,
+        height,
+        cancel,
+        base_seed,
+        model_id,
+        capture_sigma,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_pid_decoder_for_fields_with_tiling(
+    pid: Option<&PidEngine>,
+    use_pid: bool,
+    prompt: &str,
+    count: u32,
+    width: u32,
+    height: u32,
+    cancel: &CancelFlag,
+    base_seed: u64,
+    model_id: &str,
+    capture_sigma: f32,
+    selected: Option<(i32, i32)>,
+) -> Result<Option<PidDecoder>> {
     if !use_pid {
         return Ok(None);
     }
@@ -242,43 +277,28 @@ pub fn resolve_pid_decoder_for_fields(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    // Memory budget + tiling (F-013 sc-9095, tiling sc-10087). PiD super-resolves in pixel space by
-    // `engine.scale()`, so a `max_size`-legal `width × height` decodes at `(width·scale) ×
-    // (height·scale)` — a 1536² request → 6144², whose whole-image forward exhausts VRAM (→ the CUDA
-    // sysmem-fallback silent hang). We now **tile** rather than refuse: size the tile against the
-    // machine's safe budget (`nvidia-smi` total × 0.85, or the `PID_DECODE_BUDGET_GIB` override) and only
-    // refuse when even a minimum tile plus the resident output-resolution buffers won't fit.
     let safe_gib = candle_gen::vae_tiling::safe_budget_gib(PID_BUDGET_ENV, 0.85, 16.0);
-    crate::budget::guard(
+    let plan = crate::plan::PidDecodePlan::compile_for_fields(
         model_id,
-        count,
+        engine.config(),
+        &engine.sampler_cfg,
+        None,
         width,
         height,
-        engine.scale(),
-        engine.config(),
+        count,
+        capture_sigma,
+        base_seed,
         safe_gib,
+        selected,
     )?;
-    let scale = engine.scale();
-    let (th, tw) = (
-        (height * scale as u32) as i32,
-        (width * scale as u32) as i32,
-    );
-    let cfg = engine.config();
-    let plan = crate::budget::plan_tile_edge(
-        count.max(1) as i32,
-        th,
-        tw,
-        cfg.patch_size,
-        cfg.hidden_size,
-        safe_gib,
-    );
     // Thread the request's cancel flag into the minted decoder so the 4-step decode honors a cancel
     // per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag.
     let mut decoder = engine
         .decoder(prompt, capture_sigma, base_seed)?
-        .with_cancel(cancel.clone());
-    if !plan.whole_fits {
-        decoder = decoder.with_tiling(plan.edge, plan.overlap);
+        .with_cancel(cancel.clone())
+        .with_plan(plan.clone());
+    if let Some((edge, overlap)) = plan.applied_tiling() {
+        decoder = decoder.with_tiling(edge, overlap);
     }
     Ok(Some(decoder))
 }
@@ -587,5 +607,76 @@ mod tests {
             0.0,
         ));
         assert_eq!(via_req, via_fields);
+    }
+}
+
+#[cfg(test)]
+mod selected_tiling_tests {
+    use super::*;
+    use candle_gen::gen_core::GenerationMemory;
+
+    fn req(memory: Option<GenerationMemory>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".to_owned(),
+            use_pid: true,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_auto_plan_survives_everything_that_does_not_name_a_geometry() {
+        assert_eq!(selected_decode_tiling(&req(None)), None);
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory::default()))),
+            None
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }))),
+            None
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                decode_tile_edge: Some(2048),
+                ..Default::default()
+            }))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_geometry_is_honoured_and_the_overlap_defaults_to_the_students_own() {
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(2048),
+                decode_overlap: Some(256),
+                ..Default::default()
+            }))),
+            Some((2048, 256))
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(1536),
+                ..Default::default()
+            }))),
+            Some((1536, crate::budget::DEFAULT_TILE_OVERLAP))
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "candidates")]
+    fn the_seam_asserts_when_a_provider_emits_a_native_vae_edge() {
+        let _ = selected_decode_tiling(&req(Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(64),
+            ..Default::default()
+        })));
     }
 }

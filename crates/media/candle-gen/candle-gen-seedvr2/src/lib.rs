@@ -43,13 +43,14 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, default_seed, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, WeightsSource,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    WeightsSource,
 };
 
-use config::{DitConfig, VAE_SCALE};
-use pipeline::Seedvr2Pipeline;
+pub use config::{DitConfig, TIMESTEP, VAE_SCALE};
+pub use pipeline::{Seedvr2Driver, Seedvr2Forward, Seedvr2Pipeline};
+pub use video::{Seedvr2OutputLifecycle, Seedvr2RenderPlan, Seedvr2Route};
 
 pub const MODEL_ID: &str = "seedvr2";
 pub const MODEL_ID_3B: &str = "seedvr2_3b";
@@ -127,59 +128,23 @@ pub struct Seedvr2Generator {
     pipe: Mutex<Option<std::sync::Arc<Seedvr2Pipeline>>>,
 }
 
-/// Refuse the [`Conditioning::VideoClip`] knobs SeedVR2 does not implement (sc-20263).
-///
-/// SeedVR2 is a one-step **super-resolution upscaler**: a `VideoClip` is the LR source frame
-/// sequence, consumed whole through `generate_video`. It has no denoise mask and no output timeline
-/// to place a clip on, so neither field this variant carries has a mechanism here:
-///
-/// * `strength` is the `1 − strength` denoise mask of the LTX in-context append path. A one-step
-///   upscale runs a single deterministic pass over the LR frames — there is no multi-step denoise
-///   for a mask to gate.
-/// * `frame_idx` is the output latent frame the clip is appended at. SeedVR2 emits one upscaled
-///   frame per input frame in order; the clip *is* the timeline, so there is no offset to honor.
-///
-/// Until sc-20263 both were read off the request and thrown away — `generate` binds only
-/// `clip.frames`. The sc-19571 rule is that a control either works or is refused with a clear
-/// error, so this is the refusal, and it fires **only on a non-default value**: the contract
-/// defaults (`strength = 1.0`, `frame_idx = 0`) pass through unchanged.
-///
-/// Checked over **every** clip rather than the first: `generate` takes the first NON-empty clip, so
-/// a bad value on clip two would otherwise be the one silently dropped.
-///
-/// Byte-for-byte the MLX sibling's `reject_unimplemented_video_clip_knobs`. Typed
-/// [`gen_core::Error::Unsupported`], not `Msg`: the worker classifies `Unsupported` as a
-/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
-fn reject_unimplemented_video_clip_knobs(
-    id: &str,
-    req: &GenerationRequest,
-) -> gen_core::Result<()> {
-    for clip in req.video_clips() {
-        if clip.strength != 1.0 {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id} does not implement VideoClip strength (got {}); remove it or leave it at the \
-                 default 1.0 — SeedVR2 is a one-step upscale with no denoise mask to weight",
-                clip.strength
-            )));
-        }
-        if clip.frame_idx != 0 {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id} does not implement VideoClip frame_idx (got {}); remove it or leave it at \
-                 the default 0 — SeedVR2 upscales the clip in order and has no output timeline to \
-                 offset it against",
-                clip.frame_idx
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// The LR input image carried by the request's `Reference` conditioning.
 fn reference_image(req: &GenerationRequest) -> Option<&Image> {
     req.conditioning.iter().find_map(|c| match c {
         Conditioning::Reference { image, .. } => Some(image),
         _ => None,
     })
+}
+
+fn fold_tile_progress(
+    image_idx: usize,
+    tile_idx: usize,
+    n_tiles: usize,
+    count: usize,
+) -> (u32, u32) {
+    let total = count * n_tiles.max(1);
+    let current = (image_idx * n_tiles.max(1) + tile_idx).min(total);
+    (current as u32, total as u32)
 }
 
 impl Seedvr2Generator {
@@ -201,6 +166,28 @@ impl Seedvr2Generator {
             Ok(std::sync::Arc::new(p))
         })
     }
+
+    fn current_weights_bytes(&self) -> usize {
+        self.pipe
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|pipe| pipe.weights_bytes()))
+            .unwrap_or_else(|| video::estimated_weights_bytes(self.descriptor.id))
+    }
+
+    fn compile_render_plan(
+        &self,
+        req: &GenerationRequest,
+        weights_bytes: usize,
+    ) -> gen_core::Result<Seedvr2RenderPlan> {
+        Seedvr2RenderPlan::compile(
+            &self.descriptor,
+            req,
+            weights_bytes,
+            video::safe_budget_gib(),
+            None,
+        )
+    }
 }
 
 impl Generator for Seedvr2Generator {
@@ -209,24 +196,7 @@ impl Generator for Seedvr2Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        let has_video = req.video_clips().iter().any(|c| !c.frames.is_empty());
-        if !has_video && reference_image(req).is_none() {
-            return Err(gen_core::Error::Msg(format!(
-                "{}: requires a Reference image (image upscale) or a non-empty VideoClip frame \
-                 sequence (video upscale)",
-                self.descriptor.id
-            )));
-        }
-        if !req.width.is_multiple_of(VAE_SCALE) || !req.height.is_multiple_of(VAE_SCALE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{}: width/height must be multiples of {VAE_SCALE} (got {}x{})",
-                self.descriptor.id, req.width, req.height
-            )));
-        }
-        reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
+        self.compile_render_plan(req, self.current_weights_bytes())?;
         Ok(())
     }
 
@@ -245,85 +215,75 @@ impl Generator for Seedvr2Generator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let pipe = self.pipeline()?;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        let softness = req.softness.unwrap_or(0.0);
+        let plan = self.compile_render_plan(req, pipe.weights_bytes())?;
+        let base_seed = plan.base_seed;
+        let softness = plan.softness;
 
-        // Video upscale: a VideoClip carries the LR source frame sequence → one upscaled clip
-        // (temporal chunking + overlap cross-fade + VRAM-budgeted chunk sizer + HD tiling).
         if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
             if req.cancel.is_cancelled() {
                 return Err(gen_core::Error::Canceled);
             }
-            // Real per-chunk/per-frame progress (sc-11227 / F-092): the upscale loops call this back
-            // once per completed unit with `(done, total)` (1-based), replacing the old fixed
-            // `Step { 1, 1 }` placeholder that jumped straight to "done". `&req.cancel` is threaded in
-            // so a mid-clip cancel is honored per unit (the sam3 `propagate` contract, sc-8972) rather
-            // than only after the whole (minutes-to-hours) clip finishes.
             let mut on_step = |done: usize, total: usize| {
                 on_progress(Progress::Step {
                     current: done as u32,
                     total: total as u32,
                 });
             };
-            let frames = pipe.generate_video(
+            let frames = pipe.generate_video_for_route(
                 clip.frames,
                 req.width as usize,
                 req.height as usize,
                 base_seed,
                 softness,
-                None,
+                &plan.route,
                 Some(&req.cancel),
                 Some(&mut on_step),
             )?;
             on_progress(Progress::Decoding);
-            return Ok(GenerationOutput::Video {
+            return plan.finish_output(GenerationOutput::Video {
                 frames,
                 fps: req.fps.unwrap_or(DEFAULT_FPS),
                 audio: None,
             });
         }
 
-        // sc-9015 / F-031: `validate` above guarantees a Reference image on the non-video path, but
-        // return an `Err` rather than `.expect(...)`-panicking if that coupling ever breaks — a
-        // panic here would unwind through the shared `Arc<dyn Generator>` instead of surfacing as a
-        // recoverable error (and could poison the pipeline lock on the way out).
         let image = reference_image(req).ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{}: requires a Reference image (image upscale)",
                 self.descriptor.id
             ))
         })?;
+        let count = req.count as usize;
+        let mut idx = 0usize;
         let out = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             if req.cancel.is_cancelled() {
                 return Err(gen_core::Error::Canceled);
             }
-            on_progress(Progress::Step {
-                current: 1,
-                total: 1,
-            });
-            // `&req.cancel` is threaded so a tiled still (up to 9 full encode→DiT→decode tile
-            // passes above 1536² / over budget) honors a mid-image cancel per tile (sc-12465),
-            // not just the per-image check above.
-            let img = pipe.generate(
+            let image_idx = idx;
+            idx += 1;
+            let mut step_cb = |tile_idx: usize, n_tiles: usize| {
+                let (current, total) = fold_tile_progress(image_idx, tile_idx, n_tiles, count);
+                on_progress(Progress::Step { current, total });
+            };
+            Ok(pipe.generate_still_for_route(
                 image,
                 req.width as usize,
                 req.height as usize,
                 seed,
                 softness,
+                &plan.route,
                 Some(&req.cancel),
-            )?;
-            on_progress(Progress::Decoding);
-            Ok(img)
+                Some(&mut step_cb),
+            )?)
         })?;
-        Ok(GenerationOutput::Images(out))
+        on_progress(Progress::Decoding);
+        plan.finish_output(GenerationOutput::Images(out))
     }
 }
 
-/// Construct a lazy candle SeedVR2 generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing
-/// at a raw `numz/SeedVR2_comfyUI` checkpoint dir (`ema_vae_fp16.safetensors` + the 3B/7B DiT file).
-/// `spec.quantize` (Q4/Q8) int8/int4-quantizes the DiT Linears at load (sc-5927). Adapters / control
-/// overlays are rejected.
+/// Construct a lazy candle SeedVR2 generator.
 fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Generator>> {
+    Seedvr2RenderPlan::validate_load_spec(id, spec)?;
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -332,16 +292,6 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Gene
             )))
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: LoRA/LoKr adapters are not part of SeedVR2"
-        )));
-    }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: ControlNet / IP-Adapter conditioning is not part of SeedVR2"
-        )));
-    }
     let device = candle_gen::default_device()?;
     // Precision::Bf16 is the "native dense" sentinel → bf16 on GPU, f32 on CPU (the parity dtype);
     // Fp32 forces full precision everywhere.
@@ -582,5 +532,106 @@ mod tests {
             ..Default::default()
         })
         .expect("an image upscale carries no clip and is unaffected");
+    }
+
+    #[test]
+    fn seedvr2_render_plan_resolves_all_five_routes_and_validates_pre_load() {
+        let g = unloaded();
+        let desc = g.descriptor();
+        let lr = frame();
+        let wb = (7.3 * video::GIB) as usize;
+
+        let still_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        g.validate(&still_req).unwrap();
+        let p_single = Seedvr2RenderPlan::compile(desc, &still_req, wb, 64.0, None).unwrap();
+        assert_eq!(p_single.route, Seedvr2Route::StillSinglePass);
+
+        let large_still = GenerationRequest {
+            width: 2048,
+            height: 2048,
+            ..still_req
+        };
+        g.validate(&large_still).unwrap();
+        let p_still_tiled =
+            Seedvr2RenderPlan::compile(desc, &large_still, wb, 256.0, None).unwrap();
+        assert!(matches!(
+            p_still_tiled.route,
+            Seedvr2Route::StillSpatialTiled { .. }
+        ));
+
+        let p_chunked = Seedvr2RenderPlan::compile(
+            desc,
+            &GenerationRequest {
+                width: 512,
+                height: 512,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr.clone(); 20],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..clip_request(0, 1.0)
+            },
+            wb,
+            108.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_chunked.route,
+            Seedvr2Route::VideoTemporalChunked { .. }
+        ));
+
+        let p_per_frame = Seedvr2RenderPlan::compile(
+            desc,
+            &GenerationRequest {
+                width: 1024,
+                height: 1024,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr.clone(); 8],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..clip_request(0, 1.0)
+            },
+            wb,
+            20.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_per_frame.route,
+            Seedvr2Route::VideoPerFrame { frame_count: 8 }
+        ));
+
+        let p_vid_tiled = Seedvr2RenderPlan::compile(
+            desc,
+            &GenerationRequest {
+                width: 2048,
+                height: 2048,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr; 4],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..clip_request(0, 1.0)
+            },
+            wb,
+            256.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_vid_tiled.route,
+            Seedvr2Route::VideoSpatialTiled { frame_count: 4, .. }
+        ));
     }
 }

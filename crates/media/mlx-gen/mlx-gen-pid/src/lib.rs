@@ -33,6 +33,7 @@ pub mod engine;
 pub mod gemma2;
 pub mod lq;
 pub(crate) mod memo;
+pub mod plan;
 pub mod registry;
 pub mod sampler;
 pub mod tiling;
@@ -48,8 +49,9 @@ pub use engine::{
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
+pub use plan::{PidDecodePlan, PidTilingPlan, FM_TIMESCALE, STUDENT_SCHEDULE};
 pub use registry::{lookup, BackboneSpec, CkptType, LatentNorm};
-pub use sampler::Sampler;
+pub use sampler::{PidSamplerDriver, PidVelocityForward, Sampler};
 
 #[cfg(test)]
 pub(crate) mod model_inference_device;

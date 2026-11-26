@@ -34,6 +34,9 @@ pub mod registry;
 pub mod vae;
 pub mod video;
 
+pub use pipeline::{Seedvr2Driver, Seedvr2Forward, Seedvr2Pipeline, TIMESTEP};
+pub use video::{Seedvr2OutputLifecycle, Seedvr2RenderPlan, Seedvr2Route};
+
 /// Add all MLX SeedVR2 generators to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,

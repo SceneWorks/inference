@@ -1730,3 +1730,351 @@ fn video_phase_accepts_the_native_schedule_direction_and_selects_exact_sigma_thr
     assert!(!phase.models.slot(0.4f32.next_down()));
     assert!(phase.models.slot(0.4));
 }
+
+struct MockDecodeInnerDriver {
+    support: crate::driver::DriverSupport,
+}
+
+impl MockDecodeInnerDriver {
+    fn new(driver_id: &'static str) -> Self {
+        Self {
+            support: crate::driver::DriverSupport {
+                driver_id,
+                arbitrary_slice: false,
+                carry_history: false,
+                reset_history: false,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: false,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: crate::driver::DriverRefusalReasons::default(),
+            },
+        }
+    }
+}
+
+impl crate::driver::FamilyDriver<Vec<f32>> for MockDecodeInnerDriver {
+    fn support(&self) -> &crate::driver::DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: crate::driver::SliceInput<'_, Vec<f32>>,
+        state: &mut crate::driver::DriverRunState,
+        hooks: &mut crate::driver::StepHooks<'_, Vec<f32>>,
+    ) -> Result<crate::BoundaryState<Vec<f32>>> {
+        self.support.validate_slice(&input, state)?;
+        state.enter_slice(&input)?;
+        let mut current = match input.state {
+            crate::BoundaryState::XSigma(v)
+            | crate::BoundaryState::CleanEstimate { latent: v, .. }
+            | crate::BoundaryState::RouteSpecific { state: v, .. } => v,
+        };
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let info = crate::driver::DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: crate::driver::DriverEvaluationKind::Trajectory,
+                sigma: 1.0 - (step as f32 / input.total_steps.max(1) as f32),
+                next_sigma: 1.0 - ((step + 1) as f32 / input.total_steps.max(1) as f32),
+            };
+            hooks.observe(&info, &current)?;
+            let draw = state.next_draw_index();
+            for value in &mut current {
+                *value += (draw as f32 + 1.0) * 0.25;
+            }
+            state.record_evaluation(crate::driver::DriverEvaluationKind::Trajectory);
+            current = hooks.post_step(&info, current)?;
+            hooks.materialize(&info, &current)?;
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+            if input.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+        }
+        state.finish_slice(input.span.end);
+        Ok(crate::BoundaryState::XSigma(current))
+    }
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)]
+fn s10_decode_inner_driver_lifecycle_admission_accounting_and_output() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap();
+    let mut scope = PhaseScope::default();
+    let driver = MockDecodeInnerDriver::new("mock_pid_decode");
+
+    // Out-of-order calls before encode/rendering must refuse.
+    {
+        let early_run = RenderRun::new(&plan, &req.cancel, None);
+        let mut progress = |_| {};
+        let mut hooks = crate::driver::StepHooks::new(&mut progress);
+        assert!(matches!(
+            early_run.decode_phase_with_driver(
+                &driver,
+                crate::BoundaryState::XSigma(vec![1.0]),
+                4,
+                7,
+                &mut hooks,
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    run.begin_rendering().unwrap();
+
+    // Active denoise phase blocks decode inner driver start.
+    run.begin_denoise_phase(0).unwrap();
+    {
+        let mut progress = |_| {};
+        let mut hooks = crate::driver::StepHooks::new(&mut progress);
+        assert!(matches!(
+            run.decode_phase_with_driver(
+                &driver,
+                crate::BoundaryState::XSigma(vec![1.0]),
+                4,
+                7,
+                &mut hooks,
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+    run.end_denoise_phase(0).unwrap();
+
+    // Standalone S10 decode_phase_with_driver opens and leaves MemoryPhase::Decode.
+    let mut ticks = Vec::new();
+    let out1 = {
+        let mut on_progress = |p: Progress| ticks.push(p);
+        let mut hooks = crate::driver::StepHooks::new(&mut on_progress);
+        run.decode_phase_with_driver(
+            &driver,
+            crate::BoundaryState::XSigma(vec![0.0]),
+            4,
+            11,
+            &mut hooks,
+        )
+        .unwrap()
+    };
+    let crate::BoundaryState::XSigma(vals1) = out1 else {
+        panic!("expected XSigma");
+    };
+    assert_eq!(vals1, vec![0.25 + 0.5 + 0.75 + 1.0]);
+    assert_eq!(ticks.len(), 4);
+
+    // Nested inside an outer `decode_phase` reuses the active Decode scope without double-entering.
+    let out2 = run
+        .decode_phase(|| {
+            assert!(run.is_in_decode_phase());
+            let mut on_progress = |_| {};
+            let mut hooks = crate::driver::StepHooks::new(&mut on_progress);
+            run.decode_phase_with_driver(
+                &driver,
+                crate::BoundaryState::XSigma(vec![1.0]),
+                2,
+                19,
+                &mut hooks,
+            )
+        })
+        .unwrap();
+    let crate::BoundaryState::XSigma(vals2) = out2 else {
+        panic!("expected XSigma");
+    };
+    assert_eq!(vals2, vec![1.0 + 0.25 + 0.5]);
+
+    // `finish_output` transitions cleanly to Finished and blocks subsequent decode/output calls.
+    let finished: Vec<f32> = run.finish_output::<_, Error>(vals2.clone()).unwrap();
+    assert_eq!(finished, vals2);
+    assert!(matches!(
+        run.finish_output::<_, Error>(()),
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(
+        run.decode_driver_executions(),
+        vec![
+            DecodeDriverExecution {
+                driver_id: "mock_pid_decode",
+                completed_outer_steps: 4,
+                internal_evaluations: 4,
+                boundary_evaluations: 0,
+                stochastic_draw_index: 4,
+            },
+            DecodeDriverExecution {
+                driver_id: "mock_pid_decode",
+                completed_outer_steps: 2,
+                internal_evaluations: 2,
+                boundary_evaluations: 0,
+                stochastic_draw_index: 2,
+            },
+        ]
+    );
+    drop(run);
+    use MemoryPhase::*;
+    assert_eq!(
+        scope.events,
+        [
+            (true, Conditioning, 0),
+            (false, Conditioning, 0),
+            (true, Denoise, 0),
+            (false, Denoise, 0),
+            (true, Decode, 0),
+            (false, Decode, 0),
+            (true, Decode, 0),
+            (false, Decode, 0),
+        ]
+    );
+    assert!(scope.active.is_none());
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)]
+fn s10_decode_stage_plan_executes_inner_driver_and_refuses_denoise_or_encode() {
+    let desc = descriptor();
+    for bad in [
+        RenderPlan::decode_stage(&desc, 0, 64, 1, 1, "pid", vec![0.999, 0.0], 1),
+        RenderPlan::decode_stage(&desc, 64, 64, 0, 1, "pid", vec![0.999, 0.0], 1),
+        RenderPlan::decode_stage(&desc, 64, 64, 1, 1, "", vec![0.999, 0.0], 1),
+        RenderPlan::decode_stage(&desc, 64, 64, 1, 1, "pid", vec![0.5, 0.9], 1),
+        RenderPlan::decode_stage(&desc, 64, 64, 1, 1, "pid", vec![0.999, 0.0], 0),
+        RenderPlan::decode_stage(&desc, 64, 64, 1, 1, "pid", vec![0.999, 0.0], 2),
+    ] {
+        assert!(matches!(bad, Err(Error::Unsupported(_))));
+    }
+
+    let plan = RenderPlan::decode_stage(
+        &desc,
+        1024,
+        1024,
+        1,
+        42,
+        "pid_sde",
+        vec![0.999, 0.866, 0.634, 0.342, 0.0],
+        4,
+    )
+    .unwrap();
+    assert!(plan.is_decode_stage());
+    assert!(matches!(
+        plan.check_request(&desc, &GenerationRequest::default()),
+        Err(Error::Unsupported(_))
+    ));
+
+    let cancel = CancelFlag::new();
+    let mut scope = PhaseScope::default();
+    let driver = MockDecodeInnerDriver::new("mock_pid_stage");
+    let run = RenderRun::new(&plan, &cancel, Some(&mut scope));
+
+    // Standalone decode stage plan refuses encode and denoise phases.
+    assert!(matches!(
+        run.encode(|| Ok::<_, Error>(())),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        run.begin_denoise_phase(0),
+        Err(Error::Unsupported(_))
+    ));
+
+    // Step count mismatch against compiled S10 plan refuses before running.
+    {
+        let mut on_progress = |_| {};
+        let mut hooks = crate::driver::StepHooks::new(&mut on_progress);
+        assert!(matches!(
+            run.decode_phase_with_driver(
+                &driver,
+                crate::BoundaryState::XSigma(vec![0.0]),
+                2,
+                42,
+                &mut hooks,
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    let out = {
+        let mut on_progress = |_| {};
+        let mut hooks = crate::driver::StepHooks::new(&mut on_progress);
+        run.decode_phase_with_driver(
+            &driver,
+            crate::BoundaryState::XSigma(vec![0.0]),
+            4,
+            42,
+            &mut hooks,
+        )
+        .unwrap()
+    };
+    let finished = run.finish_output::<_, Error>(out).unwrap();
+    assert!(matches!(finished, crate::BoundaryState::XSigma(_)));
+    assert_eq!(run.decode_driver_executions().len(), 1);
+    drop(run);
+    assert_eq!(
+        scope.events,
+        [
+            (true, MemoryPhase::Decode, 0),
+            (false, MemoryPhase::Decode, 0)
+        ]
+    );
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)]
+fn s10_decode_inner_driver_cancellation_preserves_scope_ownership() {
+    let cancel = CancelFlag::new();
+    let plan = RenderPlan::decode_stage(
+        &descriptor(),
+        1024,
+        1024,
+        1,
+        1,
+        "pid_sde",
+        vec![0.999, 0.866, 0.634, 0.342, 0.0],
+        4,
+    )
+    .unwrap();
+    let mut scope = PhaseScope::default();
+    let driver = MockDecodeInnerDriver::new("mock_pid_cancel");
+    let run = RenderRun::new(&plan, &cancel, Some(&mut scope));
+
+    let cancel_hook = cancel.clone();
+    let mut on_progress = move |_: Progress| cancel_hook.cancel();
+    let mut hooks = crate::driver::StepHooks::new(&mut on_progress);
+    let err = run.decode_phase_with_driver(
+        &driver,
+        crate::BoundaryState::XSigma(vec![0.0]),
+        4,
+        1,
+        &mut hooks,
+    );
+    assert!(matches!(err, Err(Error::Canceled)));
+    assert!(run.decode_driver_executions().is_empty());
+    assert!(matches!(
+        run.finish_output::<_, Error>(()),
+        Err(Error::Canceled)
+    ));
+    drop(run);
+    assert_eq!(scope.events, [(true, MemoryPhase::Decode, 0)]);
+    assert!(scope.active.is_none());
+    scope.finish(MemoryRunOutcome::Canceled).unwrap();
+    assert_eq!(scope.terminal, vec![MemoryRunOutcome::Canceled]);
+}
+
+#[test]
+fn krea_multiphase_intentionally_excludes_use_pid() {
+    let mut req = adapter_phase_request();
+    req.use_pid = true;
+    let err = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &adapter_phase_spec(),
+        &req,
+        pass(vec![1.0, 0.75, 0.5, 0.25, 0.0], 4, 0.0),
+    );
+    assert!(matches!(err, Err(Error::Unsupported(_))));
+}

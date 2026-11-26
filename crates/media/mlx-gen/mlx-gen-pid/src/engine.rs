@@ -356,28 +356,26 @@ pub fn mint_planned_decoder_with_tiling(
     selected: Option<(i32, i32)>,
 ) -> Result<PidDecoder> {
     let safe_gib = mlx_gen::memory::safe_budget_gib();
-    let scale = engine.scale();
     let cfg = engine.config();
-    crate::budget::guard(model_id, width, height, scale, cfg, safe_gib)?;
-    let (th, tw) = (
-        (height * scale as u32) as i32,
-        (width * scale as u32) as i32,
-    );
+    let plan = crate::plan::PidDecodePlan::compile_for_fields(
+        model_id,
+        cfg,
+        &engine.sampler_cfg,
+        None,
+        width,
+        height,
+        1,
+        capture_sigma,
+        seed,
+        safe_gib,
+        selected,
+    )?;
     let mut decoder = engine
         .decoder(prompt, capture_sigma, seed)?
-        .with_cancel(cancel);
-    match selected {
-        Some((edge, overlap)) => {
-            crate::budget::validate_tile(model_id, edge, overlap, th, tw)?;
-            decoder = decoder.with_tiling(edge, overlap);
-        }
-        None => {
-            let plan =
-                crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
-            if !plan.whole_fits {
-                decoder = decoder.with_tiling(plan.edge, plan.overlap);
-            }
-        }
+        .with_cancel(cancel)
+        .with_plan(plan.clone());
+    if let Some((edge, overlap)) = plan.applied_tiling() {
+        decoder = decoder.with_tiling(edge, overlap);
     }
     Ok(decoder)
 }

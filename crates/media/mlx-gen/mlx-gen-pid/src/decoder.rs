@@ -7,10 +7,11 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::decoder::LatentDecoder;
-use mlx_gen::gen_core::LatentSpace;
+use mlx_gen::gen_core::{LatentSpace, RenderRun};
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::lq::PidNet;
+use crate::plan::{PidDecodePlan, PidTilingPlan};
 use crate::sampler::Sampler;
 
 /// A PiD decoder bound to one generation's caption + σ + scale.
@@ -39,6 +40,8 @@ pub struct PidDecoder {
     /// the output exceeds `tile_edge` on either axis, else takes the exact whole-image path. `None` ⇒
     /// always whole-image (small outputs, or a direct struct-API caller that hasn't opted in).
     tile: Option<(i32, i32)>,
+    /// Validated pre-decode plan used when creating standalone S10 (`RenderStage::Decode`) runs.
+    plan: PidDecodePlan,
 }
 
 impl PidDecoder {
@@ -52,6 +55,8 @@ impl PidDecoder {
         vae_compression: i32,
         seed: u64,
     ) -> Self {
+        let plan =
+            PidDecodePlan::from_decoder_parts(&sampler, sigma, scale, vae_compression, seed, None);
         Self {
             net,
             sampler,
@@ -63,7 +68,18 @@ impl PidDecoder {
             seed,
             cancel: None,
             tile: None,
+            plan,
         }
+    }
+
+    pub(crate) fn with_plan(mut self, plan: PidDecodePlan) -> Self {
+        self.plan = plan;
+        self
+    }
+
+    /// The compiled [`PidDecodePlan`] backing this decoder.
+    pub fn plan(&self) -> &PidDecodePlan {
+        &self.plan
     }
 
     /// Evaluate this generation's caption embeddings now. MLX builds the Gemma caption forward
@@ -94,6 +110,12 @@ impl PidDecoder {
     /// [`crate::resolve_pid_decoder`] get this wired from [`crate::budget::plan_tile_edge`] automatically.
     pub fn with_tiling(mut self, tile_edge: i32, overlap: i32) -> Self {
         self.tile = Some((tile_edge, overlap));
+        self.plan.tiling = PidTilingPlan {
+            tile_edge_px: tile_edge,
+            overlap_px: overlap,
+            whole_fits: false,
+            selected_by_request: self.plan.tiling.selected_by_request,
+        };
         self
     }
 
@@ -178,26 +200,77 @@ impl PidDecoder {
     /// Spatially-tiled decode (sc-10087): same result geometry + seeded noise as [`LatentDecoder::decode`],
     /// but the per-step velocity forward runs on overlapping `tile`-px pixel windows (feather-blended) so
     /// the whole-image `PidNet::forward` peak / long Metal command buffer never materializes. `tile` /
-    /// `overlap` are output-pixel units. Used above a size threshold at the decode seam, and by the A/B
-    /// harness to compare tiled vs whole-image on an identical latent.
+    /// `overlap` are output-pixel units.
     pub fn decode_tiled(&self, latents: &Array, tile: i32, overlap: i32) -> Result<Array> {
-        // Capture the LQ latent here too (F-154): the public tiled entry (used by the A/B harness) must
-        // honor `PID_CAPTURE_LATENT` symmetrically with [`LatentDecoder::decode`], not silently skip it.
+        self.decode_in_run_impl(latents, Some((tile, overlap)), None, None)
+    }
+
+    fn decode_in_run_impl(
+        &self,
+        latents: &Array,
+        tile_override: Option<(i32, i32)>,
+        run: Option<&RenderRun<'_, '_>>,
+        cancel_override: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let cancel = cancel_override.or(self.cancel.as_ref());
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        // Capture the LQ latent symmetrically on tiled and whole-image paths (F-154).
         self.maybe_capture(latents);
         let (latents, b, th, tw, sigma) = self.prep(latents)?;
-        self.sampler.sample_tiled(
-            &self.net,
-            &self.caption_embs,
-            &latents,
-            &sigma,
-            b,
-            th,
-            tw,
-            self.seed,
-            tile,
-            overlap,
-            self.cancel.as_ref(),
-        )
+        let tiling = match tile_override {
+            Some((tile, overlap)) => {
+                if tile <= 0 || overlap < 0 || overlap >= tile {
+                    return Err(Error::Msg(format!(
+                        "pid decode: invalid tile ({tile}) / overlap ({overlap}) geometry"
+                    )));
+                }
+                Some((tile, overlap))
+            }
+            None => self
+                .tile
+                .and_then(|(edge, overlap)| (th > edge || tw > edge).then_some((edge, overlap))),
+        };
+        let (noise, eps) = self.sampler.draw_noise_eps(b, th, tw, self.seed)?;
+        let out = match run {
+            Some(render_run) => self.sampler.run_in_render_run(
+                &self.net,
+                &noise,
+                eps,
+                &self.caption_embs,
+                &latents,
+                &sigma,
+                self.seed,
+                tiling,
+                cancel,
+                render_run,
+            )?,
+            None => {
+                let s10_plan = self
+                    .plan
+                    .render_plan(tw.max(1) as u32, th.max(1) as u32, b.max(1) as u32)
+                    .map_err(Error::from)?;
+                let fallback_cancel = CancelFlag::new();
+                let run_cancel = cancel.unwrap_or(&fallback_cancel);
+                let local_run = RenderRun::new(&s10_plan, run_cancel, None);
+                let decoded = self.sampler.run_in_render_run(
+                    &self.net,
+                    &noise,
+                    eps,
+                    &self.caption_embs,
+                    &latents,
+                    &sigma,
+                    self.seed,
+                    tiling,
+                    Some(run_cancel),
+                    &local_run,
+                )?;
+                local_run.finish_output::<_, Error>(decoded)?
+            }
+        };
+        self.sampler.observe_execution(self.seed);
+        Ok(out)
     }
 }
 
@@ -209,37 +282,15 @@ impl LatentDecoder for PidDecoder {
     /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
     /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]`.
     fn decode(&self, latents: &Array) -> Result<Array> {
-        self.maybe_capture(latents);
-        let (latents, b, th, tw, sigma) = self.prep(latents)?;
-        // Tile when a policy is set and the output exceeds one tile on either axis (sc-10087); otherwise
-        // the exact whole-image path — byte-identical to the pre-tiling decode for small outputs.
-        if let Some((edge, overlap)) = self.tile {
-            if th > edge || tw > edge {
-                return self.sampler.sample_tiled(
-                    &self.net,
-                    &self.caption_embs,
-                    &latents,
-                    &sigma,
-                    b,
-                    th,
-                    tw,
-                    self.seed,
-                    edge,
-                    overlap,
-                    self.cancel.as_ref(),
-                );
-            }
-        }
-        self.sampler.sample(
-            &self.net,
-            &self.caption_embs,
-            &latents,
-            &sigma,
-            b,
-            th,
-            tw,
-            self.seed,
-            self.cancel.as_ref(),
-        )
+        self.decode_in_run_impl(latents, None, None, None)
+    }
+
+    fn decode_in_run(
+        &self,
+        latents: &Array,
+        run: Option<&RenderRun<'_, '_>>,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        self.decode_in_run_impl(latents, None, run, cancel)
     }
 }
