@@ -2899,8 +2899,9 @@ mod key_padding_tests {
     /// are compared on the valid tokens against the f32 masked block.
     ///
     /// Declared tolerance: the trimmed fused block's rel-L2 against the f32 reference is at most
-    /// `1e-2` and at most twice the bf16 masked block's own rel-L2 plus `1e-3` (the two bf16 routes
-    /// round differently; neither may drift from the reference).
+    /// `2e-2` and at most twice the bf16 masked block's own rel-L2 plus `1e-3`. The block's bf16
+    /// projections alone cost ~9e-3 rel-L2 (the masked bf16 block measures that), so the bound is
+    /// "no worse than the masked bf16 route", not a statement about attention alone.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "CUDA compute: run by the validation workflow, not CI"]
@@ -2921,9 +2922,21 @@ mod key_padding_tests {
             &cfg,
             VarBuilder::from_varmap(&vm, DType::F32, &dev),
         )?;
+        // The same parameters at bf16, detached: a `VarMap` hands back its stored f32 vars, and a
+        // converted `Var` would stay on the tape (which the router rightly refuses as `GradTracked`).
+        let weights: std::collections::HashMap<String, Tensor> =
+            candle_gen::lock_recover(vm.data())
+                .iter()
+                .map(|(name, var)| {
+                    Ok((
+                        name.clone(),
+                        var.as_tensor().to_dtype(DType::BF16)?.detach(),
+                    ))
+                })
+                .collect::<Result<_>>()?;
         let bf16_model = ZImageTransformer2DModel::new_inference(
             &cfg,
-            VarBuilder::from_varmap(&vm, DType::BF16, &dev),
+            VarBuilder::from_tensors(weights, DType::BF16, &dev),
         )?;
         fn block(model: &ZImageTransformer2DModel) -> &ZImageTransformerBlock {
             match &model.layers {
@@ -2945,12 +2958,13 @@ mod key_padding_tests {
             0,
         )?;
         let (cos, sin) = f32_model.rope_embedder.forward(&positions)?;
+        let (cos_b, sin_b) = bf16_model.rope_embedder.forward(&positions)?;
         let mut keep = vec![1u8; image_tokens + valid_cap];
         keep.extend(vec![0u8; padded - valid_cap]);
         let mask = Tensor::from_vec(keep, (1, total), &dev)?;
         let x = Tensor::randn(0f32, 1.0, (1, total, cfg.dim), &dev)?;
         let t = (Tensor::from_vec(vec![0.6f32], 1, &dev)? * cfg.t_scale)?;
-        let adaln = f32_model.t_embedder.forward(&t)?;
+        let adaln = f32_model.t_embedder.forward(&t)?.detach();
         let plan = default_attention_plan();
 
         let reference = with_materialized_attention(|| {
@@ -2969,8 +2983,8 @@ mod key_padding_tests {
             block(&bf16_model).forward_with_attention_plan(
                 &xb,
                 Some(&mask),
-                &cos,
-                &sin,
+                &cos_b,
+                &sin_b,
                 Some(&ab),
                 plan,
             )
@@ -2980,15 +2994,16 @@ mod key_padding_tests {
         let trimmed = block(&bf16_model).forward_with_attention_plan(
             &xb.narrow(1, 0, valid)?,
             None,
-            &cos.narrow(0, 0, valid)?,
-            &sin.narrow(0, 0, valid)?,
+            &cos_b.narrow(0, 0, valid)?,
+            &sin_b.narrow(0, 0, valid)?,
             Some(&ab),
             plan,
         )?;
-        let fused_calls = attention_path_counts().since(&before).flash;
+        let routed = attention_path_counts().since(&before);
+        let fused_calls = routed.flash;
         assert!(
             fused_calls >= 1,
-            "the trimmed block must take the fused kernel (build with candle-gen/flash-attn, the \n             runtime-cuda default)"
+            "the trimmed block must take the fused kernel (needs candle-gen/flash-attn): {routed:?}"
         );
 
         let errors = |a: &Tensor, b: &Tensor| -> candle_gen::Result<(f32, f32)> {
@@ -3012,7 +3027,7 @@ mod key_padding_tests {
              {mm:.3e} rel-L2 {mr:.3e}; trimmed vs bf16 masked max|d| {dm:.3e} rel-L2 {dr:.3e}; \
              fused calls {fused_calls}"
         );
-        assert!(fr <= 1e-2, "trimmed fused block rel-L2 {fr}");
+        assert!(fr <= 2e-2, "trimmed fused block rel-L2 {fr}");
         assert!(fr <= 2.0 * mr + 1e-3, "trimmed fused {fr} vs masked {mr}");
         Ok(())
     }
