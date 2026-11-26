@@ -441,18 +441,32 @@ impl SenseNova {
         crate::t2i::InterleaveOutput,
         gen_core::render::conditional::ConditionalReceipt,
     )> {
-        if let Some((input, _)) = precompiled_plan {
-            if input.provider_id != self.descriptor.id {
-                return Err(Error::Msg(format!(
-                    "sensenova: precompiled conditional plan targets {:?}, loaded generator is {:?}",
-                    input.provider_id, self.descriptor.id
-                )));
-            }
+        let width_u32 = u32::try_from(width).map_err(|_| {
+            Error::Msg(format!(
+                "sensenova: interleave width must be non-negative, got {width}"
+            ))
+        })?;
+        let height_u32 = u32::try_from(height).map_err(|_| {
+            Error::Msg(format!(
+                "sensenova: interleave height must be non-negative, got {height}"
+            ))
+        })?;
+        if let Some(precompiled) = precompiled_plan {
+            crate::t2i::validate_precompiled_interleave_request(
+                self.descriptor.id,
+                width_u32,
+                height_u32,
+                options.seed,
+                input_images.len(),
+                max_new_tokens,
+                max_images,
+                options.num_steps,
+                precompiled,
+                ceilings.as_ref(),
+            )?;
         }
         validate_interleave_count(&request, max_images)?;
-        if i64::from(request.width) != i64::from(width)
-            || i64::from(request.height) != i64::from(height)
-        {
+        if request.width != width_u32 || request.height != height_u32 {
             return Err(Error::Msg(format!(
                 "sensenova: interleave execution {width}x{height} does not match request {}x{}",
                 request.width, request.height

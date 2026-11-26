@@ -2113,6 +2113,20 @@ impl T2iModel {
             )));
         }
         let (width_u32, height_u32) = (width as u32, height as u32);
+        if let Some(precompiled) = precompiled_plan {
+            validate_precompiled_interleave_request(
+                provider_id,
+                width_u32,
+                height_u32,
+                opts.seed,
+                input_images.len(),
+                max_new_tokens,
+                max_images,
+                opts.num_steps,
+                precompiled,
+                ceilings.as_ref(),
+            )?;
+        }
         let cell_u32 = u32::try_from(cell)
             .map_err(|_| Error::Msg("sensenova interleave: negative cell".into()))?;
         let mut source_geometries = Vec::with_capacity(input_images.len());
@@ -2145,25 +2159,23 @@ impl T2iModel {
             u32::try_from(tu_ids.len()).map_err(|_| Error::Msg("tu prefix overflow".into()))?,
             u32::try_from(iu_ids.len()).map_err(|_| Error::Msg("iu prefix overflow".into()))?,
         ];
-        let (compiled_input, compiled_plan) = match precompiled_plan {
-            Some((input, plan)) => (input.clone(), plan.clone()),
-            None => compile_interleave_conditional_plan_from_shape(
-                provider_id,
-                prompt,
-                opts.seed,
-                width_u32,
-                height_u32,
-                source_geometries.clone(),
-                prefill_tokens,
-                self.prefill_shape,
-                max_new_tokens,
-                max_images,
-                opts.num_steps,
-                self.resident_bytes_estimate,
-                self.cache_token_bytes,
-                ceilings,
-            )?,
-        };
+        let (compiled_input, compiled_plan) = resolve_interleave_conditional_plan(
+            provider_id,
+            prompt,
+            opts.seed,
+            width_u32,
+            height_u32,
+            &source_geometries,
+            prefill_tokens,
+            self.prefill_shape,
+            max_new_tokens,
+            max_images,
+            opts.num_steps,
+            self.resident_bytes_estimate,
+            self.cache_token_bytes,
+            precompiled_plan,
+            ceilings,
+        )?;
 
         // Source images (optional). Only preprocessed after the pre-load plan admits geometry/tokens.
         let mut pv_parts = Vec::with_capacity(input_images.len());
@@ -2529,6 +2541,176 @@ fn build_interleave_prefix_ids(
     let iu_query = format!("{}<img>", build_neo1_query("", ""));
     let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
     Ok(([cond_ids, tu_ids, iu_ids], grids.to_vec()))
+}
+
+/// Validate live request arguments that do not require tokenization against an explicit
+/// precompiled `(input, plan)` before entering a runtime scope or preprocessing source images.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_precompiled_interleave_request(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    seed: u64,
+    input_image_count: usize,
+    max_new_tokens: usize,
+    max_images: usize,
+    steps_per_image: usize,
+    precompiled_plan: (&ConditionalInput, &ConditionalPlan),
+    ceilings: Option<&ConditionalCeilings>,
+) -> Result<()> {
+    let (compiled_input, plan) = precompiled_plan;
+    plan.validate().map_err(Error::from)?;
+    plan.check_input(compiled_input).map_err(Error::from)?;
+    if let Some(expected_ceilings) = ceilings {
+        if plan.ceilings() != expected_ceilings {
+            return Err(Error::Msg(
+                "sensenova interleave: precompiled conditional plan ceilings differ from requested ceilings"
+                    .into(),
+            ));
+        }
+    }
+    let expected = plan.input();
+    let input_image_count = u32::try_from(input_image_count)
+        .map_err(|_| Error::Msg("sensenova interleave: input_images count overflow".into()))?;
+    let max_new_tokens = u32::try_from(max_new_tokens)
+        .map_err(|_| Error::Msg("sensenova interleave: max_new_tokens overflow".into()))?;
+    let max_images = u32::try_from(max_images)
+        .map_err(|_| Error::Msg("sensenova interleave: max_images overflow".into()))?;
+    let steps_per_image = u32::try_from(steps_per_image)
+        .map_err(|_| Error::Msg("sensenova interleave: num_steps overflow".into()))?;
+    if expected.provider_id != provider_id {
+        return Err(Error::Msg(format!(
+            "sensenova: precompiled conditional plan targets {:?}, loaded generator is {:?}",
+            expected.provider_id, provider_id
+        )));
+    }
+    if expected.width != width || expected.height != height {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live geometry {width}x{height} differs from precompiled plan {}x{}",
+            expected.width, expected.height
+        )));
+    }
+    if expected.seed != seed {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live seed {seed} differs from precompiled plan {}",
+            expected.seed
+        )));
+    }
+    if expected.input_images != input_image_count
+        || expected.source_images.len() != input_image_count as usize
+    {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live input_images count {input_image_count} differs from precompiled plan {}",
+            expected.input_images
+        )));
+    }
+    if expected.max_new_tokens != max_new_tokens {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live max_new_tokens {max_new_tokens} differs from precompiled plan {}",
+            expected.max_new_tokens
+        )));
+    }
+    if expected.max_images != max_images {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live max_images {max_images} differs from precompiled plan {}",
+            expected.max_images
+        )));
+    }
+    if expected.steps_per_image != steps_per_image {
+        return Err(Error::Msg(format!(
+            "sensenova interleave: live num_steps {steps_per_image} differs from precompiled plan {}",
+            expected.steps_per_image
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve and admit the active `(ConditionalInput, ConditionalPlan)` for an interleave run
+/// before source image tensor preprocessing or backbone execution.
+#[allow(clippy::too_many_arguments)]
+fn resolve_interleave_conditional_plan(
+    provider_id: &str,
+    prompt: &str,
+    seed: u64,
+    width: u32,
+    height: u32,
+    source_geometries: &[SourceImageGeometry],
+    prefill_tokens: [u32; 3],
+    shape: PrefillModelShape,
+    max_new_tokens: usize,
+    max_images: usize,
+    steps_per_image: usize,
+    model_resident_bytes: u64,
+    cache_token_bytes: u64,
+    precompiled_plan: Option<(&ConditionalInput, &ConditionalPlan)>,
+    ceilings: Option<ConditionalCeilings>,
+) -> Result<(ConditionalInput, ConditionalPlan)> {
+    let (compiled_input, compiled_plan) = match precompiled_plan {
+        Some((compiled_input, plan)) => {
+            validate_precompiled_interleave_request(
+                provider_id,
+                width,
+                height,
+                seed,
+                source_geometries.len(),
+                max_new_tokens,
+                max_images,
+                steps_per_image,
+                (compiled_input, plan),
+                ceilings.as_ref(),
+            )?;
+            let (expected_input, _) = compile_interleave_conditional_plan_from_shape(
+                provider_id,
+                prompt,
+                seed,
+                width,
+                height,
+                source_geometries.to_vec(),
+                prefill_tokens,
+                shape,
+                max_new_tokens,
+                max_images,
+                steps_per_image,
+                model_resident_bytes,
+                cache_token_bytes,
+                Some(plan.ceilings().clone()),
+            )?;
+            plan.check_input(&expected_input).map_err(Error::from)?;
+            if compiled_input != &expected_input {
+                return Err(Error::Msg(
+                    "sensenova interleave: precompiled conditional input differs from live execution parameters"
+                        .into(),
+                ));
+            }
+            (expected_input, plan.clone())
+        }
+        None => compile_interleave_conditional_plan_from_shape(
+            provider_id,
+            prompt,
+            seed,
+            width,
+            height,
+            source_geometries.to_vec(),
+            prefill_tokens,
+            shape,
+            max_new_tokens,
+            max_images,
+            steps_per_image,
+            model_resident_bytes,
+            cache_token_bytes,
+            ceilings,
+        )?,
+    };
+    compiled_plan
+        .check_source_images(source_geometries)
+        .map_err(Error::from)?;
+    compiled_plan
+        .check_prefill_shape(shape)
+        .map_err(Error::from)?;
+    compiled_plan
+        .check_prefill_tokens(prefill_tokens)
+        .map_err(Error::from)?;
+    Ok((compiled_input, compiled_plan))
 }
 
 /// Compile a pre-load [`ConditionalPlan`] from pure geometry, token counts, and architectural shape
@@ -4777,6 +4959,432 @@ mod tests {
             64,
             2,
             Some(tight),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn precompiled_interleave_plan_rejects_live_parameter_and_ceiling_mismatches() {
+        let shape = PrefillModelShape {
+            hidden_width: 128,
+            intermediate_width: 256,
+            vision_hidden_width: 64,
+            source_patch_size: 16,
+            source_merge_size: 2,
+            attention_heads: 4,
+            kv_heads: 2,
+            head_dim: 32,
+            layers: 2,
+            vocab_size: 64,
+        };
+        let source = vec![SourceImageGeometry {
+            width: 64,
+            height: 64,
+            storage_bytes: 64 * 64 * 3 * 4,
+        }];
+        let prefill_tokens = [24, 12, 4];
+        let resident_bytes = 1_024 * 1_024;
+        let cache_token_bytes = shape.cache_token_bytes_bound();
+        let mut ceilings = default_interleave_ceilings();
+        ceilings.max_width = 256;
+        ceilings.max_height = 256;
+        ceilings.max_new_tokens = 128;
+        ceilings.max_images = 4;
+        ceilings.max_steps_per_image = 8;
+
+        let (compiled_input, compiled_plan) = compile_interleave_conditional_plan_from_shape(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            source.clone(),
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some(ceilings.clone()),
+        )
+        .expect("precompiled plan compiles");
+
+        // Matching live arguments pass with either `None` or matching `Some(ceilings)`.
+        let (resolved_input, resolved_plan) = resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .expect("matching precompiled plan resolves");
+        assert_eq!(resolved_input, compiled_input);
+        assert_eq!(resolved_plan, compiled_plan);
+
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            Some(ceilings.clone()),
+        )
+        .is_ok());
+
+        // Mismatched `steps_per_image` vs `opts.num_steps` (still under max_steps_per_image=8).
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            6,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+
+        // Mismatched width, height, and max_images (still within ceilings).
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            96,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            96,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            3,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+
+        // Mismatched ceilings.
+        let mut other_ceilings = ceilings.clone();
+        other_ceilings.max_images = 2;
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            Some(other_ceilings.clone()),
+        )
+        .is_err());
+
+        // Mismatched prompt, seed, provider_id, max_new_tokens, source geometry, prefill tokens, and shape.
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "other prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            99,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID_FAST,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            48,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &[SourceImageGeometry {
+                width: 32,
+                height: 32,
+                storage_bytes: 32 * 32 * 3 * 4,
+            }],
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            [25, 12, 4],
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        let mut wrong_shape = shape;
+        wrong_shape.hidden_width = 256;
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            wrong_shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes + 1024,
+            cache_token_bytes,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+        assert!(resolve_interleave_conditional_plan(
+            crate::MODEL_ID,
+            "interleave prompt",
+            42,
+            64,
+            64,
+            &source,
+            prefill_tokens,
+            shape,
+            32,
+            2,
+            4,
+            resident_bytes,
+            cache_token_bytes + 64,
+            Some((&compiled_input, &compiled_plan)),
+            None,
+        )
+        .is_err());
+
+        // Mismatched `ConditionalInput` paired with `plan` is rejected by both request & full guards.
+        let mut wrong_input = compiled_input.clone();
+        wrong_input.steps_per_image = 6;
+        assert!(validate_precompiled_interleave_request(
+            crate::MODEL_ID,
+            64,
+            64,
+            42,
+            1,
+            32,
+            2,
+            4,
+            (&wrong_input, &compiled_plan),
+            Some(&ceilings),
+        )
+        .is_err());
+        assert!(validate_precompiled_interleave_request(
+            crate::MODEL_ID,
+            64,
+            64,
+            42,
+            1,
+            32,
+            2,
+            6,
+            (&compiled_input, &compiled_plan),
+            Some(&ceilings),
+        )
+        .is_err());
+        assert!(validate_precompiled_interleave_request(
+            crate::MODEL_ID,
+            96,
+            64,
+            42,
+            1,
+            32,
+            2,
+            4,
+            (&compiled_input, &compiled_plan),
+            Some(&ceilings),
+        )
+        .is_err());
+        assert!(validate_precompiled_interleave_request(
+            crate::MODEL_ID,
+            64,
+            64,
+            42,
+            1,
+            32,
+            3,
+            4,
+            (&compiled_input, &compiled_plan),
+            Some(&ceilings),
+        )
+        .is_err());
+        assert!(validate_precompiled_interleave_request(
+            crate::MODEL_ID,
+            64,
+            64,
+            42,
+            1,
+            32,
+            2,
+            4,
+            (&compiled_input, &compiled_plan),
+            Some(&other_ceilings),
         )
         .is_err());
     }

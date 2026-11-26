@@ -989,16 +989,26 @@ impl SenseNovaUnderstanding {
         InterleaveOutput,
         gen_core::render::conditional::ConditionalReceipt,
     )> {
-        if let Some((input, _)) = precompiled_plan {
-            if input.provider_id != MODEL_ID {
-                return Err(CandleError::Msg(format!(
-                    "sensenova: precompiled conditional plan targets {:?}, loaded generator is {:?}",
-                    input.provider_id, MODEL_ID
-                )));
-            }
+        let width_u32 = u32::try_from(width)
+            .map_err(|_| CandleError::Msg("sensenova interleave: width overflow".into()))?;
+        let height_u32 = u32::try_from(height)
+            .map_err(|_| CandleError::Msg("sensenova interleave: height overflow".into()))?;
+        if let Some(precompiled) = precompiled_plan {
+            t2i::validate_precompiled_interleave_request(
+                MODEL_ID,
+                width_u32,
+                height_u32,
+                options.seed,
+                input_images.len(),
+                max_new_tokens,
+                max_images,
+                options.num_steps,
+                precompiled,
+                ceilings.as_ref(),
+            )?;
         }
         validate_interleave_count(&request, max_images)?;
-        if request.width != width as u32 || request.height != height as u32 {
+        if request.width != width_u32 || request.height != height_u32 {
             return Err(CandleError::Msg(format!(
                 "sensenova: interleave execution {width}x{height} does not match request {}x{}",
                 request.width, request.height
