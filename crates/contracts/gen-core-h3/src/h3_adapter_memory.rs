@@ -989,8 +989,10 @@ mod tests {
             false,
         ));
         for backend in [CANDLE, MLX] {
-            let plain = profile_from_headers(backend, &[original.clone()], &targets).unwrap();
-            let converted = profile_from_headers(backend, &[stamped.clone()], &targets).unwrap();
+            let plain =
+                profile_from_headers(backend, std::slice::from_ref(&original), &targets).unwrap();
+            let converted =
+                profile_from_headers(backend, std::slice::from_ref(&stamped), &targets).unwrap();
             assert_eq!(converted.projections.len(), 4);
             assert_eq!(converted, plain);
         }
