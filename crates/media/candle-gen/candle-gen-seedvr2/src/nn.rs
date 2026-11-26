@@ -75,12 +75,21 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 }
 
 /// Dense scaled-dot-product attention over `[B, H, S, D]` (no mask): `softmax(q·kᵀ·scale)·v`.
+///
+/// Routed through the shared candle-gen helper (SW-7284), so the DiT's bf16 window attention takes
+/// FlashAttention-2 on a flash build, and otherwise runs the same `q·kᵀ·scale → softmax_last_dim →
+/// ·v` (single pass below the i32-overflow guard's budget, query-row chunked above it — the guard
+/// this hand-rolled copy lacked).
 pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let q = q.contiguous()?;
-    let kt = k.transpose(D::Minus2, D::Minus1)?.contiguous()?; // [B,H,D,S]
-    let scores = (q.matmul(&kt)? * scale)?;
-    let attn = softmax_last_dim(&scores)?;
-    attn.matmul(&v.contiguous()?)
+    candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        softmax_last_dim,
+        candle_gen::ATTN_SCORES_BUDGET,
+    )
 }
 
 #[cfg(test)]

@@ -164,7 +164,8 @@ impl ZImageEdit {
         // sc-9032: no-op `flash-attn` feature removed; accelerated dispatch is never wired behind a
         // build feature, so this is always off (was `cfg!(feature = "flash-attn") && …`).
         dit_cfg.set_use_accelerated_attn(false);
-        let transformer = ZImageTransformer2DModel::new(
+        // The inference graph, not the trainer's differentiable one (SW-7284): see `Pipeline`.
+        let transformer = ZImageTransformer2DModel::new_inference(
             &dit_cfg,
             component_vb(&root, "transformer", DTYPE, &device)?,
         )?;

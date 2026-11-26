@@ -1573,4 +1573,107 @@ mod tests {
             "bf16-softmax attention drifted {max_abs} from the f32 path (> 0.05 bf16 ULPs)"
         );
     }
+
+    /// SW-7284 discriminator: one production-geometry Wan 2.x 14B DiT block (dim 5120, 40 heads x
+    /// 128, the real 3-axis RoPE table over an 8x32x32 latent grid = 8192 tokens, 512 text tokens of
+    /// cross-attention) on synthetic weights, on CUDA. The f32 block on the materialized path is the
+    /// reference; the bf16 block runs once pinned to the materialized path (the pre-SW-6130 route,
+    /// including Wan's f32-upcast softmax) and once through the shared router (FlashAttention-2).
+    /// Compared on the block's residual update (`out - x`). Synthetic q/k RMS scales near 2 make the
+    /// logits sharp.
+    ///
+    /// Declared criterion: flash is no worse than the old bf16 path, within a small margin —
+    /// `flash_rel <= 1.1 * materialized_rel + 1e-3` and the same for max-abs (+1e-2).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_production_geometry_block_flash_matches_materialized() -> Result<()> {
+        use candle_gen::fused_attention::{attention_path_counts, with_materialized_attention};
+        let dev = Device::new_cuda(0)?;
+        let mut cfg = TransformerConfig::t2v_14b();
+        // The attention is the subject; a narrow FFN keeps the synthetic block cheap.
+        cfg.ffn_dim = 1024;
+        let d = cfg.dim;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        let mut put = |k: &str, shape: &[usize], mean: f32, std: f32| {
+            m.insert(
+                k.to_string(),
+                Tensor::randn(mean, std, shape, &Device::Cpu).unwrap(),
+            );
+        };
+        put("scale_shift_table", &[1, 6, d], 0.0, 0.1);
+        for attn in ["attn1", "attn2"] {
+            for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                put(&format!("{attn}.{leaf}.weight"), &[d, d], 0.0, 0.015);
+                put(&format!("{attn}.{leaf}.bias"), &[d], 0.0, 0.01);
+            }
+            put(&format!("{attn}.norm_q.weight"), &[d], 2.0, 0.3);
+            put(&format!("{attn}.norm_k.weight"), &[d], 2.0, 0.3);
+        }
+        put("norm2.weight", &[d], 1.0, 0.1);
+        put("norm2.bias", &[d], 0.0, 0.1);
+        put("ffn.net.0.proj.weight", &[cfg.ffn_dim, d], 0.0, 0.015);
+        put("ffn.net.0.proj.bias", &[cfg.ffn_dim], 0.0, 0.01);
+        put("ffn.net.2.weight", &[d, cfg.ffn_dim], 0.0, 0.03);
+        put("ffn.net.2.bias", &[d], 0.0, 0.01);
+        let block = |dtype: DType| -> Result<Block> {
+            let weights = m
+                .iter()
+                .map(|(k, t)| Ok((k.clone(), t.to_device(&dev)?.to_dtype(dtype)?)))
+                .collect::<Result<HashMap<_, _>>>()?;
+            Block::new(&cfg, VarBuilder::from_tensors(weights, dtype, &dev))
+        };
+        let (f32_block, bf16_block) = (block(DType::F32)?, block(DType::BF16)?);
+
+        let (ppf, pph, ppw) = (8usize, 32usize, 32usize);
+        let s = ppf * pph * ppw;
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(ppf, pph, ppw, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, s, d), &dev)?;
+        let temb6 = Tensor::randn(0f32, 0.1, (1, 6, d), &dev)?;
+        let context = Tensor::randn(0f32, 1.0, (1, 512, d), &dev)?;
+
+        let update = |block: &Block, x: &Tensor| -> Result<Tensor> {
+            let kv = block.prepare_cross_kv(&context.to_dtype(x.dtype())?)?;
+            let out = block.forward_prepared(x, &temb6, &kv, &cos, &sin)?;
+            out.to_dtype(DType::F32)? - x.to_dtype(DType::F32)?
+        };
+        let reference = with_materialized_attention(|| update(&f32_block, &x))?;
+        let xb = x.to_dtype(DType::BF16)?;
+        let materialized = with_materialized_attention(|| update(&bf16_block, &xb))?;
+        let before = attention_path_counts();
+        let fused = __model_proof_output!(update(&bf16_block, &xb))?;
+        let routed = attention_path_counts().since(&before);
+        assert!(
+            routed.flash >= 2,
+            "the bf16 block's self- and cross-attention must take the fused kernel (needs \
+             candle-gen/flash-attn): {routed:?}"
+        );
+
+        let errors = |a: &Tensor| -> Result<(f32, f32)> {
+            let diff = (a - &reference)?;
+            let max = diff.abs()?.max_all()?.to_scalar::<f32>()?;
+            let num = diff.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            let den = reference.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            Ok((num / den.max(f32::MIN_POSITIVE), max))
+        };
+        let (fr, fm) = errors(&fused)?;
+        let (mr, mm) = errors(&materialized)?;
+        println!(
+            "wan block (S={s}, {} heads x {}, bf16) vs f32 materialized: flash rel-L2 {fr:.4e} \
+             max|d| {fm:.4e}; bf16 materialized rel-L2 {mr:.4e} max|d| {mm:.4e}; routed {routed:?}",
+            cfg.num_heads, cfg.head_dim
+        );
+        assert!(
+            fr <= 1.1 * mr + 1e-3,
+            "flash rel-L2 {fr} vs materialized {mr}"
+        );
+        assert!(
+            fm <= 1.1 * mm + 1e-2,
+            "flash max|d| {fm} vs materialized {mm}"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cuda_production_geometry_block_flash_matches_materialized");
+        Ok(())
+    }
 }

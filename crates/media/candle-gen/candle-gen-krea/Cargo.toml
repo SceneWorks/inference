@@ -49,6 +49,9 @@ model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen-d
 default = []
 metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda"]
+# FlashAttention-2 through the shared candle-gen router (SW-7284): selected by the explicit
+# block-level flash-vs-materialized model proof.
+flash-attn = ["cuda", "candle-gen/flash-attn"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
