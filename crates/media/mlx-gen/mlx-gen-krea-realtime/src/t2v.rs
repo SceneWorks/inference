@@ -75,7 +75,7 @@ const TEMPORAL_STRIDE: usize = VAE_TILING.temporal_scale as usize;
 /// means this accepts at most 1,028 source/output frames (`ceil(frames / 4) == 257`).
 pub(crate) const MAX_LATENT_FRAMES: usize = 257;
 /// z16 Wan VAE spatial stride (latent → pixel; 8× per side). Mirrors `WanModelConfig::vae_stride.1/.2`.
-const SPATIAL_STRIDE: usize = VAE_TILING.spatial_scale as usize;
+pub(crate) const SPATIAL_STRIDE: usize = VAE_TILING.spatial_scale as usize;
 
 /// A fully-specified Krea Realtime text-to-video job (the engine-internal form
 /// [`crate::pipeline`] maps a `GenerationRequest` onto). Dimensions are **pixel** dimensions; the
@@ -148,7 +148,7 @@ pub(crate) fn bounded_latent_frame_count(what: &str, num_frames: usize) -> Resul
 /// *reference resolution's* per-frame token count and total; a different requested resolution yields a
 /// different per-frame token count, which the S3 causal forward bakes into its cache windowing + RoPE
 /// frame offset (so it must reflect the actual latent geometry, not the baked constant).
-fn resolve_request_config(
+pub(crate) fn resolve_request_config(
     base: &KreaRealtimeConfig,
     latent_h: usize,
     latent_w: usize,
@@ -174,6 +174,55 @@ fn resolve_request_config(
     // weights are already resident.
     cfg.validate_kv_cache_quant()?;
     Ok(cfg)
+}
+
+/// Map a resolved [`KreaRealtimeConfig`] onto the shared `gen_core` causal KV/codec policy
+/// (`PIPE-16`, `§6.9`).
+pub(crate) fn causal_codec_policy_for_config(
+    cfg: &KreaRealtimeConfig,
+) -> mlx_gen::gen_core::CausalCodecStatePolicy {
+    if cfg.ar.local_attn_size < 0 {
+        mlx_gen::gen_core::CausalCodecStatePolicy::FullSequenceKv
+    } else {
+        mlx_gen::gen_core::CausalCodecStatePolicy::RollingKvWindow {
+            max_attention_tokens: cfg.ar.max_attention_size(),
+            sink_tokens: cfg.ar.sink_tokens(),
+        }
+    }
+}
+
+/// Emit a completed whole-clip [`GenerationOutput`] through the shared `gen_core` bounded chunk
+/// `ChunkSink::emit` primitive as a single terminal chunk (`sequence = 0`, `is_final = true`,
+/// `ChunkResidencyPolicy::TerminalWholeClip`) without cloning or copying frames (`PIPE-16`).
+pub(crate) fn emit_whole_clip_to_sink(
+    output: GenerationOutput,
+    causal_codec_policy: Option<mlx_gen::gen_core::CausalCodecStatePolicy>,
+    sink: &mut dyn mlx_gen::gen_core::ChunkSink<GenerationOutput>,
+) -> Result<()> {
+    mlx_gen::gen_core::emit_terminal_chunk(sink, output, causal_codec_policy).map_err(Into::into)
+}
+
+/// Deliver a completed whole-clip [`GenerationOutput`] through [`TerminalChunkCollector`]
+/// (`ChunkSink::emit` -> zero-copy move out via `into_output`).
+pub(crate) fn deliver_terminal_output(
+    output: GenerationOutput,
+    causal_codec_policy: Option<mlx_gen::gen_core::CausalCodecStatePolicy>,
+    cancel: &CancelFlag,
+) -> Result<GenerationOutput> {
+    let mut collector = mlx_gen::gen_core::TerminalChunkCollector::new(cancel.clone());
+    emit_whole_clip_to_sink(output, causal_codec_policy, &mut collector)?;
+    collector.into_output().map_err(Into::into)
+}
+
+fn emit_reported_video(
+    output: GenerationOutput,
+    cfg: &KreaRealtimeConfig,
+    adapter_reports: Vec<AdapterApplyReport>,
+    cancel: &CancelFlag,
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+    let delivered =
+        deliver_terminal_output(output, Some(causal_codec_policy_for_config(cfg)), cancel)?;
+    Ok((delivered, adapter_reports))
 }
 
 /// The **memory-budgeted** VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at output size
@@ -356,11 +405,15 @@ pub fn decode_latents_to_video(
             frames.drain(0..excess);
         }
     }
-    Ok(GenerationOutput::Video {
-        frames,
-        fps,
-        audio: None,
-    })
+    deliver_terminal_output(
+        GenerationOutput::Video {
+            frames,
+            fps,
+            audio: None,
+        },
+        None,
+        cancel,
+    )
 }
 
 /// Component-level text-to-video: given the already-built causal transformer + z16 VAE + UMT5
@@ -979,7 +1032,7 @@ pub(crate) fn generate_t2v_reported(
         cancel,
         on_progress,
     )?;
-    Ok((output, adapter_reports))
+    emit_reported_video(output, &cfg, adapter_reports, cancel)
 }
 
 /// Shared real-weight component staging for the t2v/i2v/v2v pipeline paths: UMT5 prompt encode
@@ -1176,7 +1229,7 @@ pub(crate) fn generate_i2v_reported(
         cancel,
         on_progress,
     )?;
-    Ok((output, adapter_reports))
+    emit_reported_video(output, &cfg, adapter_reports, cancel)
 }
 
 /// Run the full Krea Realtime **video-to-video** generation for `job` + a `source_frames` clip at a
@@ -1274,7 +1327,7 @@ pub(crate) fn generate_v2v_reported(
         cancel,
         on_progress,
     )?;
-    Ok((output, adapter_reports))
+    emit_reported_video(output, &cfg, adapter_reports, cancel)
 }
 
 #[cfg(test)]
@@ -1950,5 +2003,122 @@ mod tests {
             cfg.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
             Some((32, 16)),
         );
+    }
+
+    #[test]
+    fn whole_clip_terminal_chunk_emit_preserves_video_output_without_copying() {
+        use mlx_gen::gen_core::{
+            BoundedChunkSink, CausalCodecStatePolicy, ChunkResidencyPolicy, TerminalChunkCollector,
+        };
+
+        let base = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(
+            causal_codec_policy_for_config(&base),
+            CausalCodecStatePolicy::FullSequenceKv
+        );
+        let mac = mac_ar_config(&base);
+        let mac_policy = causal_codec_policy_for_config(&mac);
+        assert_eq!(
+            mac_policy,
+            CausalCodecStatePolicy::RollingKvWindow {
+                max_attention_tokens: mac.ar.max_attention_size(),
+                sink_tokens: 0,
+            }
+        );
+
+        let frame0_pixels = vec![17u8; 16 * 16 * 3];
+        let frame1_pixels = vec![91u8; 16 * 16 * 3];
+        let expected_pixel_ptr = frame0_pixels.as_ptr();
+        let frames = vec![
+            Image {
+                width: 16,
+                height: 16,
+                pixels: frame0_pixels,
+            },
+            Image {
+                width: 16,
+                height: 16,
+                pixels: frame1_pixels,
+            },
+        ];
+        let expected_frames_ptr = frames.as_ptr();
+        let adapter_report = AdapterApplyReport {
+            adapter_path: std::path::PathBuf::from("/models/style.safetensors"),
+            applied: 4,
+            skipped: vec![],
+        };
+        let cancel = CancelFlag::new();
+
+        let (delivered, reports) = emit_reported_video(
+            GenerationOutput::Video {
+                frames,
+                fps: 24,
+                audio: None,
+            },
+            &mac,
+            vec![adapter_report.clone()],
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(reports, vec![adapter_report]);
+        match &delivered {
+            GenerationOutput::Video { frames, fps, audio } => {
+                assert_eq!(*fps, 24);
+                assert!(audio.is_none());
+                assert_eq!(frames.len(), 2);
+                assert_eq!(
+                    frames.as_ptr(),
+                    expected_frames_ptr,
+                    "whole-clip Vec<Image> must move through TerminalChunkCollector with zero copy"
+                );
+                assert_eq!(
+                    frames[0].pixels.as_ptr(),
+                    expected_pixel_ptr,
+                    "decoded pixel buffer must move without reallocation or copy"
+                );
+            }
+            other => panic!("expected Video output, got {other:?}"),
+        }
+
+        // Emitting to the shared BoundedChunkSink delivers one terminal chunk (sequence=0, is_final=true)
+        // with RollingKvWindow metadata and identical frame buffer pointers.
+        let mut bounded = BoundedChunkSink::new(1, CancelFlag::new()).unwrap();
+        emit_whole_clip_to_sink(delivered, Some(mac_policy), &mut bounded).unwrap();
+        assert!(bounded.is_finished());
+        assert_eq!(bounded.len(), 1);
+        let chunk = bounded.pop().unwrap();
+        assert_eq!(chunk.sequence, 0);
+        assert!(chunk.is_final);
+        assert_eq!(
+            chunk.residency_policy,
+            Some(ChunkResidencyPolicy::TerminalWholeClip)
+        );
+        assert_eq!(chunk.causal_codec_policy, Some(mac_policy));
+        match chunk.payload {
+            GenerationOutput::Video { frames, fps, audio } => {
+                assert_eq!(fps, 24);
+                assert!(audio.is_none());
+                assert_eq!(frames.as_ptr(), expected_frames_ptr);
+                assert_eq!(frames[0].pixels.as_ptr(), expected_pixel_ptr);
+            }
+            other => panic!("expected Video payload, got {other:?}"),
+        }
+
+        // Cancelled sink rejects terminal delivery before accepting ownership into the collector.
+        let cancelled = CancelFlag::new();
+        cancelled.cancel();
+        let mut cancelled_collector = TerminalChunkCollector::new(cancelled.clone());
+        let err = emit_whole_clip_to_sink(
+            GenerationOutput::Video {
+                frames: Vec::new(),
+                fps: 16,
+                audio: None,
+            },
+            Some(mac_policy),
+            &mut cancelled_collector,
+        )
+        .expect_err("cancelled sink must reject terminal chunk emit");
+        assert!(matches!(err, Error::Canceled));
+        assert!(!cancelled_collector.is_ready());
     }
 }
