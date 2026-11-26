@@ -416,6 +416,14 @@ fn output_facts(output: Option<&GenerationOutput>) -> Vec<Value> {
         Some(GenerationOutput::Audio(track)) => vec![
             json!({"format":"f32-audio","sample_rate":track.sample_rate,"channels":track.channels,"samples":track.samples.len()}),
         ],
+        Some(GenerationOutput::Interleaved { text, images }) => vec![json!({
+            "format": "interleaved-document",
+            "text_bytes": text.len(),
+            "images": images
+                .iter()
+                .map(|image| json!({"width":image.width,"height":image.height,"channels":3,"format":"rgb8"}))
+                .collect::<Vec<_>>(),
+        })],
         None => Vec::new(),
     }
 }

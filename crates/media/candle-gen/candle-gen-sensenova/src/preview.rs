@@ -964,8 +964,8 @@ mod tests {
             "the txt2img and it2i loops must each make exactly one direct emission call"
         );
         assert!(
-            t2i.contains("preview.emit_step(&preview_counter, i, &image);"),
-            "the emission must key on the loop's own 0-based index and forward the running state"
+            t2i.contains("preview.emit_step(&preview_counter, info.outer_step, image);"),
+            "the emission must key on the driver's outer step index and forward the running state"
         );
         assert!(
             t2i.contains(concat!("PreviewCounter::", "with_steps(steps)")),
@@ -976,7 +976,7 @@ mod tests {
             .find("fn it2i_denoise(")
             .expect("the understanding-surface loop must still exist");
         assert!(
-            t2i[it2i..].contains("preview.emit_step(&preview_counter, i, &image);"),
+            t2i[it2i..].contains("preview.emit_step(preview_counter, info.outer_step, image);"),
             "the it2i loop must emit through the caller's forwarded hook"
         );
         // No shared sampler anywhere in the crate: the fact that makes this crate Denoise::Bespoke.

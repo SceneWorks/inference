@@ -241,6 +241,63 @@ ArtifactInput,
             product_default
         }
     }
+
+    /// Spatial merge factor (`round(1 / downsample_ratio)`).
+    pub fn merge_size(&self) -> usize {
+        (1.0 / self.downsample_ratio).round().max(1.0) as usize
+    }
+
+    /// Combined spatial cell stride (`patch_size * merge_size`).
+    pub fn cell(&self) -> usize {
+        self.patch_size * self.merge_size()
+    }
+
+    /// Pre-load architectural shape verified against `ConditionalPlan`.
+    pub fn prefill_model_shape(
+        &self,
+    ) -> candle_gen::gen_core::render::conditional::PrefillModelShape {
+        candle_gen::gen_core::render::conditional::PrefillModelShape {
+            hidden_width: self.llm.hidden_size as u32,
+            intermediate_width: self.llm.intermediate_size as u32,
+            vision_hidden_width: self.vision.hidden_size as u32,
+            source_patch_size: self.patch_size as u32,
+            source_merge_size: self.merge_size() as u32,
+            attention_heads: self.llm.num_attention_heads as u32,
+            kv_heads: self.llm.num_key_value_heads as u32,
+            head_dim: self.llm.head_dim() as u32,
+            layers: self.llm.num_hidden_layers as u32,
+            vocab_size: self.llm.vocab_size as u32,
+        }
+    }
+
+    /// Conservative per-token f32 KV storage bound for a single cache.
+    pub fn cache_token_bytes_bound(&self) -> u64 {
+        self.prefill_model_shape().cache_token_bytes_bound()
+    }
+
+    /// Conservative resident parameter byte bound estimated from config geometry (bf16 dual-path).
+    pub fn estimated_resident_bytes(&self) -> u64 {
+        let hidden = self.llm.hidden_size as u64;
+        let inter = self.llm.intermediate_size as u64;
+        let heads = self.llm.num_attention_heads as u64;
+        let kv_heads = self.llm.num_key_value_heads as u64;
+        let head_dim = self.llm.head_dim() as u64;
+        let layers = self.llm.num_hidden_layers as u64;
+        let vocab = self.llm.vocab_size as u64;
+        let per_path_layer = hidden
+            * (heads * head_dim + 2 * kv_heads * head_dim + heads * head_dim)
+            + 3 * hidden * inter;
+        let embed_and_head = vocab * hidden * if self.tie_word_embeddings { 1 } else { 2 };
+        let fm =
+            (hidden * (self.fm_head_dim as u64)).saturating_mul(self.fm_head_layers as u64 + 1);
+        layers
+            .saturating_mul(2)
+            .saturating_mul(per_path_layer)
+            .saturating_add(embed_and_head)
+            .saturating_add(fm)
+            .saturating_mul(2)
+            .max(1)
+    }
 }
 
 /// Require a sub-object (`llm_config`/`vision_config`) to be present and a JSON object. A snapshot
