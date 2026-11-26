@@ -790,8 +790,12 @@ impl Pipeline {
             }
             dit
         } else {
-            // Keep the legacy composable normalization and attention for plain resident dense renders.
-            DiT::new(&dit_cfg, self.component_vb("transformer")?)?
+            // The plain resident dense render runs the INFERENCE graph too (SW-7284): the
+            // differentiable graph (`DiT::new`) is the trainer's, and its attention is pinned to the
+            // materialized path because the fused kernel has no backward, so building it here kept
+            // every stock-tier render off FlashAttention. The vendored dense inference forward is
+            // the stock model's (`dit::inference_tests`).
+            DiT::new_inference(&dit_cfg, self.component_vb("transformer")?)?
         };
 
         // The VAE packs only its 8 tiny (512×64) mid-block attention projections; rather than vendor the
@@ -2165,6 +2169,33 @@ use candle_gen::loader::dequantized_vae_vb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-7284: every production render path builds the DiT's INFERENCE graph. The differentiable
+    /// graph (`ZImageTransformer2DModel::new` / `DiT::new`) pins its attention to the materialized
+    /// path, so a render built on it never takes FlashAttention. A source-structure check of the
+    /// shipped halves of the two render modules: no tensor work.
+    #[test]
+    fn render_paths_build_the_inference_dit() {
+        for (name, source) in [
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("edit.rs", include_str!("edit.rs")),
+        ] {
+            let shipped = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .expect("the module has a shipped half");
+            for training in ["DiT::new(", "ZImageTransformer2DModel::new("] {
+                assert!(
+                    !shipped.contains(training),
+                    "{name} renders through the differentiable DiT constructor `{training}`"
+                );
+            }
+            assert!(
+                shipped.contains("::new_inference("),
+                "{name} must build the inference DiT"
+            );
+        }
+    }
 
     #[test]
     fn deferred_text_phase_rejects_tokenizer_replacement_before_encoder_open() {

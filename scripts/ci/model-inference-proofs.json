@@ -321619,5 +321619,121 @@
       "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
+    "fqn": "transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for one Krea 2 single-stream DiT block at production attention geometry (hidden 6144, GQA 48Q/12KV x 128, FFN narrowed to 1024), the real t2i RoPE table for 512 caption + 64x64 image tokens (the 1024^2 joint sequence).",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized",
+    "required_environment": [],
+    "device_witness": "The test observes the bf16 block's residual update through the fused route on the selected CUDA device and counts at least one fused attention call.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints flash and bf16-materialized rel-L2 / max-abs against the f32 materialized block; flash must be within 1.1x + 1e-3 (rel-L2) and 1.1x + 1e-2 (max-abs) of the bf16 materialized path.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run the block at f32 (materialized) and at bf16 twice (pinned materialized, and through the shared router into FlashAttention-2); compare residual updates."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "candle_gen_wan",
+    "target_kind": "lib",
+    "fqn": "transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
+    "source": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for one Wan 2.x 14B DiT block (dim 5120, 40 heads x 128, FFN narrowed to 1024), the real 3-axis RoPE table over an 8x32x32 latent grid (8192 tokens) and 512 cross-attention text tokens.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
+    "required_environment": [],
+    "device_witness": "The test observes the bf16 block's residual update through the fused route on the selected CUDA device and counts at least two fused attention calls (self and cross).",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints flash and bf16-materialized rel-L2 / max-abs against the f32 materialized block; flash must be within 1.1x + 1e-3 (rel-L2) and 1.1x + 1e-2 (max-abs) of the bf16 materialized path.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run the block at f32 (materialized) and at bf16 twice (pinned materialized, and through the shared router into FlashAttention-2); compare residual updates."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
+      "requirements": []
+    }
   }
 ]

@@ -351,9 +351,10 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// Enable/disable accelerated attention: a thin wrapper over the **one** process-wide fused
 /// attention switch, [`candle_gen::fused_attention::set_flash_attention_enabled`] (SW-6130), read per
 /// call by every candle provider's shared attention helpers — so it is not Z-Image-scoped. Retained
-/// as worker API. Default **on**. The Z-Image DiT always passes an attention mask, which the fused
-/// kernel cannot express, so its DiT attention stays on the materialized path either way; the Metal
-/// SDPA path remains off (sc-9032).
+/// as worker API. Default **on**. The Z-Image DiT's caption key-padding mask is trimmed exactly once
+/// per prepared request (`dit::caption_padding_trim`), so its unmasked attention takes the fused kernel
+/// on a flash build; a caption batch with unequal valid lengths keeps the masked, materialized path.
+/// The Metal SDPA path remains off (sc-9032).
 pub fn set_accel_attn(on: bool) {
     candle_gen::fused_attention::set_flash_attention_enabled(on);
 }
