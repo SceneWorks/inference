@@ -30,6 +30,11 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// Explicit provider-instance poison (`PIPE-15`): retire the provider instance without
+    /// touching GPU cleanup; unrelated providers and the host process survive.
+    #[error("provider poisoned: {0}")]
+    ProviderPoisoned(String),
+
     /// Explicit process-local backend poison. This is not inferred from an MLX exception string.
     #[error("process poisoned: {0}")]
     ProcessPoisoned(String),
@@ -105,6 +110,7 @@ impl From<Error> for gen_core::Error {
             Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
             Error::Io(io) => gen_core::Error::Io(io),
             Error::Canceled => gen_core::Error::Canceled,
+            Error::ProviderPoisoned(s) => gen_core::Error::ProviderPoisoned(s),
             Error::ProcessPoisoned(s) => gen_core::Error::ProcessPoisoned(s),
             Error::Unsupported(s) => gen_core::Error::Unsupported(s),
             Error::GeometryRefused {
@@ -152,6 +158,7 @@ impl From<gen_core::Error> for Error {
                 alternative,
             },
             gen_core::Error::Canceled => Error::Canceled,
+            gen_core::Error::ProviderPoisoned(s) => Error::ProviderPoisoned(s),
             gen_core::Error::ProcessPoisoned(s) => Error::ProcessPoisoned(s),
             gen_core::Error::Msg(s) => Error::Msg(s),
         }

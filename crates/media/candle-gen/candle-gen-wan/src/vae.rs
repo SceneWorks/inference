@@ -73,6 +73,10 @@ pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error
         }
         // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.
         CandleError::Canceled => candle_gen::candle_core::Error::Msg("cancelled".into()),
+        // Provider poison retires only the poisoned provider; keep process alive while surfacing error.
+        CandleError::ProviderPoisoned(message) => {
+            candle_gen::candle_core::Error::Msg(format!("provider poisoned: {message}"))
+        }
         // This legacy Candle-result API cannot represent typed process poison. Stop before any
         // GPU stack unwinds instead of erasing the fatal signal into a recoverable message.
         CandleError::ProcessPoisoned(_) => std::process::abort(),

@@ -4199,6 +4199,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
  "sceneworks-gen-core-tokenizer",
+ "serde",
  "serde_json",
  "tempfile",
  "tokenizers 0.21.4",

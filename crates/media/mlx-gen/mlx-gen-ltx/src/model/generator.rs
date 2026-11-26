@@ -40,8 +40,15 @@ impl Generator for Ltx25 {
         // Reuse the full conditioning/index validation that owns the LTX request surface.  The
         // descriptor supplied here is the 2.5 descriptor, so shared capability gates stay closed
         // for any axis not yet consumed by the assembled execution route.
-        validate_request_for(MODEL_25_ID, &self.descriptor.capabilities, req)
-            .map_err(mlx_gen::gen_core::Error::from)?;
+        validate_request_with_route(
+            MODEL_25_ID,
+            &self.descriptor.capabilities,
+            gen_core_ltx::LtxModelFamily::Ltx25,
+            self.variant,
+            self.descriptor.capabilities.max_temporal_upsample_rounds > 0,
+            req,
+        )
+        .map_err(mlx_gen::gen_core::Error::from)?;
         if req.enhance_prompt && req.use_uncensored_enhancer {
             return Err(mlx_gen::gen_core::Error::Unsupported(
                 "ltx_2_5: use_uncensored_enhancer is unsupported; only the staged stock \
@@ -126,13 +133,37 @@ pub(super) fn request_with_effective_prompt(
 /// guidance/negative/true_cfg/sampler/scheduler, only advertised conditioning kinds) plus the LTX
 /// model-specific constraints: non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32),
 /// `num_frames = 1 + 8·k`, and all weight-free conditioning cardinality/shape/index constraints.
-pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+#[cfg(test)]
+pub(super) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     validate_request_for(MODEL_ID, caps, req)
 }
 
+#[cfg(test)]
 pub(super) fn validate_request_for(
     model_id: &str,
     caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    let family = if model_id == MODEL_25_ID {
+        gen_core_ltx::LtxModelFamily::Ltx25
+    } else {
+        gen_core_ltx::LtxModelFamily::Ltx23
+    };
+    let variant = if model_id == MODEL_25_ID && caps.supports_negative_prompt {
+        TransformerVariant::Dev
+    } else {
+        TransformerVariant::Distilled
+    };
+    let has_temporal_upsampler = model_id == MODEL_25_ID;
+    validate_request_with_route(model_id, caps, family, variant, has_temporal_upsampler, req)
+}
+
+pub(super) fn validate_request_with_route(
+    model_id: &str,
+    caps: &Capabilities,
+    family: gen_core_ltx::LtxModelFamily,
+    variant: TransformerVariant,
+    has_temporal_upsampler: bool,
     req: &GenerationRequest,
 ) -> Result<()> {
     if req.prompt.is_empty() {
@@ -339,6 +370,26 @@ pub(super) fn validate_request_for(
             _ => {}
         }
     }
+    let fps = Ltx::fps(req);
+    let resolved_frames = match (req.frames, req.auto_duration) {
+        (Some(frames), _) => frames,
+        (None, Some(range)) => gen_core_ltx::duration_head::resolve_auto_duration_frames(
+            range.max_seconds,
+            fps,
+            range,
+            TEMPORAL_SCALE,
+        )?
+        .min(MAX_FRAMES),
+        (None, None) => 1,
+    };
+    crate::drivers::render_plan_for_request(
+        family,
+        variant,
+        req,
+        resolved_frames,
+        fps,
+        has_temporal_upsampler,
+    )?;
     Ok(())
 }
 
@@ -374,14 +425,19 @@ impl Generator for Ltx {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        let result = if self.descriptor.id == MODEL_ID {
-            validate_request(&self.descriptor.capabilities, req)
-                .map_err(mlx_gen::gen_core::Error::from)
-        } else {
-            validate_request_for(self.descriptor.id, &self.descriptor.capabilities, req)
-                .map_err(mlx_gen::gen_core::Error::from)
+        let (family, has_temporal_upsampler) = match &self.execution {
+            LtxExecution::Ltx23 => (gen_core_ltx::LtxModelFamily::Ltx23, false),
+            LtxExecution::Ltx25(_) => (gen_core_ltx::LtxModelFamily::Ltx25, true),
         };
-        result?;
+        validate_request_with_route(
+            self.descriptor.id,
+            &self.descriptor.capabilities,
+            family,
+            self.transformer_variant(),
+            has_temporal_upsampler,
+            req,
+        )
+        .map_err(mlx_gen::gen_core::Error::from)?;
         if self.descriptor.id == MODEL_25_ID {
             if let (Some(contract), Some(memory)) =
                 (self.memory_strategy.as_ref(), req.memory.as_ref())

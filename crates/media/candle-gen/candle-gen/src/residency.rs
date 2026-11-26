@@ -20,6 +20,13 @@ impl gen_core::ResidencyRuntime for CandleResidencyRuntime {
         matches!(error, CandleError::ProcessPoisoned(_))
     }
 
+    fn suppresses_cleanup(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            CandleError::ProviderPoisoned(_) | CandleError::ProcessPoisoned(_)
+        )
+    }
+
     fn after_component_drop() {}
 }
 
@@ -90,10 +97,31 @@ pub fn synchronize_result<T>(device: &Device, result: Result<T>) -> Result<T> {
 }
 
 fn synchronize_result_with<T>(result: Result<T>, sync: impl FnOnce() -> Result<()>) -> Result<T> {
-    if matches!(&result, Err(CandleError::ProcessPoisoned(_))) {
+    if matches!(
+        &result,
+        Err(CandleError::ProviderPoisoned(_) | CandleError::ProcessPoisoned(_))
+    ) {
         return result;
     }
     finish_synchronized_phase(result, sync())
+}
+
+fn run_three_stage_phase<P, State, Out>(
+    state: &mut State,
+    load: impl FnOnce(&mut State) -> Result<P>,
+    use_phase: impl FnOnce(&P, &mut State) -> Result<Out>,
+    sync: &mut impl FnMut() -> Result<()>,
+) -> Result<Out> {
+    let phase = match load(state) {
+        Ok(phase) => phase,
+        Err(primary) => return synchronize_result_with(Err(primary), sync),
+    };
+    let used = use_phase(&phase, state);
+    if matches!(&used, Err(CandleError::ProcessPoisoned(_))) {
+        std::mem::forget(phase);
+        return used;
+    }
+    synchronize_result_with(used, sync)
 }
 
 /// Drive a video-specific three-component lifecycle while keeping at most one component resident.
@@ -108,31 +136,9 @@ pub fn run_three_stage_sequential<A, B, C, State, Out>(
     use_c: impl FnOnce(&C, &mut State) -> Result<Out>,
     mut sync: impl FnMut() -> Result<()>,
 ) -> Result<Out> {
-    {
-        let phase = match load_a(state) {
-            Ok(phase) => phase,
-            Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
-        };
-        let used = use_a(&phase, state);
-        let synced = sync();
-        finish_synchronized_phase(used, synced)?;
-    }
-    {
-        let phase = match load_b(state) {
-            Ok(phase) => phase,
-            Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
-        };
-        let used = use_b(&phase, state);
-        let synced = sync();
-        finish_synchronized_phase(used, synced)?;
-    }
-    let phase = match load_c(state) {
-        Ok(phase) => phase,
-        Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
-    };
-    let used = use_c(&phase, state);
-    let synced = sync();
-    finish_synchronized_phase(used, synced)
+    run_three_stage_phase(state, load_a, use_a, &mut sync)?;
+    run_three_stage_phase(state, load_b, use_b, &mut sync)?;
+    run_three_stage_phase(state, load_c, use_c, &mut sync)
 }
 
 fn finish_synchronized_phase<T>(used: Result<T>, synced: Result<()>) -> Result<T> {
@@ -158,6 +164,13 @@ mod tests {
             calls.set(calls.get() + 1);
             Ok(())
         };
+        let provider_poisoned: Result<()> =
+            Err(CandleError::ProviderPoisoned("stale rope cache".into()));
+        assert!(matches!(
+            synchronize_result_with(provider_poisoned, sync),
+            Err(CandleError::ProviderPoisoned(ref detail)) if detail == "stale rope cache"
+        ));
+        assert_eq!(calls.get(), 0);
         let poisoned: Result<()> = Err(CandleError::ProcessPoisoned("device lost".into()));
         assert!(matches!(
             synchronize_result_with(poisoned, sync),
@@ -171,6 +184,70 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(synchronize_result_with(Ok(()), sync).is_ok());
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn provider_poisoned_suppresses_device_sync_without_misclassifying_as_process_poisoned() {
+        use gen_core::ResidencyRuntime;
+
+        let provider = CandleError::ProviderPoisoned("stale rope cache".into());
+        assert!(!CandleResidencyRuntime::is_process_poisoned(&provider));
+        assert!(CandleResidencyRuntime::suppresses_cleanup(&provider));
+        let process = CandleError::ProcessPoisoned("cuda context lost".into());
+        assert!(CandleResidencyRuntime::is_process_poisoned(&process));
+        assert!(CandleResidencyRuntime::suppresses_cleanup(&process));
+        assert!(!CandleResidencyRuntime::suppresses_cleanup(
+            &CandleError::Msg("ordinary".into())
+        ));
+
+        let log = RefCell::new(Vec::new());
+        let result: Result<()> = run_sequential_with_sync(
+            &CancelFlag::new(),
+            &mut |_| {},
+            || {
+                Ok(Witness {
+                    name: "drop-text",
+                    log: &log,
+                })
+            },
+            |_| {
+                log.borrow_mut().push("encode-provider-poisoned");
+                Err::<u8, _>(CandleError::ProviderPoisoned("provider wedged".into()))
+            },
+            || {
+                log.borrow_mut().push("sync");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("load-heavy");
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        );
+        assert!(
+            matches!(result, Err(CandleError::ProviderPoisoned(ref message)) if message == "provider wedged")
+        );
+        assert_eq!(*log.borrow(), vec!["encode-provider-poisoned", "drop-text"]);
+
+        let warm_sync_calls = std::cell::Cell::new(0);
+        let warm_residency = Residency::<u8, u8>::request_scoped(|_| Ok(2), |_, _| Ok(3));
+        let warm_result: Result<()> = warm_residency.run_request_scoped(
+            false,
+            false,
+            &CancelFlag::new(),
+            false,
+            &mut |_| {},
+            |_| Err::<u8, _>(CandleError::ProviderPoisoned("warm encode wedged".into())),
+            |_| {
+                warm_sync_calls.set(warm_sync_calls.get() + 1);
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        );
+        assert!(
+            matches!(warm_result, Err(CandleError::ProviderPoisoned(ref message)) if message == "warm encode wedged")
+        );
+        assert_eq!(warm_sync_calls.get(), 0);
     }
 
     struct Witness<'a> {
