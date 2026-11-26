@@ -18,9 +18,9 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -93,16 +93,7 @@ pub struct Seedvr2Generator {
 }
 
 fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
-        return Err(Error::Msg(format!(
-            "{id}: ControlNet / IP-Adapter conditioning is not part of SeedVR2"
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{id}: LoRA/LoKr adapters are not supported"
-        )));
-    }
+    crate::video::Seedvr2RenderPlan::validate_load_spec(id, spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
@@ -156,7 +147,7 @@ impl mlx_gen::Generator for Seedvr2Generator {
     }
     fn validate(&self, req: &mlx_gen::GenerationRequest) -> mlx_gen::gen_core::Result<()> {
         let s = self;
-        s.validate_impl(req).map_err(Into::into)
+        s.validate_impl(req).map(|_| ()).map_err(Into::into)
     }
     fn generate(
         &self,
@@ -223,7 +214,21 @@ fn reference_image(req: &GenerationRequest) -> Option<&Image> {
 }
 
 impl Seedvr2Generator {
-    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
+    fn compile_render_plan(
+        &self,
+        req: &GenerationRequest,
+    ) -> Result<crate::video::Seedvr2RenderPlan> {
+        crate::video::Seedvr2RenderPlan::compile(
+            &self.descriptor,
+            req,
+            self.pipe.weights_bytes(),
+            crate::video::safe_budget_gib(),
+            None,
+        )
+        .map_err(Into::into)
+    }
+
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<crate::video::Seedvr2RenderPlan> {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -242,7 +247,7 @@ impl Seedvr2Generator {
             )));
         }
         reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
-        Ok(())
+        self.compile_render_plan(req)
     }
 
     fn generate_impl(
@@ -250,64 +255,50 @@ impl Seedvr2Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate_impl(req)?;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        let softness = req.softness.unwrap_or(0.0); // input pre-blur; reference default 0.0 (sc-4816)
+        let plan = self.validate_impl(req)?;
+        let base_seed = plan.base_seed;
+        let softness = plan.softness;
 
-        // Video upscale: a VideoClip carries the LR source frame sequence → one upscaled clip.
-        // F-099: `validate_impl` accepts the request if ANY clip is non-empty, so match that
-        // contract here by taking the first NON-empty clip — `into_iter().next()` would instead
-        // take the first clip unconditionally, so `[empty_clip, real_clip]` returned an empty
-        // video as success.
         if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            // F-099: `generate_video` reports per-chunk `Step{i, n}` progress itself (per-frame on
-            // the fallback paths) — a minutes-long N-chunk run used to surface a single Step{1,1}.
-            let frames = self.pipe.generate_video(
+            let frames = self.pipe.generate_video_for_route(
                 clip.frames,
                 req.width as i32,
                 req.height as i32,
                 base_seed,
                 softness,
-                None,
+                &plan.route,
                 &req.cancel,
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
-            return Ok(GenerationOutput::Video {
+            let output = GenerationOutput::Video {
                 frames,
                 fps: req.fps.unwrap_or(DEFAULT_FPS),
                 audio: None,
-            });
+            };
+            return plan.finish_output(output).map_err(Into::into);
         }
 
         let image = reference_image(req).expect("validated");
         let mut out = Vec::with_capacity(req.count as usize);
         let count = req.count as usize;
         for i in 0..req.count {
-            // Honor a cancel that arrives between output images for count > 1 (sc-5551); the per-tile
-            // and single-pass paths inside `generate_with_progress` check the flag at their own step
-            // boundaries (the tiled loop per tile, the single pass right after its `(1,1)` emit).
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
             let seed = base_seed.wrapping_add(i as u64);
             mlx_gen::video_execution::output_index(i as usize);
-            // F-162 / F-164 (sc-11133): fold each image's per-tile progress into ONE monotone bar
-            // across the whole count loop. `generate_with_progress` reports `(tile_idx, n_tiles)`
-            // (a lone `(1,1)` on the single-pass path); mapping it to
-            // `current = i·n_tiles + tile_idx`, `total = count·n_tiles` makes both the count axis
-            // (F-162) AND per-tile liveness (F-164) visible without the bar restarting per image or
-            // reporting a bare `Step{1,1}`.
             let idx = i as usize;
-            let img = self.pipe.generate_with_progress(
+            let img = self.pipe.generate_still_for_route(
                 image,
                 req.width as i32,
                 req.height as i32,
                 seed,
                 softness,
+                &plan.route,
                 &req.cancel,
                 &mut |tile_idx, n_tiles| {
                     let (current, total) = fold_tile_progress(idx, tile_idx, n_tiles, count);
@@ -316,10 +307,9 @@ impl Seedvr2Generator {
             )?;
             out.push(img);
         }
-        // F-162: emit the terminal decode phase exactly ONCE for the whole batch (the pre-fix code
-        // emitted it per image, violating the Decoding-exactly-once contract).
         on_progress(Progress::Decoding);
-        Ok(GenerationOutput::Images(out))
+        plan.finish_output(GenerationOutput::Images(out))
+            .map_err(Into::into)
     }
 }
 
@@ -574,5 +564,121 @@ mod tests {
             validate.contains("reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?"),
             "validate_impl must run the sc-20263 refusal:\n{validate}"
         );
+    }
+
+    #[test]
+    fn seedvr2_render_plan_resolves_all_five_routes_and_load_refusals_before_weights() {
+        use crate::video::{Seedvr2OutputLifecycle, Seedvr2RenderPlan, Seedvr2Route, GIB};
+
+        let desc = descriptor();
+        let wb = (7.3 * GIB) as usize;
+        let lr = frame();
+
+        assert!(Seedvr2RenderPlan::validate_load_spec(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::File("/single.safetensors".into())),
+        )
+        .is_err());
+
+        let still_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let p_single = Seedvr2RenderPlan::compile(&desc, &still_req, wb, 64.0, None).unwrap();
+        assert_eq!(p_single.route, Seedvr2Route::StillSinglePass);
+        assert!(matches!(
+            p_single.output_lifecycle,
+            Seedvr2OutputLifecycle::Images { .. }
+        ));
+
+        let p_still_tiled = Seedvr2RenderPlan::compile(
+            &desc,
+            &GenerationRequest {
+                width: 2048,
+                height: 2048,
+                ..still_req
+            },
+            wb,
+            256.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_still_tiled.route,
+            Seedvr2Route::StillSpatialTiled { .. }
+        ));
+
+        let vid_req = clip_request(0, 1.0);
+        let p_chunked = Seedvr2RenderPlan::compile(
+            &desc,
+            &GenerationRequest {
+                width: 512,
+                height: 512,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr.clone(); 20],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..vid_req.clone()
+            },
+            wb,
+            108.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_chunked.route,
+            Seedvr2Route::VideoTemporalChunked { .. }
+        ));
+
+        let p_per_frame = Seedvr2RenderPlan::compile(
+            &desc,
+            &GenerationRequest {
+                width: 1024,
+                height: 1024,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr.clone(); 8],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..vid_req.clone()
+            },
+            wb,
+            20.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_per_frame.route,
+            Seedvr2Route::VideoPerFrame { frame_count: 8 }
+        ));
+
+        let p_vid_tiled = Seedvr2RenderPlan::compile(
+            &desc,
+            &GenerationRequest {
+                width: 2048,
+                height: 2048,
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![lr; 4],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..vid_req
+            },
+            wb,
+            256.0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            p_vid_tiled.route,
+            Seedvr2Route::VideoSpatialTiled { frame_count: 4, .. }
+        ));
     }
 }

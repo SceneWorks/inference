@@ -49,6 +49,29 @@ pub trait LatentDecoder {
         }
         self.decode(latents)
     }
+
+    /// Decode `latents` while optionally hosted inside an active [`gen_core::RenderRun`] S10
+    /// (`MemoryPhase::Decode`) stage.
+    ///
+    /// Native VAEs inherit the forwarding default: if `run` is already inside `MemoryPhase::Decode`,
+    /// decode runs directly without double-entering the scope; otherwise it opens `run.decode_phase`
+    /// when `run` is provided. Inner-driver decoders such as `PidDecoder` override this to execute
+    /// their typed inner [`FamilyDriver`](gen_core::driver::FamilyDriver) via
+    /// `run.decode_phase_with_driver_with`.
+    fn decode_in_run(
+        &self,
+        latents: &Array,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        match run {
+            Some(r) if !r.is_in_decode_phase() => r.decode_phase(|| self.decode(latents)),
+            _ => self.decode(latents),
+        }
+    }
 }
 
 /// Require full latent-space compatibility before selecting an alternate decoder. Missing
@@ -213,5 +236,43 @@ mod tests {
             &malformed_decoder,
         )
         .is_err());
+    }
+
+    #[test]
+    fn decode_in_run_honors_active_decode_phase_and_cancellation() {
+        let decoder = ForwardingDecoder;
+        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 4]);
+        let cancel = CancelFlag::new();
+        let desc = gen_core::ModelDescriptor {
+            id: "decoder_test",
+            backend: "mlx",
+            family: "test",
+            modality: gen_core::Modality::Image,
+            capabilities: gen_core::Capabilities {
+                ..Default::default()
+            },
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let plan =
+            gen_core::RenderPlan::decode_stage(&desc, 64, 64, 1, 1, "euler", vec![1.0, 0.0], 1)
+                .unwrap();
+        let run = gen_core::RenderRun::new(&plan, &cancel, None);
+        let got = decoder
+            .decode_in_run(&input, Some(&run), Some(&cancel))
+            .unwrap();
+        assert_eq!(got.as_slice::<f32>(), input.as_slice::<f32>());
+        let nested = run
+            .decode_phase(|| decoder.decode_in_run(&input, Some(&run), None))
+            .unwrap();
+        assert_eq!(nested.as_slice::<f32>(), input.as_slice::<f32>());
+
+        cancel.cancel();
+        assert!(matches!(
+            decoder.decode_in_run(&input, Some(&run), Some(&cancel)),
+            Err(Error::Canceled)
+        ));
     }
 }
