@@ -29,3 +29,6 @@ serde_json = { workspace = true }
 safetensors = "0.7"
 half = "2"
 rayon = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

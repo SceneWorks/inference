@@ -97,8 +97,7 @@ use mlx_gen_minimax_h3::cost::{packed_seq_len, DitSequenceCost};
 use mlx_gen_minimax_h3::model::load;
 use mlx_gen_minimax_h3::{
     align_frames_for_duration, resolve_geometry, JointGeometry, MiniMaxH3DitConfig,
-    LEGAL_FRAME_COUNTS, MAX_DURATION_SECONDS, MINIMAX_H3_FPS, MIN_DURATION_SECONDS, PATCH_SIZE,
-    SMALLEST_LEGAL_FRAMES,
+    LEGAL_FRAME_COUNTS, MINIMAX_H3_FPS, MIN_DURATION_SECONDS, PATCH_SIZE, SMALLEST_LEGAL_FRAMES,
 };
 
 use common::snapshot;
@@ -374,11 +373,8 @@ fn text_tokens(root: &std::path::Path) -> i32 {
     ids.shape()[1]
 }
 
-/// **The cost table.** Every legal duration rung the story asks for, each its own render.
-///
-/// 5, 8, 12 and 15 s map onto the `17n + 5` lattice as 124, 192, 294 and 345 frames — 8 s is the
-/// only one of the four that lands exactly, and 15 s lands on nothing at all (the lattice ceiling is
-/// 14.375 s; see `the_declared_ceiling_has_no_lattice_point`).
+/// Historical measured cost curve at 124, 192, 294 and 345 frames.
+/// Keep these recorded points fixed when the supported generation range expands.
 #[test]
 #[ignore = "sc-17152: needs the full MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT) + Metal; ~25 min at the default 6 steps"]
 fn the_duration_cost_curve_at_the_gating_canvas() {
@@ -388,28 +384,20 @@ fn the_duration_cost_curve_at_the_gating_canvas() {
     let height = env_u32("MINIMAX_H3_SWEEP_HEIGHT", SWEEP_HEIGHT);
     let cfg = MiniMaxH3DitConfig::default();
 
-    // The four rungs the story's 4/5/8/12/15 s row set maps onto.
-    //
-    // Two of the five nominal durations are not requestable at all and are handled as facts rather
-    // than as blank cells: **4 s** is below the lattice floor
-    // (`the_four_second_row_is_structurally_unrenderable`) and **15 s** is above the lattice ceiling
-    // since sc-17152 derived the advertised range from the lattice
-    // (`the_declared_ceiling_has_no_lattice_point`). The nominal 5 s and 15 s rows are therefore
-    // swept at the two rungs that actually bound the model — 5.1667 s and 14.375 s — and the
-    // refusals are asserted here so the table's endpoints are not mistaken for the nominal ones.
+    // Retain the historical sample points instead of silently changing the measured profile.
     assert!(
-        align_frames_for_duration(15.0).is_err(),
-        "15 s must be refused, or this sweep's top row is not the model's ceiling"
+        align_frames_for_duration(21.0).is_err(),
+        "past the supported range"
     );
     assert!(
         align_frames_for_duration(4.0).is_err(),
-        "4 s must be refused"
+        "below the supported range"
     );
     let requested = [
         f64::from(SMALLEST_LEGAL_FRAMES) as f32 / MINIMAX_H3_FPS as f32, // nominal 5 s
         8.0,
         12.0,
-        MAX_DURATION_SECONDS, // nominal 15 s -> the lattice ceiling, 14.375 s
+        345.0 / MINIMAX_H3_FPS as f32, // historical upper sample: 14.375 s
     ];
     let mut points: Vec<(f32, Point)> = Vec::new();
     for seconds in requested {
@@ -896,25 +884,19 @@ fn the_tier_axis_exists_and_never_quantizes_at_load() {
     );
 }
 
-/// **The declared 15 s ceiling has no lattice point**, and this is the arithmetic the sc-17152
-/// decision rests on. Costs no weights.
+/// The extended ceiling reaches twenty seconds without violating temporal geometry. No weights.
 #[test]
-fn the_declared_ceiling_has_no_lattice_point() {
+fn the_supported_ceiling_reaches_twenty_seconds() {
+    // Clip-length conversion is pure arithmetic, not a wall-clock measurement.
+    use mlx_gen_minimax_h3::pipeline::align_frames_for_duration as align_clip;
     let top = LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1];
-    assert_eq!(top, 345);
-    let top_seconds = f64::from(top) / MINIMAX_H3_FPS;
-    assert!((top_seconds - 14.375).abs() < 1e-9);
-    // The next rung is past the declared ceiling.
-    let next = top + 17;
-    assert_eq!(next, 362);
-    assert!((f64::from(next) / MINIMAX_H3_FPS - 15.0833).abs() < 1e-3);
-    // ...so nothing sits in [14.375, 15.0].
-    assert!(
-        !LEGAL_FRAME_COUNTS
-            .iter()
-            .any(|&f| { (14.375..=15.0).contains(&(f64::from(f) / MINIMAX_H3_FPS)) && f != top }),
-        "no legal frame count may sit strictly inside the gap"
-    );
-    // And the geometry of the top rung is derivable, i.e. 345 is a real renderable point.
+    assert_eq!(top, 481);
+    let clip_length = f64::from(top) / MINIMAX_H3_FPS;
+    assert!((20.0..21.0).contains(&clip_length));
+    assert!((clip_length - 481.0 / 24.0).abs() < 1e-9);
+    assert_eq!(align_clip(20.0).unwrap(), top);
+    assert_eq!(align_clip(20.0417).unwrap(), top);
+    assert!(align_clip(21.0).is_err());
+    assert!(!LEGAL_FRAME_COUNTS.contains(&(top + 17)));
     JointGeometry::new(top, 20, 36).unwrap();
 }

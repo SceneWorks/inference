@@ -1411,13 +1411,25 @@ pub fn repack_packed_weight(
     group_size: usize,
     device: &Device,
 ) -> Result<QTensor> {
+    crate::quantization_cache::repack_affine_cached(wq, scales, biases, group_size, device, || {
+        repack_packed_weight_uncached(wq, scales, biases, group_size, device)
+    })
+}
+
+fn repack_packed_weight_uncached(
+    wq: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    group_size: usize,
+    device: &Device,
+) -> Result<QTensor> {
     let (wq_cols, s_cols) = (wq.dims2()?.1, scales.dims2()?.1);
     match mlx_packed_bits_gs(wq_cols, s_cols, group_size) {
         4 => repack_mlx_q4_to_q4_1_gs(wq, scales, biases, group_size, device),
         8 => {
             let grid = dequant_mlx_q8_gs(wq, scales, biases, group_size)?;
             // `quantize_onto` needs a CPU source; `dequant_mlx_q8_gs` already returns on the CPU.
-            crate::quantization_cache::quantize_cached(&grid, GgmlDType::Q8_0, device)
+            QTensor::quantize_onto(&grid, GgmlDType::Q8_0, device)
         }
         b => candle_core::bail!(
             "unsupported MLX packed bit-width {b} (wq {wq_cols}, scales {s_cols}, group {group_size})"

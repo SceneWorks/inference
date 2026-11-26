@@ -17,8 +17,8 @@
 //! * **spatial stride 32** — [`SPATIAL_STRIDE`], the VAE's 16× compression times the DiT's width
 //!   patch of 2. A canvas that survives the VAE but is not a whole number of patch columns wide has
 //!   no packed representation at all;
-//! * **frames `17n + 5`** — [`crate::denoise::LEGAL_FRAME_COUNTS`], 124…345 under the hardcoded
-//!   5–15 s duration clamp. This is *not* the `4k + 1` a 4× temporal downsample suggests: the video
+//! * **frames `17n + 5`** — [`crate::denoise::LEGAL_FRAME_COUNTS`], 124…481 under the supported
+//!   duration range. This is *not* the `4k + 1` a 4× temporal downsample suggests: the video
 //!   VAE decodes in 17-frame chunks producing 5 latents each, so `5k + 2` latents cover `17k + 5`
 //!   frames and every other count desynchronizes the picture from the soundtrack
 //!   ([`crate::denoise::geometry`]).
@@ -103,35 +103,8 @@ pub const MAX_CANVAS_EDGE: u32 = 2016;
 pub const MIN_DURATION_SECONDS: f32 =
     crate::denoise::LEGAL_FRAME_COUNTS[0] as f32 / MINIMAX_H3_FPS as f32;
 
-/// Longest clip the released model generates, in seconds — **the lattice ceiling**, 345 frames.
-///
-/// # 14.375 s, not the advertised 15.0 (sc-17152)
-///
-/// The reference pipeline's `max_duration` is **15.0 s**, but its `align_num_frames` walks the
-/// `17n + 5` lattice and the largest rung inside that declaration is `LEGAL_FRAME_COUNTS[13] = 345`
-/// = **14.375 s**. The next rung, 362 frames, is 15.083 s and past it. **No lattice point sits in
-/// `[14.375, 15.0]`**, so a caller asking for the documented maximum has nothing exact to land on —
-/// and the floor had the mirror-image gap at 5.0 s against 124 frames' 5.1667 s.
-///
-/// Both bounds are therefore **derived from the lattice** rather than declared alongside it. Three
-/// reasons, in the order they decided it:
-///
-/// 1. **An advertised bound must be reachable.** sc-17147 kept 15.0 and clamped the aligned count to
-///    the ceiling, which delivers 14.375 s of picture for a 15 s request without telling the caller
-///    — the same quiet refit the `frames` path exists to prevent, applied to three quarters of a
-///    second. Refusing 15.0 s is worse than delivering 14.375 s **only if 15.0 s is real**, and it
-///    is not: nothing upstream can produce it either.
-/// 2. **Admitting 362 frames would be an untested extension, not a fix.** The lattice has no upper
-///    term of its own and MM-RoPE is computed rather than tabulated, so 362 is arithmetically fine —
-///    but the reference pipeline never emits it, so no upstream render has ever exercised it. Taking
-///    the envelope *past* what upstream ships, on our own authority, is a larger commitment than
-///    trimming an unreachable 0.625 s.
-/// 3. **Derived bounds cannot drift apart again.** The declaration and the lattice disagreeing is
-///    the defect; making one the source of the other removes the class.
-///
-/// The consequence is that [`align_frames_for_duration`] needs no ceiling clamp: every duration in
-/// range now aligns *upward* onto a real rung, at both ends, which is the single policy sc-17147
-/// asked for.
+/// Longest supported clip, derived from the shared 481-frame ceiling (about 20.04 seconds).
+/// The original 15-second policy is extended; temporal spacing, canvas and memory checks remain.
 pub const MAX_DURATION_SECONDS: f32 = crate::denoise::LEGAL_FRAME_COUNTS
     [crate::denoise::LEGAL_FRAME_COUNTS.len() - 1] as f32
     / MINIMAX_H3_FPS as f32;
@@ -216,9 +189,8 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 /// The requested **duration** is range-checked against
 /// [`MIN_DURATION_SECONDS`]–[`MAX_DURATION_SECONDS`], which are the lattice's own two ends, and the
 /// count is then aligned **upward** onto a rung. Because the range is the lattice's, the walk can
-/// never leave it: the largest in-range duration is exactly 345 frames, so no ceiling clamp is
-/// needed and there is no duration in range that silently renders shorter than it asked for
-/// (sc-17152 — see [`MAX_DURATION_SECONDS`] for why 15.0 s is not in range).
+/// never leave it: the largest in-range duration is exactly 481 frames, so no ceiling clamp is
+/// needed and there is no duration in range that silently renders shorter than it asked for.
 ///
 /// Alignment is upward within the range, so a caller that asks for 5.2 s gets 141 frames (5.875 s)
 /// and one that asks for 14.3 s gets 345 (14.375 s) — always at or above the request, never below.
@@ -1103,65 +1075,25 @@ mod tests {
         assert!(resolve_geometry(576, 320, SMALLEST_LEGAL_FRAMES - 17).is_err());
     }
 
-    /// **The advertised duration range IS the lattice** (sc-17152), at both ends.
-    ///
-    /// The reference pipeline declares 5–15 s while its own `17n + 5` lattice runs 5.1667–14.375 s,
-    /// so both declared endpoints are unreachable. Deriving the bounds from
-    /// [`LEGAL_FRAME_COUNTS`] makes every in-range duration land on a rung at or above itself, and
-    /// makes both out-of-range endpoints a refusal rather than a silent 0.625 s short delivery.
+    /// Bounds derive from the supported lattice; in-range alignment never shortens a request.
     #[test]
     fn the_advertised_duration_range_is_the_lattice_at_both_ends() {
-        // Derived, not declared — the two must agree by construction.
         assert!((f64::from(MIN_DURATION_SECONDS) - 124.0 / 24.0).abs() < 1e-6);
-        assert_eq!(MAX_DURATION_SECONDS, 14.375);
-        assert!(
-            (f64::from(LEGAL_FRAME_COUNTS[13]) / MINIMAX_H3_FPS - 14.375).abs() < 1e-9,
-            "the lattice ceiling really is short of the reference's declared 15 s"
-        );
-
-        // Both declared-but-unreachable endpoints are now refused rather than quietly refit.
-        for (label, seconds) in [
-            ("the reference's declared 5.0 s floor", 5.0f32),
-            ("the reference's declared 15.0 s ceiling", 15.0),
-        ] {
-            let e = align_frames_for_duration(seconds)
-                .expect_err(&format!(
-                    "{label} is not on the lattice and must be refused"
-                ))
-                .to_string();
-            assert!(e.contains("outside the model"), "{label}: {e}");
+        assert!((f64::from(MAX_DURATION_SECONDS) - 481.0 / 24.0).abs() < 1e-6);
+        for (seconds, frames) in [(5.1667f32, 124), (15.0, 362), (20.0, 481), (20.0417, 481)] {
+            assert_eq!(align_frames_for_duration(seconds).unwrap(), frames);
+            resolve_geometry(576, 320, frames).unwrap();
         }
-
-        // Every in-range duration aligns UPWARD onto a real rung — never below the request, and
-        // never off the lattice.
-        for (seconds, frames) in [
-            (5.1667f32, 124),
-            (5.3, 141),
-            (8.0, 192),
-            (12.0, 294),
-            (14.3, 345),
-            (14.375, 345),
-        ] {
-            let got = align_frames_for_duration(seconds).unwrap();
-            assert_eq!(got, frames, "{seconds} s");
-            assert!(LEGAL_FRAME_COUNTS.contains(&got));
-            assert!(
-                f64::from(got) / MINIMAX_H3_FPS >= f64::from(seconds) - 1e-4,
-                "{seconds} s aligned DOWN to {got} frames"
-            );
-        }
-        // ...and the aligned count always resolves, i.e. alignment cannot produce a geometry the
-        // gate then rejects.
         for &frames in &LEGAL_FRAME_COUNTS {
-            let seconds = frames as f32 / MINIMAX_H3_FPS as f32;
-            let aligned = align_frames_for_duration(seconds).unwrap();
-            assert_eq!(aligned, frames);
-            resolve_geometry(576, 320, aligned).unwrap();
+            assert_eq!(
+                align_frames_for_duration(frames as f32 / 24.0).unwrap(),
+                frames
+            );
+            resolve_geometry(576, 320, frames).unwrap();
         }
-
-        assert!(align_frames_for_duration(0.5).is_err(), "below the floor");
-        assert!(align_frames_for_duration(16.0).is_err(), "past the ceiling");
-        assert!(align_frames_for_duration(f32::NAN).is_err());
+        for seconds in [5.0, 20.0418, 21.0, f32::NAN] {
+            assert!(align_frames_for_duration(seconds).is_err());
+        }
     }
 
     /// Patchify and unpatchify are exact inverses, and the row order really is frame-major.
@@ -1287,8 +1219,8 @@ mod tests {
             );
         }
         assert_eq!(
-            corrected, 9,
-            "9 of the 14 legal durations need a correction; 141/192/243/294/345 are exact"
+            corrected, 15,
+            "15 of the 22 legal durations need a correction; multiples of three are exact"
         );
 
         // Stems are delivered at the picture's length too — including one whose length is not a

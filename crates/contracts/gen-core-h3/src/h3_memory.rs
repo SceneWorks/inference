@@ -13,7 +13,7 @@ pub use gen_core::h3_memory::FFN_INTERMEDIATE_BUDGET;
 pub use gen_core::h3_memory::{
     align_frames_for_duration, resolve_request_frames, NativeAllocationFacts, NativeBackend,
     NativeProjection, NativeRows, NativeTaskAllocation, NativeTaskSelection, RowDomain,
-    DEFAULT_DURATION_SECONDS, FPS, MAX_FRAMES, MIN_FRAMES,
+    DEFAULT_DURATION_SECONDS, FPS, LEGAL_FRAME_COUNTS, MAX_FRAMES, MIN_FRAMES,
 };
 use gen_core::w4a8_int8::W4A8Int8;
 use gen_core::weightsmeta::{self, Dtype, SafetensorsTensorHeader};
@@ -195,9 +195,9 @@ pub fn validate_request_geometry(width: u32, height: u32, frames: u64, count: u3
             "minimax_h3: {frames} frames must be on the 17n + 5 lattice"
         )));
     }
-    if !(124..=345).contains(&frames) {
+    if !(u64::from(MIN_FRAMES)..=u64::from(MAX_FRAMES)).contains(&frames) {
         return Err(invalid(format!(
-            "minimax_h3: {frames} frames is outside the model's 124-345 frame range"
+            "minimax_h3: {frames} frames is outside the model's {MIN_FRAMES}-{MAX_FRAMES} frame range"
         )));
     }
     Ok(())
@@ -1918,6 +1918,14 @@ mod tests {
             "incompatible selected reference-task temporal patch"
         );
         req.conditioning.clear();
+        req.frames = Some(345);
+        let short = facts.denoise_peak_bytes(facts.request_rows((&req).into(), 4).unwrap());
+        req.frames = Some(481);
+        let long = facts.denoise_peak_bytes(facts.request_rows((&req).into(), 4).unwrap());
+        assert!(
+            long > short,
+            "twenty-second requests must pay for their additional tokens"
+        );
         for (width, height, frames, count) in [
             (1345, 768, 124, 1),
             (1344, 1344, 124, 1),
@@ -1971,5 +1979,19 @@ mod tests {
         let (mut headers, payloads) = fixture(true, &[256]);
         headers.retain(|h| !h.name.ends_with("weight_s_rel"));
         assert!(allocation_from_headers(&headers, &payloads, CUDA, 2, |_| None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod extended_geometry_tests {
+    use super::*;
+    #[test]
+    fn twenty_second_geometry_is_admitted_without_relaxing_the_lattice() {
+        for frames in [362, 464, 481] {
+            validate_request_geometry(576, 320, frames, 1).unwrap();
+        }
+        for frames in [480, 482, 498] {
+            assert!(validate_request_geometry(576, 320, frames, 1).is_err());
+        }
     }
 }

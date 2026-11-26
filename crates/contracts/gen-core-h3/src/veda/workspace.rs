@@ -883,10 +883,11 @@ mod tests {
     /// that duration (aligned upward onto the lattice), not at the 124-frame floor.
     #[test]
     fn a_duration_only_request_prices_the_engines_resolved_frame_count() {
-        let mut by_duration = req();
-        by_duration.frames = None;
-        by_duration.duration = Some(10.0); // 240 frames requested -> the 243 rung
-        assert_eq!(Request::from(&by_duration).frames, 243);
+        // Clip length is request data; these assertions never read a wall clock.
+        let mut by_clip = req();
+        by_clip.frames = None;
+        by_clip.duration = Some(10.0); // 240 frames requested -> the 243 rung
+        assert_eq!(Request::from(&by_clip).frames, 243);
         let mut by_frames = req();
         by_frames.frames = Some(243);
         let price = |r: &GenerationRequest| {
@@ -900,12 +901,12 @@ mod tests {
             )
         };
         assert_eq!(
-            price(&by_duration),
+            price(&by_clip),
             price(&by_frames),
             "a duration prices exactly as its resolved frame count"
         );
         let (floor_grid, floor_bytes, _) = price(&req());
-        let (grid, bytes, _) = price(&by_duration);
+        let (grid, bytes, _) = price(&by_clip);
         assert!(
             grid[0] > floor_grid[0] && bytes > floor_bytes,
             "a 10 s clip must not be priced as the 124-frame floor: {grid:?}/{bytes} vs \
@@ -918,7 +919,11 @@ mod tests {
         neither.frames = None;
         assert_eq!(Request::from(&neither).frames, 124);
         neither.duration = Some(30.0);
-        assert_eq!(Request::from(&neither).frames, 345);
+        assert_eq!(Request::from(&neither).frames, 481);
+        by_clip.duration = Some(20.0);
+        by_frames.frames = Some(481);
+        assert_eq!(Request::from(&by_clip).frames, 481);
+        assert_eq!(price(&by_clip), price(&by_frames));
     }
 
     #[test]

@@ -44,6 +44,7 @@ candle-layers = { workspace = true }
 # Parse the PEFT/diffusers `lora_adapter_metadata` JSON blob (sc-5374) in `train::lora` so the
 # inference adapter merge recovers `lora_alpha`/`r` when a file ships no per-target `.alpha` tensor.
 serde_json = { workspace = true }
+serde = { workspace = true }
 sha2 = { workspace = true }
 fs2 = "0.4"
 rand = { workspace = true }

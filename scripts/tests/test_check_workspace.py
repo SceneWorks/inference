@@ -844,7 +844,7 @@ class AudioHubLayoutDerivationTests(unittest.TestCase):
             {"crates/audio/candle-audio-x/tests/real_weights.rs": self.DERIVATION}
         )
         self.assertIsNotNone(failure)
-        self.assertIn("candle-audio-x/tests/real_weights.rs:2", failure)
+        self.assertIn("candle-audio-x/tests/real_weights.rs:2", failure.replace("\\", "/"))
 
     def test_the_one_helper_and_non_audio_crates_pass(self) -> None:
         self.assertIsNone(
@@ -1785,9 +1785,9 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
         self.assertEqual(reference["VAE_RATIO_T"], (4.0,))
         self.assertEqual(reference["FRAMES_PER_CHUNK"], (17.0,))
         self.assertEqual(reference["LATENTS_PER_CHUNK"], (5.0,))
-        self.assertEqual(len(reference["LEGAL_FRAME_COUNTS"]), 14)
+        self.assertEqual(len(reference["LEGAL_FRAME_COUNTS"]), 22)
         self.assertEqual(reference["LEGAL_FRAME_COUNTS"][0], 124.0)
-        self.assertEqual(reference["LEGAL_FRAME_COUNTS"][-1], 345.0)
+        self.assertEqual(reference["LEGAL_FRAME_COUNTS"][-1], 481.0)
 
     def test_every_dual_backend_family_in_the_workspace_is_reached(self) -> None:
         """The sc-19496 clause, asserted with no maintained number: the families the gate compares
