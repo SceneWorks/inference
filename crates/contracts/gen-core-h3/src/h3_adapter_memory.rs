@@ -943,6 +943,61 @@ mod tests {
         assert_eq!(p.projections.len(), 4);
     }
 
+    #[test]
+    fn converted_comfy_trainer_metadata_prices_like_the_unstamped_file() {
+        let original = file(vec![
+            h(
+                "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
+                Dtype::F32,
+                &[16, 5376],
+            ),
+            h(
+                "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+                Dtype::F32,
+                &[21504, 16],
+            ),
+            h(
+                "diffusion_model.blocks.0.mlp.fc1.lora_A.weight",
+                Dtype::F32,
+                &[16, 5376],
+            ),
+            h(
+                "diffusion_model.blocks.0.mlp.fc1.lora_B.weight",
+                Dtype::F32,
+                &[28672, 16],
+            ),
+        ]);
+        let mut stamped = original.clone();
+        stamped.metadata.insert(
+            "ss_network_module".into(),
+            weightsmeta::MINIMAX_H3_TRAINER_NETWORK_MODULE.into(),
+        );
+        stamped
+            .metadata
+            .insert("ss_network_dim".into(), "16".into());
+        stamped
+            .metadata
+            .insert("ss_network_alpha".into(), "16.0".into());
+        let mut targets = ["to_q", "to_k", "to_v"]
+            .into_iter()
+            .map(|n| target(&format!("transformer_blocks.0.attn.{n}"), 5376, 7168, false))
+            .collect::<Vec<_>>();
+        targets.push(target(
+            "transformer_blocks.0.ff.net.0.proj",
+            5376,
+            28672,
+            false,
+        ));
+        for backend in [CANDLE, MLX] {
+            let plain =
+                profile_from_headers(backend, std::slice::from_ref(&original), &targets).unwrap();
+            let converted =
+                profile_from_headers(backend, std::slice::from_ref(&stamped), &targets).unwrap();
+            assert_eq!(converted.projections.len(), 4);
+            assert_eq!(converted, plain);
+        }
+    }
+
     /// SW-7096: a generic kohya file prices through the shared rewrite exactly as its dotted
     /// twin, and one key naming no module refuses the file rather than pricing part of it.
     #[test]

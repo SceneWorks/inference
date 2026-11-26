@@ -1428,8 +1428,9 @@ pub fn validate_minimax_h3_trainer_layout(
 /// both backends' installs and the adapter-memory pricing route it identically (SW-7096).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MiniMaxH3LoraKeySpace {
-    /// The exact `networks.lora_minimax_h3` trainer export: stamped with that module, so it is
-    /// held to [`validate_minimax_h3_trainer_layout`]'s complete 50 × 4 census.
+    /// The exact flattened `networks.lora_minimax_h3` trainer export: stamped with that module
+    /// and carrying `lora_unet_` keys, so it is held to
+    /// [`validate_minimax_h3_trainer_layout`]'s complete 50 × 4 census.
     Trainer,
     /// A generic kohya file: `lora_unet_` keys without the trainer's module stamp. Every key is
     /// rewritten through [`minimax_h3_kohya_key_to_dotted`]; one that does not resolve refuses the
@@ -1441,8 +1442,10 @@ pub enum MiniMaxH3LoraKeySpace {
 
 /// Classify a MiniMax-H3 LoRA file's key space (SW-7096).
 ///
-/// A file whose metadata claims [`MINIMAX_H3_TRAINER_NETWORK_MODULE`] is the exact trainer export
-/// and keeps its strict census. Any other `lora_unet_` file is generic kohya — community trainers
+/// A flattened file whose metadata claims [`MINIMAX_H3_TRAINER_NETWORK_MODULE`] is the exact
+/// trainer export and keeps its strict census. Converted dotted exports can retain that stamp;
+/// their tensor keys select the existing ComfyUI/PEFT route. Any other `lora_unet_` file is generic
+/// kohya — community trainers
 /// (kohya sd-scripts, musubi-tuner) write `ss_network_module = "networks.lora"` and train subsets
 /// of the blocks, which the trainer census would refuse although every key maps to a real module.
 /// The kohya route applies the same raw-module conversion the trainer route does (fused QKV split,
@@ -1459,9 +1462,10 @@ pub fn classify_minimax_h3_lora_key_space<'a>(
         classify_minimax_h3_trainer_namespace(keys.iter().copied(), network_module, network_type)?;
     let stamped =
         network_module.is_some_and(|module| module.trim() == MINIMAX_H3_TRAINER_NETWORK_MODULE);
-    Ok(if trainer && stamped {
+    let kohya = keys_are_kohya(keys.iter().copied());
+    Ok(if trainer && stamped && kohya {
         MiniMaxH3LoraKeySpace::Trainer
-    } else if keys_are_kohya(keys.iter().copied()) {
+    } else if kohya {
         MiniMaxH3LoraKeySpace::Kohya
     } else {
         MiniMaxH3LoraKeySpace::Dotted
@@ -2440,6 +2444,41 @@ mod tests {
         );
         // The trainer/LoKr mixing refusal still runs first.
         assert!(classify_minimax_h3_lora_key_space(raw, None, Some("lokr")).is_err());
+    }
+
+    #[test]
+    fn minimax_h3_converted_exports_retain_the_trainer_stamp() {
+        for keys in [
+            vec![
+                "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
+                "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+            ],
+            vec![
+                "transformer_blocks.0.attn.to_q.lora_A.default.weight",
+                "transformer_blocks.0.attn.to_q.lora_B.default.weight",
+            ],
+        ] {
+            assert_eq!(
+                classify_minimax_h3_lora_key_space(
+                    keys,
+                    Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                    None,
+                ),
+                Ok(MiniMaxH3LoraKeySpace::Dotted)
+            );
+        }
+        // A dotted key cannot route a mixed trainer file around its strict census.
+        assert_eq!(
+            classify_minimax_h3_lora_key_space(
+                [
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight",
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+                ],
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                None,
+            ),
+            Ok(MiniMaxH3LoraKeySpace::Trainer)
+        );
     }
 
     #[test]
