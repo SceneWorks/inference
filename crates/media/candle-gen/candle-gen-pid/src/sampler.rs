@@ -49,6 +49,21 @@ fn core_err(err: CandleError) -> gen_core::Error {
     err.into()
 }
 
+pub(crate) fn pid_driver_support() -> DriverSupport {
+    DriverSupport {
+        driver_id: "candle_pid_sampler",
+        arbitrary_slice: false,
+        carry_history: false,
+        reset_history: false,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons::default(),
+    }
+}
+
 /// Typed [`FamilyDriver`] executing Candle PiD's pixel-diffusion sampler schedule (`Sde` or `Ode`).
 pub struct PidSamplerDriver<F> {
     t_list: Vec<f32>,
@@ -57,6 +72,7 @@ pub struct PidSamplerDriver<F> {
     eps: Vec<Tensor>,
     forward: F,
     support: DriverSupport,
+    run_cancel: Option<CancelFlag>,
 }
 
 impl<F> PidSamplerDriver<F> {
@@ -68,18 +84,8 @@ impl<F> PidSamplerDriver<F> {
             sde,
             eps,
             forward,
-            support: DriverSupport {
-                driver_id: "candle_pid_sampler",
-                arbitrary_slice: false,
-                carry_history: false,
-                reset_history: false,
-                renoise_from_clean: false,
-                geometry_change: false,
-                read_only_boundary_estimate: false,
-                previous_estimate_capture: false,
-                uses_global_rng: false,
-                refusal_reasons: DriverRefusalReasons::default(),
-            },
+            support: pid_driver_support(),
+            run_cancel: None,
         }
     }
 
@@ -94,13 +100,27 @@ impl<F> PidSamplerDriver<F> {
         )
     }
 
-    fn num_eps(&self) -> usize {
-        if !self.sde {
-            return 0;
-        }
-        (1..self.t_list.len())
-            .filter(|&i| self.t_list[i] > 0.0)
-            .count()
+    /// Bind an auxiliary cooperative cancellation flag (such as an enclosing `RenderRun::cancel()`)
+    /// checked at every step alongside `SliceInput::cancel`.
+    pub fn with_run_cancel(mut self, cancel: CancelFlag) -> Self {
+        self.run_cancel = Some(cancel);
+        self
+    }
+
+    fn is_canceled(&self, input_cancel: &CancelFlag) -> bool {
+        input_cancel.is_cancelled()
+            || self
+                .run_cancel
+                .as_ref()
+                .is_some_and(CancelFlag::is_cancelled)
+    }
+}
+
+#[cfg(test)]
+impl<F> PidSamplerDriver<F> {
+    pub(crate) fn with_arbitrary_slice(mut self, allow: bool) -> Self {
+        self.support.arbitrary_slice = allow;
+        self
     }
 }
 
@@ -116,10 +136,33 @@ impl<F: PidVelocityForward> FamilyDriver<Tensor> for PidSamplerDriver<F> {
         hooks: &mut StepHooks<'_, Tensor>,
     ) -> gen_core::Result<BoundaryState<Tensor>> {
         self.support.validate_slice(&input, state)?;
-        if input.cancel.is_cancelled() {
+        if self.is_canceled(input.cancel) {
             return Err(gen_core::Error::Canceled);
         }
-        let required_eps = self.num_eps();
+        if !self.support.arbitrary_slice && input.span.end != input.total_steps {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: {}",
+                self.support.driver_id, self.support.refusal_reasons.arbitrary_slice
+            )));
+        }
+        if self.t_list.len() < 2
+            || self.t_list.len() != input.total_steps + 1
+            || self.t_list.len() <= input.span.end
+        {
+            return Err(gen_core::Error::Msg(format!(
+                "pid sampler: schedule length {} does not match total_steps={} for span {:?}",
+                self.t_list.len(),
+                input.total_steps,
+                input.span
+            )));
+        }
+        let required_eps = if !self.sde {
+            0
+        } else {
+            (1..=input.span.end)
+                .filter(|&idx| self.t_list[idx] > 0.0)
+                .count()
+        };
         if self.eps.len() < required_eps {
             return Err(gen_core::Error::Msg(format!(
                 "pid sampler: need {required_eps} eps draws for this schedule, got {}",
@@ -152,7 +195,7 @@ impl<F: PidVelocityForward> FamilyDriver<Tensor> for PidSamplerDriver<F> {
         let b = x.dim(0).map_err(CandleError::from).map_err(core_err)?;
         let device = x.device().clone();
         for i in input.span.clone() {
-            if input.cancel.is_cancelled() {
+            if self.is_canceled(input.cancel) {
                 return Err(gen_core::Error::Canceled);
             }
             let t_cur = self.t_list[i];
@@ -203,16 +246,19 @@ impl<F: PidVelocityForward> FamilyDriver<Tensor> for PidSamplerDriver<F> {
             hooks.materialize(&info, &x)?;
             state.record_outer_step(i);
             hooks.emit_progress(&info);
-            if input.cancel.is_cancelled() {
+            if self.is_canceled(input.cancel) {
                 return Err(gen_core::Error::Canceled);
             }
         }
-        let clamped = x
-            .clamp(-1.0f32, 1.0f32)
-            .map_err(CandleError::from)
-            .map_err(core_err)?;
+        let out = if input.span.end == input.total_steps {
+            x.clamp(-1.0f32, 1.0f32)
+                .map_err(CandleError::from)
+                .map_err(core_err)?
+        } else {
+            x
+        };
         state.finish_slice(input.span.end);
-        Ok(BoundaryState::XSigma(clamped))
+        Ok(BoundaryState::XSigma(out))
     }
 }
 
@@ -268,6 +314,53 @@ impl Sampler {
         Ok((x - (v * t as f64)?)?)
     }
 
+    /// Execute [`PidSamplerDriver`] through [`run_candle_driver_slices`] into `driver_state`,
+    /// binding an optional `run_cancel` (e.g. from an enclosing `RenderRun::cancel()`) alongside
+    /// `cancel`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drive_with_driver_state<F: Fn(&Tensor, &Tensor) -> Result<Tensor>>(
+        &self,
+        noise: &Tensor,
+        eps: Vec<Tensor>,
+        seed: u64,
+        cancel: Option<&CancelFlag>,
+        run_cancel: Option<&CancelFlag>,
+        driver_state: &mut DriverRunState,
+        forward: F,
+    ) -> Result<Tensor> {
+        let total_steps = self.steps();
+        let mut driver = PidSamplerDriver::from_sampler(self, eps, forward);
+        if let Some(rc) = run_cancel {
+            driver = driver.with_run_cancel(rc.clone());
+        }
+        let fallback_cancel = CancelFlag::new();
+        let cancel = cancel.unwrap_or(&fallback_cancel);
+        let dims = noise.dims();
+        let geometry = (dims.len() >= 4).then(|| (dims[3] as u32, dims[2] as u32));
+        let mut on_progress = |_| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let mut spec = SliceSpec::full(total_steps);
+        spec.geometry = geometry;
+        let out_state = run_candle_driver_slices(
+            &driver,
+            [spec],
+            BoundaryState::XSigma(noise.clone()),
+            total_steps,
+            seed,
+            cancel,
+            None,
+            driver_state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )?;
+        let BoundaryState::XSigma(out) = out_state else {
+            return Err(CandleError::Msg(
+                "pid sampler driver returned non-XSigma state".into(),
+            ));
+        };
+        Ok(out)
+    }
+
     /// Execute [`PidSamplerDriver`] through [`run_candle_driver_slices`], optionally hosted inside
     /// an active S10 [`RenderRun`] `Decode` stage.
     #[allow(clippy::too_many_arguments)]
@@ -280,57 +373,34 @@ impl Sampler {
         run: Option<&RenderRun<'_, '_>>,
         forward: F,
     ) -> Result<Tensor> {
-        let total_steps = self.steps();
-        let driver = PidSamplerDriver::from_sampler(self, eps, forward);
-        let fallback_cancel = CancelFlag::new();
-        let cancel = cancel.unwrap_or(&fallback_cancel);
-        let dims = noise.dims();
-        let geometry = (dims.len() >= 4).then(|| (dims[3] as u32, dims[2] as u32));
-        let mut on_progress = |_| {};
-        let mut hooks = StepHooks::new(&mut on_progress);
-        let mut spec = SliceSpec::full(total_steps);
-        spec.geometry = geometry;
-        let out_state = match run {
-            Some(render_run) => render_run.decode_phase_with_driver_with(
-                driver.support(),
-                total_steps,
-                |driver_state| {
-                    run_candle_driver_slices(
-                        &driver,
-                        [spec],
-                        BoundaryState::XSigma(noise.clone()),
-                        total_steps,
+        match run {
+            Some(render_run) => {
+                let support = pid_driver_support();
+                render_run.decode_phase_with_driver_with(&support, self.steps(), |driver_state| {
+                    self.drive_with_driver_state(
+                        noise,
+                        eps,
                         seed,
                         cancel,
-                        None,
+                        Some(render_run.cancel()),
                         driver_state,
-                        &mut hooks,
-                        |_, out, _| Ok(out),
+                        forward,
                     )
-                },
-            )?,
+                })
+            }
             None => {
                 let mut driver_state = DriverRunState::new();
-                run_candle_driver_slices(
-                    &driver,
-                    [spec],
-                    BoundaryState::XSigma(noise.clone()),
-                    total_steps,
+                self.drive_with_driver_state(
+                    noise,
+                    eps,
                     seed,
                     cancel,
                     None,
                     &mut driver_state,
-                    &mut hooks,
-                    |_, out, _| Ok(out),
-                )?
+                    forward,
+                )
             }
-        };
-        let BoundaryState::XSigma(out) = out_state else {
-            return Err(CandleError::Msg(
-                "pid sampler driver returned non-XSigma state".into(),
-            ));
-        };
-        Ok(out)
+        }
     }
 
     /// Deterministic loop with the initial `noise` and the per-step `eps` injected (one ε per SDE
@@ -375,39 +445,6 @@ impl Sampler {
         self.drive_with_forward(noise, eps.to_vec(), 0, cancel, None, |x, t_scaled| {
             forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_in_render_run(
-        &self,
-        net: &PidNet,
-        noise: &Tensor,
-        eps: Vec<Tensor>,
-        caption: &Tensor,
-        lq_latent: &Tensor,
-        sigma: &Tensor,
-        seed: u64,
-        tiling: Option<(i32, i32)>,
-        cancel: Option<&CancelFlag>,
-        run: &RenderRun<'_, '_>,
-    ) -> Result<Tensor> {
-        match tiling {
-            Some((tile, overlap)) => {
-                candle_gen::execution::policy(
-                    "pid_decode",
-                    format!("tiled;edge={tile};overlap={overlap}").into(),
-                );
-                self.drive_with_forward(noise, eps, seed, cancel, Some(run), |x, t_scaled| {
-                    forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
-                })
-            }
-            None => {
-                candle_gen::execution::policy("pid_decode", "whole_image".into());
-                self.drive_with_forward(noise, eps, seed, cancel, Some(run), |x, t_scaled| {
-                    net.forward(x, t_scaled, caption, lq_latent, sigma)
-                })
-            }
-        }
     }
 
     pub(crate) fn draw_noise_eps(
@@ -644,5 +681,124 @@ mod driver_conformance_tests {
         assert_eq!(execs.len(), 1);
         assert_eq!(execs[0].completed_outer_steps, 4);
         assert_eq!(execs[0].stochastic_draw_index, 3);
+    }
+
+    #[test]
+    fn pid_sampler_driver_rejects_short_or_mismatched_schedule_without_panicking() {
+        let cancel = CancelFlag::default();
+        for (t_list, total_steps) in [
+            (Vec::<f32>::new(), 0usize),
+            (Vec::<f32>::new(), 1usize),
+            (vec![0.0], 0usize),
+            (vec![1.0], 1usize),
+            (vec![0.9, 0.0], 4usize),
+            (vec![0.999, 0.866, 0.634, 0.342, 0.0], 2usize),
+        ] {
+            let driver = PidSamplerDriver::new(
+                t_list,
+                1000.0,
+                false,
+                Vec::new(),
+                |_x: &Tensor, _t: &Tensor| Ok(make_constant(0.0)),
+            );
+            let mut st = DriverRunState::new();
+            let mut on_p = |_| {};
+            let mut hooks = StepHooks::new(&mut on_p);
+            let input = SliceInput::full_trajectory(make_constant(0.5), total_steps, 1, &cancel);
+            let res = driver.run_slice(input, &mut st, &mut hooks);
+            assert!(
+                matches!(res, Err(gen_core::Error::Msg(_))),
+                "invalid schedule must return Err(Msg) instead of panicking (total_steps={total_steps})"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_sampler_driver_clamps_only_final_slice_and_refuses_partial_when_unsupported() {
+        let cancel = CancelFlag::default();
+        let strict_driver = PidSamplerDriver::new(
+            vec![1.0, 0.5, 0.0],
+            1000.0,
+            false,
+            Vec::new(),
+            |_x: &Tensor, _t: &Tensor| Ok(make_constant(0.0)),
+        );
+        let mut st_strict = DriverRunState::new();
+        let mut on_p = |_| {};
+        let mut hooks = StepHooks::new(&mut on_p);
+        let mut partial = SliceInput::full_trajectory(make_constant(2.0), 2, 1, &cancel);
+        partial.span = 0..1;
+        assert!(matches!(
+            strict_driver.run_slice(partial, &mut st_strict, &mut hooks),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        let sliceable = PidSamplerDriver::new(
+            vec![1.0, 0.5, 0.0],
+            1000.0,
+            false,
+            Vec::new(),
+            |_x: &Tensor, _t: &Tensor| Ok(make_constant(0.0)),
+        )
+        .with_arbitrary_slice(true);
+
+        let mut st = DriverRunState::new();
+        let mut on_p1 = |_| {};
+        let mut hooks1 = StepHooks::new(&mut on_p1);
+        let mut first = SliceInput::full_trajectory(make_constant(2.0), 2, 1, &cancel);
+        first.span = 0..1;
+        let BoundaryState::XSigma(mid) = sliceable.run_slice(first, &mut st, &mut hooks1).unwrap()
+        else {
+            panic!("expected XSigma");
+        };
+        let mid_vals = mid.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            mid_vals.iter().all(|&v| (v - 2.0).abs() < 1e-6),
+            "partial slice must NOT clamp values before final step: {mid_vals:?}"
+        );
+
+        let mut on_p2 = |_| {};
+        let mut hooks2 = StepHooks::new(&mut on_p2);
+        let mut second = SliceInput::full_trajectory(mid, 2, 1, &cancel);
+        second.span = 1..2;
+        let BoundaryState::XSigma(final_out) =
+            sliceable.run_slice(second, &mut st, &mut hooks2).unwrap()
+        else {
+            panic!("expected XSigma");
+        };
+        let final_vals = final_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            final_vals.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "final slice must clamp output to [-1.0, 1.0]: {final_vals:?}"
+        );
+    }
+
+    #[test]
+    fn pid_sampler_driver_checks_run_cancel_between_steps() {
+        let input_cancel = CancelFlag::default();
+        let run_cancel = CancelFlag::default();
+        let steps_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steps_cb = steps_seen.clone();
+        let flag_cb = run_cancel.clone();
+        let driver = PidSamplerDriver::new(
+            vec![1.0, 0.5, 0.2, 0.0],
+            1000.0,
+            false,
+            Vec::new(),
+            move |_x: &Tensor, _t: &Tensor| {
+                steps_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                flag_cb.cancel();
+                Ok(make_constant(0.0))
+            },
+        )
+        .with_run_cancel(run_cancel);
+
+        let mut st = DriverRunState::new();
+        let mut on_p = |_| {};
+        let mut hooks = StepHooks::new(&mut on_p);
+        let input = SliceInput::full_trajectory(make_constant(0.5), 3, 1, &input_cancel);
+        let err = driver.run_slice(input, &mut st, &mut hooks);
+        assert!(matches!(err, Err(gen_core::Error::Canceled)));
+        assert_eq!(steps_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -1623,6 +1623,11 @@ impl<'p, 's> RenderRun<'p, 's> {
         self.plan
     }
 
+    /// Cooperative cancellation flag bound to this render run.
+    pub fn cancel(&self) -> &CancelFlag {
+        self.cancel
+    }
+
     /// Invoke a closure with the active [`MemoryRequestScope`] when present (`MEM-5`).
     pub fn with_active_scope<T>(
         &self,

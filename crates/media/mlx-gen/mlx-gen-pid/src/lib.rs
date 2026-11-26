@@ -44,8 +44,9 @@ pub use config::{ConvPadding, PidConfig, SampleType, SamplerConfig};
 pub use decode_routes::{assert_decode_routes, DecodeRoutes};
 pub use decoder::PidDecoder;
 pub use engine::{
-    flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_tiling,
-    resolve_pid_decoder, resolve_pid_decoder_at_sigma, PidEngine,
+    flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_routes,
+    mint_planned_decoder_with_tiling, resolve_pid_decoder, resolve_pid_decoder_at_sigma,
+    resolve_pid_decoder_with_routes, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};

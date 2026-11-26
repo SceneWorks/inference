@@ -52,7 +52,8 @@ pub use decode_routes::{assert_decode_routes, DecodeRoutes};
 pub use decoder::PidDecoder;
 pub use engine::{
     flow_capture_for_request, resolve_pid_decoder, resolve_pid_decoder_at_sigma,
-    resolve_pid_decoder_for_fields, selected_decode_tiling, PidEngine,
+    resolve_pid_decoder_for_fields, resolve_pid_decoder_for_fields_with_routes,
+    resolve_pid_decoder_with_routes, selected_decode_tiling, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};

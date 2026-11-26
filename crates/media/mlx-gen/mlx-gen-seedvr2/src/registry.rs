@@ -147,7 +147,7 @@ impl mlx_gen::Generator for Seedvr2Generator {
     }
     fn validate(&self, req: &mlx_gen::GenerationRequest) -> mlx_gen::gen_core::Result<()> {
         let s = self;
-        s.validate_impl(req).map_err(Into::into)
+        s.validate_impl(req).map(|_| ()).map_err(Into::into)
     }
     fn generate(
         &self,
@@ -228,7 +228,7 @@ impl Seedvr2Generator {
         .map_err(Into::into)
     }
 
-    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate_impl(&self, req: &GenerationRequest) -> Result<crate::video::Seedvr2RenderPlan> {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -247,8 +247,7 @@ impl Seedvr2Generator {
             )));
         }
         reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
-        self.compile_render_plan(req)?;
-        Ok(())
+        self.compile_render_plan(req)
     }
 
     fn generate_impl(
@@ -256,8 +255,7 @@ impl Seedvr2Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate_impl(req)?;
-        let plan = self.compile_render_plan(req)?;
+        let plan = self.validate_impl(req)?;
         let base_seed = plan.base_seed;
         let softness = plan.softness;
 

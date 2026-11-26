@@ -184,13 +184,10 @@ impl PidDecodePlan {
 
         budget::guard(model_id, count, width, height, cfg.sr_scale, cfg, safe_gib)?;
 
+        Self::validate_selected_tiling(selected_tiling, decode_routes)?;
+
         let tiling = match selected_tiling {
             Some((edge, overlap)) => {
-                if let Some(routes) = decode_routes {
-                    routes
-                        .validate(true, u32::try_from(edge).ok(), u32::try_from(overlap).ok())
-                        .map_err(|msg| CandleError::from(CoreError::Unsupported(msg)))?;
-                }
                 budget::validate_tile(model_id, edge, overlap, th, tw)?;
                 PidTilingPlan {
                     tile_edge_px: edge,
@@ -236,8 +233,59 @@ impl PidDecodePlan {
         })
     }
 
+    /// Validate explicit `(tile_edge, overlap)` against `decode_routes`, falling back to
+    /// [`DecodeRoutes::default_pid`] when `decode_routes` is `None`.
+    pub(crate) fn validate_selected_tiling(
+        selected_tiling: Option<(i32, i32)>,
+        decode_routes: Option<&DecodeRoutes>,
+    ) -> Result<()> {
+        let Some((edge, overlap)) = selected_tiling else {
+            return Ok(());
+        };
+        let default_routes;
+        let routes = match decode_routes {
+            Some(routes) => routes,
+            None => {
+                default_routes = DecodeRoutes::default_pid();
+                &default_routes
+            }
+        };
+        routes
+            .validate(true, u32::try_from(edge).ok(), u32::try_from(overlap).ok())
+            .map_err(|msg| CandleError::from(CoreError::Unsupported(msg)))
+    }
+
+    /// Resolve and route-validate request-level bounded-decode tiling before weight loads.
+    pub(crate) fn resolve_request_tiling(
+        req: &GenerationRequest,
+        decode_routes: Option<&DecodeRoutes>,
+    ) -> Result<Option<(i32, i32)>> {
+        let Some(memory) = req.memory else {
+            return Ok(None);
+        };
+        if !memory.tile_vae_decode {
+            return Ok(None);
+        }
+        if let Some(routes) = decode_routes {
+            routes
+                .validate(true, memory.decode_tile_edge, memory.decode_overlap)
+                .map_err(|msg| CandleError::from(CoreError::Unsupported(msg)))?;
+        } else if memory.decode_tile_edge.is_some() {
+            let overlap = memory
+                .decode_overlap
+                .or(Some(crate::budget::DEFAULT_TILE_OVERLAP as u32));
+            DecodeRoutes::default_pid()
+                .validate(true, memory.decode_tile_edge, overlap)
+                .map_err(|msg| CandleError::from(CoreError::Unsupported(msg)))?;
+        } else {
+            return Ok(None);
+        }
+        Ok(crate::engine::selected_decode_tiling(req))
+    }
+
     /// Compile and validate a [`PidDecodePlan`] from a [`GenerationRequest`], honoring `req.use_pid`,
-    /// `selected_decode_tiling(req)`, and optional [`DecodeRoutes`] admission.
+    /// `selected_decode_tiling(req)`, and [`DecodeRoutes`] admission (defaulting to
+    /// [`DecodeRoutes::default_pid`] when `decode_routes` is `None`).
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         model_id: &str,
@@ -254,17 +302,7 @@ impl PidDecodePlan {
                 "{model_id}: cannot compile PidDecodePlan when req.use_pid is false"
             ))));
         }
-        let selected_tiling = match req.memory {
-            Some(memory) if memory.tile_vae_decode => {
-                if let Some(routes) = decode_routes {
-                    routes
-                        .validate(true, memory.decode_tile_edge, memory.decode_overlap)
-                        .map_err(|msg| CandleError::from(CoreError::Unsupported(msg)))?;
-                }
-                crate::engine::selected_decode_tiling(req)
-            }
-            _ => None,
-        };
+        let selected_tiling = Self::resolve_request_tiling(req, decode_routes)?;
         Self::compile_for_fields(
             model_id,
             cfg,
@@ -421,5 +459,51 @@ mod tests {
         assert!(
             PidDecodePlan::compile("qwenimage", &cfg, &sampler, None, &huge, 0.0, 1, 2.0).is_err()
         );
+
+        let unmeasured_tile = GenerationRequest {
+            width: 512,
+            height: 512,
+            use_pid: true,
+            memory: Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(1536),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(PidDecodePlan::compile(
+            "qwenimage",
+            &cfg,
+            &sampler,
+            None,
+            &unmeasured_tile,
+            0.0,
+            1,
+            96.0,
+        )
+        .is_err());
+        assert!(PidDecodePlan::compile_for_fields(
+            "qwenimage",
+            &cfg,
+            &sampler,
+            None,
+            512,
+            512,
+            1,
+            0.0,
+            1,
+            96.0,
+            Some((1536, 64)),
+        )
+        .is_err());
+        assert!(
+            PidDecodePlan::compile("qwenimage", &cfg, &sampler, None, &bad_tile, 0.0, 1, 96.0,)
+                .is_err()
+        );
+        let default_pid_good =
+            PidDecodePlan::compile("qwenimage", &cfg, &sampler, None, &good_tile, 0.0, 1, 96.0)
+                .unwrap();
+        assert_eq!(default_pid_good.applied_tiling(), Some((2048, 256)));
     }
 }

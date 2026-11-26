@@ -280,6 +280,73 @@ fn check_canceled(cancel: Option<&CancelFlag>) -> CResult<()> {
     Ok(())
 }
 
+/// Per-frame color-correct a decoded clip `(1,3,T,Hc,Wc)` against `style` `(1,3,Ts,Hc,Wc)` with
+/// cooperative per-frame cancellation (`F-163`).
+fn frames_from_decoded_with_cancel(
+    decoded: &Tensor,
+    style: &Tensor,
+    count: usize,
+    cancel: Option<&CancelFlag>,
+) -> CResult<Vec<Image>> {
+    let style_t = style.dim(2)?;
+    let mut out = Vec::with_capacity(count);
+    for t in 0..count {
+        check_canceled(cancel)?;
+        let d = decoded.narrow(2, t, 1)?.squeeze(2)?; // (1,3,Hc,Wc)
+        let s = style
+            .narrow(2, t.min(style_t.saturating_sub(1)), 1)?
+            .squeeze(2)?;
+        let corrected = color::apply_color_correction(
+            &d.to_dtype(DType::F32)?,
+            &s.to_dtype(DType::F32)?,
+            LUMINANCE_WEIGHT,
+        )?;
+        out.push(decoded_to_image(&corrected)?);
+    }
+    Ok(out)
+}
+
+/// Normalize accumulated weighted spatial tiles (`acc / wsum`), surfacing an explicit error when a
+/// tiled run produced no tile contributions instead of panicking.
+fn finalize_tiled_accumulators(acc: Option<Tensor>, wsum: Option<Tensor>) -> CResult<Tensor> {
+    let acc = acc.ok_or_else(|| {
+        CandleError::Msg("seedvr2 tiled upscale: plan produced no accumulated tiles".into())
+    })?;
+    let wsum = wsum.ok_or_else(|| {
+        CandleError::Msg("seedvr2 tiled upscale: plan produced no accumulated weights".into())
+    })?;
+    Ok(acc.broadcast_div(&wsum)?)
+}
+
+/// Determine the budget [`ChunkPlan`] associated with a [`Seedvr2Route`] so `generate_video_for_route`
+/// records identical `"seedvr2_budget_route"` policy observability across chunked, per-frame, and
+/// memory-fallback tiled video routes.
+fn chunk_plan_for_video_route(
+    route: &Seedvr2Route,
+    weights_bytes: usize,
+    width: usize,
+    height: usize,
+    safe_gib: f64,
+) -> Option<ChunkPlan> {
+    match route {
+        Seedvr2Route::VideoTemporalChunked { chunk_frames, .. } => {
+            Some(ChunkPlan::Chunked(*chunk_frames))
+        }
+        Seedvr2Route::VideoPerFrame { .. } => Some(ChunkPlan::PerFrame),
+        Seedvr2Route::VideoSpatialTiled { .. }
+            if width.max(height) as i32 <= video::VAE_SAFE_DECODE_EDGE_PX =>
+        {
+            Some(video::plan_chunk_size_with(
+                weights_bytes,
+                height as i32,
+                width as i32,
+                safe_gib,
+            ))
+        }
+        _ => None,
+    }
+}
+
 impl Seedvr2Pipeline {
     /// Build from already-converted candle-layout VAE + DiT weights + a neg-embed (parity tests).
     pub fn from_parts(
@@ -483,26 +550,20 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Image> {
-        let over_budget = matches!(
-            video::plan_chunk_size_with(self.weights_bytes, height as i32, width as i32, safe_gib),
-            ChunkPlan::OverBudget { .. }
-        );
-        let over_vae_cap = width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX;
-        candle_gen::execution::policy(
-            "seedvr2_still_route",
-            serde_json::json!({
-                "tiled": over_budget || over_vae_cap, "memory_fallback": over_budget,
-                "decoder_cap_fallback": over_vae_cap
-            }),
-        );
-        if over_budget || over_vae_cap {
-            let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
-            let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-            return self.generate_tiled_with_params(
-                image, width, height, seed, softness, tile, overlap, cancel, on_step,
-            );
-        }
-        self.generate_single_pass_unit(image, width, height, seed, softness, cancel, on_step)
+        let resolved =
+            video::resolve_still_route(width as i32, height as i32, self.weights_bytes, safe_gib);
+        self.generate_still_for_route_with_policy(
+            image,
+            width,
+            height,
+            seed,
+            softness,
+            &resolved.route,
+            resolved.over_budget,
+            resolved.over_vae_cap,
+            cancel,
+            on_step,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -517,14 +578,56 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Image> {
+        let over_vae_cap = width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX;
+        let over_budget = matches!(route, Seedvr2Route::StillSpatialTiled { .. })
+            && (!over_vae_cap
+                || matches!(
+                    video::plan_chunk_size(self.weights_bytes, height as i32, width as i32),
+                    ChunkPlan::OverBudget { .. }
+                ));
+        self.generate_still_for_route_with_policy(
+            image,
+            width,
+            height,
+            seed,
+            softness,
+            route,
+            over_budget,
+            over_vae_cap,
+            cancel,
+            on_step,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_still_for_route_with_policy(
+        &self,
+        image: &Image,
+        width: usize,
+        height: usize,
+        seed: u64,
+        softness: f32,
+        route: &Seedvr2Route,
+        over_budget: bool,
+        over_vae_cap: bool,
+        cancel: Option<&CancelFlag>,
+        on_step: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> CResult<Image> {
+        candle_gen::execution::policy(
+            "seedvr2_still_route",
+            serde_json::json!({
+                "tiled": over_budget || over_vae_cap, "memory_fallback": over_budget,
+                "decoder_cap_fallback": over_vae_cap
+            }),
+        );
         match route {
             Seedvr2Route::StillSinglePass => self
                 .generate_single_pass_unit(image, width, height, seed, softness, cancel, on_step),
             Seedvr2Route::StillSpatialTiled {
                 tile_edge_px,
                 overlap_px,
-                ..
-            } => self.generate_tiled_with_params(
+                tiles,
+            } => self.generate_tiled_with_plan(
                 image,
                 width,
                 height,
@@ -532,6 +635,7 @@ impl Seedvr2Pipeline {
                 softness,
                 *tile_edge_px,
                 *overlap_px,
+                tiles,
                 cancel,
                 on_step,
             ),
@@ -663,13 +767,13 @@ impl Seedvr2Pipeline {
             &mut post_step,
             &mut progress,
         )?;
-        Ok(result_img
-            .into_inner()
-            .expect("one single-pass still image produced"))
+        result_img.into_inner().ok_or_else(|| {
+            CandleError::Msg("seedvr2 single-pass upscale: produced no frame".into())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_tiled_with_params(
+    fn generate_tiled_with_plan(
         &self,
         image: &Image,
         width: usize,
@@ -678,6 +782,7 @@ impl Seedvr2Pipeline {
         softness: f32,
         tile: i32,
         overlap: i32,
+        plan: &[video::SpatialTile],
         cancel: Option<&CancelFlag>,
         on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Image> {
@@ -685,12 +790,11 @@ impl Seedvr2Pipeline {
             .preprocess(image, width, height, softness)?
             .unsqueeze(2)?; // (1,3,1,H,W)
         let decoded =
-            self.run_frame_tiled_with_progress(&processed, seed, tile, overlap, cancel, on_step)?;
-        Ok(self
-            .frames_from_decoded(&decoded, &processed, 1)?
+            self.run_frame_tiled_with_plan(&processed, seed, tile, overlap, plan, cancel, on_step)?;
+        self.frames_from_decoded(&decoded, &processed, 1, cancel)?
             .into_iter()
             .next()
-            .expect("one tiled frame"))
+            .ok_or_else(|| CandleError::Msg("seedvr2 tiled upscale: produced no frame".into()))
     }
 
     /// LR `Image` → `(1,3,height,width)` in [-1,1] at the model dtype. Bicubic resize to target;
@@ -770,20 +874,9 @@ impl Seedvr2Pipeline {
         decoded: &Tensor,
         style: &Tensor,
         count: usize,
+        cancel: Option<&CancelFlag>,
     ) -> CResult<Vec<Image>> {
-        let style_t = style.dim(2)?;
-        let mut out = Vec::with_capacity(count);
-        for t in 0..count {
-            let d = decoded.narrow(2, t, 1)?.squeeze(2)?; // (1,3,Hc,Wc)
-            let s = style.narrow(2, t.min(style_t - 1), 1)?.squeeze(2)?;
-            let corrected = color::apply_color_correction(
-                &d.to_dtype(DType::F32)?,
-                &s.to_dtype(DType::F32)?,
-                LUMINANCE_WEIGHT,
-            )?;
-            out.push(decoded_to_image(&corrected)?);
-        }
-        Ok(out)
+        frames_from_decoded_with_cancel(decoded, style, count, cancel)
     }
 
     /// Preprocess one temporal chunk: pixel-frames `[start, start+len)` of `frames`, clamping past the
@@ -837,55 +930,32 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
-        candle_gen::execution::policy(
-            "seedvr2_video_processing",
-            serde_json::json!({
-                "softness_bits": softness.to_bits(), "luminance_weight_bits": LUMINANCE_WEIGHT.to_bits(),
-                "frame_count": frames.len(), "size": [width, height]
-            }),
-        );
-        let n = frames.len() as i32;
-        if n == 0 {
+        if frames.is_empty() {
+            candle_gen::execution::policy(
+                "seedvr2_video_processing",
+                serde_json::json!({
+                    "softness_bits": softness.to_bits(), "luminance_weight_bits": LUMINANCE_WEIGHT.to_bits(),
+                    "frame_count": 0, "size": [width, height]
+                }),
+            );
             return Ok(Vec::new());
         }
-        if width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX {
-            let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
-            let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-            return self.generate_video_tiled_with_params(
-                frames, width, height, seed, softness, tile, overlap, cancel, progress,
-            );
-        }
-        let selected = resolve_chunk_plan(
-            video::plan_chunk_size(self.weights_bytes, height as i32, width as i32),
+        let resolved = video::resolve_video_route(
+            frames.len(),
+            width as i32,
+            height as i32,
+            self.weights_bytes,
+            video::safe_budget_gib(),
             chunk_override,
         );
-        let chunk = match selected {
-            ChunkPlan::Chunked(c) => c,
-            ChunkPlan::PerFrame => {
-                return self.generate_video_per_frame(
-                    frames, width, height, seed, softness, cancel, progress,
-                )
-            }
-            ChunkPlan::OverBudget { .. } => {
-                let tile =
-                    video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
-                let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-                return self.generate_video_tiled_with_params(
-                    frames, width, height, seed, softness, tile, overlap, cancel, progress,
-                );
-            }
-        };
-
-        let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
-        self.generate_video_temporal_chunked(
+        self.generate_video_for_route_with_policy(
             frames,
             width,
             height,
             seed,
             softness,
-            chunk,
-            video::DEFAULT_OVERLAP,
-            &plan,
+            &resolved.route,
+            resolved.chunk_plan,
             cancel,
             progress,
         )
@@ -903,6 +973,31 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
+        let chunk_plan = chunk_plan_for_video_route(
+            route,
+            self.weights_bytes,
+            width,
+            height,
+            video::safe_budget_gib(),
+        );
+        self.generate_video_for_route_with_policy(
+            frames, width, height, seed, softness, route, chunk_plan, cancel, progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_video_for_route_with_policy(
+        &self,
+        frames: &[Image],
+        width: usize,
+        height: usize,
+        seed: u64,
+        softness: f32,
+        route: &Seedvr2Route,
+        chunk_plan: Option<ChunkPlan>,
+        cancel: Option<&CancelFlag>,
+        progress: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> CResult<Vec<Image>> {
         candle_gen::execution::policy(
             "seedvr2_video_processing",
             serde_json::json!({
@@ -910,37 +1005,34 @@ impl Seedvr2Pipeline {
                 "frame_count": frames.len(), "size": [width, height]
             }),
         );
+        if let Some(plan) = chunk_plan {
+            resolve_chunk_plan(plan, None);
+        }
         match route {
             Seedvr2Route::VideoTemporalChunked {
                 chunk_frames,
                 overlap_frames,
                 chunks,
-            } => {
-                resolve_chunk_plan(ChunkPlan::Chunked(*chunk_frames), None);
-                self.generate_video_temporal_chunked(
-                    frames,
-                    width,
-                    height,
-                    seed,
-                    softness,
-                    *chunk_frames,
-                    *overlap_frames,
-                    chunks,
-                    cancel,
-                    progress,
-                )
-            }
-            Seedvr2Route::VideoPerFrame { .. } => {
-                resolve_chunk_plan(ChunkPlan::PerFrame, None);
-                self.generate_video_per_frame(
-                    frames, width, height, seed, softness, cancel, progress,
-                )
-            }
+            } => self.generate_video_temporal_chunked(
+                frames,
+                width,
+                height,
+                seed,
+                softness,
+                *chunk_frames,
+                *overlap_frames,
+                chunks,
+                cancel,
+                progress,
+            ),
+            Seedvr2Route::VideoPerFrame { .. } => self
+                .generate_video_per_frame(frames, width, height, seed, softness, cancel, progress),
             Seedvr2Route::VideoSpatialTiled {
                 tile_edge_px,
                 overlap_px,
+                tiles_per_frame,
                 ..
-            } => self.generate_video_tiled_with_params(
+            } => self.generate_video_tiled_with_plan(
                 frames,
                 width,
                 height,
@@ -948,6 +1040,7 @@ impl Seedvr2Pipeline {
                 softness,
                 *tile_edge_px,
                 *overlap_px,
+                tiles_per_frame,
                 cancel,
                 progress,
             ),
@@ -1001,7 +1094,7 @@ impl Seedvr2Pipeline {
                 .map_err(core_err)?;
             let real_count = video::real_frame_count(c.start, c.len, n) as usize;
             let chunk_imgs = self
-                .frames_from_decoded(&decoded, &clip, real_count)
+                .frames_from_decoded(&decoded, &clip, real_count, cancel)
                 .map_err(core_err)?;
             video::assemble_overlap_chunk(&mut out.borrow_mut(), c.start, chunk_imgs, n, overlap);
             Ok(latents)
@@ -1105,7 +1198,7 @@ impl Seedvr2Pipeline {
     /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) with its
     /// spatial tiles driven through [`Seedvr2Driver`].
     #[allow(clippy::too_many_arguments)]
-    fn generate_video_tiled_with_params(
+    fn generate_video_tiled_with_plan(
         &self,
         frames: &[Image],
         width: usize,
@@ -1114,6 +1207,7 @@ impl Seedvr2Pipeline {
         softness: f32,
         tile: i32,
         overlap: i32,
+        plan: &[video::SpatialTile],
         cancel: Option<&CancelFlag>,
         mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
@@ -1122,9 +1216,12 @@ impl Seedvr2Pipeline {
         for (i, f) in frames.iter().enumerate() {
             check_canceled(cancel)?;
             let processed = self.preprocess(f, width, height, softness)?.unsqueeze(2)?; // (1,3,1,H,W)
-            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, cancel)?;
-            let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
-            out.push(imgs.into_iter().next().expect("one frame"));
+            let decoded = self
+                .run_frame_tiled_with_plan(&processed, seed, tile, overlap, plan, cancel, None)?;
+            let imgs = self.frames_from_decoded(&decoded, &processed, 1, cancel)?;
+            out.push(imgs.into_iter().next().ok_or_else(|| {
+                CandleError::Msg("seedvr2 tiled upscale: produced no frame".into())
+            })?);
             if let Some(cb) = progress.as_deref_mut() {
                 cb(i + 1, total);
             }
@@ -1155,11 +1252,31 @@ impl Seedvr2Pipeline {
         tile: i32,
         overlap: i32,
         cancel: Option<&CancelFlag>,
-        mut on_step: Option<&mut dyn FnMut(usize, usize)>,
+        on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Tensor> {
         let (_b, _c, _t, height, width) = processed.dims5()?; // (1,3,1,H,W)
+        let plan = video::plan_spatial_tiles(height as i32, width as i32, tile, overlap);
+        self.run_frame_tiled_with_plan(processed, seed, tile, overlap, &plan, cancel, on_step)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_frame_tiled_with_plan(
+        &self,
+        processed: &Tensor,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        plan: &[video::SpatialTile],
+        cancel: Option<&CancelFlag>,
+        mut on_step: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> CResult<Tensor> {
+        if plan.is_empty() {
+            return Err(CandleError::Msg(
+                "seedvr2 tiled upscale: spatial tile plan has no tiles".into(),
+            ));
+        }
+        let (_b, _c, _t, height, width) = processed.dims5()?; // (1,3,1,H,W)
         let (h_i, w_i) = (height as i32, width as i32);
-        let plan = video::plan_spatial_tiles(h_i, w_i, tile, overlap);
         candle_gen::execution::policy(
             "seedvr2_spatial_tiles",
             serde_json::json!({
@@ -1256,10 +1373,7 @@ impl Seedvr2Pipeline {
             &mut post_step,
             &mut on_progress,
         )?;
-        Ok(acc
-            .into_inner()
-            .expect("≥1 tile")
-            .broadcast_div(&wsum.into_inner().expect("≥1 tile"))?)
+        finalize_tiled_accumulators(acc.into_inner(), wsum.into_inner())
     }
 }
 
@@ -1276,6 +1390,68 @@ mod tests {
         assert!(
             matches!(check_canceled(Some(&flag)), Err(CandleError::Canceled)),
             "tripped → typed Canceled"
+        );
+    }
+
+    #[test]
+    fn frames_from_decoded_honors_cancel_and_decodes_when_untripped() {
+        let decoded = Tensor::zeros((1, 3, 2, 4, 4), DType::F32, &Device::Cpu).unwrap();
+        let style = Tensor::zeros((1, 3, 1, 4, 4), DType::F32, &Device::Cpu).unwrap();
+        let flag = CancelFlag::new();
+        let frames = frames_from_decoded_with_cancel(&decoded, &style, 2, Some(&flag)).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (4, 4));
+
+        flag.cancel();
+        let canceled = frames_from_decoded_with_cancel(&decoded, &style, 2, Some(&flag));
+        assert!(
+            matches!(canceled, Err(CandleError::Canceled)),
+            "tripped cancel flag must abort frames_from_decoded before decoding"
+        );
+    }
+
+    #[test]
+    fn finalize_tiled_accumulators_errors_cleanly_when_empty() {
+        let missing_acc = finalize_tiled_accumulators(None, None);
+        assert!(
+            matches!(missing_acc, Err(CandleError::Msg(_))),
+            "empty tile accumulator must return Err(CandleError::Msg), not panic"
+        );
+        let one = Tensor::ones((1, 3, 1, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        let missing_wsum = finalize_tiled_accumulators(Some(one.clone()), None);
+        assert!(
+            matches!(missing_wsum, Err(CandleError::Msg(_))),
+            "missing tile weights must return Err(CandleError::Msg), not panic"
+        );
+        let two = (&one * 2.0).unwrap();
+        let four = (&one * 4.0).unwrap();
+        let normalized = finalize_tiled_accumulators(Some(four), Some(two))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(normalized.iter().all(|&v| (v - 2.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn chunk_plan_for_video_spatial_tiled_preserves_budget_route_when_under_vae_cap() {
+        let tiled = Seedvr2Route::VideoSpatialTiled {
+            frame_count: 4,
+            tile_edge_px: 512,
+            overlap_px: 64,
+            tiles_per_frame: vec![],
+        };
+        let huge_weights = 500 * 1024 * 1024 * 1024usize;
+        let under_cap = chunk_plan_for_video_route(&tiled, huge_weights, 1024, 1024, 8.0);
+        assert!(
+            matches!(under_cap, Some(ChunkPlan::OverBudget { .. })),
+            "memory-fallback tiled route within VAE cap must keep its ChunkPlan for policy observability"
+        );
+        let over_cap = chunk_plan_for_video_route(&tiled, huge_weights, 2048, 2048, 8.0);
+        assert!(
+            over_cap.is_none(),
+            "VAE-cap tiled route has no chunk plan fallback"
         );
     }
 

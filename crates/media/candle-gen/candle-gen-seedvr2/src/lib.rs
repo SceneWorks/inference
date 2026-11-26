@@ -188,6 +188,10 @@ impl Seedvr2Generator {
             None,
         )
     }
+
+    fn validate_and_plan(&self, req: &GenerationRequest) -> gen_core::Result<Seedvr2RenderPlan> {
+        self.compile_render_plan(req, self.current_weights_bytes())
+    }
 }
 
 impl Generator for Seedvr2Generator {
@@ -196,7 +200,7 @@ impl Generator for Seedvr2Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.compile_render_plan(req, self.current_weights_bytes())?;
+        self.validate_and_plan(req)?;
         Ok(())
     }
 
@@ -213,9 +217,15 @@ impl Generator for Seedvr2Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
+        let pre_plan = self.validate_and_plan(req)?;
         let pipe = self.pipeline()?;
-        let plan = self.compile_render_plan(req, pipe.weights_bytes())?;
+        let plan = pre_plan.with_live_budget(
+            &self.descriptor,
+            req,
+            pipe.weights_bytes(),
+            video::safe_budget_gib(),
+            None,
+        )?;
         let base_seed = plan.base_seed;
         let softness = plan.softness;
 
