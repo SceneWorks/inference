@@ -16,7 +16,7 @@
 //! `[B, img_len, 128]` plus the 4 captured text-feature layers and predicts the patch-space velocity
 //! `[B, img_len, 128]` (= `patch²·out_channels`). Run bf16 in production / f32 for the parity gate.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{
     linear, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
 };
@@ -171,12 +171,37 @@ fn attention(
     k: &Tensor,
     v: &Tensor,
     head_dim: usize,
-    mask: Option<&Tensor>,
+    mask: Option<&JointMask>,
     plan: AttentionPlan<'_>,
 ) -> candle_gen::Result<Tensor> {
     let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_planned_bhsd(q, k, v, scale, mask, softmax_last_dim, plan)?; // [B,H,S,head_dim]
+    let o = match mask {
+        // A key-padding mask with its host-known valid prefixes: the fused kernel over each row's
+        // valid keys when the router allows it, else exactly the masked call (SW-6130).
+        Some(JointMask {
+            additive,
+            valid_keys: Some(valid),
+        }) => candle_gen::sdpa_planned_bhsd_key_prefix(
+            q,
+            k,
+            v,
+            scale,
+            additive,
+            valid,
+            softmax_last_dim,
+            plan,
+        )?,
+        other => candle_gen::sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            other.map(|m| &m.additive),
+            softmax_last_dim,
+            plan,
+        )?,
+    }; // [B,H,S,head_dim]
     let (_b, h, _s, d) = o.dims4()?;
     Ok(o.transpose(1, 2)?.reshape((b, s, h * d))?)
 }
@@ -357,7 +382,7 @@ impl JointAttention {
         img_sin: &Tensor,
         txt_cos: &Tensor,
         txt_sin: &Tensor,
-        mask: Option<&Tensor>,
+        mask: Option<&JointMask>,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         let img_seq = img.dim(1)?;
@@ -513,6 +538,10 @@ impl LensTransformerBlock {
         txt_sin: &Tensor,
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        let mask = mask.map(|additive| JointMask {
+            additive: additive.clone(),
+            valid_keys: None,
+        });
         self.forward_with_plan(
             hidden,
             encoder,
@@ -521,7 +550,7 @@ impl LensTransformerBlock {
             img_sin,
             txt_cos,
             txt_sin,
-            mask,
+            mask.as_ref(),
             AttentionPlan::budgeted(AttentionBudget::from_score_elements(
                 candle_gen::ATTN_SCORES_BUDGET as u64,
                 false,
@@ -540,7 +569,7 @@ impl LensTransformerBlock {
         img_sin: &Tensor,
         txt_cos: &Tensor,
         txt_sin: &Tensor,
-        mask: Option<&Tensor>,
+        mask: Option<&JointMask>,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         // SiLU'd timestep → per-stream 6·inner modulation, split into mod1 (around attn) / mod2 (MLP).
@@ -651,6 +680,28 @@ pub struct LensTransformer {
     dtype: DType,
     /// `Mutex` (not `RefCell`): the DiT is shared as `Arc<LensTransformer>` and must stay `Send + Sync`.
     rope_cache: GeometryCache<(usize, usize, usize, usize), LensRopeTables>,
+    /// Per-row valid text prefix of the last `text_valid` mask seen (keyed by its tensor id), so
+    /// the host read happens once per render, not per step (SW-6130).
+    text_prefix_cache: std::sync::Mutex<Option<(TensorId, Option<Vec<usize>>)>>,
+}
+
+/// The joint additive key mask, with each row's valid key-prefix length when the mask is a pure
+/// key-padding suffix (SW-6130). `valid_keys: None` keeps the plain masked call.
+pub(crate) struct JointMask {
+    pub(crate) additive: Tensor,
+    pub(crate) valid_keys: Option<Vec<usize>>,
+}
+
+/// Per-row valid text counts of a `[B, txt_len]` `text_valid` mask (`1` = valid) when every row is a
+/// valid prefix followed only by padding — what `pad_mask` builds, including the empty-negative
+/// row of all zeros. `None` for any other pattern (then the mask is applied as given).
+pub(crate) fn text_valid_prefixes(rows: &[Vec<f32>]) -> Option<Vec<usize>> {
+    rows.iter()
+        .map(|row| {
+            let n = row.iter().take_while(|&&m| m == 1.0).count();
+            row[n..].iter().all(|&m| m == 0.0).then_some(n)
+        })
+        .collect()
 }
 
 impl LensTransformer {
@@ -717,6 +768,7 @@ impl LensTransformer {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             rope_cache: GeometryCache::new(1),
+            text_prefix_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -724,6 +776,19 @@ impl LensTransformer {
     /// (sc-8992). Recomputed only when `(frame, h, w, txt_len)` changes; otherwise the Arc-backed
     /// handles are cloned. Construction is identical to computing it inline, so every step is
     /// byte-identical.
+    /// [`text_valid_prefixes`] for `valid`, read to the host once per mask tensor.
+    fn text_prefixes(&self, valid: &Tensor) -> Result<Option<Vec<usize>>> {
+        let mut cache = candle_gen::lock_recover(&self.text_prefix_cache);
+        if let Some((id, prefixes)) = cache.as_ref() {
+            if *id == valid.id() {
+                return Ok(prefixes.clone());
+            }
+        }
+        let prefixes = text_valid_prefixes(&valid.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        *cache = Some((valid.id(), prefixes.clone()));
+        Ok(prefixes)
+    }
+
     fn rope_tables(
         &self,
         frame: usize,
@@ -908,7 +973,13 @@ impl LensTransformer {
         let (img_cos, img_sin, txt_cos, txt_sin) = self.rope_tables(frame, h, w, txt_len)?;
 
         let mask = match text_valid {
-            Some(valid) => Some(build_joint_mask(valid, img_len, self.dtype, &self.device)?),
+            Some(valid) => Some(JointMask {
+                additive: build_joint_mask(valid, img_len, self.dtype, &self.device)?,
+                // The joint order is `[img, txt]`: row `b` keeps `img_len + n_b` leading keys.
+                valid_keys: self
+                    .text_prefixes(valid)?
+                    .map(|rows| rows.iter().map(|n| img_len + n).collect()),
+            }),
             None => None,
         };
 
@@ -1004,6 +1075,23 @@ pub fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-6130: the CFG text masks `pad_mask` builds are valid prefixes (the empty negative is the
+    /// all-zero prefix), so their joint key counts are host data; any other pattern keeps the mask.
+    #[test]
+    fn text_valid_prefixes_accept_only_padding_suffixes() {
+        let pos = vec![1.0f32; 7];
+        let mut neg = vec![1.0f32, 1.0, 1.0];
+        neg.extend([0.0f32; 4]);
+        let empty = vec![0.0f32; 7];
+        assert_eq!(
+            text_valid_prefixes(&[pos.clone(), neg.clone()]),
+            Some(vec![7, 3])
+        );
+        assert_eq!(text_valid_prefixes(&[pos, empty]), Some(vec![7, 0]));
+        assert_eq!(text_valid_prefixes(&[vec![1.0, 0.0, 1.0]]), None);
+        assert_eq!(text_valid_prefixes(&[vec![0.5, 1.0]]), None);
+    }
     use crate::testfix::randn_seeded;
     use candle_gen::candle_nn::VarMap;
     use rand::{rngs::StdRng, SeedableRng};

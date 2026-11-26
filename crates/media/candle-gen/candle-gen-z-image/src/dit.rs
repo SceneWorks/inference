@@ -916,7 +916,7 @@ struct StreamGeometry {
     mask: Tensor,
 }
 
-struct PositionedGeometry {
+pub(crate) struct PositionedGeometry {
     image_positions: Tensor,
     caption_positions: Tensor,
     image: StreamGeometry,
@@ -969,11 +969,43 @@ pub(crate) struct PreparedConditioning {
     img_seq_len: usize,
     x_cos: Tensor,
     x_sin: Tensor,
-    x_attn_mask: Tensor,
+    /// `None`: the image stream is all-valid (always, by construction), so no mask is applied,
+    /// exactly what an all-ones mask's zero additive term does.
+    x_attn_mask: Option<Tensor>,
     cap: Tensor,
     unified_cos: Tensor,
     unified_sin: Tensor,
-    unified_attn_mask: Tensor,
+    /// `None` when the caption padding was trimmed ([`caption_padding_trim`]): every remaining key
+    /// is valid. `Some` keeps the original key-padding mask.
+    unified_attn_mask: Option<Tensor>,
+}
+
+/// The exact key-padding rewrite of one prepared request (SW-6130): `Some(valid)` when every caption
+/// row of `cap_mask` (`[B, L]`, `1` = valid) is the same valid **prefix** of `valid > 0` tokens followed
+/// only by padding. Then the padded caption tokens can be removed from the joint sequence without
+/// changing any output, because:
+///
+/// - a padded token is only ever a *key* under a `(0 - 1) * 1e9` additive mask, so its softmax weight
+///   is exactly zero for every query (the f32 `exp` underflows): removing the key changes no row;
+/// - everything else is per token (projections, QK norm, RoPE, FFN, AdaLN from the timestep only), so
+///   a padded token's own hidden state never reaches a valid one;
+/// - the velocity reads only the leading image tokens (`output_velocity` narrows `0..img_seq_len`);
+/// - RoPE positions are computed from the **padded** length before the trim (the image grid starts at
+///   `padded_len + 1`), and a valid caption token keeps its row of the caption grid.
+///
+/// The image refiner, caption refiner and main layers then call attention with no mask, which the
+/// shared router can send to the fused kernel. `None` (rows of different valid lengths, a non-prefix
+/// mask, or an empty caption) keeps the masked path unchanged.
+pub(crate) fn caption_padding_trim(rows: &[Vec<u8>]) -> Option<usize> {
+    let mut valid = None;
+    for row in rows {
+        let n = row.iter().take_while(|&&m| m != 0).count();
+        if n == 0 || row[n..].iter().any(|&m| m != 0) || valid.is_some_and(|v| v != n) {
+            return None;
+        }
+        valid = Some(n);
+    }
+    valid
 }
 
 /// Main-stack residency for ladder rung 4. The front-end, refiners, and final projection remain
@@ -1229,6 +1261,27 @@ impl ZImageTransformer2DModel {
         })
     }
 
+    /// [`caption_padding_trim`]'s rewrite of the geometry: keep the first `valid` caption rows of the
+    /// (padded-length) caption grid, their RoPE tables and mask. The image grid is untouched: it was
+    /// already offset by the padded caption length.
+    pub(crate) fn trim_caption_geometry(
+        &self,
+        geometry: PositionedGeometry,
+        valid: usize,
+    ) -> Result<PositionedGeometry> {
+        let caption_positions = geometry.caption_positions.narrow(0, 0, valid)?;
+        let (cos, sin) = self.rope_embedder.forward(&caption_positions)?;
+        Ok(PositionedGeometry {
+            caption: StreamGeometry {
+                cos,
+                sin,
+                mask: geometry.caption.mask.narrow(1, 0, valid)?,
+            },
+            caption_positions,
+            ..geometry
+        })
+    }
+
     fn join_geometry(&self, geometry: &PositionedGeometry) -> Result<StreamGeometry> {
         let positions = Tensor::cat(&[&geometry.image_positions, &geometry.caption_positions], 0)?;
         let (cos, sin) = self.rope_embedder.forward(&positions)?;
@@ -1274,7 +1327,7 @@ impl ZImageTransformer2DModel {
     pub(crate) fn refine_image<F>(
         &self,
         mut hidden: Tensor,
-        attention_mask: &Tensor,
+        attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
@@ -1287,7 +1340,7 @@ impl ZImageTransformer2DModel {
         for (index, layer) in self.noise_refiner.iter().enumerate() {
             hidden = layer.forward_with_attention_plan(
                 &hidden,
-                Some(attention_mask),
+                attention_mask,
                 cos,
                 sin,
                 Some(adaln),
@@ -1306,7 +1359,7 @@ impl ZImageTransformer2DModel {
     pub(crate) fn refine_caption(
         &self,
         mut hidden: Tensor,
-        attention_mask: &Tensor,
+        attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
@@ -1314,7 +1367,7 @@ impl ZImageTransformer2DModel {
         for layer in &self.context_refiner {
             hidden = layer.forward_with_attention_plan(
                 &hidden,
-                Some(attention_mask),
+                attention_mask,
                 cos,
                 sin,
                 None,
@@ -1328,7 +1381,7 @@ impl ZImageTransformer2DModel {
     pub(crate) fn control_run_layers<F>(
         &self,
         hidden: Tensor,
-        attention_mask: &Tensor,
+        attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
@@ -1356,7 +1409,7 @@ impl ZImageTransformer2DModel {
     fn run_layers(
         &self,
         mut hidden: Tensor,
-        attention_mask: &Tensor,
+        attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
@@ -1370,7 +1423,7 @@ impl ZImageTransformer2DModel {
                 for (index, layer) in layers.iter().enumerate() {
                     hidden = layer.forward_with_attention_plan_and_pag(
                         &hidden,
-                        Some(attention_mask),
+                        attention_mask,
                         cos,
                         sin,
                         Some(adaln),
@@ -1435,7 +1488,7 @@ impl ZImageTransformer2DModel {
                             let index = first + offset;
                             state = block.forward_with_attention_plan_and_pag(
                                 &state,
-                                Some(attention_mask),
+                                attention_mask,
                                 cos,
                                 sin,
                                 Some(adaln),
@@ -1469,7 +1522,7 @@ impl ZImageTransformer2DModel {
             let (unified, ctx) = self.forward_pre_main(x, t, cap_feats, cap_mask)?;
             let unified = into_candle_core(self.run_layers(
                 unified,
-                &ctx.unified_attn_mask,
+                Some(&ctx.unified_attn_mask),
                 &ctx.unified_cos,
                 &ctx.unified_sin,
                 &ctx.adaln_input,
@@ -1574,9 +1627,19 @@ impl ZImageTransformer2DModel {
         let f_patch_size = self.cfg.all_f_patch_size[0];
         let (_, orig_size) = patchify(x, patch_size, f_patch_size)?;
         let geometry = self.positioned_geometry(x, cap_feats, cap_mask)?;
+        // One host read of the tiny `[B, L]` caption mask per prepared request (not per step or
+        // attention call) decides the exact padding trim (SW-6130).
+        let trim = caption_padding_trim(&cap_mask.to_dtype(DType::U8)?.to_vec2::<u8>()?);
+        let (geometry, cap_feats) = match trim {
+            Some(valid) => (
+                self.trim_caption_geometry(geometry, valid)?,
+                cap_feats.narrow(1, 0, valid)?,
+            ),
+            None => (geometry, cap_feats.clone()),
+        };
         let cap = self.refine_caption(
-            self.embed_caption(cap_feats)?,
-            &geometry.caption.mask,
+            self.embed_caption(&cap_feats)?,
+            trim.is_none().then_some(&geometry.caption.mask),
             &geometry.caption.cos,
             &geometry.caption.sin,
             self.execution.attention_plan(attention_plan),
@@ -1591,11 +1654,11 @@ impl ZImageTransformer2DModel {
             img_seq_len: geometry.image.mask.dim(1)?,
             x_cos: geometry.image.cos,
             x_sin: geometry.image.sin,
-            x_attn_mask: geometry.image.mask,
+            x_attn_mask: None,
             cap,
             unified_cos: unified.cos,
             unified_sin: unified.sin,
-            unified_attn_mask: unified.mask,
+            unified_attn_mask: trim.is_none().then_some(unified.mask),
         })
     }
 
@@ -1678,7 +1741,7 @@ impl ZImageTransformer2DModel {
         let (x, adaln_input, _) = self.embed_image(x, t)?;
         let x = self.refine_image(
             x,
-            &prepared.x_attn_mask,
+            prepared.x_attn_mask.as_ref(),
             &prepared.x_cos,
             &prepared.x_sin,
             &adaln_input,
@@ -1687,7 +1750,7 @@ impl ZImageTransformer2DModel {
         )?;
         let unified = self.run_layers(
             Tensor::cat(&[&x, &prepared.cap], 1)?,
-            &prepared.unified_attn_mask,
+            prepared.unified_attn_mask.as_ref(),
             &prepared.unified_cos,
             &prepared.unified_sin,
             &adaln_input,
@@ -1853,7 +1916,7 @@ impl ZImageTransformer2DModel {
         let plan = default_attention_plan();
         let x = into_candle_core(self.refine_image(
             x,
-            &geometry.image.mask,
+            Some(&geometry.image.mask),
             &geometry.image.cos,
             &geometry.image.sin,
             &adaln_input,
@@ -1862,7 +1925,7 @@ impl ZImageTransformer2DModel {
         ))?;
         let cap = into_candle_core(self.refine_caption(
             cap,
-            &geometry.caption.mask,
+            Some(&geometry.caption.mask),
             &geometry.caption.cos,
             &geometry.caption.sin,
             plan,
@@ -2781,5 +2844,176 @@ mod inference_tests {
             r2.is_err(),
             "a LoHa adapter must be rejected on the packed additive path"
         );
+    }
+}
+
+/// SW-6130: the exact caption key-padding trim that lets the Z-Image DiT attention go unmasked.
+#[cfg(test)]
+mod key_padding_tests {
+    use super::*;
+
+    fn rows(rows: &[&[u8]]) -> Vec<Vec<u8>> {
+        rows.iter().map(|r| r.to_vec()).collect()
+    }
+
+    /// The pure decision: a uniform valid prefix trims, anything else keeps the mask.
+    #[test]
+    fn only_a_uniform_valid_prefix_is_trimmed() {
+        // `prepare_inputs` pads one caption to the next multiple of 32: 19 valid + 13 padding.
+        let mut padded = vec![1u8; 19];
+        padded.extend([0u8; 13]);
+        assert_eq!(caption_padding_trim(&[padded.clone()]), Some(19));
+        // An unpadded caption trims to its own length (a no-op narrow, and no mask).
+        assert_eq!(caption_padding_trim(&rows(&[&[1, 1, 1]])), Some(3));
+        // Two rows with the same prefix trim together.
+        assert_eq!(caption_padding_trim(&[padded.clone(), padded]), Some(19));
+        // Different lengths, a hole, a mask that is not a prefix, or no valid token: keep the mask.
+        assert_eq!(caption_padding_trim(&rows(&[&[1, 1, 0], &[1, 0, 0]])), None);
+        assert_eq!(caption_padding_trim(&rows(&[&[1, 0, 1]])), None);
+        assert_eq!(caption_padding_trim(&rows(&[&[0, 1, 1]])), None);
+        assert_eq!(caption_padding_trim(&rows(&[&[0, 0, 0]])), None);
+    }
+
+    /// The caption grid is token-major, so the trimmed rows are exactly the valid tokens' positions;
+    /// the image grid keeps its padded-length offset. A layout probe on host-built grids, no compute.
+    #[test]
+    fn the_trim_keeps_every_valid_position() -> Result<()> {
+        let dev = Device::Cpu;
+        let (padded, valid) = (32usize, 19usize);
+        let caption = create_coordinate_grid((padded, 1, 1), (1, 0, 0), &dev)?;
+        let kept = caption.narrow(0, 0, valid)?.to_vec2::<u32>()?;
+        for (token, row) in kept.iter().enumerate() {
+            assert_eq!(row, &[1 + token as u32, 0, 0]);
+        }
+        let image = create_coordinate_grid((1, 2, 2), (padded + 1, 0, 0), &dev)?;
+        assert!(image
+            .to_vec2::<u32>()?
+            .iter()
+            .all(|row| row[0] == padded as u32 + 1));
+        Ok(())
+    }
+
+    /// **Inference compute, `#[ignore]`d.** One Z-Image DiT block on CUDA bf16 (6 heads x 128): the
+    /// pre-SW-6130 masked call (pinned to the materialized path) against the trimmed, unmasked call
+    /// the prepared conditioning now makes, which the shared router sends to FlashAttention-2. Both
+    /// are compared on the valid tokens against the f32 masked block.
+    ///
+    /// Declared tolerance: the trimmed fused block's rel-L2 against the f32 reference is at most
+    /// `1e-2` and at most twice the bf16 masked block's own rel-L2 plus `1e-3` (the two bf16 routes
+    /// round differently; neither may drift from the reference).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_trimmed_caption_block_matches_the_masked_block() -> candle_gen::Result<()> {
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+        use candle_gen::fused_attention::{attention_path_counts, with_materialized_attention};
+        let dev = Device::new_cuda(0)?;
+        let mut cfg = Config::z_image_turbo();
+        cfg.dim = 768; // 6 heads x 128 (head_dim is fixed by axes_dims = [32, 48, 48])
+        cfg.n_heads = 6;
+        cfg.n_kv_heads = 6;
+        cfg.n_layers = 1;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg.set_use_accelerated_attn(false);
+        let vm = VarMap::new();
+        let f32_model = ZImageTransformer2DModel::new_inference(
+            &cfg,
+            VarBuilder::from_varmap(&vm, DType::F32, &dev),
+        )?;
+        let bf16_model = ZImageTransformer2DModel::new_inference(
+            &cfg,
+            VarBuilder::from_varmap(&vm, DType::BF16, &dev),
+        )?;
+        fn block(model: &ZImageTransformer2DModel) -> &ZImageTransformerBlock {
+            match &model.layers {
+                TransformerLayers::Resident(layers) => &layers[0],
+                TransformerLayers::Streamed { .. } => unreachable!("resident test model"),
+            }
+        }
+
+        // A 32x32 image grid and one caption padded from 19 to 32 tokens (image first).
+        let (grid, padded, valid_cap) = (32usize, 32usize, 19usize);
+        let image_tokens = grid * grid;
+        let total = image_tokens + padded;
+        let valid = image_tokens + valid_cap;
+        let positions = Tensor::cat(
+            &[
+                &create_coordinate_grid((1, grid, grid), (padded + 1, 0, 0), &dev)?,
+                &create_coordinate_grid((padded, 1, 1), (1, 0, 0), &dev)?,
+            ],
+            0,
+        )?;
+        let (cos, sin) = f32_model.rope_embedder.forward(&positions)?;
+        let mut keep = vec![1u8; image_tokens + valid_cap];
+        keep.extend(vec![0u8; padded - valid_cap]);
+        let mask = Tensor::from_vec(keep, (1, total), &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, total, cfg.dim), &dev)?;
+        let t = (Tensor::from_vec(vec![0.6f32], 1, &dev)? * cfg.t_scale)?;
+        let adaln = f32_model.t_embedder.forward(&t)?;
+        let plan = default_attention_plan();
+
+        let reference = with_materialized_attention(|| {
+            block(&f32_model).forward_with_attention_plan(
+                &x,
+                Some(&mask),
+                &cos,
+                &sin,
+                Some(&adaln),
+                plan,
+            )
+        })?
+        .narrow(1, 0, valid)?;
+        let (xb, ab) = (x.to_dtype(DType::BF16)?, adaln.to_dtype(DType::BF16)?);
+        let masked = with_materialized_attention(|| {
+            block(&bf16_model).forward_with_attention_plan(
+                &xb,
+                Some(&mask),
+                &cos,
+                &sin,
+                Some(&ab),
+                plan,
+            )
+        })?
+        .narrow(1, 0, valid)?;
+        let before = attention_path_counts();
+        let trimmed = block(&bf16_model).forward_with_attention_plan(
+            &xb.narrow(1, 0, valid)?,
+            None,
+            &cos.narrow(0, 0, valid)?,
+            &sin.narrow(0, 0, valid)?,
+            Some(&ab),
+            plan,
+        )?;
+        let fused_calls = attention_path_counts().since(&before).flash;
+        assert!(
+            fused_calls >= 1,
+            "the trimmed block must take the fused kernel (build with candle-gen/flash-attn, the \n             runtime-cuda default)"
+        );
+
+        let errors = |a: &Tensor, b: &Tensor| -> candle_gen::Result<(f32, f32)> {
+            let d = (a.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?;
+            let max = d.abs()?.max_all()?.to_scalar::<f32>()?;
+            let num = d.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            let den = b
+                .to_dtype(DType::F32)?
+                .sqr()?
+                .sum_all()?
+                .sqrt()?
+                .to_scalar::<f32>()?;
+            Ok((max, num / den.max(f32::MIN_POSITIVE)))
+        };
+        let (fm, fr) = errors(&trimmed, &reference)?;
+        let (mm, mr) = errors(&masked, &reference)?;
+        let (dm, dr) = errors(&trimmed, &masked)?;
+        println!(
+            "z-image block key-padding parity (S={total}, valid {valid}, 6x128, bf16): trimmed fused \
+             vs f32 masked max|d| {fm:.3e} rel-L2 {fr:.3e}; bf16 masked materialized vs f32 max|d| \
+             {mm:.3e} rel-L2 {mr:.3e}; trimmed vs bf16 masked max|d| {dm:.3e} rel-L2 {dr:.3e}; \
+             fused calls {fused_calls}"
+        );
+        assert!(fr <= 1e-2, "trimmed fused block rel-L2 {fr}");
+        assert!(fr <= 2.0 * mr + 1e-3, "trimmed fused {fr} vs masked {mr}");
+        Ok(())
     }
 }

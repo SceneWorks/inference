@@ -1556,6 +1556,73 @@ mod tests {
         Ok(())
     }
 
+    /// SW-6130: a key-padding mask expressed as per-row valid key prefixes runs the fused kernel
+    /// over each row's valid keys, and matches the masked materialized call on **every** query row
+    /// (padded rows included): Lens's CFG batch, with an empty negative keeping only its image keys.
+    /// Same declared tolerance as [`cuda_flash_matches_budgeted`], against the f32 masked reference.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_key_prefix_matches_the_masked_call() -> crate::Result<()> {
+        use crate::attention::{sdpa_planned_bhsd_key_prefix, sdpa_planned_bhsd_materialized};
+        let dev = Device::new_cuda(0)?;
+        let (b, h, img, txt, d) = (2usize, 8usize, 1024usize, 77usize, 128usize);
+        let s = img + txt;
+        let valid_keys = [s, img + 31];
+        let mut additive = Vec::with_capacity(b * s);
+        for &n in &valid_keys {
+            additive.extend((0..s).map(|i| if i < n { 0f32 } else { -1e9 }));
+        }
+        let mask = Tensor::from_vec(additive, (b, 1, 1, s), &dev)?;
+        let q = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let scale = 1.0 / (d as f64).sqrt();
+        let plan = AttentionPlan::UNBOUNDED;
+        let before = attention_path_counts();
+        let fused = sdpa_planned_bhsd_key_prefix(
+            &q,
+            &k,
+            &v,
+            scale,
+            &mask.to_dtype(DType::BF16)?,
+            &valid_keys,
+            softmax_last_dim,
+            plan,
+        )?;
+        assert_eq!(attention_path_counts().since(&before).flash, 1);
+        let f32 = |t: &Tensor| t.to_dtype(DType::F32);
+        let want = sdpa_planned_bhsd_materialized(
+            &f32(&q)?,
+            &f32(&k)?,
+            &f32(&v)?,
+            scale,
+            Some(&mask),
+            softmax_last_dim,
+            plan,
+        )?;
+        let old = sdpa_planned_bhsd_materialized(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&mask.to_dtype(DType::BF16)?),
+            |s: &Tensor| softmax_last_dim(&s.to_dtype(DType::F32)?)?.to_dtype(s.dtype()),
+            plan,
+        )?;
+        let (fm, fr) = errors(&fused, &want)?;
+        let (bm, br) = errors(&old, &want)?;
+        println!(
+            "key-prefix parity b={b} h={h} s={s} valid={valid_keys:?} d={d}: fused max|d| {fm:.3e} \
+             rel-L2 {fr:.3e}; bf16 masked materialized max|d| {bm:.3e} rel-L2 {br:.3e}"
+        );
+        assert!(
+            fm <= 2e-2 && fr <= 1e-2,
+            "key-prefix fused vs f32 masked: {fm} / {fr}"
+        );
+        Ok(())
+    }
+
     /// The fused path never allocates the `[B, H, Sq, Sk]` scores. At S = 16384 (8 heads, d = 128,
     /// bf16) the materialized scores alone would be 4 GiB; the measured live-byte peak of the call
     /// (the stream-ordered pool's `USED_MEM_HIGH`, [`crate::cuda_mempool::MemPool`]) must stay

@@ -352,6 +352,104 @@ where
     Ok(Tensor::cat(&blocks, 2)?) // [B,H,Sq,D]
 }
 
+/// How [`sdpa_planned_bhsd_key_prefix`] serves one call, from the per-row valid key counts alone (a
+/// pure function of host data, unit-tested without tensors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPrefixPlan {
+    /// The counts do not describe this call (wrong batch, a zero or an over-long prefix): keep the
+    /// caller's additive mask on the flash-eligible helper, which then refuses as `Masked`.
+    Masked,
+    /// Every key of every row is valid: no mask at all.
+    Unmasked,
+    /// Every row has the same `n < Sk` valid leading keys: one unmasked call over `k/v[.., ..n, ..]`.
+    SharedPrefix(usize),
+    /// Rows differ: one unmasked call per batch row over its own key prefix.
+    PerRow,
+}
+
+/// The pure decision behind [`sdpa_planned_bhsd_key_prefix`].
+pub fn key_prefix_plan(valid_keys: &[usize], batch: usize, sk: usize) -> KeyPrefixPlan {
+    if batch == 0 || valid_keys.len() != batch || valid_keys.iter().any(|&n| n == 0 || n > sk) {
+        return KeyPrefixPlan::Masked;
+    }
+    match valid_keys {
+        [first, rest @ ..] if rest.iter().all(|n| n == first) => {
+            if *first == sk {
+                KeyPrefixPlan::Unmasked
+            } else {
+                KeyPrefixPlan::SharedPrefix(*first)
+            }
+        }
+        _ => KeyPrefixPlan::PerRow,
+    }
+}
+
+/// [`sdpa_planned_bhsd`] for a **key-padding** additive mask whose row `b` leaves exactly the first
+/// `valid_keys[b]` keys valid (`0`) and masks every later key with a large negative term (SW-6130).
+///
+/// Such a mask is the same attention as an unmasked call over each row's valid key prefix: a masked
+/// key's softmax weight is exactly zero (the f32 `exp` underflows), for padded and valid query rows
+/// alike. So when the shared router would send the *unmasked* call to the fused kernel, this runs the
+/// kernel over the narrowed (view, no copy) keys — once, or once per batch row when the prefixes
+/// differ — and otherwise calls [`sdpa_planned_bhsd`] with `mask`, byte-identical to before.
+///
+/// `valid_keys` is host data the caller derives once per forward (or request) from the same source
+/// as `mask`; this helper never reads a tensor back. The cancel flag is checked once before launch.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_planned_bhsd_key_prefix(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: &Tensor,
+    valid_keys: &[usize],
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    use crate::fused_attention::{
+        flash_bhsd, record_attention_path, route_attention_kernel, AttentionKernel,
+    };
+    let (batch, _, _, _) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let prefix = key_prefix_plan(valid_keys, batch, sk);
+    match prefix {
+        KeyPrefixPlan::Masked => {
+            return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan)
+        }
+        KeyPrefixPlan::Unmasked => return sdpa_planned_bhsd(q, k, v, scale, None, softmax, plan),
+        KeyPrefixPlan::SharedPrefix(_) | KeyPrefixPlan::PerRow => {}
+    }
+    if route_attention_kernel(q, k, v, None) != AttentionKernel::Flash {
+        return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan);
+    }
+    crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
+    record_attention_path(AttentionKernel::Flash);
+    if plan.is_cancelled() {
+        return Err(crate::CandleError::Canceled);
+    }
+    if let KeyPrefixPlan::SharedPrefix(n) = prefix {
+        return Ok(flash_bhsd(
+            q,
+            &k.narrow(2, 0, n)?,
+            &v.narrow(2, 0, n)?,
+            scale,
+        )?);
+    }
+    let rows = valid_keys
+        .iter()
+        .enumerate()
+        .map(|(row, &n)| {
+            flash_bhsd(
+                &q.narrow(0, row, 1)?,
+                &k.narrow(0, row, 1)?.narrow(2, 0, n)?,
+                &v.narrow(0, row, 1)?.narrow(2, 0, n)?,
+                scale,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Tensor::cat(&rows, 0)?)
+}
+
 /// i32-overflow-safe SDPA over the 3-D shape `q,k,v: [N, Sq, D]`, returning `[N, Sq, D]`. `N` folds the
 /// leading dims — `B·H` for SDXL's head-into-batch attention, or `B` for a single-head VAE spatial
 /// self-attention where `Sq = H·W`. `scale`/`softmax` behave as in [`sdpa_budgeted_bhsd`]; there is no
@@ -900,6 +998,22 @@ mod tests {
                 .any(|c| c.budget == ATTN_SCORES_BUDGET as u64),
             "the shared cross-backend table no longer covers ATTN_SCORES_BUDGET ({ATTN_SCORES_BUDGET})"
         );
+    }
+
+    #[test]
+    fn the_key_prefix_plan_reads_only_the_host_counts() {
+        use KeyPrefixPlan::*;
+        // Z-Image / Lens shapes: an image block always valid, a padded caption after it.
+        assert_eq!(key_prefix_plan(&[4128, 4128], 2, 4128), Unmasked);
+        assert_eq!(key_prefix_plan(&[4100], 1, 4128), SharedPrefix(4100));
+        assert_eq!(key_prefix_plan(&[4100, 4100], 2, 4128), SharedPrefix(4100));
+        // CFG with an empty negative: the uncond row keeps only the image keys.
+        assert_eq!(key_prefix_plan(&[4128, 4096], 2, 4128), PerRow);
+        // Counts that do not describe the call keep the caller's mask.
+        assert_eq!(key_prefix_plan(&[4100], 2, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[4100, 0], 2, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[4129], 1, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[], 0, 4128), Masked);
     }
 
     #[test]

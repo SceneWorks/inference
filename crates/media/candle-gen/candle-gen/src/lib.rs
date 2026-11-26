@@ -92,8 +92,9 @@ pub use loader::{
 pub mod attention;
 pub use attention::{
     sdpa_budgeted_bhsd, sdpa_budgeted_bhsd_materialized, sdpa_budgeted_flat,
-    sdpa_budgeted_flat_materialized, sdpa_planned_bhsd, sdpa_planned_bhsd_materialized,
-    sdpa_planned_flat, sdpa_planned_flat_materialized, ATTN_SCORES_BUDGET,
+    sdpa_budgeted_flat_materialized, sdpa_planned_bhsd, sdpa_planned_bhsd_key_prefix,
+    sdpa_planned_bhsd_materialized, sdpa_planned_flat, sdpa_planned_flat_materialized,
+    ATTN_SCORES_BUDGET,
 };
 
 // Shared interleaved-RoPE application + sinusoidal timestep embedding (sc-27286), hoisted from the
