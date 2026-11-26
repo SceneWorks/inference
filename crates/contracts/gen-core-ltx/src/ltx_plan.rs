@@ -490,6 +490,19 @@ impl LtxRenderPlan {
                     }
                     canvas as u32
                 } else {
+                    let slots = u32::try_from(*slot_count).unwrap_or(u32::MAX);
+                    if input.frames < 2
+                        || crate::ltx_dfr::evenly_spaced_keyframe_positions(
+                            slots,
+                            i64::from(input.frames),
+                        )
+                        .is_empty()
+                    {
+                        return Err(Error::Msg(
+                            "ltx_2_5: DFR needs at least two requested frames to place a generated-keyframe slot"
+                                .into(),
+                        ));
+                    }
                     input.frames
                 };
                 (canvas, *temporal_rounds_ref(temporal_upsample_rounds), true)
@@ -1182,6 +1195,44 @@ mod tests {
                 .unwrap()
                 .token_time_policy,
             PerTokenTimePolicy::Uniform
+        );
+
+        // 6. Generated-keyframe DFR without temporal rounds still needs at least 2 frames so
+        // `evenly_spaced_keyframe_positions` places non-empty slots.
+        let single_frame_dfr = LtxRenderPlanInput {
+            conditioning: LtxConditioningProfile::DfrGeneratedKeyframes {
+                slot_count: 1,
+                temporal_upsample_rounds: 0,
+            },
+            frames: 1,
+            ..sample_input(LtxVariant::Distilled, LtxOrchestrationRoute::AvDfr)
+        };
+        let err = LtxRenderPlan::build(single_frame_dfr).unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(ref message) if message.contains("at least two")),
+            "expected at least two frames error, got: {err:?}"
+        );
+        let single_frame_req = GenerationRequest {
+            prompt: "dfr single frame".into(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            num_generated_keyframes: Some(1),
+            ..Default::default()
+        };
+        let req_err = LtxRenderPlan::from_generation_request(
+            LtxModelFamily::Ltx25,
+            LtxVariant::Distilled,
+            MemoryBudgetDomainKey::UnifiedMemory,
+            &single_frame_req,
+            1,
+            24.0,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(req_err, Error::Msg(ref message) if message.contains("at least two")),
+            "expected at least two frames error from request, got: {req_err:?}"
         );
     }
 
