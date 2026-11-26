@@ -194,10 +194,12 @@ class OwnedCpuSafetyTests(unittest.TestCase):
     def test_observed_setsid_child_is_retained_after_immediate_root_exit(self):
         with tempfile.TemporaryDirectory() as root:
             marker, seen = Path(root) / "regrouped.pid", Path(root) / "seen"
+            # collect() polls while the parent runs; publish a complete PID atomically.
             wait_seen = f"while not Path({str(seen)!r}).exists(): time.sleep(0.005)"
             parent = ("import subprocess,sys,time;from pathlib import Path;"
                 "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],start_new_session=True);"
-                f"Path({str(marker)!r}).write_text(str(p.pid),encoding='utf-8');"
+                f"marker=Path({str(marker)!r});pending=marker.with_suffix('.tmp');"
+                "pending.write_text(str(p.pid),encoding='utf-8');pending.replace(marker);"
                 f"exec({wait_seen!r})")
             class ObservedOwner(fixture.CpuOwner):
                 retained_after_exit = False
