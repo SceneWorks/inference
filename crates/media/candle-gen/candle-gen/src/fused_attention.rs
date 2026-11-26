@@ -485,14 +485,32 @@ thread_local! {
 /// (`train::policy::with_job_policy`) and the checkpointed backward driver enter this scope, so a
 /// training step is the materialized path it always was, bit for bit.
 pub fn with_materialized_attention<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(u32);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            MATERIALIZED_SCOPE.set(self.0);
-        }
-    }
-    let _restore = Restore(MATERIALIZED_SCOPE.replace(MATERIALIZED_SCOPE.get().saturating_add(1)));
+    let _scope = enter_materialized_attention();
     f()
+}
+
+/// The guard form of [`with_materialized_attention`]: the scope lasts until the returned value
+/// drops (nesting, and unwinding, restore the previous depth). Thread-bound, so not `Send`. For a
+/// test or harness that pins a whole body to the materialized path.
+pub fn enter_materialized_attention() -> MaterializedAttentionScope {
+    let previous = MATERIALIZED_SCOPE.replace(MATERIALIZED_SCOPE.get().saturating_add(1));
+    MaterializedAttentionScope {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// An active [`enter_materialized_attention`] scope on this thread.
+#[must_use = "the materialized-attention scope ends when this guard drops"]
+pub struct MaterializedAttentionScope {
+    previous: u32,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for MaterializedAttentionScope {
+    fn drop(&mut self) {
+        MATERIALIZED_SCOPE.set(self.previous);
+    }
 }
 
 /// Whether this thread is inside [`with_materialized_attention`].
@@ -1226,6 +1244,14 @@ mod tests {
             "leaving the inner scope must keep the outer one"
         );
         assert!(!in_materialized_attention_scope());
+        {
+            let _guard = enter_materialized_attention();
+            assert_eq!(route_attention_kernel(&q, &k, &v, None), mat);
+        }
+        assert!(
+            !in_materialized_attention_scope(),
+            "the guard restores on drop"
+        );
         assert_eq!(
             route_attention_kernel(&q, &k, &v, None),
             AttentionKernel::Budgeted(cpu_refusal())
