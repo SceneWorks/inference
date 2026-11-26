@@ -2904,7 +2904,7 @@ mod key_padding_tests {
     /// "no worse than the masked bf16 route", not a statement about attention alone.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_trimmed_caption_block_matches_the_masked_block() -> candle_gen::Result<()> {
         use candle_gen::candle_nn::{VarBuilder, VarMap};
         use candle_gen::fused_attention::{attention_path_counts, with_materialized_attention};
@@ -2991,14 +2991,15 @@ mod key_padding_tests {
         })?
         .narrow(1, 0, valid)?;
         let before = attention_path_counts();
-        let trimmed = block(&bf16_model).forward_with_attention_plan(
+        // The learned-device witness of the model-proof protocol: the fused route's block output.
+        let trimmed = __model_proof_output!(block(&bf16_model).forward_with_attention_plan(
             &xb.narrow(1, 0, valid)?,
             None,
             &cos_b.narrow(0, 0, valid)?,
             &sin_b.narrow(0, 0, valid)?,
             Some(&ab),
             plan,
-        )?;
+        ))?;
         let routed = attention_path_counts().since(&before);
         let fused_calls = routed.flash;
         assert!(
@@ -3029,6 +3030,10 @@ mod key_padding_tests {
         );
         assert!(fr <= 2e-2, "trimmed fused block rel-L2 {fr}");
         assert!(fr <= 2.0 * mr + 1e-3, "trimmed fused {fr} vs masked {mr}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("
+MODEL_INFERENCE_BODY_COMPLETED dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block");
         Ok(())
     }
 }

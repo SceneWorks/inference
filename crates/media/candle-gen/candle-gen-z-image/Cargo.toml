@@ -54,6 +54,9 @@ model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-
 default = []
 metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda"]
+# FlashAttention-2 through the shared candle-gen router (SW-6130): what the Z-Image DiT's unmasked
+# attention dispatches to on a flash build. Selected by the explicit key-padding model proof.
+flash-attn = ["cuda", "candle-gen/flash-attn"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

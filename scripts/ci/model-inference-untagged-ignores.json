@@ -1,0 +1,238 @@
+[
+  {
+    "source": "crates/llm/mlx-llm/tests/real_weights.rs",
+    "test": "round_trips_a_generation_through_the_core_llm_contract"
+  },
+  {
+    "source": "crates/llm/mlx-llm/tests/stop_strings.rs",
+    "test": "honors_request_stop_strings_on_real_model"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/adapter_topology.rs",
+    "test": "the_delta_is_independent_of_the_body_weights_it_folds_onto"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "native_blocks_and_final_outputs_match_the_pinned_reference"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "native_pruned_adaln_matches_pinned_reference"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/w4a8_compare.rs",
+    "test": "mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/w4a8_compare.rs",
+    "test": "native_forward_matches_the_external_reference"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "exact_author_graph_fp32_bf16_and_ragged_masks"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "exact_unmerged_fp32_residual_and_fixed_noise_recurrence"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "mask_and_cancellation_refuse_before_blocks"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "renderer_off_on_off_never_reuses_modified_backbone"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests.rs",
+    "test": "supplied_fp32_conditioning_preserves_precision_until_selected_projection_sc26324"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs",
+    "test": "cached_renderer_invalidates_on_adapter_replacement_or_removal"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs",
+    "test": "strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs",
+    "test": "structured_lokr_matches_independent_f64_kronecker_for_both_orders_and_decompositions"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs",
+    "test": "native_complete_surface_campaign"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-supra2/tests/real_weights.rs",
+    "test": "components_match_torch_reference"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-supra2/tests/real_weights.rs",
+    "test": "registry_renders_published_defaults"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen-supra2/tests/real_weights.rs",
+    "test": "trajectories_match_torch_reference"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen/src/reference_training_attention.rs",
+    "test": "tests::dense_reference_forward_backward_matches_composable"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen/src/train/krea_ops.rs",
+    "test": "tests::rms_rope_forward_backward_matches_composable"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen/src/train/norm.rs",
+    "test": "ownership_tests::graph_retaining_norm_rope_attention_fallbacks"
+  },
+  {
+    "source": "crates/media/candle-gen/candle-gen/src/training_attention.rs",
+    "test": "tests::streaming_forward_backward_matches_composable"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-anima/tests/real_weights.rs",
+    "test": "dit_rejects_out_of_range_size_per_axis"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-anima/tests/shared_memory_ladder_real_weights.rs",
+    "test": "rung_four_preconditions_fail_closed_on_real_weights"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-catalog/tests/preview_real_weights.rs",
+    "test": "registered_route_emits_exact_step_cadence_without_changing_output"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/real_weights.rs",
+    "test": "real_distilled_text_to_image_renders"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/real_weights.rs",
+    "test": "real_dit_forward_matches_upstream"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-kolors/tests/memory_ladder_real_weights.rs",
+    "test": "the_rung_four_stream_replays_an_installed_ip_adapter"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs",
+    "test": "kv_cache_residency_at_the_production_geometry"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/style_lora_real_weights.rs",
+    "test": "registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adapter_topology.rs",
+    "test": "the_delta_is_independent_of_the_body_weights_it_folds_onto"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adapter_topology.rs",
+    "test": "the_exact_corpus_is_bit_identical_across_partitions"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adapter_topology.rs",
+    "test": "the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/int8_gemm_parity.rs",
+    "test": "microbench_h3_projection_shapes"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/int8_gemm_parity.rs",
+    "test": "tiled_w4a8_matches_serial_reference_on_random_packed_codes"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "full_model_live_coordinates_match_cache_and_refuse_foreign_basis"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/pruned_adaln.rs",
+    "test": "manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/ref2va_reference_partition_real.rs",
+    "test": "cold_second_load_token_embedding_incidence_probe"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/ref2va_reference_partition_real.rs",
+    "test": "reference_partition_step_cost_against_base"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/w4a8_compare.rs",
+    "test": "mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/w4a8_compare.rs",
+    "test": "native_forward_matches_the_external_reference"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/portable_exchange_tests.rs",
+    "test": "cpu_train_export_and_import_portable_adapters"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/portable_exchange_tests.rs",
+    "test": "external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer/author_fixture_tests.rs",
+    "test": "frozen_reference_unmerged_fp32_projection_and_three_step_dmd"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer/training_bf16_cpu_tests.rs",
+    "test": "production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer/training_graph_tests.rs",
+    "test": "cpu_native_backward_updates_only_factors_and_reload_changes_generation"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer/training_projection_tests.rs",
+    "test": "custom_stack_is_fp32_scaled_and_keeps_dmd_separate"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/tests/native_smoke.rs",
+    "test": "native_advanced_supplied_order_receipt"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/tests/native_smoke.rs",
+    "test": "native_generation_or_cancel_with_actual_receipt"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-sana/tests/memory_ladder_real_weights.rs",
+    "test": "an_eager_load_declares_and_refuses_rung_four"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-supra2/tests/real_weights.rs",
+    "test": "components_match_torch_reference"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-supra2/tests/real_weights.rs",
+    "test": "registry_renders_published_defaults"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-supra2/tests/real_weights.rs",
+    "test": "trajectories_match_torch_reference"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/pid_decode_real_weights.rs",
+    "test": "use_pid_without_loaded_pid_errors"
+  },
+  {
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/text_encoder_window_real_weights.rs",
+    "test": "a_non_streamable_encoder_refuses_the_rung_instead_of_running_resident"
+  }
+]

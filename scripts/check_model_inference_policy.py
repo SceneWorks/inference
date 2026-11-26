@@ -15,6 +15,11 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci.model_proof_parent_helpers import identity as helper_identity, validate_parent_helpers
 
 CANONICAL = 'model inference; explicit model-proof workflow'
+# A learned-model seam call: the structural detector shared by the Rustdoc and ignored-test rules.
+LEARNED_SEAM = re.compile(r'\.(?:forward(?:_[A-Za-z0-9_]+)?|generate(?:_[A-Za-z0-9_]+)?|train|backward)\s*\(')
+# Ignored tests that executed a learned seam under a non-canonical reason, unregistered, before the
+# untagged-ignore rule existed. The list may only shrink: a stale entry is itself an error.
+UNTAGGED_IGNORE_BASELINE = 'scripts/ci/model-inference-untagged-ignores.json'
 RAW_STRING = re.compile(r'(?:b|c)?r(#{0,255})"')
 CHARACTER = re.compile(r"'(?:\\.|[^'\\\n])'")
 MODIFIER = re.compile(r'(?:pub(?:\([^()]*\))?|async|unsafe)\s*$')
@@ -350,6 +355,15 @@ def registry_errors(root: Path, rows: list[dict], legacy: list[dict] = ()) -> li
                 errors.append(row['fqn'] + ': actual body completion marker is missing')
     # Coverage binds tagged source functions, not a frozen population/count. New cases classify
     # and register; removing an entry cannot silently leave a newly manual test unreachable.
+    # An ignored test that executes a learned seam must carry the canonical tag (or a registered
+    # legacy reason) too: a non-canonical ignore would otherwise hide new model work from both the
+    # registry and ordinary CI. Pre-rule cases are an explicit, shrink-only baseline.
+    baseline_path = root / UNTAGGED_IGNORE_BASELINE
+    baseline = set()
+    if baseline_path.is_file():
+        for entry in json.loads(baseline_path.read_text(encoding='utf-8')):
+            baseline.add((entry['source'], entry['test']))
+    baseline_seen = set()
     sources = set(root.glob('crates/**/*.rs')) | set(root.glob('ios-host/**/*.rs'))
     for path in sorted(sources):
         relative = path.relative_to(root).as_posix()
@@ -365,10 +379,22 @@ def registry_errors(root: Path, rows: list[dict], legacy: list[dict] = ()) -> li
             if not any(row['fqn'] == marker for row in by_source.get(relative, [])):
                 errors.append(f'{relative}: model body marker has no executable registry binding: {marker}')
         for item in parsed:
-            if item['canonical'] and not any(row.get('source_function', row['fqn'].split('::')[-1]) == item['name']
-                                             and (not item['inline_modules'] or tuple(row['fqn'].split('::')[-len(item['inline_modules']) - 1:-1]) == item['inline_modules'])
-                                             for row in by_source.get(relative, [])):
+            registered = any(row.get('source_function', row['fqn'].split('::')[-1]) == item['name']
+                             and (not item['inline_modules'] or tuple(row['fqn'].split('::')[-len(item['inline_modules']) - 1:-1]) == item['inline_modules'])
+                             for row in by_source.get(relative, []))
+            if item['canonical'] and not registered:
                 errors.append(f'{relative}:{item["line"]}: tagged model test is not registered: {item["name"]}')
+            qualified = '::'.join((*item['inline_modules'], item['name']))
+            if (item['ignored'] and not item['canonical'] and not registered
+                    and LEARNED_SEAM.search(rust_mask(item.get('body', '')))):
+                if (relative, qualified) in baseline:
+                    baseline_seen.add((relative, qualified))
+                else:
+                    errors.append(f'{relative}:{item["line"]}: ignored test executes a learned-model seam '
+                                  f'but is neither tagged "{CANONICAL}" nor registered: {qualified}')
+    for source, test in sorted(baseline - baseline_seen):
+        errors.append(f'{UNTAGGED_IGNORE_BASELINE}: stale entry {source}::{test} (now tagged, registered, '
+                      'removed or no longer a learned seam); delete it')
     return errors
 
 
@@ -380,7 +406,7 @@ def model_doc_errors(text: str, source: str) -> list[str]:
     Raw functional kernels remain permitted. no_run/compile_fail compile without execution.
     """
     errors = []
-    learned = re.compile(r'\.(?:forward(?:_[A-Za-z0-9_]+)?|generate(?:_[A-Za-z0-9_]+)?|train|backward)\s*\(')
+    learned = LEARNED_SEAM
     fragments = []
     current = []
     start = 0
