@@ -21,6 +21,7 @@ model-inference-proof = ["sceneworks-gen-core/model-inference-proof"]
 # The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
 # never depends on them (sc-27316). Tensor-free, like gen-core.
 sceneworks-gen-core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
