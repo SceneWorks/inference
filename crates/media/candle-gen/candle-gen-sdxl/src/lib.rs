@@ -25,8 +25,9 @@
 //! `realvisxl_lightning` model id renderable on the candle (Windows) lane at ~5 steps; base SDXL is
 //! unaffected (it keeps the DDIM default).
 //!
-//! Perf (sc-3674): CLIP loads f16 and the UNet attention runs through fused **flash-attention** when
-//! built `--features flash-attn` and the runtime toggle ([`set_flash_attn`], default on) is set.
+//! Perf (sc-3674): CLIP loads f16. The attention routes through the shared `candle_gen` helpers,
+//! which take fused **flash-attention** on a `candle-gen/flash-attn` build when the one process-wide
+//! toggle ([`set_flash_attn`] wraps it, default on) is set and the operands are bf16/f16 (SW-6130).
 //!
 //! Peak VRAM (sc-4987): the dual CLIP is loaded/run/freed before the UNet+VAE load (staged
 //! sequential load), and the VAE decode tiles + blends above 512² output ([`set_vae_tiling`], default
@@ -332,26 +333,20 @@ pub use memory_strategy::{
 /// from the check; the bespoke edit provider imports this same crate-root const.
 pub const SIZE_MULTIPLE: u32 = 8;
 
-/// Process-global flash-attention runtime toggle (sc-3674). This switch was designed to decide
-/// whether a flash-attn-capable build actually *uses* the fused kernels, so the SceneWorks UI can
-/// expose it (defaulted on) and the worker flips it from settings — without recompiling. Mirrors
-/// `mlx-gen-sdxl::set_compile_glue`. **sc-9032:** the `flash-attn` cargo feature it was ANDed with
-/// was a no-op alias (`= ["cuda"]`, no `candle-flash-attn` wired) and was removed. The toggle remains inert as part
-/// of the public worker API. Default **on**.
-static FLASH_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Enable/disable flash-attention for subsequently-loaded pipelines (sc-3674). Process-global; the
-/// worker calls this from its `backend_candle`/flash setting at startup. Inert since sc-9032 removed
-/// the no-op `flash-attn` feature — no fused kernels are compiled in (retained as worker API).
+/// Enable/disable fused flash-attention (sc-3674): a thin wrapper over the **one** process-wide
+/// switch, [`candle_gen::fused_attention::set_flash_attention_enabled`] (SW-6130), which every
+/// candle provider's shared attention helpers read per call — so this is not SDXL-scoped, and it
+/// takes effect at the next attention call rather than at pipeline load. Retained as worker API.
+/// Default **on**. It has no effect on a build without `candle-gen/flash-attn`, or on SDXL
+/// attention whose operands the UNet upcasts to f32 (the fused kernel is bf16/f16 only).
 pub fn set_flash_attn(on: bool) {
-    FLASH_ATTN.store(on, std::sync::atomic::Ordering::Relaxed);
+    candle_gen::fused_attention::set_flash_attention_enabled(on);
 }
 
-/// Whether flash-attention is currently enabled (the runtime toggle, [`set_flash_attn`]). Since
-/// sc-9032 the pipeline hard-codes the flash path off (the no-op `flash-attn` feature was removed),
-/// so this returning `true` does not enable anything.
+/// Whether fused flash-attention is currently enabled: the shared switch
+/// ([`candle_gen::fused_attention::flash_attention_enabled`]) behind [`set_flash_attn`].
 pub fn flash_attn_enabled() -> bool {
-    FLASH_ATTN.load(std::sync::atomic::Ordering::Relaxed)
+    candle_gen::fused_attention::flash_attention_enabled()
 }
 
 /// Process-global VAE-tiling runtime toggle (sc-4987). When on, the VAE decode tiles the latent into

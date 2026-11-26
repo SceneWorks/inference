@@ -1542,14 +1542,24 @@ mod tests {
         let (q, k, v) = (mk(), mk(), mk());
         let scale = (d as f64).powf(-0.5);
 
-        let f32_path = sdpa_budgeted(&q, &k, &v, scale, usize::MAX, |scores: &Tensor| {
+        // The materialized helper: this compares two softmax closures, which the fused kernel
+        // (taken by the flash-eligible helper on a flash build) would not call at all (SW-6130).
+        let materialized = |softmax: &dyn Fn(&Tensor) -> Result<Tensor>| {
+            candle_gen::sdpa_budgeted_bhsd_materialized(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                softmax,
+                usize::MAX,
+            )
+        };
+        let f32_path = materialized(&|scores: &Tensor| {
             softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)
         })
         .unwrap();
-        let bf16_path = sdpa_budgeted(&q, &k, &v, scale, usize::MAX, |scores: &Tensor| {
-            softmax_last_dim(scores)
-        })
-        .unwrap();
+        let bf16_path = materialized(&|scores: &Tensor| softmax_last_dim(scores)).unwrap();
 
         // Compare in f32. bf16 has ~7-bit mantissa (step ~1/128 near 1.0); the attention output is a
         // convex combination of the (unit-scale) values, so a max-abs a few bf16 ULPs wide is expected

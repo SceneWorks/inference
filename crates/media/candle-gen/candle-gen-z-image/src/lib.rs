@@ -348,28 +348,20 @@ pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContrac
 /// copy can drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
 
-/// Process-global accelerated-attention runtime toggle (the Z-Image analogue of the SDXL flash-attn
-/// switch, sc-3674). This switch was designed to decide whether a capable build actually *uses* the
-/// DiT's fused attention dispatch (CUDA flash-attn / Metal SDPA), so the SceneWorks UI can expose it
-/// (defaulted on) and the worker flips it from settings without recompiling. **sc-9032:** the
-/// `flash-attn` cargo feature it was ANDed with was a no-op alias (`= ["cuda"]`, no fused dispatch
-/// wired) and was removed; the pipeline now hard-codes the accelerated path off, so this toggle is
-/// retained as public worker API but is inert until a real fused-dispatch slice re-gates it.
-/// Default **on**.
-static ACCEL_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Enable/disable accelerated attention for subsequently-loaded pipelines. Process-global; the worker
-/// calls this from its backend setting at startup. Inert since sc-9032 removed the no-op `flash-attn`
-/// feature — no fused dispatch is wired in (retained as worker API).
+/// Enable/disable accelerated attention: a thin wrapper over the **one** process-wide fused
+/// attention switch, [`candle_gen::fused_attention::set_flash_attention_enabled`] (SW-6130), read per
+/// call by every candle provider's shared attention helpers — so it is not Z-Image-scoped. Retained
+/// as worker API. Default **on**. The Z-Image DiT always passes an attention mask, which the fused
+/// kernel cannot express, so its DiT attention stays on the materialized path either way; the Metal
+/// SDPA path remains off (sc-9032).
 pub fn set_accel_attn(on: bool) {
-    ACCEL_ATTN.store(on, std::sync::atomic::Ordering::Relaxed);
+    candle_gen::fused_attention::set_flash_attention_enabled(on);
 }
 
-/// Whether accelerated attention is currently enabled (the runtime toggle, [`set_accel_attn`]). Since
-/// sc-9032 the pipeline hard-codes the accelerated path off (the no-op `flash-attn` feature was
-/// removed), so this returning `true` does not enable anything.
+/// Whether accelerated attention is currently enabled: the shared switch
+/// ([`candle_gen::fused_attention::flash_attention_enabled`]) behind [`set_accel_attn`].
 pub fn accel_attn_enabled() -> bool {
-    ACCEL_ATTN.load(std::sync::atomic::Ordering::Relaxed)
+    candle_gen::fused_attention::flash_attention_enabled()
 }
 
 /// A loaded candle Z-Image generator. Loading is **tensor-lazy**: `load` reads only the transformer's

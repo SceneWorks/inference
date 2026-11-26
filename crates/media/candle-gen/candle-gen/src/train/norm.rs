@@ -523,7 +523,7 @@ mod ownership_tests {
             crate::fused_attention::training_sdpa_standard_bhsd(&xf, &k, &v, 0.4, None, plan)
         })
         .map_err(candle_core::Error::wrap)?;
-        let legacy = crate::attention::sdpa_planned_bhsd(
+        let legacy = crate::attention::sdpa_planned_bhsd_materialized(
             &xf,
             &k,
             &v,
@@ -558,7 +558,7 @@ mod ownership_tests {
             crate::training_attention::take_training_attention_counts(),
             (0, 1)
         );
-        let composable = crate::attention::sdpa_planned_bhsd(
+        let composable = crate::attention::sdpa_planned_bhsd_materialized(
             &q32,
             &k32,
             &v32,

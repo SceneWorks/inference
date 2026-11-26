@@ -2015,6 +2015,81 @@
       "platforms": [
         "darwin"
       ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_flash_matches_budgeted",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6130 CUDA numerical attention parity: the shared helpers' FlashAttention-2 route vs the f32 materialized reference at head dims 64/128/256, with and without GQA, bf16, 4-D and flat helpers. cfg(flash-attn), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "flash-attn"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_masked_calls_keep_the_materialized_path",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6130 CUDA attention: a masked bf16 call through the flash-eligible helper must equal the materialized path exactly (the router refuses the kernel for an additive mask). cfg(flash-attn), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "flash-attn"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_flash_peak_memory_has_no_score_matrix",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6130 CUDA attention memory: one S=16384, 8-head, d=128 bf16 fused call must peak (pool USED_MEM_HIGH) far below the 4 GiB materialized score matrix. cfg(flash-attn), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "flash-attn"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_key_prefix_matches_the_masked_call",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6130 CUDA attention parity: a per-row key-padding prefix (Lens CFG with an empty negative) through the fused kernel vs the f32 masked materialized reference, every query row. cfg(flash-attn), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "flash-attn"
+      ]
+    },
+    {
+      "package": "candle-gen-z-image",
+      "kind": "lib",
+      "target": "candle_gen_z_image",
+      "test": "dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block",
+      "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
+      "reason": "SW-6130 CUDA parity of one random-weight Z-Image DiT block (6x128 bf16): masked materialized vs the trimmed-caption fused route, both against the f32 masked block. cfg(cuda); asserts a candle-gen/flash-attn build.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
     }
   ]
 }

@@ -289,6 +289,45 @@ impl CrossAttention {
             .reshape((batch_size / self.heads, seq_len, dim * self.heads))
     }
 
+    /// The shared fused attention for the native-dtype (f16/bf16) operands, when the shared router
+    /// selects it (SW-6130): the kernel keeps its scores and softmax in f32 internally, so the f32
+    /// upcast below — which exists for the materialized path's numerics — has nothing to add. `None`
+    /// (CPU, Metal, f32, a non-flash build, the toggle off, a training step) keeps that path.
+    fn fused_attention(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        // Skip even the reshapes where the kernel cannot run.
+        if !candle_gen::fused_attention::FLASH_ATTN_COMPILED || !query.device().is_cuda() {
+            return Ok(None);
+        }
+        let (batch_heads, query_len, dim) = query.dims3()?;
+        let batch = batch_heads / self.heads;
+        let key_len = key.dim(1)?;
+        let q = query.reshape((batch, self.heads, query_len, dim))?;
+        let k = key.reshape((batch, self.heads, key_len, dim))?;
+        let v = value.reshape((batch, self.heads, key_len, dim))?;
+        if candle_gen::fused_attention::route_attention_kernel(&q, &k, &v, None)
+            != candle_gen::AttentionKernel::Flash
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            candle_gen::sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                self.scale,
+                None,
+                |s| nn::ops::softmax(s, D::Minus1),
+                crate::request_attention_budget(),
+            )?
+            .reshape((batch_heads, query_len, dim))?,
+        ))
+    }
+
     fn attention(&self, query: &Tensor, key: &Tensor, value: &Tensor) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let xs = if self.use_flash_attn {
@@ -309,6 +348,8 @@ impl CrossAttention {
                 .transpose(1, 2)?
                 .squeeze(0)?
                 .to_dtype(init_dtype)?
+        } else if let Some(fused) = self.fused_attention(query, key, value)? {
+            fused
         } else {
             let in_dtype = query.dtype();
             let query = query.to_dtype(DType::F32)?;

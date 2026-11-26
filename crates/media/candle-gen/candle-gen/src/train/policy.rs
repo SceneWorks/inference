@@ -227,7 +227,10 @@ pub fn with_job_policy<T>(mut policy: JobTrainingPolicy, f: impl FnOnce() -> T) 
     }
     eprintln!("training execution profile: version={VERSION} model={} arm={} resume={} proof_override={:?}",
         policy.model, policy.profile.measured_arm(), policy.resumed, super::comparison::active_stage());
-    scoped(Some(policy), f)
+    // A training job keeps every shared attention helper on the materialized path (SW-6130): the
+    // fused kernel has no backward, and the detached stash forwards of checkpointing would hide
+    // the tape from the per-call autograd check.
+    crate::fused_attention::with_materialized_attention(|| scoped(Some(policy), f))
 }
 
 /// Prevent a job's arithmetic/preparation choices leaking into user callbacks or

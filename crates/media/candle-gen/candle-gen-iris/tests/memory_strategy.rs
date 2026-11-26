@@ -168,6 +168,9 @@ fn an_admitted_staged_request_stages_a_warm_generator() {
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn an_admitted_attention_budget_bounds_the_render() {
+    // This rung's evidence is the materialized query-chunking ladder: pin it there, so a
+    // FlashAttention build (which never chunks) still measures what the rung selects (SW-6130).
+    let _materialized = candle_gen::fused_attention::enter_materialized_attention();
     let generator = load(Precision::Fp32);
     chunk_probe::reset();
     let (unbounded, _) = render(generator.as_ref(), &request());
@@ -308,6 +311,9 @@ const BF16_BOUNDED_MEAN_ABS_LEVELS: f64 = 1.0;
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn a_bf16_render_under_a_binding_attention_budget_stays_inside_the_declared_bound() {
+    // This rung's evidence is the materialized query-chunking ladder: pin it there, so a
+    // FlashAttention build (which never chunks) still measures what the rung selects (SW-6130).
+    let _materialized = candle_gen::fused_attention::enter_materialized_attention();
     let generator = load(Precision::Bf16);
     let mut worst_max = 0u8;
     let mut worst_mean = 0f64;

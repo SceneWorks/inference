@@ -1924,24 +1924,29 @@ mod bfl_tests {
         let v = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
         // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
         // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
-        let single = candle_gen::sdpa_budgeted_flat(&q, &k, &v, scale, sm, usize::MAX).unwrap();
+        let single =
+            candle_gen::sdpa_budgeted_flat_materialized(&q, &k, &v, scale, sm, usize::MAX).unwrap();
         // budget = n·s·block = 2·7·3 = 42 → block = 3.
         for budget in [1usize, 42] {
             assert_close(
                 &single,
-                &candle_gen::sdpa_budgeted_flat(&q, &k, &v, scale, sm, budget).unwrap(),
+                &candle_gen::sdpa_budgeted_flat_materialized(&q, &k, &v, scale, sm, budget)
+                    .unwrap(),
             );
         }
 
         let sk = 5usize;
         let kx = Tensor::randn(0f32, 1f32, (n, sk, d), &dev).unwrap();
         let vx = Tensor::randn(0f32, 1f32, (n, sk, d), &dev).unwrap();
-        let single = candle_gen::sdpa_budgeted_flat(&q, &kx, &vx, scale, sm, usize::MAX).unwrap();
+        let single =
+            candle_gen::sdpa_budgeted_flat_materialized(&q, &kx, &vx, scale, sm, usize::MAX)
+                .unwrap();
         // budget = n·sk·block = 2·5·3 = 30 → block = 3 (chunks 3, 3, 1 over the 7 query rows).
         for budget in [1usize, 30] {
             assert_close(
                 &single,
-                &candle_gen::sdpa_budgeted_flat(&q, &kx, &vx, scale, sm, budget).unwrap(),
+                &candle_gen::sdpa_budgeted_flat_materialized(&q, &kx, &vx, scale, sm, budget)
+                    .unwrap(),
             );
         }
     }

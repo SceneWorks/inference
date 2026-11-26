@@ -1062,6 +1062,36 @@ mod tests {
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
     use rand::{rngs::StdRng, SeedableRng};
 
+    /// SW-6130 leak sweep: an inference-loaded branch is frozen, so every leaf it reads in a forward
+    /// is a detached, untracked view; its residuals (added into the main stream) therefore cannot put
+    /// the main DiT's attention operands on the tape, and the shared router may fuse them. A training
+    /// branch keeps reading its live `Var`s. Load and leaf reads only, no forward.
+    #[test]
+    fn an_inference_branch_reads_only_untracked_leaves() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let (_dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
+        let w = crate::loader::Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let trainable = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        assert!(!trainable.frozen);
+        assert!(trainable.named.iter().all(|(_, v)| rd(v, false).track_op()));
+        let checkpoint = tmp.path().join("branch.safetensors");
+        trainable.save(&checkpoint).unwrap();
+        for quant in [None, Some(Quant::Q8)] {
+            let inference =
+                ControlBranch::from_checkpoint_for_inference(&checkpoint, &c, &dev, quant).unwrap();
+            assert!(inference.frozen, "{quant:?}: inference loads must freeze");
+            assert!(
+                inference
+                    .named
+                    .iter()
+                    .all(|(_, v)| !rd(v, inference.frozen).track_op()),
+                "{quant:?}: a frozen branch read a tracked leaf"
+            );
+        }
+    }
+
     fn nudge_vars(branch: &ControlBranch, dev: &Device) {
         for v in branch.vars() {
             v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), dev).unwrap())

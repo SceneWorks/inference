@@ -223,7 +223,11 @@ fn sdpa_planned_by_heads(
     let head_plan = plan
         .budget
         .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
-    if !head_plan.chunks_heads() {
+    // A call the shared router sends to the fused kernel materializes no scores for the head
+    // chunks to bound: one launch (SW-6130).
+    let fused = candle_gen::fused_attention::route_attention_kernel(q, k, v, None)
+        == candle_gen::AttentionKernel::Flash;
+    if fused || !head_plan.chunks_heads() {
         record_attention_head_chunk_count(1);
         return candle_gen::fused_attention::training_sdpa_bhsd(
             q,
