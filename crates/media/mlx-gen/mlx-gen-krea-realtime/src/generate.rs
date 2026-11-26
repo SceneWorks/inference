@@ -624,9 +624,15 @@ impl<F: KreaArBlockForward> FamilyDriver<Array> for KreaRealtimeArDriver<F> {
             return Err(GenError::Canceled);
         }
 
-        // Validate Carry compatibility BEFORE mutating `state` (`PIPE-3`).
+        // Validate Carry compatibility and span invariants BEFORE mutating `state` (`PIPE-3`).
         let carrying = input.transition == SliceTransition::Continue
             && input.history == DriverHistoryPolicy::Carry;
+        if input.span.is_empty() || (!carrying && input.span.start != 0) {
+            return Err(GenError::Unsupported(format!(
+                "{}: slice {:?} requires a non-empty span starting at 0 unless continuing with Carry",
+                self.support.driver_id, input.span
+            )));
+        }
         if carrying {
             let Some(existing) = state.history_ref::<KreaArDriverState>() else {
                 return Err(GenError::Unsupported(format!(
@@ -1856,5 +1862,166 @@ mod tests {
             |chunk: &Array, _t: f32, _s: usize, _c: bool| Ok(chunk.clone()),
         );
         assert!(bad_driver.validate_source_shape().is_err());
+    }
+
+    #[test]
+    fn krea_realtime_ar_driver_rejects_empty_or_nonzero_start_span_without_state_mutation() {
+        use std::rc::Rc;
+
+        let schedule = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_ref = Rc::clone(&calls);
+        let driver = KreaRealtimeArDriver::new(
+            schedule,
+            4,
+            4,
+            3,
+            5,
+            4,
+            4,
+            true,
+            0.0,
+            0,
+            None,
+            move |chunk: &Array, _t: f32, _s: usize, _c: bool| -> Result<Array> {
+                *calls_ref.borrow_mut() += 1;
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        );
+        let cancel = CancelFlag::new();
+        let mut on_progress = |_p: Progress| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+
+        // 1. Start with span.start > 0 refuses cleanly before mutating DriverRunState or burning PRNG draws.
+        let mut state_nonzero = DriverRunState::new();
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 2..5,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state_nonzero,
+                &mut hooks,
+            )
+            .expect_err("Start with span.start > 0 must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(state_nonzero.stochastic_draw_index, 0);
+        assert_eq!(state_nonzero.completed_outer_steps, 0);
+        assert_eq!(state_nonzero.internal_evaluations, 0);
+        assert!(state_nonzero.history_ref::<KreaArDriverState>().is_none());
+
+        // 2. Empty Start span (0..0) refuses cleanly before mutating state or burning PRNG draws.
+        let mut state_empty = DriverRunState::new();
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..0,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state_empty,
+                &mut hooks,
+            )
+            .expect_err("empty Start span must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(state_empty.stochastic_draw_index, 0);
+        assert_eq!(state_empty.completed_outer_steps, 0);
+        assert_eq!(state_empty.internal_evaluations, 0);
+        assert!(state_empty.history_ref::<KreaArDriverState>().is_none());
+
+        // 3. Empty Continue+Carry span after a real Start slice refuses without truncating carried history
+        // or burning a PRNG draw, leaving the subsequent Carry slice able to finish cleanly.
+        let mut carried_state = DriverRunState::new();
+        let boundary = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..3,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .unwrap();
+        let draws_after_start = carried_state.stochastic_draw_index;
+        let evals_after_start = carried_state.internal_evaluations;
+        let calls_after_start = *calls.borrow();
+
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..3,
+                    total_steps: 10,
+                    state: boundary.clone(),
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .expect_err("empty Continue span must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), calls_after_start);
+        assert_eq!(carried_state.stochastic_draw_index, draws_after_start);
+        assert_eq!(carried_state.internal_evaluations, evals_after_start);
+        assert_eq!(carried_state.completed_outer_steps, 3);
+        assert!(carried_state.history_ref::<KreaArDriverState>().is_some());
+
+        let final_boundary = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..10,
+                    total_steps: 10,
+                    state: boundary,
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .unwrap();
+        match final_boundary {
+            BoundaryState::XSigma(latents) => assert_eq!(latents.shape(), &[4, 5, 4, 4]),
+            other => panic!("expected XSigma terminal latents, got {other:?}"),
+        }
     }
 }

@@ -198,8 +198,8 @@ pub(crate) fn emit_whole_clip_to_sink(
     output: GenerationOutput,
     causal_codec_policy: Option<mlx_gen::gen_core::CausalCodecStatePolicy>,
     sink: &mut dyn mlx_gen::gen_core::ChunkSink<GenerationOutput>,
-) -> Result<()> {
-    mlx_gen::gen_core::emit_terminal_chunk(sink, output, causal_codec_policy).map_err(Into::into)
+) -> mlx_gen::gen_core::Result<()> {
+    mlx_gen::gen_core::emit_terminal_chunk(sink, output, causal_codec_policy)
 }
 
 /// Deliver a completed whole-clip [`GenerationOutput`] through [`TerminalChunkCollector`]
@@ -2118,7 +2118,75 @@ mod tests {
             &mut cancelled_collector,
         )
         .expect_err("cancelled sink must reject terminal chunk emit");
-        assert!(matches!(err, Error::Canceled));
+        assert!(matches!(err, mlx_gen::gen_core::Error::Canceled));
         assert!(!cancelled_collector.is_ready());
+    }
+
+    #[test]
+    fn emit_whole_clip_to_sink_preserves_backpressure_error_on_saturated_bounded_sink() {
+        use mlx_gen::gen_core::{BackpressureError, BoundedChunkSink, ChunkSink, OutputChunk};
+
+        struct SequenceAdvancingSink<'a>(&'a mut BoundedChunkSink<GenerationOutput>);
+
+        impl ChunkSink<GenerationOutput> for SequenceAdvancingSink<'_> {
+            fn emit(
+                &mut self,
+                mut chunk: OutputChunk<GenerationOutput>,
+            ) -> mlx_gen::gen_core::Result<()> {
+                chunk.sequence = self.0.next_sequence();
+                self.0.emit(chunk)
+            }
+        }
+
+        let mut bounded = BoundedChunkSink::new(1, CancelFlag::new()).unwrap();
+        bounded
+            .emit(OutputChunk::new(
+                0,
+                false,
+                GenerationOutput::Video {
+                    frames: Vec::new(),
+                    fps: 16,
+                    audio: None,
+                },
+            ))
+            .unwrap();
+
+        let err = {
+            let mut adapter = SequenceAdvancingSink(&mut bounded);
+            emit_whole_clip_to_sink(
+                GenerationOutput::Video {
+                    frames: Vec::new(),
+                    fps: 16,
+                    audio: None,
+                },
+                None,
+                &mut adapter,
+            )
+            .expect_err("saturated BoundedChunkSink must reject emit with backpressure")
+        };
+        assert_eq!(
+            BackpressureError::from_error(&err),
+            Some(&BackpressureError {
+                sequence: 1,
+                buffered: 1,
+                max_buffered_chunks: 1,
+            })
+        );
+        assert_eq!(bounded.backpressure_events(), 1);
+        assert!(!bounded.is_finished());
+
+        let _ = bounded.pop().unwrap();
+        let mut adapter = SequenceAdvancingSink(&mut bounded);
+        emit_whole_clip_to_sink(
+            GenerationOutput::Video {
+                frames: Vec::new(),
+                fps: 16,
+                audio: None,
+            },
+            None,
+            &mut adapter,
+        )
+        .unwrap();
+        assert!(bounded.is_finished());
     }
 }

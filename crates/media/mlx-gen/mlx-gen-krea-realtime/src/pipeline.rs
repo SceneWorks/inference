@@ -370,13 +370,15 @@ impl KreaRealtime {
         generation: &mut impl ReportedGeneration,
         sink: &mut dyn mlx_gen::gen_core::ChunkSink<GenerationOutput>,
         causal_codec_policy: Option<mlx_gen::gen_core::CausalCodecStatePolicy>,
-    ) -> Result<()> {
+    ) -> mlx_gen::gen_core::Result<()> {
         let reported = match route {
             GenerationRoute::T2v => generation.t2v(),
             GenerationRoute::I2v(image) => generation.i2v(image),
             GenerationRoute::V2v { frames, strength } => generation.v2v(frames, strength),
         };
-        let output = self.finish_reported_generation(reported)?;
+        let output = self
+            .finish_reported_generation(reported)
+            .map_err(mlx_gen::gen_core::Error::from)?;
         emit_whole_clip_to_sink(output, causal_codec_policy, sink)
     }
 
@@ -1439,5 +1441,98 @@ mod tests {
             }
             other => panic!("expected Some(Video) output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn finish_routed_generation_to_sink_preserves_backpressure_error_on_saturated_bounded_sink() {
+        use mlx_gen::gen_core::{BackpressureError, BoundedChunkSink, ChunkSink, OutputChunk};
+
+        struct SequenceAdvancingSink<'a>(&'a mut BoundedChunkSink<GenerationOutput>);
+
+        impl ChunkSink<GenerationOutput> for SequenceAdvancingSink<'_> {
+            fn emit(
+                &mut self,
+                mut chunk: OutputChunk<GenerationOutput>,
+            ) -> mlx_gen::gen_core::Result<()> {
+                chunk.sequence = self.0.next_sequence();
+                self.0.emit(chunk)
+            }
+        }
+
+        struct SimpleMockGeneration {
+            report: AdapterApplyReport,
+        }
+
+        impl ReportedGeneration for SimpleMockGeneration {
+            fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                Ok((
+                    GenerationOutput::Video {
+                        frames: Vec::new(),
+                        fps: 16,
+                        audio: None,
+                    },
+                    vec![self.report.clone()],
+                ))
+            }
+
+            fn i2v(
+                &mut self,
+                _image: &Image,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+
+            fn v2v(
+                &mut self,
+                _frames: &[Image],
+                _strength: f32,
+            ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+                self.t2v()
+            }
+        }
+
+        let provider = unloaded();
+        let report = AdapterApplyReport {
+            adapter_path: PathBuf::from("/models/lora.safetensors"),
+            applied: 1,
+            skipped: vec![],
+        };
+        let mut bounded = BoundedChunkSink::new(1, CancelFlag::new()).unwrap();
+        bounded
+            .emit(OutputChunk::new(
+                0,
+                false,
+                GenerationOutput::Video {
+                    frames: Vec::new(),
+                    fps: 16,
+                    audio: None,
+                },
+            ))
+            .unwrap();
+
+        let err = {
+            let mut mock = SimpleMockGeneration {
+                report: report.clone(),
+            };
+            let mut adapter = SequenceAdvancingSink(&mut bounded);
+            provider
+                .finish_routed_generation_to_sink(
+                    GenerationRoute::T2v,
+                    &mut mock,
+                    &mut adapter,
+                    None,
+                )
+                .expect_err("saturated BoundedChunkSink must return typed BackpressureError")
+        };
+        assert_eq!(
+            BackpressureError::from_error(&err),
+            Some(&BackpressureError {
+                sequence: 1,
+                buffered: 1,
+                max_buffered_chunks: 1,
+            })
+        );
+        assert_eq!(bounded.backpressure_events(), 1);
+        assert_eq!(Generator::adapter_apply_reports(&provider), vec![report]);
     }
 }
