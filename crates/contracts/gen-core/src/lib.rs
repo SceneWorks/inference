@@ -53,10 +53,18 @@ pub mod comfy_quant;
 pub mod control;
 pub mod convrot_int8;
 pub mod driver;
+pub mod multistream;
 pub use driver::{
     run_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
     DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate,
-    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks,
+    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks, StreamObserveHook,
+};
+pub use multistream::{
+    build_multistream_phase_live_set, build_stream_transition_live_set, LearnedUpsamplerComponent,
+    MultiStreamStepInfo, PerTokenTimePolicy, ResolvedSchedule, ScheduleSource, ScheduleSourceKind,
+    StreamBoundarySemantics, StreamBundleSpec, StreamGeometry, StreamId, StreamLatentDescriptor,
+    StreamMemorySpec, StreamSpec, StreamStepSigma, StreamTransition, StreamTransitionKind,
+    TransitionBoundaryGuard,
 };
 pub mod duration_head;
 pub mod encoder_contract;
@@ -207,7 +215,10 @@ pub use encoder_contract::{
     ValidatedTokenizerSource,
 };
 pub use env_flag::env_flag;
-pub use error::{Error, Result};
+pub use error::{
+    run_with_cleanup_policy, run_with_cleanup_policy_with_outcome, CleanupPolicyOutcome, Error,
+    ErrorClass, Result,
+};
 pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
     GraphEvalCadence, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheOverflow,

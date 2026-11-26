@@ -111,6 +111,11 @@ pub enum CandleError {
     #[error("cancelled")]
     Canceled,
 
+    /// Explicit provider-instance poison (`PIPE-15`): retire the provider instance without
+    /// running GPU cleanup across corrupted locals; unrelated providers and the process survive.
+    #[error("provider poisoned: {0}")]
+    ProviderPoisoned(String),
+
     /// Explicit process-local backend poison. Ordinary Candle failures remain backend errors.
     #[error("process poisoned: {0}")]
     ProcessPoisoned(String),
@@ -138,6 +143,7 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Unsupported(s) => gen_core::Error::Unsupported(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+            CandleError::ProviderPoisoned(s) => gen_core::Error::ProviderPoisoned(s),
             CandleError::ProcessPoisoned(s) => gen_core::Error::ProcessPoisoned(s),
             CandleError::GeometryRefused {
                 reason,
@@ -165,6 +171,7 @@ impl From<gen_core::Error> for CandleError {
     fn from(e: gen_core::Error) -> Self {
         match e {
             gen_core::Error::Canceled => CandleError::Canceled,
+            gen_core::Error::ProviderPoisoned(s) => CandleError::ProviderPoisoned(s),
             gen_core::Error::ProcessPoisoned(s) => CandleError::ProcessPoisoned(s),
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
             gen_core::Error::Unsupported(s) => CandleError::Unsupported(s),
