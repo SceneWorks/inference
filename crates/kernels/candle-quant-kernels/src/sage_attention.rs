@@ -45,10 +45,15 @@
 use crate::nvrtc::KernelSource;
 use candle_core::DType;
 
-/// The INT8 QK attention kernels (quantizer, centering statistics and the attention kernel).
+/// The INT8 QK attention kernels (quantizer, centering statistics and the attention kernel), after
+/// the shared INT8-attention device primitives (`int8_attention_common.cuh`, also prepended to the
+/// sol_attn source, SW-6137).
 pub const SOURCE: KernelSource = KernelSource {
     name: "sage-int8-qk-attention-v2",
-    src: include_str!("sage_attention.cu"),
+    src: concat!(
+        include_str!("int8_attention_common.cuh"),
+        include_str!("sage_attention.cu")
+    ),
     cc_floor: (8, 0),
 };
 

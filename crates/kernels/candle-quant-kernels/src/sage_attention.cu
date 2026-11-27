@@ -33,54 +33,13 @@
 //   V                : bf16/f16 [B, HK, Sk, D] with arbitrary batch/head/row strides, unit last dim.
 //   O                : bf16/f16 [B, H, Sq, D] contiguous.
 // Every index is computed in 64 bits.
-
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef signed char i8;
-typedef long long i64;
-
-#define SAGE_NEG_INF __int_as_float(0xff800000)
+//
+// Prepended at compile time: int8_attention_common.cuh (the shared ia_* primitives).
 
 // comfy-kitchen `apply_convrot_sign128` words: channel c is negated when bit (c & 31) of word
 // (c >> 5) is clear.
 __device__ __forceinline__ u32 sage_sign_word(int w) {
     return w == 0 ? 0x1035997bu : w == 1 ? 0x8087f5eeu : w == 2 ? 0xee2e4e1au : 0x71132418u;
-}
-
-__device__ __forceinline__ float sage_load(const u16* p, bool bf) {
-    u16 h = *p;
-    if (bf) return __uint_as_float(((u32)h) << 16);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
-    return f;
-}
-
-// Pack (lo, hi) into a bf16x2 / f16x2 register, round to nearest even.
-template <bool BF>
-__device__ __forceinline__ u32 sage_pack2(float lo, float hi) {
-    u32 r;
-    if (BF) asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
-    else asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
-    return r;
-}
-
-// 2^x on the SFU (ex2.approx, ~2 ulp; exactly 0 for -inf), as FlashAttention-2's fast-math build.
-__device__ __forceinline__ float sage_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-__device__ __forceinline__ float sage_warp_max(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
-__device__ __forceinline__ float sage_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
 }
 
 // One row of D channels held as D/32 consecutive channels per lane (channel = lane*EPT + c).
@@ -127,7 +86,7 @@ __device__ __forceinline__ void sage_load_row(const u16* x, i64 row_off, bool li
     constexpr int EPT = D / 32;
 #pragma unroll
     for (int c = 0; c < EPT; ++c) {
-        v[c] = live ? sage_load(x + row_off + lane * EPT + c, bf) : 0.0f;
+        v[c] = live ? ia_load(x + row_off + lane * EPT + c, bf) : 0.0f;
         if (center && live) v[c] -= mean[lane * EPT + c];
     }
 }
@@ -144,7 +103,7 @@ __device__ void sage_k_sum(const u16* x, i64 sb, i64 sh, i64 ss, int H, int S, i
     const i64 base = (i64)b * sb + (i64)h * sh + c;
     float acc = 0.0f;
 #pragma unroll 8
-    for (int r = r0; r < r1; ++r) acc += sage_load(x + base + (i64)r * ss, bf);
+    for (int r = r0; r < r1; ++r) acc += ia_load(x + base + (i64)r * ss, bf);
     partial[((i64)bh * gridDim.y + blockIdx.y) * D + c] = acc;
 }
 
@@ -186,8 +145,8 @@ __device__ void sage_k_center(const u16* x, i64 sb, i64 sh, i64 ss, int H, int S
                 av = fmaxf(av, fabsf(v[c]));
                 aw = fmaxf(aw, fabsf(w[c]));
             }
-            raw += sage_warp_max(av);
-            cen += sage_warp_max(aw);
+            raw += ia_warp_max(av);
+            cen += ia_warp_max(aw);
         }
         if (lane == 0) {
             red[0][warp] = raw;
@@ -231,7 +190,7 @@ __device__ void sage_quant(const u16* x, i64 sb, i64 sh, i64 ss, int H, int S, i
     float amax = 0.0f;
 #pragma unroll
     for (int c = 0; c < EPT; ++c) amax = fmaxf(amax, fabsf(v[c]));
-    amax = sage_warp_max(amax);
+    amax = ia_warp_max(amax);
     const float step = amax / 127.0f;
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     u32 packed = 0;
@@ -255,66 +214,6 @@ __device__ void sage_quant(const u16* x, i64 sb, i64 sh, i64 ss, int H, int S, i
 // through shared memory with cp.async, FlashAttention-2's K/V overlap.
 // ---------------------------------------------------------------------------------------------
 
-__device__ __forceinline__ u32 sage_smem(const void* p) {
-    return (u32)__cvta_generic_to_shared(p);
-}
-
-__device__ __forceinline__ void sage_cp16(void* dst, const void* src, int bytes) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sage_smem(dst)), "l"(src),
-                 "r"(bytes));
-}
-
-__device__ __forceinline__ void sage_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-
-template <int N>
-__device__ __forceinline__ void sage_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-}
-
-__device__ __forceinline__ void sage_ldm4(u32* r, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(sage_smem(p)));
-}
-
-__device__ __forceinline__ void sage_ldm4t(u32* r, const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(sage_smem(p)));
-}
-
-__device__ __forceinline__ void sage_mma_s8(int* c, const u32* a, u32 b0, u32 b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};\n"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-template <bool BF>
-__device__ __forceinline__ void sage_mma_16(float* c, const u32* a, u32 b0, u32 b1) {
-    if (BF)
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-            "{%8,%9}, {%0,%1,%2,%3};\n"
-            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    else
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-            "{%8,%9}, {%0,%1,%2,%3};\n"
-            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void sage_mma_u8s8(int* c, const u32* a, u32 b0, u32 b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};\n"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
 // ---------------------------------------------------------------------------------------------
 // INT8 P.V mode (comfy-kitchen `qk_int_sv_i8`): V is quantized per channel and P per tile to U8.
 // ---------------------------------------------------------------------------------------------
@@ -327,25 +226,6 @@ __device__ __forceinline__ void sage_mma_u8s8(int* c, const u32* a, u32 b0, u32 
 // {b3,b2,b1,b0} -> {b2,b0,b3,b1} (P packs keys 2t,2t+1,8+2t,9+2t of a group into one register).
 __device__ __forceinline__ int sage_inv_perm16(int w) {
     return (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) | (((w >> 2) & 1) << 3);
-}
-
-// Round to nearest even and saturate to [0, 255] (comfy-kitchen `pack_u8x4` on sm_89+); byte j
-// of the result is the j-th argument.
-__device__ __forceinline__ u32 sage_pack_u8x4(float a, float b, float c, float d) {
-    const float v[4] = {a, b, c, d};
-    u32 out = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        int q;
-        asm("cvt.rni.s32.f32 %0, %1;" : "=r"(q) : "f"(v[j]));
-        q = max(0, min(255, q));
-        out |= ((u32)q) << (8 * j);
-    }
-    return out;
-}
-
-__device__ __forceinline__ float sage_u8_sum(u32 p) {
-    return (float)__dp4a(p, 0x01010101u, 0u);
 }
 
 // comfy-kitchen `quant_v_int8`: per-(batch, kv head, channel) symmetric INT8 over the whole key
@@ -368,11 +248,11 @@ __device__ void sage_quant_v(const u16* v, i64 sb, i64 sh, i64 ss, int H, int S,
     for (int i = 0; i < TILE; ++i) mx[i] = 0.0f;
     for (int n = threadIdx.x; n < S; n += 256) {
 #pragma unroll
-        for (int i = 0; i < TILE; ++i) mx[i] = fmaxf(mx[i], fabsf(sage_load(base + (i64)n * ss + i, bf)));
+        for (int i = 0; i < TILE; ++i) mx[i] = fmaxf(mx[i], fabsf(ia_load(base + (i64)n * ss + i, bf)));
     }
 #pragma unroll
     for (int i = 0; i < TILE; ++i) {
-        const float m = sage_warp_max(mx[i]);
+        const float m = ia_warp_max(mx[i]);
         if (lane == 0) red[i][warp] = m;
     }
     __syncthreads();
@@ -394,7 +274,7 @@ __device__ void sage_quant_v(const u16* v, i64 sb, i64 sh, i64 ss, int H, int S,
         for (int i = 0; i < TILE; ++i) {
             int q = 0;
             if (n < S) {
-                const float x = sage_load(base + (i64)n * ss + i, bf) * inv[i];
+                const float x = ia_load(base + (i64)n * ss + i, bf) * inv[i];
                 asm("cvt.rni.s32.f32 %0, %1;" : "=r"(q) : "f"(x));
                 q = max(-128, min(127, q));
             }
@@ -453,7 +333,7 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
     float acc[NT][4];
 #pragma unroll
     for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
-    float m0 = SAGE_NEG_INF, m1 = SAGE_NEG_INF, l0 = 0.0f, l1 = 0.0f;
+    float m0 = IA_NEG_INF, m1 = IA_NEG_INF, l0 = 0.0f, l1 = 0.0f;
 
     const int blocks = sk_pad / SAGE_BLOCK_N;
     const i8* kbase = k + bhk * (i64)sk_pad * D;
@@ -466,10 +346,10 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
 #pragma unroll
         for (int i = tid; i < CHUNKS; i += 256) {
             const int r = i / (D / 16), c = i - r * (D / 16);
-            sage_cp16(k_s + r * KSTR + c * 16, kbase + ((i64)blk * SAGE_BLOCK_N + r) * D + c * 16, 16);
+            ia_cp16(k_s + r * KSTR + c * 16, kbase + ((i64)blk * SAGE_BLOCK_N + r) * D + c * 16, 16);
         }
         if (tid < SAGE_BLOCK_N / 4)
-            sage_cp16(ksc_s + tid * 4, ksbase + (i64)blk * SAGE_BLOCK_N + tid * 4, 16);
+            ia_cp16(ksc_s + tid * 4, ksbase + (i64)blk * SAGE_BLOCK_N + tid * 4, 16);
     };
     auto load_v = [&](int blk) {
         if (I8PV) {
@@ -478,7 +358,7 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
 #pragma unroll
             for (int i = tid; i < CHUNKS; i += 256) {
                 const int r = i / (SAGE_BLOCK_N / 16), c = i - r * (SAGE_BLOCK_N / 16);
-                sage_cp16(vq_s + r * VQSTR + c * 16,
+                ia_cp16(vq_s + r * VQSTR + c * 16,
                           vqbase + (i64)r * sk_pad + (i64)blk * SAGE_BLOCK_N + c * 16, 16);
             }
         } else {
@@ -489,17 +369,17 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
                 const int key = blk * SAGE_BLOCK_N + r;
                 const bool live = key < sk;
                 const u16* src = vbase + (i64)(live ? key : 0) * vss + c * 8;
-                sage_cp16(v_s + r * VSTR + c * 8, src, live ? 16 : 0);
+                ia_cp16(v_s + r * VSTR + c * 8, src, live ? 16 : 0);
             }
         }
     };
 
     load_k(0);
-    sage_commit();
+    ia_commit();
     for (int blk = 0; blk < blocks; ++blk) {
         load_v(blk);
-        sage_commit();
-        sage_wait<1>();
+        ia_commit();
+        ia_wait<1>();
         __syncthreads();
 
         // S = Q.K^T for this warp's 16 rows x 64 keys.
@@ -511,9 +391,9 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
 #pragma unroll
             for (int kc = 0; kc < KT / 2; ++kc) {
                 u32 bf[4];
-                sage_ldm4(bf, k_s + (n * 8 + (lane & 7)) * KSTR + kc * 64 + (lane >> 3) * 16);
-                sage_mma_s8(s[n], qa[2 * kc], bf[0], bf[1]);
-                sage_mma_s8(s[n], qa[2 * kc + 1], bf[2], bf[3]);
+                ia_ldm4(bf, k_s + (n * 8 + (lane & 7)) * KSTR + kc * 64 + (lane >> 3) * 16);
+                ia_mma_s8(s[n], qa[2 * kc], bf[0], bf[1]);
+                ia_mma_s8(s[n], qa[2 * kc + 1], bf[2], bf[3]);
             }
         }
         float ksc[8][2];
@@ -525,21 +405,21 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
         __syncthreads();  // every warp is done with k_s / ksc_s
         if (blk + 1 < blocks) {
             load_k(blk + 1);
-            sage_commit();
+            ia_commit();
         }
 
         // Scores in the log2 domain (the Q scale carries softmax_scale * log2(e)).
         float p[8][4];
         const int key0 = blk * SAGE_BLOCK_N;
         const bool tail = key0 + SAGE_BLOCK_N > sk;
-        float mx0 = SAGE_NEG_INF, mx1 = SAGE_NEG_INF;
+        float mx0 = IA_NEG_INF, mx1 = IA_NEG_INF;
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const bool dead = tail && key0 + n * 8 + 2 * t + j >= sk;
-                p[n][j] = dead ? SAGE_NEG_INF : (float)s[n][j] * qs0 * ksc[n][j];
-                p[n][2 + j] = dead ? SAGE_NEG_INF : (float)s[n][2 + j] * qs1 * ksc[n][j];
+                p[n][j] = dead ? IA_NEG_INF : (float)s[n][j] * qs0 * ksc[n][j];
+                p[n][2 + j] = dead ? IA_NEG_INF : (float)s[n][2 + j] * qs1 * ksc[n][j];
                 mx0 = fmaxf(mx0, p[n][j]);
                 mx1 = fmaxf(mx1, p[n][2 + j]);
             }
@@ -553,7 +433,7 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
             // comfy-kitchen `update_mdo_f32_u8`: each tile is exponentiated against its own max
             // (minus the U8 offset); the accumulator and row sum rescale to the running max.
             const float t0 = mx0 - SAGE_U8_OFFSET, t1 = mx1 - SAGE_U8_OFFSET;
-            const float sm0 = sage_exp2(-fabsf(m0 - t0)), sm1 = sage_exp2(-fabsf(m1 - t1));
+            const float sm0 = ia_exp2(-fabsf(m0 - t0)), sm1 = ia_exp2(-fabsf(m1 - t1));
             const float os0 = m0 < t0 ? sm0 : 1.0f, os1 = m1 < t1 ? sm1 : 1.0f;
             const float ts0 = t0 < m0 ? sm0 : 1.0f, ts1 = t1 < m1 ? sm1 : 1.0f;
             m0 = fmaxf(m0, t0);
@@ -576,23 +456,23 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
 #pragma unroll
                 for (int grp = 0; grp < 2; ++grp) {
                     const int n = 4 * kc + 2 * grp;
-                    const u32 lo = sage_pack_u8x4(
-                        sage_exp2(p[n][0] - t0), sage_exp2(p[n][1] - t0),
-                        sage_exp2(p[n + 1][0] - t0), sage_exp2(p[n + 1][1] - t0));
-                    const u32 hi = sage_pack_u8x4(
-                        sage_exp2(p[n][2] - t1), sage_exp2(p[n][3] - t1),
-                        sage_exp2(p[n + 1][2] - t1), sage_exp2(p[n + 1][3] - t1));
+                    const u32 lo = ia_pack_u8x4(
+                        ia_exp2(p[n][0] - t0), ia_exp2(p[n][1] - t0),
+                        ia_exp2(p[n + 1][0] - t0), ia_exp2(p[n + 1][1] - t0));
+                    const u32 hi = ia_pack_u8x4(
+                        ia_exp2(p[n][2] - t1), ia_exp2(p[n][3] - t1),
+                        ia_exp2(p[n + 1][2] - t1), ia_exp2(p[n + 1][3] - t1));
                     pq[kc][2 * grp] = lo;
                     pq[kc][2 * grp + 1] = hi;
-                    sum0 += sage_u8_sum(lo);
-                    sum1 += sage_u8_sum(hi);
+                    sum0 += ia_u8_sum(lo);
+                    sum1 += ia_u8_sum(hi);
                 }
             }
             l0 += sum0 * ts0;
             l1 += sum1 * ts1;
 
-            if (blk + 1 < blocks) sage_wait<1>();  // V(blk) is the older group; K(blk+1) may wait
-            else sage_wait<0>();
+            if (blk + 1 < blocks) ia_wait<1>();  // V(blk) is the older group; K(blk+1) may wait
+            else ia_wait<0>();
             __syncthreads();
             // O += ts * (P_u8 . V_i8) for this warp's 16 rows x D channels.
 #pragma unroll
@@ -602,10 +482,10 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
                 for (int kc = 0; kc < 2; ++kc) {
                     u32 bv[4];
                     const int mi = lane >> 3;
-                    sage_ldm4(bv, vq_s + (np * 16 + (mi >> 1) * 8 + (lane & 7)) * VQSTR + kc * 32 +
+                    ia_ldm4(bv, vq_s + (np * 16 + (mi >> 1) * 8 + (lane & 7)) * VQSTR + kc * 32 +
                                       (mi & 1) * 16);
-                    sage_mma_u8s8(part[0], pq[kc], bv[0], bv[1]);
-                    sage_mma_u8s8(part[1], pq[kc], bv[2], bv[3]);
+                    ia_mma_u8s8(part[0], pq[kc], bv[0], bv[1]);
+                    ia_mma_u8s8(part[1], pq[kc], bv[2], bv[3]);
                 }
 #pragma unroll
                 for (int x = 0; x < 2; ++x) {
@@ -618,16 +498,16 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
             __syncthreads();  // every warp is done with vq_s before the next V copy
         } else {
             const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
-            const float a0 = sage_exp2(m0 - n0), a1 = sage_exp2(m1 - n1);
+            const float a0 = ia_exp2(m0 - n0), a1 = ia_exp2(m1 - n1);
             m0 = n0;
             m1 = n1;
             float sum0 = 0.0f, sum1 = 0.0f;
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
-                p[n][0] = sage_exp2(p[n][0] - n0);
-                p[n][1] = sage_exp2(p[n][1] - n0);
-                p[n][2] = sage_exp2(p[n][2] - n1);
-                p[n][3] = sage_exp2(p[n][3] - n1);
+                p[n][0] = ia_exp2(p[n][0] - n0);
+                p[n][1] = ia_exp2(p[n][1] - n0);
+                p[n][2] = ia_exp2(p[n][2] - n1);
+                p[n][3] = ia_exp2(p[n][3] - n1);
                 sum0 += p[n][0] + p[n][1];
                 sum1 += p[n][2] + p[n][3];
             }
@@ -643,14 +523,14 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
             u32 pa[4][4];
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
-                pa[kk][0] = sage_pack2<BF>(p[2 * kk][0], p[2 * kk][1]);
-                pa[kk][1] = sage_pack2<BF>(p[2 * kk][2], p[2 * kk][3]);
-                pa[kk][2] = sage_pack2<BF>(p[2 * kk + 1][0], p[2 * kk + 1][1]);
-                pa[kk][3] = sage_pack2<BF>(p[2 * kk + 1][2], p[2 * kk + 1][3]);
+                pa[kk][0] = ia_pack2<BF>(p[2 * kk][0], p[2 * kk][1]);
+                pa[kk][1] = ia_pack2<BF>(p[2 * kk][2], p[2 * kk][3]);
+                pa[kk][2] = ia_pack2<BF>(p[2 * kk + 1][0], p[2 * kk + 1][1]);
+                pa[kk][3] = ia_pack2<BF>(p[2 * kk + 1][2], p[2 * kk + 1][3]);
             }
 
-            if (blk + 1 < blocks) sage_wait<1>();
-            else sage_wait<0>();
+            if (blk + 1 < blocks) ia_wait<1>();
+            else ia_wait<0>();
             __syncthreads();  // V(blk) landed for every thread's copies
 
             // O += P.V for this warp's 16 rows x D channels.
@@ -659,10 +539,10 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
 #pragma unroll
                 for (int np = 0; np < NT / 2; ++np) {
                     u32 bv[4];
-                    sage_ldm4t(bv, v_s + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * VSTR +
+                    ia_ldm4t(bv, v_s + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * VSTR +
                                        np * 16 + (lane >> 4) * 8);
-                    sage_mma_16<BF>(acc[2 * np], pa[kk], bv[0], bv[1]);
-                    sage_mma_16<BF>(acc[2 * np + 1], pa[kk], bv[2], bv[3]);
+                    ia_mma_16<BF>(acc[2 * np], pa[kk], bv[0], bv[1]);
+                    ia_mma_16<BF>(acc[2 * np + 1], pa[kk], bv[2], bv[3]);
                 }
             }
             __syncthreads();  // every warp is done with v_s before the next V copy
@@ -685,9 +565,9 @@ __device__ void sage_attn(const i8* __restrict__ q, const float* __restrict__ qs
             c1 = vsc[bhk * D + n * 8 + 2 * t + 1];
         }
         if (row0 < sq)
-            *(u32*)(o0 + n * 8) = sage_pack2<BF>(acc[n][0] * c0 * inv0, acc[n][1] * c1 * inv0);
+            *(u32*)(o0 + n * 8) = ia_pack2<BF>(acc[n][0] * c0 * inv0, acc[n][1] * c1 * inv0);
         if (row1 < sq)
-            *(u32*)(o1 + n * 8) = sage_pack2<BF>(acc[n][2] * c0 * inv1, acc[n][3] * c1 * inv1);
+            *(u32*)(o1 + n * 8) = ia_pack2<BF>(acc[n][2] * c0 * inv1, acc[n][3] * c1 * inv1);
     }
 }
 
