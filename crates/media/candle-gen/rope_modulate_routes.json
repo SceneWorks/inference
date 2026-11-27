@@ -1,0 +1,218 @@
+{
+  "version": 1,
+  "about": "SW-6129 per-crate RoPE / adaLN-modulate route table, enforced by scripts/check_candle_rope_modulate_routes.py (a pure source scan; the candle twin of mlx-gen's SW-6140 table). Shared RoPE: candle_gen::rope::{apply_rope, apply_rope_in_place, rms_norm_rope(_in_place), apply_rope_freqs_cis} over a RopeSpec (pairing interleaved|split-half, layout BSHD|BHSD, partial rotary, f32|native math) - the fused strided media_rope kernel on CUDA, bit-identical to the shared reference chain that runs everywhere else (SW-6128) - and candle_gen::apply_interleaved_rope (= apply_rope with INTERLEAVED_BHSD_F32 since SW-6129; within one product rounding of the candle rope_i it replaced on CUDA, bit-identical on CPU). Shared modulate: candle_gen::modulate::{modulate, modulate_with} (composable normed*(1+scale)+shift / normed*scale+shift, the exact body of every former private copy) and the fused candle_gen::modulate::{adaln, rms_adaln, layer_adaln}, bit-identical only to candle's ops::rms_norm / ops::layer_norm + modulate (SW-6127). 'exact' = bit-identical to the former private op chain on every backend; 'scale-only' = a norm*(1+scale) factor with no shift, which is not the modulate affine.",
+  "crates": {
+    "candle-gen-anima": {
+      "rope": "shared fused: rope::apply_rope ANIMA_ROPE split-half BSHD native (DiT, conditioner, text encoder); exact",
+      "modulate": "shared composable: modulate::modulate via nn::modulate; exact"
+    },
+    "candle-gen-bernini": {
+      "rope": "shared fused: rope::apply_rope split-half BSHD native (Qwen2.5-VL M-RoPE apply_mrope; vision tower vision_rope); exact",
+      "modulate": "shared composable: modulate::modulate (clip_diff SimpleMLPAdaLN); exact"
+    },
+    "candle-gen-boogu": {
+      "rope": "shared fused: rope::apply_rope BOOGU_ROPE interleaved BSHD f32 (= KREA_ROPE); exact",
+      "modulate": "shared composable: modulate::modulate (double-stream MLP modulations); ModNorm / norm_out are scale-only; exact"
+    },
+    "candle-gen-chroma": {
+      "rope": "shared fused: rope::apply_interleaved_rope (RopeTable::apply, f32; CUDA within one product rounding of rope_i); exact on CPU",
+      "modulate": "shared composable: modulate::modulate; exact"
+    },
+    "candle-gen-flux": {
+      "rope": "shared fused: rope::apply_rope_freqs_cis Matrix, interleaved BHSD native (DiT, control branch, PAG); exact",
+      "modulate": "shared composable: modulate::modulate (ModulationOut::scale_shift, AdaLN-continuous final layer, control branch); exact"
+    },
+    "candle-gen-flux2": {
+      "rope": "shared fused: rope::apply_interleaved_rope (DiT Flux2PosEmbed::apply, f32; CUDA within one product rounding of rope_i) + rope::apply_rope split-half BHSD f32 (Pixtral vision); exact on CPU",
+      "modulate": "shared composable: modulate::modulate; exact"
+    },
+    "candle-gen-flux3": {
+      "rope": "shared fused: rope::apply_rope interleaved BHSD f32 on the f32 q/k RMSNorm output (rmsnorm_rope, inference and training); exact",
+      "modulate": "kept: layernorm_modulation torch weak-scalar promotion (exception)"
+    },
+    "candle-gen-ideogram": {
+      "rope": "shared fused: rope::apply_rope IDEOGRAM_ROPE split-half BHSD native, per-batch MRoPE tables; exact",
+      "modulate": "scale-only rmsnorm*(1+scale), no shift: not the modulate affine"
+    },
+    "candle-gen-iris": {
+      "rope": "shared fused: rope::apply_rope interleaved BSHD f32 (Rope::apply; apply_rope_reference in forced-composable regions); exact",
+      "modulate": "shared composable: modulate::modulate for same-dtype calls; mixed-dtype torch promotion kept (exception)"
+    },
+    "candle-gen-kolors": {
+      "rope": "shared fused: rope::apply_rope interleaved BSHD native, rotary_dim 64/128 on fused-QKV views (ChatGLM3); exact",
+      "modulate": "n/a (SDXL UNet, no adaLN)"
+    },
+    "candle-gen-krea": {
+      "rope": "shared fused: rope::rms_norm_rope_in_place KREA_ROPE (DiT q/k, SW-6128); transformer::rope::apply_interleaved_rope = rope::apply_rope KREA_ROPE; exact",
+      "modulate": "shared fused: modulate::adaln RMS +1-weight norm_in_f32 (blocks + final layer, SW-6127); exact"
+    },
+    "candle-gen-lens": {
+      "rope": "shared: rope::apply_interleaved_rope (DiT); text encoder via shared Rotary; CPU exact, CUDA within one product rounding of the former rope_i",
+      "modulate": "shared composable: modulate::modulate (blocks + norm_out; dit_train reuses it, same ops); exact"
+    },
+    "candle-gen-ltx": {
+      "rope": "shared: rope::apply_rope split-half BHSD f32 (Gemma text encoder) + interleaved BSHD native over the folded axis (diff_vae NaAttention rotate_axis); exact. DiT split RoPE kept private (per-head tables)",
+      "modulate": "shared composable modulate::modulate (DiT, composable rms/LN chains); diff_vae DiffusionBlock fused modulate::rms_adaln (ops::rms_norm norm, exact)"
+    },
+    "candle-gen-mage": {
+      "rope": "shared fused: rope::apply_rope interleaved BSHD f32 (MSRoPE apply); exact",
+      "modulate": "shared composable: modulate::modulate (DiT wrapper in (shift, scale) order, VAE decoder blocks); exact"
+    },
+    "candle-gen-minimax-h3": {
+      "rope": "shared: rope::apply_rope split-half BSHD native partial rotary (DiT MmRope::apply, video-VAE Rope3d::apply); exact",
+      "modulate": "shared composable modulate::modulate (per-row gathered modulation in dit/block.rs; norm_out in heads.rs)"
+    },
+    "candle-gen-mochi": {
+      "rope": "kept private: per-head learned frequency tables (MochiRope::apply)",
+      "modulate": "n/a (no adaLN shift affine)"
+    },
+    "candle-gen-moss-image": {
+      "rope": "shared fused: rope::apply_rope split-half BSHD native on the [sin|cos] half-width views (DiT, edit); exact",
+      "modulate": "shared composable: modulate::modulate (blocks, final heads, edit path); exact"
+    },
+    "candle-gen-pid": {
+      "rope": "shared fused: rope::apply_rope PID_ROPE interleaved BHSD native (backbone q/k) + GEMMA2_ROPE split-half BHSD native (Gemma-2); exact",
+      "modulate": "shared composable: modulate::modulate (backbone blocks); exact"
+    },
+    "candle-gen-pulid": {
+      "rope": "shared fused: rope::apply_rope EVA_ROPE interleaved BHSD f32, full-width per-lane tables (EVA-CLIP vision); exact",
+      "modulate": "n/a (no adaLN modulate)"
+    },
+    "candle-gen-qwen-image": {
+      "rope": "shared: rope::apply_interleaved_rope (MMDiT); vision tower candle rotary_emb::rope; CPU exact, CUDA within one product rounding",
+      "modulate": "shared composable: modulate::modulate (modulate, modulate_sel, norm_out); exact"
+    },
+    "candle-gen-qwen-image-2-1": {
+      "rope": "shared: rope::apply_interleaved_rope (Ops::Fused render path); Ops::Composable training keeps rope_i_slow; CPU exact, CUDA within one product rounding",
+      "modulate": "n/a: modulation rows feed model-specific chains, no private modulate copy"
+    },
+    "candle-gen-sam3": {
+      "rope": "shared: rope::apply_rope interleaved BHSD native, full-width repeat_interleave tables (vision tower, tracker memory attention incl. repeated tables + excluded keys); exact",
+      "modulate": "n/a (no adaLN)"
+    },
+    "candle-gen-sana": {
+      "rope": "n/a (no RoPE)",
+      "modulate": "shared composable: modulate::modulate; exact"
+    },
+    "candle-gen-scail2": {
+      "rope": "shared: rope::apply_interleaved_rope (via candle_gen_wan::rope::apply_rope)",
+      "modulate": "shared composable modulate::modulate (composable ln_no_affine norm)"
+    },
+    "candle-gen-sd3": {
+      "rope": "n/a (no RoPE)",
+      "modulate": "shared composable: modulate::modulate; exact"
+    },
+    "candle-gen-seedvr2": {
+      "rope": "shared: rope::apply_rope interleaved BSHD f32 partial rotary, per-lane tables; exact",
+      "modulate": "shared composable modulate::modulate_with ScaleForm::Direct (AdaSingle emb+learned params); modulate_out gate kept"
+    },
+    "candle-gen-sensenova": {
+      "rope": "shared fused: rope::apply_rope QWEN3_ROPE split-half BSHD native (Qwen3) + interleaved BSHD native (vision 1-D); exact",
+      "modulate": "n/a (no adaLN modulate)"
+    },
+    "candle-gen-supra2": {
+      "rope": "n/a (no private RoPE)",
+      "modulate": "shared composable modulate::modulate (composable LayerNorm)"
+    },
+    "candle-gen-wan": {
+      "rope": "shared: rope::apply_interleaved_rope (via crate::rope::apply_rope); CPU exact, CUDA within one product rounding of the former rope_i",
+      "modulate": "shared composable modulate::modulate in f32 then cast (DiT blocks, head, VACE head); composable ln_no_affine norm"
+    },
+    "candle-gen-z-image": {
+      "rope": "shared fused: rope::apply_rope Z_IMAGE_ROPE interleaved BSHD native (replaces candle-transformers z_image::apply_rotary_emb); exact",
+      "modulate": "scale-only Lumina norm*(1+scale), no shift: not the modulate affine"
+    }
+  },
+  "exceptions": [
+    {
+      "file": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
+      "fn": "rope",
+      "route": "table",
+      "reason": "builds the FLUX.1 [cos,-sin,sin,cos] freqs_cis rotation-matrix table from position ids; the apply is the shared apply_rope_freqs_cis"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs",
+      "fn": "layernorm_modulation",
+      "route": "kept",
+      "reason": "torch weak-scalar promotion: (1 + scale) rounds in the compute dtype, then the product with the f32 LayerNorm and the shift promote to f32 - the same-dtype shared modulate cannot express that rounding"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
+      "fn": "modulate",
+      "route": "kept",
+      "reason": "same-dtype calls route through candle_gen::modulate::modulate; the mixed-dtype branch keeps torch promotion ((1 + scale) rounded in the scale dtype before promoting to f32), which the same-dtype shared helper cannot express"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-krea/src/control.rs",
+      "fn": "<inline modulate>",
+      "route": "trainer",
+      "reason": "the trainable pose-ControlNet branch reuses train_dit's composable, differentiable ops (epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs",
+      "fn": "<inline modulate>",
+      "route": "trainer",
+      "reason": "the Krea LoRA trainer DiT keeps its composable, differentiable modulation (epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-lens/src/dit_train.rs",
+      "fn": "apply_rope_diff",
+      "route": "trainer",
+      "reason": "the Lens LoRA trainer's differentiable interleaved RoPE (candle rope_i has no backward); trainer numerics untouched (epic E9)"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-lens/src/text_encoder.rs",
+      "fn": "rotary_embedding",
+      "route": "table",
+      "reason": "builds the gpt-oss YaRN cos/sin tables (mscale folded in) for the shared Rotary; table arithmetic, not a rotation"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-ltx/src/dit_train.rs",
+      "fn": "<inline modulate>",
+      "route": "trainer",
+      "reason": "the LTX trainer DiT keeps its composable, differentiable modulation (epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-ltx/src/dit_train.rs",
+      "fn": "apply_rope_diff",
+      "route": "trainer",
+      "reason": "the differentiable split RoPE of the LTX trainer (candle's fused rope has no backward; epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-ltx/src/dit_train.rs",
+      "fn": "modulate",
+      "route": "trainer",
+      "reason": "the LTX trainer DiT keeps its composable, differentiable modulation (epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-ltx/src/rope.rs",
+      "fn": "apply_split_rope",
+      "route": "kept",
+      "reason": "LTX-2 split RoPE tables are per head ([1, H, T, D/2]: precompute_split_freqs_nd spreads the dim/2 frequency slots across heads); RopeSpec tables broadcast over heads"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-mochi/src/rope.rs",
+      "fn": "apply",
+      "route": "kept",
+      "reason": "Mochi's learned per-head frequency tables ([seq, heads, half]) and its f32 output are not expressible as a head-broadcast RopeSpec table"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-seedvr2/src/dit.rs",
+      "fn": "modulate_out",
+      "route": "kept",
+      "reason": "a residual gate multiply hidden*(emb+learned gate), not the norm*(1+scale)+shift modulate affine"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-wan/src/dit_train.rs",
+      "fn": "<inline modulate>",
+      "route": "trainer",
+      "reason": "the Wan trainer DiT keeps its composable, differentiable modulation (epic E9); trainer numerics are untouched"
+    },
+    {
+      "file": "crates/media/candle-gen/candle-gen-wan/src/dit_train.rs",
+      "fn": "apply_rope_diff",
+      "route": "trainer",
+      "reason": "the differentiable interleaved RoPE of the Wan trainer (rope_i has no backward; epic E9); trainer numerics are untouched"
+    }
+  ]
+}
