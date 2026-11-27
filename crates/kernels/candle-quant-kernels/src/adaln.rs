@@ -202,14 +202,25 @@ pub fn adaln_norm_reference(x: &Tensor, spec: &AdaLn<'_>) -> Result<Tensor> {
         Some(w) => w.clone(),
         None => ones()?,
     };
+    // candle's fused norm ops record no backward op: when the input or a norm parameter is on an
+    // autograd tape, take the composable `*_slow` form so gradients reach them (E9). Untracked
+    // calls keep the fused op, so inference numerics are unchanged.
+    let tracked = xc.track_op()
+        || spec.weight.is_some_and(Tensor::track_op)
+        || spec.bias.is_some_and(Tensor::track_op);
     let normed = match spec.norm {
+        AdaNorm::Rms if tracked => candle_nn::ops::rms_norm_slow(&xc, &weight, spec.eps)?,
         AdaNorm::Rms => candle_nn::ops::rms_norm(&xc, &weight, spec.eps)?,
         AdaNorm::Layer => {
             let bias = match spec.bias {
                 Some(b) => b.clone(),
                 None => Tensor::zeros(n, xc.dtype(), xc.device())?,
             };
-            candle_nn::ops::layer_norm(&xc, &weight, &bias, spec.eps)?
+            if tracked {
+                candle_nn::ops::layer_norm_slow(&xc, &weight, &bias, spec.eps)?
+            } else {
+                candle_nn::ops::layer_norm(&xc, &weight, &bias, spec.eps)?
+            }
         }
     };
     normed.to_dtype(dtype)
@@ -1005,6 +1016,54 @@ mod tests {
         assert_eq!((got - by_hand)?.abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
         // A bias on RMSNorm is refused outright.
         assert!(adaln(&x, &AdaLn::rms(1e-6).with_bias(&bias), &scale, &shift).is_err());
+        Ok(())
+    }
+
+    /// The autograd fallback keeps gradients for the input and the norm parameters, not just for
+    /// scale and shift: candle's fused norm ops record no backward, so tracked operands take the
+    /// composable form (epic E9).
+    #[test]
+    fn the_autograd_fallback_backpropagates_to_x_and_the_norm_parameters() -> Result<()> {
+        let dev = Device::Cpu;
+        let x = Var::from_tensor(&Tensor::randn(0f32, 1.0, (2, 3, 8), &dev)?)?;
+        let w = Var::from_tensor(&Tensor::randn(1f32, 0.1, 8, &dev)?)?;
+        let b = Var::from_tensor(&Tensor::randn(0f32, 0.1, 8, &dev)?)?;
+        let scale = Tensor::randn(0f32, 0.1, (2, 1, 8), &dev)?;
+        let shift = Tensor::randn(0f32, 0.1, (2, 1, 8), &dev)?;
+        for spec in [
+            AdaLn::rms(1e-6).with_weight(w.as_tensor()),
+            AdaLn::layer(1e-6)
+                .with_weight(w.as_tensor())
+                .with_bias(b.as_tensor()),
+        ] {
+            let out = adaln(x.as_tensor(), &spec, &scale, &shift)?;
+            // Same value as the untracked reference chain (within the slow form's rounding).
+            let (xd, wd, bd) = (
+                x.as_tensor().detach(),
+                w.as_tensor().detach(),
+                b.as_tensor().detach(),
+            );
+            let plain_spec = match spec.norm {
+                AdaNorm::Rms => AdaLn::rms(1e-6).with_weight(&wd),
+                AdaNorm::Layer => AdaLn::layer(1e-6).with_weight(&wd).with_bias(&bd),
+            };
+            let plain = adaln_reference(&xd, &plain_spec, &scale, &shift)?;
+            let diff = (&out - &plain)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(diff < 1e-5, "{:?}: slow form drifted {diff}", spec.norm);
+            let grads = out.sqr()?.sum_all()?.backward()?;
+            for (name, var) in [("x", &x), ("weight", &w)] {
+                let g = grads
+                    .get(var.as_tensor())
+                    .unwrap_or_else(|| panic!("{:?}: no gradient reached {name}", spec.norm));
+                assert!(g.abs()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+            }
+            if spec.norm == AdaNorm::Layer {
+                assert!(
+                    grads.get(b.as_tensor()).is_some(),
+                    "no gradient reached bias"
+                );
+            }
+        }
         Ok(())
     }
 
