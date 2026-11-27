@@ -465,6 +465,10 @@ pub struct VectorExtension {
     /// terminal metadata instead of failing with `Error::Msg`.
     #[serde(default)]
     pub allow_non_publishable: bool,
+    /// Optional compressed-KV-cache opt-in policy forwarded to the autoregressive vector decoder
+    /// (`None` => `KvCompressionPolicy::Off`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_compression: Option<crate::core_llm::KvCompressionPolicy>,
 }
 
 const fn default_render_preview() -> bool {
@@ -484,6 +488,7 @@ impl VectorExtension {
             && !self.render_preview
             && self.preview_max_dimension.is_none()
             && !self.allow_non_publishable
+            && self.kv_compression.is_none()
     }
 
     pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
@@ -499,6 +504,7 @@ impl VectorExtension {
             render_preview: _,
             preview_max_dimension: _,
             allow_non_publishable: _,
+            kv_compression: _,
         } = self;
         for (name, val) in [
             ("vector.temperature", *temperature),

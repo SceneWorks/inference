@@ -571,6 +571,9 @@ fn pipe12_vector_output_and_per_run_execution_reports_are_typed() {
             viewport: Some([64, 64]),
             svg_sha256: Some("0".repeat(64)),
             element_count: Some(1),
+            kv_cache: Some(gen_core::core_llm::KvCacheReport::without_table_family(
+                gen_core::core_llm::KvCompressionPolicy::Qualified,
+            )),
             ..VectorTerminalMetadata::default()
         },
     };

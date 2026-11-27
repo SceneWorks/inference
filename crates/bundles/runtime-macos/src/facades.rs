@@ -143,6 +143,7 @@ pub mod memory_helpers {
         pub use mlx_gen_catalog::providers::kolors::SIZE_MULTIPLE as KOLORS;
         pub use mlx_gen_catalog::providers::krea::RES_MULTIPLE as KREA;
         pub use mlx_gen_catalog::providers::lens::VAE_SCALE_FACTOR as LENS;
+        pub use mlx_gen_catalog::providers::ltx::SIZE_MULTIPLE as LTX;
         pub use mlx_gen_catalog::providers::qwen_image::SIZE_MULTIPLE as QWEN_IMAGE;
         pub use mlx_gen_catalog::providers::sana::RES_MULTIPLE as SANA;
         pub use mlx_gen_catalog::providers::sd3::SIZE_MULTIPLE as SD3;
@@ -193,7 +194,7 @@ pub mod memory_helpers {
     }
     pub mod ltx {
         pub use mlx_gen_catalog::providers::ltx::{
-            memory_strategy, memory_strategy_2_5, vae_tiling,
+            memory_strategy, memory_strategy_2_5, vae_tiling, SIZE_MULTIPLE,
         };
     }
     pub mod mage {
@@ -201,7 +202,9 @@ pub mod memory_helpers {
     }
     pub mod minimax_h3 {
         pub use mlx_gen_catalog::providers::minimax_h3::{
-            denoise, h3_image, memory_strategy, pipeline, text_encoder,
+            audio_config, audio_vae, audio_vae_encoder, config, denoise, detect, dit, h3_image,
+            memory_strategy, model, pipeline, quant, text_encoder, DitBlock, MiniMaxH3Dit,
+            MiniMaxH3DitConfig, MmRope, PackedLayout, TimestepSchedule,
         };
     }
     pub mod moss_image {
@@ -245,7 +248,7 @@ pub mod memory_helpers {
     }
     pub mod wan {
         pub use mlx_gen_catalog::providers::wan::{
-            i2v_memory_strategy, memory_strategy, vae_tiling,
+            config, i2v_memory_strategy, memory_strategy, vae_tiling,
         };
     }
     pub mod z_image {

@@ -42,6 +42,9 @@ pub struct VectorTerminalMetadata {
     /// Optional underlying provider identifier that produced the vector stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Optional KV-cache telemetry report emitted by the autoregressive vector decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<crate::core_llm::KvCacheReport>,
 }
 
 /// Sanitized canonical SVG plus optional rendered preview and terminal metadata (`PIPE-12`).
@@ -71,6 +74,9 @@ pub struct VectorOutput {
 /// is a **pure** audio synthesis (TTS / music — `Modality::Audio`); audio attached to a video
 /// stays on the `Video` variant.
 #[derive(Clone, Debug)]
+// `GenerationOutput` is returned once per generation (never stored in dense arrays), and keeping
+// `Vector(VectorOutput)` unboxed preserves source compatibility for pattern matches.
+#[allow(clippy::large_enum_variant)]
 pub enum GenerationOutput {
     Images(Vec<Image>),
     /// Four-channel images with a **straight (un-premultiplied) alpha** channel (sc-24111) — the

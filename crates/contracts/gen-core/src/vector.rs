@@ -241,6 +241,7 @@ pub fn build_vector_output(
                     provider_finish_reason: Some(provider_reason.to_owned()),
                     generated_bytes: Some(generated_bytes),
                     provider_id: Some(provider_id.to_owned()),
+                    kv_cache: None,
                 },
             })
         }
@@ -272,6 +273,7 @@ pub fn build_vector_output(
                     provider_finish_reason: Some(provider_reason.to_owned()),
                     generated_bytes: Some(generated_bytes),
                     provider_id: Some(provider_id.to_owned()),
+                    kv_cache: None,
                 },
             })
         }

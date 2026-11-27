@@ -374,6 +374,9 @@ impl StarVectorGenerator {
         text_request.sampling = sampling;
         text_request.seed = request.seed;
         text_request.cancel = LlmCancelFlag::from_arc(request.cancel.as_arc().clone());
+        if let Some(kv_compression) = ext.and_then(|v| v.kv_compression) {
+            text_request.kv_compression = kv_compression;
+        }
 
         if let Some(dim) = ext.and_then(|v| v.preview_max_dimension) {
             if dim == 0 || dim > MAX_PREVIEW_DIMENSION {
@@ -495,7 +498,7 @@ impl Generator for StarVectorGenerator {
             preview_max_dimension,
         };
         let prompt_tokens = Some(sv.starvector_descriptor().projection.image_token_count as usize);
-        let vector_output = build_vector_output(
+        let mut vector_output = build_vector_output(
             completed.output.svg.as_deref(),
             completed.output.finish_reason,
             completed.output.generated_tokens,
@@ -505,6 +508,7 @@ impl Generator for StarVectorGenerator {
             sanitize_options,
             allow_non_publishable,
         )?;
+        vector_output.terminal.kv_cache = completed.output.kv_cache;
         let execution = self.adapt_execution_identity(completed.execution);
         CompletedGeneration::new(
             GenerationReport::from_output(GenerationOutput::Vector(vector_output)),
@@ -875,6 +879,205 @@ mod tests {
         assert!(
             matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("Nvfp4"),
             "expected Unsupported Nvfp4 error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn starvector_generator_forwards_kv_compression_policy_and_surfaces_kv_cache_report() {
+        use std::sync::{Arc, Mutex};
+
+        use core_llm::{KvCacheFallbackReason, KvCacheReport, KvCompressionPolicy};
+
+        struct RecordingKvStarVectorProvider {
+            text_desc: TextLlmDescriptor,
+            sv_desc: core_llm::StarVectorDescriptor,
+            finish_reason: StarVectorFinishReason,
+            svg: Option<String>,
+            seen_policy: Arc<Mutex<Option<KvCompressionPolicy>>>,
+        }
+
+        impl TextLlm for RecordingKvStarVectorProvider {
+            fn descriptor(&self) -> &TextLlmDescriptor {
+                &self.text_desc
+            }
+
+            fn as_starvector_provider(&self) -> Option<&dyn StarVectorProvider> {
+                Some(self)
+            }
+
+            fn validate(&self, request: &TextLlmRequest) -> core_llm::Result<()> {
+                core_llm::starvector_conditioning_image("RecordingKvStarVector", request)
+                    .map(|_| ())
+            }
+
+            fn generate(
+                &self,
+                _request: &TextLlmRequest,
+                _on_event: &mut dyn FnMut(StreamEvent),
+            ) -> core_llm::Result<TextLlmOutput> {
+                Err(core_llm::Error::Unsupported(
+                    "mock uses StarVectorProvider::generate_svg".into(),
+                ))
+            }
+        }
+
+        impl StarVectorProvider for RecordingKvStarVectorProvider {
+            fn starvector_descriptor(&self) -> &core_llm::StarVectorDescriptor {
+                &self.sv_desc
+            }
+
+            fn generate_svg(
+                &self,
+                request: &StarVectorRequest,
+                on_event: &mut dyn FnMut(StarVectorStreamEvent),
+            ) -> core_llm::Result<StarVectorOutput> {
+                let policy = request.text_request.kv_compression;
+                *self.seen_policy.lock().unwrap() = Some(policy);
+                let generated_bytes = self.svg.as_ref().map_or(0, String::len);
+                on_event(StarVectorStreamEvent::Progress {
+                    generated_tokens: 12,
+                });
+                on_event(StarVectorStreamEvent::Done {
+                    finish_reason: self.finish_reason,
+                    generated_tokens: 12,
+                    generated_bytes,
+                });
+                Ok(StarVectorOutput {
+                    svg: self.svg.clone(),
+                    generated_tokens: 12,
+                    generated_bytes,
+                    finish_reason: self.finish_reason,
+                    kv_cache: Some(KvCacheReport::without_table_family(policy)),
+                })
+            }
+
+            fn generate_svg_with_execution_report(
+                &self,
+                request: &StarVectorRequest,
+                on_event: &mut dyn FnMut(StarVectorStreamEvent),
+            ) -> core_llm::Result<core_llm::CompletedStarVector> {
+                let output = self.generate_svg(request, on_event)?;
+                core_llm::CompletedStarVector::new(
+                    output,
+                    ExecutionIdentity::provider_default(),
+                    &self.text_desc,
+                )
+            }
+        }
+
+        let raw_svg = r##"<svg width="32" height="32"><rect x="2" y="2" width="28" height="28" fill="#123456"/></svg>"##;
+
+        // 1. Default None forwards KvCompressionPolicy::Off and surfaces PolicyDisabled report.
+        let seen_default = Arc::new(Mutex::new(None));
+        let gen_default = StarVectorGenerator::new(
+            descriptor_mlx_8b(),
+            Box::new(RecordingKvStarVectorProvider {
+                text_desc: starvector_8b::text_descriptor(MLX_STARVECTOR_8B_LLM_ID, "mlx"),
+                sv_desc: starvector_8b::starvector_descriptor(),
+                finish_reason: StarVectorFinishReason::CompleteRoot,
+                svg: Some(raw_svg.to_owned()),
+                seen_policy: seen_default.clone(),
+            }),
+        )
+        .expect("wrap recording StarVector provider");
+        let completed_default = gen_default
+            .generate_with_execution_report(&mock_request(), &mut |_| {})
+            .expect("default KV policy generation succeeds");
+        assert_eq!(
+            *seen_default.lock().unwrap(),
+            Some(KvCompressionPolicy::Off)
+        );
+        let Some(GenerationOutput::Vector(out_default)) = completed_default.generation.output
+        else {
+            panic!("expected GenerationOutput::Vector");
+        };
+        assert_eq!(
+            out_default.terminal.kv_cache,
+            Some(KvCacheReport::without_table_family(
+                KvCompressionPolicy::Off
+            ))
+        );
+        assert_eq!(
+            out_default.terminal.kv_cache.as_ref().unwrap().fallback,
+            Some(KvCacheFallbackReason::PolicyDisabled)
+        );
+
+        // 2. Explicit Qualified forwards KvCompressionPolicy::Qualified and surfaces
+        //    UnqualifiedModel report on publishable completions.
+        let seen_qualified = Arc::new(Mutex::new(None));
+        let gen_qualified = StarVectorGenerator::new(
+            descriptor_mlx_8b(),
+            Box::new(RecordingKvStarVectorProvider {
+                text_desc: starvector_8b::text_descriptor(MLX_STARVECTOR_8B_LLM_ID, "mlx"),
+                sv_desc: starvector_8b::starvector_descriptor(),
+                finish_reason: StarVectorFinishReason::CompleteRoot,
+                svg: Some(raw_svg.to_owned()),
+                seen_policy: seen_qualified.clone(),
+            }),
+        )
+        .expect("wrap recording StarVector provider");
+        let mut req_qualified = mock_request();
+        req_qualified
+            .extensions
+            .vector
+            .as_mut()
+            .unwrap()
+            .kv_compression = Some(KvCompressionPolicy::Qualified);
+        let completed_qualified = gen_qualified
+            .generate_with_execution_report(&req_qualified, &mut |_| {})
+            .expect("qualified KV policy generation succeeds");
+        assert_eq!(
+            *seen_qualified.lock().unwrap(),
+            Some(KvCompressionPolicy::Qualified)
+        );
+        let Some(GenerationOutput::Vector(out_qualified)) = completed_qualified.generation.output
+        else {
+            panic!("expected GenerationOutput::Vector");
+        };
+        assert_eq!(
+            out_qualified.terminal.kv_cache,
+            Some(KvCacheReport::without_table_family(
+                KvCompressionPolicy::Qualified
+            ))
+        );
+        assert_eq!(
+            out_qualified.terminal.kv_cache.as_ref().unwrap().fallback,
+            Some(KvCacheFallbackReason::UnqualifiedModel)
+        );
+
+        // 3. Bounded-limit non-publishable completions also preserve terminal.kv_cache.
+        let seen_limit = Arc::new(Mutex::new(None));
+        let gen_limit = StarVectorGenerator::new(
+            descriptor_candle_8b(),
+            Box::new(RecordingKvStarVectorProvider {
+                text_desc: starvector_8b::text_descriptor(CANDLE_STARVECTOR_8B_LLM_ID, "candle"),
+                sv_desc: starvector_8b::starvector_descriptor(),
+                finish_reason: StarVectorFinishReason::TokenLimit,
+                svg: None,
+                seen_policy: seen_limit.clone(),
+            }),
+        )
+        .expect("wrap recording StarVector provider");
+        let mut req_limit = mock_request();
+        let ext = req_limit.extensions.vector.as_mut().unwrap();
+        ext.allow_non_publishable = true;
+        ext.kv_compression = Some(KvCompressionPolicy::Qualified);
+        let completed_limit = gen_limit
+            .generate_with_execution_report(&req_limit, &mut |_| {})
+            .expect("token limit returns typed VectorOutput");
+        assert_eq!(
+            *seen_limit.lock().unwrap(),
+            Some(KvCompressionPolicy::Qualified)
+        );
+        let Some(GenerationOutput::Vector(out_limit)) = completed_limit.generation.output else {
+            panic!("expected GenerationOutput::Vector");
+        };
+        assert_eq!(out_limit.finish_reason, VectorFinishReason::Length);
+        assert_eq!(
+            out_limit.terminal.kv_cache,
+            Some(KvCacheReport::without_table_family(
+                KvCompressionPolicy::Qualified
+            ))
         );
     }
 }
