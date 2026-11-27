@@ -114,6 +114,10 @@ pub use fused_attention::{
     with_int8_attention_if, AttentionKernel, AttentionPathCounts, FlashRefusal,
     Int8AttentionConfig, Int8Refusal, Int8RefusalCounts, KCentering, PvPrecision,
 };
+// SW-6137: the opt-in Sol-Attn sparse kernel.
+pub use fused_attention::{
+    with_sol_attention, SolConfig, SolRefusalCounts, SolRouteRefusal, SolSelection,
+};
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The

@@ -425,12 +425,15 @@ pub fn sdpa_planned_bhsd_key_prefix(
         KeyPrefixPlan::Unmasked => return sdpa_planned_bhsd(q, k, v, scale, None, softmax, plan),
         KeyPrefixPlan::SharedPrefix(_) | KeyPrefixPlan::PerRow => {}
     }
-    let (route, int8_refusal) = route_ready(q, k, v, None);
-    let Some(kernel) = FusedKernel::of(route) else {
+    let (route, refusals) = route_ready(q, k, v, None);
+    // Sol-Attn (SW-6137) routes one token sequence (`Sq == Sk`); the key-prefix launches below
+    // narrow the keys, so a Sol-Attn-scope call takes the masked call instead (counted there as a
+    // Sol-Attn `masked` refusal).
+    let Some(kernel) = FusedKernel::of(route).filter(|k| !matches!(k, FusedKernel::Sol(_))) else {
         return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan);
     };
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
-    record_route(route, int8_refusal);
+    record_route(route, refusals);
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
     }
