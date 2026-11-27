@@ -23,11 +23,26 @@
 //! let pre = adaln(&x, &AdaLn::rms(eps).with_weight(&w_f32).norm_in_f32(), &prescale, &preshift)?;
 //! ```
 //!
+//! [`adaln_chain`] / [`AdaLnChain`] (SW-6129) are the same AdaLN for the providers' **composable**
+//! norm chains (`mean_keepdim` / `sqr` / `sqrt` / `broadcast_div` LayerNorm and RMS in f32 or the
+//! activation dtype, candle_nn's LayerNorm without a bias), bit-identical to each chain.
+//!
 //! The implementation (kernel, plan, reference, parity tests) lives in
 //! `candle_quant_kernels::adaln`, beside the nvrtc seam it compiles through.
 
 pub use candle_quant_kernels::adaln::{
-    adaln, adaln_block_dim, adaln_norm_reference, adaln_reference, check_adaln, layer_adaln,
-    modulate, modulate_with, plan_adaln, rms_adaln, AdaLn, AdaLnPlan, AdaLnRefusal, AdaNorm,
-    OperandMeta, ParamKind, ScaleForm, ADALN_MAX_ELEMS, ADALN_PATH, ADALN_SRC,
+    adaln, adaln_block_dim, adaln_norm_reference, adaln_reference, adaln_scale_only,
+    adaln_scale_only_reference, check_adaln, layer_adaln, modulate, modulate_with, plan_adaln,
+    rms_adaln, AdaLn, AdaLnPlan, AdaLnRefusal, AdaNorm, OperandMeta, ParamKind, ScaleForm,
+    ADALN_MAX_ELEMS, ADALN_PATH, ADALN_SRC,
+};
+
+// SW-6129: the same AdaLN for the providers' composable norm chains (`mean_keepdim` / `sqr` /
+// `sqrt` / `broadcast_div` LayerNorm and RMS, f32 or native precision, any modulation / output
+// dtype) — bit-identical to each chain on CUDA, the chain itself everywhere else, counted on the
+// same `ADALN_PATH`.
+pub use candle_quant_kernels::adaln_chain::{
+    adaln_chain, adaln_chain_norm_reference, adaln_chain_reference, adaln_chain_scale_only,
+    adaln_chain_scale_only_reference, chain_block_dim, check_adaln_chain, plan_adaln_chain,
+    AdaLnChain, ChainNorm, ChainPlan, ChainPrecision, ADALN_CHAIN_SRC,
 };

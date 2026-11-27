@@ -288,6 +288,46 @@ pub fn layer_adaln(
     adaln(x, &spec, scale, shift)
 }
 
+/// The scale-only AdaLN `norm(x) · (1 + scale)` (or `· scale`) with no shift — the Lumina-family
+/// `RMSNorm(x) * (1 + scale)` blocks. The reference is [`adaln_norm_reference`] then one
+/// `broadcast_mul`; the fused kernel stores the product without the add, bit-identical.
+pub fn adaln_scale_only_reference(x: &Tensor, spec: &AdaLn<'_>, scale: &Tensor) -> Result<Tensor> {
+    let normed = adaln_norm_reference(x, spec)?;
+    match spec.scale_form {
+        ScaleForm::OnePlus => normed.broadcast_mul(&(scale + 1.0)?),
+        ScaleForm::Direct => normed.broadcast_mul(scale),
+    }
+}
+
+/// [`adaln`] without a shift (see [`adaln_scale_only_reference`]), recorded in [`ADALN_PATH`].
+pub fn adaln_scale_only(x: &Tensor, spec: &AdaLn<'_>, scale: &Tensor) -> Result<Tensor> {
+    spec.validate()?;
+    ADALN_PATH.dispatch(
+        || fused_attempt_opt(x, spec, scale, None),
+        || adaln_scale_only_reference(x, spec, scale),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn fused_attempt_opt(
+    x: &Tensor,
+    spec: &AdaLn<'_>,
+    scale: &Tensor,
+    shift: Option<&Tensor>,
+) -> Result<Attempt<Tensor>> {
+    cuda_impl::fused_adaln_opt(x, spec, scale, shift)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fused_attempt_opt(
+    _x: &Tensor,
+    _spec: &AdaLn<'_>,
+    _scale: &Tensor,
+    _shift: Option<&Tensor>,
+) -> Result<Attempt<Tensor>> {
+    Ok(Attempt::Reference(PathReason::CudaFeatureOff))
+}
+
 #[cfg(feature = "cuda")]
 fn fused_attempt(
     x: &Tensor,
@@ -417,7 +457,7 @@ pub struct AdaLnPlan {
 
 /// The batch / sequence strides of a `[B or 1, S or 1, D]` modulation operand (0 for a broadcast
 /// axis), or why it does not fit `x`'s `(b, s, n)`.
-fn modulation_strides(
+pub(crate) fn modulation_strides(
     m: &OperandMeta<'_>,
     (b, s, n): (usize, usize, usize),
 ) -> std::result::Result<(usize, usize), AdaLnRefusal> {
@@ -639,6 +679,8 @@ mod cuda_impl {
         bias: Option<(&'a CudaStorage, usize)>,
         scale: (&'a CudaStorage, usize),
         shift: (&'a CudaStorage, usize),
+        /// Whether `shift` is added (`false`: the scale-only form; `shift` aliases `scale`).
+        has_shift: bool,
     }
 
     /// An operand's elements from its offset on, as `T`.
@@ -678,6 +720,7 @@ mod cuda_impl {
             launch_i64(plan.shift_strides.0),
             launch_i64(plan.shift_strides.1),
         );
+        let has_shift = i32::from(ops.has_shift);
         let stream = dev.cuda_stream();
         let mut b = stream.launch_builder(func);
         b.arg(&xs);
@@ -704,7 +747,8 @@ mod cuda_impl {
             .arg(&scale_sb)
             .arg(&scale_ss)
             .arg(&shift_sb)
-            .arg(&shift_ss);
+            .arg(&shift_ss)
+            .arg(&has_shift);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (plan.block, 1, 1),
@@ -723,6 +767,18 @@ mod cuda_impl {
         scale: &Tensor,
         shift: &Tensor,
     ) -> Result<Attempt<Tensor>> {
+        fused_adaln_opt(x, spec, scale, Some(shift))
+    }
+
+    /// [`fused_adaln`] with an optional shift (`None`: the scale-only `norm * (1 + scale)`).
+    pub fn fused_adaln_opt(
+        x: &Tensor,
+        spec: &AdaLn<'_>,
+        scale: &Tensor,
+        shift: Option<&Tensor>,
+    ) -> Result<Attempt<Tensor>> {
+        let has_shift = shift.is_some();
+        let shift = shift.unwrap_or(scale);
         let plan = match plan_adaln(x, spec, scale, shift) {
             Ok(plan) => plan,
             Err(refusal) => return Ok(Attempt::Reference(refusal.reason())),
@@ -760,6 +816,7 @@ mod cuda_impl {
             bias: bc,
             scale: (sc, so),
             shift: (hc, ho),
+            has_shift,
         };
         let storage = match plan.dtype {
             DType::F32 => launch::<f32>(dev, &f.f32, &plan, spec, &ops)?,
@@ -777,7 +834,7 @@ mod cuda_impl {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::fused_adaln;
+pub use cuda_impl::{fused_adaln, fused_adaln_opt};
 
 #[cfg(test)]
 mod tests {

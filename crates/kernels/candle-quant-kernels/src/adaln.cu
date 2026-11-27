@@ -131,7 +131,7 @@ __device__ __forceinline__ void adaln_row(const void* x, const void* weight, int
                                           const void* shift, void* out, int n, float eps,
                                           int layer, int one_plus, long long seq,
                                           long long scale_sb, long long scale_ss,
-                                          long long shift_sb, long long shift_ss) {
+                                          long long shift_sb, long long shift_ss, int has_shift) {
     __shared__ float s_sum[ADALN_WARP];
     __shared__ float s_sumsq[ADALN_WARP];
     const long long row = blockIdx.x;
@@ -179,7 +179,9 @@ __device__ __forceinline__ void adaln_row(const void* x, const void* weight, int
         float sc = adaln_load<DT>(scale, scale_row + col);
         if (one_plus) sc = adaln_round<DT>(__fadd_rn(sc, 1.0f));
         const float p = adaln_round<DT>(__fmul_rn(y, sc));
-        adaln_store<DT>(out, base + col, __fadd_rn(p, adaln_load<DT>(shift, shift_row + col)));
+        // Scale-only (`norm * (1 + scale)`, no shift): the product is the result.
+        adaln_store<DT>(out, base + col,
+                        has_shift ? __fadd_rn(p, adaln_load<DT>(shift, shift_row + col)) : p);
     }
 }
 
@@ -188,9 +190,10 @@ __device__ __forceinline__ void adaln_row(const void* x, const void* weight, int
                                     const void* bias, int bias_kind, const void* scale,          \
                                     const void* shift, void* out, int n, float eps, int layer,   \
                                     int one_plus, long long seq, long long scale_sb,             \
-                                    long long scale_ss, long long shift_sb, long long shift_ss) { \
+                                    long long scale_ss, long long shift_sb, long long shift_ss,  \
+                                    int has_shift) {                                             \
         adaln_row<DT>(x, weight, weight_kind, bias, bias_kind, scale, shift, out, n, eps, layer, \
-                      one_plus, seq, scale_sb, scale_ss, shift_sb, shift_ss);                    \
+                      one_plus, seq, scale_sb, scale_ss, shift_sb, shift_ss, has_shift);         \
     }
 
 ADALN_ENTRY(adaln_modulate_f32, 0)

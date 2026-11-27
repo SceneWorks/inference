@@ -66,6 +66,7 @@ const _: fn() = || {
 
 pub mod act_quant;
 pub mod adaln;
+pub mod adaln_chain;
 pub mod convrot;
 pub mod convrot_int8;
 pub mod cublaslt;
@@ -164,6 +165,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::NVFP4_QUANT_SRC,
     ACT_QUANT_SRC,
     adaln::ADALN_SRC,
+    adaln_chain::ADALN_CHAIN_SRC,
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
