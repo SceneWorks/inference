@@ -2690,6 +2690,11 @@ mod tests {
         dk: usize,
         mutation: Mutation,
     ) -> std::result::Result<(), String> {
+        use crate::primitives::fused::{fused_policy_guard, fused_tally};
+        // Force the fused policy on for the whole comparison: `CANDLE_LLM_FUSED_KERNELS=0` in the
+        // environment (or a parallel test flipping the switch) must not turn the fused arm into
+        // a second reference run.
+        let _policy = fused_policy_guard(Some(true));
         let (b, hk, hv, dv, conv_dim) = (1usize, 2usize, 6usize, 16usize, 8usize);
         let total = 12usize;
         let mut seed = 0x9e37_79b9u32 ^ dk as u32;
@@ -2790,7 +2795,14 @@ mod tests {
             seen
         };
         let mut fused = DeltaNetCache::with_ring(spec.clone()).unwrap();
+        let before = fused_tally();
         let fused_seen = run(&mut fused, mutation);
+        let launched = fused_tally().since(&before);
+        if launched.fused == 0 {
+            return Err(format!(
+                "dk {dk}: the fused arm never launched a fused leaf ({launched:?})"
+            ));
+        }
         let mut reference = DeltaNetCache::with_ring(spec).unwrap();
         let reference_seen = with_per_token_reference(|| run(&mut reference, Mutation::None));
         let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -2848,9 +2860,12 @@ mod tests {
         }
         for mutation in [Mutation::DropDecay, Mutation::WrongRollbackSlot] {
             for dk in [64usize, 128] {
+                let err = fused_parity(&device, dk, mutation)
+                    .expect_err(&format!("dk {dk}: {mutation:?} went undetected"));
+                // A parity miss, not the fused arm silently falling back to the reference.
                 assert!(
-                    fused_parity(&device, dk, mutation).is_err(),
-                    "dk {dk}: {mutation:?} went undetected"
+                    !err.contains("never launched"),
+                    "dk {dk}: {mutation:?}: {err}"
                 );
             }
         }
