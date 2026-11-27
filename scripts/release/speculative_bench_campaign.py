@@ -2093,7 +2093,12 @@ def _token_identity(
     speed. Rows or documents without a digest, and non-greedy sampling, are not judged."""
     checked, mismatches = 0, []
     for on, off, _ in pairs:
-        if (on[0].document.get("sampling") or {}).get("temperature") != 0.0:
+        temperature = (on[0].document.get("sampling") or {}).get("temperature")
+        # Greedy exactly as the runtime defines it (`Sampling::is_greedy`: temperature <= 0);
+        # a missing or non-numeric temperature is not judged.
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+            continue
+        if temperature > 0.0:
             continue
         by_prompt: dict[str, dict[str, list[str]]] = {}
         for side, processes in (("on", on), ("off", off)):

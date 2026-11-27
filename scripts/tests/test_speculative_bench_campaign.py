@@ -1365,13 +1365,14 @@ class CompareTests(unittest.TestCase):
     def test_a_switch_twin_whose_greedy_token_streams_differ_is_never_recommended_on(self) -> None:
         """SW-6139: a faster kernel row that changed the greedy accepted tokens is a defect."""
 
-        def digest_row(row_id, state, speed, digest_for):
+        def digest_row(row_id, state, speed, digest_for, temperature=0.0):
             def make(run, k):
                 return document(
                     run,
                     effective={"CANDLE_LLM_CUDA_GRAPHS": state},
                     value=lambda p, o, m: (speed if m == "decode_tok_s" else 100.0) + jitter(k),
                     row_extra=lambda p, o: {"token_digest": digest_for(p, o)},
+                    sampling={"temperature": temperature},
                 )
 
             return {
@@ -1409,6 +1410,23 @@ class CompareTests(unittest.TestCase):
             ]
         )["CANDLE_CUDA.cuda_graphs"]
         self.assertEqual(wrong_prefix["outcome"], "off")
+        # A negative temperature is greedy too (`Sampling::is_greedy`: temperature <= 0).
+        negative = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"bad-{p}:256", temperature=-1.0),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256", temperature=-1.0),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual((negative["outcome"], negative["recommended_on"]), ("off", False))
+        self.assertIn("token streams differ", negative["reason"])
+        # A sampled (positive-temperature) campaign is not judged for identity.
+        sampled = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"bad-{p}:256", temperature=0.7),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256", temperature=0.7),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(sampled["token_identity"]["checked_prompts"], 0)
 
     def test_the_speculative_and_prefix_cache_defaults_are_decided_from_their_pairs(self) -> None:
         def speculative_row(auto_speed):
