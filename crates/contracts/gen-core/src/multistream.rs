@@ -256,7 +256,7 @@ impl StreamGeometry {
         }
     }
 
-    /// Convert into [`StreamPhaseGeometry`] for [`crate::memory_strategy::pricing`].
+    /// Convert into [`StreamPhaseGeometry`] for memory-strategy pricing.
     pub fn to_phase_geometry(&self, stream: &StreamId) -> StreamPhaseGeometry {
         let mut geom = StreamPhaseGeometry::image(stream.as_str(), 0, 0, 1);
         match *self {
