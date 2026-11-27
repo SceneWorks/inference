@@ -148,18 +148,25 @@ fn rope_chain(x: &Tensor, cos: &Tensor, sin: &Tensor, spec: &RopeSpec) -> Result
 /// weight cast down ([`RopeMath::Native`]).
 fn rms_norm_chain(x: &Tensor, weight: &Tensor, eps: f64, math: RopeMath) -> Result<Tensor> {
     let dt = x.dtype();
+    // candle's fused `rms_norm` records no backward op: when the activation or the norm weight is
+    // on an autograd tape (the same operands the fused plan refuses as `Autograd`), take the
+    // composable `rms_norm_slow` so gradients reach them (E9). Untracked calls keep the fused op,
+    // so inference numerics are unchanged.
+    let tracked = x.track_op() || weight.track_op();
+    let norm = |x: &Tensor, w: &Tensor| {
+        if tracked {
+            candle_nn::ops::rms_norm_slow(x, w, eps as f32)
+        } else {
+            candle_nn::ops::rms_norm(x, w, eps as f32)
+        }
+    };
     match math {
-        RopeMath::F32 => candle_nn::ops::rms_norm(
+        RopeMath::F32 => norm(
             &x.to_dtype(DType::F32)?.contiguous()?,
             &weight.to_dtype(DType::F32)?.contiguous()?,
-            eps as f32,
         )?
         .to_dtype(dt),
-        RopeMath::Native => candle_nn::ops::rms_norm(
-            &x.contiguous()?,
-            &weight.to_dtype(dt)?.contiguous()?,
-            eps as f32,
-        ),
+        RopeMath::Native => norm(&x.contiguous()?, &weight.to_dtype(dt)?.contiguous()?),
     }
 }
 
@@ -827,6 +834,88 @@ mod tests {
             "cuda_feature_off"
         };
         assert_eq!(d3.reference_for(off), 1, "{d3}");
+    }
+
+    /// A tracked activation or norm weight takes the reference with a differentiable norm (E9):
+    /// both `rms_norm_rope` entry points, in both precision branches, return the untracked value
+    /// and backpropagate to `x` and `weight` exactly like a chain built from composable ops only
+    /// (`rms_norm_slow` then the reference RoPE).
+    #[test]
+    fn tracked_rms_norm_rope_backpropagates_to_x_and_the_norm_weight() {
+        let (s, h, d) = (3, 2, 8);
+        let (cos, sin) = tables(s, d / 2);
+        let x = candle_core::Var::from_tensor(&randn(&[1, s, h, d], 11)).unwrap();
+        let w = candle_core::Var::from_tensor(&randn(&[d], 12).affine(0.25, 1.0).unwrap()).unwrap();
+        let eps = 1e-6;
+        let grads_of = |out: &Tensor| {
+            let g = out.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+            [x.as_tensor(), w.as_tensor()].map(|v| {
+                g.get(v)
+                    .expect("a gradient reached the operand")
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max)
+        };
+        for pairing in [RopePairing::Interleaved, RopePairing::SplitHalf] {
+            for math in [RopeMath::F32, RopeMath::Native] {
+                let spec = RopeSpec {
+                    math,
+                    ..RopeSpec::new(pairing, RopeLayout::Bshd)
+                };
+                let slow = apply_rope_reference(
+                    &candle_nn::ops::rms_norm_slow(x.as_tensor(), w.as_tensor(), eps as f32)
+                        .unwrap(),
+                    &cos,
+                    &sin,
+                    &spec,
+                )
+                .unwrap();
+                let want = grads_of(&slow);
+                let plain = rms_norm_rope(
+                    &x.as_tensor().detach(),
+                    &w.as_tensor().detach(),
+                    eps,
+                    &cos,
+                    &sin,
+                    &spec,
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+                for in_place in [false, true] {
+                    let entry = if in_place {
+                        rms_norm_rope_in_place
+                    } else {
+                        rms_norm_rope
+                    };
+                    let out = entry(x.as_tensor(), w.as_tensor(), eps, &cos, &sin, &spec).unwrap();
+                    let tag = format!("{pairing:?}/{math:?}/in_place={in_place}");
+                    let value = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    let drift = max_diff(&value, &plain);
+                    assert!(drift < 1e-5, "{tag}: slow norm drifted {drift}");
+                    let got = grads_of(&out);
+                    for (name, (g, r)) in ["x", "weight"].iter().zip(got.iter().zip(&want)) {
+                        assert!(
+                            g.iter().any(|v| *v != 0.0),
+                            "{tag}: zero gradient at {name}"
+                        );
+                        let diff = max_diff(g, r);
+                        assert!(diff < 1e-5, "{tag}: {name} gradient off by {diff}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
