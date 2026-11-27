@@ -25,14 +25,19 @@
 //!   template and may be header-only (see dump-headers / fetch-headers). With a header-only template
 //!   the non-quantized tensors come from the dense source, cast to the template's dtype (reported).
 //! * `NAME` may be several path segments (`distilled/q4`); output mirrors `<out>/<NAME>/<component>`.
+//! * **No `--component`** = each `--tier` is a **split tier** (a flat `split_model.json` directory:
+//!   the LTX-2.3 / LTX-2.5 tiers): `<src-root>/<NAME>` -> `<out-root>/<NAME>`, and the from-bf16
+//!   root is the bf16 split tier directory itself (same file names), e.g.
+//!   `--tier distilled/q4=from-mlx --tier distilled/q8=from-bf16@<snap>/distilled/bf16`.
+//! * Stacked MoE experts (rank-3 triples, Lens's text encoder) convert to rank-4 stored blocks; a
+//!   from-bf16 source that ships them MXFP4 (`{base}_blocks` / `{base}_scales`) is dequantized and
+//!   quantized to Q8_0 (reported as `mxfp4`).
 //! * An existing output component is a hard error, so a partial run resumes by naming only the
 //!   components still missing.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use candle_gen::ggml_tier::{
-    convert_component, dump_headers, plan_jobs, write_header_dump, PrefixMap, TierSpec,
-};
+use candle_gen::ggml_tier::{dump_headers, plan_jobs, write_header_dump, PrefixMap, TierSpec};
 
 fn usage(msg: &str) -> ! {
     eprintln!("error: {msg}\nsee the module docs of examples/candle_ggml_tier.rs for usage");
@@ -211,8 +216,8 @@ fn build(args: Vec<String>) {
     }
     let src_root = src_root.unwrap_or_else(|| usage("--src-root is required"));
     let out_root = out_root.unwrap_or_else(|| usage("--out-root is required"));
-    if tiers.is_empty() || components.is_empty() {
-        usage("at least one --tier and --component are required");
+    if tiers.is_empty() {
+        usage("at least one --tier is required (no --component = split tiers)");
     }
     let jobs = plan_jobs(&src_root, &out_root, &tiers, &components, &maps)
         .unwrap_or_else(|e| usage(&e.to_string()));
@@ -224,23 +229,26 @@ fn build(args: Vec<String>) {
             job.src.display(),
             job.dst.display()
         );
-        let report = convert_component(&job.src, &job.dst, &job.mode, &mut |path, r| {
-            println!(
-                "  [shard] {} ({} converted, {} copied, {} B out, {:.1}s)",
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                r.converted,
-                r.passthrough,
-                r.tensor_bytes,
-                started.elapsed().as_secs_f64()
-            );
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("{}: {e}", job.label));
+        let report = job
+            .run(&mut |path, r| {
+                println!(
+                    "  [shard] {} ({} converted, {} copied, {} B out, {:.1}s)",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    r.converted,
+                    r.passthrough,
+                    r.tensor_bytes,
+                    started.elapsed().as_secs_f64()
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{}: {e}", job.label));
         println!(
-            "[done] {}: {} shards, {} quantized, {} copied, {} B in -> {} B out, {:.1}s",
+            "[done] {}: {} shards written, {} files copied, {} quantized ({} from mxfp4), {} copied, {} B in -> {} B out, {:.1}s",
             job.label,
             report.shards,
+            report.copied_files,
             report.converted,
+            report.mxfp4_sources,
             report.passthrough,
             report.bytes_in,
             report.tensor_bytes,
