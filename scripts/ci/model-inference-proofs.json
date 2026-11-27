@@ -321923,7 +321923,7 @@
     "backend": null,
     "expected_devices": [],
     "cargo_features": [],
-    "fixture_identity": "Fixed-seed 1024x1024 8-step Krea 2 Turbo renders: the bf16 snapshot, the SW-6135 W4A8 tier (native single file over the bf16 base) and the optional q8/q4/NVFP4/blanket-W4A8 rows; image PSNR vs bf16, s/step and device peak; W4A8 must clear the declared 22 dB floor.",
+    "fixture_identity": "Fixed-seed 1024x1024 8-step Krea 2 Turbo renders: the bf16 snapshot, the SW-6135 W4A8 tier (native single file over the bf16 base), loaded resident and again through the staged-residency shape (Sequential + DeferredMaterialization File load, staged request; DiT resident in the heavy phase), and the optional q8/q4/NVFP4/blanket-W4A8 rows; image PSNR vs bf16, s/step and device peak; both W4A8 renders must clear the declared 22 dB floor.",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",

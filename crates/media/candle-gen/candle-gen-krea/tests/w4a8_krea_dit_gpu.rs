@@ -19,7 +19,10 @@
 //!    snapshot tiers, the Kitchen NVFP4 single file and the blanket W4A8 measurement arm), each in
 //!    its own load. Records image PSNR vs the bf16 render, s/step (median inter-step interval) and
 //!    the device peak over the idle baseline, writes every PNG for visual inspection, and asserts
-//!    the W4A8 render clears the declared floor.
+//!    the W4A8 render clears the declared floor. The W4A8 tier renders twice: resident, and through
+//!    the advertised `StagedResidency` shape (an adapter-free Sequential + DeferredMaterialization
+//!    File load with a staged request), whose DiT must load resident inside the sequential heavy
+//!    phase rather than being routed into native block streaming (PR #1526 review).
 //! 2. [`w4a8_krea_dit_gpu_additive_lora_matches_q8_class`] — a real Krea 2 LoRA installs additively
 //!    over the W4A8 trunk onto exactly the targets it resolves on the q8 trunk, and the adapted
 //!    W4A8 render lands in the same result class as the adapted q8 render.
@@ -40,8 +43,8 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    WeightsSource,
+    AdapterKind, AdapterSpec, GenerationMemory, GenerationOutput, GenerationRequest, Image,
+    LoadShape, LoadSpec, OffloadPolicy, Progress, WeightsSource,
 };
 use candle_gen::testkit::{save_image_png, VramProbe};
 use candle_gen_krea::loader::Weights;
@@ -91,6 +94,8 @@ enum Tier<'a> {
     Snapshot(&'a Path),
     /// A native single-file DiT over the bf16 base snapshot (W4A8, NVFP4).
     Native { base: &'a Path, dit: &'a Path },
+    /// [`Tier::Native`] loaded Sequential + DeferredMaterialization: the staged-residency shape.
+    NativeStaged { base: &'a Path, dit: &'a Path },
 }
 
 struct Measured {
@@ -133,6 +138,18 @@ fn render(tier: Tier<'_>, adapters: &[AdapterSpec], req: &GenerationRequest) -> 
             adapters,
             candle_gen_krea::descriptor(),
         ),
+        Tier::NativeStaged { base, dit } => {
+            let mut spec = LoadSpec::new(WeightsSource::File(dit.to_path_buf()))
+                .with_component(
+                    candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
+                    WeightsSource::Dir(base.to_path_buf()),
+                )
+                .with_adapters(adapters.to_vec())
+                .with_offload_policy(OffloadPolicy::Sequential)
+                .with_load_shape(LoadShape::DeferredMaterialization);
+            spec.prepare_file_sources()
+                .and_then(|()| candle_gen_krea::provider_registry()?.load("krea_2_turbo", &spec))
+        }
     }
     .expect("the tier loads through its production LoadSpec route");
     probe.end_load(phase);
@@ -259,6 +276,27 @@ fn w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16() {
             &req,
         ),
     ));
+    // PR #1526 review: the same W4A8 tier through the advertised StagedResidency shape. Before the
+    // fix this adapter-free Sequential + Deferred File load was implicitly armed for native block
+    // streaming and refused after conditioning; its DiT must now load resident in the heavy phase.
+    let staged_req = GenerationRequest {
+        memory: Some(GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        }),
+        ..request(EDGE, STEPS)
+    };
+    rows.push((
+        "w4a8 (mixed, staged)".into(),
+        render(
+            Tier::NativeStaged {
+                base: &bf16,
+                dit: &w4a8,
+            },
+            &[],
+            &staged_req,
+        ),
+    ));
     if let Some(blanket) = &blanket {
         rows.push((
             "w4a8 (blanket)".into(),
@@ -318,6 +356,15 @@ fn w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16() {
     assert!(
         w4a8_psnr >= W4A8_PSNR_FLOOR_DB,
         "the W4A8 render is {w4a8_psnr:.2} dB from bf16, below the {W4A8_PSNR_FLOOR_DB} dB floor"
+    );
+    let staged_psnr = psnr(&rows[1].1.image, &reference.image);
+    println!(
+        "[sw-6135] staged W4A8 vs resident W4A8: {:.2} dB",
+        psnr(&rows[1].1.image, &rows[0].1.image)
+    );
+    assert!(
+        staged_psnr >= W4A8_PSNR_FLOOR_DB,
+        "the staged W4A8 render is {staged_psnr:.2} dB from bf16, below the {W4A8_PSNR_FLOOR_DB} dB floor"
     );
 
     #[cfg(feature = "model-inference-proof")]

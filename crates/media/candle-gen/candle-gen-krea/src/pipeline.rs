@@ -1127,8 +1127,12 @@ fn load_native_dit_at_dtype(
         let native_w4a8 = dit_w.is_native_w4a8();
         let mut dit_w = if native_w4a8 {
             ensure_w4a8_adapters_supported(adapters.specs)?;
+            // Backstop only: the registered build never arms implicit streaming for a W4A8 file
+            // (`native_file_streamable` excludes it, so the sequential heavy phase loads it
+            // resident), and an explicit `stream_transformer_blocks` request is refused at request
+            // admission (`validate_native_file_transformer_request`) before any conditioning.
             if stream_blocks {
-                return Err(CandleError::Msg(
+                return Err(CandleError::Unsupported(
                     "Krea W4A8 imports require resident transformer loading".into(),
                 ));
             }

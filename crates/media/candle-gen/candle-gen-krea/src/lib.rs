@@ -1897,9 +1897,15 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
 /// Missing, while an explicit adapter-free Sequential + Deferred load can still exercise the pinned
 /// native stream path. Candle cannot replay adapters onto streamed blocks, so every adapter form —
 /// including diff-patches — stays excluded.
+///
+/// A native **W4A8** tier (SW-6135) is excluded too: its delegated projections construct whole
+/// through `W4A8Linear` and have no block-window materialization, so its DiT loads resident inside
+/// the sequential heavy phase instead. This is what keeps an ordinary adapter-free Sequential +
+/// Deferred W4A8 load (the advertised `StagedResidency` rung) from being implicitly routed into a
+/// stream the loader must refuse after conditioning. The header classification runs last, so it
+/// is read only for an otherwise eligible File load.
 fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
     provider_id == KREA_2_TURBO_ID
-        && matches!(spec.weights, WeightsSource::File(_))
         && matches!(spec.offload_policy, gen_core::OffloadPolicy::Sequential)
         && matches!(
             spec.load_shape,
@@ -1907,6 +1913,7 @@ fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
         )
         && spec.quantize.is_none()
         && spec.adapters.is_empty()
+        && matches!(&spec.weights, WeightsSource::File(path) if !is_native_w4a8_file(path))
 }
 
 fn validate_native_file_transformer_request(
@@ -1927,6 +1934,18 @@ fn validate_native_file_transformer_request(
     }
     if !memory.stream_transformer_blocks {
         return Ok(());
+    }
+    // SW-6135: explicitly requested block streaming of a W4A8 tier is refused here, at request
+    // admission and before any conditioning, with its own reason (the generic eligibility text
+    // below would blame the load shape).
+    if let WeightsSource::File(path) = &spec.weights {
+        if is_native_w4a8_file(path) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: a native W4A8 transformer loads resident; its packed projections \
+                 have no transformer block-streaming form (stream_transformer_blocks=true is \
+                 unsupported for this tier)"
+            )));
+        }
     }
     if !native_file_streamable(provider_id, spec) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -5460,6 +5479,61 @@ mod tests {
         let dense_tmp = tempfile::tempdir().unwrap();
         let (_, dense_file, _) = crate::testfix::tiny_native_transformer_fixture(&dense_tmp);
         assert!(!is_native_w4a8_file(&dense_file));
+    }
+
+    /// SW-6135 review (PR #1526): an adapter-free Turbo W4A8 File load with Sequential offload and
+    /// DeferredMaterialization — the advertised `StagedResidency` shape — must NOT arm the native
+    /// block loader implicitly. `build()` passes `native_file_streamable` straight into the
+    /// sequential heavy phase, so a `true` here routed every ordinary staged W4A8 generation into the
+    /// loader's W4A8 stream refusal *after* conditioning. The W4A8 DiT now loads resident inside
+    /// the sequential heavy phase; only an explicit `stream_transformer_blocks` request is refused,
+    /// typed, at request admission.
+    ///
+    /// Mutation: drop the `!is_native_w4a8_file` arm from `native_file_streamable` and the first
+    /// assertion goes red; drop the W4A8 arm from `validate_native_file_transformer_request` and the
+    /// refusal reason assertion goes red (the generic eligibility text names no tier).
+    #[test]
+    fn native_w4a8_staged_file_load_is_resident_not_implicitly_block_streamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, w4a8, _) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let staged = |file: &Path| {
+            LoadSpec::new(WeightsSource::File(file.to_path_buf()))
+                .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()))
+                .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+                .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+        };
+        let spec = staged(&w4a8);
+        assert!(spec.adapters.is_empty() && spec.quantize.is_none());
+        assert!(
+            !native_file_streamable(KREA_2_TURBO_ID, &spec),
+            "an adapter-free staged W4A8 File load must load its DiT resident, not stream it"
+        );
+
+        // Staged residency without block streaming is admitted for the W4A8 tier.
+        let staged_only = gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &spec, staged_only)
+            .expect("staged W4A8 residency without block streaming is admitted");
+
+        // Explicit block streaming is refused at admission, typed, naming the tier.
+        let streamed = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        };
+        let error = validate_native_file_transformer_request(KREA_2_TURBO_ID, &spec, streamed)
+            .expect_err("explicit W4A8 block streaming is refused before conditioning");
+        assert!(matches!(error, gen_core::Error::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("W4A8"), "{error}");
+
+        // Control: the same tiny trunk without the W4A8 projection keeps the physical stream path.
+        let (_, dense_file, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let dense = staged(&dense_file);
+        assert!(native_file_streamable(KREA_2_TURBO_ID, &dense));
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &dense, streamed)
+            .expect("an eligible dense File load still reaches the physical block streamer");
     }
 
     #[test]

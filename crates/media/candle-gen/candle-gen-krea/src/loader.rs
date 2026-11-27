@@ -681,7 +681,22 @@ impl Weights {
     /// from a run that executed it as packed W4A4 or as dense BF16. `Ok(None)` when the source has
     /// no encoded rows or family plan; `Err` when the pinned file changed under the load,
     /// so facts are never reported about bytes that are gone.
+    ///
+    /// # A native W4A8 file reports `Ok(None)` (SW-6135)
+    ///
+    /// Its W4A8 projections are delegated out of the codec plan (the registry has no W4A8 row by
+    /// design, SW-6134) and materialize through `W4A8Linear`, never through the reader. The
+    /// reader's facts would therefore describe only the undelegated remainder — a source inventory
+    /// without the packed projections and a resident-byte total without any W4A8 operand — while
+    /// the source binding ties that partial inventory to the *whole* file. The facts contract's
+    /// inventory is plan-derived per codec row and has no truthful place for a delegated half, so
+    /// this source shape answers `None`: the same "this source shape does not answer these
+    /// questions" the MLX q4/q8 packed tiers (whose projections are likewise served outside any
+    /// plan) report, never a misleading partial set.
     pub fn checkpoint_weight_facts(&self) -> Result<Option<CheckpointWeightFacts>> {
+        if self.w4a8.is_some() {
+            return Ok(None);
+        }
         let Some(logical) = self.logical.as_ref() else {
             return Ok(None);
         };
@@ -1836,6 +1851,91 @@ mod tests {
             .err()
             .expect("W4A8 has no CPU forward");
         assert!(err.to_string().contains("CUDA"), "{err}");
+    }
+
+    /// SW-6135 review (PR #1526): a native W4A8 file publishes **no** checkpoint facts rather than
+    /// a partial inventory. Its delegated projections never reach the codec plan or the reader's
+    /// accounting, so the reader's own facts would list only the dense remainder and measure no
+    /// W4A8 operand — yet bind that partial set to the whole file. The contract cannot carry a
+    /// delegated half truthfully, so the accessor answers `None`, exactly as the MLX q4/q8 packed
+    /// tiers (projections likewise served outside any plan) do; the generator's sink therefore
+    /// stays empty. Pure metadata/accounting over tiny synthetic safetensors — no model compute.
+    ///
+    /// Mutation: drop the `w4a8.is_some()` guard in `checkpoint_weight_facts` and the `None`
+    /// assertion goes red (the reader's partial facts — asserted present below — leak through).
+    #[test]
+    fn native_w4a8_file_reports_no_checkpoint_facts_instead_of_a_partial_inventory() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Control: the same tiny native trunk without the W4A8 projection does publish facts.
+        let (_dense_root, dense_path, dense_cfg) =
+            crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let dense = Weights::from_native_file_for(
+            &dense_path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&dense_cfg),
+        )?;
+        dense.get("transformer_blocks.0.attn.to_q.weight")?;
+        assert!(dense.checkpoint_weight_facts()?.is_some());
+
+        let (_root, path, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let w = Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        assert!(w.is_native_w4a8());
+        w.get("transformer_blocks.0.attn.to_q.weight")?;
+        // The defect being guarded: the reader alone would hand out facts whose inventory omits
+        // every delegated tensor and whose resident total excludes every W4A8 operand.
+        let partial = w
+            .logical
+            .as_ref()
+            .expect("a native file has a reader")
+            .checkpoint_weight_facts()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        let delegated: Vec<&str> = w.w4a8_delegated_keys().collect();
+        assert_eq!(delegated.len(), 5);
+        let plan = w.logical_plan().expect("a native file has a plan");
+        assert!(
+            plan.all_physical_keys()
+                .all(|key| !delegated.contains(&key)),
+            "the reader's inventory cannot see the delegated projection"
+        );
+        assert_eq!(
+            partial.source().tensor_count,
+            plan.tensor_count(),
+            "the reader's inventory is exactly the undelegated plan"
+        );
+        assert!(
+            w.w4a8_resident_bytes() > 0,
+            "the delegated half holds real resident bytes the reader never measured"
+        );
+        assert!(
+            w.checkpoint_weight_facts()?.is_none(),
+            "a W4A8 file must not publish a partial inventory bound to the whole file"
+        );
+        let sink = candle_gen::gen_core::CheckpointFactsSink::new();
+        sink.publish_optional(w.checkpoint_weight_facts()?);
+        assert!(
+            sink.is_empty(),
+            "the generator's facts stay None for a W4A8 import"
+        );
+
+        // Consistency: an MLX q4 packed-tier component also answers None (no plan at all).
+        let (wq, s, b, _) = q4_packed(128, 256);
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("attn.to_out.0.weight".into(), wq);
+        map.insert("attn.to_out.0.scales".into(), s);
+        map.insert("attn.to_out.0.biases".into(), b);
+        let dir = tmp.path().join("q4_component");
+        write_component(&dir, map, true);
+        let packed = Weights::from_dir(&dir, &Device::Cpu, DType::F32)?;
+        assert!(packed.packed().is_some());
+        assert!(packed.checkpoint_weight_facts()?.is_none());
+        Ok(())
     }
 
     /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
