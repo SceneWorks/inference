@@ -1536,18 +1536,46 @@ fn catalog_attention_routing_covers_every_provider() {
         table, registered,
         "every registered provider (and only those) states its attention routing"
     );
-    use super::SharedAttentionRouting::{Bespoke, SharedHelpers};
+    use super::LossyServe::{Never, Served};
+    use super::SharedAttentionRouting::{self as R, Bespoke, SharedHelpers};
+    let serves = |id: &str| match super::shared_attention_routing(id) {
+        Some(SharedHelpers { int8, sol }) => Some((int8 == Served, sol == Served)),
+        Some(Bespoke) => None,
+        None => panic!("{id} is not listed"),
+    };
     for (id, want) in [
-        ("krea_2_turbo", SharedHelpers),
-        ("wan2_2_ti2v_5b", SharedHelpers),
-        ("ltx_2_3_distilled", SharedHelpers),
-        ("sdxl", SharedHelpers),
-        ("moss_image_base", Bespoke),
-        ("sana_1600m", Bespoke),
-        ("supra2_img", Bespoke),
+        ("krea_2_turbo", Some((true, true))),
+        ("wan2_2_ti2v_5b", Some((true, true))),
+        ("flux1_dev", Some((true, true))),
+        // f32 attention: the flash toggle reaches it, neither lossy kernel can.
+        ("ltx_2_3_distilled", Some((false, false))),
+        ("flux2_dev", Some((false, false))),
+        // 64-wide heads: INT8 only.
+        ("sdxl", Some((true, false))),
+        ("instantid", Some((true, false))),
+        ("moss_image_base", None),
+        ("sana_1600m", None),
+        ("supra2_img", None),
     ] {
-        assert_eq!(super::shared_attention_routing(id), Some(want), "{id}");
+        assert_eq!(serves(id), want, "{id}");
     }
+    // Every `Never` carries a reason for the typed refusal.
+    for (id, routing) in super::SHARED_ATTENTION_ROUTING {
+        if let SharedHelpers { int8, sol } = routing {
+            for serve in [int8, sol] {
+                if let Never(why) = serve {
+                    assert!(!why.trim().is_empty(), "{id}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        R::ALL,
+        SharedHelpers {
+            int8: Served,
+            sol: Served
+        }
+    );
     assert_eq!(super::shared_attention_routing("no_such_model"), None);
 }
 
@@ -1587,7 +1615,7 @@ fn lossy_attention_admission_is_typed() {
         (int8, INT8_ATTN_COMPILED, "INT8 attention kernel"),
         (sol, SOL_ATTN_COMPILED, "Sol-Attn kernel"),
     ] {
-        for id in ["krea_2_turbo", "wan2_2_ti2v_5b", "flux2_dev", "pulid_flux"] {
+        for id in ["krea_2_turbo", "wan2_2_ti2v_5b", "flux1_dev", "pulid_flux"] {
             let got = admit(id, &opt_ins);
             if compiled {
                 got.unwrap();
@@ -1595,5 +1623,28 @@ fn lossy_attention_admission_is_typed() {
                 unsupported(got, needle);
             }
         }
+    }
+    // A kernel the provider's attention can never take is refused upfront with its reason, even
+    // when the other requested kernel would serve (never admitted and then rendered exact).
+    let both = LossyAttentionOptIns {
+        int8: Some(Int8AttentionConfig::default()),
+        sol: Some(SolConfig::top_k(0.25)),
+    };
+    unsupported(
+        admit("flux2_dev", &int8),
+        "int8_attention: `flux2_dev` runs its attention in f32",
+    );
+    unsupported(
+        admit("ltx_2_3_distilled", &sol),
+        "sol_attention: `ltx_2_3_distilled` runs its attention in f32",
+    );
+    unsupported(admit("sdxl", &sol), "64-wide attention heads");
+    unsupported(admit("sdxl", &both), "sol_attention: `sdxl`");
+    unsupported(admit("boogu_image", &int8), "120-wide attention heads");
+    unsupported(admit("qwen_image_2_1", &sol), "block-causally");
+    if INT8_ATTN_COMPILED {
+        admit("sdxl", &int8).unwrap();
+        admit("instantid", &int8).unwrap();
+        admit("qwen_image_2_1", &int8).unwrap();
     }
 }

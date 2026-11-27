@@ -125,8 +125,14 @@
 //! gate, and a call either cannot serve falls through to flash / budgeted with its refusal counted.
 //! A thread scope (an engine option: Krea's `int8_attention`, Wan's `sol_attention`) wins over the
 //! job switch for the calls inside it ([`requested_opt_ins`]). Which providers route attention
-//! through the shared helpers at all is the catalog's `shared_attention_routing` (a provider that
-//! does not is refused upfront by `admit_lossy_attention`, never silently rendered exact).
+//! through the shared helpers at all, and which lossy kernels each one's attention can take, is the
+//! catalog's `shared_attention_routing` (a provider that does not, or a kernel its attention can
+//! never take, is refused upfront by `admit_lossy_attention`, never silently rendered exact).
+//!
+//! A provider that picks between a native-dtype path into these helpers and its own upcast /
+//! materialized fallback by asking the router must test [`AttentionKernel::is_fused`], never
+//! `== AttentionKernel::Flash`: an opted-in INT8 / Sol-Attn route is fused too, and treating it as
+//! "not flash" would send the call to the fallback, losing flash without running the lossy kernel.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

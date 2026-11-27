@@ -51,8 +51,10 @@ pub fn conservative_video_decode_memory_profile(
 /// sparse kernel ([`attention::LossyAttentionOptIns`]). Per job, a product worker calls
 /// [`attention::admit_lossy_attention`]`(provider_id, &opt_ins)` (a typed `Unsupported` for a
 /// provider with its own attention — [`attention::shared_attention_routing`] is
-/// [`attention::SharedAttentionRouting::Bespoke`] — an unknown id, an invalid Sol-Attn
-/// configuration or a kernel this build lacks), then [`attention::set_lossy_attention`] at job
+/// [`attention::SharedAttentionRouting::Bespoke`] — a requested kernel the provider's attention can
+/// never take, [`attention::LossyServe::Never`] (f32 attention, an unserved head width or attention
+/// pattern), an unknown id, an invalid Sol-Attn configuration or a kernel this build lacks), then
+/// [`attention::set_lossy_attention`] at job
 /// start and `set_lossy_attention(LossyAttentionOptIns::OFF)` at job end. Calls the kernel cannot
 /// serve keep FlashAttention / the budgeted path, counted in
 /// [`attention::AttentionPathCounts`]'s `int8` / `sol` and `int8_refusals` / `sol_refusals`.
@@ -66,7 +68,7 @@ pub mod attention {
         SolSelection, FLASH_ATTN_COMPILED, INT8_ATTN_COMPILED, SOL_ATTN_COMPILED,
     };
     pub use candle_gen_catalog::{
-        admit_lossy_attention, shared_attention_routing, SharedAttentionRouting,
+        admit_lossy_attention, shared_attention_routing, LossyServe, SharedAttentionRouting,
         SHARED_ATTENTION_ROUTING,
     };
 }

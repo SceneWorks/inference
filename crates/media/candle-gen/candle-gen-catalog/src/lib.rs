@@ -92,14 +92,58 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedAttentionRouting {
     /// The provider's transformer / UNet attention goes through the shared helpers: the flash
-    /// toggle and the INT8 / Sol-Attn opt-ins reach it. Each call is still eligibility-checked; a
-    /// call a lossy kernel cannot serve keeps FlashAttention / the budgeted path, counted in
-    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`.
-    SharedHelpers,
+    /// toggle reaches it, and so does each lossy kernel the provider can take
+    /// ([`LossyServe::Served`]) when opted in. Each call is still eligibility-checked; a call a
+    /// lossy kernel cannot serve keeps FlashAttention / the budgeted path, counted in
+    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`. A kernel the provider's attention can
+    /// never take (f32 attention, a head width or attention pattern the kernel does not serve) is
+    /// [`LossyServe::Never`] and refused upfront by [`admit_lossy_attention`].
+    SharedHelpers {
+        /// Whether the provider's attention can take the INT8 QK kernel (SW-6131).
+        int8: LossyServe,
+        /// Whether the provider's attention can take the Sol-Attn kernel (SW-6137).
+        sol: LossyServe,
+    },
     /// The provider's model attention is its own code (outside the shared helpers): no job-level
     /// attention switch reaches it, so a product must refuse a lossy-attention opt-in for it with a
     /// typed error rather than silently render the exact path ([`admit_lossy_attention`]).
     Bespoke,
+}
+
+/// Whether a [`SharedAttentionRouting::SharedHelpers`] provider's attention can take one lossy
+/// kernel at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossyServe {
+    /// Its attention calls are shaped for the kernel (bf16 / f16 on CUDA, a head width and an
+    /// attention pattern the kernel serves); each call is still eligibility-checked.
+    Served,
+    /// Its attention can never take the kernel, and why (the typed refusal's text): opting in
+    /// would only render the exact path.
+    Never(&'static str),
+}
+
+impl SharedAttentionRouting {
+    /// Shared helpers, both lossy kernels served.
+    pub const ALL: Self = Self::SharedHelpers {
+        int8: LossyServe::Served,
+        sol: LossyServe::Served,
+    };
+
+    /// Shared helpers, the INT8 kernel served and Sol-Attn never (`why`).
+    pub const fn int8_only(why: &'static str) -> Self {
+        Self::SharedHelpers {
+            int8: LossyServe::Served,
+            sol: LossyServe::Never(why),
+        }
+    }
+
+    /// Shared helpers (the flash toggle reaches it) but neither lossy kernel can serve (`why`).
+    pub const fn exact_only(why: &'static str) -> Self {
+        Self::SharedHelpers {
+            int8: LossyServe::Never(why),
+            sol: LossyServe::Never(why),
+        }
+    }
 }
 
 /// Every provider this catalog registers (generators, transforms, captioners, embedders) plus the
@@ -108,87 +152,111 @@ pub enum SharedAttentionRouting {
 /// materialized path (epic E9), whatever the job switches say. `catalog_attention_routing_covers_every_provider`
 /// (tests) pins this table to the registry, so a new provider must state its routing here.
 pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
-    use SharedAttentionRouting::{Bespoke, SharedHelpers as Shared};
+    use SharedAttentionRouting as R;
+    const ALL: R = R::ALL;
+    const BESPOKE: R = R::Bespoke;
+    const F32: &str = "runs its attention in f32; the INT8 / Sol-Attn kernels take bf16 / f16 only";
+    const HD64: &str = "has 64-wide attention heads; Sol-Attn takes head dim 128 only";
+    const HD120: &str = "has 120-wide attention heads; the INT8 kernel takes head dim 64 / 128 \
+                         and Sol-Attn 128";
+    const HD256: &str = "has 256-wide attention heads; the INT8 kernel takes head dim 64 / 128 \
+                         and Sol-Attn 128";
+    const BLOCK_CAUSAL: &str = "attends block-causally (no unmasked whole-sequence \
+                                self-attention); Sol-Attn takes only that";
+    const MASKED_F32: &str = "runs its masked attention in f32; the INT8 / Sol-Attn kernels take \
+                              unmasked bf16 / f16 only";
     &[
-        ("anima_base", Shared),
-        ("anima_aesthetic", Shared),
-        ("anima_turbo", Shared),
+        ("anima_base", ALL),
+        ("anima_aesthetic", ALL),
+        ("anima_turbo", ALL),
         // Bernini renders with Wan's `WanTransformer`.
-        ("bernini_renderer", Shared),
-        ("bernini", Shared),
-        ("boogu_image", Shared),
-        ("boogu_image_turbo", Shared),
-        ("boogu_image_edit", Shared),
-        ("chroma1_hd", Shared),
-        ("chroma1_base", Shared),
-        ("chroma1_flash", Shared),
-        ("flux1_schnell", Shared),
-        ("flux1_dev", Shared),
-        ("flux2_klein_9b", Shared),
-        ("flux2_dev", Shared),
-        ("flux3_klein", Shared),
-        ("flux3_klein_base", Shared),
-        ("ideogram_4", Shared),
-        ("ideogram_4_turbo", Shared),
-        ("iris_3b", Shared),
-        // Kolors denoises with the SDXL UNet (`candle-gen-sdxl`).
-        ("kolors", Shared),
-        ("krea_2_turbo", Shared),
-        ("krea_2_raw", Shared),
-        ("krea_2_edit", Shared),
-        ("krea_2_turbo_edit", Shared),
-        ("krea_2_turbo_control", Shared),
-        ("lens_turbo", Shared),
-        ("lens", Shared),
-        ("ltx_2_3_distilled", Shared),
-        ("ltx_2_5_distilled", Shared),
+        ("bernini_renderer", ALL),
+        ("bernini", ALL),
+        ("boogu_image", R::exact_only(HD120)),
+        ("boogu_image_turbo", R::exact_only(HD120)),
+        ("boogu_image_edit", R::exact_only(HD120)),
+        // Chroma's DiT loads and attends at f32.
+        ("chroma1_hd", R::exact_only(F32)),
+        ("chroma1_base", R::exact_only(F32)),
+        ("chroma1_flash", R::exact_only(F32)),
+        ("flux1_schnell", ALL),
+        ("flux1_dev", ALL),
+        // FLUX.2 pins every component's compute dtype to f32.
+        ("flux2_klein_9b", R::exact_only(F32)),
+        ("flux2_dev", R::exact_only(F32)),
+        // FLUX.3's packed attention upcasts its operands to an f32 kernel dtype.
+        ("flux3_klein", R::exact_only(F32)),
+        ("flux3_klein_base", R::exact_only(F32)),
+        ("ideogram_4", R::exact_only(HD256)),
+        ("ideogram_4_turbo", R::exact_only(HD256)),
+        ("iris_3b", ALL),
+        // Kolors' dense UNet is candle's stock f32 attention; its packed UNet is the SDXL UNet at
+        // f32.
+        ("kolors", R::exact_only(F32)),
+        ("krea_2_turbo", ALL),
+        ("krea_2_raw", ALL),
+        ("krea_2_edit", ALL),
+        ("krea_2_turbo_edit", ALL),
+        ("krea_2_turbo_control", ALL),
+        ("lens_turbo", R::int8_only(HD64)),
+        ("lens", R::int8_only(HD64)),
+        // LTX's DiT attention upcasts Q/K/V to f32 before the shared helper.
+        ("ltx_2_3_distilled", R::exact_only(F32)),
+        ("ltx_2_5_distilled", R::exact_only(F32)),
         // Mage's DiT attention goes through `training_sdpa_bhsd` (the shared planned helper).
-        ("mage_flow", Shared),
-        ("mage_flow_base", Shared),
-        ("mage_flow_turbo", Shared),
-        ("mage_flow_edit", Shared),
-        ("mage_flow_edit_base", Shared),
-        ("mage_flow_edit_turbo", Shared),
-        ("minimax_h3", Shared),
-        ("minimax_h3_image", Shared),
-        ("mochi_1", Shared),
+        ("mage_flow", ALL),
+        ("mage_flow_base", ALL),
+        ("mage_flow_turbo", ALL),
+        ("mage_flow_edit", ALL),
+        ("mage_flow_edit_base", ALL),
+        ("mage_flow_edit_turbo", ALL),
+        ("minimax_h3", ALL),
+        ("minimax_h3_image", ALL),
+        // Mochi's joint attention always carries the text padding mask.
+        ("mochi_1", R::exact_only(MASKED_F32)),
         // MOSS-Image's DiT attention is its own explicit-f32 materialized path.
-        ("moss_image_base", Bespoke),
-        ("moss_image_sft", Bespoke),
-        ("qwen_image", Shared),
-        ("qwen_image_2_1", Shared),
-        ("qwen_image_2_1_turbo", Shared),
+        ("moss_image_base", BESPOKE),
+        ("moss_image_sft", BESPOKE),
+        ("qwen_image", ALL),
+        ("qwen_image_2_1", R::int8_only(BLOCK_CAUSAL)),
+        ("qwen_image_2_1_turbo", R::int8_only(BLOCK_CAUSAL)),
         // Sana: ReLU linear self-attention plus its own masked cross-attention.
-        ("sana_1600m", Bespoke),
-        ("sana_sprint_1600m", Bespoke),
-        ("scail2_14b", Shared),
-        ("sd3_5_large", Shared),
-        ("sd3_5_large_turbo", Shared),
-        ("sd3_5_medium", Shared),
-        ("sdxl", Shared),
-        ("seedvr2", Shared),
-        ("seedvr2_3b", Shared),
-        ("seedvr2_7b", Shared),
-        ("sensenova_u1_8b", Shared),
-        ("sensenova_u1_8b_fast", Shared),
+        ("sana_1600m", BESPOKE),
+        ("sana_sprint_1600m", BESPOKE),
+        // SCAIL2's DiT loads at f32.
+        ("scail2_14b", R::exact_only(F32)),
+        ("sd3_5_large", R::int8_only(HD64)),
+        ("sd3_5_large_turbo", R::int8_only(HD64)),
+        ("sd3_5_medium", R::int8_only(HD64)),
+        ("sdxl", R::int8_only(HD64)),
+        ("seedvr2", ALL),
+        ("seedvr2_3b", ALL),
+        ("seedvr2_7b", ALL),
+        // SenseNova's block-causal attention widens to f32 activations.
+        ("sensenova_u1_8b", R::exact_only(MASKED_F32)),
+        ("sensenova_u1_8b_fast", R::exact_only(MASKED_F32)),
         // Supra-2's DiT has its own materialized `sdpa`.
-        ("supra2_img", Bespoke),
-        ("svd_xt", Shared),
-        ("wan2_2_ti2v_5b", Shared),
-        ("wan2_2_t2v_14b", Shared),
-        ("wan2_2_i2v_14b", Shared),
-        ("wan_vace", Shared),
-        ("wan2_2_vace_fun_14b", Shared),
-        ("z_image_turbo", Shared),
-        ("z_image", Shared),
-        ("iris_3b_restore", Shared),
-        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet.
-        (candle_gen_pulid::memory_strategy::PROVIDER_ID, Shared),
-        (candle_gen_instantid::memory_strategy::PROVIDER_ID, Shared),
+        ("supra2_img", BESPOKE),
+        // SVD's UNet runs f32 (half precision only under the `SVD_FORCE_*` diagnostics).
+        ("svd_xt", R::exact_only(F32)),
+        ("wan2_2_ti2v_5b", ALL),
+        ("wan2_2_t2v_14b", ALL),
+        ("wan2_2_i2v_14b", ALL),
+        ("wan_vace", ALL),
+        ("wan2_2_vace_fun_14b", ALL),
+        ("z_image_turbo", ALL),
+        ("z_image", ALL),
+        ("iris_3b_restore", ALL),
+        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet (f16).
+        (candle_gen_pulid::memory_strategy::PROVIDER_ID, ALL),
+        (
+            candle_gen_instantid::memory_strategy::PROVIDER_ID,
+            R::int8_only(HD64),
+        ),
         // The captioner and the CLIP embedders run their own attention.
-        ("fancyfeast/llama-joycaption-beta-one-hf-llava", Bespoke),
-        ("clip_vit_l14", Bespoke),
-        ("clip_vit_l14_text", Bespoke),
+        ("fancyfeast/llama-joycaption-beta-one-hf-llava", BESPOKE),
+        ("clip_vit_l14", BESPOKE),
+        ("clip_vit_l14_text", BESPOKE),
     ]
 };
 
@@ -202,11 +270,12 @@ pub fn shared_attention_routing(provider_id: &str) -> Option<SharedAttentionRout
 
 /// The one upfront check a product runs before setting a job's lossy-attention opt-ins
 /// (`candle_gen::fused_attention::set_lossy_attention`) for `provider_id` (SW-6132): `Ok` when
-/// nothing is requested, or when the provider's attention routes through the shared helpers and
-/// this build compiles every requested kernel; otherwise a typed [`media::gen_core::Error::Unsupported`]
-/// naming the provider and the reason — never a silently exact render. Per-call constraints (mask,
-/// head dim, dtype, the device's compute capability, cross-attention for Sol-Attn) are checked at
-/// each attention call and counted in `AttentionPathCounts::{int8_refusals, sol_refusals}`.
+/// nothing is requested, or when the provider's attention routes through the shared helpers, can
+/// take every requested kernel ([`LossyServe::Served`]) and this build compiles it; otherwise a
+/// typed [`media::gen_core::Error::Unsupported`] naming the provider and the reason — never a
+/// silently exact render. Per-call constraints (mask, head dim, dtype, the device's compute
+/// capability, cross-attention for Sol-Attn) are checked at each attention call and counted in
+/// `AttentionPathCounts::{int8_refusals, sol_refusals}`.
 pub fn admit_lossy_attention(
     provider_id: &str,
     opt_ins: &media::fused_attention::LossyAttentionOptIns,
@@ -224,7 +293,7 @@ pub fn admit_lossy_attention(
     opt_ins
         .validate()
         .map_err(|refusal| Error::Unsupported(format!("{provider_id}: {refusal}")))?;
-    match shared_attention_routing(provider_id) {
+    let (int8, sol) = match shared_attention_routing(provider_id) {
         None => {
             return Err(Error::Unsupported(format!(
                 "{requested}: `{provider_id}` is not a Candle provider this runtime registers"
@@ -232,10 +301,19 @@ pub fn admit_lossy_attention(
         }
         Some(SharedAttentionRouting::Bespoke) => {
             return Err(Error::Unsupported(format!(
-                "{requested}: `{provider_id}` runs its own attention, outside the shared Candle                  attention helpers the option acts on"
+                "{requested}: `{provider_id}` runs its own attention, outside the shared Candle \
+                 attention helpers the option acts on"
             )))
         }
-        Some(SharedAttentionRouting::SharedHelpers) => {}
+        Some(SharedAttentionRouting::SharedHelpers { int8, sol }) => (int8, sol),
+    };
+    for (asked, serve, name) in [
+        (opt_ins.int8.is_some(), int8, "int8_attention"),
+        (opt_ins.sol.is_some(), sol, "sol_attention"),
+    ] {
+        if let (true, LossyServe::Never(why)) = (asked, serve) {
+            return Err(Error::Unsupported(format!("{name}: `{provider_id}` {why}")));
+        }
     }
     if opt_ins.int8.is_some() && !INT8_ATTN_COMPILED {
         return Err(Error::Unsupported(format!(
