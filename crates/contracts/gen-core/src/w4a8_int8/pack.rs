@@ -139,6 +139,40 @@ pub struct W4A8CheckpointTensor {
     pub data: Vec<u8>,
 }
 
+impl W4A8CheckpointTensor {
+    /// A tensor written **unchanged** beside the packed projections (a dense projection kept at
+    /// higher precision, a bias, a norm scale, a modulation table), in its stored dtype. A tier
+    /// builder reads it through the gen-core header layer, so the dtype arrives as gen-core's own
+    /// [`crate::weightsmeta::Dtype`]; this converts it to the serializer's. `data` must be exactly
+    /// `shape`'s element count at that width.
+    pub fn passthrough(
+        name: impl Into<String>,
+        dtype: crate::weightsmeta::Dtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        let dtype_name = dtype.as_str();
+        let st_dtype: safetensors::Dtype = serde_json::from_value(serde_json::json!(dtype_name))
+            .map_err(|_| format!("{name}: dtype {dtype_name} has no safetensors serializer"))?;
+        let expected = shape
+            .iter()
+            .try_fold(dtype.size(), |acc, &dim| acc.checked_mul(dim));
+        if expected != Some(data.len()) {
+            return Err(format!(
+                "{name}: {} payload bytes do not match {dtype_name} {shape:?}",
+                data.len()
+            ));
+        }
+        Ok(Self {
+            name,
+            dtype: st_dtype,
+            shape,
+            data,
+        })
+    }
+}
+
 impl safetensors::View for W4A8CheckpointTensor {
     fn dtype(&self) -> safetensors::Dtype {
         self.dtype
