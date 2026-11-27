@@ -32,17 +32,36 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 /// Counts every artifact a load asks the saved-quantization cache for. Requested artifacts are
-/// produced under `dir` (the run's own `MINIMAX_H3_OUT`) so an MLX-tier control run still completes;
-/// the count is the evidence.
+/// produced under `dir` (a `saved-quantization/` folder inside the run's own `MINIMAX_H3_OUT`) so an
+/// MLX-tier control run still completes; the count is the evidence, and every produced file is
+/// disposable — see [`ScratchArtifact`].
 struct CountingCache {
     requests: AtomicUsize,
     dir: PathBuf,
 }
 
-struct NoArtifact(PathBuf);
-impl QuantizationArtifact for NoArtifact {
+/// One produced control-run artifact, deleted when its lease ends. An MLX-tier load requests one
+/// per packed projection (tens of GB in total), so keeping them would fill the run's storage with
+/// copies nothing reads again.
+struct ScratchArtifact(PathBuf);
+impl QuantizationArtifact for ScratchArtifact {
     fn path(&self) -> &Path {
         &self.0
+    }
+}
+/// The control run's artifact folder, removed when the run ends however it ends.
+struct ScratchDir(PathBuf);
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Drop for ScratchArtifact {
+    fn drop(&mut self) {
+        // A consumer still mapping the file (Windows refuses the delete) leaves it for the
+        // end-of-run sweep of `dir` in `main`.
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -58,11 +77,13 @@ impl QuantizationArtifactCache for CountingCache {
             key.digest(),
             key.extension()
         );
-        let path = self
-            .dir
-            .join(format!("saved-quantization-{n}.{}", key.extension()));
-        produce(&path)?;
-        Ok(Box::new(NoArtifact(path)))
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            candle_gen::gen_core::Error::Msg(format!("create {}: {e}", self.dir.display()))
+        })?;
+        // Owned from before `produce` runs, so a failed or partial write is removed too.
+        let artifact = ScratchArtifact(self.dir.join(format!("{n}.{}", key.extension())));
+        produce(artifact.path())?;
+        Ok(Box::new(artifact))
     }
 }
 
@@ -103,9 +124,13 @@ fn main() {
         ..Default::default()
     };
 
+    let scratch = out.join("saved-quantization");
+    // Declared before the generator, so it drops after it (and on a panic): whatever a still-mapped
+    // artifact left behind goes with the run.
+    let _scratch_guard = ScratchDir(scratch.clone());
     let cache = Arc::new(CountingCache {
         requests: AtomicUsize::new(0),
-        dir: out.clone(),
+        dir: scratch.clone(),
     });
     let _scope = QuantizationCacheContext::new(cache.clone()).install();
     let _runtime = candle_gen::quantization_cache::install_runtime_cache_context();
