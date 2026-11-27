@@ -21,6 +21,7 @@ use mlx_gen::{
 
 use crate::caption::CaptionEncoder;
 use crate::config::{PidConfig, SamplerConfig};
+use crate::decode_routes::DecodeRoutes;
 use crate::decoder::PidDecoder;
 use crate::gemma2::{Gemma2, Gemma2Config};
 use crate::lq::PidNet;
@@ -197,15 +198,30 @@ pub fn resolve_pid_decoder_at_sigma(
     model_id: &str,
     capture_sigma: f32,
 ) -> Result<Option<PidDecoder>> {
+    resolve_pid_decoder_with_routes(pid, req, base_seed, model_id, capture_sigma, None)
+}
+
+/// [`resolve_pid_decoder_at_sigma`] with optional provider-supplied [`DecodeRoutes`] admission.
+/// When `decode_routes` is `None` and the request enables bounded decode with an explicit tile
+/// geometry, [`DecodeRoutes::default_pid`] validates that geometry before minting the decoder.
+pub fn resolve_pid_decoder_with_routes(
+    pid: Option<&PidEngine>,
+    req: &GenerationRequest,
+    base_seed: u64,
+    model_id: &str,
+    capture_sigma: f32,
+    decode_routes: Option<&DecodeRoutes>,
+) -> Result<Option<PidDecoder>> {
     if !req.use_pid {
         return Ok(None);
     }
+    let selected = crate::plan::PidDecodePlan::resolve_request_tiling(req, decode_routes)?;
     let engine = pid.ok_or_else(|| {
         Error::Msg(format!(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    Ok(Some(mint_planned_decoder_with_tiling(
+    Ok(Some(mint_planned_decoder_with_routes(
         engine,
         model_id,
         &req.prompt,
@@ -214,7 +230,8 @@ pub fn resolve_pid_decoder_at_sigma(
         capture_sigma,
         base_seed,
         req.cancel.clone(),
-        selected_decode_tiling(req),
+        selected,
+        decode_routes,
     )?))
 }
 
@@ -355,29 +372,56 @@ pub fn mint_planned_decoder_with_tiling(
     cancel: CancelFlag,
     selected: Option<(i32, i32)>,
 ) -> Result<PidDecoder> {
+    mint_planned_decoder_with_routes(
+        engine,
+        model_id,
+        prompt,
+        width,
+        height,
+        capture_sigma,
+        seed,
+        cancel,
+        selected,
+        None,
+    )
+}
+
+/// [`mint_planned_decoder_with_tiling`] with optional [`DecodeRoutes`] admission (defaulting to
+/// [`DecodeRoutes::default_pid`] when `decode_routes` is `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_planned_decoder_with_routes(
+    engine: &PidEngine,
+    model_id: &str,
+    prompt: &str,
+    width: u32,
+    height: u32,
+    capture_sigma: f32,
+    seed: u64,
+    cancel: CancelFlag,
+    selected: Option<(i32, i32)>,
+    decode_routes: Option<&DecodeRoutes>,
+) -> Result<PidDecoder> {
     let safe_gib = mlx_gen::memory::safe_budget_gib();
-    let scale = engine.scale();
     let cfg = engine.config();
-    crate::budget::guard(model_id, width, height, scale, cfg, safe_gib)?;
-    let (th, tw) = (
-        (height * scale as u32) as i32,
-        (width * scale as u32) as i32,
-    );
+    let plan = crate::plan::PidDecodePlan::compile_for_fields(
+        model_id,
+        cfg,
+        &engine.sampler_cfg,
+        decode_routes,
+        width,
+        height,
+        1,
+        capture_sigma,
+        seed,
+        safe_gib,
+        selected,
+    )?;
     let mut decoder = engine
         .decoder(prompt, capture_sigma, seed)?
-        .with_cancel(cancel);
-    match selected {
-        Some((edge, overlap)) => {
-            crate::budget::validate_tile(model_id, edge, overlap, th, tw)?;
-            decoder = decoder.with_tiling(edge, overlap);
-        }
-        None => {
-            let plan =
-                crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
-            if !plan.whole_fits {
-                decoder = decoder.with_tiling(plan.edge, plan.overlap);
-            }
-        }
+        .with_cancel(cancel)
+        .with_plan(plan.clone());
+    if let Some((edge, overlap)) = plan.applied_tiling() {
+        decoder = decoder.with_tiling(edge, overlap);
     }
     Ok(decoder)
 }
@@ -663,6 +707,81 @@ mod tests {
         assert!(resolve_pid_decoder(None, &req, 0, "flux")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn resolve_pid_decoder_with_routes_gates_selected_tiling_before_engine_load() {
+        let routes = DecodeRoutes::new("z_image_turbo", [768, 640, 512], 64).unwrap();
+        let unmeasured = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(1536),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err_default = err_string(resolve_pid_decoder_at_sigma(
+            None,
+            &unmeasured,
+            0,
+            "z_image_turbo",
+            0.0,
+        ));
+        assert!(
+            err_default.contains("1536") && !err_default.contains("no PiD decoder is loaded"),
+            "expected DecodeRoutes::default_pid rejection before engine lookup, got: {err_default}"
+        );
+
+        let native_edge = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err_routes = err_string(resolve_pid_decoder_with_routes(
+            None,
+            &native_edge,
+            0,
+            "z_image_turbo",
+            0.0,
+            Some(&routes),
+        ));
+        assert!(
+            err_routes.contains("PiD overlay") && err_routes.contains("512"),
+            "expected DecodeRoutes native rejection before debug_assert/engine lookup, got: {err_routes}"
+        );
+
+        let valid_tile = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(2048),
+                decode_overlap: Some(256),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err_missing_engine = err_string(resolve_pid_decoder_with_routes(
+            None,
+            &valid_tile,
+            0,
+            "z_image_turbo",
+            0.0,
+            Some(&routes),
+        ));
+        assert!(
+            err_missing_engine.contains("no PiD decoder is loaded"),
+            "valid PiD tile passes route validation and reaches engine check, got: {err_missing_engine}"
+        );
     }
 }
 

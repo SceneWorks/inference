@@ -121,6 +121,7 @@ pub mod generate;
 pub mod load;
 pub mod memory_strategy;
 pub mod pipeline;
+pub mod plan;
 pub mod scheduler;
 pub mod t2v;
 
@@ -183,7 +184,8 @@ pub use convert::{
 };
 pub use generate::{
     generate_i2v_latents, generate_latents, generate_latents_conditioned_into,
-    generate_latents_into, generate_v2v_latents, ArGenParams, RefConditioning,
+    generate_latents_into, generate_v2v_latents, ArGenParams, KreaArBlockForward,
+    KreaRealtimeArDriver, RefConditioning,
 };
 pub use load::{
     expected_transformer_tensors, load_krea_realtime_transformer,
@@ -196,6 +198,7 @@ pub use memory_strategy::{
     production_calibration_identity, STATIC_BEHAVIOR_FINGERPRINT,
 };
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
+pub use plan::{KreaKvResidencyPlan, KreaRealtimeRenderPlan, KreaRealtimeRoute};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{
     decode_latents_to_video, decode_tiling, generate_i2v, generate_i2v_from_components,

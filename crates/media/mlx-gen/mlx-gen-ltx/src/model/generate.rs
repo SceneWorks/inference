@@ -209,6 +209,23 @@ impl Ltx {
             ),
             None => Self::latent_dims(req),
         };
+        let resolved_frames = dfr_plan
+            .as_ref()
+            .map_or(((lf - 1) * TEMPORAL_SCALE as usize + 1) as u32, |plan| {
+                plan.requested_frames
+            });
+        let family = match &self.execution {
+            LtxExecution::Ltx23 => gen_core_ltx::LtxModelFamily::Ltx23,
+            LtxExecution::Ltx25(_) => gen_core_ltx::LtxModelFamily::Ltx25,
+        };
+        let _render_plan = crate::drivers::render_plan_for_request(
+            family,
+            self.transformer_variant(),
+            req,
+            resolved_frames,
+            fps,
+            matches!(&self.execution, LtxExecution::Ltx25(_)),
+        )?;
         let audio_frames = match dfr_plan.as_ref() {
             Some(_) => audio_s1.shape()[2] as usize,
             None => Self::audio_frames(req),

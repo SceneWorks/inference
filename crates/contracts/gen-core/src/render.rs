@@ -689,6 +689,10 @@ pub struct RenderPlan {
     /// Position inside a [`MultiPassRenderPlan`]; 0 for a single-pass plan.
     #[serde(skip_serializing_if = "is_first_pass")]
     pass_index: usize,
+    /// True when compiled via [`Self::decode_stage`] for standalone S10 (`RenderStage::Decode`)
+    /// inner-driver execution (for example PiD pixel-diffusion).
+    #[serde(skip)]
+    decode_only: bool,
 }
 
 fn is_first_pass(index: &usize) -> bool {
@@ -749,6 +753,8 @@ impl RenderPlan {
     ///
     /// The Feature owns the executed step count and capture sigma. This constructor ignores
     /// those two fields of `pass` and binds the final plan to `spec`'s ordered adapter stack.
+    /// Multi-phase denoise explicitly excludes `req.use_pid` and `req.low_res_start` (Krea
+    /// Raw phased adapter execution decodes through its standard VAE rather than PiD).
     pub fn krea_multiphase(
         descriptor: &ModelDescriptor,
         spec: &LoadSpec,
@@ -960,7 +966,124 @@ impl RenderPlan {
                 adapter_phases: None,
             },
             pass_index: 0,
+            decode_only: false,
         })
+    }
+
+    /// Compile a standalone S10 (`RenderStage::Decode`) plan for decode-stage inner drivers
+    /// (for example PiD pixel-diffusion decoding a denoised latent without an upstream denoise pass).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_stage(
+        descriptor: &ModelDescriptor,
+        width: u32,
+        height: u32,
+        count: u32,
+        seed: u64,
+        sampler: &str,
+        sigmas: Vec<f32>,
+        executed_steps: usize,
+    ) -> Result<Self> {
+        let capture_sigma = sigmas.get(executed_steps).copied().unwrap_or(f32::NAN);
+        if width == 0
+            || height == 0
+            || count == 0
+            || sampler.trim().is_empty()
+            || executed_steps == 0
+            || sigmas.len() < 2
+            || executed_steps >= sigmas.len()
+            || !capture_sigma.is_finite()
+            || sigmas
+                .iter()
+                .any(|sigma| !sigma.is_finite() || *sigma < 0.0)
+            || sigmas.windows(2).any(|nodes| nodes[0] < nodes[1])
+        {
+            return Err(Error::Unsupported(format!(
+                "{} has an invalid S10 decode stage plan",
+                descriptor.id
+            )));
+        }
+        let tokens = width
+            .checked_mul(height)
+            .ok_or_else(|| Error::Unsupported("decode stage pixel count overflow".into()))?;
+        Ok(Self {
+            backend: descriptor.backend.to_owned(),
+            provider: descriptor.id.to_owned(),
+            inputs: ImageInputs {
+                prompt_sha256: Sha256::digest(b"").into(),
+                negative_prompt: None,
+                width,
+                height,
+                count,
+                requested_seed: Some(seed),
+                frames: 1,
+                references: 0,
+                conditioning: PackedImageConditioning::None,
+                source_image: None,
+                low_res_start: None,
+                adapter_phases: None,
+                exact_controls: None,
+                steps: u32::try_from(executed_steps).ok(),
+                sampler: Some(sampler.to_owned()),
+                scheduler: None,
+                scheduler_shift: None,
+                guidance: None,
+                guidance_method: None,
+                true_cfg_bits: None,
+                image_guidance_bits: None,
+                timestep_to_start_cfg: None,
+                use_pid: false,
+                pid_capture_sigma: None,
+                enhance_prompt: false,
+                enhance_temperature_bits: None,
+                enhance_max_tokens: None,
+            },
+            preparation: None,
+            exact_load: None,
+            count: CountPlan::SequentialWrappingSeeds {
+                count,
+                base_seed: seed,
+            },
+            pass: ImagePass {
+                stages: [
+                    Stage::Schedule,
+                    Stage::PromptPrep,
+                    Stage::Encode,
+                    Stage::Init,
+                    Stage::Enter,
+                    Stage::Denoise,
+                    Stage::Exit,
+                    Stage::PostLatent,
+                    Stage::Decode,
+                    Stage::Output,
+                ],
+                sigmas,
+                capture_sigma,
+                phase: ImagePhase {
+                    first_step: 0,
+                    end_step: executed_steps,
+                    sampler: sampler.to_owned(),
+                    guidance: 0.0,
+                    stream: PackedImageStream {
+                        width,
+                        height,
+                        patch_stride: 1,
+                        tokens,
+                        token_width: 3,
+                    },
+                },
+                low_res_start: None,
+                inert_splits: Vec::new(),
+                adapter_phases: None,
+            },
+            pass_index: 0,
+            decode_only: true,
+        })
+    }
+
+    /// True when this plan was compiled specifically for standalone S10 (`RenderStage::Decode`)
+    /// inner-driver execution via [`Self::decode_stage`].
+    pub fn is_decode_stage(&self) -> bool {
+        self.decode_only
     }
 
     /// Admission may configure memory controls, preview and cancellation after compilation.
@@ -970,6 +1093,12 @@ impl RenderPlan {
         descriptor: &ModelDescriptor,
         req: &GenerationRequest,
     ) -> Result<()> {
+        if self.decode_only {
+            return Err(Error::Unsupported(
+                "standalone decode-stage render plan does not validate a full generation request"
+                    .into(),
+            ));
+        }
         let mut live = ImageInputs::try_from(req)?;
         if self.inputs.exact_controls.is_some() {
             live.exact_controls = Some(req.into());
@@ -1363,6 +1492,28 @@ enum RunState {
     Finished,
 }
 
+/// Recorded execution summary for an inner [`FamilyDriver`](crate::driver::FamilyDriver)
+/// hosted inside S10 (`RenderStage::Decode`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DecodeDriverExecution {
+    pub driver_id: &'static str,
+    pub completed_outer_steps: usize,
+    pub internal_evaluations: u64,
+    pub boundary_evaluations: u64,
+    pub stochastic_draw_index: u64,
+}
+
+struct DecodePhaseGuard<'a> {
+    flag: &'a Cell<bool>,
+    prev: bool,
+}
+
+impl Drop for DecodePhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.prev);
+    }
+}
+
 /// Owner-local state for an invocation. A provider's existing residency driver temporarily
 /// owns its text and heavy bundles. The two callbacks share one request scope without holding
 /// a dynamic borrow while running provider code or progress callbacks.
@@ -1373,6 +1524,8 @@ pub struct RenderRun<'p, 's> {
     scope: RefCell<Option<&'s mut dyn MemoryRequestScope>>,
     next_denoise_phase: Cell<usize>,
     active_denoise_phase: Cell<Option<usize>>,
+    in_decode_phase: Cell<bool>,
+    decode_executions: RefCell<Vec<DecodeDriverExecution>>,
 }
 
 impl<'p, 's> RenderRun<'p, 's> {
@@ -1381,13 +1534,20 @@ impl<'p, 's> RenderRun<'p, 's> {
         cancel: &'p CancelFlag,
         scope: Option<&'s mut dyn MemoryRequestScope>,
     ) -> Self {
+        let initial_state = if plan.decode_only {
+            RunState::Rendering
+        } else {
+            RunState::BeforeEncode
+        };
         Self {
             plan,
             cancel,
             scope: RefCell::new(scope),
-            state: Cell::new(RunState::BeforeEncode),
+            state: Cell::new(initial_state),
             next_denoise_phase: Cell::new(0),
             active_denoise_phase: Cell::new(None),
+            in_decode_phase: Cell::new(false),
+            decode_executions: RefCell::new(Vec::new()),
         }
     }
 
@@ -1433,6 +1593,13 @@ impl<'p, 's> RenderRun<'p, 's> {
             let identity = self.target_phase_identity();
             scope.enter_render_phase(phase, &identity)?;
         }
+        let _decode_guard = (phase == MemoryPhase::Decode).then(|| {
+            let prev = self.in_decode_phase.replace(true);
+            DecodePhaseGuard {
+                flag: &self.in_decode_phase,
+                prev,
+            }
+        });
         // A failed stage leaves teardown to the scope's owner, preserving the original error.
         let result = body()?;
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
@@ -1456,6 +1623,11 @@ impl<'p, 's> RenderRun<'p, 's> {
         self.plan
     }
 
+    /// Cooperative cancellation flag bound to this render run.
+    pub fn cancel(&self) -> &CancelFlag {
+        self.cancel
+    }
+
     /// Invoke a closure with the active [`MemoryRequestScope`] when present (`MEM-5`).
     pub fn with_active_scope<T>(
         &self,
@@ -1471,6 +1643,11 @@ impl<'p, 's> RenderRun<'p, 's> {
     /// Enter the next declared denoise span on the owner thread. A failed body leaves scope
     /// teardown to the owner, as in `phase`; the next image cannot start with an active span.
     pub fn begin_denoise_phase(&self, phase: usize) -> Result<()> {
+        if self.plan.decode_only {
+            return Err(Error::Unsupported(
+                "decode-stage render plan cannot enter a denoise phase".into(),
+            ));
+        }
         if self.state.get() != RunState::Rendering
             || self.active_denoise_phase.get().is_some()
             || phase != self.next_denoise_phase.get()
@@ -1743,6 +1920,142 @@ impl<'p, 's> RenderRun<'p, 's> {
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         self.phase(MemoryPhase::Decode, body)
+    }
+
+    /// True when execution is currently inside an active S10 (`MemoryPhase::Decode`) stage.
+    pub fn is_in_decode_phase(&self) -> bool {
+        self.in_decode_phase.get()
+    }
+
+    /// Recorded inner-driver executions hosted inside S10 (`RenderStage::Decode`) on this run.
+    pub fn decode_driver_executions(&self) -> Vec<DecodeDriverExecution> {
+        self.decode_executions.borrow().clone()
+    }
+
+    /// Execute an S10 (`RenderStage::Decode`) inner [`FamilyDriver`](crate::driver::FamilyDriver)
+    /// over `0..expected_steps` inside `MemoryPhase::Decode`.
+    ///
+    /// When already hosted inside an enclosing [`Self::decode_phase`] or `Self::images*` decode
+    /// closure, reuses the active `MemoryPhase::Decode` scope without double-entering
+    /// `MemoryRequestScope::enter_render_phase`. Otherwise opens and closes `MemoryPhase::Decode`
+    /// via `self.phase`, leaving teardown to the scope owner on error.
+    pub fn decode_phase_with_driver_with<O, E: From<Error>>(
+        &self,
+        support: &crate::driver::DriverSupport,
+        expected_steps: usize,
+        body: impl FnOnce(&mut crate::driver::DriverRunState) -> std::result::Result<O, E>,
+    ) -> std::result::Result<O, E> {
+        if self.state.get() != RunState::Rendering {
+            return Err(Error::Unsupported(format!(
+                "decode inner driver cannot start from {:?}",
+                self.state.get()
+            ))
+            .into());
+        }
+        if self.active_denoise_phase.get().is_some() {
+            return Err(Error::Unsupported(
+                "decode inner driver cannot start while a denoise phase is active".into(),
+            )
+            .into());
+        }
+        if expected_steps == 0 {
+            return Err(Error::Unsupported(format!(
+                "{}: decode inner driver requires at least 1 outer step",
+                support.driver_id
+            ))
+            .into());
+        }
+        if self.plan.is_decode_stage() && expected_steps != self.plan.executed_steps() {
+            return Err(Error::Unsupported(format!(
+                "{}: decode inner driver expected {expected_steps} steps but S10 plan compiled {}",
+                support.driver_id,
+                self.plan.executed_steps()
+            ))
+            .into());
+        }
+        let execute = || -> std::result::Result<O, E> {
+            if self.cancel.is_cancelled() {
+                return Err(Error::Canceled.into());
+            }
+            let mut driver_state = crate::driver::DriverRunState::new();
+            let output = body(&mut driver_state)?;
+            if self.cancel.is_cancelled() {
+                return Err(Error::Canceled.into());
+            }
+            if driver_state.completed_outer_steps != expected_steps {
+                return Err(Error::Unsupported(format!(
+                    "{}: decode inner driver completed {} outer steps, expected {}",
+                    support.driver_id, driver_state.completed_outer_steps, expected_steps
+                ))
+                .into());
+            }
+            self.decode_executions
+                .borrow_mut()
+                .push(DecodeDriverExecution {
+                    driver_id: support.driver_id,
+                    completed_outer_steps: driver_state.completed_outer_steps,
+                    internal_evaluations: driver_state.internal_evaluations,
+                    boundary_evaluations: driver_state.boundary_evaluations,
+                    stochastic_draw_index: driver_state.stochastic_draw_index,
+                });
+            Ok(output)
+        };
+        if self.in_decode_phase.get() {
+            execute()
+        } else {
+            self.phase(MemoryPhase::Decode, execute)
+        }
+    }
+
+    /// Execute a generic S10 (`RenderStage::Decode`) inner [`FamilyDriver`](crate::driver::FamilyDriver)
+    /// over `0..total_steps` inside `MemoryPhase::Decode` using [`crate::driver::run_driver_slices`].
+    pub fn decode_phase_with_driver<L, D: crate::driver::FamilyDriver<L> + ?Sized>(
+        &self,
+        driver: &D,
+        initial_state: crate::BoundaryState<L>,
+        total_steps: usize,
+        seed: u64,
+        hooks: &mut crate::driver::StepHooks<'_, L>,
+    ) -> Result<crate::BoundaryState<L>> {
+        self.decode_phase_with_driver_with(driver.support(), total_steps, |driver_state| {
+            let mut spec = crate::driver::SliceSpec::full(total_steps);
+            spec.pass = self.plan.pass_index();
+            crate::driver::run_driver_slices(
+                driver,
+                [spec],
+                initial_state,
+                total_steps,
+                seed,
+                self.cancel,
+                None,
+                driver_state,
+                hooks,
+                |_, out, _| Ok(out),
+            )
+        })
+    }
+
+    /// Complete the S10 output lifecycle (`RenderStage::Output`) and mark the render run finished.
+    pub fn finish_output<O, E: From<Error>>(&self, output: O) -> std::result::Result<O, E> {
+        if self.state.get() != RunState::Rendering {
+            return Err(Error::Unsupported(format!(
+                "render stage Output cannot finish from {:?}",
+                self.state.get()
+            ))
+            .into());
+        }
+        if self.active_denoise_phase.get().is_some() || self.in_decode_phase.get() {
+            return Err(Error::Unsupported(
+                "render stage Output cannot finish while another stage is active".into(),
+            )
+            .into());
+        }
+        if self.cancel.is_cancelled() {
+            self.state.set(RunState::Finished);
+            return Err(Error::Canceled.into());
+        }
+        self.state.set(RunState::Finished);
+        Ok(output)
     }
 
     /// Mark the render run finished after staged decode completes.

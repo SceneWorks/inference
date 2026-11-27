@@ -245,6 +245,7 @@ impl CurveAdaLn {
                 let base = name.trim_end_matches(".weight");
                 if w.contains(&format!("{base}.scales"))
                     || w.contains(&format!("{base}.comfy_quant"))
+                    || crate::quant::stored_ggml_storage(w, base).is_some()
                 {
                     return None;
                 }

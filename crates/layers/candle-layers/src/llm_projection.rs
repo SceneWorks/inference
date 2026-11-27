@@ -386,9 +386,18 @@ pub fn mlx_affine_in_dim(
 }
 
 /// The GGML block types a prepared snapshot persists (sc-19375). Their block byte sizes are
-/// pairwise distinct — Q4_0 18 B / 32 weights, Q8_0 34 B / 32, Q4_K 144 B / 256 — which is what
-/// makes a stored block tensor self-describing.
-pub const STORED_GGML: [GgmlDType; 3] = [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K];
+/// pairwise distinct — Q4_0 18 B / 32 weights, Q4_1 20 B / 32, Q8_0 34 B / 32, Q4_K 144 B / 256 —
+/// which is what makes a stored block tensor self-describing.
+///
+/// `Q4_1` is the media lane's 4-bit container: an MLX affine Q4 pack repacks into it losslessly
+/// (its per-block `min` is the MLX `bias`), so a Candle-native media tier persists exactly the
+/// blocks that load-time repack would build (`candle-gen-minimax-h3`'s GGML tier).
+pub const STORED_GGML: [GgmlDType; 4] = [
+    GgmlDType::Q4_0,
+    GgmlDType::Q4_1,
+    GgmlDType::Q8_0,
+    GgmlDType::Q4K,
+];
 
 /// The GGML block type and logical `(rows, cols)` of a **stored GGML block tensor** — a prepared
 /// Q4 / Q8 snapshot's on-disk projection form (sc-19375): a `U8` tensor `[rows, blocks_per_row,
@@ -418,7 +427,7 @@ pub fn is_ggml_block_tensor(t: &Tensor) -> bool {
     ggml_block_storage(t.dtype() == DType::U8, t.dims()).is_some()
 }
 
-/// Serialize a 2-D [`QTensor`] of a persisted block type (Q4_0 / Q8_0 / Q4_K) into its stored
+/// Serialize a 2-D [`QTensor`] of a persisted block type (Q4_0 / Q4_1 / Q8_0 / Q4_K) into its stored
 /// GGML block tensor on the CPU: a `U8` `[rows, blocks_per_row, block_bytes]` tensor of the raw
 /// GGML blocks, row-major, which [`from_ggml_block_tensor`] reads back. GGML quantizes each block
 /// on its own, so the blocks of any row slice are byte-for-byte those of quantizing that slice
@@ -1745,6 +1754,10 @@ mod tests {
         assert_eq!(
             ggml_block_storage(true, &[2, 1, 144]),
             Some((GgmlDType::Q4K, 2, 256))
+        );
+        assert_eq!(
+            ggml_block_storage(true, &[6, 4, 20]),
+            Some((GgmlDType::Q4_1, 6, 128))
         );
         assert_eq!(ggml_block_storage(false, &[8, 2, 34]), None);
 

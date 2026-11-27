@@ -7,6 +7,7 @@
 //! artifact resolution and seeded-output mapping. Grouped so a change to one of them rebuilds
 //! only these families, never gen-core.
 
+pub mod bernini_plan;
 pub mod face_align;
 pub mod fx_program;
 pub mod ideogram_scheduler;
@@ -14,6 +15,7 @@ pub mod instantid_kps;
 pub mod krea_multiphase;
 pub mod krea_schedule;
 pub mod lens_resolution;
+pub mod mage_plan;
 pub mod mochi;
 pub mod qwen_image_2_1;
 pub mod scail2;

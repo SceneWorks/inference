@@ -115,6 +115,12 @@ pub trait JointVelocity {
     fn forward(&mut self, step: &JointStep<'_>) -> Result<(Tensor, Tensor)>;
 }
 
+impl<T: JointVelocity + ?Sized> JointVelocity for &mut T {
+    fn forward(&mut self, step: &JointStep<'_>) -> Result<(Tensor, Tensor)> {
+        (**self).forward(step)
+    }
+}
+
 /// Build the global AdaLN modulation schedule a joint run needs.
 ///
 /// One entry per [`RowClass`] per evaluation, which [`crate::dit::adaln::TimestepSchedule`] then
@@ -138,7 +144,7 @@ pub fn adaln_schedule(schedule: &JointSchedule) -> Result<TimestepSchedule> {
 /// The reference writes `latents[num_condition_rows:] = scheduler.step(...)` in place, so the
 /// `fl2va` anchors survive every step by construction. Reproduced here as a split-and-rejoin
 /// because candle tensors are values.
-fn step_generated_tail(
+pub(crate) fn step_generated_tail(
     schedule: &SigmaSchedule,
     index: usize,
     latents: &Tensor,
@@ -216,96 +222,68 @@ pub fn denoise_av_with_observer(
     on_step: &mut dyn FnMut(usize),
     mut on_observed_step: Option<&mut dyn FnMut(usize, std::time::Duration)>,
 ) -> Result<(Tensor, Tensor)> {
-    if adaln.num_steps() != schedule.num_evals() {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 denoise: the AdaLN schedule covers {} steps but the sigma schedules drive \
-             {}; build it with `adaln_schedule(schedule)`",
-            adaln.num_steps(),
-            schedule.num_evals()
-        )));
-    }
-    if adaln.num_row_classes() != NUM_ROW_CLASSES {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 denoise: the AdaLN schedule declares {} row classes, expected \
-             {NUM_ROW_CLASSES}",
-            adaln.num_row_classes()
-        )));
-    }
-    check_block(video, layout.video_indices().len(), "video")?;
-    check_block(audio, layout.audio_indices().len(), "audio")?;
-
-    let mut vlat = video.clone();
-    let mut alat = audio.clone();
-    for i in 0..schedule.num_evals() {
-        // Honor the engine cancellation contract — check before each (minutes-long) step
-        // (sc-5551). The synchronize at the bottom of the loop is what makes this seam real on
-        // CUDA: without it candle's stream-async launches let the loop run ahead of the device and
-        // the queued work lands in the caller's next operation, where no cancel check exists.
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
+    let total_steps = schedule.num_evals();
+    let driver = crate::drivers::CandleH3JointDriver::borrowed(
+        "candle_h3_joint_av",
+        model,
+        layout,
+        schedule,
+        adaln,
+        device,
+    )?;
+    let initial = crate::drivers::CandleH3AvState {
+        video: video.clone(),
+        audio: audio.clone(),
+    };
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let track_observed = on_observed_step.is_some();
+    let step_started = std::cell::Cell::new(None);
+    let mut progress = |event: candle_gen::gen_core::Progress| {
+        if let candle_gen::gen_core::Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-
-        let step_started = on_observed_step.as_ref().map(|_| std::time::Instant::now());
-        let step_clock = std::time::Instant::now();
-        tracing::info!(
-            step = i + 1,
-            total = schedule.num_evals(),
-            seq_len = layout.seq_len(),
-            "minimax-h3: denoise step start"
-        );
-
-        // The one place a stale step index is catchable.
-        let adaln_indices =
-            adaln.adaln_indices(i, layout.row_classes(), layout.token_tags(), device)?;
-        let row_timesteps = PackedLayout::row_timesteps(
-            schedule.video().timesteps()[i],
-            schedule.audio().timesteps()[i],
-        );
-
-        // ONE forward. The checkpoint is guidance-distilled: there is no unconditional pass.
-        let (vvel, avel) = model.forward(&JointStep {
-            index: i,
-            layout,
-            video_rows: &vlat,
-            audio_rows: &alat,
-            adaln_indices: &adaln_indices,
-            row_timesteps,
-        })?;
-
-        vlat = step_generated_tail(
-            schedule.video(),
-            i,
-            &vlat,
-            &vvel,
-            layout.num_condition_video_rows(),
-        )?;
-        alat = step_generated_tail(
-            schedule.audio(),
-            i,
-            &alat,
-            &avel,
-            layout.num_condition_audio_rows(),
-        )?;
-
-        // Force this step's compute to LAND inside this step. See the module docs: on CUDA this is
-        // the whole of cancellation responsiveness, and it also bounds the queued work. A no-op on
-        // the CPU device, where the arithmetic has already happened.
-        device.synchronize()?;
-        tracing::info!(
-            step = i + 1,
-            total = schedule.num_evals(),
-            elapsed_ms = step_clock.elapsed().as_millis() as u64,
-            "minimax-h3: denoise step done"
-        );
-        if let (Some(started), Some(observer)) = (step_started, on_observed_step.as_mut()) {
-            observer(i + 1, started.elapsed());
+    };
+    let mut on_observe = |_info: &candle_gen::driver::DriverStepInfo,
+                          _latent: &crate::drivers::CandleH3AvState| {
+        if track_observed {
+            step_started.set(Some(std::time::Instant::now()));
         }
-        on_step(i + 1);
+        Ok(())
+    };
+    let mut on_materialize =
+        |info: &candle_gen::driver::DriverStepInfo, _latent: &crate::drivers::CandleH3AvState| {
+            if let (Some(started), Some(observer)) =
+                (step_started.take(), on_observed_step.as_deref_mut())
+            {
+                observer(info.outer_step + 1, started.elapsed());
+            }
+            Ok(())
+        };
+    let mut hooks = candle_gen::driver::StepHooks::new(&mut progress);
+    hooks.on_observe = Some(&mut on_observe);
+    hooks.on_materialize = Some(&mut on_materialize);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [candle_gen::driver::SliceSpec::full(total_steps)],
+        candle_gen::gen_core::BoundaryState::XSigma(initial),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    match out {
+        candle_gen::gen_core::BoundaryState::XSigma(av)
+        | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: av, .. }
+        | candle_gen::gen_core::BoundaryState::RouteSpecific { state: av, .. } => {
+            Ok((av.video, av.audio))
+        }
     }
-    Ok((vlat, alat))
 }
 
-fn check_block(x: &Tensor, rows: usize, what: &str) -> Result<()> {
+pub(crate) fn check_block(x: &Tensor, rows: usize, what: &str) -> Result<()> {
     let s = x.dims();
     if s.len() != 3 || s[0] != 1 || s[1] != rows {
         return Err(CandleError::Msg(format!(

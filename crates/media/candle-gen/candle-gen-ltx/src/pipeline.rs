@@ -2,20 +2,84 @@
 //! conditioned/native joint denoise, latent token flatten/unflatten, and frames → `gen_core::Image`.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::{phase::ScaleContext, AudioTrack, Image, Progress};
+use candle_gen::driver::{DriverRunState, SliceSpec, StepHooks, StreamId};
+use candle_gen::gen_core::multistream::{
+    LearnedUpsamplerComponent, ResolvedSchedule, ScheduleSource, StreamTransition,
+    StreamTransitionKind,
+};
+use candle_gen::gen_core::{phase::ScaleContext, AudioTrack, BoundaryState, Image, Progress};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::audio_vae::AudioDecoder;
 use crate::config::{
-    AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE,
+    AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, STAGE2_SIGMAS,
+    TEMPORAL_SCALE,
+};
+use crate::drivers::{
+    CandleAvState, CandleDevAvBranches, CandleStdRngNoise, CandleVideoTokenMask,
+    LtxCandleAvDevDriver, LtxCandleDistilledAvDriver, LtxCandleRfAncestralDriver,
+    LtxCandleVideoDevDriver,
 };
 use crate::vocoder::LtxVocoder;
 use crate::{
-    conditioning, dev_sampler,
+    conditioning,
     params::GuiderParams,
     transformer::{AvDiT, AvPerturbation},
 };
+
+pub(crate) fn resolve_candle_schedule(
+    table_id: &str,
+    sigmas: &[f32],
+) -> candle_gen::Result<ResolvedSchedule> {
+    ScheduleSource::ExplicitTable {
+        table_id: table_id.to_owned(),
+        sigmas: sigmas.to_vec(),
+    }
+    .resolve()
+    .map_err(Into::into)
+}
+
+fn unwrap_xsigma<L>(state: BoundaryState<L>) -> L {
+    match state {
+        BoundaryState::XSigma(latent)
+        | BoundaryState::CleanEstimate { latent, .. }
+        | BoundaryState::RouteSpecific { state: latent, .. } => latent,
+    }
+}
+
+pub(crate) fn stage2_video_upsample_transition(
+    spatial_workspace_bytes: u64,
+) -> candle_gen::Result<StreamTransition> {
+    StreamTransition::new(
+        "stage1_to_stage2_video_spatial_upsample",
+        vec![StreamId::Video],
+        StreamTransitionKind::LatentResample {
+            upsampler: Some(LearnedUpsamplerComponent {
+                name: gen_core_ltx::LTX_SPATIAL_UPSAMPLER_COMPONENT_NAME.into(),
+                normalization: gen_core_ltx::LTX_UPSAMPLER_NORMALIZATION.into(),
+                workspace_bytes: spatial_workspace_bytes.max(1),
+            }),
+            spatial_factor: (2, 2),
+            temporal_factor: 1,
+        },
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn stage2_stream_renoise_transition(
+    stream: StreamId,
+    label: &str,
+) -> candle_gen::Result<StreamTransition> {
+    StreamTransition::new(
+        label,
+        vec![stream],
+        StreamTransitionKind::Renoise {
+            sigma: STAGE2_SIGMAS[0],
+        },
+    )
+    .map_err(Into::into)
+}
 
 pub(crate) const BASE_DENOISE_SCALES: ScaleContext<'static> = ScaleContext::new();
 pub(crate) const REFINEMENT_DENOISE_SCALES: ScaleContext<'static> =
@@ -377,60 +441,57 @@ pub(crate) fn denoise_av_conditioned_with_scales(
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
     candle_gen::execution::schedule("ltx_conditioned_euler_v1", sigmas, "flow_velocity");
-    let mut state = video.clone();
-    let mut alat = audio.clone();
+    let schedule = resolve_candle_schedule("ltx_conditioned_euler_v1", sigmas)?;
+    let total_steps = schedule.num_steps();
     // The conditioned state owns its final geometry (including appended clip tokens), so prepare
     // RoPE only after that state is complete and retain it for every denoise step.
-    let audio_request = flatten_audio_latent(&alat)?;
+    let audio_request = flatten_audio_latent(audio)?;
     let prepared_rope =
-        dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
-    let total = sigmas.len().saturating_sub(1).max(1) as u32;
-    for (step, window) in sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(candle_gen::CandleError::Canceled);
-        }
-        on_model_forward()?;
-        let (sigma, sigma_next) = (window[0], window[1]);
-        let aflat = flatten_audio_latent(&alat)?;
-        let timesteps = state.token_timesteps(sigma)?;
-        let (vvel, avel) = dit.forward_conditioned_prepared(
-            &state.latent,
-            &aflat,
-            &timesteps,
-            sigma as f64,
-            video_ctx,
-            audio_ctx,
-            &state.positions,
-            audio_grid,
-            state.keyframes_mask.as_ref(),
-            &prepared_rope,
-            scales,
-        )?;
-        let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
-        let vden = conditioning::apply_denoise_mask(
-            &(&state.latent - (&vvel.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let aden = (&alat - (&avel * sigma as f64)?)?;
-        state.latent = if sigma_next <= 0.0 {
-            vden
-        } else {
-            let step = (((&state.latent - &vden)? * sigma_next as f64)? / sigma as f64)?;
-            (&vden + step)?
-        };
-        alat = if sigma_next <= 0.0 {
-            aden
-        } else {
-            let step = (((&alat - &aden)? * sigma_next as f64)? / sigma as f64)?;
-            (&aden + step)?
-        };
-        on_progress(Progress::Step {
-            current: step as u32 + 1,
-            total,
-        });
-    }
-    Ok((state, alat))
+        dit.prepare_rope(&video.latent, &audio_request, &video.positions, audio_grid)?;
+    let forward_cell = std::cell::RefCell::new(on_model_forward);
+    let driver = LtxCandleDistilledAvDriver::new(
+        "candle_ltx_av_conditioned",
+        schedule,
+        CandleVideoTokenMask {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        audio_frames,
+        |vtok, timesteps, aflat, sigma, _kind| {
+            (forward_cell.borrow_mut())()?;
+            Ok(dit.forward_conditioned_prepared(
+                vtok,
+                aflat,
+                timesteps,
+                sigma as f64,
+                video_ctx,
+                audio_ctx,
+                &video.positions,
+                audio_grid,
+                video.keyframes_mask.as_ref(),
+                &prepared_rope,
+                scales,
+            )?)
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(CandleAvState::av(video.latent.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let av = unwrap_xsigma(out);
+    let mut state = video.clone();
+    state.latent = av.video;
+    Ok((state, av.audio.expect("audio preserved")))
 }
 
 /// Non-distilled LTX-2.5 single-video Dev denoise.  This is the actual
@@ -455,8 +516,6 @@ pub fn denoise_video_dev_conditioned(
         "ltx_dev_guidance",
         serde_json::json!({"video": format!("{video_guider:?}"), "stg_blocks": stg_blocks}),
     );
-    let mut state = video.clone();
-    let total = sigmas.len().saturating_sub(1).max(1) as u32;
     if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
     {
         return Err(candle_gen::CandleError::Msg(format!(
@@ -471,55 +530,52 @@ pub fn denoise_video_dev_conditioned(
             "ltx_2_5: dev STG blocks must not contain duplicates".into(),
         ));
     }
-    for (step, window) in sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(candle_gen::CandleError::Canceled);
-        }
-        let (sigma, sigma_next) = (window[0], window[1]);
-        let timesteps = state.token_timesteps(sigma)?;
-        let mut forward = |context: &Tensor, perturbation: AvPerturbation| -> Result<Tensor> {
-            on_model_forward()?;
-            dit.forward_video_only_conditioned_controlled(
-                &state.latent,
-                &timesteps,
-                context,
-                &state.positions,
-                state.keyframes_mask.as_ref(),
-                &perturbation,
-                &BASE_DENOISE_SCALES,
-            )
-        };
-        let conditional = forward(video_ctx, AvPerturbation::none())?;
-        let negative = forward(negative_video_ctx, AvPerturbation::none())?;
-        let perturbed = forward(video_ctx, AvPerturbation::stg(stg_blocks))?;
-        let denoise = |velocity: Tensor| -> Result<Tensor> {
-            conditioning::apply_denoise_mask(
-                &(&state.latent - (&velocity.to_dtype(DType::F32)? * sigma as f64)?)?,
-                &state.clean_latent,
-                &state.denoise_mask,
-            )
-        };
-        let conditional = denoise(conditional)?;
-        let negative = denoise(negative)?;
-        let perturbed = denoise(perturbed)?;
-        let video_denoised = dev_sampler::combine_guidance(
-            &conditional,
-            &negative,
-            &perturbed,
-            &conditional,
-            video_guider,
-        )?;
-        state.latent = if sigma_next <= 0.0 {
-            video_denoised
-        } else {
-            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
-            (&video_denoised + step)?
-        };
-        on_progress(Progress::Step {
-            current: step as u32 + 1,
-            total,
-        });
-    }
+    let schedule = resolve_candle_schedule("ltx_dev_euler_v1", sigmas)?;
+    let total_steps = schedule.num_steps();
+    let forward_cell = std::cell::RefCell::new(on_model_forward);
+    let driver = LtxCandleVideoDevDriver::new(
+        "candle_ltx_video_dev_conditioned",
+        schedule,
+        CandleVideoTokenMask {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        video_guider,
+        |vtok, timesteps, _sigma, _kind| {
+            let forward = |context: &Tensor, perturbation: AvPerturbation| -> Result<Tensor> {
+                (forward_cell.borrow_mut())()?;
+                dit.forward_video_only_conditioned_controlled(
+                    vtok,
+                    timesteps,
+                    context,
+                    &video.positions,
+                    video.keyframes_mask.as_ref(),
+                    &perturbation,
+                    &BASE_DENOISE_SCALES,
+                )
+            };
+            let conditional = forward(video_ctx, AvPerturbation::none())?;
+            let negative = forward(negative_video_ctx, AvPerturbation::none())?;
+            let perturbed = forward(video_ctx, AvPerturbation::stg(stg_blocks))?;
+            Ok((conditional, negative, perturbed))
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(video.latent.clone()),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let mut state = video.clone();
+    state.latent = unwrap_xsigma(out);
     Ok(state)
 }
 
@@ -592,117 +648,83 @@ pub(crate) fn denoise_av_dev_conditioned_with_scales(
         "ltx_dev_guidance",
         serde_json::json!({"video": format!("{video_guider:?}"), "stg_blocks": stg_blocks, "audio": format!("{audio_guider:?}")}),
     );
-    let mut state = video.clone();
-    let mut alat = audio.clone();
-    let audio_request = flatten_audio_latent(&alat)?;
-    let prepared_rope =
-        dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
-    let total = sigmas.len().saturating_sub(1).max(1) as u32;
     if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
     {
         return Err(candle_gen::CandleError::Msg(format!(
             "ltx_2_5: dev STG blocks must contain 1..=8 unique indices in 0..48, got {stg_blocks:?}"
         )));
     }
-    for (step, window) in sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(candle_gen::CandleError::Canceled);
-        }
-        let (sigma, sigma_next) = (window[0], window[1]);
-        let aflat = flatten_audio_latent(&alat)?;
-        let timesteps = state.token_timesteps(sigma)?;
-        let mut forward = |video_context: &Tensor,
+    let schedule = resolve_candle_schedule("ltx_dev_euler_v1", sigmas)?;
+    let total_steps = schedule.num_steps();
+    let audio_request = flatten_audio_latent(audio)?;
+    let prepared_rope =
+        dit.prepare_rope(&video.latent, &audio_request, &video.positions, audio_grid)?;
+    let forward_cell = std::cell::RefCell::new(on_model_forward);
+    let driver = LtxCandleAvDevDriver::new(
+        "candle_ltx_av_dev_conditioned",
+        schedule,
+        CandleVideoTokenMask {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        audio_frames,
+        video_guider,
+        audio_guider,
+        |vtok, timesteps, aflat, sigma, _kind| {
+            let forward = |video_context: &Tensor,
                            audio_context: &Tensor,
                            perturbation: AvPerturbation|
-         -> Result<(Tensor, Tensor)> {
-            on_model_forward()?;
-            dit.forward_conditioned_prepared_controlled(
-                &state.latent,
-                &aflat,
-                &timesteps,
-                sigma as f64,
-                video_context,
-                audio_context,
-                &state.positions,
-                audio_grid,
-                state.keyframes_mask.as_ref(),
-                &prepared_rope,
-                &perturbation,
-                scales,
-            )
-        };
-        let (conditional_video, conditional_audio) =
-            forward(video_ctx, audio_ctx, AvPerturbation::none())?;
-        let (negative_video, negative_audio) = forward(
-            negative_video_ctx,
-            negative_audio_ctx,
-            AvPerturbation::none(),
-        )?;
-        let (perturbed_video, perturbed_audio) =
-            forward(video_ctx, audio_ctx, AvPerturbation::stg(stg_blocks))?;
-        let (isolated_video, isolated_audio) =
-            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
-
-        let conditional_video = conditioning::apply_denoise_mask(
-            &(&state.latent - (&conditional_video.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let negative_video = conditioning::apply_denoise_mask(
-            &(&state.latent - (&negative_video.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let perturbed_video = conditioning::apply_denoise_mask(
-            &(&state.latent - (&perturbed_video.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let isolated_video = conditioning::apply_denoise_mask(
-            &(&state.latent - (&isolated_video.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let denoise_audio = |velocity: Tensor| -> Result<Tensor> {
-            let velocity = unflatten_audio_latent(&velocity.to_dtype(DType::F32)?, audio_frames)?;
-            &alat - (&velocity * sigma as f64)?
-        };
-        let conditional_audio = denoise_audio(conditional_audio)?;
-        let negative_audio = denoise_audio(negative_audio)?;
-        let perturbed_audio = denoise_audio(perturbed_audio)?;
-        let isolated_audio = denoise_audio(isolated_audio)?;
-        let video_denoised = dev_sampler::combine_guidance(
-            &conditional_video,
-            &negative_video,
-            &perturbed_video,
-            &isolated_video,
-            video_guider,
-        )?;
-        let audio_denoised = dev_sampler::combine_guidance(
-            &conditional_audio,
-            &negative_audio,
-            &perturbed_audio,
-            &isolated_audio,
-            audio_guider,
-        )?;
-        state.latent = if sigma_next <= 0.0 {
-            video_denoised
-        } else {
-            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
-            (&video_denoised + step)?
-        };
-        alat = if sigma_next <= 0.0 {
-            audio_denoised
-        } else {
-            let step = (((&alat - &audio_denoised)? * sigma_next as f64)? / sigma as f64)?;
-            (&audio_denoised + step)?
-        };
-        on_progress(Progress::Step {
-            current: step as u32 + 1,
-            total,
-        });
-    }
-    Ok((state, alat))
+             -> Result<(Tensor, Tensor)> {
+                (forward_cell.borrow_mut())()?;
+                dit.forward_conditioned_prepared_controlled(
+                    vtok,
+                    aflat,
+                    timesteps,
+                    sigma as f64,
+                    video_context,
+                    audio_context,
+                    &video.positions,
+                    audio_grid,
+                    video.keyframes_mask.as_ref(),
+                    &prepared_rope,
+                    &perturbation,
+                    scales,
+                )
+            };
+            let conditional = forward(video_ctx, audio_ctx, AvPerturbation::none())?;
+            let negative = forward(
+                negative_video_ctx,
+                negative_audio_ctx,
+                AvPerturbation::none(),
+            )?;
+            let perturbed = forward(video_ctx, audio_ctx, AvPerturbation::stg(stg_blocks))?;
+            let isolated = forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
+            Ok(CandleDevAvBranches {
+                conditional,
+                negative,
+                perturbed,
+                isolated,
+            })
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(CandleAvState::av(video.latent.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let av = unwrap_xsigma(out);
+    let mut state = video.clone();
+    state.latent = av.video;
+    Ok((state, av.audio.expect("audio preserved")))
 }
 
 /// The audio side of an ancestral token denoise, when the audio modality is present.
@@ -735,123 +757,82 @@ pub fn denoise_tokens_rf_ancestral(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Option<Tensor>)> {
-    let mut state = video.clone();
     candle_gen::execution::schedule("ltx_dfr_rf_ancestral_v1", sigmas, "flow_velocity");
     candle_gen::execution::policy(
         "ltx_rf_ancestral",
         serde_json::json!({"eta_bits": eta.to_bits(), "noise_bits": s_noise.to_bits()}),
     );
-    let mut alat = audio.as_ref().map(|a| a.latent.clone());
-    let total = sigmas.len().saturating_sub(1).max(1) as u32;
-    let device = state.latent.device().clone();
-    let seeded_normal = |shape: &[usize], step: usize, modality: u64| -> Result<Tensor> {
-        let effective_seed = noise_seed
-            .wrapping_add(2 * step as u64)
-            .wrapping_add(modality);
-        candle_gen::execution::stream(
-            &format!("ltx_ancestral_step_{step}_modality_{modality}"),
-            effective_seed,
-        );
-        let mut rng = StdRng::seed_from_u64(effective_seed);
-        let n: usize = shape.iter().product();
-        let data = candle_gen::seeded_normal_vec(&mut rng, n);
-        Tensor::from_vec(data, shape, &device)?.to_dtype(DType::F32)
-    };
-
-    for (step, window) in sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(candle_gen::CandleError::Canceled);
-        }
-        on_model_forward()?;
-        let (sigma, sigma_next) = (window[0], window[1]);
-        let timesteps = state.token_timesteps(sigma)?;
-        let (vvel, avel) = match (&alat, &audio) {
-            (Some(al), Some(a)) => {
-                let aflat = flatten_audio_latent(al)?;
-                // Temporal tiles use the base pass, independently of the detailing pass.
-                let (vv, av) = dit.forward_conditioned_with_scales(
-                    &state.latent,
-                    &aflat,
-                    &timesteps,
-                    sigma as f64,
-                    video_ctx,
-                    a.ctx,
-                    &state.positions,
-                    a.grid,
-                    state.keyframes_mask.as_ref(),
-                    &BASE_DENOISE_SCALES,
-                )?;
-                let av = unflatten_audio_latent(&av.to_dtype(DType::F32)?, a.audio_frames)?;
-                (vv, Some(av))
-            }
-            _ => (
-                dit.forward_video_only_conditioned_controlled(
-                    &state.latent,
-                    &timesteps,
-                    video_ctx,
-                    &state.positions,
-                    state.keyframes_mask.as_ref(),
-                    &AvPerturbation::none(),
-                    &BASE_DENOISE_SCALES,
-                )?,
-                None,
-            ),
-        };
-
-        // Mask-corrected x0 (reference `post_process_latent`).
-        let vden = conditioning::apply_denoise_mask(
-            &(&state.latent - (&vvel.to_dtype(DType::F32)? * sigma as f64)?)?,
-            &state.clean_latent,
-            &state.denoise_mask,
-        )?;
-        let aden = match (&alat, &avel) {
-            (Some(al), Some(av)) => Some((al - (av * sigma as f64)?)?),
-            _ => None,
-        };
-
-        if sigma_next <= 0.0 {
-            state.latent = vden;
-            if let Some(ad) = aden {
-                alat = Some(ad);
-            }
-        } else {
-            let coeffs =
-                gen_core_ltx::ltx_dfr::RfAncestralCoeffs::new(sigma, sigma_next, eta, s_noise)
-                    .map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
-            let ratio = coeffs.sigma_down_ratio as f64;
-            let step_rf = |x: &Tensor, x0: &Tensor, modality: u64| -> Result<Tensor> {
-                let mut next = ((x * ratio)? + (x0 * (1.0 - ratio))?)?;
-                if eta > 0.0 {
-                    // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 —
-                    // the reference does not fall back to the noise-free branch when eta > 0).
-                    next = (next * coeffs.alpha_ratio as f64)?;
-                    if coeffs.renoise_coeff > 0.0 {
-                        let noise = seeded_normal(next.dims(), step, modality)?;
-                        next = (next + (noise * coeffs.renoise_coeff as f64)?)?;
-                    }
+    let schedule = resolve_candle_schedule("ltx_dfr_rf_ancestral_v1", sigmas)?;
+    let total_steps = schedule.num_steps();
+    let audio_frames = audio.as_ref().map(|a| a.audio_frames);
+    let forward_cell = std::cell::RefCell::new(on_model_forward);
+    let driver = LtxCandleRfAncestralDriver::new(
+        "candle_ltx_denoise_tokens_rf_ancestral",
+        schedule,
+        CandleVideoTokenMask {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        audio_frames,
+        eta,
+        s_noise,
+        |vtok, timesteps, aflat, sigma, _kind| {
+            (forward_cell.borrow_mut())()?;
+            match (aflat, &audio) {
+                (Some(aflat), Some(a)) => {
+                    // Temporal tiles use the base pass, independently of the detailing pass.
+                    let (vv, av) = dit.forward_conditioned_with_scales(
+                        vtok,
+                        aflat,
+                        timesteps,
+                        sigma as f64,
+                        video_ctx,
+                        a.ctx,
+                        &video.positions,
+                        a.grid,
+                        video.keyframes_mask.as_ref(),
+                        &BASE_DENOISE_SCALES,
+                    )?;
+                    Ok((vv, Some(av)))
                 }
-                Ok(next)
-            };
-            let mut vnext = step_rf(&state.latent, &vden, 0)?;
-            if eta > 0.0 {
-                // Injected noise reached the conditioning tokens; re-pin them.
-                vnext = conditioning::apply_denoise_mask(
-                    &vnext,
-                    &state.clean_latent,
-                    &state.denoise_mask,
-                )?;
+                _ => Ok((
+                    dit.forward_video_only_conditioned_controlled(
+                        vtok,
+                        timesteps,
+                        video_ctx,
+                        &video.positions,
+                        video.keyframes_mask.as_ref(),
+                        &AvPerturbation::none(),
+                        &BASE_DENOISE_SCALES,
+                    )?,
+                    None,
+                )),
             }
-            state.latent = vnext;
-            if let (Some(al), Some(ad)) = (&alat, &aden) {
-                alat = Some(step_rf(al, ad, 1)?);
-            }
-        }
-        on_progress(Progress::Step {
-            current: step as u32 + 1,
-            total,
-        });
-    }
-    Ok((state, alat))
+        },
+        CandleStdRngNoise { noise_seed },
+    );
+    let initial = match &audio {
+        Some(a) => CandleAvState::av(video.latent.clone(), a.latent.clone()),
+        None => CandleAvState::video_only(video.latent.clone()),
+    };
+    let mut run_state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(initial),
+        total_steps,
+        noise_seed,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let av = unwrap_xsigma(out);
+    let mut state = video.clone();
+    state.latent = av.video;
+    Ok((state, av.audio))
 }
 
 /// Decode audio latents → an interleaved-PCM [`AudioTrack`]: `AudioDecoder` → mel `(1,2,T',64)` →

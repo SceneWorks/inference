@@ -238,6 +238,20 @@ impl DecodeRoutes {
             .map_err(|errors| mlx_gen::gen_core::Error::Unsupported(errors.join("; ")))
     }
 
+    /// Default PiD-only route validator enforcing the measured PiD ladder ([`Self::pid_edges`] at
+    /// [`Self::pid_overlap`]), with an empty native domain so no native candidate is admitted.
+    ///
+    /// Used as the fail-closed default when an explicit `(edge, overlap)` selection is supplied to a
+    /// PiD entry point with `decode_routes: None`, ensuring unmeasured geometries such as `1536` or
+    /// mismatched overlaps are rejected unless explicitly admitted.
+    pub fn default_pid() -> Self {
+        Self {
+            provider_id: "pid".to_owned(),
+            native_edges: Vec::new(),
+            native_overlap: 0,
+        }
+    }
+
     /// The native VAE route's declared tile edges, descending.
     pub fn native_edges(&self) -> &[u32] {
         &self.native_edges
@@ -578,5 +592,16 @@ mod tests {
             error.to_string(),
             format!("unsupported: {}", errors.join("; "))
         );
+    }
+
+    #[test]
+    fn default_pid_admits_measured_pid_domain_only() {
+        let defaults = DecodeRoutes::default_pid();
+        defaults.validate(true, Some(2048), Some(256)).unwrap();
+        assert!(defaults.validate(true, Some(1536), Some(64)).is_err());
+        assert!(defaults.validate(true, Some(1536), Some(256)).is_err());
+        assert!(defaults.validate(true, Some(2048), Some(64)).is_err());
+        assert!(defaults.validate(true, Some(512), Some(64)).is_err());
+        assert!(defaults.validate(false, Some(512), Some(64)).is_err());
     }
 }

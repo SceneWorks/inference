@@ -289,99 +289,118 @@ pub(super) fn denoise_ltx25_validation_av(
     cancel: &gen_core::CancelFlag,
 ) -> Result<crate::conditioning::VideoTokenState> {
     let dtype = video.latent.dtype();
-    let shape = audio.shape();
-    let (batch, channels, frames, bins) = (shape[0], shape[1], shape[2], shape[3]);
-    let mut video_tokens = video.latent.clone();
-    let mut audio_latents = audio.clone();
+    let audio_layout = crate::drivers::MlxAudioLayout::from_array(audio);
+    let [batch, channels, frames, bins] = audio_layout.shape;
     let rope_epoch = Some(dit.next_rope_epoch());
     let stg = AvPerturbation::stg_blocks(&plan.stg_blocks)?;
     let video_guider = validation_guider(plan.video_guidance);
     let audio_guider = validation_guider(plan.audio_guidance);
-    for (step, sigmas) in plan.sigmas.windows(2).enumerate() {
-        if cancel.is_cancelled() {
-            return Err(mlx_gen::Error::Canceled);
-        }
-        let (sigma, sigma_next) = (sigmas[0], sigmas[1]);
-        let audio_tokens = audio_latents.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
-            batch,
-            frames,
-            channels * bins,
-        ])?;
-        let video_timestep =
-            crate::conditioning::token_timesteps(&video.denoise_mask, video_tokens.dtype(), sigma)?;
-        let sigma_array = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
-        let audio_timestep = broadcast_to(&sigma_array, &[batch, frames])?;
-        let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
-            dit.forward_controlled(
-                &video_tokens,
-                &video_timestep,
-                vctx,
-                None,
-                &video.positions,
-                &audio_tokens,
-                &audio_timestep,
-                actx,
-                None,
-                audio_positions,
-                video.keyframes_mask.as_ref(),
-                rope_epoch,
-                perturbation,
-            )
-        };
-        let (conditional_video, conditional_audio) =
-            forward(video_context, audio_context, AvPerturbation::NONE)?;
-        let (unconditional_video, unconditional_audio) = forward(
-            negative_video_context,
-            negative_audio_context,
-            AvPerturbation::NONE,
-        )?;
-        let (stg_video, stg_audio) = forward(video_context, audio_context, stg)?;
-        let (isolated_video, isolated_audio) = forward(
-            video_context,
-            audio_context,
-            AvPerturbation::modality_isolated(),
-        )?;
-        let denoised = |video_velocity: Array, audio_velocity: Array| -> Result<(Array, Array)> {
-            let audio_velocity = audio_velocity
-                .reshape(&[batch, frames, channels, bins])?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            Ok((
-                crate::transformer::to_denoised(&video_tokens, &video_velocity, &sigma_array)?,
-                crate::transformer::to_denoised(&audio_latents, &audio_velocity, &sigma_array)?,
-            ))
-        };
-        let (conditional_video, conditional_audio) =
-            denoised(conditional_video, conditional_audio)?;
-        let (unconditional_video, unconditional_audio) =
-            denoised(unconditional_video, unconditional_audio)?;
-        let (stg_video, stg_audio) = denoised(stg_video, stg_audio)?;
-        let (isolated_video, isolated_audio) = denoised(isolated_video, isolated_audio)?;
-        let guided_video = crate::dev_sampler::combine_guidance(
-            &conditional_video,
-            &unconditional_video,
-            &stg_video,
-            &isolated_video,
-            video_guider,
-        )?;
-        let guided_video = crate::conditioning::apply_denoise_mask(
-            &guided_video,
-            &video.clean_latent,
-            &video.denoise_mask,
-        )?;
-        let guided_audio = crate::dev_sampler::combine_guidance(
-            &conditional_audio,
-            &unconditional_audio,
-            &stg_audio,
-            &isolated_audio,
-            audio_guider,
-        )?;
-        video_tokens =
-            crate::pipeline::euler_step(&video_tokens, &guided_video, sigma, sigma_next)?;
-        audio_latents =
-            crate::pipeline::euler_step(&audio_latents, &guided_audio, sigma, sigma_next)?;
-        eval([&video_tokens, &audio_latents])?;
-        let _ = step;
+    let schedule = mlx_gen::gen_core::multistream::ScheduleSource::ExplicitTable {
+        table_id: "ltx_2_5_validation_av".into(),
+        sigmas: plan.sigmas.clone(),
     }
+    .resolve()?;
+    let total_steps = schedule.num_steps();
+
+    let driver = crate::drivers::LtxMlxDevGuidedDriver::new(
+        "mlx_ltx_validation_av",
+        schedule,
+        crate::drivers::MlxVideoLayout::Tokens {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        Some(audio_layout),
+        |cur, video_tokens, video_timestep, audio_in, sigma, _kind| {
+            let audio_latents = cur.audio.as_ref().expect("audio active in validation AV");
+            let (audio_tokens, audio_timestep) = audio_in.expect("audio flattened");
+            let sigma_array = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
+            let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
+                dit.forward_controlled(
+                    video_tokens,
+                    video_timestep,
+                    vctx,
+                    None,
+                    &video.positions,
+                    audio_tokens,
+                    audio_timestep,
+                    actx,
+                    None,
+                    audio_positions,
+                    video.keyframes_mask.as_ref(),
+                    rope_epoch,
+                    perturbation,
+                )
+            };
+            let (conditional_video, conditional_audio) =
+                forward(video_context, audio_context, AvPerturbation::NONE)?;
+            let (unconditional_video, unconditional_audio) = forward(
+                negative_video_context,
+                negative_audio_context,
+                AvPerturbation::NONE,
+            )?;
+            let (stg_video, stg_audio) = forward(video_context, audio_context, stg)?;
+            let (isolated_video, isolated_audio) = forward(
+                video_context,
+                audio_context,
+                AvPerturbation::modality_isolated(),
+            )?;
+            let denoised = |video_velocity: Array,
+                            audio_velocity: Array|
+             -> Result<(Array, Array)> {
+                let audio_velocity = audio_velocity
+                    .reshape(&[batch, frames, channels, bins])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                Ok((
+                    crate::transformer::to_denoised(video_tokens, &video_velocity, &sigma_array)?,
+                    crate::transformer::to_denoised(audio_latents, &audio_velocity, &sigma_array)?,
+                ))
+            };
+            let (conditional_video, conditional_audio) =
+                denoised(conditional_video, conditional_audio)?;
+            let (unconditional_video, unconditional_audio) =
+                denoised(unconditional_video, unconditional_audio)?;
+            let (stg_video, stg_audio) = denoised(stg_video, stg_audio)?;
+            let (isolated_video, isolated_audio) = denoised(isolated_video, isolated_audio)?;
+            let guided_video = crate::dev_sampler::combine_guidance(
+                &conditional_video,
+                &unconditional_video,
+                &stg_video,
+                &isolated_video,
+                video_guider,
+            )?;
+            let guided_audio = crate::dev_sampler::combine_guidance(
+                &conditional_audio,
+                &unconditional_audio,
+                &stg_audio,
+                &isolated_audio,
+                audio_guider,
+            )?;
+            Ok((guided_video, Some(guided_audio), 4))
+        },
+    );
+    let mut run_state = mlx_gen::driver::DriverRunState::new();
+    let mut noop = |_: mlx_gen::Progress| {};
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut noop);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec::full(total_steps)],
+        gen_core::BoundaryState::XSigma(crate::drivers::MlxAvState::av(
+            video.latent.clone(),
+            audio.clone(),
+        )),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let video_tokens = match out {
+        gen_core::BoundaryState::XSigma(st)
+        | gen_core::BoundaryState::CleanEstimate { latent: st, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: st, .. } => st.video,
+    };
     Ok(crate::conditioning::VideoTokenState {
         latent: video_tokens,
         clean_latent: video.clean_latent.clone(),
@@ -401,53 +420,76 @@ pub(super) fn denoise_ltx25_validation_video(
     plan: &Ltx25ValidationRenderPlan,
     cancel: &gen_core::CancelFlag,
 ) -> Result<crate::conditioning::VideoTokenState> {
-    let mut tokens = video.latent.clone();
     let rope_epoch = Some(dit.next_rope_epoch());
     let stg = AvPerturbation::stg_blocks(&plan.stg_blocks)?;
     let guider = validation_guider(plan.video_guidance);
-    for sigmas in plan.sigmas.windows(2) {
-        if cancel.is_cancelled() {
-            return Err(mlx_gen::Error::Canceled);
-        }
-        let (sigma, sigma_next) = (sigmas[0], sigmas[1]);
-        let timestep =
-            crate::conditioning::token_timesteps(&video.denoise_mask, tokens.dtype(), sigma)?;
-        let forward = |context: &Array, perturbation: AvPerturbation| {
-            dit.forward_video_only_controlled(
-                &tokens,
-                &timestep,
-                context,
-                None,
-                &video.positions,
-                video.keyframes_mask.as_ref(),
-                rope_epoch,
-                perturbation,
-            )
-        };
-        let conditional = forward(video_context, AvPerturbation::NONE)?;
-        let unconditional = forward(negative_video_context, AvPerturbation::NONE)?;
-        let perturbed = forward(video_context, stg)?;
-        let sigma_array = Array::from_slice(&[sigma], &[1]).as_dtype(tokens.dtype())?;
-        let conditional = crate::transformer::to_denoised(&tokens, &conditional, &sigma_array)?;
-        let unconditional = crate::transformer::to_denoised(&tokens, &unconditional, &sigma_array)?;
-        let perturbed = crate::transformer::to_denoised(&tokens, &perturbed, &sigma_array)?;
-        // With no audio modality, the isolated-modality branch is the conditional branch and its
-        // configured guidance term is therefore exactly zero.
-        let guided = crate::dev_sampler::combine_guidance(
-            &conditional,
-            &unconditional,
-            &perturbed,
-            &conditional,
-            guider,
-        )?;
-        let guided = crate::conditioning::apply_denoise_mask(
-            &guided,
-            &video.clean_latent,
-            &video.denoise_mask,
-        )?;
-        tokens = crate::pipeline::euler_step(&tokens, &guided, sigma, sigma_next)?;
-        eval([&tokens])?;
+    let schedule = mlx_gen::gen_core::multistream::ScheduleSource::ExplicitTable {
+        table_id: "ltx_2_5_validation_video".into(),
+        sigmas: plan.sigmas.clone(),
     }
+    .resolve()?;
+    let total_steps = schedule.num_steps();
+    let driver = crate::drivers::LtxMlxDevGuidedDriver::new(
+        "mlx_ltx_validation_video",
+        schedule,
+        crate::drivers::MlxVideoLayout::Tokens {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        None,
+        |cur, tokens, timestep, _audio, sigma, _kind| {
+            let forward = |context: &Array, perturbation: AvPerturbation| {
+                dit.forward_video_only_controlled(
+                    tokens,
+                    timestep,
+                    context,
+                    None,
+                    &video.positions,
+                    video.keyframes_mask.as_ref(),
+                    rope_epoch,
+                    perturbation,
+                )
+            };
+            let conditional = forward(video_context, AvPerturbation::NONE)?;
+            let unconditional = forward(negative_video_context, AvPerturbation::NONE)?;
+            let perturbed = forward(video_context, stg)?;
+            let sigma_array = Array::from_slice(&[sigma], &[1]).as_dtype(cur.video.dtype())?;
+            let conditional = crate::transformer::to_denoised(tokens, &conditional, &sigma_array)?;
+            let unconditional =
+                crate::transformer::to_denoised(tokens, &unconditional, &sigma_array)?;
+            let perturbed = crate::transformer::to_denoised(tokens, &perturbed, &sigma_array)?;
+            let guided = crate::dev_sampler::combine_guidance(
+                &conditional,
+                &unconditional,
+                &perturbed,
+                &conditional,
+                guider,
+            )?;
+            Ok((guided, None, 3))
+        },
+    );
+    let mut run_state = mlx_gen::driver::DriverRunState::new();
+    let mut noop = |_: mlx_gen::Progress| {};
+    let mut hooks = mlx_gen::driver::StepHooks::new(&mut noop);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [mlx_gen::driver::SliceSpec::full(total_steps)],
+        gen_core::BoundaryState::XSigma(crate::drivers::MlxAvState::video_only(
+            video.latent.clone(),
+        )),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let tokens = match out {
+        gen_core::BoundaryState::XSigma(st)
+        | gen_core::BoundaryState::CleanEstimate { latent: st, .. }
+        | gen_core::BoundaryState::RouteSpecific { state: st, .. } => st.video,
+    };
     Ok(crate::conditioning::VideoTokenState {
         latent: tokens,
         clean_latent: video.clean_latent.clone(),

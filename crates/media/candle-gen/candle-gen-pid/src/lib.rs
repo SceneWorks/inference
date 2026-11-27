@@ -34,11 +34,13 @@ pub mod backbone;
 pub mod budget;
 pub mod caption;
 pub mod config;
+pub mod decode_routes;
 pub mod decoder;
 pub mod engine;
 pub mod gemma2;
 pub mod lq;
 pub(crate) mod nn;
+pub mod plan;
 pub mod registry;
 pub mod sampler;
 pub mod tiling;
@@ -46,12 +48,15 @@ pub mod tiling;
 pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;
 pub use config::{ConvPadding, PidConfig, SampleType, SamplerConfig};
+pub use decode_routes::{assert_decode_routes, DecodeRoutes};
 pub use decoder::PidDecoder;
 pub use engine::{
     flow_capture_for_request, resolve_pid_decoder, resolve_pid_decoder_at_sigma,
-    resolve_pid_decoder_for_fields, PidEngine,
+    resolve_pid_decoder_for_fields, resolve_pid_decoder_for_fields_with_routes,
+    resolve_pid_decoder_with_routes, selected_decode_tiling, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
+pub use plan::{PidDecodePlan, PidTilingPlan, FM_TIMESCALE, STUDENT_SCHEDULE};
 pub use registry::{lookup, BackboneSpec, CkptType, LatentNorm};
-pub use sampler::Sampler;
+pub use sampler::{PidSamplerDriver, PidVelocityForward, Sampler};

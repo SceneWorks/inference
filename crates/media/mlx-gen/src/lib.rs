@@ -158,7 +158,8 @@ pub use driver::{
     acquire_global_rng_trajectory, run_mlx_driver_slices, with_global_rng_trajectory,
     DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons, DriverRunState,
     DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate, GlobalRngTrajectoryLease,
-    SliceInput, SliceSpec, SliceTransition, StepHooks,
+    MultiStreamStepInfo, SliceInput, SliceSpec, SliceTransition, StepHooks, StreamId,
+    StreamObserveHook, StreamStepSigma,
 };
 pub use error::{Error, Result};
 pub use gen_core::sampling::{

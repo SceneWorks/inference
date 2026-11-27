@@ -8,8 +8,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_transformers::models::z_image::sampling::postprocess_image;
+use candle_core::{DType, Device, Result, Tensor};
 
 use crate::config::LATENT_CHANNELS;
 use crate::rope::{ImgShape, PackLayout};
@@ -542,7 +541,7 @@ impl MageEdit {
 
         let noise =
             crate::latent::watermarked_noise(LATENT_CHANNELS, gh, gw, seed, DType::BF16, device)?;
-        let mut target = noise
+        let initial_target = noise
             .permute((0, 2, 3, 1))?
             .reshape((1, gh * gw, LATENT_CHANNELS))?;
         let native = scheduler::sigmas(steps)?;
@@ -573,63 +572,34 @@ impl MageEdit {
             format!("{transformer_window:?}").into(),
         );
         candle_gen::execution::schedule("mage-euler", &ladder, "flow-velocity");
-        candle_gen::execution::runtime(target.device(), target.dtype());
-        for (index, pair) in ladder.windows(2).enumerate() {
-            if cancel.is_cancelled() {
-                candle_core::bail!("mage edit canceled");
-            }
-            let sequence = Tensor::cat(&[target.clone(), ref_tokens.clone()], 1)?;
-            let (input, sigma) = if use_cfg {
-                (
-                    Tensor::cat(&[sequence.clone(), sequence], 1)?,
-                    Tensor::new(&[pair[0], pair[0]], device)?,
-                )
-            } else {
-                (sequence, Tensor::new(&[pair[0]], device)?)
-            };
-            let output = transformer.forward_with_memory(
-                &input,
-                &text,
-                &sigma,
-                &layout,
-                attention_budget,
-                transformer_window,
-                cancel,
-            )?;
-            let velocity = if use_cfg {
-                let cond = output.narrow(1, 0, image_tokens)?;
-                let unc = output.narrow(1, image_tokens, image_tokens)?;
-                (&unc + ((&cond - &unc)? * guidance as f64)?)?
-            } else {
-                output
-            };
-            let target_velocity = velocity.narrow(1, 0, gh * gw)?;
-            target = scheduler::euler_step(&target, &target_velocity, pair[0], pair[1])?
-                .to_dtype(DType::BF16)?;
-            on_progress(candle_gen::gen_core::Progress::Step {
-                current: (index + 1) as u32,
-                total: steps as u32,
-            });
-        }
+        candle_gen::execution::runtime(initial_target.device(), initial_target.dtype());
+        let target = crate::pipeline::run_mage_candle_driver(
+            "mage_candle_edit_driver",
+            transformer,
+            initial_target,
+            gh * gw,
+            Some(ref_tokens),
+            &text,
+            &layout,
+            use_cfg,
+            guidance,
+            &ladder,
+            attention_budget,
+            transformer_window,
+            seed,
+            cancel,
+            on_progress,
+        )?;
 
-        crate::begin_decode(cancel, "mage edit", on_progress)?;
-        let latent = target
-            .reshape((1, gh, gw, LATENT_CHANNELS))?
-            .permute((0, 3, 1, 2))?;
-        let decoded = vae.decode(&latent)?.to_dtype(DType::F32)?;
-        if cancel.is_cancelled() {
-            candle_core::bail!("mage edit canceled");
-        }
-        let image = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
-        let (channels, out_h, out_w) = image.dims3()?;
-        if channels != 3 {
-            candle_core::bail!("mage edit: VAE returned {channels} channels");
-        }
-        Ok(candle_gen::gen_core::Image {
-            width: out_w as u32,
-            height: out_h as u32,
-            pixels: image.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?,
-        })
+        crate::pipeline::decode_tokens_to_image(
+            vae,
+            &target,
+            gh,
+            gw,
+            cancel,
+            "mage edit",
+            on_progress,
+        )
     }
 }
 

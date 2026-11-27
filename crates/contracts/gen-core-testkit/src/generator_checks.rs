@@ -114,6 +114,12 @@ pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
         GenerationOutput::Audio(track) => {
             track.samples.iter().flat_map(|s| s.to_le_bytes()).collect()
         }
+        GenerationOutput::Interleaved { text, images } => text
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(images.iter().flat_map(|i| i.pixels.iter().copied()))
+            .collect(),
     }
 }
 
@@ -421,6 +427,7 @@ pub(super) fn output_variant_name(out: &GenerationOutput) -> &'static str {
         GenerationOutput::ImagesRgba(_) => "GenerationOutput::ImagesRgba",
         GenerationOutput::Video { .. } => "GenerationOutput::Video",
         GenerationOutput::Audio(_) => "GenerationOutput::Audio",
+        GenerationOutput::Interleaved { .. } => "GenerationOutput::Interleaved",
     }
 }
 

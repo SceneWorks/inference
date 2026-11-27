@@ -22,6 +22,14 @@
 //! `context` (the UMT5 text embedding) is taken as an input parameter; the DiT-side text embedding +
 //! cross-attention K/V are built here once per prompt.
 
+use std::cell::RefCell;
+
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec,
+    SliceTransition, StepHooks,
+};
+use mlx_gen::gen_core::{BoundaryState, Error as GenError, Result as GenResult};
 use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array};
@@ -65,7 +73,7 @@ fn t2v_schedule(
 
 /// Per-chunk latent-frame counts for `num_frames` at `frames_per_block`: full blocks then a
 /// (possibly partial) trailing block. Length `ceil(num_frames / frames_per_block)`.
-fn chunk_frame_counts(num_frames: usize, frames_per_block: usize) -> Vec<usize> {
+pub(crate) fn chunk_frame_counts(num_frames: usize, frames_per_block: usize) -> Vec<usize> {
     if frames_per_block == 0 || num_frames == 0 {
         return Vec::new();
     }
@@ -444,37 +452,400 @@ fn run_ar_loop(
     )
 }
 
-/// The AR chunk-loop core, generic over the per-chunk forward so it is unit-testable without weights.
+/// Per-block forward evaluation seam for [`KreaRealtimeArDriver`], generic so weights-free Tier 0
+/// conformance tests can mock the causal transformer forward without loading weights (`PIPE-7`).
+pub trait KreaArBlockForward {
+    /// Evaluate one autoregressive chunk at timestep `t` and global token offset `start_token`.
+    /// When `commit` is `true`, the implementation commits this block's self-attention K/V into the
+    /// persistent [`CausalKvCache`].
+    fn forward_block(
+        &mut self,
+        chunk: &Array,
+        timestep: f32,
+        start_token: usize,
+        commit: bool,
+    ) -> Result<Array>;
+}
+
+impl<F> KreaArBlockForward for F
+where
+    F: FnMut(&Array, f32, usize, bool) -> Result<Array>,
+{
+    fn forward_block(
+        &mut self,
+        chunk: &Array,
+        timestep: f32,
+        start_token: usize,
+        commit: bool,
+    ) -> Result<Array> {
+        self(chunk, timestep, start_token, commit)
+    }
+}
+
+/// Owner-local state carried in [`DriverRunState`] across [`KreaRealtimeArDriver`] slices.
+#[derive(Clone)]
+struct KreaArDriverState {
+    seed: u64,
+    total_steps: usize,
+    n_steps: usize,
+    chunk_counts: Vec<usize>,
+    key: Array,
+    full_noise: Array,
+    active_chunk: Option<Array>,
+    outputs: Vec<Array>,
+    frame_cursor: usize,
+    start_token: usize,
+    expected_next_step: usize,
+}
+
+/// Typed [`FamilyDriver<Array>`] executing Krea Realtime's autoregressive Self-Forcing chunk loop
+/// (`PIPE-7`, `PIPE-14`, `SW-6976`).
+pub struct KreaRealtimeArDriver<F> {
+    support: DriverSupport,
+    schedule: FewStepSchedule,
+    channels: usize,
+    frame_seq_length: usize,
+    frames_per_block: usize,
+    num_latent_frames: usize,
+    latent_height: usize,
+    latent_width: usize,
+    do_kv_recomp: bool,
+    context_noise: f32,
+    start_token_offset: usize,
+    init_source: Option<(Array, f64)>,
+    forward: RefCell<F>,
+}
+
+impl<F: KreaArBlockForward> KreaRealtimeArDriver<F> {
+    /// Construct a typed Krea Realtime AR driver over `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        schedule: FewStepSchedule,
+        channels: usize,
+        frame_seq_length: usize,
+        frames_per_block: usize,
+        num_latent_frames: usize,
+        latent_height: usize,
+        latent_width: usize,
+        do_kv_recomp: bool,
+        context_noise: f32,
+        start_token_offset: usize,
+        init_source: Option<(Array, f64)>,
+        forward: F,
+    ) -> Self {
+        Self {
+            support: DriverSupport {
+                driver_id: "krea_realtime_ar",
+                arbitrary_slice: true,
+                carry_history: true,
+                reset_history: false,
+                renoise_from_clean: false,
+                geometry_change: false,
+                read_only_boundary_estimate: false,
+                previous_estimate_capture: false,
+                uses_global_rng: false,
+                refusal_reasons: DriverRefusalReasons {
+                    reset_history:
+                        "Krea Realtime AR causal KV trajectory cannot reset block/cache state mid-trajectory",
+                    renoise_from_clean:
+                        "Krea Realtime AR driver owns its per-step Self-Forcing renoise chain and refuses external Renoise transitions",
+                    geometry_change:
+                        "Krea Realtime AR driver does not support mid-trajectory spatial resampling",
+                    read_only_boundary_estimate:
+                        "Krea Realtime AR chunk driver does not expose a separate read-only boundary clean estimate",
+                    ..DriverRefusalReasons::default()
+                },
+            },
+            schedule,
+            channels,
+            frame_seq_length,
+            frames_per_block,
+            num_latent_frames,
+            latent_height,
+            latent_width,
+            do_kv_recomp,
+            context_noise,
+            start_token_offset,
+            init_source,
+            forward: RefCell::new(forward),
+        }
+    }
+
+    fn validate_source_shape(&self) -> Result<()> {
+        if let Some((source, _)) = &self.init_source {
+            let c = self.channels as i32;
+            let num_frames = self.num_latent_frames;
+            let h = self.latent_height as i32;
+            let w = self.latent_width as i32;
+            let s = source.shape();
+            if s.len() != 4 || s[0] != c || s[1] as usize != num_frames || s[2] != h || s[3] != w {
+                return Err(Error::Msg(format!(
+                    "krea v2v: source latents shape {s:?} must be [{c}, {num_frames}, {h}, {w}] \
+                     (one source frame per generated frame)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: KreaArBlockForward> FamilyDriver<Array> for KreaRealtimeArDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> GenResult<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        let step_ts = self.schedule.step_timesteps();
+        let n_steps = step_ts.len();
+        if n_steps == 0 {
+            return Err(GenError::Msg("krea AR: empty denoising schedule".into()));
+        }
+        let chunk_counts = chunk_frame_counts(self.num_latent_frames, self.frames_per_block);
+        if chunk_counts.is_empty() {
+            return Err(GenError::Msg(
+                "krea AR: num_latent_frames and frames_per_block must be >= 1".into(),
+            ));
+        }
+        let expected_total_steps = chunk_counts.len() * n_steps;
+        if input.total_steps != expected_total_steps || input.span.end > expected_total_steps {
+            return Err(GenError::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with Krea AR schedule steps={expected_total_steps}",
+                self.support.driver_id, input.span, input.total_steps
+            )));
+        }
+        self.validate_source_shape().map_err(GenError::from)?;
+        if input.cancel.is_cancelled() {
+            return Err(GenError::Canceled);
+        }
+
+        // Validate Carry compatibility and span invariants BEFORE mutating `state` (`PIPE-3`).
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if input.span.is_empty() || (!carrying && input.span.start != 0) {
+            return Err(GenError::Unsupported(format!(
+                "{}: slice {:?} requires a non-empty span starting at 0 unless continuing with Carry",
+                self.support.driver_id, input.span
+            )));
+        }
+        if carrying {
+            let Some(existing) = state.history_ref::<KreaArDriverState>() else {
+                return Err(GenError::Unsupported(format!(
+                    "{}: Carry requested without prior Krea AR state in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.seed != input.seed
+                || existing.total_steps != input.total_steps
+                || existing.n_steps != n_steps
+                || existing.chunk_counts != chunk_counts
+                || existing.expected_next_step != input.span.start
+            {
+                return Err(GenError::Unsupported(format!(
+                    "{}: Carry refused across incompatible Krea AR trajectory state",
+                    self.support.driver_id
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+
+        let mut ar_state = if carrying {
+            state
+                .take_history::<KreaArDriverState>()
+                .expect("validated Krea AR state exists")
+        } else {
+            // Init the whole clip's noise once from the seed (then slice per chunk, matching the
+            // reference's `noise[:, block]`), and carry a split PRNG key for per-step renoise draws.
+            let key = random::key(input.seed)
+                .map_err(Error::from)
+                .map_err(GenError::from)?;
+            let (noise_key, next_key) = random::split(&key, 2)
+                .map_err(Error::from)
+                .map_err(GenError::from)?;
+            mlx_gen::video_execution::draw(
+                0,
+                "krea_split_chain_initial_left_then_right",
+                input.seed,
+            );
+            let _ = state.next_draw_index();
+            let full_noise = random::normal::<f32>(
+                &[
+                    self.channels as i32,
+                    self.num_latent_frames as i32,
+                    self.latent_height as i32,
+                    self.latent_width as i32,
+                ],
+                None,
+                None,
+                Some(&noise_key),
+            )
+            .map_err(Error::from)
+            .map_err(GenError::from)?;
+            KreaArDriverState {
+                seed: input.seed,
+                total_steps: input.total_steps,
+                n_steps,
+                chunk_counts,
+                key: next_key,
+                full_noise,
+                active_chunk: None,
+                outputs: Vec::with_capacity(self.num_latent_frames.div_ceil(self.frames_per_block)),
+                frame_cursor: 0,
+                start_token: self.start_token_offset,
+                expected_next_step: input.span.start,
+            }
+        };
+
+        for outer_step in input.span.clone() {
+            // Per-step / per-chunk cancellation checkpoint (F-003): bail before committing to a
+            // chunk or running the next denoise forward.
+            if input.cancel.is_cancelled() {
+                return Err(GenError::Canceled);
+            }
+            let chunk_idx = outer_step / n_steps;
+            let step_in_chunk = outer_step % n_steps;
+            let chunk_frames = ar_state.chunk_counts[chunk_idx];
+
+            let mut cur = match ar_state.active_chunk.take() {
+                Some(existing) => existing,
+                None => {
+                    let idx: Vec<i32> = (ar_state.frame_cursor as i32
+                        ..(ar_state.frame_cursor + chunk_frames) as i32)
+                        .collect();
+                    let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+                    let noise_chunk = ar_state
+                        .full_noise
+                        .take_axis(&idx, 1)
+                        .map_err(Error::from)
+                        .map_err(GenError::from)?;
+                    match &self.init_source {
+                        None => noise_chunk,
+                        Some((source, sigma_init)) => {
+                            let source_chunk = source
+                                .take_axis(&idx, 1)
+                                .map_err(Error::from)
+                                .map_err(GenError::from)?;
+                            renoise_step(&source_chunk, &noise_chunk, *sigma_init)
+                                .map_err(GenError::from)?
+                        }
+                    }
+                }
+            };
+
+            let t = step_ts[step_in_chunk];
+            let sigma_f64 = self.schedule.sigma_at_timestep(t);
+            let next_sigma_f64 = if step_in_chunk + 1 < n_steps {
+                self.schedule.sigma_at_timestep(step_ts[step_in_chunk + 1])
+            } else {
+                0.0
+            };
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: sigma_f64 as f32,
+                next_sigma: next_sigma_f64 as f32,
+            };
+
+            hooks.observe(&info, &cur)?;
+
+            let is_final = step_in_chunk + 1 == n_steps;
+            let commit = is_final && !self.do_kv_recomp;
+            let velocity = self
+                .forward
+                .borrow_mut()
+                .forward_block(&cur, t as f32, ar_state.start_token, commit)
+                .map_err(GenError::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let x0_i = euler_x0(&cur, &velocity, sigma_f64).map_err(GenError::from)?;
+            if is_final {
+                cur = hooks.post_step(&info, x0_i)?;
+                mlx_rs::transforms::eval([&cur]).map_err(|e| GenError::Msg(e.to_string()))?;
+                hooks.materialize(&info, &cur)?;
+                state.record_outer_step(outer_step);
+                hooks.emit_progress(&info);
+
+                // Step 3.3: clean-context KV recompute — rerun one forward on the chunk's clean x0
+                // at context_noise and commit *that* K/V (the read-only denoise steps left the
+                // cache untouched, so this is the chunk's one and only commit).
+                if self.do_kv_recomp {
+                    if input.cancel.is_cancelled() {
+                        return Err(GenError::Canceled);
+                    }
+                    let _ = self
+                        .forward
+                        .borrow_mut()
+                        .forward_block(&cur, self.context_noise, ar_state.start_token, true)
+                        .map_err(GenError::from)?;
+                    state.record_evaluation(DriverEvaluationKind::Trajectory);
+                }
+
+                ar_state.outputs.push(cur);
+                ar_state.frame_cursor += chunk_frames;
+                ar_state.start_token += chunk_frames * self.frame_seq_length;
+            } else {
+                let (eps_key, next_key) = random::split(&ar_state.key, 2)
+                    .map_err(Error::from)
+                    .map_err(GenError::from)?;
+                mlx_gen::video_execution::draw(
+                    0,
+                    &format!(
+                        "krea_split_chain_renoise_left_then_right:frame_{}:step_{step_in_chunk}",
+                        ar_state.frame_cursor
+                    ),
+                    input.seed,
+                );
+                let _ = state.next_draw_index();
+                ar_state.key = next_key;
+                let eps = random::normal::<f32>(x0_i.shape(), None, None, Some(&eps_key))
+                    .map_err(Error::from)
+                    .map_err(GenError::from)?;
+                let next_cur = renoise_step(&x0_i, &eps, next_sigma_f64).map_err(GenError::from)?;
+                let next_cur = hooks.post_step(&info, next_cur)?;
+                mlx_rs::transforms::eval([&next_cur]).map_err(|e| GenError::Msg(e.to_string()))?;
+                hooks.materialize(&info, &next_cur)?;
+                ar_state.active_chunk = Some(next_cur);
+                state.record_outer_step(outer_step);
+                hooks.emit_progress(&info);
+            }
+            ar_state.expected_next_step = outer_step + 1;
+        }
+
+        state.finish_slice(input.span.end);
+        if input.span.end == expected_total_steps {
+            let refs: Vec<&Array> = ar_state.outputs.iter().collect();
+            let full_latents = concatenate_axis(&refs, 1)
+                .map_err(Error::from)
+                .map_err(GenError::from)?;
+            state.set_history(ar_state);
+            Ok(BoundaryState::XSigma(full_latents))
+        } else {
+            let boundary_latent = ar_state
+                .active_chunk
+                .clone()
+                .or_else(|| ar_state.outputs.last().cloned())
+                .unwrap_or_else(|| Array::from_f32(0.0));
+            state.set_history(ar_state);
+            Ok(BoundaryState::XSigma(boundary_latent))
+        }
+    }
+}
+
+/// The AR chunk-loop core, driven through [`KreaRealtimeArDriver`] + [`run_mlx_driver_slices`].
 ///
 /// `denoise(chunk, t, start_token, commit) -> velocity` runs one batch-1 forward: it reads the
 /// committed history at `start_token` and returns the model velocity `[out_dim, F_chunk, H, W]`;
-/// `commit = true` appends that forward's self-attention K/V to the persistent cache. The loop owns the
-/// schedule, the deterministic RNG (init noise + per-step renoise), the Euler `x0` estimate, the
-/// renoise, and — when `do_kv_recomp` — the S5 **clean-context KV recompute**: after a chunk's denoise
-/// steps (all read-only in that mode), it reruns one forward on the chunk's clean `x0` at
-/// `context_noise` and commits *that* K/V (mirroring `causal_inference.py:227-236`). Exactly one commit
-/// per chunk in both modes: the final denoise step when `do_kv_recomp` is off (the S4 baseline), or the
-/// recompute forward when it is on. Returns the frame-axis concatenation of every chunk's final `x0`,
-/// `[out_dim, num_frames, H, W]` (f32).
-///
-/// **Reference conditioning (sc-8440 S7).** `start_token_offset` is the global token index where
-/// generation begins — non-zero when the caller has already warmed the KV cache from clean context
-/// (i2v/v2v reference frames), so the first generated chunk's causal RoPE offset + read window line up
-/// past the warmed context (the reference's `current_start_frame · frame_seq_length` after the Step-2
-/// warm, `causal_inference.py:136-170`). `init_source = Some((source, sigma_init))` is the **v2v**
-/// strength init: each chunk starts from the VAE-encoded source clip renoised to `sigma_init` — the
-/// schedule's max-timestep sigma — instead of pure noise (`latents·(1−σ) + ε·σ`,
-/// `release_server.py:426,658` + `v2v.py::get_denoising_schedule`). `source` is `[C, num_latent_frames,
-/// H, W]` (one source frame per generated frame). `None` ⇒ pure-noise init (t2v / i2v continuation).
-///
-/// **Per-step cancel + progress (sc-8441 S8).** `cancel` is polled at the top of every chunk **and**
-/// every denoise step (before the forward) — a set flag bails promptly with the typed
-/// [`Error::Canceled`], so a mid-clip cancel interrupts within ~one step instead of after the whole
-/// clip. The per-step [`mlx_rs::transforms::eval`] already materializes each step's compute, which is
-/// what makes the poll effective (MLX's lazy graph would otherwise defer all compute past the loop —
-/// mirrors `mlx-gen-scail2` / `mlx-gen-wan`). `on_progress` emits a [`Progress::Step`] after each
-/// denoise step's `eval` with a monotonic 1-based `current` over `total = num_chunks · n_steps`; the
-/// clean-context recompute forward is KV housekeeping, not a denoise step, so it is not counted.
+/// `commit = true` appends that forward's self-attention K/V to the persistent cache.
 #[allow(clippy::too_many_arguments)]
 fn run_ar_loop_conditioned(
     schedule: &FewStepSchedule,
@@ -488,7 +859,7 @@ fn run_ar_loop_conditioned(
     init_source: Option<(&Array, f64)>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
-    mut denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
+    denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
 ) -> Result<Array> {
     let step_ts = schedule.step_timesteps();
     let execution_sigmas: Vec<f64> = step_ts
@@ -511,117 +882,49 @@ fn run_ar_loop_conditioned(
     if step_ts.is_empty() {
         return Err(Error::Msg("krea AR: empty denoising schedule".into()));
     }
-    let n_steps = step_ts.len();
-    let c = channels as i32;
-    let (h, w) = (params.latent_height as i32, params.latent_width as i32);
-    let num_frames = params.num_latent_frames;
-
-    // v2v strength init requires one source frame per generated frame.
-    if let Some((source, _)) = init_source {
-        let s = source.shape();
-        if s.len() != 4 || s[0] != c || s[1] as usize != num_frames || s[2] != h || s[3] != w {
-            return Err(Error::Msg(format!(
-                "krea v2v: source latents shape {s:?} must be [{c}, {num_frames}, {h}, {w}] \
-                 (one source frame per generated frame)"
-            )));
-        }
+    let chunk_counts = chunk_frame_counts(params.num_latent_frames, frames_per_block);
+    if chunk_counts.is_empty() {
+        return Err(Error::Msg(
+            "krea AR: num_latent_frames and frames_per_block must be >= 1".into(),
+        ));
     }
-
-    // Init the whole clip's noise once from the seed (then slice per chunk, matching the reference's
-    // `noise[:, block]`), and carry a split PRNG key for the per-step renoise draws — all seed-derived.
-    let mut key = random::key(params.seed)?;
-    let (noise_key, next) = random::split(&key, 2)?;
-    mlx_gen::video_execution::draw(0, "krea_split_chain_initial_left_then_right", params.seed);
-    key = next;
-    let full_noise =
-        random::normal::<f32>(&[c, num_frames as i32, h, w], None, None, Some(&noise_key))?;
-
-    // Per-step progress is reported over the whole clip (num_chunks · n_steps), not per chunk, so the
-    // count is monotonic across chunk boundaries (mirrors the scail2 whole-job Step count).
-    let chunk_counts = chunk_frame_counts(num_frames, frames_per_block);
-    let total_steps = (chunk_counts.len() * n_steps) as u32;
-    let mut steps_done = 0u32;
-
-    let mut outputs: Vec<Array> = Vec::new();
-    let mut frame_cursor = 0usize;
-    let mut start_token = start_token_offset;
-    for chunk_frames in chunk_counts {
-        // Per-chunk cancellation checkpoint (F-003): bail before committing to a new chunk's denoise.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let total_steps = chunk_counts.len() * step_ts.len();
+    let driver = KreaRealtimeArDriver::new(
+        schedule.clone(),
+        channels,
+        frame_seq_length,
+        frames_per_block,
+        params.num_latent_frames,
+        params.latent_height,
+        params.latent_width,
+        do_kv_recomp,
+        context_noise,
+        start_token_offset,
+        init_source.map(|(source, sigma_init)| (source.clone(), sigma_init)),
+        denoise,
+    );
+    driver.validate_source_shape()?;
+    let mut run_state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(Array::from_f32(0.0)),
+        total_steps,
+        params.seed,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, boundary, _| Ok(boundary),
+    )?;
+    match out {
+        BoundaryState::XSigma(latents)
+        | BoundaryState::CleanEstimate {
+            latent: latents, ..
         }
-        // This chunk's init: pure seeded noise (t2v / i2v), or — for v2v — the VAE-encoded source clip
-        // renoised to the strength schedule's max sigma (`source·(1−σ) + ε·σ`). Both slice the frame
-        // axis `[frame_cursor : frame_cursor + chunk_frames]` (the reference's `noise[:, block]`).
-        let idx: Vec<i32> = (frame_cursor as i32..(frame_cursor + chunk_frames) as i32).collect();
-        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
-        let noise_chunk = full_noise.take_axis(&idx, 1)?;
-        let mut cur = match init_source {
-            None => noise_chunk,
-            Some((source, sigma_init)) => {
-                let source_chunk = source.take_axis(&idx, 1)?;
-                renoise_step(&source_chunk, &noise_chunk, sigma_init)?
-            }
-        };
-
-        // Commit the chunk's K/V at the final denoise step ONLY when the recompute is off (the S4
-        // baseline). With recompute on, every denoise step is read-only and the single commit is the
-        // clean-context recompute below — exactly one commit per chunk either way.
-        let mut chunk_x0: Option<Array> = None;
-        for (i, &t) in step_ts.iter().enumerate() {
-            // Per-step cancellation checkpoint (F-003): poll before each forward so a mid-clip cancel
-            // bails within ~one step. The per-step `eval` below materializes the step's compute, which
-            // is what makes this effective (MLX would otherwise defer all compute past the loop).
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let is_final = i + 1 == n_steps;
-            let commit = is_final && !do_kv_recomp;
-            let velocity = denoise(&cur, t as f32, start_token, commit)?;
-            let x0_i = euler_x0(&cur, &velocity, schedule.sigma_at_timestep(t))?;
-            if is_final {
-                mlx_rs::transforms::eval([&x0_i])?;
-                chunk_x0 = Some(x0_i);
-            } else {
-                // Renoise x0 to the next step's noise level with fresh seed-derived Gaussian noise.
-                let sigma_next = schedule.sigma_at_timestep(step_ts[i + 1]);
-                let (eps_key, next) = random::split(&key, 2)?;
-                mlx_gen::video_execution::draw(
-                    0,
-                    &format!(
-                        "krea_split_chain_renoise_left_then_right:frame_{frame_cursor}:step_{i}"
-                    ),
-                    params.seed,
-                );
-                key = next;
-                let eps = random::normal::<f32>(x0_i.shape(), None, None, Some(&eps_key))?;
-                cur = renoise_step(&x0_i, &eps, sigma_next)?;
-                mlx_rs::transforms::eval([&cur])?;
-            }
-            // Report sampling progress after the step's compute is materialized (denoise steps only —
-            // the clean-context recompute below is KV housekeeping, not a denoise step).
-            steps_done += 1;
-            on_progress(Progress::Step {
-                current: steps_done,
-                total: total_steps,
-            });
-        }
-        let x0 = chunk_x0.ok_or_else(|| Error::Msg("krea AR: empty denoising schedule".into()))?;
-
-        // Step 3.3: clean-context KV recompute — rerun one forward on the chunk's clean x0 at
-        // context_noise and commit *that* K/V (the read-only denoise steps left the cache untouched, so
-        // this is the chunk's one and only commit). Mirrors `causal_inference.py:227-236`.
-        if do_kv_recomp {
-            let _ = denoise(&x0, context_noise, start_token, true)?;
-        }
-
-        outputs.push(x0);
-        frame_cursor += chunk_frames;
-        start_token += chunk_frames * frame_seq_length;
+        | BoundaryState::RouteSpecific { state: latents, .. } => Ok(latents),
     }
-
-    let refs: Vec<&Array> = outputs.iter().collect();
-    Ok(concatenate_axis(&refs, 1)?)
 }
 
 #[cfg(test)]
@@ -1373,5 +1676,352 @@ mod tests {
         assert_eq!(eager.retained_tokens(), old_window);
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention");
+    }
+
+    #[test]
+    fn krea_realtime_ar_driver_passes_tier0_conformance_across_split_boundaries() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        let schedule = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let latents_equal = |a: &Array, b: &Array| {
+            mlx_rs::transforms::eval([a, b]).unwrap();
+            a.shape() == b.shape()
+                && a.as_slice::<f32>()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(b.as_slice::<f32>().iter().map(|v| v.to_bits()))
+        };
+
+        for do_kv_recomp in [true, false] {
+            for split_at in [3usize, 5] {
+                let schedule_for_case = schedule.clone();
+                let report = verify_driver_conformance(ConformanceCase {
+                    total_steps: 10,
+                    split_at,
+                    seed: 42,
+                    base_geometry: (32, 32),
+                    alt_geometry: (64, 64),
+                    make_driver: move || {
+                        let forward =
+                            |chunk: &Array, t: f32, start: usize, _commit: bool| -> Result<Array> {
+                                let bias = Array::from_f32(t * 0.0005 + start as f32 * 0.01);
+                                let scaled = mlx_rs::ops::multiply(chunk, Array::from_f32(0.25))?;
+                                Ok(mlx_rs::ops::add(&scaled, &bias)?)
+                            };
+                        Box::new(KreaRealtimeArDriver::new(
+                            schedule_for_case.clone(),
+                            4,
+                            4,
+                            3,
+                            5,
+                            4,
+                            4,
+                            do_kv_recomp,
+                            0.0,
+                            0,
+                            None,
+                            forward,
+                        ))
+                    },
+                    make_initial: || Array::zeros::<f32>(&[4, 5, 4, 4]).unwrap(),
+                    latents_equal,
+                })
+                .unwrap();
+
+                assert_eq!(report.driver_id, "krea_realtime_ar");
+                assert_eq!(report.total_steps, 10);
+                assert!(report.verified_inert_split);
+                assert!(report.verified_carry_refusal_or_support);
+                assert!(report.verified_renoise_and_resample_guards);
+                assert!(report.verified_cancellation);
+                let expected_evals = if do_kv_recomp { 12 } else { 10 };
+                assert_eq!(report.unsplit_evaluations, expected_evals);
+                assert_eq!(report.unsplit_draws, 9);
+            }
+        }
+    }
+
+    #[test]
+    fn krea_realtime_ar_driver_enforces_kv_commit_cadence_and_i2v_offset() {
+        use std::rc::Rc;
+
+        let schedule = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let ctx_noise = 7.0f32;
+        let fsl = 4usize;
+        let start_token_offset = 3 * fsl;
+        let source = Array::full::<f32>(&[4, 5, 4, 4], Array::from_f32(0.5)).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::<(f32, usize, bool, i32)>::new()));
+        let calls_ref = Rc::clone(&calls);
+
+        let forward = move |chunk: &Array, t: f32, start: usize, commit: bool| -> Result<Array> {
+            let chunk_frames = chunk.shape()[1];
+            calls_ref
+                .borrow_mut()
+                .push((t, start, commit, chunk_frames));
+            Ok(Array::full::<f32>(chunk.shape(), Array::from_f32(0.1))?)
+        };
+
+        let driver = KreaRealtimeArDriver::new(
+            schedule,
+            4,
+            fsl,
+            3,
+            5,
+            4,
+            4,
+            true,
+            ctx_noise,
+            start_token_offset,
+            Some((source, 0.5)),
+            forward,
+        );
+        driver.validate_source_shape().unwrap();
+
+        let mut progress = Vec::new();
+        let mut run_state = DriverRunState::new();
+        let cancel = CancelFlag::new();
+        let mut on_progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                progress.push((current, total));
+            }
+        };
+        let mut hooks = StepHooks::new(&mut on_progress);
+        let boundary = run_mlx_driver_slices(
+            &driver,
+            [
+                SliceSpec {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..3,
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    request_boundary_estimate: false,
+                },
+                SliceSpec {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..10,
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((32, 32)),
+                    request_boundary_estimate: false,
+                },
+            ],
+            BoundaryState::XSigma(Array::from_f32(0.0)),
+            10,
+            99,
+            &cancel,
+            None,
+            &mut run_state,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+
+        let out = match boundary {
+            BoundaryState::XSigma(latents) => latents,
+            _ => panic!("expected XSigma terminal latents"),
+        };
+        assert_eq!(out.shape(), &[4, 5, 4, 4]);
+        assert_eq!(run_state.completed_outer_steps, 10);
+        assert_eq!(run_state.internal_evaluations, 12);
+        assert_eq!(run_state.stochastic_draw_index, 9);
+        assert_eq!(
+            progress,
+            (1u32..=10).map(|i| (i, 10u32)).collect::<Vec<_>>(),
+            "clean-context KV commits must not emit extra Progress::Step events"
+        );
+
+        let log = calls.borrow();
+        assert_eq!(log.len(), 12);
+        // Chunk 0 (3 frames @ start_token=12): 5 readonly denoise steps + 1 context_noise commit.
+        assert!(log[0..5]
+            .iter()
+            .all(|&(_, s, commit, f)| s == 12 && !commit && f == 3));
+        assert_eq!(log[5], (ctx_noise, 12, true, 3));
+        // Chunk 1 (2 frames @ start_token=24): 5 readonly denoise steps + 1 context_noise commit.
+        assert!(log[6..11]
+            .iter()
+            .all(|&(_, s, commit, f)| s == 24 && !commit && f == 2));
+        assert_eq!(log[11], (ctx_noise, 24, true, 2));
+
+        // Mismatched V2V source latent frame count fails cleanly in validate_source_shape.
+        let bad_driver = KreaRealtimeArDriver::new(
+            FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap(),
+            4,
+            fsl,
+            3,
+            5,
+            4,
+            4,
+            true,
+            0.0,
+            0,
+            Some((Array::zeros::<f32>(&[4, 4, 4, 4]).unwrap(), 0.5)),
+            |chunk: &Array, _t: f32, _s: usize, _c: bool| Ok(chunk.clone()),
+        );
+        assert!(bad_driver.validate_source_shape().is_err());
+    }
+
+    #[test]
+    fn krea_realtime_ar_driver_rejects_empty_or_nonzero_start_span_without_state_mutation() {
+        use std::rc::Rc;
+
+        let schedule = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_ref = Rc::clone(&calls);
+        let driver = KreaRealtimeArDriver::new(
+            schedule,
+            4,
+            4,
+            3,
+            5,
+            4,
+            4,
+            true,
+            0.0,
+            0,
+            None,
+            move |chunk: &Array, _t: f32, _s: usize, _c: bool| -> Result<Array> {
+                *calls_ref.borrow_mut() += 1;
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        );
+        let cancel = CancelFlag::new();
+        let mut on_progress = |_p: Progress| {};
+        let mut hooks = StepHooks::new(&mut on_progress);
+
+        // 1. Start with span.start > 0 refuses cleanly before mutating DriverRunState or burning PRNG draws.
+        let mut state_nonzero = DriverRunState::new();
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 2..5,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state_nonzero,
+                &mut hooks,
+            )
+            .expect_err("Start with span.start > 0 must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(state_nonzero.stochastic_draw_index, 0);
+        assert_eq!(state_nonzero.completed_outer_steps, 0);
+        assert_eq!(state_nonzero.internal_evaluations, 0);
+        assert!(state_nonzero.history_ref::<KreaArDriverState>().is_none());
+
+        // 2. Empty Start span (0..0) refuses cleanly before mutating state or burning PRNG draws.
+        let mut state_empty = DriverRunState::new();
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..0,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut state_empty,
+                &mut hooks,
+            )
+            .expect_err("empty Start span must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(state_empty.stochastic_draw_index, 0);
+        assert_eq!(state_empty.completed_outer_steps, 0);
+        assert_eq!(state_empty.internal_evaluations, 0);
+        assert!(state_empty.history_ref::<KreaArDriverState>().is_none());
+
+        // 3. Empty Continue+Carry span after a real Start slice refuses without truncating carried history
+        // or burning a PRNG draw, leaving the subsequent Carry slice able to finish cleanly.
+        let mut carried_state = DriverRunState::new();
+        let boundary = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..3,
+                    total_steps: 10,
+                    state: BoundaryState::XSigma(Array::from_f32(0.0)),
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .unwrap();
+        let draws_after_start = carried_state.stochastic_draw_index;
+        let evals_after_start = carried_state.internal_evaluations;
+        let calls_after_start = *calls.borrow();
+
+        let err = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..3,
+                    total_steps: 10,
+                    state: boundary.clone(),
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .expect_err("empty Continue span must be refused");
+        assert!(matches!(err, GenError::Unsupported(_)));
+        assert_eq!(*calls.borrow(), calls_after_start);
+        assert_eq!(carried_state.stochastic_draw_index, draws_after_start);
+        assert_eq!(carried_state.internal_evaluations, evals_after_start);
+        assert_eq!(carried_state.completed_outer_steps, 3);
+        assert!(carried_state.history_ref::<KreaArDriverState>().is_some());
+
+        let final_boundary = driver
+            .run_slice(
+                SliceInput {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..10,
+                    total_steps: 10,
+                    state: boundary,
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((32, 32)),
+                    seed: 7,
+                    cancel: &cancel,
+                    request_boundary_estimate: false,
+                },
+                &mut carried_state,
+                &mut hooks,
+            )
+            .unwrap();
+        match final_boundary {
+            BoundaryState::XSigma(latents) => assert_eq!(latents.shape(), &[4, 5, 4, 4]),
+            other => panic!("expected XSigma terminal latents, got {other:?}"),
+        }
     }
 }

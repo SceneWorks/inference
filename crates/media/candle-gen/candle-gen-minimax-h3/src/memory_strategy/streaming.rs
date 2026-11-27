@@ -173,6 +173,13 @@ fn cuda_adaln_working_sets_for(
                     return Err(invalid());
                 }
                 true
+            } else if let Some((_, rows, cols)) = stored_ggml(weight) {
+                // A Candle-native tier's stored GGML blocks: the same dequant-per-forward base
+                // as a repacked affine triple, so the same working set.
+                if (rows, cols as u64) != (output_dim, input) {
+                    return Err(invalid());
+                }
+                true
             } else {
                 // Tiled MXFP8 can store a padded grid; the model supplies true N/K to the
                 // shared constructor and to the window's arithmetic below.
@@ -200,6 +207,17 @@ fn cuda_adaln_working_sets_for(
             )
         })
         .collect()
+}
+
+/// The GGML block type and logical `[rows, cols]` of a **stored GGML block tensor** header — a
+/// Candle-native tier's projection (`crate::quant::stored_ggml_storage`'s header-only twin).
+fn stored_ggml(
+    h: &weightsmeta::SafetensorsTensorHeader,
+) -> Option<(candle_gen::candle_core::quantized::GgmlDType, usize, usize)> {
+    candle_gen::candle_layers::llm_projection::ggml_block_storage(
+        h.dtype == weightsmeta::Dtype::U8 && h.name.ends_with(".weight"),
+        &h.shape,
+    )
 }
 
 fn is_fp8_parameter(h: &weightsmeta::SafetensorsTensorHeader) -> bool {
@@ -378,6 +396,29 @@ fn runtime_payloads_with_plan(
                 }
                 continue;
             }
+        }
+        if let Some((_, rows, cols)) = stored_ggml(h) {
+            // Stored GGML blocks are resident exactly as published: no repack and no Q8 requant
+            // scratch. Rebuilding the `QTensor` holds two host copies of the blocks, and the
+            // dequant forward owns the same F32 + target-width decode as a repacked triple.
+            let elements = (rows as u64)
+                .checked_mul(cols as u64)
+                .ok_or_else(|| CoreError::Unsupported("H3 GGML decode size overflow".into()))?;
+            prepare_scratch = prepare_scratch.max(h.data_bytes.saturating_mul(2));
+            if !(text_encoder && h.name.ends_with("embed_tokens.weight")) {
+                derived = add(derived, h.data_bytes)?;
+                if !h.name.contains(".adaln_proj.linear.") {
+                    decode = decode.max(
+                        elements
+                            .checked_mul(if text_encoder { 4 } else { 6 })
+                            .ok_or_else(|| {
+                                CoreError::Unsupported("H3 GGML decode size overflow".into())
+                            })?,
+                    );
+                }
+            }
+            payload.insert(h.name.clone(), h.data_bytes);
+            continue;
         }
         let norm =
             text_encoder && (h.name.contains("layernorm") || h.name.contains("_norm.weight"));

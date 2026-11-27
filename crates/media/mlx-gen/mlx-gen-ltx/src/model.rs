@@ -109,7 +109,7 @@ mod staging;
 pub use conditioning::*;
 pub use descriptor::*;
 use generate::*;
-pub(crate) use generator::*;
+use generator::*;
 pub use load::*;
 use prompt_enhance::*;
 
