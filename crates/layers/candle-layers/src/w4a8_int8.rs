@@ -1,8 +1,28 @@
-//! Native packed W4A8 projections (sc-26685).
+//! Native packed W4A8 projections (sc-26685, SW-6134).
 //!
-//! Only packed codes and their original companions survive load. CUDA decodes bounded output-row
-//! tiles to INT8, reusing one full-row ConvRot activation quantization and the shared S4 integer
-//! GEMM/epilogue arithmetic. There is no resident dense INT8 shadow or floating-weight fallback.
+//! Only packed codes and their original companions survive load. The activation is ConvRot-rotated
+//! and INT8-quantized once per row; the weight side then takes one of two CUDA paths that produce
+//! **bit-identical** output (integer accumulation is exact and both repeat the same F32 epilogue):
+//!
+//! * **fused** (default, `sm_80+`): `candle_quant_kernels::w4a8_gemm` rotates and quantizes the
+//!   activation in one launch (byte-identical to the eager FHT + Kitchen quantizer), then decodes
+//!   the packed int4 codes inside an int8 tensor-core GEMM and applies the epilogue in the same
+//!   launch;
+//! * **reference** (`sm_89+`, the shared 8-bit lane): bounded output-row tiles decoded to INT8 by
+//!   `CublasLt::dequant_w4a8_packed_tile`, the cuBLASLt INT8 IGEMM, then eager F32 tensor ops.
+//!
+//! Which path ran is recorded per call — two leaves, the activation prep and the GEMM — in the
+//! shared fused tally ([`crate::fused`]: `note_fused`, or
+//! `note_reference` with the fused kernel's refusal / compile label, or `disabled` when the
+//! `CANDLE_LLM_FUSED_KERNELS` switch is off). A fused refusal never changes backend and is never
+//! silent. On `sm_80`–`sm_88` the reference lane is unavailable (the 8-bit IGEMM lane is floored at
+//! `sm_89`), so a fused refusal there is a typed error rather than a downgrade. Below `sm_80` the
+//! projection is refused at load ([`W4A8_COMPUTE_CAP_FLOOR`]). There is no resident dense INT8
+//! shadow or floating-weight fallback.
+//!
+//! `W4A8Linear::from_packed` (CUDA builds) builds a projection directly from the offline packer's
+//! output ([`gen_core::w4a8_int8::quantize_weight`]); [`W4A8Linear::from_weights`] from a
+//! checkpoint.
 //!
 //! # The activation rotation is the pinned F32 butterfly, not a dense `x·H` matmul
 //!
@@ -15,7 +35,14 @@
 //! dtypes' worth of ulps and changes the int8 codes.
 use crate::{CandleError, CandleWeightSource, Result};
 use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "cuda")]
+use gen_core::w4a8_int8::W4A8Packed;
 use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
+
+pub use candle_quant_kernels::w4a8_gemm::{
+    check_w4a8_gemm, w4a8_tier_refusal, W4A8GemmRefusal, W4A8TierRefusal, W4A8_COMPUTE_CAP_FLOOR,
+    W4A8_GEMM_COMPUTE_CAP_FLOOR,
+};
 
 /// Output rows decoded at a time; every tile spans the full contraction dimension.
 pub const TILE_ROWS: usize = 64;
@@ -32,10 +59,14 @@ pub struct W4A8Linear {
     codebook: Tensor,
     #[cfg(feature = "cuda")]
     s_channel: Tensor,
+    /// The bias as F32 (an exact widening of the source dtype), staged once at load.
     #[cfg(feature = "cuda")]
     bias: Option<Tensor>,
     #[cfg(feature = "cuda")]
     lt: std::sync::Arc<crate::cublaslt::CublasLt>,
+    /// Whether the dequant-tile + IGEMM reference lane exists on this device (`sm_89+`).
+    #[cfg(feature = "cuda")]
+    igemm_reference: bool,
 }
 
 impl std::fmt::Debug for W4A8Linear {
@@ -56,7 +87,9 @@ impl W4A8Linear {
         self.descriptor.resident_bytes()
     }
 
-    /// Peak transient decoded weight bytes on the compute device (not a resident shadow).
+    /// Peak transient decoded weight bytes on the compute device (not a resident shadow): the
+    /// reference path's one decoded `[TILE_ROWS, in]` INT8 tile. The fused GEMM decodes in shared
+    /// memory and allocates none, so this is an upper bound over both paths.
     /// Activation/output buffers are request-shaped and are not included in this weight-only bound.
     pub fn weight_scratch_bytes(&self) -> usize {
         self.descriptor.out_features.min(TILE_ROWS) * self.descriptor.in_features
@@ -171,38 +204,16 @@ impl W4A8Linear {
         {
             let ctx = w.int8_context(codes.device())?;
             let lt = ctx.handle_for(codes.device())?.clone();
-            if !lt.meets_fp8_floor()? {
-                return Err(CandleError::Unsupported(
-                    "W4A8 requires the shared sm_89 integer lane".into(),
-                ));
-            }
-            if !descriptor.out_features.is_multiple_of(16) {
-                return Err(CandleError::Msg(
-                    "W4A8 CUDA output width must be a multiple of 16".into(),
-                ));
-            }
-            let packed = codes.clone().contiguous()?;
-            let s_rel = Tensor::from_vec(
-                s_rel,
-                (
-                    descriptor.out_features,
-                    descriptor.in_features / descriptor.group_size,
-                ),
-                codes.device(),
-            )?;
-            let codebook = Tensor::from_vec(levels, 16, codes.device())?;
-            let s_channel = s_channel.to_device(codes.device())?;
-            let bias = bias.map(|b| b.to_device(codes.device())).transpose()?;
-            Ok(Some(Self {
+            Self::build(
                 descriptor,
-                device: codes.device().clone(),
-                packed,
+                codes.clone().contiguous()?,
                 s_rel,
-                codebook,
-                s_channel,
-                bias,
+                levels,
+                bias.as_ref(),
+                s_channel.to_device(codes.device())?,
                 lt,
-            }))
+            )
+            .map(Some)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -211,6 +222,90 @@ impl W4A8Linear {
                 "W4A8 requires native CUDA; no floating fallback".into(),
             ))
         }
+    }
+
+    /// Build a projection straight from the offline packer's output
+    /// ([`gen_core::w4a8_int8::quantize_weight`]), validated by the same descriptor and value
+    /// checks as a checkpoint load. `bias` is `[out]` in any float dtype.
+    #[cfg(feature = "cuda")]
+    pub fn from_packed(
+        p: &W4A8Packed,
+        bias: Option<&Tensor>,
+        lt: std::sync::Arc<crate::cublaslt::CublasLt>,
+    ) -> Result<Self> {
+        let d = p.descriptor();
+        d.validate_s_rel(&p.s_rel).map_err(CandleError::Msg)?;
+        d.validate_codebook(&p.codebook).map_err(CandleError::Msg)?;
+        d.validate_s_channel(&p.s_channel)
+            .map_err(CandleError::Msg)?;
+        if bias.is_some_and(|b| {
+            b.dims() != [d.out_features]
+                || !matches!(b.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        }) {
+            return Err(CandleError::Msg("invalid W4A8 bias".into()));
+        }
+        let device = lt.device();
+        let packed = Tensor::from_vec(
+            p.packed.clone(),
+            (d.out_features, d.in_features / 2),
+            &device,
+        )?;
+        let s_channel = Tensor::from_vec(p.s_channel.clone(), d.out_features, &device)?;
+        Self::build(
+            d,
+            packed,
+            p.s_rel.clone(),
+            p.codebook.to_vec(),
+            bias,
+            s_channel,
+            lt,
+        )
+    }
+
+    /// Stage validated operands on the handle's device after the capability gates.
+    #[cfg(feature = "cuda")]
+    fn build(
+        descriptor: W4A8Int8,
+        packed: Tensor,
+        s_rel: Vec<u8>,
+        levels: Vec<f32>,
+        bias: Option<&Tensor>,
+        s_channel: Tensor,
+        lt: std::sync::Arc<crate::cublaslt::CublasLt>,
+    ) -> Result<Self> {
+        let cap = lt.compute_cap()?;
+        if let Some(refusal) = w4a8_tier_refusal(cap) {
+            return Err(CandleError::Unsupported(refusal.to_string()));
+        }
+        if !descriptor.out_features.is_multiple_of(16) {
+            return Err(CandleError::Msg(
+                "W4A8 CUDA output width must be a multiple of 16".into(),
+            ));
+        }
+        let device = packed.device().clone();
+        let s_rel = Tensor::from_vec(
+            s_rel,
+            (
+                descriptor.out_features,
+                descriptor.in_features / descriptor.group_size,
+            ),
+            &device,
+        )?;
+        let codebook = Tensor::from_vec(levels, 16, &device)?;
+        let bias = bias
+            .map(|b| b.to_device(&device)?.to_dtype(DType::F32)?.contiguous())
+            .transpose()?;
+        Ok(Self {
+            descriptor,
+            device,
+            packed,
+            s_rel,
+            codebook,
+            s_channel: s_channel.contiguous()?,
+            bias,
+            igemm_reference: lt.meets_fp8_floor()?,
+            lt,
+        })
     }
 
     pub fn device(&self) -> &Device {
@@ -228,47 +323,25 @@ impl W4A8Linear {
             {
                 candle_core::bail!("W4A8 activation shape/dtype/device mismatch");
             }
-            // The pinned fused FHT, in F32 and in kernel butterfly order. NOT
-            // `convrot_rotate` (a dense matmul): see the module doc — it re-associates the
-            // additions and, in the source dtype, rounds the rotated values before the row
-            // absmax, which is what moves `x_scale` and the int8 codes.
-            let rotated = crate::convrot::convrot_fht_f32(x, d.rotation_group)?
-                .reshape((x.elem_count() / d.in_features, d.in_features))?;
+            let rows = x.elem_count() / d.in_features;
             // Full-row scale and codes are computed ONCE, outside the weight tile loop. Never
             // quantize per K-chunk: that would change the published activation arithmetic.
-            let (qx, xs) = self.lt.quantize_kitchen_int8(&rotated, x.dtype())?;
-            let mut outputs = Vec::with_capacity(d.out_features.div_ceil(TILE_ROWS));
-            for row in (0..d.out_features).step_by(TILE_ROWS) {
-                let rows = (d.out_features - row).min(TILE_ROWS);
-                // Device-side weight decode of this bounded output-row tile: the packed codes,
-                // F8_E4M3 s_rel and F32 codebook are resident; the int8 tile is a transient scratch
-                // that dies with this turn. No host round-trip and no per-forward CPU→GPU upload.
-                let staged = self.lt.dequant_w4a8_packed_tile(
-                    &self.packed,
-                    &self.s_rel,
-                    &self.codebook,
-                    crate::cublaslt::W4A8DecodeTile {
-                        rows,
-                        in_features: d.in_features,
-                        group: d.group_size,
-                        out0: row,
-                    },
-                )?;
-                let acc = self
-                    .lt
-                    .matmul_int8_staged(&staged, &qx)?
-                    .to_dtype(DType::F32)?;
-                let scales = self.s_channel.narrow(0, row, rows)?.reshape((1, rows))?;
-                // As in S4, separate eager FP32 tensor ops prohibit multiply/add fusion. Do not
-                // pre-fold xs*s_channel, and round to the output dtype only after adding bias.
-                let y = acc.broadcast_mul(&xs)?.broadcast_mul(&scales)?;
-                let y = match &self.bias {
-                    Some(b) => y.broadcast_add(&b.narrow(0, row, rows)?.to_dtype(DType::F32)?)?,
-                    None => y,
-                };
-                outputs.push(y.to_dtype(x.dtype())?);
-            }
-            let out = Tensor::cat(&outputs, 1)?;
+            let (qx, xs) = match self.prep_fused(&x.reshape((rows, d.in_features))?)? {
+                Some(prepared) => prepared,
+                None => {
+                    // The reference: the pinned FHT in F32 and in kernel butterfly order, NOT
+                    // `convrot_rotate` (a dense matmul): see the module doc — it re-associates the
+                    // additions and, in the source dtype, rounds the rotated values before the row
+                    // absmax, which is what moves `x_scale` and the int8 codes.
+                    let rotated = crate::convrot::convrot_fht_f32(x, d.rotation_group)?
+                        .reshape((rows, d.in_features))?;
+                    self.lt.quantize_kitchen_int8(&rotated, x.dtype())?
+                }
+            };
+            let out = match self.forward_fused(&qx, &xs, x.dtype())? {
+                Some(y) => y,
+                None => self.forward_reference(&qx, &xs, x.dtype())?,
+            };
             let mut shape = x.dims().to_vec();
             *shape.last_mut().unwrap() = d.out_features;
             out.reshape(shape)
@@ -278,5 +351,118 @@ impl W4A8Linear {
             let _ = x;
             candle_core::bail!("W4A8 requires native CUDA; no floating fallback")
         }
+    }
+
+    /// The fused activation prep (ConvRot FHT + row-wise int8 quantizer in one launch),
+    /// byte-identical to the eager FHT + `quantize_kitchen_int8` reference. `Ok(None)` (recorded
+    /// as a reference run with the reason) when the switch is off or the kernel declines.
+    #[cfg(feature = "cuda")]
+    fn prep_fused(
+        &self,
+        x: &Tensor,
+    ) -> candle_core::Result<Option<(crate::cublaslt::DevInt8, Tensor)>> {
+        use candle_quant_kernels::w4a8_gemm::{w4a8_quantize_activation, W4A8GemmError};
+        if self.descriptor.rotation_group != candle_quant_kernels::w4a8_gemm::W4A8_QUANTIZE_GROUP
+            || !crate::fused::try_fused()
+        {
+            return Ok(None);
+        }
+        match w4a8_quantize_activation(x) {
+            Ok((q, xs)) => {
+                crate::fused::note_fused();
+                Ok(Some((self.lt.stage_int8_bytes(&q)?, xs)))
+            }
+            Err(W4A8GemmError::Candle(e)) => Err(e),
+            Err(e) => {
+                crate::fused::note_reference(e.label());
+                Ok(None)
+            }
+        }
+    }
+
+    /// The fused int4-weight int8-MMA GEMM. `Ok(None)` (recorded as a reference run with the
+    /// reason) when the switch is off or the kernel refuses / cannot compile here; a genuine
+    /// failure inside the launch propagates.
+    #[cfg(feature = "cuda")]
+    fn forward_fused(
+        &self,
+        qx: &crate::cublaslt::DevInt8,
+        xs: &Tensor,
+        dtype: DType,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use candle_quant_kernels::w4a8_gemm::{w4a8_gemm, W4A8GemmError, W4A8GemmOperands};
+        if !crate::fused::try_fused() {
+            return Ok(None);
+        }
+        let ops = W4A8GemmOperands {
+            qx: qx.codes(),
+            xs,
+            packed: &self.packed,
+            s_rel: &self.s_rel,
+            codebook: &self.codebook,
+            s_channel: &self.s_channel,
+            bias: self.bias.as_ref(),
+        };
+        match w4a8_gemm(&ops, dtype) {
+            Ok(y) => {
+                crate::fused::note_fused();
+                Ok(Some(y))
+            }
+            Err(W4A8GemmError::Candle(e)) => Err(e),
+            Err(e) => {
+                crate::fused::note_reference(e.label());
+                Ok(None)
+            }
+        }
+    }
+
+    /// The reference: bounded output-row tiles decoded to INT8 on the device, the shared cuBLASLt
+    /// INT8 IGEMM, then the eager F32 epilogue. Exists only on the `sm_89+` 8-bit lane.
+    #[cfg(feature = "cuda")]
+    fn forward_reference(
+        &self,
+        qx: &crate::cublaslt::DevInt8,
+        xs: &Tensor,
+        dtype: DType,
+    ) -> candle_core::Result<Tensor> {
+        let d = self.descriptor;
+        if !self.igemm_reference {
+            candle_core::bail!(
+                "W4A8: the fused GEMM declined this call and the dequant+IGEMM reference needs \
+                 the sm_89 8-bit lane (the fused tally records the reason)"
+            );
+        }
+        let mut outputs = Vec::with_capacity(d.out_features.div_ceil(TILE_ROWS));
+        for row in (0..d.out_features).step_by(TILE_ROWS) {
+            let rows = (d.out_features - row).min(TILE_ROWS);
+            // Device-side weight decode of this bounded output-row tile: the packed codes,
+            // F8_E4M3 s_rel and F32 codebook are resident; the int8 tile is a transient scratch
+            // that dies with this turn. No host round-trip and no per-forward CPU→GPU upload.
+            let staged = self.lt.dequant_w4a8_packed_tile(
+                &self.packed,
+                &self.s_rel,
+                &self.codebook,
+                crate::cublaslt::W4A8DecodeTile {
+                    rows,
+                    in_features: d.in_features,
+                    group: d.group_size,
+                    out0: row,
+                },
+            )?;
+            let acc = self
+                .lt
+                .matmul_int8_staged(&staged, qx)?
+                .to_dtype(DType::F32)?;
+            let scales = self.s_channel.narrow(0, row, rows)?.reshape((1, rows))?;
+            // As in S4, separate eager FP32 tensor ops prohibit multiply/add fusion. Do not
+            // pre-fold xs*s_channel, and round to the output dtype only after adding bias.
+            let y = acc.broadcast_mul(xs)?.broadcast_mul(&scales)?;
+            let y = match &self.bias {
+                Some(b) => y.broadcast_add(&b.narrow(0, row, rows)?)?,
+                None => y,
+            };
+            outputs.push(y.to_dtype(dtype)?);
+        }
+        Tensor::cat(&outputs, 1)
     }
 }
