@@ -904,6 +904,18 @@ mod tests {
         assert_eq!(w.require(key).unwrap().dtype(), DType::U8);
         let loaded = lin(&w, DIT, "blocks.0.attn.to_q", false, DType::BF16).unwrap();
         assert_eq!(loaded.linear.quant_dtype(), Some(GgmlDType::Q4_1));
+
+        // The DiT's constructor keeps the blocks on the host and names the destination, so the
+        // `QTensor` build is the projection's only device upload.
+        let dit = Weights::from_files_native_int8(
+            &[dst.join("model-00001-of-00001.safetensors")],
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert!(dit.host_packed_target().is_some());
+        assert_eq!(dit.require(key).unwrap().dtype(), DType::U8);
+        let loaded = lin(&dit, DIT, "blocks.0.attn.to_q", false, DType::BF16).unwrap();
+        assert_eq!(loaded.linear.quant_dtype(), Some(GgmlDType::Q4_1));
         assert!(
             crate::ggml_tier::convert_component(&src, &dst, &mut |_, _| Ok(())).is_err(),
             "an existing tier is never overwritten"
