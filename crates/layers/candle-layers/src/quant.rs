@@ -633,14 +633,19 @@ impl QLinear {
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
+    /// Dense-only: a stored GGML block `{prefix}.weight` is refused
+    /// ([`crate::stored_ggml::guard_dense_vb`]), never read as a float.
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        crate::stored_ggml::guard_dense_vb(&vb)?;
         Ok(Self::Dense(DenseLinear::Linear(candle_nn::linear(
             in_dim, out_dim, vb,
         )?)))
     }
 
-    /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`).
+    /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`). Dense-only, like
+    /// [`Self::linear`].
     pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        crate::stored_ggml::guard_dense_vb(&vb)?;
         Ok(Self::Dense(DenseLinear::Linear(candle_nn::linear_no_bias(
             in_dim, out_dim, vb,
         )?)))
@@ -1149,6 +1154,7 @@ pub struct QEmbeddingStorage {
 impl QEmbedding {
     /// A dense `[vocab, hidden]` embedding from `vb` (`{prefix}.weight`).
     pub fn embedding(vocab: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+        crate::stored_ggml::guard_dense_vb(&vb)?;
         Ok(Self::Dense(candle_nn::embedding(vocab, hidden, vb)?))
     }
 
@@ -1469,6 +1475,25 @@ pub fn lin_gs(
     bias: bool,
     group_size: usize,
 ) -> Result<QLinear> {
+    // A Candle-native GGML tier: the projection is already device-format blocks. Built as stored —
+    // no repack, no saved-quantization cache entry (SW-7285).
+    if let Some(weight) = crate::stored_ggml::stored_ggml_qtensor_vb(
+        vb,
+        crate::stored_ggml::SHARED_CONTEXT,
+        base,
+        Some((out_dim, in_dim)),
+        vb.device(),
+    )? {
+        let bias = if bias {
+            Some(vb.get_unchecked_dtype(&format!("{base}.bias"), vb.dtype())?)
+        } else {
+            None
+        };
+        return Ok(QLinear::from_qtensor_dequant(
+            std::sync::Arc::new(weight),
+            bias,
+        ));
+    }
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -1519,8 +1544,35 @@ pub fn linear_from_weights_gs<W: crate::CandleWeightSource + ?Sized>(
         }
     }
     let scales_key = format!("{base}.scales");
+    let weight_key = format!("{base}.weight");
+    // A Candle-native GGML tier (SW-7285): `{base}.weight` is a stored block tensor. Built as stored
+    // on the projection's destination — no repack, no saved-quantization cache entry. A `.scales`
+    // sibling beside it is refused rather than either form being silently preferred.
+    if weights.contains(&weight_key) {
+        let stored = weights.require(&weight_key)?;
+        if let Some(geometry) = crate::stored_ggml::stored_block_tensor(&stored) {
+            crate::stored_ggml::validate_stored(
+                crate::stored_ggml::SHARED_CONTEXT,
+                base,
+                geometry,
+                weights.contains(&scales_key),
+                None,
+            )
+            .map_err(|e| crate::CandleError::Msg(e.to_string()))?;
+            let device = match weights.host_packed_target() {
+                Some(d) => d.clone(),
+                None => stored.device().clone(),
+            };
+            let qt = crate::stored_ggml::qtensor_from_stored(&stored, &device)?;
+            let bias = if bias {
+                Some(weights.require(&format!("{base}.bias"))?)
+            } else {
+                None
+            };
+            return Ok(QLinear::from_qtensor_dequant(std::sync::Arc::new(qt), bias));
+        }
+    }
     if weights.contains(&scales_key) {
-        let weight_key = format!("{base}.weight");
         // A host-packed set (sc-26691) keeps the triple on the CPU; its destination is explicit.
         let device = match weights.host_packed_target() {
             Some(d) => d.clone(),
@@ -1613,6 +1665,17 @@ pub fn embedding_dtype_gs(
     group_size: usize,
     packed_dtype: DType,
 ) -> Result<QEmbedding> {
+    // A Candle-native GGML tier stores the table as GGML rows. The packed embedding keeps host row
+    // bytes only (no device table), so the blocks are rebuilt on the host (SW-7285).
+    if let Some(table) = crate::stored_ggml::stored_ggml_qtensor_vb(
+        vb,
+        crate::stored_ggml::SHARED_CONTEXT,
+        base,
+        Some((vocab, hidden)),
+        &Device::Cpu,
+    )? {
+        return QEmbedding::from_qtensor(table, packed_dtype);
+    }
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();

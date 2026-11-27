@@ -98,6 +98,31 @@ impl Weights {
         self.st.mmap().get(name).is_ok()
     }
 
+    /// `{base}.weight` read on the host when its safetensors header marks it a **stored GGML block
+    /// tensor** (a Candle-native tier, SW-7285), after refusing a `.scales` sibling beside it (the
+    /// shared [`candle_gen::quant::stored_ggml::validate_stored`] rule). `None` otherwise.
+    pub fn stored_ggml(&self, base: &str) -> Result<Option<Tensor>> {
+        use candle_gen::quant::stored_ggml::{stored_block_geometry, validate_stored};
+        let key = format!("{base}.weight");
+        let Ok(view) = self.st.mmap().get(&key) else {
+            return Ok(None);
+        };
+        let Ok(dtype) = DType::try_from(view.dtype()) else {
+            return Ok(None);
+        };
+        let Some(geometry) = stored_block_geometry(dtype, view.shape()) else {
+            return Ok(None);
+        };
+        validate_stored(
+            "ideogram",
+            base,
+            geometry,
+            self.contains(&format!("{base}.scales")),
+            None,
+        )?;
+        Ok(Some(self.st.mmap().load(&key, &Device::Cpu)?))
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -181,6 +206,20 @@ fn dense_adapt(l: Linear) -> Result<QLinear> {
 pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
+    // (0) A Candle-native GGML tier (SW-7285): the stored blocks are the packed base as-is — no
+    // repack, no saved-quantization cache entry.
+    if let Some(stored) = w.stored_ggml(base)? {
+        let qt = candle_gen::quant::stored_ggml::qtensor_from_stored(&stored, w.device())?;
+        let (out, in_) = qt.shape().dims2()?;
+        let dense_bias = if bias {
+            Some(w.get(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        let packed =
+            candle_gen::quant::QLinear::from_qtensor_dequant(std::sync::Arc::new(qt), dense_bias);
+        return Ok(QLinear::from_packed(packed, in_, out));
+    }
     // (1) A `.scales` sibling → build the packed base straight from the MLX triple (kept quantized).
     if w.contains(&scales_key) {
         let wq = w.get_native(&weight_key)?;
@@ -216,6 +255,13 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
 /// this takes the dense arm; the packed arm is the future-proof path (and guards against a silent dense
 /// read of u32 codes should a tier ever pack the table).
 pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
+    // A Candle-native GGML tier's stored table (SW-7285): host-resident rows.
+    if let Some(stored) = w.stored_ggml(base)? {
+        let table = candle_gen::quant::stored_ggml::qtensor_from_stored(&stored, &Device::Cpu)?;
+        return Ok(QEmbedding::Packed(
+            candle_gen::quant::QEmbedding::from_qtensor(table, w.dtype())?,
+        ));
+    }
     let scales_key = format!("{base}.scales");
     if w.contains(&scales_key) {
         let wq = w.get_native(&format!("{base}.weight"))?;

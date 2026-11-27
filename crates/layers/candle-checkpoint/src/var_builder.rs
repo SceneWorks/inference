@@ -595,6 +595,8 @@ impl SimpleBackend for ProjectionSource {
                 .then_some(gen_core::mxfp8_padded_shape),
                 source_packed: row.residency.mode
                     == gen_core::checkpoint_codec::ResidencyMode::Packed,
+                // A planned row's stored dtype is its codec's, not what a reader returns.
+                dtype: None,
             }))
         } else {
             SimpleBackend::tensor_info(self.mmap(), name)
@@ -928,6 +930,8 @@ impl SimpleBackend for Remapped {
             padded_shape: matches!(view, SourceView::Whole(_) | SourceView::Transposed(_))
                 .then_some(source.padded_shape)
                 .flatten(),
+            // Every view re-addresses the same stored elements; none changes their dtype.
+            dtype: source.dtype,
         }))
     }
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {

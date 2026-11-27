@@ -552,6 +552,17 @@ impl SparseMoe {
         // by the `.scales` sibling and build every expert straight from the packed parts (no MXFP4, no
         // dense staging), exactly as the DiT packed-detects its linears (sc-9413). `quant` is irrelevant
         // here: the experts land quantized at the on-disk tier's bit-width regardless of the request.
+        // A Candle-native GGML tier (SW-7285) stores each fused expert projection as stacked GGML
+        // blocks `U8 [E, out, in / 32, block_bytes]` — exactly the per-expert blocks the triple's
+        // repack builds — so every expert is built as stored: no repack, no cache entry.
+        if let Some(experts) = stored_experts(&vb_e, cfg)? {
+            return Ok(Self {
+                router,
+                experts,
+                num_experts_per_tok: cfg.num_experts_per_tok,
+                quantized: true,
+            });
+        }
         if vb_e.contains_tensor("gate_up_proj.scales") {
             return Ok(Self {
                 router,
@@ -660,6 +671,101 @@ impl SparseMoe {
             quantized: quant.is_some(),
         })
     }
+}
+
+/// The fused MoE experts of a **Candle-native GGML tier** (SW-7285): `experts.{gate_up_proj,
+/// down_proj}.weight` is a stacked stored block tensor `U8 [E, out, in / 32, block_bytes]`, the
+/// header-classified rank-4 form of `candle_layers::llm_projection::ggml_block_storage`. `None` when
+/// `gate_up_proj.weight` is not one (the MLX triple / MXFP4 paths own it). A `.scales` sibling, a
+/// mismatched `down_proj` form, or an expert slice whose blocks decode to the wrong `[out, in]` is
+/// refused. GGML quantizes each block independently, so an expert's slice is byte-for-byte that
+/// expert's own blocks.
+fn stored_experts(vb_e: &VarBuilder, cfg: &Config) -> Result<Option<Vec<Expert>>> {
+    use candle_gen::candle_layers::llm_projection::ggml_block_storage;
+    use candle_gen::quant::stored_ggml::{qtensor_from_stored, validate_stored};
+    let (e, h, i) = (
+        cfg.num_local_experts,
+        cfg.hidden_size,
+        cfg.intermediate_size,
+    );
+    let stacked = |base: &str| -> Result<Option<GgmlDType>> {
+        let key = format!("{base}.weight");
+        if !vb_e.contains_tensor(&key) {
+            return Ok(None);
+        }
+        let Some(info) = vb_e.tensor_info(&key)? else {
+            return Ok(None);
+        };
+        Ok(match (info.dtype, info.shape.dims()) {
+            (Some(DType::U8), dims @ [_, _, _, _]) => {
+                ggml_block_storage(true, dims).map(|(dtype, ..)| dtype)
+            }
+            _ => None,
+        })
+    };
+    let Some(gate_up) = stacked("gate_up_proj")? else {
+        return Ok(None);
+    };
+    let Some(down) = stacked("down_proj")? else {
+        candle_gen::candle_core::bail!(
+            "lens text_encoder experts: `gate_up_proj.weight` is stored {gate_up:?} GGML blocks \
+             but `down_proj.weight` is not — a tier stores both fused expert projections the same way"
+        );
+    };
+    let cpu = Device::Cpu;
+    let host = vb_e.clone().set_device(cpu.clone());
+    let load = |base: &str, dtype: GgmlDType, out: usize, inp: usize| -> Result<Tensor> {
+        validate_stored(
+            "lens text_encoder experts",
+            base,
+            (dtype, out, inp),
+            vb_e.contains_tensor(&format!("{base}.scales")),
+            None,
+        )?;
+        let t = host.get_unchecked_dtype(&format!("{base}.weight"), DType::U8)?;
+        if t.dim(0)? != e {
+            candle_gen::candle_core::bail!(
+                "lens text_encoder experts: `{base}.weight` stacks {} experts, expected {e}",
+                t.dim(0)?
+            );
+        }
+        Ok(t)
+    };
+    let gate_up_w = load("gate_up_proj", gate_up, 2 * i, h)?;
+    let down_w = load("down_proj", down, h, i)?;
+    let gu_bias = vb_e.get_unchecked_dtype("gate_up_proj_bias", DType::F32)?;
+    let dn_bias = vb_e.get_unchecked_dtype("down_proj_bias", DType::F32)?;
+    let dev = vb_e.device().clone();
+    let proj = |stored: &Tensor, base: &str, x: usize, expected, bias: Tensor| {
+        let weight = qtensor_from_stored(&stored.i(x)?, &dev)?;
+        let got = weight.shape().dims2()?;
+        if got != expected {
+            candle_gen::candle_core::bail!(
+                "lens text_encoder experts: `{base}` expert {x} blocks decode to {got:?}, \
+                 expected {expected:?}"
+            );
+        }
+        Ok(ExpertProj::Quant {
+            w: QMatMul::from_qtensor(weight)?,
+            bias,
+        })
+    };
+    (0..e)
+        .map(|x| {
+            Ok(Expert {
+                gate_up_proj: proj(
+                    &gate_up_w,
+                    "gate_up_proj",
+                    x,
+                    (2 * i, h),
+                    gu_bias.i(x)?.contiguous()?,
+                )?,
+                down_proj: proj(&down_w, "down_proj", x, (h, i), dn_bias.i(x)?.contiguous()?)?,
+                limit: cfg.swiglu_limit,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 /// Load the fused MoE experts from an **MLX-packed** tier (`SceneWorks/lens-mlx`, sc-9457 / sc-9089

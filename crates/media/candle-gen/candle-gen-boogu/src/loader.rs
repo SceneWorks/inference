@@ -307,6 +307,18 @@ pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
 /// if a future tier ever packs `model.visual.*`. This guard turns that latent silent-garbage into a
 /// hard load error. (Dense components with no packed config are unaffected: `packed()` is `None`.)
 pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if let Some(stored) = stored_ggml(w, base)? {
+        let (dtype, ..) = candle_gen::quant::stored_ggml::stored_block_tensor(&stored)
+            .expect("stored_ggml classified this tensor");
+        return Err(
+            candle_gen::quant::stored_ggml::StoredGgmlRefusal::DenseOnly {
+                context: "boogu".into(),
+                base: base.into(),
+                dtype,
+            }
+            .into(),
+        );
+    }
     if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "boogu: `{base}` has a `.scales` sibling in a packed component but is loaded dense — the \
@@ -315,6 +327,41 @@ pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear>
         )));
     }
     linear(w, base, bias)
+}
+
+/// `{base}.weight` when it is a **stored GGML block tensor** (a Candle-native tier, SW-7285),
+/// classified from its header ([`candle_gen::quant::stored_ggml::stored_block_geometry`]) and read
+/// at its native `U8` width; `None` for any other weight (absent, dense, MLX-packed or encoded).
+pub fn stored_ggml(w: &Weights, base: &str) -> Result<Option<Tensor>> {
+    let key = format!("{base}.weight");
+    if !w.contains(&key) {
+        return Ok(None);
+    }
+    let Some((dtype, shape)) = w.native_header(&key) else {
+        return Ok(None);
+    };
+    if candle_gen::quant::stored_ggml::stored_block_geometry(dtype, &shape).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(w.get_native(&key)?))
+}
+
+/// [`stored_ggml`] validated for a projection loader: a `.scales` sibling beside a stored block is
+/// refused (the shared [`candle_gen::quant::stored_ggml::validate_stored`] rule).
+pub fn stored_ggml_checked(w: &Weights, context: &str, base: &str) -> Result<Option<Tensor>> {
+    let Some(stored) = stored_ggml(w, base)? else {
+        return Ok(None);
+    };
+    let geometry = candle_gen::quant::stored_ggml::stored_block_tensor(&stored)
+        .expect("stored_ggml classified this tensor");
+    candle_gen::quant::stored_ggml::validate_stored(
+        context,
+        base,
+        geometry,
+        w.contains(&format!("{base}.scales")),
+        None,
+    )?;
+    Ok(Some(stored))
 }
 
 /// **Packed-detecting** [`QLinear`] loader (sc-9410): when the component is a packed q4 tier *and*
@@ -326,6 +373,15 @@ pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear>
 /// survive any `to_out.0`-style nesting — the key-remap trap: build the base string first, then detect
 /// (the `linear_detect_fires_on_to_out_remap` test pins this on the real boogu `to_out.0` layout).
 pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
+    // A Candle-native GGML tier (SW-7285): built as stored — no repack, no cache entry.
+    if let Some(stored) = stored_ggml_checked(w, "boogu", base)? {
+        let dense_bias = if bias {
+            Some(w.get(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        return QLinear::from_stored_ggml(&stored, dense_bias, w.device());
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let wq = w.get_native(&format!("{base}.weight"))?;
@@ -346,6 +402,17 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
 /// dtype parity with the dense table), else a dense [`Embedding`] from `{base}.weight` (`hidden`
 /// inferred from the stored `[vocab, hidden]` shape). The Qwen3-VL TE `embed_tokens` is packed in q4.
 pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
+    // A Candle-native GGML tier's stored table (SW-7285): host-resident rows, dequantized to f32
+    // exactly like the packed triple's (sc-12828).
+    if let Some(stored) = stored_ggml_checked(w, "boogu", base)? {
+        let table = candle_gen::quant::stored_ggml::qtensor_from_stored(
+            &stored,
+            &candle_gen::candle_core::Device::Cpu,
+        )?;
+        return Ok(QEmbedding::Packed(
+            candle_gen::quant::QEmbedding::from_qtensor(table, DType::F32)?,
+        ));
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let wq = w.get_native(&format!("{base}.weight"))?;

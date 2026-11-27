@@ -162,8 +162,9 @@ pub(crate) fn adapter_var_builder(
     impl SimpleBackend for Overlay {
         fn tensor_info(&self, key: &str) -> CoreResult<Option<candle_nn::var_builder::TensorInfo>> {
             match self.overrides.get(key) {
-                Some(t) => Ok(Some(candle_nn::var_builder::TensorInfo::dense(
+                Some(t) => Ok(Some(candle_nn::var_builder::TensorInfo::stored(
                     t.shape().clone(),
+                    t.dtype(),
                 ))),
                 None => self.base.tensor_info(key),
             }

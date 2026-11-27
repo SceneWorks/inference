@@ -108,7 +108,11 @@ pub fn linear_detect_dense(
     base: &str,
     bias: bool,
 ) -> Result<Linear> {
-    if !vb.contains_tensor(&format!("{base}.scales")) {
+    // A Candle-native GGML tier's stored block (SW-7285) takes the same dequantize-to-dense route as
+    // the MLX triple (the shared `lin` builds it as stored); only a truly dense weight reads directly.
+    if !vb.contains_tensor(&format!("{base}.scales"))
+        && candle_gen::quant::stored_ggml::stored_ggml_vb(vb, base)?.is_none()
+    {
         let sub = vb.pp(base);
         return if bias {
             candle_gen::candle_nn::linear(in_dim, out_dim, sub)

@@ -75,44 +75,28 @@
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_layers::llm_projection::{from_ggml_block_tensor, ggml_block_storage};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{AdaptLinear, QEmbedding, QLinear, MLX_GROUP_SIZE as GROUP_SIZE};
 use candle_gen::{CandleError, Result, Weights};
 
 /// The `quantization.storage` value a **Candle-native** H3 tier's component `config.json` carries
 /// (`SceneWorks/minimax-h3-candle`): every packed projection is persisted as a stored GGML block
-/// tensor rather than an MLX affine triple. The same tag `candle-llm`'s prepared tiers use.
-pub const GGML_STORAGE: &str = "ggml";
+/// tensor rather than an MLX affine triple. The shared tag (SW-7285), re-exported for the converter.
+pub use candle_gen::quant::stored_ggml::GGML_STORAGE;
 
 /// The GGML block type and logical `[rows, cols]` of `{base}.weight` when it is a **stored GGML
-/// block tensor** — `U8 [rows, cols / block, block_bytes]` (`candle_layers::llm_projection`'s
-/// sc-19375 convention, Q4_1 / Q8_0 for the H3 tiers). `None` for a dense, MLX-packed or
-/// checkpoint-encoded (FP8 / MXFP8 / NVFP4 …) weight, which other loaders own.
-///
-/// An encoded key is ruled out by its source format **before** the tensor is fetched, because
-/// `Weights::require` on an encoded key decodes it dense — exactly the transient this path exists
-/// to avoid.
-pub fn stored_ggml_storage(w: &Weights, base: &str) -> Option<(GgmlDType, usize, usize)> {
-    let key = format!("{base}.weight");
-    if !w.contains(&key)
-        || w.source_format_id(&key).is_some()
-        || w.contains(&format!("{base}.comfy_quant"))
-    {
-        return None;
-    }
-    let t = w.require(&key).ok()?;
-    ggml_block_storage(t.dtype() == DType::U8, t.dims())
+/// block tensor**: the shared `Weights`-fed classifier (SW-7285). PR #1529's H3-only design lives in
+/// `candle_gen::quant::stored_ggml` now, so every family shares one implementation.
+pub use candle_gen::quant::stored_ggml::stored_ggml_storage;
+
+/// The component-attributed label the shared stored-GGML refusals carry (`minimax-h3 dit`).
+fn context(component: &str) -> String {
+    format!("minimax-h3 {component}")
 }
 
-/// Rebuild `{base}.weight`'s stored GGML blocks as a resident [`QTensor`] on `device` — the
-/// blocks are used exactly as published, never dequantized, re-quantized or routed through the
-/// saved-quantization cache. `None` when the weight is not a stored block tensor
-/// ([`stored_ggml_storage`]).
-///
-/// A stored weight that ALSO carries an MLX `.scales` sibling is refused: the two forms are
-/// mutually exclusive, and silently preferring one would load whichever a converter bug left
-/// behind.
+/// Rebuild `{base}.weight`'s stored GGML blocks as a resident [`QTensor`] through the shared
+/// helper: blocks used exactly as published, no repack, no saved-quantization cache entry. A
+/// `.scales` sibling, or blocks decoding to a shape other than `shape`, are refused.
 fn stored_ggml_qtensor(
     w: &Weights,
     component: &str,
@@ -120,36 +104,7 @@ fn stored_ggml_qtensor(
     shape: Option<(usize, usize)>,
     device: Option<&Device>,
 ) -> Result<Option<QTensor>> {
-    let Some((dtype, rows, cols)) = stored_ggml_storage(w, base) else {
-        return Ok(None);
-    };
-    let key = format!("{base}.weight");
-    let scales = format!("{base}.scales");
-    if w.contains(&scales) {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 {component} {base}: `{key}` is a stored {dtype:?} GGML block tensor but \
-             `{scales}` is also present — a tier stores a projection either as GGML blocks or as \
-             an MLX affine triple, never both"
-        )));
-    }
-    if let Some(expected) = shape {
-        if (rows, cols) != expected {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3 {component} {base}: stored {dtype:?} blocks decode to [{rows}, {cols}], \
-                 expected {expected:?}"
-            )));
-        }
-    }
-    let stored = w.require(&key)?;
-    // The destination mirrors the MLX branch: a host-packed set names it, otherwise the stored
-    // tensor's own device does.
-    let device = device
-        .or_else(|| w.host_packed_target())
-        .cloned()
-        .unwrap_or_else(|| stored.device().clone());
-    let qt = from_ggml_block_tensor(&stored, &device)
-        .map_err(|e| CandleError::Msg(format!("minimax-h3 {component} {base}: {e}")))?;
-    Ok(Some(qt))
+    candle_gen::quant::stored_ggml::stored_ggml_qtensor(w, &context(component), base, shape, device)
 }
 
 /// A loaded projection plus the device bytes its **frozen base** holds.
@@ -225,13 +180,7 @@ pub fn guard_dense(w: &Weights, component: &str, base: &str) -> Result<()> {
             )));
         }
     }
-    if let Some((dtype, ..)) = stored_ggml_storage(w, base) {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 {component} {base}: `{base}.weight` is a stored {dtype:?} GGML block \
-             tensor, but {base} is loaded by a dense-only path. Reading GGML blocks as a float is \
-             silent garbage (sc-14980); the Candle tier converter must leave this tensor dense."
-        )));
-    }
+    candle_gen::quant::stored_ggml::guard_dense_stored(w, &context(component), base)?;
     let scales = format!("{base}.scales");
     if w.contains(&scales) {
         let policy = if component == TEXT_ENCODER {

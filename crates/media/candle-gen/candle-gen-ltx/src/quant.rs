@@ -364,6 +364,32 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             bounded_packed_training: false,
         });
     }
+    // A Candle-native GGML tier (SW-7285): the stored blocks are built as-is (no repack, no
+    // saved-quantization cache entry) and carry their own `[out, in]`; a `.scales` sibling beside
+    // them is refused by the shared helper.
+    if let Some(weight) =
+        candle_gen::quant::stored_ggml::stored_ggml_qtensor_vb(vb, "ltx", key, None, vb.device())?
+    {
+        let (out_features, in_features) = weight.shape().dims2()?;
+        let bias = if bias {
+            Some(vb.get_unchecked_dtype(&format!("{key}.bias"), vb.dtype())?)
+        } else {
+            None
+        };
+        return Ok(QLinear {
+            base: QLinearBase::Adapt(LoraLinear::from_qlinear(
+                shared::QLinear::from_qtensor_dequant(std::sync::Arc::new(weight), bias),
+                in_features,
+                out_features,
+                path.clone(),
+            )),
+            path,
+            in_features,
+            out_features,
+            attestation: "candle-ggml-blocks".into(),
+            bounded_packed_training: false,
+        });
+    }
     let scales_key = format!("{key}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -463,7 +489,10 @@ impl QEmbedding {
 /// **dense** table (`{key}.weight`, cast to the vb dtype, exactly the legacy Gemma `embed_tokens` read).
 /// `vocab`/`hidden` size the dense fallback's shape check.
 pub fn qembedding(vb: &VarBuilder, key: &str, vocab: usize, hidden: usize) -> Result<QEmbedding> {
-    if vb.contains_tensor(&format!("{key}.scales")) {
+    // A Candle-native GGML tier's stored table (SW-7285) takes the same shared packed route.
+    if vb.contains_tensor(&format!("{key}.scales"))
+        || candle_gen::quant::stored_ggml::stored_ggml_vb(vb, key)?.is_some()
+    {
         // Build the shared packed embedding (dequantizes to vb.dtype() on the vb device), then
         // materialize its `[vocab, hidden]` table once for the Gemma encoder's direct index-select.
         let e = shared::embedding_gs(vb, key, vocab, hidden, GROUP_SIZE)?;
@@ -491,6 +520,8 @@ pub fn qembedding(vb: &VarBuilder, key: &str, vocab: usize, hidden: usize) -> Re
 /// means the tier packed a leaf we would silently load as u32-code garbage. Fail with a clear message
 /// instead (sc-9417). Returns the raw dense tensor for the caller to wrap (conv/norm/etc.).
 pub fn guard_no_scales(vb: &VarBuilder, key: &str, dtype: DType) -> Result<Tensor> {
+    // A stored GGML block (SW-7285) at this dense-only surface is the same silent-garbage class.
+    candle_gen::quant::stored_ggml::guard_dense_vb(&vb.pp(key))?;
     if vb.contains_tensor(&format!("{key}.scales")) {
         candle_gen::candle_core::bail!(
             "ltx: `{key}.scales` present where a DENSE weight is expected — this component (VAE / \

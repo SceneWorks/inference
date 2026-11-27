@@ -62,7 +62,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{LayerNorm, Linear, Module};
 
-use crate::loader::Weights;
+use crate::loader::{stored_ggml, Weights};
 use crate::quant::QLinear;
 
 /// Qwen3-VL vision-tower config (the `vision_config` block of `mllm/config.json`).
@@ -241,24 +241,6 @@ fn vision_linear(
         bias,
         shape.as_ref().map(|s| s.as_slice()),
     )?))
-}
-
-/// `{base}.weight` when it is a **stored GGML block tensor** (a Candle-native tier), read at its
-/// native `U8` width; `None` for any other weight (absent, dense, MLX-packed or encoded).
-fn stored_ggml(w: &Weights, base: &str) -> Result<Option<Tensor>> {
-    let key = format!("{base}.weight");
-    if !w.contains(&key) {
-        return Ok(None);
-    }
-    let Some((dtype, shape)) = w.native_header(&key) else {
-        return Ok(None);
-    };
-    if candle_gen::candle_layers::llm_projection::ggml_block_storage(dtype == DType::U8, &shape)
-        .is_none()
-    {
-        return Ok(None);
-    }
-    Ok(Some(w.get_native(&key)?))
 }
 
 /// One vision block: pre-LayerNorm full attention + pre-LayerNorm GELU-tanh MLP, both residual.

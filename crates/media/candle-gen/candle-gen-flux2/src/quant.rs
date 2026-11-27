@@ -70,7 +70,11 @@ impl QEmbedding {
     /// [`candle_gen::quant::embedding`], dequantized to `vb.dtype()` — dtype parity with the dense
     /// table), else dense (`{base}.weight`, path unchanged). `base` is the full dotted key prefix.
     pub fn detect(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
+        // A Candle-native GGML tier's stored table (SW-7285) is packed too; the shared loader builds
+        // it as stored (or refuses a malformed one).
+        if vb.contains_tensor(&format!("{base}.scales"))
+            || candle_gen::quant::stored_ggml::stored_ggml_vb(vb, base)?.is_some()
+        {
             return Ok(Self::Packed(shared::embedding(vb, base, vocab, hidden)?));
         }
         Ok(Self::Dense(candle_gen::candle_nn::embedding(
