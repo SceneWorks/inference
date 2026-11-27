@@ -51,12 +51,17 @@ mod int8_attention;
 #[path = "fused_kernels_bench/sol_attention.rs"]
 mod sol_attention;
 
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/vae_norm_silu_pad.rs"]
+mod vae_norm_silu_pad;
+
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
 const SUITES: &[(&str, harness::Suite)] = &[
     ("act_quant", act_quant::rows),
     ("int8_attention", int8_attention::rows),
     ("sol_attention", sol_attention::rows),
+    ("vae_norm_silu_pad", vae_norm_silu_pad::rows),
 ];
 
 #[cfg(feature = "cuda")]

@@ -21,6 +21,7 @@ use candle_gen::vae_tiling;
 
 use crate::config::{LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::conv3d::CausalConv3d;
+use candle_gen::vae_norm_silu_pad::{VaeNorm, VAE_NORM_SILU_PAD_PATH};
 
 const DEC_NORM_EPS: f64 = 1e-8;
 const ENC_NORM_EPS: f64 = 1e-6;
@@ -32,6 +33,31 @@ fn pixel_norm(x: &Tensor) -> Result<Tensor> {
     let mean = (sumsq / c as f64)?;
     let denom = (mean + DEC_NORM_EPS)?.sqrt()?;
     x.broadcast_div(&denom)
+}
+
+/// `conv(silu(pixel_norm(x)))` — every LTX VAE `pixel-norm → SiLU → CausalConv3d` site (the
+/// decoder / encoder resblock convs and both `conv_out`s). On CUDA the norm, SiLU and the
+/// frame-replication pad run as one fused kernel writing the conv input
+/// ([`CausalConv3d::forward_norm_silu`], SW-6133); the op chain (`reference_norm`, SiLU,
+/// [`CausalConv3d::forward`]) stays as the parity oracle and the path for CPU, Metal, an unserved
+/// input or a failed compile. Which path ran is counted on [`VAE_NORM_SILU_PAD_PATH`]
+/// (`CANDLE_FUSED_VAE_NORM_SILU_PAD` turns the kernel off).
+fn norm_silu_conv(
+    conv: &CausalConv3d,
+    x: &Tensor,
+    causal: bool,
+    eps: f64,
+    reference_norm: impl FnOnce(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    VAE_NORM_SILU_PAD_PATH.dispatch(
+        || conv.forward_norm_silu(x, &VaeNorm::PixelRms { eps }, causal),
+        || {
+            conv.forward(
+                &candle_gen::candle_nn::ops::silu(&reference_norm(x)?)?,
+                causal,
+            )
+        },
+    )
 }
 
 /// Decoder residual block (`ResnetBlock3DSimple`): pixel-norm → SiLU → conv → pixel-norm → SiLU →
@@ -50,10 +76,8 @@ impl DecResBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = candle_gen::candle_nn::ops::silu(&pixel_norm(x)?)?;
-        let h = self.conv1.forward(&h, false)?;
-        let h = candle_gen::candle_nn::ops::silu(&pixel_norm(&h)?)?;
-        let h = self.conv2.forward(&h, false)?;
+        let h = norm_silu_conv(&self.conv1, x, false, DEC_NORM_EPS, pixel_norm)?;
+        let h = norm_silu_conv(&self.conv2, &h, false, DEC_NORM_EPS, pixel_norm)?;
         h + x
     }
 }
@@ -203,10 +227,9 @@ impl EncResBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(x, ENC_NORM_EPS)?)?;
-        let h = self.conv1.forward(&h, true)?;
-        let h = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(&h, ENC_NORM_EPS)?)?;
-        let h = self.conv2.forward(&h, true)?;
+        let enc_norm = |x: &Tensor| pixel_norm_eps(x, ENC_NORM_EPS);
+        let h = norm_silu_conv(&self.conv1, x, true, ENC_NORM_EPS, enc_norm)?;
+        let h = norm_silu_conv(&self.conv2, &h, true, ENC_NORM_EPS, enc_norm)?;
         h + x
     }
 }
@@ -377,8 +400,9 @@ impl VideoEncoder {
                 DownLayer::Down(down) => down.forward(&x)?,
             };
         }
-        let x = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(&x, ENC_NORM_EPS)?)?;
-        let x = self.conv_out.forward(&x, true)?;
+        let x = norm_silu_conv(&self.conv_out, &x, true, ENC_NORM_EPS, |x| {
+            pixel_norm_eps(x, ENC_NORM_EPS)
+        })?;
         let means = x.narrow(1, 0, self.latent_channels)?;
         means.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
     }
@@ -594,9 +618,7 @@ impl LtxVideoVae {
                 UpLayer::Up(u) => u.forward(&x)?,
             };
         }
-        let x = pixel_norm(&x)?;
-        let x = candle_gen::candle_nn::ops::silu(&x)?;
-        let x = conv_out.forward(&x, false)?;
+        let x = norm_silu_conv(conv_out, &x, false, DEC_NORM_EPS, pixel_norm)?;
         unpatchify(&x, self.patch_size)
     }
 
@@ -862,7 +884,7 @@ mod budget_tests {
     fn conv_decode_budgeted_still_selects_through_auto_tiling_budgeted_ltx() {
         let body = fn_body("decode_budgeted");
         assert!(
-            body.contains("match auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
+            body.contains("auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
             "the conv decode's auto-tiling arm no longer calls `auto_tiling_budgeted_ltx` with the \
              conv output dims — sc-18799 budgets the DiffVAE, it does not re-route the conv \
              decoder:\n{body}"
@@ -1102,5 +1124,80 @@ mod budget_tests {
                 "over-predicts {ow}x{oh}x{of} tile {tw}x{th}x{tf}: est {est:.2} > 2.5x measured {measured:.2} GiB"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_norm_silu_pad_tests {
+    //! SW-6133: the fused pixel-norm + SiLU + frame-replication pad inside real LTX VAE blocks
+    //! (`DecResBlock`: non-causal, first and last frame replicated; `EncResBlock`: causal, first
+    //! frame replicated twice) on synthetic weights, on CUDA. The VAE runs f32, where the kernel is
+    //! the op chain bit for bit, so the block outputs must be identical; the path counters must show
+    //! every norm site fused with the switch on and none with it off. Model work (learned block
+    //! forwards): `#[ignore]`d and registered as an explicit model proof.
+    use super::{DecResBlock, EncResBlock};
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::fused_path::media_fused_policy_guard;
+    use candle_gen::vae_norm_silu_pad::VAE_NORM_SILU_PAD_PATH;
+    use std::collections::HashMap;
+
+    fn block_weights(c: usize, dev: &Device) -> Result<HashMap<String, Tensor>> {
+        let mut m = HashMap::new();
+        for conv in ["conv1", "conv2"] {
+            m.insert(
+                format!("blk.{conv}.conv.weight"),
+                Tensor::randn(0f32, 0.5 / ((c * 27) as f32).sqrt(), (c, c, 3, 3, 3), dev)?,
+            );
+            m.insert(
+                format!("blk.{conv}.conv.bias"),
+                Tensor::randn(0f32, 0.02, c, dev)?,
+            );
+        }
+        Ok(m)
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let _media = media_fused_policy_guard(Some(true));
+        for (c, t, h, w) in [(128usize, 5usize, 16usize, 24usize), (256, 3, 12, 20)] {
+            let vb = VarBuilder::from_tensors(block_weights(c, &dev)?, DType::F32, &dev);
+            let dec = DecResBlock::load(vb.clone(), "blk")?;
+            let enc = EncResBlock::load(vb, "blk")?;
+            let x = (Tensor::randn(0f32, 1.0, (1, c, t, h, w), &dev)? * 2.0)?;
+            for (name, forward) in [
+                (
+                    "decoder",
+                    &(|x: &Tensor| dec.forward(x)) as &dyn Fn(&Tensor) -> Result<Tensor>,
+                ),
+                ("encoder", &|x: &Tensor| enc.forward(x)),
+            ] {
+                let run = |on: bool| -> Result<(Tensor, u64, u64)> {
+                    let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(on));
+                    let before = VAE_NORM_SILU_PAD_PATH.thread_counts();
+                    let y = __model_proof_output!(forward(&x))?;
+                    let d = VAE_NORM_SILU_PAD_PATH.thread_counts().since(&before);
+                    Ok((y, d.fused, d.reference_for("disabled")))
+                };
+                let (reference, ref_fused, ref_disabled) = run(false)?;
+                let (fused, fused_calls, fused_disabled) = run(true)?;
+                assert_eq!((ref_fused, ref_disabled), (0, 2), "{name} off");
+                assert_eq!((fused_calls, fused_disabled), (2, 0), "{name} on");
+                let max = (&fused - &reference)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?;
+                println!("ltx {name} block {c}ch {t}x{h}x{w}: fused vs op chain max |d| {max:e}");
+                assert_eq!(
+                    max, 0.0,
+                    "{name}: the f32 fused block must equal the op chain"
+                );
+            }
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain");
+        Ok(())
     }
 }

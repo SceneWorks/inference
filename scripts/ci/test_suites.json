@@ -2409,6 +2409,51 @@
       ]
     },
     {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "vae_norm_silu_pad::cuda_tests::fused_norm_silu_pad_gpu",
+      "source": "crates/kernels/candle-quant-kernels/src/vae_norm_silu_pad.rs",
+      "reason": "SW-6133 CUDA fused video-VAE norm+SiLU+temporal pad vs pad(silu(norm(x))) op chain: Wan channel-L2 (first chunk zero pad, warming and cached feat_cache frames, single pass, batch 2, strided x, frame-major cache views) and LTX pixel-RMS (replicate pads), F32 max rel err <= 1e-5, BF16/F16 within one output rounding of the f32 oracle and no worse than the 16-bit chain, both output layouts. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "vae_norm_silu_pad::cuda_tests::wrong_side_pad_and_dropped_cache_fail_parity",
+      "source": "crates/kernels/candle-quant-kernels/src/vae_norm_silu_pad.rs",
+      "reason": "SW-6133 CUDA mutation check: the fused kernel with the causal zero pad written after the frames, or with the cache dropped, must fail the parity criterion. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "vae_norm_silu_pad::cuda_tests::the_dispatching_entry_reports_its_path",
+      "source": "crates/kernels/candle-quant-kernels/src/vae_norm_silu_pad.rs",
+      "reason": "SW-6133 CUDA path telemetry: norm_silu_pad_or_reference records fused on CUDA, disabled with the switch off (same values), not_cuda for a CPU tensor and autograd for a Var. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-llm",
       "kind": "lib",
       "target": "candle_llm",

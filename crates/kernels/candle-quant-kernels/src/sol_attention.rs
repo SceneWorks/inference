@@ -119,6 +119,11 @@ impl SolConfig {
         if self.sink_q.1 < self.sink_q.0 {
             return Err("sink_q must be [start, end) with end >= start");
         }
+        // The kernels take block indices as signed 32-bit ints.
+        let i32_max = i32::MAX as u32;
+        if self.sink_blocks.1 > i32_max || self.sink_q.1 > i32_max {
+            return Err("sink_blocks / sink_q endpoints must fit the kernels' i32 block index");
+        }
         Ok(())
     }
 }
@@ -505,7 +510,7 @@ pub fn similarity(a: &Tensor, b: &Tensor) -> candle_core::Result<(f32, f32)> {
     ))
 }
 
-/// Per-call routing statistics ([`sol_attention_with_stats`], cuda builds).
+/// Per-call routing statistics (`sol_attention_with_stats`, cuda builds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SolStats {
     /// Routed (exact) `(query block, key block)` pairs over every `(batch, head)`.
@@ -795,8 +800,12 @@ mod cuda {
         unsafe { l.launch(cfg((t.div_ceil(256), bh), 256, 0)?) }.map_err(drv)?;
         drop((qs_st, ks_st, vs_st));
 
-        let (sink_s, sink_e) = (config.sink_blocks.0 as i32, config.sink_blocks.1 as i32);
-        let (sink_qs, sink_qe) = (config.sink_q.0 as i32, config.sink_q.1 as i32);
+        // Clamp the sink ranges to the actual block count before the i32 kernel ABI: a range past
+        // the sequence would otherwise count sink blocks that do not exist (`validate` already
+        // refuses endpoints beyond i32).
+        let block = |v: u32| v.min(n as u32) as i32;
+        let (sink_s, sink_e) = (block(config.sink_blocks.0), block(config.sink_blocks.1));
+        let (sink_qs, sink_qe) = (block(config.sink_q.0), block(config.sink_q.1));
         if let SolSelection::TopK(ratio) = config.selection {
             let kk = i32_of(topk_count(n - sink_count(n, config.sink_blocks), ratio))?;
             let mut l = stream.launch_builder(&f_topk);
@@ -1004,6 +1013,28 @@ mod tests {
             ..SolConfig::top_k(0.5)
         };
         assert!(sink_q.validate().is_err());
+        // Endpoints beyond the kernels' i32 block index are refused, not wrapped negative.
+        for (blocks, q) in [
+            ((2_147_483_648, 2_147_483_649), (0, 1)),
+            ((0, 1), (0, 2_147_483_648)),
+            ((0, u32::MAX), (0, 1)),
+        ] {
+            let wide = SolConfig {
+                sink_blocks: blocks,
+                sink_q: q,
+                ..SolConfig::top_k(0.5)
+            };
+            assert!(wide.validate().is_err(), "{blocks:?} {q:?}");
+        }
+        let edge = SolConfig {
+            sink_blocks: (0, i32::MAX as u32),
+            sink_q: (0, i32::MAX as u32),
+            ..SolConfig::top_k(0.5)
+        };
+        assert!(edge.validate().is_ok());
+        // Sink ranges past the sequence count only the blocks that exist.
+        assert_eq!(sink_count(1, (0, i32::MAX as u32)), 1);
+        assert_eq!(sink_count(4, (2, 9)), 2);
     }
 
     #[test]
