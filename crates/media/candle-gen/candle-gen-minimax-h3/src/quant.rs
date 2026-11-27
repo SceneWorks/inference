@@ -73,11 +73,84 @@
 //! The projection exposes its bounded per-forward device decode scratch separately through
 //! `W4A8Linear::weight_scratch_bytes`; that scratch is transient, not a frozen base allocation.
 
-use candle_gen::candle_core::quantized::GgmlDType;
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_layers::llm_projection::{from_ggml_block_tensor, ggml_block_storage};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{AdaptLinear, QEmbedding, QLinear, MLX_GROUP_SIZE as GROUP_SIZE};
 use candle_gen::{CandleError, Result, Weights};
+
+/// The `quantization.storage` value a **Candle-native** H3 tier's component `config.json` carries
+/// (`SceneWorks/minimax-h3-candle`): every packed projection is persisted as a stored GGML block
+/// tensor rather than an MLX affine triple. The same tag `candle-llm`'s prepared tiers use.
+pub const GGML_STORAGE: &str = "ggml";
+
+/// The GGML block type and logical `[rows, cols]` of `{base}.weight` when it is a **stored GGML
+/// block tensor** — `U8 [rows, cols / block, block_bytes]` (`candle_layers::llm_projection`'s
+/// sc-19375 convention, Q4_1 / Q8_0 for the H3 tiers). `None` for a dense, MLX-packed or
+/// checkpoint-encoded (FP8 / MXFP8 / NVFP4 …) weight, which other loaders own.
+///
+/// An encoded key is ruled out by its source format **before** the tensor is fetched, because
+/// `Weights::require` on an encoded key decodes it dense — exactly the transient this path exists
+/// to avoid.
+pub fn stored_ggml_storage(w: &Weights, base: &str) -> Option<(GgmlDType, usize, usize)> {
+    let key = format!("{base}.weight");
+    if !w.contains(&key)
+        || w.source_format_id(&key).is_some()
+        || w.contains(&format!("{base}.comfy_quant"))
+    {
+        return None;
+    }
+    let t = w.require(&key).ok()?;
+    ggml_block_storage(t.dtype() == DType::U8, t.dims())
+}
+
+/// Rebuild `{base}.weight`'s stored GGML blocks as a resident [`QTensor`] on `device` — the
+/// blocks are used exactly as published, never dequantized, re-quantized or routed through the
+/// saved-quantization cache. `None` when the weight is not a stored block tensor
+/// ([`stored_ggml_storage`]).
+///
+/// A stored weight that ALSO carries an MLX `.scales` sibling is refused: the two forms are
+/// mutually exclusive, and silently preferring one would load whichever a converter bug left
+/// behind.
+fn stored_ggml_qtensor(
+    w: &Weights,
+    component: &str,
+    base: &str,
+    shape: Option<(usize, usize)>,
+    device: Option<&Device>,
+) -> Result<Option<QTensor>> {
+    let Some((dtype, rows, cols)) = stored_ggml_storage(w, base) else {
+        return Ok(None);
+    };
+    let key = format!("{base}.weight");
+    let scales = format!("{base}.scales");
+    if w.contains(&scales) {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 {component} {base}: `{key}` is a stored {dtype:?} GGML block tensor but \
+             `{scales}` is also present — a tier stores a projection either as GGML blocks or as \
+             an MLX affine triple, never both"
+        )));
+    }
+    if let Some(expected) = shape {
+        if (rows, cols) != expected {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 {component} {base}: stored {dtype:?} blocks decode to [{rows}, {cols}], \
+                 expected {expected:?}"
+            )));
+        }
+    }
+    let stored = w.require(&key)?;
+    // The destination mirrors the MLX branch: a host-packed set names it, otherwise the stored
+    // tensor's own device does.
+    let device = device
+        .or_else(|| w.host_packed_target())
+        .cloned()
+        .unwrap_or_else(|| stored.device().clone());
+    let qt = from_ggml_block_tensor(&stored, &device)
+        .map_err(|e| CandleError::Msg(format!("minimax-h3 {component} {base}: {e}")))?;
+    Ok(Some(qt))
+}
 
 /// A loaded projection plus the device bytes its **frozen base** holds.
 ///
@@ -152,6 +225,13 @@ pub fn guard_dense(w: &Weights, component: &str, base: &str) -> Result<()> {
             )));
         }
     }
+    if let Some((dtype, ..)) = stored_ggml_storage(w, base) {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 {component} {base}: `{base}.weight` is a stored {dtype:?} GGML block \
+             tensor, but {base} is loaded by a dense-only path. Reading GGML blocks as a float is \
+             silent garbage (sc-14980); the Candle tier converter must leave this tensor dense."
+        )));
+    }
     let scales = format!("{base}.scales");
     if w.contains(&scales) {
         let policy = if component == TEXT_ENCODER {
@@ -217,6 +297,26 @@ pub(crate) fn lin_shaped(
         return Ok(TieredLinear {
             linear: AdaptLinear::from_dense(layer, inp, out),
             base_bytes,
+        });
+    }
+
+    // A Candle-native tier: the projection is already GGML blocks. No repack, no cache entry.
+    // Ahead of the W4A8 / ConvRot detects, which claim every U8 `.weight` as a native INT8 code
+    // stream and refuse one without a `.comfy_quant` descriptor; a stored block tensor is rank 3,
+    // which no native INT8 projection is.
+    if let Some(qt) = stored_ggml_qtensor(w, component, base, shape, None)? {
+        let (out, in_features) = qt.shape().dims2()?;
+        let quant_dtype = qt.dtype();
+        let dense_bias = if bias {
+            Some(w.require(&bias_key)?.to_dtype(dtype)?)
+        } else {
+            None
+        };
+        let bias_bytes = dense_bias.as_ref().map(dense_bytes).unwrap_or(0);
+        let packed = QLinear::from_qtensor_dequant(std::sync::Arc::new(qt), dense_bias);
+        return Ok(TieredLinear {
+            base_bytes: quant_bytes(quant_dtype, out, in_features) + bias_bytes,
+            linear: AdaptLinear::from_packed(packed, in_features, out),
         });
     }
 
@@ -345,6 +445,26 @@ pub(crate) fn embed_shaped(
 ) -> Result<TieredEmbedding> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
+
+    // A Candle-native tier stores the table as GGML rows. The packed embedding retains host row
+    // bytes only (no device table), so the blocks are rebuilt on the host and never uploaded whole.
+    if let Some(table) = stored_ggml_qtensor(w, TEXT_ENCODER, base, shape, Some(&Device::Cpu))? {
+        let (_vocab, hidden) = table.shape().dims2()?;
+        let embedding = QEmbedding::from_qtensor(table, dtype)?;
+        let base_bytes = embedding
+            .resident_storage()
+            .ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 te {base}: stored GGML rows produced a dense embedding"
+                ))
+            })?
+            .device_table_bytes;
+        return Ok(TieredEmbedding {
+            embedding,
+            base_bytes,
+            hidden,
+        });
+    }
 
     if w.contains(&scales_key) {
         let wq = w.require(&weight_key)?;
@@ -614,5 +734,179 @@ mod tests {
         );
         let err = lin(&Weights::from_map(map), DIT, "p", false, DType::BF16).unwrap_err();
         assert!(err.to_string().contains("authoritative .comfy_quant"));
+    }
+
+    /// The Candle-native tier's form of `base`: the MLX triple converted to stored GGML blocks by
+    /// the offline converter, so the fixture is exactly what `SceneWorks/minimax-h3-candle` ships.
+    fn insert_stored(map: &mut HashMap<String, Tensor>, base: &str, out: usize, inp: usize) {
+        let mut triple = HashMap::new();
+        insert_packed(&mut triple, base, out, inp, 7);
+        let mut report = crate::ggml_tier::ComponentReport::default();
+        for (k, v) in crate::ggml_tier::convert_tensors(triple, &mut report).unwrap() {
+            map.insert(k, v);
+        }
+    }
+
+    /// Stored GGML blocks load as the same Q4_1 dequant-dense base the MLX repack builds, with the
+    /// same resident bytes — and without going through the repack at all.
+    #[test]
+    fn stored_ggml_blocks_load_as_the_packed_base_without_a_repack() {
+        let mut map = HashMap::new();
+        insert_stored(&mut map, "p", 32, 128);
+        assert!(
+            !map.contains_key("p.scales"),
+            "the converter drops the triple"
+        );
+        let w = Weights::from_map(map);
+        assert_eq!(
+            stored_ggml_storage(&w, "p"),
+            Some((GgmlDType::Q4_1, 32, 128))
+        );
+        let loaded = lin_shaped(&w, DIT, "p", false, DType::F32, Some((32, 128))).unwrap();
+        assert!(loaded.linear.is_packed());
+        assert_eq!(loaded.linear.base_shape(), (32, 128));
+        assert_eq!(loaded.linear.quant_dtype(), Some(GgmlDType::Q4_1));
+        assert_eq!(
+            loaded.linear.matmul_strategy(),
+            Some(candle_gen::quant::MatmulStrategy::DequantDense)
+        );
+        assert_eq!(loaded.base_bytes, (32 * 128 / 32) * 20);
+
+        let err = lin_shaped(&w, DIT, "p", false, DType::F32, Some((16, 128))).unwrap_err();
+        assert!(err.to_string().contains("expected"), "{err}");
+    }
+
+    /// The GGML tier's forward is the MLX tier's forward: both dequantize the same Q4_1 blocks.
+    #[test]
+    #[ignore = "model inference; explicit model workflow only"]
+    fn the_stored_ggml_forward_equals_the_repacked_forward() {
+        let (out, in_) = (32usize, 128usize);
+        let mut mlx = HashMap::new();
+        insert_packed(&mut mlx, "p", out, in_, 7);
+        let mut stored = HashMap::new();
+        insert_stored(&mut stored, "p", out, in_);
+        let a = lin(&Weights::from_map(mlx), DIT, "p", false, DType::F32).unwrap();
+        let b = lin(&Weights::from_map(stored), DIT, "p", false, DType::F32).unwrap();
+        let x = Tensor::from_vec(
+            (0..3 * in_)
+                .map(|i| (i as f32 * 0.29).cos())
+                .collect::<Vec<_>>(),
+            (3, in_),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let got = b.linear.forward_upcast(&x).unwrap();
+        let want = a.linear.forward_upcast(&x).unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "identical blocks must give a bit-identical forward"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::the_stored_ggml_forward_equals_the_repacked_forward");
+    }
+
+    #[test]
+    fn dense_only_loaders_refuse_stored_ggml_blocks() {
+        let mut map = HashMap::new();
+        insert_stored(&mut map, "proj_in", 32, 128);
+        let err = guard_dense(&Weights::from_map(map), DIT, "proj_in").unwrap_err();
+        assert!(err.to_string().contains("stored Q4_1 GGML block"), "{err}");
+    }
+
+    #[test]
+    fn a_projection_stored_both_ways_is_refused() {
+        let mut map = HashMap::new();
+        insert_stored(&mut map, "p", 32, 128);
+        let mut triple = HashMap::new();
+        insert_packed(&mut triple, "p", 32, 128, 1);
+        map.insert("p.scales".into(), triple.remove("p.scales").unwrap());
+        map.insert("p.biases".into(), triple.remove("p.biases").unwrap());
+        let err = lin(&Weights::from_map(map), DIT, "p", false, DType::F32).unwrap_err();
+        assert!(err.to_string().contains("never both"), "{err}");
+    }
+
+    /// A stored token table stays host-resident (no device table), like the repacked one.
+    #[test]
+    fn a_stored_ggml_embedding_is_host_resident() {
+        let mut map = HashMap::new();
+        insert_stored(&mut map, "embed_tokens", 16, 128);
+        let e = embed(&Weights::from_map(map), "embed_tokens", DType::F32).unwrap();
+        assert!(e.embedding.is_quantized());
+        assert_eq!(e.hidden, 128);
+        assert_eq!(e.base_bytes, 0, "packed rows are host-resident");
+    }
+
+    /// End to end on disk: a converted component reloads through the production `Weights`
+    /// constructor with its stored blocks intact — not captured by the checkpoint-codec plan and not
+    /// cast — and builds the packed base.
+    #[test]
+    fn a_converted_component_reloads_through_the_host_packed_constructor() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut map = HashMap::new();
+        insert_packed(&mut map, "blocks.0.attn.to_q", 32, 128, 2);
+        map.insert(
+            "blocks.0.norm.weight".into(),
+            Tensor::ones(128, DType::BF16, &Device::Cpu).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(
+            &map,
+            src.join("model-00001-of-00001.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("model.safetensors.index.json"),
+            r#"{"metadata": {"total_size": 1}, "weight_map": {}}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+
+        let dst = root.path().join("dst");
+        let report = crate::ggml_tier::convert_component(&src, &dst, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(
+            (report.shards, report.converted, report.passthrough),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("tokenizer.json")).unwrap(),
+            "{}"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["quantization"]["storage"], GGML_STORAGE);
+        let index: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dst.join("model.safetensors.index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index["metadata"]["total_size"], report.tensor_bytes);
+        assert!(index["weight_map"]
+            .get("blocks.0.attn.to_q.scales")
+            .is_none());
+
+        let w = Weights::from_files_filtered_host_packed(
+            &[dst.join("model-00001-of-00001.safetensors")],
+            &Device::Cpu,
+            DType::BF16,
+            &[""],
+        )
+        .unwrap();
+        let key = "blocks.0.attn.to_q.weight";
+        assert!(w.source_format_id(key).is_none(), "not a checkpoint codec");
+        assert_eq!(w.require(key).unwrap().dtype(), DType::U8);
+        let loaded = lin(&w, DIT, "blocks.0.attn.to_q", false, DType::BF16).unwrap();
+        assert_eq!(loaded.linear.quant_dtype(), Some(GgmlDType::Q4_1));
+        assert!(
+            crate::ggml_tier::convert_component(&src, &dst, &mut |_, _| Ok(())).is_err(),
+            "an existing tier is never overwritten"
+        );
     }
 }

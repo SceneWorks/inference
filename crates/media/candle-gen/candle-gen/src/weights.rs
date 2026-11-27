@@ -351,6 +351,19 @@ impl Weights {
                 if let Some(base) = key.strip_suffix(".scales") {
                     packed_bases.insert(base.to_owned());
                 }
+                // A stored GGML block tensor (a Candle-native pre-quantized tier) is already in
+                // its device format; it stays on the host only so its one upload is the final
+                // `QTensor` build, never a device round-trip through `from_ggml_block_tensor`.
+                if let Some(base) = key.strip_suffix(".weight") {
+                    if candle_layers::llm_projection::ggml_block_storage(
+                        view.dtype() == safetensors::Dtype::U8,
+                        view.shape(),
+                    )
+                    .is_some()
+                    {
+                        packed_bases.insert(base.to_owned());
+                    }
+                }
             }
         }
         let source =
