@@ -238,7 +238,12 @@ fn text_style_gain_sweep_1024() {
             count: 1,
             seed: Some(0),
             steps: Some(8),
-            extensions: candle_gen::gen_core::FamilyExtensions { krea: Some(candle_gen::gen_core::KreaExtension { text_style_gain: gain, ..Default::default() }), ..Default::default() },
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                krea: Some(candle_gen::gen_core::KreaExtension {
+                    text_style_gain: gain,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let imgs = pipeline::render(&comps, &req, &device, &mut |_| {}).expect("render");

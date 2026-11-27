@@ -1286,7 +1286,10 @@ mod tests {
                 WeightsSource::Dir("/nonexistent/gemma".into()),
             );
             let early_capture = GenerationRequest {
-                features: candle_gen::gen_core::FeatureParams { pid: (Some(0.2)).map(candle_gen::gen_core::PidParams::with_capture_sigma), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    pid: Some(candle_gen::gen_core::PidParams::with_capture_sigma(0.2)),
+                    ..Default::default()
+                },
                 ..pid_req
             };
             assert!(registry

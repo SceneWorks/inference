@@ -148,7 +148,12 @@ fn request(size: u32, gain: Option<f32>) -> GenerationRequest {
             kind: ControlKind::Pose,
             scale: Some(0.6),
         }],
-        extensions: mlx_gen::gen_core::FamilyExtensions { krea: Some(mlx_gen::gen_core::KreaExtension { text_style_gain: gain, ..Default::default() }), ..Default::default() },
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            krea: Some(mlx_gen::gen_core::KreaExtension {
+                text_style_gain: gain,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

@@ -424,7 +424,12 @@ fn controls_the_route_does_not_have_are_refused() {
         (
             "timestep_to_start_cfg",
             GenerationRequest {
-                extensions: candle_gen::gen_core::FamilyExtensions { pulid: Some(candle_gen::gen_core::PulidExtension { timestep_to_start_cfg: Some(2), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    pulid: Some(candle_gen::gen_core::PulidExtension {
+                        timestep_to_start_cfg: Some(2),
+                    }),
+                    ..Default::default()
+                },
                 ..request()
             },
         ),

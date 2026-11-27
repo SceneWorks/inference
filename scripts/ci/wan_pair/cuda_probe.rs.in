@@ -34,7 +34,7 @@ fn curated_tier1() -> ProofResult<()> {
         seed: Some(SEED),
         steps: Some(STEPS as u32),
         guidance: Some(5.0),
-        sampler: Some(SAMPLER.to_owned()),
+        sampler: Some(SAMPLER.into()),
         ..Default::default()
     };
     let knobs = model.resolve_knobs(&request);

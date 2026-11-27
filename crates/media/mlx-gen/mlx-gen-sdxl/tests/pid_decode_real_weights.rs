@@ -243,7 +243,12 @@ fn sdxl_pid_from_ldm_early_stop() {
 
     // from_ldm early-stop at the (env-tunable) VP-frame capture ceiling.
     let early_req = GenerationRequest {
-        features: mlx_gen::gen_core::FeatureParams { pid: (Some(capture_sigma)).map(mlx_gen::gen_core::PidParams::with_capture_sigma), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::with_capture_sigma(
+                capture_sigma,
+            )),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();

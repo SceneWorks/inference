@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                "applied":report.applied,"skipped":report.skipped})
         })
         .collect();
-    let GenerationOutput::Video { frames, fps, audio } = generated else {
+    let Some(GenerationOutput::Video { frames, fps, audio }) = generated else {
         return Err("Wan T2V did not return video".into());
     };
     // The 9-frame request uses three latents. The non-causal z16 decoder

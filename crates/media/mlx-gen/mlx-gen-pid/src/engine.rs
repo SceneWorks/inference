@@ -699,7 +699,10 @@ mod tests {
         // pid_capture_sigma is only consulted under use_pid — off → None (native VAE), no error.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pid: if false { Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.2) }) } else { (Some(0.2)).map(mlx_gen::gen_core::PidParams::with_capture_sigma) }, ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(resolve_pid_decoder(None, &req, 0, "flux")

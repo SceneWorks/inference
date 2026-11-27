@@ -464,7 +464,12 @@ fn controls_the_route_does_not_have_are_refused_body() {
         (
             "timestep_to_start_cfg",
             GenerationRequest {
-                extensions: mlx_gen::gen_core::FamilyExtensions { pulid: Some(mlx_gen::gen_core::PulidExtension { timestep_to_start_cfg: Some(2), ..Default::default() }), ..Default::default() },
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    pulid: Some(mlx_gen::gen_core::PulidExtension {
+                        timestep_to_start_cfg: Some(2),
+                    }),
+                    ..Default::default()
+                },
                 ..request()
             },
         ),

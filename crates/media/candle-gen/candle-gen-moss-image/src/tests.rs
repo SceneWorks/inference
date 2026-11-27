@@ -1187,6 +1187,102 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
 }
 
 #[test]
+fn validate_agrees_with_generate_on_edit_requests() {
+    let generator = synthetic_generator();
+    let reference = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![128; 16 * 16 * 3],
+    };
+    let make_edit_req = || {
+        let mut req = GenerationRequest::default();
+        req.extensions.moss_image_mut().edit = Some(
+            gen_core::moss_image_edit::MossImageEditRequest {
+                references: vec![reference.clone()],
+                ..Default::default()
+            },
+        );
+        req
+    };
+
+    // Valid edit request passes validate.
+    assert!(generator.validate(&make_edit_req()).is_ok());
+
+    // Non-Images output is rejected by validate (matches generate).
+    let mut latent_edit = make_edit_req();
+    latent_edit
+        .extensions
+        .moss_image_mut()
+        .edit
+        .as_mut()
+        .unwrap()
+        .advanced
+        .output = MossImageOutputKind::Latents;
+    let err = generator.validate(&latent_edit).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(_))
+            && err.to_string().contains("image output"),
+        "expected Unsupported image output refusal, got {err}"
+    );
+
+    // Edit + DMD is rejected by validate (matches generate).
+    let mut dmd_edit = make_edit_req();
+    dmd_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+        acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+        ..Default::default()
+    });
+    let err = generator.validate(&dmd_edit).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(_))
+            && err.to_string().contains("edit+DMD"),
+        "expected Unsupported edit+DMD refusal, got {err}"
+    );
+
+    // Edit + SLG is rejected by validate.
+    let mut slg_edit = make_edit_req();
+    slg_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+        slg: Some(MossSkipLayerGuidance {
+            scale: 1.5,
+            layers: vec![10],
+            start: 0.0,
+            stop: 1.0,
+        }),
+        ..Default::default()
+    });
+    let err = generator.validate(&slg_edit).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("SLG"),
+        "expected Unsupported edit+SLG refusal, got {err}"
+    );
+
+    // Edit + uncond_skip_layers is rejected by validate.
+    let mut skip_edit = make_edit_req();
+    skip_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+        uncond_skip_layers: Some(vec![20]),
+        ..Default::default()
+    });
+    let err = generator.validate(&skip_edit).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(_))
+            && err.to_string().contains("full-layer CFG"),
+        "expected Unsupported edit+skip-layers refusal, got {err}"
+    );
+
+    // Edit + conditioning is rejected by validate.
+    let mut cond_edit = make_edit_req();
+    cond_edit.conditioning.push(gen_core::Conditioning::Reference {
+        image: reference,
+        strength: None,
+    });
+    let err = generator.validate(&cond_edit).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(_))
+            && err.to_string().contains("typed edit inputs"),
+        "expected Unsupported edit+conditioning refusal, got {err}"
+    );
+}
+
+#[test]
 fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     let mut base = synthetic_report().data().clone();
     base.resolved.uncond_skip_layers.clear();

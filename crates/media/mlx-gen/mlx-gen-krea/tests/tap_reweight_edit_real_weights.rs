@@ -167,7 +167,12 @@ fn text_style_gain_edit_sweep() {
                 image: source.clone(),
                 strength: Some(1.0),
             }],
-            extensions: mlx_gen::gen_core::FamilyExtensions { krea: Some(mlx_gen::gen_core::KreaExtension { text_style_gain: gain, ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                krea: Some(mlx_gen::gen_core::KreaExtension {
+                    text_style_gain: gain,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let GenerationOutput::Images(mut imgs) = gen

@@ -747,32 +747,32 @@ impl Generator for MossImageGenerator {
         decision
     }
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
         let edit_req = req
             .extensions
             .moss_image
             .as_ref()
             .and_then(|ext| ext.edit.as_ref());
-        let advanced = edit_req.map_or_else(MossImageAdvancedInputs::default, |edit| {
-            edit.as_inputs().advanced
-        });
-        if let Some(edit) = edit_req {
-            edit.as_inputs().validate()?;
-        }
+        let normalized;
+        let (req, advanced) = if let Some(edit) = edit_req {
+            let inputs = edit.as_inputs();
+            if inputs.advanced.output != MossImageOutputKind::Images {
+                return Err(gen_core::Error::Unsupported(
+                    "generic MOSS generation requires image output".into(),
+                ));
+            }
+            inputs.validate()?;
+            edit::check_precision(&self.device)?;
+            normalized = edit_request(req)?;
+            (&normalized, inputs.advanced)
+        } else {
+            (req, MossImageAdvancedInputs::default())
+        };
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
         let r = MossImageResolved::resolve(self.variant(), req)?;
-        advanced.validate(req, &r)?;
-        checked_host_elements(
-            req,
-            req.prompt_batch
-                .len()
-                .max(1)
-                .checked_mul(req.count as usize)
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported("MOSS expanded batch overflow".into())
-                })?,
-        )?;
+        let images = advanced.validate(req, &r)?;
+        checked_host_elements(req, images)?;
         memory_strategy::check_request(req)?;
         self.selected_sources(r.acceleration, &req.cancel)?
             .assets(r.acceleration)?;

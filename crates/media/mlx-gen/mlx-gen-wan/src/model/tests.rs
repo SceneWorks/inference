@@ -1133,7 +1133,12 @@ fn video_plan_freezes_padded_wan_decode_and_curated_routes_without_weights() {
         frames: Some(5),
         steps: Some(2),
         sampler: Some("heun".into()),
-        extensions: mlx_gen::gen_core::FamilyExtensions { wan: Some(mlx_gen::gen_core::WanExtension { trim_first_frames: Some(1), ..Default::default() }), ..Default::default() },
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            wan: Some(mlx_gen::gen_core::WanExtension {
+                trim_first_frames: Some(1),
+            }),
+            ..Default::default()
+        },
         ..req(512, 512)
     };
     let resolve = |id, r: &GenerationRequest| registry.compile_video_plan(id, &spec, r);

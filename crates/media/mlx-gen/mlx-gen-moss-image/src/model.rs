@@ -384,6 +384,51 @@ impl MossImage {
         }
         Sources::selected(self.variant, &self.spec, mode)
     }
+    fn prepare_generator_request<'a>(
+        request: &'a GenerationRequest,
+    ) -> gen_core::Result<(
+        std::borrow::Cow<'a, GenerationRequest>,
+        MossImageAdvancedInputs<'a>,
+        Option<MossImageEditInputs<'a>>,
+    )> {
+        let edit_req = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        if let Some(edit) = edit_req {
+            let inputs = edit.as_inputs();
+            if inputs.advanced.output != MossImageOutputKind::Images {
+                return Err(gen_core::Error::Unsupported(
+                    "generic MOSS generation requires image output".into(),
+                ));
+            }
+            inputs.validate()?;
+            let normalized = edit_request(request)?;
+            Ok((
+                std::borrow::Cow::Owned(normalized),
+                inputs.advanced,
+                Some(inputs),
+            ))
+        } else {
+            Ok((
+                std::borrow::Cow::Borrowed(request),
+                MossImageAdvancedInputs::default(),
+                None,
+            ))
+        }
+    }
+    #[cfg(test)]
+    fn validate_generator_request_policy(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        request: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        let (request, advanced, _) = Self::prepare_generator_request(request)?;
+        Self::resolve_request_inputs(variant, spec, &request, advanced)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
     fn validate_inputs(
         &self,
         request: &GenerationRequest,
@@ -1161,44 +1206,28 @@ impl Generator for MossImage {
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-        let edit_req = request
+        let is_edit_req = request
             .extensions
             .moss_image
             .as_ref()
-            .and_then(|ext| ext.edit.as_ref());
-        let (output, pag, execution, is_edit) = if let Some(edit_req) = edit_req {
+            .and_then(|ext| ext.edit.as_ref())
+            .is_some();
+        if is_edit_req {
             // Clear both receipts even if edit validation rejects before execution starts.
-            {
-                let mut state = self.state.lock().map_err(|_| {
-                    gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into())
-                })?;
-                let mut edit_report = self.edit_report.lock().map_err(|_| {
-                    gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
-                })?;
-                state
-                    .begin_request(&self.custom_pins, &mut edit_report)
-                    .map_err(gen_core::Error::from)?;
-            }
-            let inputs = edit_req.as_inputs();
-            if inputs.advanced.output != MossImageOutputKind::Images {
-                return Err(gen_core::Error::Unsupported(
-                    "generic MOSS generation requires image output".into(),
-                ));
-            }
-            inputs.validate()?;
-            let request = edit_request(request)?;
-            let (output, pag, execution) =
-                self.execute_with_execution(&request, inputs.advanced, progress, Some(inputs))?;
-            (output, pag, execution, true)
-        } else {
-            let (output, pag, execution) = self.execute_with_execution(
-                request,
-                MossImageAdvancedInputs::default(),
-                progress,
-                None,
-            )?;
-            (output, pag, execution, false)
-        };
+            let mut state = self.state.lock().map_err(|_| {
+                gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into())
+            })?;
+            let mut edit_report = self.edit_report.lock().map_err(|_| {
+                gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
+            })?;
+            state
+                .begin_request(&self.custom_pins, &mut edit_report)
+                .map_err(gen_core::Error::from)?;
+        }
+        let (request, advanced, edit_inputs) = Self::prepare_generator_request(request)?;
+        let is_edit = edit_inputs.is_some();
+        let (output, pag, execution) =
+            self.execute_with_execution(&request, advanced, progress, edit_inputs)?;
         let MossImageAdvancedOutput::Images(images) = output else {
             return Err(gen_core::Error::Unsupported(
                 "generic MOSS generation requires image output".into(),
@@ -1240,19 +1269,8 @@ impl Generator for MossImage {
         &self.descriptor
     }
     fn validate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
-        let edit_req = request
-            .extensions
-            .moss_image
-            .as_ref()
-            .and_then(|ext| ext.edit.as_ref());
-        let advanced = if let Some(edit) = edit_req {
-            let inputs = edit.as_inputs();
-            inputs.validate()?;
-            inputs.advanced
-        } else {
-            MossImageAdvancedInputs::default()
-        };
-        self.validate_inputs(request, advanced)
+        let (request, advanced, _) = Self::prepare_generator_request(request)?;
+        self.validate_inputs(&request, advanced)
             .map(|_| ())
             .map_err(Into::into)
     }
@@ -1560,6 +1578,136 @@ mod cpu_tests {
                 .unwrap()
                 .acceleration,
             MossImageAcceleration::Off
+        );
+    }
+
+    #[test]
+    fn validate_agrees_with_generate_on_edit_requests() {
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(std::path::PathBuf::from(
+            "synthetic-moss",
+        )));
+        let reference = gen_core::Image {
+            width: 16,
+            height: 16,
+            pixels: vec![128; 16 * 16 * 3],
+        };
+        let make_edit_req = || {
+            let mut req = GenerationRequest::default();
+            req.extensions.moss_image_mut().edit = Some(
+                gen_core::moss_image_edit::MossImageEditRequest {
+                    references: vec![reference.clone()],
+                    ..Default::default()
+                },
+            );
+            req
+        };
+
+        // Valid edit request passes generator validation policy.
+        assert!(MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &make_edit_req()
+        )
+        .is_ok());
+
+        // Non-Images output is rejected by validate (matches generate).
+        let mut latent_edit = make_edit_req();
+        latent_edit
+            .extensions
+            .moss_image_mut()
+            .edit
+            .as_mut()
+            .unwrap()
+            .advanced
+            .output = MossImageOutputKind::Latents;
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &latent_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("image output"),
+            "expected Unsupported image output refusal, got {err}"
+        );
+
+        // Edit + DMD is rejected by validate (matches generate).
+        let mut dmd_edit = make_edit_req();
+        dmd_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &dmd_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("edit+DMD"),
+            "expected Unsupported edit+DMD refusal, got {err}"
+        );
+
+        // Edit + SLG is rejected by validate.
+        let mut slg_edit = make_edit_req();
+        slg_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            slg: Some(MossSkipLayerGuidance {
+                scale: 1.5,
+                layers: vec![10],
+                start: 0.0,
+                stop: 1.0,
+            }),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &slg_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("SLG"),
+            "expected Unsupported edit+SLG refusal, got {err}"
+        );
+
+        // Edit + uncond_skip_layers is rejected by validate.
+        let mut skip_edit = make_edit_req();
+        skip_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            uncond_skip_layers: Some(vec![20]),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &skip_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("full-layer CFG"),
+            "expected Unsupported edit+skip-layers refusal, got {err}"
+        );
+
+        // Edit + conditioning is rejected by validate.
+        let mut cond_edit = make_edit_req();
+        cond_edit
+            .conditioning
+            .push(gen_core::Conditioning::Reference {
+                image: reference,
+                strength: None,
+            });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &cond_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("typed edit inputs"),
+            "expected Unsupported edit+conditioning refusal, got {err}"
         );
     }
 
