@@ -649,13 +649,25 @@ impl GatedDeltaNet {
         b_in: &Tensor,
         q_scale: f64,
     ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
-        let served = !self.sensenova
-            && crate::primitives::gated_delta::fused_prep_serves(conv_out)
-            && candle_quant_kernels::gdn_qkv_serves_key_dim(self.head_k_dim)
-            && [a_in, b_in, &self.a_log, &self.dt_bias]
-                .iter()
-                .all(|t| t.dtype() == DType::BF16);
-        if !served {
+        use crate::primitives::gated_delta::{note_gdn, plan_fused_prep, GdnRefusal};
+        let plan = if self.sensenova {
+            Err(GdnRefusal::Variant)
+        } else {
+            plan_fused_prep(conv_out).and_then(|()| {
+                if !candle_quant_kernels::gdn_qkv_serves_key_dim(self.head_k_dim) {
+                    Err(GdnRefusal::KeyDim)
+                } else if ![a_in, b_in, &self.a_log, &self.dt_bias]
+                    .iter()
+                    .all(|t| t.dtype() == DType::BF16)
+                {
+                    Err(GdnRefusal::Dtype)
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        note_gdn(plan);
+        if plan.is_err() {
             return Ok(None);
         }
         let (q, k, v) = candle_quant_kernels::gdn_qkv(

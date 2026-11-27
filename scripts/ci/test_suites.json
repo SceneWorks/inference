@@ -2090,6 +2090,36 @@
       "features": [
         "cuda"
       ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::fused_recurrence_matches_the_op_chain_bit_for_bit",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6136 CUDA numerical parity: the fused gated-delta recurrence kernel vs the op-chain reference, bit for bit, through prefill, decode, a verify step, a ring rollback and decode-on at Dk 32/64/128/256 with GQA x3. cfg(cuda), CUDA device 0.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::the_fused_parity_check_discriminates_mutations",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6136 CUDA mutation check: the fused-vs-reference parity comparison must FAIL when the fused arm drops the decay multiply or a rollback restores the wrong ring slot (Dk 64/128), proving the parity test discriminates. cfg(cuda), CUDA device 0.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
     }
   ]
 }

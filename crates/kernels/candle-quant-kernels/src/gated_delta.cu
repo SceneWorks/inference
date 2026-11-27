@@ -1,3 +1,8 @@
+// Attribution (SW-F287 E10): the gated delta rule recurrence and the GDN input preparation follow
+// mlx_lm.models.gated_delta (MIT, ml-explore/mlx-lm) and the Gated DeltaNet kernels of comfy-kitchen
+// (Apache-2.0, Comfy-Org/comfy-kitchen); the implementation here targets this repository's
+// candle op chains bit for bit (see the numerics contract below).
+//
 // Fused gated delta recurrence for decode and speculative verify (Gated DeltaNet linear attention).
 //
 // One warp owns one (batch, value head, value row) row of the recurrent state S [B, Hv, Dv, Dk]

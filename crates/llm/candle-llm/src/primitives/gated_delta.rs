@@ -403,33 +403,130 @@ pub(crate) fn with_unfused_prep<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Whether the fused GDN input-preparation kernels ([`candle_quant_kernels::gdn_conv_silu`],
-/// `gdn_qkv`, `gdn_gates`) serve `x`: a `BF16` tensor on a CUDA device whose kernels compile.
-/// They are bit-identical to the op chains they replace, so this is a pure speed choice.
-pub(crate) fn fused_prep_serves(x: &Tensor) -> bool {
-    #[cfg(test)]
-    if FORCE_UNFUSED_PREP.with(std::cell::Cell::get) {
-        return false;
-    }
-    x.device().is_cuda()
-        && x.dtype() == DType::BF16
-        && candle_quant_kernels::gdn_prep_available(x.device()).is_ok()
+/// Why a fused GDN kernel (the input preparation or the recurrence step) did not serve a call and
+/// the op-chain reference ran instead (feature SW-F287, E1/E5): the reference-run reason the
+/// fused tally reports, so a downgrade is never silent and never changes backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GdnRefusal {
+    /// The fused-kernel switch is off (`CANDLE_LLM_FUSED_KERNELS=0`, or a test override).
+    Disabled,
+    /// The tensors are not on a CUDA device (or the build has no `cuda` feature).
+    NotCuda,
+    /// An operand dtype the kernel does not take (the step wants F32, the preparation BF16).
+    Dtype,
+    /// The key head (`linear_key_head_dim`) is not one the kernel serves.
+    KeyDim,
+    /// A layer variant with no fused kernel (the SenseNova conv wrapper).
+    Variant,
+    /// The cache has no checkpoint ring to write the step's states into.
+    NoRing,
+    /// The kernel cannot compile on this device; the cached compile error's label.
+    Compile(&'static str),
 }
 
-/// Whether the fused recurrence kernel serves this step: a CUDA device whose kernel compiles,
+impl GdnRefusal {
+    /// The stable lower-case reason label recorded in the fused tally.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => crate::primitives::fused::REASON_DISABLED,
+            #[cfg(feature = "cuda")]
+            Self::NotCuda => "not_cuda",
+            #[cfg(not(feature = "cuda"))]
+            Self::NotCuda => crate::primitives::fused::REASON_CUDA_FEATURE_OFF,
+            Self::Dtype => "dtype",
+            Self::KeyDim => "dk_unsupported",
+            Self::Variant => "variant",
+            Self::NoRing => "no_ring",
+            Self::Compile(label) => label,
+        }
+    }
+}
+
+/// What decides whether a fused GDN kernel serves a call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnFacts {
+    /// The fused-kernel switch.
+    pub enabled: bool,
+    /// The operands are on a CUDA device.
+    pub cuda: bool,
+    /// Every operand has the dtype the kernel takes.
+    pub dtypes_ok: bool,
+    /// The key head is one the kernel serves.
+    pub key_dim_ok: bool,
+}
+
+/// The pure plan: which refusal (if any) sends a call to the reference, in precedence order.
+/// `compile` is asked last, and only for a CUDA call the other checks let through, so it never
+/// touches a device the call is not on.
+pub(crate) fn plan_gdn(
+    facts: GdnFacts,
+    compile: impl FnOnce() -> Option<&'static str>,
+) -> std::result::Result<(), GdnRefusal> {
+    if !facts.cuda {
+        return Err(GdnRefusal::NotCuda);
+    }
+    if !facts.enabled {
+        return Err(GdnRefusal::Disabled);
+    }
+    if !facts.dtypes_ok {
+        return Err(GdnRefusal::Dtype);
+    }
+    if !facts.key_dim_ok {
+        return Err(GdnRefusal::KeyDim);
+    }
+    match compile() {
+        Some(label) => Err(GdnRefusal::Compile(label)),
+        None => Ok(()),
+    }
+}
+
+/// Record a plan's outcome in the per-thread fused tally (fused, or reference with its reason).
+pub(crate) fn note_gdn(plan: std::result::Result<(), GdnRefusal>) {
+    match plan {
+        Ok(()) => crate::primitives::fused::note_fused(),
+        Err(why) => crate::primitives::fused::note_reference(why.label()),
+    }
+}
+
+/// The plan for the fused GDN input-preparation kernels ([`candle_quant_kernels::gdn_conv_silu`],
+/// `gdn_qkv`, `gdn_gates`) on `x`: a `BF16` tensor on a CUDA device whose kernels compile. They
+/// are bit-identical to the op chains they replace, so this is a pure speed choice.
+pub(crate) fn plan_fused_prep(x: &Tensor) -> std::result::Result<(), GdnRefusal> {
+    #[cfg(test)]
+    if FORCE_UNFUSED_PREP.with(std::cell::Cell::get) {
+        return Err(GdnRefusal::Disabled);
+    }
+    plan_gdn(
+        GdnFacts {
+            enabled: crate::primitives::fused::fused_kernels_enabled(),
+            cuda: x.device().is_cuda(),
+            dtypes_ok: x.dtype() == DType::BF16,
+            key_dim_ok: true,
+        },
+        || candle_quant_kernels::gdn_prep_unavailable_label(x.device()),
+    )
+}
+
+/// The plan for the fused recurrence kernel on this step: a CUDA device whose kernel compiles,
 /// `F32` operands and ring, and a key head it fits. Anything else takes the op-chain reference.
-fn fused_step_serves(q: &Tensor, ssm: &Tensor, g: &Tensor) -> bool {
+fn plan_fused_step(q: &Tensor, ssm: &Tensor, g: &Tensor) -> std::result::Result<(), GdnRefusal> {
     #[cfg(test)]
     if FORCE_PER_TOKEN.with(std::cell::Cell::get) {
-        return false;
+        return Err(GdnRefusal::Disabled);
     }
-    q.device().is_cuda()
-        && q.dtype() == DType::F32
-        && g.dtype() == DType::F32
-        && ssm.dtype() == DType::F32
-        && q.dim(3)
-            .is_ok_and(candle_quant_kernels::gated_delta_serves_key_dim)
-        && candle_quant_kernels::gated_delta_available(q.device()).is_ok()
+    plan_gdn(
+        GdnFacts {
+            enabled: crate::primitives::fused::fused_kernels_enabled(),
+            cuda: q.device().is_cuda(),
+            dtypes_ok: q.dtype() == DType::F32
+                && g.dtype() == DType::F32
+                && ssm.dtype() == DType::F32,
+            key_dim_ok: q
+                .dim(3)
+                .is_ok_and(candle_quant_kernels::gated_delta_serves_key_dim),
+        },
+        || candle_quant_kernels::gated_delta_unavailable_label(q.device()),
+    )
 }
 
 /// The shortest run of un-checkpointed tokens the recurrence computes chunkwise (one full
@@ -800,11 +897,19 @@ fn depthwise_conv_traced(
 ) -> Result<(Tensor, ConvTrace)> {
     let (_b, s, c) = x.dims3()?;
     let kk = weight.dim(1)?; // kernel size K (weight is [C, K])
-    if !float_accumulate
-        && fused_prep_serves(x)
-        && weight.dtype() == DType::BF16
-        && conv_state.dtype() == DType::BF16
-    {
+    let conv_plan = if float_accumulate {
+        Err(GdnRefusal::Variant)
+    } else {
+        plan_fused_prep(x).and_then(|()| {
+            if weight.dtype() == DType::BF16 && conv_state.dtype() == DType::BF16 {
+                Ok(())
+            } else {
+                Err(GdnRefusal::Dtype)
+            }
+        })
+    };
+    note_gdn(conv_plan);
+    if conv_plan.is_ok() {
         // One kernel for the concat, the K-tap conv and the SiLU, bit-identical to the chain below.
         let (cat, out) = candle_quant_kernels::gdn_conv_silu(conv_state, x, weight)?;
         return Ok((
@@ -1350,9 +1455,14 @@ impl DeltaNetCache {
                 ring.lo = ring.lo.max(offset + t.min(slots) as i32 + 1 - slots as i32);
                 let ring = &*ring;
                 let first_write = t.saturating_sub(slots);
-                if !runs_chunked(first_write.min(t), q.device())
-                    && fused_step_serves(q, &ring.ssm, g)
-                {
+                // A chunkwise prefill is its own algorithm, not a downgraded decode step, so it
+                // is not tallied; every per-token step is, fused or with the reason it was not.
+                let fused_step = !runs_chunked(first_write.min(t), q.device()) && {
+                    let plan = plan_fused_step(q, &ring.ssm, g);
+                    note_gdn(plan);
+                    plan.is_ok()
+                };
+                if fused_step {
                     // The fused recurrence: one kernel over the step's tokens,
                     // writing each token's state into its ring slot; the conv tails are written
                     // as the reference sink writes them.
@@ -1482,9 +1592,14 @@ impl DeltaNetCache {
                 }
                 .and_then(|(y, _)| Ok((y, ring.views(next)?)))
             }
-            None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
-                |(y, final_state)| Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state))),
-            ),
+            None => {
+                note_gdn(Err(GdnRefusal::NoRing));
+                gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
+                    |(y, final_state)| {
+                        Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state)))
+                    },
+                )
+            }
         };
         let (y, (conv_state, ssm_state)) = match run {
             Ok(out) => out,
@@ -2553,11 +2668,155 @@ mod tests {
         }
     }
 
+    /// How the fused arm of [`fused_parity`] is deliberately broken, to prove the parity test
+    /// discriminates (SW-6136's mutation checks).
+    #[cfg(feature = "cuda")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Mutation {
+        /// The faithful fused arm.
+        None,
+        /// The decay multiply is dropped: the fused arm sees `g = 1`.
+        DropDecay,
+        /// The rollback restores the slot one position early (the wrong ring slot).
+        WrongRollbackSlot,
+    }
+
+    /// Run the shared prompt / decode / verify / rollback / decode-on plan through a fused cache
+    /// (with `mutation` applied to it) and an op-chain reference cache; the first bit difference
+    /// as `Err`.
+    #[cfg(feature = "cuda")]
+    fn fused_parity(
+        device: &Device,
+        dk: usize,
+        mutation: Mutation,
+    ) -> std::result::Result<(), String> {
+        let (b, hk, hv, dv, conv_dim) = (1usize, 2usize, 6usize, 16usize, 8usize);
+        let total = 12usize;
+        let mut seed = 0x9e37_79b9u32 ^ dk as u32;
+        let mut sample = |n: usize, scale: f32, bias: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    bias + ((seed % 20001) as f32 / 10000.0 - 1.0) * scale
+                })
+                .collect()
+        };
+        let q = Tensor::from_vec(
+            sample(total * hk * dk, 0.1, 0.0),
+            (b, total, hk, dk),
+            device,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            sample(total * hk * dk, 0.1, 0.0),
+            (b, total, hk, dk),
+            device,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            sample(total * hv * dv, 1.0, 0.0),
+            (b, total, hv, dv),
+            device,
+        )
+        .unwrap();
+        let g = Tensor::from_vec(sample(total * hv, 0.04, 0.95), (b, total, hv), device).unwrap();
+        let beta = Tensor::from_vec(sample(total * hv, 0.4, 0.5), (b, total, hv), device).unwrap();
+        let x = Tensor::from_vec(
+            sample(total * conv_dim, 1.0, 0.0),
+            (b, total, conv_dim),
+            device,
+        )
+        .unwrap();
+        let weight =
+            Tensor::from_vec(sample(conv_dim * RK, 0.5, 0.0), (conv_dim, RK), device).unwrap();
+        let spec = RingSpec {
+            slots: 6,
+            conv_dims: (b, RK - 1, conv_dim),
+            conv_dtype: DType::F32,
+            ssm_dims: (b, hv, dv, dk),
+            ssm_dtype: DType::F32,
+            device: device.clone(),
+        };
+        // (start, len) per advance; `None` rolls back to that position instead.
+        let plan: [(usize, usize, Option<i32>); 7] = [
+            (0, 3, None),
+            (3, 1, None),
+            (4, 1, None),
+            (5, 4, None),
+            (0, 0, Some(7)),
+            (7, 1, None),
+            (8, 4, None),
+        ];
+        type Seen = Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>;
+        let run = |cache: &mut DeltaNetCache, mutation: Mutation| -> Seen {
+            let mut seen = Vec::new();
+            for &(start, len, rollback) in &plan {
+                if let Some(n) = rollback {
+                    let n = if mutation == Mutation::WrongRollbackSlot {
+                        n - 1
+                    } else {
+                        n
+                    };
+                    cache.rollback_to(n).unwrap();
+                    continue;
+                }
+                let conv_state = match cache.conv_state() {
+                    Some(c) => c.clone(),
+                    None => Tensor::zeros((b, RK - 1, conv_dim), DType::F32, device).unwrap(),
+                };
+                let (_out, trace) =
+                    causal_depthwise_conv_traced(&narrow_t(&x, start, len), &weight, &conv_state)
+                        .unwrap();
+                let gate = if mutation == Mutation::DropDecay {
+                    g.ones_like().unwrap()
+                } else {
+                    g.clone()
+                };
+                let y = cache
+                    .advance(
+                        &trace,
+                        &narrow_t(&q, start, len),
+                        &narrow_t(&k, start, len),
+                        &narrow_t(&v, start, len),
+                        &narrow_t(&gate, start, len),
+                        &narrow_t(&beta, start, len),
+                    )
+                    .unwrap();
+                let (conv, ssm) = live(cache).unwrap();
+                seen.push((host(&y), conv, ssm));
+            }
+            seen
+        };
+        let mut fused = DeltaNetCache::with_ring(spec.clone()).unwrap();
+        let fused_seen = run(&mut fused, mutation);
+        let mut reference = DeltaNetCache::with_ring(spec).unwrap();
+        let reference_seen = with_per_token_reference(|| run(&mut reference, Mutation::None));
+        let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (i, (f, r)) in fused_seen.iter().zip(&reference_seen).enumerate() {
+            if bits(&f.0) != bits(&r.0) {
+                return Err(format!("dk {dk} step {i}: y"));
+            }
+            if bits(&f.1) != bits(&r.1) {
+                return Err(format!("dk {dk} step {i}: conv tail"));
+            }
+            if bits(&f.2) != bits(&r.2) {
+                return Err(format!("dk {dk} step {i}: ssm state"));
+            }
+        }
+        if fused.restorable() != reference.restorable() {
+            return Err(format!("dk {dk}: restorable window"));
+        }
+        Ok(())
+    }
+
     /// The fused CUDA recurrence is bit-identical to the op chain it replaces: the same outputs
     /// and the same ringed states through a prompt, single-token decodes, a speculative verify
     /// step, a rollback into it and decoding on from there, for every served key width (GQA x3).
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "GPU parity: run on the CUDA box / exhaustive suite"]
     fn fused_recurrence_matches_the_op_chain_bit_for_bit() {
         let Ok(device) = crate::device::new_cuda_for_test() else {
             eprintln!("skipped: no CUDA device");
@@ -2567,111 +2826,175 @@ mod tests {
             eprintln!("skipped: the fused kernel does not compile here");
             return;
         }
-        let (b, hk, hv, dv, conv_dim) = (1usize, 2usize, 6usize, 16usize, 8usize);
         for dk in [32usize, 64, 128, 256] {
-            let total = 12usize;
-            let mut seed = 0x9e37_79b9u32 ^ dk as u32;
-            let mut sample = |n: usize, scale: f32, bias: f32| -> Vec<f32> {
-                (0..n)
-                    .map(|_| {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 17;
-                        seed ^= seed << 5;
-                        bias + ((seed % 20001) as f32 / 10000.0 - 1.0) * scale
-                    })
-                    .collect()
-            };
-            let q = Tensor::from_vec(
-                sample(total * hk * dk, 0.1, 0.0),
-                (b, total, hk, dk),
-                &device,
-            )
-            .unwrap();
-            let k = Tensor::from_vec(
-                sample(total * hk * dk, 0.1, 0.0),
-                (b, total, hk, dk),
-                &device,
-            )
-            .unwrap();
-            let v = Tensor::from_vec(
-                sample(total * hv * dv, 1.0, 0.0),
-                (b, total, hv, dv),
-                &device,
-            )
-            .unwrap();
-            let g =
-                Tensor::from_vec(sample(total * hv, 0.04, 0.95), (b, total, hv), &device).unwrap();
-            let beta =
-                Tensor::from_vec(sample(total * hv, 0.4, 0.5), (b, total, hv), &device).unwrap();
-            let x = Tensor::from_vec(
-                sample(total * conv_dim, 1.0, 0.0),
-                (b, total, conv_dim),
-                &device,
-            )
-            .unwrap();
-            let weight =
-                Tensor::from_vec(sample(conv_dim * RK, 0.5, 0.0), (conv_dim, RK), &device).unwrap();
+            fused_parity(&device, dk, Mutation::None).unwrap();
+        }
+    }
+
+    /// Mutation check (SW-6136): the parity comparison above fails when the fused arm drops the
+    /// decay multiply and when a rollback restores the wrong ring slot, so a green parity run is
+    /// evidence rather than a comparison that cannot fail.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU parity: run on the CUDA box / exhaustive suite"]
+    fn the_fused_parity_check_discriminates_mutations() {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
+            eprintln!("skipped: no CUDA device");
+            return;
+        };
+        if candle_quant_kernels::gated_delta_available(&device).is_err() {
+            eprintln!("skipped: the fused kernel does not compile here");
+            return;
+        }
+        for mutation in [Mutation::DropDecay, Mutation::WrongRollbackSlot] {
+            for dk in [64usize, 128] {
+                assert!(
+                    fused_parity(&device, dk, mutation).is_err(),
+                    "dk {dk}: {mutation:?} went undetected"
+                );
+            }
+        }
+    }
+
+    fn facts() -> GdnFacts {
+        GdnFacts {
+            enabled: true,
+            cuda: true,
+            dtypes_ok: true,
+            key_dim_ok: true,
+        }
+    }
+
+    #[test]
+    fn the_fused_plan_names_why_the_reference_runs() {
+        // A served call: nothing refuses.
+        assert_eq!(plan_gdn(facts(), || None), Ok(()));
+        let cases = [
+            (
+                GdnFacts {
+                    enabled: false,
+                    ..facts()
+                },
+                GdnRefusal::Disabled,
+            ),
+            (
+                GdnFacts {
+                    cuda: false,
+                    ..facts()
+                },
+                GdnRefusal::NotCuda,
+            ),
+            (
+                GdnFacts {
+                    dtypes_ok: false,
+                    ..facts()
+                },
+                GdnRefusal::Dtype,
+            ),
+            (
+                GdnFacts {
+                    key_dim_ok: false,
+                    ..facts()
+                },
+                GdnRefusal::KeyDim,
+            ),
+        ];
+        for (f, why) in cases {
+            assert_eq!(plan_gdn(f, || None), Err(why));
+        }
+        // A compile failure is reported under the cached compile error's label.
+        assert_eq!(
+            plan_gdn(facts(), || Some("nvrtc")),
+            Err(GdnRefusal::Compile("nvrtc"))
+        );
+        // Precedence, and the compile probe is not asked on a refusal that precedes it.
+        let bad = GdnFacts {
+            enabled: false,
+            cuda: false,
+            dtypes_ok: false,
+            key_dim_ok: false,
+        };
+        let never = || -> Option<&'static str> { panic!("probed a device the call is not on") };
+        assert_eq!(plan_gdn(bad, never), Err(GdnRefusal::NotCuda));
+        let cuda = GdnFacts { cuda: true, ..bad };
+        assert_eq!(plan_gdn(cuda, never), Err(GdnRefusal::Disabled));
+        let on = GdnFacts {
+            enabled: true,
+            ..cuda
+        };
+        assert_eq!(plan_gdn(on, never), Err(GdnRefusal::Dtype));
+        let typed = GdnFacts {
+            dtypes_ok: true,
+            ..on
+        };
+        assert_eq!(plan_gdn(typed, never), Err(GdnRefusal::KeyDim));
+    }
+
+    #[test]
+    fn the_refusal_labels_are_stable() {
+        assert_eq!(GdnRefusal::Disabled.label(), "disabled");
+        assert_eq!(GdnRefusal::Dtype.label(), "dtype");
+        assert_eq!(GdnRefusal::KeyDim.label(), "dk_unsupported");
+        assert_eq!(GdnRefusal::Variant.label(), "variant");
+        assert_eq!(GdnRefusal::NoRing.label(), "no_ring");
+        assert_eq!(
+            GdnRefusal::Compile("compute_floor").label(),
+            "compute_floor"
+        );
+        #[cfg(feature = "cuda")]
+        assert_eq!(GdnRefusal::NotCuda.label(), "not_cuda");
+        #[cfg(not(feature = "cuda"))]
+        assert_eq!(GdnRefusal::NotCuda.label(), "cuda_feature_off");
+    }
+
+    #[test]
+    fn a_refused_plan_is_tallied_with_its_reason_and_a_served_one_as_fused() {
+        use crate::primitives::fused::fused_tally;
+        let start = fused_tally();
+        note_gdn(Err(GdnRefusal::KeyDim));
+        let d = fused_tally().since(&start);
+        assert_eq!((d.fused, d.reference), (0, 1));
+        assert_eq!(d.reference_reason, Some("dk_unsupported"));
+        assert_eq!(d.label(), "reference");
+        let mid = fused_tally();
+        note_gdn(Ok(()));
+        let d = fused_tally().since(&mid);
+        assert_eq!((d.fused, d.reference), (1, 0));
+    }
+
+    /// A whole step on a CPU cache takes the reference, whatever the switch says, and records a
+    /// reference run (never silent): `not_cuda` here, `disabled` on a CUDA call (pinned in
+    /// `the_fused_plan_names_why_the_reference_runs`). The outputs are the reference's.
+    #[test]
+    fn a_cpu_step_runs_the_reference_and_is_tallied() {
+        use crate::primitives::fused::{fused_policy_guard, fused_tally};
+        for switch in [Some(false), Some(true)] {
+            let _policy = fused_policy_guard(switch);
+            let (b, hk, hv, dk, dv, conv_dim) = (1usize, 1usize, 2usize, 32usize, 4usize, 6usize);
+            let dev = Device::Cpu;
             let spec = RingSpec {
-                slots: 6,
+                slots: 3,
                 conv_dims: (b, RK - 1, conv_dim),
                 conv_dtype: DType::F32,
                 ssm_dims: (b, hv, dv, dk),
                 ssm_dtype: DType::F32,
-                device: device.clone(),
+                device: dev.clone(),
             };
-            // (start, len) per advance; `None` rolls back to that position instead.
-            let plan: [(usize, usize, Option<i32>); 7] = [
-                (0, 3, None),
-                (3, 1, None),
-                (4, 1, None),
-                (5, 4, None),
-                (0, 0, Some(7)),
-                (7, 1, None),
-                (8, 4, None),
-            ];
-            let run = |cache: &mut DeltaNetCache| -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                let mut seen = Vec::new();
-                for &(start, len, rollback) in &plan {
-                    if let Some(n) = rollback {
-                        cache.rollback_to(n).unwrap();
-                        continue;
-                    }
-                    let conv_state = match cache.conv_state() {
-                        Some(c) => c.clone(),
-                        None => Tensor::zeros((b, RK - 1, conv_dim), DType::F32, &device).unwrap(),
-                    };
-                    let (_out, trace) = causal_depthwise_conv_traced(
-                        &narrow_t(&x, start, len),
-                        &weight,
-                        &conv_state,
-                    )
-                    .unwrap();
-                    let y = cache
-                        .advance(
-                            &trace,
-                            &narrow_t(&q, start, len),
-                            &narrow_t(&k, start, len),
-                            &narrow_t(&v, start, len),
-                            &narrow_t(&g, start, len),
-                            &narrow_t(&beta, start, len),
-                        )
-                        .unwrap();
-                    let (conv, ssm) = live(cache).unwrap();
-                    seen.push((host(&y), conv, ssm));
-                }
-                seen
-            };
-            let mut fused = DeltaNetCache::with_ring(spec.clone()).unwrap();
-            let fused_seen = run(&mut fused);
-            let mut reference = DeltaNetCache::with_ring(spec).unwrap();
-            let reference_seen = with_per_token_reference(|| run(&mut reference));
-            for (i, (f, r)) in fused_seen.iter().zip(&reference_seen).enumerate() {
-                let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                assert_eq!(bits(&f.0), bits(&r.0), "dk {dk} step {i}: y");
-                assert_eq!(bits(&f.1), bits(&r.1), "dk {dk} step {i}: conv tail");
-                assert_eq!(bits(&f.2), bits(&r.2), "dk {dk} step {i}: ssm state");
-            }
-            assert_eq!(fused.restorable(), reference.restorable());
+            let mut cache = DeltaNetCache::with_ring(spec).unwrap();
+            let x = Tensor::ones((b, 1, conv_dim), DType::F32, &dev).unwrap();
+            let w = Tensor::ones((conv_dim, RK), DType::F32, &dev).unwrap();
+            let cs = Tensor::zeros((b, RK - 1, conv_dim), DType::F32, &dev).unwrap();
+            let (_out, trace) = causal_depthwise_conv_traced(&x, &w, &cs).unwrap();
+            let q = Tensor::ones((b, 1, hk, dk), DType::F32, &dev).unwrap();
+            let v = Tensor::ones((b, 1, hv, dv), DType::F32, &dev).unwrap();
+            let g = Tensor::ones((b, 1, hv), DType::F32, &dev).unwrap();
+            let start = fused_tally();
+            cache.advance(&trace, &q, &q, &v, &g, &g).unwrap();
+            let d = fused_tally().since(&start);
+            assert_eq!(d.fused, 0, "no fused kernel on CPU");
+            assert!(d.reference >= 1);
+            assert!(d.reference_reason.is_some());
+            assert_eq!(d.label(), "reference");
         }
     }
 
