@@ -333,3 +333,121 @@ fn forced_spatial_tiling_matches_monolithic_with_acceptable_psnr() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED forced_spatial_tiling_matches_monolithic_with_acceptable_psnr");
 }
+
+/// Resets the SW-6132 job-level lossy-attention switch even when an assertion unwinds.
+struct LossyAttentionJob;
+
+impl LossyAttentionJob {
+    fn set(opt_ins: candle_gen::fused_attention::LossyAttentionOptIns) -> Self {
+        candle_gen::fused_attention::set_lossy_attention(opt_ins).expect("a valid selection");
+        Self
+    }
+}
+
+impl Drop for LossyAttentionJob {
+    fn drop(&mut self) {
+        candle_gen::fused_attention::set_lossy_attention(
+            candle_gen::fused_attention::LossyAttentionOptIns::OFF,
+        )
+        .unwrap();
+    }
+}
+
+/// SW-6132 (SW-F287 S7): the shared, job-level lossy-attention opt-in on a video model it cannot
+/// serve — the "never silent" half of the contract. SVD's UNet runs **f32** (see `dense_dtype`)
+/// and both lossy kernels take bf16 / f16 only, so with the switch on every attention call is
+/// offered to the kernel, refused with a counted `dtype` reason (Sol-Attn: `dtype` / `head_dim` /
+/// `cross_attention`), and routed exactly as before: the clip is byte-identical to the off clip.
+/// A fixed-seed 8-frame 512² clip (10 steps) with the switch off, `int8` and `sol`. (Under the
+/// `SVD_FORCE_F16` / `SVD_FORCE_BF16` escapes the INT8 kernel may serve calls; the test then only
+/// checks that every call was offered and counted.)
+///
+/// `SVD_SNAPSHOT=<snapshot> cargo test --release --features cuda,model-inference-proof
+/// -p candle-gen-svd --test real_weights_smoke svd_xt_job_level_lossy_attention_smoke -- --ignored
+/// --nocapture --test-threads=1`
+#[test]
+#[ignore = "requires SVD_SNAPSHOT, real weights, and a CUDA device"]
+fn svd_xt_job_level_lossy_attention_smoke() {
+    use candle_gen::fused_attention::{
+        attention_path_counts, lossy_attention, Int8AttentionConfig, LossyAttentionOptIns,
+        SolConfig,
+    };
+    let generator = load_sequential();
+    let clip = request(512, 512, 8, 1, 10);
+    let run = |label: &str, opt_ins: LossyAttentionOptIns| {
+        let job = LossyAttentionJob::set(opt_ins);
+        let before = attention_path_counts();
+        let out = run_profile(label, generator.as_ref(), &clip);
+        let counts = attention_path_counts().since(&before);
+        drop(job);
+        assert_eq!(
+            lossy_attention(),
+            LossyAttentionOptIns::OFF,
+            "reset at job end"
+        );
+        println!("[[SVD_LOSSY_ATTENTION]] {label}: {counts:?}");
+        (out, counts)
+    };
+    let (off, off_counts) = run("off", LossyAttentionOptIns::OFF);
+    assert_eq!((off_counts.int8, off_counts.sol), (0, 0), "{off_counts:?}");
+    assert_eq!(off_counts.int8_refusals.total(), 0, "{off_counts:?}");
+    assert_eq!(off_counts.sol_refusals.total(), 0, "{off_counts:?}");
+    assert!(off_counts.total() > 0, "{off_counts:?}");
+
+    let identical = |frames: &[Image]| {
+        frames
+            .iter()
+            .zip(&off.frames)
+            .all(|(a, b)| a.pixels == b.pixels)
+    };
+    let (int8, int8_counts) = run(
+        "job-int8",
+        LossyAttentionOptIns {
+            int8: Some(Int8AttentionConfig::default()),
+            sol: None,
+        },
+    );
+    assert_eq!(int8_counts.sol, 0, "{int8_counts:?}");
+    assert_eq!(
+        int8_counts.int8 + int8_counts.int8_refusals.total(),
+        int8_counts.total(),
+        "every call is offered to INT8 and counted: {int8_counts:?}"
+    );
+    if int8_counts.int8 == 0 {
+        assert!(
+            identical(&int8.frames),
+            "a refused opt-in leaves the clip byte-identical"
+        );
+    }
+    println!(
+        "[[SVD_LOSSY_ATTENTION]] job int8: {} INT8 calls of {}, refusals {:?}, PSNR vs off {:.2} dB",
+        int8_counts.int8,
+        int8_counts.total(),
+        int8_counts.int8_refusals,
+        frame_psnr(&int8.frames, &off.frames)
+    );
+
+    let (sol, sol_counts) = run(
+        "job-sol",
+        LossyAttentionOptIns {
+            int8: None,
+            sol: Some(SolConfig::top_k(0.25)),
+        },
+    );
+    assert_eq!(
+        sol_counts.sol, 0,
+        "f32 / head dim 64 is not Sol-Attn's: {sol_counts:?}"
+    );
+    assert_eq!(
+        sol_counts.sol_refusals.total(),
+        sol_counts.total(),
+        "every call is a counted Sol-Attn refusal: {sol_counts:?}"
+    );
+    assert!(
+        identical(&sol.frames),
+        "a refused opt-in leaves the clip byte-identical"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED svd_xt_job_level_lossy_attention_smoke");
+}
