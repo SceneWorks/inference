@@ -101923,7 +101923,7 @@
     "backend": null,
     "expected_devices": [],
     "cargo_features": [],
-    "fixture_identity": "Production sequential SVD-XT condition encoder/UNet/video decoder (SVD_SNAPSHOT), fixed-seed 8-frame 512^2 x 10-step clip with the SW-6132 job-level lossy-attention switch off, int8 and sol (the f32 UNet: every opt-in call a counted refusal, clips byte-identical); crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
+    "fixture_identity": "Production sequential SVD-XT condition encoder/UNet/video decoder (SVD_SNAPSHOT), fixed-seed 8-frame 512^2 x 10-step clip with the SW-6132 job-level lossy-attention switch off, int8, sol (top-k 0.25) and a top-k 1.0 Sol-Attn control (the f32 UNet with 64-wide heads: INT8 serves every call at bf16, Sol-Attn the self-attention at bf16 padded to 128, cross-attention a counted refusal, PSNR vs off recorded); crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
     "configuration_source": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
     "required_environment": [
       "SVD_SNAPSHOT"
@@ -101946,7 +101946,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Render the fixed-seed clip with the job switch off, INT8 and Sol-Attn; check every call is offered and counted, the job-end reset, and that refused opt-ins leave the clip byte-identical."
+          "Render the fixed-seed clip with the job switch off, INT8, Sol-Attn top-k 0.25 and the top-k 1.0 Sol-Attn control; check every call is offered and counted, the f32 cast / head pad adaptation counts, the job-end reset, and that each clip is non-degenerate."
         ]
       }
     },

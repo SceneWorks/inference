@@ -353,14 +353,17 @@ impl Drop for LossyAttentionJob {
     }
 }
 
-/// SW-6132 (SW-F287 S7): the shared, job-level lossy-attention opt-in on a video model it cannot
-/// serve — the "never silent" half of the contract. SVD's UNet runs **f32** (see `dense_dtype`)
-/// and both lossy kernels take bf16 / f16 only, so with the switch on every attention call is
-/// offered to the kernel, refused with a counted `dtype` reason (Sol-Attn: `dtype` / `head_dim` /
-/// `cross_attention`), and routed exactly as before: the clip is byte-identical to the off clip.
-/// A fixed-seed 8-frame 512² clip (10 steps) with the switch off, `int8` and `sol`. (Under the
-/// `SVD_FORCE_F16` / `SVD_FORCE_BF16` escapes the INT8 kernel may serve calls; the test then only
-/// checks that every call was offered and counted.)
+/// SW-6132 (SW-F287 S7): the shared, job-level lossy-attention opt-in on an **f32** video model.
+/// SVD's UNet runs f32 (see `dense_dtype`) with 64-wide heads; the shared dispatch runs every
+/// eligible call at bf16 (counted `lossy_adapted.f32_cast`) and, for Sol-Attn, zero-pads the heads
+/// to 128 (`lossy_adapted.head_pad`), so the opt-in serves this model instead of refusing it. A
+/// fixed-seed 8-frame 512² clip (10 steps) with the switch off, `int8`, `sol` at top-k 0.25 and a
+/// top-k 1.0 Sol-Attn control (every block routed): every call is
+/// offered and counted (served + refused = all calls), INT8 serves every call (none is masked,
+/// every head is 64 wide), Sol-Attn serves the self-attention and refuses the cross-attention, each
+/// opt-in clip stays non-degenerate and its PSNR against the off clip is printed (recorded, not
+/// gated). `SVD_LOSSY_FRAMES_DIR=<dir>` saves the first and last frame of each clip as PNG for
+/// review.
 ///
 /// `SVD_SNAPSHOT=<snapshot> cargo test --release --features cuda,model-inference-proof
 /// -p candle-gen-svd --test real_weights_smoke svd_xt_job_level_lossy_attention_smoke -- --ignored
@@ -394,12 +397,35 @@ fn svd_xt_job_level_lossy_attention_smoke() {
     assert_eq!(off_counts.sol_refusals.total(), 0, "{off_counts:?}");
     assert!(off_counts.total() > 0, "{off_counts:?}");
 
-    let identical = |frames: &[Image]| {
-        frames
-            .iter()
-            .zip(&off.frames)
-            .all(|(a, b)| a.pixels == b.pixels)
+    let save = |label: &str, frames: &[Image]| {
+        let Some(dir) = std::env::var_os("SVD_LOSSY_FRAMES_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("frames dir");
+        for (i, frame) in [
+            (0, &frames[0]),
+            (frames.len() - 1, &frames[frames.len() - 1]),
+        ] {
+            image::RgbImage::from_raw(frame.width, frame.height, frame.pixels.clone())
+                .expect("RGB frame")
+                .save(dir.join(format!("svd_{label}_{i:02}.png")))
+                .expect("save frame");
+        }
     };
+    // Non-degenerate: every frame has real spatial variation (not a flat / NaN-black frame).
+    let varied = |frames: &[Image]| {
+        frames.iter().all(|f| {
+            let (lo, hi) = f
+                .pixels
+                .iter()
+                .fold((u8::MAX, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+            hi - lo > 32
+        })
+    };
+    save("off", &off.frames);
+    assert!(varied(&off.frames), "the off clip is non-degenerate");
+
     let (int8, int8_counts) = run(
         "job-int8",
         LossyAttentionOptIns {
@@ -413,40 +439,74 @@ fn svd_xt_job_level_lossy_attention_smoke() {
         int8_counts.total(),
         "every call is offered to INT8 and counted: {int8_counts:?}"
     );
-    if int8_counts.int8 == 0 {
-        assert!(
-            identical(&int8.frames),
-            "a refused opt-in leaves the clip byte-identical"
-        );
-    }
-    println!(
-        "[[SVD_LOSSY_ATTENTION]] job int8: {} INT8 calls of {}, refusals {:?}, PSNR vs off {:.2} dB",
+    assert_eq!(
         int8_counts.int8,
         int8_counts.total(),
+        "unmasked 64-wide f32 calls: INT8 serves every one at bf16: {int8_counts:?}"
+    );
+    assert_eq!(
+        int8_counts.lossy_adapted.f32_cast, int8_counts.int8,
+        "every INT8 call is an f32 call cast to bf16: {int8_counts:?}"
+    );
+    assert_eq!(int8_counts.lossy_adapted.head_pad, 0, "{int8_counts:?}");
+    save("int8", &int8.frames);
+    assert!(varied(&int8.frames), "the INT8 clip is non-degenerate");
+    println!(
+        "[[SVD_LOSSY_ATTENTION]] job int8: {} INT8 calls of {} (f32 cast {}), refusals {:?}, \
+         PSNR vs off {:.2} dB",
+        int8_counts.int8,
+        int8_counts.total(),
+        int8_counts.lossy_adapted.f32_cast,
         int8_counts.int8_refusals,
         frame_psnr(&int8.frames, &off.frames)
     );
 
-    let (sol, sol_counts) = run(
-        "job-sol",
-        LossyAttentionOptIns {
-            int8: None,
-            sol: Some(SolConfig::top_k(0.25)),
-        },
-    );
-    assert_eq!(
-        sol_counts.sol, 0,
-        "f32 / head dim 64 is not Sol-Attn's: {sol_counts:?}"
-    );
-    assert_eq!(
-        sol_counts.sol_refusals.total(),
-        sol_counts.total(),
-        "every call is a counted Sol-Attn refusal: {sol_counts:?}"
-    );
-    assert!(
-        identical(&sol.frames),
-        "a refused opt-in leaves the clip byte-identical"
-    );
+    // Sol-Attn at the product's sparse budget, and at top-k 1.0 (every key block routed: dense
+    // attention up to the kernel's INT8 arithmetic) — the control that separates the f32 cast /
+    // head pad adaptation (top-k 1.0 tracks the off clip like INT8 does) from the sparsity loss.
+    for (label, ratio) in [("sol", 0.25f32), ("sol-dense", 1.0)] {
+        let (sol, sol_counts) = run(
+            label,
+            LossyAttentionOptIns {
+                int8: None,
+                sol: Some(SolConfig::top_k(ratio)),
+            },
+        );
+        assert!(
+            sol_counts.sol > 0,
+            "Sol-Attn serves the f32 64-wide self-attention: {sol_counts:?}"
+        );
+        assert_eq!(
+            sol_counts.sol + sol_counts.sol_refusals.total(),
+            sol_counts.total(),
+            "every call is offered to Sol-Attn and counted: {sol_counts:?}"
+        );
+        assert_eq!(
+            sol_counts.sol_refusals.total(),
+            sol_counts.sol_refusals.cross_attention,
+            "only the cross-attention is refused: {sol_counts:?}"
+        );
+        assert_eq!(
+            (
+                sol_counts.lossy_adapted.f32_cast,
+                sol_counts.lossy_adapted.head_pad
+            ),
+            (sol_counts.sol, sol_counts.sol),
+            "every Sol-Attn call is cast to bf16 and padded to 128: {sol_counts:?}"
+        );
+        save(label, &sol.frames);
+        assert!(varied(&sol.frames), "the {label} clip is non-degenerate");
+        println!(
+            "[[SVD_LOSSY_ATTENTION]] job {label} (top-k {ratio}): {} Sol-Attn calls of {} \
+             (f32 cast {}, head pad {}), refusals {:?}, PSNR vs off {:.2} dB",
+            sol_counts.sol,
+            sol_counts.total(),
+            sol_counts.lossy_adapted.f32_cast,
+            sol_counts.lossy_adapted.head_pad,
+            sol_counts.sol_refusals,
+            frame_psnr(&sol.frames, &off.frames)
+        );
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED svd_xt_job_level_lossy_attention_smoke");
