@@ -22,7 +22,7 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
+    curated_sampler_names, default_seed, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
     Precision, Progress, Result, StepSupport, WeightsSource,
 };
@@ -69,44 +69,123 @@ const MAX_FRAMES: u32 = 64;
 /// value from pinning the GPU for an unbounded time.
 const MAX_STEPS: u32 = 200;
 
-/// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SVD_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for SVD-XT (`REG-1`, `AP5`).
+pub(crate) fn route_svd() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "svd",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // SVD uses a frame-wise guidance ramp (min→max); `req.guidance` overrides the ceiling.
-            supports_guidance: true,
-            // image→video is a single `Reference` image.
-            conditioning: vec![ConditioningKind::Reference],
-            // Curated unified solvers (epic 7114, sc-7122): SVD exposes the SAMPLER axis but NO scheduler
-            // (matching ComfyUI) — it keeps its native Karras EDM σ schedule and only swaps the
-            // integrator (over `EdmModelSampling`, v-prediction). An unset sampler → the native EDM Euler
-            // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
-            samplers: curated_sampler_names(),
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface::default(),
+            conditioning: gen_core::ConditioningSurface {
+                // image->video is a single `Reference` image.
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: false,
+                modules: vec!["clip_vit_h14"],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "svd_unet_spatiotemporal",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("svd_temporal_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::SVD_LATENT_SPACE),
+                pixel_stride: Some(SIZE_ALIGN),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["clip_vit_h14", "svd_temporal_vae"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["svd_unet_spatiotemporal"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["svd_temporal_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: 256,
             max_size: 1024,
-            max_count: 1,
-            // SVD-XT's engine bound, advertised rather than hidden (sc-19559). It lived only in
-            // `validate_output_params` below, so a consumer could not learn the ceiling without
-            // dispatching a job; the shared floor now enforces the same number from the same
-            // constant. `candle-gen-svd` declares the identical range from its own `MAX_STEPS`.
+            size_floor: gen_core::SizeFloor::RangeChecked,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            mac_only: true,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(25),
+            guidance: Some(3.0),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 576)),
             ..Default::default()
         },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        })
+        .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+        .with_resident_only_memory_registration(crate::memory_strategy::RESIDENT_ONLY_WITNESS),
     }
+}
+
+/// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
+pub fn descriptor() -> ModelDescriptor {
+    route_svd().compute_descriptor()
 }
 
 /// The loaded SVD model: the assembled pipeline + the cached descriptor.
@@ -722,10 +801,6 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     let x = round(&multiply(&x, mlx_gen::array::scalar(255.0))?, 0)?;
     mlx_gen::image::u8_frames_to_images(&x.squeeze_axes(&[0])?)
 }
-
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]
 mod tests {

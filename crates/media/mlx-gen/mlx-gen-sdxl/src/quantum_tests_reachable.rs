@@ -475,7 +475,7 @@ fn before_cell(
     let unet = resident(&unet_file, Stored::F16, HALF);
     let control = quantized_controlnet(cn, bits);
     let ip_pairs =
-        341_000_000u64 * bits.map_or(16, |b| b) / 8 + bits.map_or(0, |_| 341_000_000 / 64 * 4);
+        341_000_000u64 * bits.unwrap_or(16) / 8 + bits.map_or(0, |_| 341_000_000 / 64 * 4);
     let ip_resident = (632_000_000 + 83_000_000) * HALF + ip_pairs;
     let te_act = activation_width(&file("text_encoder", "model"))
         .max(activation_width(&file("text_encoder_2", "model")));

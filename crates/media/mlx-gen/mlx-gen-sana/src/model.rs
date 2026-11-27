@@ -34,7 +34,7 @@ use std::path::Path;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
+    curated_sampler_names, curated_scheduler_names, default_seed, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
     Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
@@ -75,117 +75,186 @@ pub const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
 
-/// SANA-1.6B's identity + capabilities — constructible without loading weights (registry
-/// introspection / capability advertisement). True-CFG text-to-image: negative prompt + guidance
-/// scale, flow-match Euler over the unified curated sampler/scheduler menu (epic 7114). Advertises
-/// `Reference` img2img (sc-10190): a single reference image seeds the denoise from the DC-AE-encoded
-/// init latent. ControlNet conditioning is a separate, later variant.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for SANA-1.6B 1024px (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> mlx_gen::gen_core::RouteRecord {
+    let mut samplers = curated_sampler_names();
+    samplers.push("default");
+    let mut schedulers = curated_scheduler_names();
+    schedulers.push("default");
+
+    mlx_gen::gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "sana",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // img2img (sc-10190): a single `Reference` image seeds the denoise from the DC-AE-encoded
-            // init latent (`ui.img2img` in the catalog). ControlNet is a separate, later variant.
-            conditioning: vec![ConditioningKind::Reference],
-            // No SANA LoRA wiring yet (reserved for a later story).
-            supports_lora: false,
-            // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
-            // native loop (`req.sampler == None`) stays the byte-exact default. `"default"` is the
-            // engine-default sentinel the manifest drift guard always allows.
-            samplers: {
-                let mut s = curated_sampler_names();
-                s.push("default");
-                s
+        mac_only: true,
+        structure: mlx_gen::gen_core::RouteStructure {
+            text_encoders: mlx_gen::gen_core::TextEncoderSurface {
+                encoders: vec![mlx_gen::gen_core::TextEncoderDeclaration::new(
+                    "gemma2_2b_it",
+                    Some(300),
+                )],
+                ..Default::default()
             },
-            schedulers: {
-                let mut s = curated_scheduler_names();
-                s.push("default");
-                s
+            conditioning: mlx_gen::gen_core::ConditioningSurface {
+                // img2img (sc-10190): a single `Reference` image seeds the denoise from the
+                // DC-AE-encoded init latent (`ui.img2img` in the catalog).
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: Vec::new(),
             },
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // SANA ships pre-quantized Q4/Q8 turnkey tiers (sc-8489, epic 8506): the Linear-DiT
-            // transformer + the Gemma-2 CHI TE are packed and PACKED-DETECTED on load (the DC-AE VAE
-            // stays dense in every tier). Advertise Q4/Q8 so the catalog routes SANA through the
-            // SAME quant-tier path as every other matrix model (tier selection + accurate recipe /
-            // downgrade telemetry) rather than a no-quant special case. This is NOT the (still
-            // unported) 2-bit Clark-Labs quant — it is the shared group-64 affine tier, packed
-            // offline by `crate::convert` and self-describing on load, so a `spec.quantize` is
-            // advisory (the resolved tier dir dictates the actual precision; see [`load`]).
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
-            requires_sigma_shift: false,
-            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
-            // Under `Sequential` the Gemma-2 CHI text encoder is encoded, materialized, then dropped
-            // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
-            // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
+            sampling: mlx_gen::gen_core::SamplingSurface {
+                samplers,
+                schedulers,
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: mlx_gen::gen_core::ModelBinding::family_model(
+                mlx_gen::gen_core::FamilyModelSpec::new("sana_linear_dit").with_low_res_start(),
+            ),
+            latent_codec: mlx_gen::gen_core::LatentCodecDeclaration {
+                codec_id: Some("dc_ae_f32c32"),
+                output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(32),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: mlx_gen::gen_core::UpsamplerSurface::default(),
+            adapters: mlx_gen::gen_core::AdapterSurface::unsupported(),
+            residency: mlx_gen::gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["gemma2_2b_it"],
+                        true,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Denoise,
+                        ["sana_linear_dit"],
+                        false,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Decode,
+                        ["dc_ae_f32c32"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: mlx_gen::gen_core::WeightPlanDeclaration {
+                source_kind: mlx_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: mlx_gen::gen_core::OutputSurface {
+                preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: mlx_gen::gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: mlx_gen::gen_core::SizeFloor::RangeChecked,
+            supported_steps: mlx_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: mlx_gen::gen_core::SeedAndBatchSemantics {
+            seed_scheme: mlx_gen::gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: mlx_gen::gen_core::RouteDefaults {
+            steps: Some(crate::pipeline::DEFAULT_STEPS as u32),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("default"),
+            schedule: Some("default"),
+            shift: Some(3.0),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: mlx_gen::gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(compile_render_plan)
+        .with_memory_registration(BASE_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        )
+        .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR_REGISTRATION),
     }
 }
 
-/// **SANA-Sprint** identity + capabilities (sc-8490). Same `sana` family / `mlx` backend / image
-/// modality as the base, but the distilled variant is **CFG-free** (the guidance scale is an
-/// *embedded scalar* fed to the trunk, not classifier-free guidance) and **few-step** (1–4, default
-/// 2): so `supports_true_cfg = false`, `supports_negative_prompt = false`, and NO
-/// `supported_guidance_methods` (the epic-7434 cfg/cfg_rescale/apg/cfg_pp combine operators do not
-/// apply — there is no cond/uncond pair). `supports_guidance` stays `true` because the guidance scale
-/// is still an honored request knob (it just modulates the embedded scalar). The SCM/TrigFlow sampler
-/// is a dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised.
-pub fn sprint_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: SPRINT_MODEL_ID,
-        family: "sana",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
-            supports_negative_prompt: false,
-            supports_guidance: true,
-            // img2img (sc-10190): reference-seeded, via the SCM/TrigFlow renoise at the start angle.
-            // Distilled/few-step → the strength window is narrow (validate on-device).
-            conditioning: vec![ConditioningKind::Reference],
-            // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
-            // epic-7114 `Solver`; only the engine-default sentinel is advertised.
-            samplers: vec!["default"],
-            schedulers: vec!["default"],
-            // CFG-free: no cfg/cfg_rescale/apg/cfg_pp combine (the guidance axis embedded case).
-            supported_guidance_methods: vec![],
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // Same Q4/Q8 packed turnkey tiers as base SANA (sc-8489): the Sprint Linear-DiT trunk +
-            // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard
-            // quant-tier routing; `spec.quantize` is advisory (resolved tier dir dictates precision).
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
-            // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
-            // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
-            supports_sequential_offload: true,
-            supports_preview: true,
-            ..Default::default()
+/// Primary typed route declaration for SANA-Sprint 1.6B 1024px (`REG-1`, `AP5`).
+pub(crate) fn route_sprint() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = SPRINT_MODEL_ID;
+    route.structure.conditioning.supports_negative_prompt = false;
+    route.structure.sampling = mlx_gen::gen_core::SamplingSurface {
+        // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
+        // epic-7114 `Solver`; only the engine-default sentinel is advertised.
+        samplers: vec!["default"],
+        schedulers: vec!["default"],
+        guidance_methods: Vec::new(),
+        supports_guidance: true,
+        supports_true_cfg: false,
+        supports_cfg_interval: false,
+        requires_sigma_shift: false,
+        supports_h3_image_sampler: false,
+    };
+    route.structure.denoiser = mlx_gen::gen_core::ModelBinding::family_model(
+        mlx_gen::gen_core::FamilyModelSpec::new("sana_sprint_linear_dit"),
+    );
+    route.defaults = mlx_gen::gen_core::RouteDefaults {
+        steps: Some(crate::pipeline::SPRINT_DEFAULT_STEPS as u32),
+        guidance: Some(crate::pipeline::SPRINT_DEFAULT_GUIDANCE),
+        sampler: Some("default"),
+        schedule: Some("default"),
+        shift: None,
+        strength: None,
+        dimensions: Some((1024, 1024)),
+        ..Default::default()
+    };
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(sprint_descriptor, |spec| {
+        load_sprint(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_activation_memory(crate::SPRINT_ACTIVATION_MEMORY_REGISTRATION.anchor)
+    .with_memory_registration(SPRINT_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(SPRINT_MODEL_ID, spec)
         },
-    }
+    )
+    .with_memory_behavior_registration(SPRINT_MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
+/// SANA-1.6B's identity + capabilities — constructible without loading weights (registry
+/// introspection / capability advertisement).
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
+}
+
+/// **SANA-Sprint** identity + capabilities (sc-8490), computed from [`route_sprint`].
+pub fn sprint_descriptor() -> ModelDescriptor {
+    route_sprint().compute_descriptor()
 }
 
 /// A loaded SANA generator: the component-residency seam plus the cached descriptor and the variant
@@ -1197,11 +1266,6 @@ pub(crate) fn component_footprint(
     )
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
 pub const BASE_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -1235,11 +1299,6 @@ pub const SPRINT_MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehavior
             )
         },
     };
-mlx_gen::register_generators! {
-    pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint;
-    footprint = component_footprint
-}
-
 pub const BASE_RENDER_PLAN_REGISTRATION: mlx_gen::gen_core::RenderPlanRegistration =
     mlx_gen::gen_core::RenderPlanRegistration {
         provider_id: MODEL_ID,

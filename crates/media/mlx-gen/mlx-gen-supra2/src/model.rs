@@ -18,7 +18,7 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    CancelFlag, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    CancelFlag, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::text_encoder::{T5Geometry, T5TextEncoder};
@@ -30,33 +30,122 @@ use mlx_rs::Array;
 use crate::dit::SupraDit;
 use crate::memory_strategy;
 
-/// The weights-free descriptor.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // The SD VAE's 4-channel f8 latent, scaled by 0.18215 — the same space SVD's VAE consumes.
-        denoiser_output_latent_space: Some(&gen_core::SVD_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
-        id: PROVIDER_ID,
+/// Primary typed route declaration for Supra2-IMG (`REG-1`, `AP5`).
+pub(crate) fn route_supra2() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: PROVIDER_ID,
         family: s2::FAMILY,
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: true,
-            samplers: vec![s2::SAMPLER],
-            schedulers: vec![s2::SCHEDULER],
-            supported_guidance_methods: vec!["cfg"],
-            min_size: s2::IMAGE_SIZE,
-            max_size: s2::IMAGE_SIZE,
-            max_count: s2::MAX_IMAGES,
-            size_floor: SizeFloor::RangeChecked,
-            mac_only: true,
-            max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "flan_t5_base",
+                    Some(s2::MAX_PROMPT_TOKENS),
+                )],
+                max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: Vec::new(),
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: Vec::new(),
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec![s2::SAMPLER],
+                schedulers: vec![s2::SCHEDULER],
+                guidance_methods: vec!["cfg"],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "supra2_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sd_vae_ft_mse"),
+                // The SD VAE's 4-channel f8 latent, scaled by 0.18215 — the same space SVD's VAE consumes.
+                output_latent_space: Some(&gen_core::SVD_LATENT_SPACE),
+                pixel_stride: Some(8),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["flan_t5_base"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["supra2_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sd_vae_ft_mse"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: s2::IMAGE_SIZE,
+            max_size: s2::IMAGE_SIZE,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: s2::MAX_IMAGES,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(s2::DEFAULT_STEPS),
+            guidance: Some(s2::DEFAULT_GUIDANCE),
+            sampler: Some(s2::SAMPLER),
+            schedule: Some(s2::SCHEDULER),
+            shift: None,
+            strength: None,
+            dimensions: Some((s2::IMAGE_SIZE, s2::IMAGE_SIZE)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+        .with_footprint(footprint)
+        .with_memory_registration(MEMORY)
+        .with_memory_fixture(memory_strategy::surface_specs, memory_strategy::fixture),
     }
+}
+
+/// The weights-free descriptor.
+pub fn descriptor() -> ModelDescriptor {
+    route_supra2().compute_descriptor()
 }
 
 /// The resolved component directories of one load (backend-neutral; shared with the Candle port).
@@ -563,8 +652,6 @@ fn footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
         vae: f.decoder_bytes,
     })
 }
-
-mlx_gen::register_generators! {pub(crate) const REGISTRATION = descriptor => load; footprint = footprint}
 
 pub(crate) const MEMORY: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: PROVIDER_ID,

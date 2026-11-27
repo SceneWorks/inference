@@ -402,24 +402,12 @@ pub use vae22::Wan22Vae;
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    let registry = model::register_video_plans(registry)
-        .register_generator(model::TI2V_REGISTRATION)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_generator(model::T2V_14B_REGISTRATION)
-        // sc-22736 (epic sc-22723, E1): the two A14B routes get the pre-load half of what their
-        // loaded generators already do. Without these three registrations a plan anchor naming
-        // either route resolves nothing before the weights exist, so the cell is unmeasurable.
-        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
-        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
-        .register_generator(model::I2V_14B_REGISTRATION)
-        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
-        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR)
-        .register_generator(model_vace::VACE_REGISTRATION)
-        .register_generator(model_vace::VACE_FUN_REGISTRATION);
+    let registry = registry
+        .register_route(model::route_ti2v())
+        .register_route(model::route_t2v_14b())
+        .register_route(model::route_i2v_14b())
+        .register_route(model_vace::route_vace())
+        .register_route(model_vace::route_vace_fun());
     // The trainers (and their perceptual/dataset deps) are the `training` feature: an inference-only
     // consumer — the iOS bundle, through `mlx-gen-qwen-image`'s single-frame decoder — compiles none
     // of them.

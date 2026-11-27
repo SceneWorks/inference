@@ -29,7 +29,7 @@ use mlx_rs::Array;
 use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    default_seed, gen_core, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Quant, Result, WeightsSource,
 };
@@ -69,6 +69,148 @@ fn image_cfg_scale(req: &GenerationRequest) -> f32 {
     req.true_cfg.unwrap_or(1.0)
 }
 
+fn route_for(id: &'static str) -> gen_core::RouteRecord {
+    let is_fast = id == MODEL_ID_FAST;
+    let bindings = if is_fast {
+        gen_core::RouteBindings::generator(descriptor_fast, |spec| {
+            load_fast(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_memory_registration(FAST_MEMORY_REGISTRATION)
+        .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_FAST, spec)
+        })
+        .with_memory_behavior_registration(FAST_MEMORY_BEHAVIOR)
+    } else {
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_memory_registration(QUALITY_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_behavior_registration(QUALITY_MEMORY_BEHAVIOR)
+            .with_activation_memory(crate::QUALITY_ACTIVATION_MEMORY_REGISTRATION.anchor)
+    };
+    gen_core::RouteRecord {
+        route_id: id,
+        family: "sensenova-u1",
+        backend: "mlx",
+        modality: Modality::Image,
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen3_mot_understanding",
+                    None,
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec!["neo_vision_embedder"],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "sensenova_u1_8b_mot",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: None,
+                output_latent_space: None,
+                pixel_stride: Some(CELL),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![gen_core::ResidencyPhaseNode::new(
+                    gen_core::ResidencyPhaseKind::Denoise,
+                    ["sensenova_u1_8b_mot"],
+                    false,
+                )],
+                supports_sequential_offload: false,
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(if is_fast {
+                DEFAULT_STEPS_FAST
+            } else {
+                DEFAULT_STEPS
+            }),
+            guidance: Some(if is_fast {
+                DEFAULT_GUIDANCE_FAST
+            } else {
+                DEFAULT_GUIDANCE
+            }),
+            sampler: None,
+            schedule: None,
+            shift: Some(DEFAULT_TIMESTEP_SHIFT),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
+    }
+}
+
+/// Primary typed route declaration for SenseNova-U1 Quality (`REG-1`, `AP5`).
+pub(crate) fn route_quality() -> gen_core::RouteRecord {
+    route_for(MODEL_ID)
+}
+
+/// Primary typed route declaration for SenseNova-U1 Fast (`REG-1`, `AP5`).
+pub(crate) fn route_fast() -> gen_core::RouteRecord {
+    route_for(MODEL_ID_FAST)
+}
+
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    route_for(id).compute_descriptor()
+}
+
 pub fn descriptor() -> ModelDescriptor {
     descriptor_for(MODEL_ID)
 }
@@ -77,50 +219,6 @@ pub fn descriptor() -> ModelDescriptor {
 /// id and the generation defaults (applied in `SenseNova::options`) differ.
 pub fn descriptor_fast() -> ModelDescriptor {
     descriptor_for(MODEL_ID_FAST)
-}
-
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id,
-        family: "sensenova-u1",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // `guidance` → text cfg_scale; `true_cfg` → image cfg (it2i edit≈1.0 / character≈1.5).
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Reference image(s) → it2i edit / Character Studio reference. No control/depth/mask.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Bespoke-by-architecture (epic 7114, sc-7120, task 7185): SenseNova-U1 is NOT routed through
-            // the unified curated-sampler framework. Its denoise threads each step through an
-            // autoregressive backbone with a per-step-mutated `KvCache` (`predict_v` appends to the cache;
-            // `cache.offset()` feeds the RoPE/position build), shared between the cond/uncond passes. The
-            // multistep/2nd-order solvers (heun = 2 evals/step; dpmpp_2m / uni_pc reuse prior-step state)
-            // would append to the cache multiple times per step and desync the AR positions → corrupt
-            // output. It is also x0-prediction over a clean-fraction timestep grid (not noise-fraction σ).
-            // Its native shifted-Euler loop is its only valid sampler. See `t2i::denoise`/`it2i_denoise`.
-            samplers: Vec::new(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            // The backbone uses a KV cache for the AR prefix + denoise.
-            supports_kv_cache: true,
-            // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
-            requires_sigma_shift: true,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
-            ..Default::default()
-        },
-    }
 }
 
 /// A loaded SenseNova-U1 generator: the unified [`T2iModel`] + tokenizer + cached descriptor.
@@ -1044,11 +1142,6 @@ pub(crate) fn component_footprint(
     })
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const QUALITY_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
 pub const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -1080,11 +1173,6 @@ pub const FAST_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
             crate::memory_strategy::registered_begin_request(MODEL_ID_FAST, spec, contract, context)
         },
     };
-mlx_gen::register_generators! {
-    pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast;
-    footprint = component_footprint
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

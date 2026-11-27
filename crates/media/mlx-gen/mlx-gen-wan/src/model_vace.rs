@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterApplyReport, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
+    AdapterApplyReport, AdapterSpec, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
@@ -300,47 +300,124 @@ fn vace_decode_tail(
     })
 }
 
-/// Stable identity + advertised capabilities for `wan_vace`.
-pub fn descriptor_vace() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID_VACE,
+/// Primary typed route declaration for `wan_vace` (`REG-1`, `AP5`).
+pub(crate) fn route_vace() -> mlx_gen::gen_core::RouteRecord {
+    mlx_gen::gen_core::RouteRecord {
+        route_id: MODEL_ID_VACE,
         family: "wan",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // CFG (guide 5.0) + the Chinese anti-artifact negative prompt. The control input is a
-            // masked control clip (`ControlClip`, the universal VACE form the worker builds per
-            // mode); optional `Reference` images become leading conditioning frames.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
-            // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
-            // base Wan slice sc-2682). LoRA/LoKr is wired (sc-3439): `spec.adapters` merge onto the
-            // dense diffusers-layout VACE weight map via `merge_vace_adapters` before `from_weights` +
-            // quantize (the fork order — merge a dense adapter, then quantize), mirroring the base Wan
-            // slices sc-2683 (LoRA) / sc-2393 (LoKr) on the diffusers host.
-            supports_lora: true,
-            supports_lokr: true,
-            // sc-7296: curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`) routed to Wan's native solvers
-            // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
-            samplers: crate::model::wan_native_samplers(),
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
-            // The TE, scoped z16 VAE work, and VACE transformer are loaded/used/dropped as phases on
-            // every request even though this provider exposes no selectable Sequential control.
-            unconditionally_engages_staged_residency: true,
+        mac_only: true,
+        structure: mlx_gen::gen_core::RouteStructure {
+            text_encoders: mlx_gen::gen_core::TextEncoderSurface {
+                encoders: vec![mlx_gen::gen_core::TextEncoderDeclaration::new(
+                    "umt5_xxl",
+                    Some(512),
+                )],
+                ..Default::default()
+            },
+            conditioning: mlx_gen::gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement:
+                    mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: Vec::new(),
+            },
+            sampling: mlx_gen::gen_core::SamplingSurface {
+                samplers: crate::model::wan_native_samplers(),
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: mlx_gen::gen_core::ModelBinding::family_model(
+                mlx_gen::gen_core::FamilyModelSpec::new("wan_vace_dit"),
+            ),
+            latent_codec: mlx_gen::gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(16),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: mlx_gen::gen_core::UpsamplerSurface::default(),
+            adapters: mlx_gen::gen_core::AdapterSurface::lora_and_lokr(
+                mlx_gen::gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: mlx_gen::gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Denoise,
+                        ["wan_vace_dit"],
+                        true,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_vae"],
+                        true,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                unconditionally_engages_staged_residency: true,
+                supports_kv_cache: false,
+                ..Default::default()
+            },
+            weight_plan: mlx_gen::gen_core::WeightPlanDeclaration {
+                source_kind: mlx_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: mlx_gen::gen_core::OutputSurface {
+                preview: mlx_gen::gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: mlx_gen::gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: mlx_gen::gen_core::SizeFloor::RangeChecked,
+            supported_steps: mlx_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: mlx_gen::gen_core::SeedAndBatchSemantics {
+            seed_scheme: mlx_gen::gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: mlx_gen::gen_core::RouteDefaults {
+            steps: Some(40),
+            guidance: Some(5.0),
+            sampler: Some("uni_pc"),
+            schedule: None,
+            shift: Some(5.0),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: mlx_gen::gen_core::RouteBindings::generator(descriptor_vace, |spec| {
+            load(spec).map_err(Into::into)
+        }),
     }
+}
+
+/// Stable identity + advertised capabilities for `wan_vace`.
+pub fn descriptor_vace() -> ModelDescriptor {
+    route_vace().compute_descriptor()
 }
 
 /// The loaded Wan-VACE model. Holds the resolved config + snapshot dir; the heavy components (UMT5
@@ -741,12 +818,6 @@ fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
     )))
 }
 
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! {
-    pub(crate) const VACE_REGISTRATION = descriptor_vace => load
-}
-
 // ============================================================================================
 // Wan2.2 VACE-Fun A14B — dual-expert (MoE) controllable video (sc-6604, epic 3456).
 //
@@ -763,16 +834,25 @@ mlx_gen::register_generators! {
 /// Public provider id: `"wan2_2_vace_fun_14b"`.
 pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
 
+/// Primary typed route declaration for `wan2_2_vace_fun_14b` (`REG-1`, `AP5`).
+pub(crate) fn route_vace_fun() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = route_vace();
+    route.route_id = MODEL_ID_VACE_FUN;
+    route.structure.denoiser = mlx_gen::gen_core::ModelBinding::family_model(
+        mlx_gen::gen_core::FamilyModelSpec::new("wan_vace_fun_dit_moe").with_expert_switching(),
+    );
+    route.structure.residency.supports_sequential_offload = true;
+    route.defaults.shift = Some(12.0);
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_vace_fun, |spec| {
+        load_vace_fun(spec).map_err(Into::into)
+    });
+    route
+}
+
 /// Stable identity + advertised capabilities for `wan2_2_vace_fun_14b` (same surface as `wan_vace`:
 /// a masked `ControlClip` + optional `Reference` images, CFG, Q4/Q8, LoRA/LoKr).
 pub fn descriptor_vace_fun() -> ModelDescriptor {
-    let mut descriptor = ModelDescriptor {
-        required_components: &[],
-        id: MODEL_ID_VACE_FUN,
-        ..descriptor_vace()
-    };
-    descriptor.capabilities.supports_sequential_offload = true;
-    descriptor
+    route_vace_fun().compute_descriptor()
 }
 
 /// The loaded Wan2.2 VACE-Fun model (dual-expert). Mirrors [`WanVace`] but stages **two** transformers
@@ -1367,11 +1447,6 @@ fn validate_vace_clip(
         )));
     }
     Ok(())
-}
-
-// Explicit registration for the dual-expert VACE-Fun variant.
-mlx_gen::register_generators! {
-    pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
 }
 
 /// SC-20686 estimate-plus-reserve admission: the [`crate::model::DenoiseFacts`] the two VACE

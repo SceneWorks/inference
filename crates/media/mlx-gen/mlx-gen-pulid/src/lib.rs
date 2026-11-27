@@ -21,27 +21,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: pulid_flux::MODEL_ID,
-            compile: pulid_flux::compile_plan,
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: "flux1_dev_pulid",
-            parent_provider_id: Some("flux1_dev"),
-            descriptor: pulid_flux::descriptor,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: "flux1_dev_pulid",
-                compile: pulid_flux::compile_plan,
-            }),
-        })
-        .register_generator(pulid_flux::REGISTRATION)
-        .register_memory_strategy(pulid_flux::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: pulid_flux::MODEL_ID,
-            contract: memory_strategy::weights_free_contract,
-        })
-        .register_memory_behavior(pulid_flux::MEMORY_BEHAVIOR)
+        .register_route(pulid_flux::route_pulid_flux())
+        .register_route(pulid_flux::route_flux1_dev_pulid())
 }
 
 /// Build the complete explicit MLX PuLID provider catalog.

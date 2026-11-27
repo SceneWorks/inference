@@ -2,8 +2,7 @@
 
 use super::*;
 use mlx_gen::gen_core::{
-    self, ProviderRegistryBuilder, VideoPhaseLayout, VideoPlanLayout, VideoPlanRegistration,
-    VideoReferenceLayout,
+    self, VideoPhaseLayout, VideoPlanLayout, VideoReferenceLayout,
 };
 
 pub(super) struct VideoDimensions {
@@ -150,7 +149,7 @@ pub(super) fn video_layout(
     })
 }
 
-fn compile(
+pub(super) fn compile_for(
     desc: ModelDescriptor,
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -174,20 +173,4 @@ fn compile(
     }
     let quant = resolve_load_time_quant(desc.id, &cfg, spec.quantize)?;
     Ok(Some(video_layout(&desc, &cfg, req, quant)?))
-}
-
-pub(crate) fn register_video_plans(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
-    registry
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: |s, r| compile(descriptor(), s, r),
-        })
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID_T2V_14B,
-            compile: |s, r| compile(descriptor_t2v_14b(), s, r),
-        })
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID_I2V_14B,
-            compile: |s, r| compile(descriptor_i2v_14b(), s, r),
-        })
 }
