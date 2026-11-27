@@ -321847,5 +321847,171 @@
       "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
       "requirements": []
     }
+  },
+  {
+    "package": "mlx-gen-wan",
+    "target": "mlx_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae::tests::fused_norm_silu_pad_decode_and_encode_match_the_reference_route",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays (seeded z16 topology at width 16, latent [1,16,2,8,8], clip [1,3,5,32,32])",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/vae.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/vae.rs::vae::tests::fused_norm_silu_pad_decode_and_encode_match_the_reference_route@3e654c9da17712537bb7795ddb6b463df28d6719d6f5bde2df2256595da6c4c0"
+    }
+  },
+  {
+    "package": "mlx-gen-wan",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "vae_norm_silu_pad_proof::wan_z16_vae_norm_silu_pad_decode_proof",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Wan 2.1 z16 VAE: vae.safetensors of SceneWorks/wan2.2-t2v-a14b-mlx@991eb255c544bbb2e1f1e07da4355c2f0a5337b7/q4 staged into the runner Hub cache (WAN_Z16_VAE_SNAPSHOT); seeded latent [1,16,4,60,60], clip [1,3,9,256,256] and source-generated Wan/LTX parity geometries",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-wan/tests/vae_norm_silu_pad_proof.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/tests/vae_norm_silu_pad_proof.rs::vae_norm_silu_pad_proof::wan_z16_vae_norm_silu_pad_decode_proof@1e134228f2b644b1c816c9ca4e38edfffe132182885d527b53c783549a497b18",
+      "requirements": [
+        {
+          "slot": "wan-z16-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "wan-z16-vae-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "WAN_Z16_VAE_SNAPSHOT"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "WAN_Z16_VAE_SNAPSHOT",
+        "pin": "SceneWorks/wan2.2-t2v-a14b-mlx@991eb255c544bbb2e1f1e07da4355c2f0a5337b7/q4"
+      }
+    ]
+  },
+  {
+    "package": "mlx-gen-ltx",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "vae_norm_silu_pad_proof::ltx_vae_norm_silu_pad_decode_proof",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned LTX-2.3 video VAE: vae_decoder/vae_encoder.safetensors + embedded_config.json of SceneWorks/ltx-2.3-mlx@01df27d308466533aa09d251e3aebdcc627d07eb/q4 staged into the runner Hub cache (LTX_VAE_SNAPSHOT); seeded latent [1,128,3,12,16], clip [1,3,9,256,256] and source-generated LTX parity geometries",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/tests/vae_norm_silu_pad_proof.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/tests/vae_norm_silu_pad_proof.rs::vae_norm_silu_pad_proof::ltx_vae_norm_silu_pad_decode_proof@cfac39637bcbf9d828fc3ca086f478be0ceeb0bff741b7979061fa9eeebd77d2",
+      "requirements": [
+        {
+          "slot": "ltx-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx-vae-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx-vae-embedded-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@29553"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "when": "external-present"
+        }
+      ]
+    },
+    "required_environment": [
+      "LTX_VAE_SNAPSHOT"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "LTX_VAE_SNAPSHOT",
+        "pin": "SceneWorks/ltx-2.3-mlx@01df27d308466533aa09d251e3aebdcc627d07eb/q4"
+      }
+    ]
   }
 ]
