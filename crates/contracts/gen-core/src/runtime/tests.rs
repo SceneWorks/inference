@@ -388,7 +388,10 @@ fn checked_artifact_pin_cancels_inside_bounded_hash_and_preserves_digest_memo() 
         checks >= 11,
         "metadata and every bounded read must check cancellation"
     );
-    assert_eq!(first.content_sha256(), &hash_file_sha256(&path).unwrap());
+    assert_eq!(
+        first.content_sha256(),
+        Some(&hash_file_sha256(&path).unwrap())
+    );
     let before = test_full_hash_work_count();
     let mut warm_checks = 0;
     let warm = ArtifactSeal::pin_with_check(&path, || {
@@ -551,7 +554,10 @@ fn concurrent_first_pins_of_one_file_read_it_once() {
                 barrier.wait();
                 let before = test_full_hash_work_count();
                 let seal = ArtifactSeal::pin(&file).expect("pin regular file");
-                (test_full_hash_work_count() - before, *seal.content_sha256())
+                (
+                    test_full_hash_work_count() - before,
+                    *seal.content_sha256().unwrap(),
+                )
             })
         })
         .collect();
@@ -587,7 +593,9 @@ fn a_waiter_does_not_seal_a_file_rewritten_while_it_waited() {
         .count();
     let waiter = {
         let file = file.clone();
-        std::thread::spawn(move || ArtifactSeal::pin(&file).map(|seal| *seal.content_sha256()))
+        std::thread::spawn(move || {
+            ArtifactSeal::pin(&file).map(|seal| *seal.content_sha256().unwrap())
+        })
     };
     while seal_claim_attempts()
         .lock()
@@ -602,7 +610,7 @@ fn a_waiter_does_not_seal_a_file_rewritten_while_it_waited() {
     // The first caller "finishes" with the old identity's digest, then the file changes before
     // the parked waiter resumes.
     let stale = [0xAA_u8; 32];
-    remember_proven_digest(identity, stale);
+    remember_proven_digest(identity, ProvenContent::Sha256(stale));
     std::fs::write(&file, b"REWRITTEN WEIGHT").expect("rewrite fixture");
     drop(held);
     let digest = waiter.join().expect("waiter thread").expect("re-pin");
@@ -810,7 +818,7 @@ fn an_attested_digest_seals_without_reading_while_the_identity_matches() {
         before,
         "neither the attested pin nor the memo-seeded plain pin may read content"
     );
-    assert_eq!(sealed.content_sha256(), &sha256_of(&bytes));
+    assert_eq!(sealed.content_sha256(), Some(&sha256_of(&bytes)));
     assert_eq!(again.content_sha256(), sealed.content_sha256());
     assert_eq!(acquisitions, vec![(ArtifactSealAcquisition::Attested, 0)]);
     sealed
@@ -838,7 +846,7 @@ fn an_attestation_survives_a_rename_of_the_parent_directory() {
     let sealed =
         ArtifactSeal::pin_attested(bundle.join("weights.safetensors"), &attestation).unwrap();
     assert_eq!(test_full_hash_work_count(), before);
-    assert_eq!(sealed.content_sha256(), &sha256_of(b"produced bytes"));
+    assert_eq!(sealed.content_sha256(), Some(&sha256_of(b"produced bytes")));
 }
 
 /// Tamper semantics are unchanged: a rewrite after the attestation moves the target identity,
@@ -866,8 +874,8 @@ fn an_attestation_never_authorizes_a_rewritten_file() {
         test_full_hash_work_count() > before,
         "a moved identity must be re-read"
     );
-    assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
-    assert_ne!(sealed.content_sha256(), attestation.content_sha256());
+    assert_eq!(sealed.content_sha256(), Some(&sha256_of(b"tampered bytes")));
+    assert_ne!(sealed.content_sha256(), Some(attestation.content_sha256()));
 }
 
 /// Overwrite `file` IN PLACE (same file object, same length) with `bytes`, then restore its
@@ -921,7 +929,7 @@ fn an_attestation_never_authorizes_an_mtime_restoring_same_size_rewrite() {
         test_full_hash_work_count() > before,
         "the tampered file must be re-read"
     );
-    assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
+    assert_eq!(sealed.content_sha256(), Some(&sha256_of(b"tampered bytes")));
 }
 
 /// The hard-link path's twin: the same change-time-only tamper between the pin and the link
@@ -988,6 +996,264 @@ fn a_seal_refuses_to_hard_link_a_file_that_changed_since_it_was_pinned() {
         .hard_link_with_check(dir.path().join("staged.safetensors"), || Ok(()))
         .expect_err("a changed file must never be relinked under the old digest");
     assert!(error.to_string().contains("changed"), "{error}");
+}
+
+/// A host-produced file sealed by identity alone reads nothing, carries no digest, and seeds the
+/// memo so a later plain pin of the unchanged file is digest-free with no read either.
+#[test]
+fn an_identity_attestation_seals_without_reading_or_a_digest() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, vec![3_u8; 2 * 1024 * 1024]).expect("write fixture");
+    let attestation = ArtifactIdentityAttestation::capture(&file).expect("attest identity");
+
+    let before = test_full_hash_work_count();
+    let mut acquisitions = Vec::new();
+    let sealed = ArtifactSeal::pin_identity_attested_with_progress(
+        &file,
+        &attestation,
+        || Ok(()),
+        |progress| acquisitions.push((progress.acquisition, progress.hashed_bytes)),
+    )
+    .expect("identity-attested pin");
+    let again = ArtifactSeal::pin(&file).expect("plain pin after the identity attestation");
+    assert_eq!(
+        test_full_hash_work_count(),
+        before,
+        "neither the identity pin nor the memo-seeded plain pin may read content"
+    );
+    assert_eq!(sealed.full_hash_work_count(), 0);
+    assert_eq!(sealed.content_sha256(), None);
+    assert_eq!(sealed.content_sha256_hex(), None);
+    assert!(sealed.is_identity_attested());
+    assert_eq!(again.content_sha256(), None);
+    assert!(again.is_identity_attested());
+    assert_eq!(acquisitions, vec![(ArtifactSealAcquisition::Attested, 0)]);
+    sealed
+        .ensure_unchanged()
+        .expect("the identity seal is a live seal");
+    assert_ne!(
+        sealed.content_or_identity_digest(),
+        sha256_of(&std::fs::read(&file).unwrap()),
+        "an identity key is domain-separated from any content digest"
+    );
+    assert_eq!(
+        again.content_or_identity_digest(),
+        sealed.content_or_identity_digest()
+    );
+}
+
+/// A restarted worker redeems the persisted producer-identity entry: still no read, still no
+/// digest. The entry is written in the store's on-disk form because only the process-wide store
+/// (which tests never configure) receives identity entries from `pin_identity_attested`.
+#[test]
+fn a_persisted_producer_identity_survives_a_restart_without_a_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    if !persists_on_this_volume(dir.path()) {
+        return;
+    }
+    let store = dir.path().join("seal-digests");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"produced weights").expect("write fixture");
+    let attestation = ArtifactIdentityAttestation::capture(&file).expect("attest identity");
+    let sealed = ArtifactSeal::pin_identity_attested(&file, &attestation).expect("identity pin");
+    let volume = volume_identity(sealed.canonical_target_path()).expect("volume identity");
+    let entry = proven_digest_store_entry(&store, &sealed.seal_identity(), &volume);
+    std::fs::create_dir_all(&store).expect("store dir");
+    std::fs::write(&entry, "producer-identity-v1").expect("persist identity entry");
+    forget_proven_digests_for(sealed.loader_path());
+
+    let before = test_full_hash_work_count();
+    let mut acquisitions = Vec::new();
+    let restarted =
+        ArtifactSeal::pin_with_store_and_check(&file, Some(&store), &mut || Ok(()), &mut |e| {
+            acquisitions.push(e.acquisition)
+        })
+        .expect("pin from the persisted store");
+    assert_eq!(test_full_hash_work_count(), before);
+    assert_eq!(restarted.content_sha256(), None);
+    assert!(restarted.is_identity_attested());
+    assert_eq!(
+        acquisitions.last(),
+        Some(&ArtifactSealAcquisition::PersistedMemo)
+    );
+    let warm = ArtifactSeal::pin(&file).expect("memo re-seeded from the store");
+    assert_eq!(test_full_hash_work_count(), before);
+    assert_eq!(warm.content_sha256(), None);
+
+    // Without the in-memory memo and without the store entry, a plain pin hashes for real.
+    forget_proven_digests_for(sealed.loader_path());
+    std::fs::remove_file(&entry).expect("drop the entry");
+    let cold = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("cold pin");
+    assert!(test_full_hash_work_count() > before);
+    assert_eq!(cold.content_sha256(), Some(&sha256_of(b"produced weights")));
+}
+
+/// A rewrite after the identity was captured moves it, so the pin reads the file and seals the
+/// digest of what is really there.
+#[test]
+fn an_identity_attestation_never_authorizes_a_rewritten_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"original bytes").expect("write fixture");
+    let attestation = ArtifactIdentityAttestation::capture(&file).expect("attest identity");
+    rewrite_in_place_restoring_mtime(&file, b"tampered bytes");
+
+    let before = test_full_hash_work_count();
+    let mut acquisitions = Vec::new();
+    let sealed = ArtifactSeal::pin_identity_attested_with_progress(
+        &file,
+        &attestation,
+        || Ok(()),
+        |progress| acquisitions.push(progress.acquisition),
+    )
+    .expect("falls back to a content pin");
+    assert!(
+        !acquisitions.contains(&ArtifactSealAcquisition::Attested),
+        "a moved identity must not redeem the attestation: {acquisitions:?}"
+    );
+    assert!(test_full_hash_work_count() > before, "must be re-read");
+    assert!(!sealed.is_identity_attested());
+    assert_eq!(sealed.content_sha256(), Some(&sha256_of(b"tampered bytes")));
+}
+
+/// Consumers whose correctness depends on the bytes' hash are refused, typed, on an identity seal.
+#[test]
+fn an_identity_seal_refuses_digest_consumers_and_content_audits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"produced bytes").expect("write fixture");
+    let attestation = ArtifactIdentityAttestation::capture(&file).expect("attest identity");
+    let sealed = ArtifactSeal::pin_identity_attested(&file, &attestation).expect("identity pin");
+
+    assert!(matches!(
+        sealed.require_content_sha256(),
+        Err(crate::Error::Unsupported(message)) if message.contains("no content digest")
+    ));
+    assert!(matches!(
+        sealed.require_content_sha256_hex(),
+        Err(crate::Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        sealed.audit_content(),
+        Err(crate::Error::Unsupported(message)) if message.contains("no content digest")
+    ));
+
+    let other = dir.path().join("downloaded.safetensors");
+    std::fs::write(&other, b"downloaded bytes").expect("write fixture");
+    let hashed = ArtifactSeal::pin(&other).expect("content pin");
+    assert_eq!(
+        hashed.require_content_sha256().expect("hashed seal"),
+        &sha256_of(b"downloaded bytes")
+    );
+    assert_eq!(
+        hashed.content_or_identity_digest(),
+        sha256_of(b"downloaded bytes")
+    );
+    hashed.audit_content().expect("a hashed seal still audits");
+}
+
+/// A hard link created from an identity seal carries the absent digest: no read, no invented
+/// digest, and the relinked identity stays digest-free for later pins.
+#[test]
+fn an_identity_seal_carries_no_digest_across_a_hard_link_it_creates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"produced bytes").expect("write fixture");
+    let attestation = ArtifactIdentityAttestation::capture(&file).expect("attest identity");
+    let sealed = ArtifactSeal::pin_identity_attested(&file, &attestation).expect("identity pin");
+    let link = dir.path().join("staged.safetensors");
+
+    let before = test_full_hash_work_count();
+    let relinked = sealed
+        .hard_link_with_check(&link, || Ok(()))
+        .expect("hard link from the identity seal");
+    let after_link = ArtifactSeal::pin(&file).expect("plain re-pin");
+    assert_eq!(test_full_hash_work_count(), before);
+    relinked
+        .ensure_unchanged()
+        .expect("live at the new identity");
+    assert_eq!(relinked.content_sha256(), None);
+    assert!(relinked.is_identity_attested());
+    assert_eq!(after_link.content_sha256(), None);
+    assert_eq!(std::fs::read(&link).unwrap(), b"produced bytes");
+}
+
+#[test]
+fn a_produced_file_identity_matches_only_the_unchanged_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"produced bytes").expect("write fixture");
+    let record = ProducedFileIdentity::seal_written(&file).expect("seal written");
+    assert!(!record.is_racy(), "{record:?}");
+    assert!(!record.is_weak(), "{record:?}");
+    assert!(record.is_trustworthy());
+    assert_eq!(record.size_bytes, 14);
+    assert!(record.matches(&file));
+    assert!(record.attest(&file).is_some());
+
+    // Same size, original (backdated) mtime restored: only the change time moves.
+    rewrite_in_place_restoring_mtime(&file, b"tampered bytes");
+    assert!(!record.matches(&file), "a same-size rewrite must be stale");
+    assert!(record.attest(&file).is_none());
+
+    std::fs::write(&file, b"rewritten, longer bytes").expect("rewrite");
+    assert!(!record.matches(&file));
+}
+
+#[test]
+fn a_freshly_captured_produced_file_identity_is_racy_and_never_matches() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"just written").expect("write fixture");
+    let record = ProducedFileIdentity::capture(&file).expect("capture");
+    assert!(record.is_racy(), "{record:?}");
+    assert!(!record.is_trustworthy());
+    assert!(!record.matches(&file));
+    assert!(record.attest(&file).is_none());
+    assert!(ArtifactSeal::pin_produced(&file, &record).is_err());
+}
+
+#[test]
+fn a_produced_file_identity_round_trips_through_json() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, b"produced bytes").expect("write fixture");
+    let record = ProducedFileIdentity::seal_written(&file).expect("seal written");
+    let json = serde_json::to_string(&record).expect("serialize");
+    assert!(json.contains("\"sizeBytes\":14"), "{json}");
+    let parsed: ProducedFileIdentity = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, record);
+    assert!(parsed.matches(&file));
+    let with_unknown_field = json.replacen('{', "{\"unknown\":1,", 1);
+    assert!(serde_json::from_str::<ProducedFileIdentity>(&with_unknown_field).is_err());
+}
+
+#[test]
+fn pin_produced_seals_an_unchanged_file_without_reading_and_refuses_a_changed_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, vec![5_u8; 1024 * 1024]).expect("write fixture");
+    let record = ProducedFileIdentity::seal_written(&file).expect("seal written");
+
+    let before = test_full_hash_work_count();
+    let sealed = ArtifactSeal::pin_produced(&file, &record).expect("pin produced");
+    assert_eq!(test_full_hash_work_count(), before);
+    assert_eq!(sealed.content_sha256(), None);
+    assert!(sealed.is_identity_attested());
+    sealed.ensure_unchanged().expect("live seal");
+
+    rewrite_in_place_restoring_mtime(&file, &[6_u8; 1024 * 1024]);
+    let before = test_full_hash_work_count();
+    assert!(matches!(
+        ArtifactSeal::pin_produced(&file, &record),
+        Err(crate::Error::Unsupported(message)) if message.contains("changed")
+    ));
+    assert_eq!(
+        test_full_hash_work_count(),
+        before,
+        "a stale produced file is refused, never hashed"
+    );
 }
 
 #[test]

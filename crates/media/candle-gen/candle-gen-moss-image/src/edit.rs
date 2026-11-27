@@ -64,7 +64,7 @@ fn pin(spec: &LoadSpec, path: &Path, digest: &str) -> Result<PinnedWeightsFile> 
     } else {
         PinnedWeightsFile::pin(&path)?
     };
-    if pin.loader_path() != path || hex(pin.content_sha256()) != digest {
+    if pin.loader_path() != path || hex(pin.require_content_sha256()?) != digest {
         return Err(Error::Unsupported(format!(
             "MOSS edit frozen package hash mismatch: {}",
             path.display()

@@ -161,7 +161,9 @@ fn logical_bytes(path: &Path) -> Result<u64> {
 /// Whole-file SHA-256 through the shared [`ArtifactSeal`]: read once per file identity and
 /// reused (after a stat-level replacement check) by every later receipt of the same file.
 fn content_digest(path: &Path) -> Result<String> {
-    Ok(ArtifactSeal::pin(path)?.content_sha256_hex())
+    Ok(mlx_gen::gen_core::snapshot_inventory::hex_lower(
+        &ArtifactSeal::pin(path)?.content_or_identity_digest(),
+    ))
 }
 
 fn inspect_file(path: &Path) -> Result<PhysicalFile> {
@@ -346,7 +348,10 @@ fn canonical_artifact_identity_for_source(
         let pin = spec.file_pin_for(&adapter.path)?;
         pin.verify_unchanged()?;
         digest.update(pin.loader_path().to_string_lossy().as_bytes());
-        digest.update(pin.content_sha256_hex().as_bytes());
+        digest.update(
+            mlx_gen::gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest())
+                .as_bytes(),
+        );
         digest.update(logical_bytes(&adapter.path)?.to_le_bytes());
         digest.update(adapter.scale.to_bits().to_le_bytes());
         digest.update(

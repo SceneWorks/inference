@@ -124,7 +124,7 @@ impl Asset {
     pub(crate) fn verify_owned_bytes(&self, bytes: &[u8]) -> gen_core::Result<()> {
         if self.repo == IMPORTED_TRANSFORMER_REPOSITORY {
             if bytes.len() as u64 != self.pin.target_fingerprint().size
-                || Sha256::digest(bytes)[..] != self.pin.content_sha256()[..]
+                || Sha256::digest(bytes)[..] != self.pin.require_content_sha256()?[..]
             {
                 return Err(gen_core::Error::Unsupported(
                     "imported transformer bytes changed".into(),
@@ -135,7 +135,7 @@ impl Asset {
         #[cfg(feature = "test-support")]
         if let Some(expected) = self.fixture_digest {
             let actual = Sha256::digest(bytes);
-            if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
+            if actual[..] != expected[..] || actual[..] != self.pin.require_content_sha256()?[..] {
                 return Err(gen_core::Error::Unsupported(
                     "synthetic fixture consumed bytes changed".into(),
                 ));
@@ -149,7 +149,7 @@ impl Asset {
         let digest = Sha256::digest(bytes);
         if bytes.len() as u64 != expected.bytes
             || format!("{digest:x}") != expected.sha256
-            || digest[..] != self.pin.content_sha256()[..]
+            || digest[..] != self.pin.require_content_sha256()?[..]
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "MOSS actual consumed bytes differ from authenticated asset {}",
@@ -283,7 +283,7 @@ impl Sources {
             let mut hash = Sha256::new();
             for asset in &self.ordinary {
                 hash.update(asset.relative.as_bytes());
-                hash.update(asset.pin.content_sha256());
+                hash.update(asset.pin.content_or_identity_digest());
             }
             format!(
                 "synthetic-moss-full-pipeline-v1:{}:{:x}",
@@ -297,7 +297,7 @@ impl Sources {
         {
             let digest = asset
                 .pin
-                .content_sha256()
+                .content_or_identity_digest()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
@@ -948,7 +948,7 @@ fn asset_headers(
             IMPORTED_TRANSFORMER_REVISION,
             IMPORTED_TRANSFORMER_PATH,
             bytes,
-            *a.pin.content_sha256(),
+            *a.pin.require_content_sha256()?,
         );
         return cached_headers_with_check(
             CACHE.get_or_init(Mutex::default),
@@ -960,7 +960,7 @@ fn asset_headers(
                     stream_headers_with_check(
                         std::fs::File::open(path)?,
                         bytes,
-                        a.pin.content_sha256(),
+                        a.pin.require_content_sha256()?,
                         check,
                     )
                 })
@@ -976,7 +976,7 @@ fn asset_headers(
         identity.revision,
         identity.relative_path,
         identity.bytes,
-        *a.pin.content_sha256(),
+        *a.pin.require_content_sha256()?,
     );
     cached_headers_with_check(
         CACHE.get_or_init(Mutex::default),
@@ -997,7 +997,12 @@ fn asset_headers(
                 );
                 let mut file = source.reader(file)?;
                 file.begin();
-                stream_headers_with_check(file, identity.bytes, a.pin.content_sha256(), check)
+                stream_headers_with_check(
+                    file,
+                    identity.bytes,
+                    a.pin.require_content_sha256()?,
+                    check,
+                )
             });
             check()?;
             result
@@ -1032,7 +1037,7 @@ fn validate_source_dtypes(
                 a.relative
             )));
         }
-        result.insert(*a.pin.content_sha256(), headers);
+        result.insert(*a.pin.require_content_sha256()?, headers);
     }
     Ok(result)
 }
@@ -1052,7 +1057,7 @@ fn validate_fp32(
         identity.revision,
         identity.relative_path,
         identity.bytes,
-        *a.pin.content_sha256(),
+        *a.pin.require_content_sha256()?,
     );
     let cache = VALIDATED.get_or_init(Mutex::default);
     if cache
@@ -1094,7 +1099,7 @@ fn validate_fp32(
         }
         read?;
         if reader.bytes != identity.bytes
-            || reader.hash.clone().finalize()[..] != a.pin.content_sha256()[..]
+            || reader.hash.clone().finalize()[..] != a.pin.require_content_sha256()?[..]
         {
             return Err(gen_core::Error::Unsupported(
                 "MOSS actual validation bytes differ from approved identity".into(),
@@ -1407,7 +1412,7 @@ mod header_cpu_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &data).unwrap();
         let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
-        let digest = *pin.content_sha256();
+        let digest = *pin.content_sha256().unwrap();
         let key = (
             "tiny-approved-test",
             "rev",
@@ -1458,7 +1463,7 @@ mod header_cpu_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &data).unwrap();
         let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
-        let digest = *pin.content_sha256();
+        let digest = *pin.content_sha256().unwrap();
         let key = (
             "tiny-approved-test",
             "rev",
