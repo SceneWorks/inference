@@ -60,9 +60,7 @@ pub const H3_AUDIO_LATENT_CHANNELS: u16 = 32;
 pub const H3_PATCH_SIZE: [u32; 3] = [1, 2, 2];
 pub const H3_CANVAS_DEFAULT_WIDTH: u32 = 1344;
 pub const H3_CANVAS_DEFAULT_HEIGHT: u32 = 768;
-pub const H3_LEGAL_FRAME_COUNTS: [u32; 14] = [
-    124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345,
-];
+pub use crate::h3_memory::LEGAL_FRAME_COUNTS as H3_LEGAL_FRAME_COUNTS;
 pub const H3_FPS: f32 = 24.0;
 pub const H3_CUBLASLT_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 pub const H3_M5_POOL_BUDGET_BYTES: u64 = 21 * 1024 * 1024 * 1024;
