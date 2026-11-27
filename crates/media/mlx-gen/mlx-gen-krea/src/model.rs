@@ -504,7 +504,7 @@ pub fn route_raw() -> RouteRecord {
     route.bindings =
         RouteBindings::generator(raw_descriptor, |spec| load_raw(spec).map_err(Into::into))
             .with_footprint(raw_component_footprint)
-            .with_render_plan(compile_raw_render_plan)
+            .with_multiphase_render_plan(compile_raw_render_plan)
             .with_memory_registration(RAW_MEMORY_REGISTRATION)
             .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
                 crate::block_memory_strategy::weights_free_memory_strategy_contract(

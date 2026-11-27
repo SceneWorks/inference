@@ -2209,4 +2209,71 @@ mod tests {
             "MLX descriptor conformance sweep failed"
         );
     }
+
+    /// SW-6979 (`HOOK-4`, `AP5`): `krea_2_raw`'s render-plan compiler only compiles explicit
+    /// multi-phase requests (`req.phases.is_some()`), so its `RouteRecord` must declare
+    /// `RenderPlanScope::MultiphaseOnly`: `krea_multiphase` stays applicable while `hires_fix`
+    /// and `inert_phase_split` are refused with typed inapplicability codes.
+    #[test]
+    fn krea_2_raw_advertises_multiphase_only_feature_applicability() {
+        use mlx_gen::gen_core::{FeatureInapplicabilityCode, RenderPlanScope};
+
+        let registry = super::provider_registry().unwrap();
+        let raw_record = registry
+            .route_record("krea_2_raw")
+            .expect("krea_2_raw must be registered via RouteRecord");
+        assert_eq!(
+            raw_record.bindings.render_plan_scope,
+            RenderPlanScope::MultiphaseOnly
+        );
+
+        let raw_desc = registry
+            .generator_descriptor("krea_2_raw")
+            .expect("krea_2_raw descriptor");
+        let raw_features = registry.generator_feature_applicability(raw_desc);
+        assert!(
+            raw_features["krea_multiphase"].applicable,
+            "krea_2_raw must advertise krea_multiphase as applicable: {:?}",
+            raw_features["krea_multiphase"]
+        );
+        assert!(
+            !raw_features["hires_fix"].applicable,
+            "krea_2_raw must refuse hires_fix (compile_raw_render_plan rejects Reference with phases and returns Ok(None) without phases)"
+        );
+        assert!(
+            raw_features["hires_fix"]
+                .reasons
+                .iter()
+                .any(|r| r.code == FeatureInapplicabilityCode::MissingProducedReferenceSupport),
+            "expected MissingProducedReferenceSupport for krea_2_raw hires_fix, got {:?}",
+            raw_features["hires_fix"].reasons
+        );
+        assert!(
+            !raw_features["inert_phase_split"].applicable,
+            "krea_2_raw must refuse inert_phase_split"
+        );
+        assert!(
+            raw_features["inert_phase_split"]
+                .reasons
+                .iter()
+                .any(|r| r.code == FeatureInapplicabilityCode::MissingPackedImageTrajectory),
+            "expected MissingPackedImageTrajectory for krea_2_raw inert_phase_split, got {:?}",
+            raw_features["inert_phase_split"].reasons
+        );
+
+        let turbo_record = registry
+            .route_record("krea_2_turbo")
+            .expect("krea_2_turbo must be registered via RouteRecord");
+        assert_eq!(
+            turbo_record.bindings.render_plan_scope,
+            RenderPlanScope::SingleAndMultiPass
+        );
+        let turbo_desc = registry
+            .generator_descriptor("krea_2_turbo")
+            .expect("krea_2_turbo descriptor");
+        let turbo_features = registry.generator_feature_applicability(turbo_desc);
+        assert!(turbo_features["hires_fix"].applicable);
+        assert!(turbo_features["inert_phase_split"].applicable);
+        assert!(!turbo_features["krea_multiphase"].applicable);
+    }
 }

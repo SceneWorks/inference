@@ -1536,6 +1536,73 @@ fn every_registered_generator_is_backed_by_a_conforming_route_record() {
     }
 }
 
+/// SW-6979 (`HOOK-4`, `AP5`): `krea_2_raw`'s render-plan compiler only compiles explicit
+/// multi-phase requests (`req.phases.is_some()`), so its `RouteRecord` must declare
+/// `RenderPlanScope::MultiphaseOnly`: `krea_multiphase` stays applicable while `hires_fix`
+/// and `inert_phase_split` are refused with typed inapplicability codes.
+#[test]
+fn krea_2_raw_advertises_multiphase_only_feature_applicability() {
+    use candle_gen::gen_core::{FeatureInapplicabilityCode, RenderPlanScope};
+
+    let registry = super::provider_registry().unwrap();
+    let raw_record = registry
+        .route_record("krea_2_raw")
+        .expect("krea_2_raw must be registered via RouteRecord");
+    assert_eq!(
+        raw_record.bindings.render_plan_scope,
+        RenderPlanScope::MultiphaseOnly
+    );
+
+    let raw_desc = registry
+        .generator_descriptor("krea_2_raw")
+        .expect("krea_2_raw descriptor");
+    let raw_features = registry.generator_feature_applicability(raw_desc);
+    assert!(
+        raw_features["krea_multiphase"].applicable,
+        "krea_2_raw must advertise krea_multiphase as applicable: {:?}",
+        raw_features["krea_multiphase"]
+    );
+    assert!(
+        !raw_features["hires_fix"].applicable,
+        "krea_2_raw must refuse hires_fix (compile_raw_render_plan rejects Reference with phases and returns Ok(None) without phases)"
+    );
+    assert!(
+        raw_features["hires_fix"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingProducedReferenceSupport),
+        "expected MissingProducedReferenceSupport for krea_2_raw hires_fix, got {:?}",
+        raw_features["hires_fix"].reasons
+    );
+    assert!(
+        !raw_features["inert_phase_split"].applicable,
+        "krea_2_raw must refuse inert_phase_split"
+    );
+    assert!(
+        raw_features["inert_phase_split"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingPackedImageTrajectory),
+        "expected MissingPackedImageTrajectory for krea_2_raw inert_phase_split, got {:?}",
+        raw_features["inert_phase_split"].reasons
+    );
+
+    let turbo_record = registry
+        .route_record("krea_2_turbo")
+        .expect("krea_2_turbo must be registered via RouteRecord");
+    assert_eq!(
+        turbo_record.bindings.render_plan_scope,
+        RenderPlanScope::SingleAndMultiPass
+    );
+    let turbo_desc = registry
+        .generator_descriptor("krea_2_turbo")
+        .expect("krea_2_turbo descriptor");
+    let turbo_features = registry.generator_feature_applicability(turbo_desc);
+    assert!(turbo_features["hires_fix"].applicable);
+    assert!(turbo_features["inert_phase_split"].applicable);
+    assert!(!turbo_features["krea_multiphase"].applicable);
+}
+
 /// Machine-readable bespoke memory waivers remain well-formed, point to existing crate files,
 /// and stay absent from the ordinary generator and memory-strategy registries.
 #[test]
@@ -1600,12 +1667,71 @@ fn bespoke_memory_route_waivers_are_valid() {
     }
 }
 
-/// Every catalog provider whose `register_providers` body gates registration on `feature = "cuda"`
-/// must receive that feature from `candle-gen-catalog`'s `cuda` feature.
+/// Every catalog provider whose registration surface (`register_providers`, `register_memory_*`,
+/// or `RouteRecord` / `RouteBindings` / `ProviderRegistryBuilder` helpers across `src/**/*.rs`)
+/// gates registration on `feature = "cuda"` must receive that feature from `candle-gen-catalog`'s
+/// `cuda` feature.
 #[test]
 fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
     use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    fn skip_string_or_char(bytes: &[u8], i: usize) -> Option<usize> {
+        match bytes[i] {
+            b'"' => {
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b'"' {
+                        return Some(j + 1);
+                    }
+                    j += 1;
+                }
+                Some(bytes.len())
+            }
+            b'\'' => {
+                // Distinguish char literals (`'{'`, `'\''`, `'\n'`) from lifetimes (`'a`, `'static`).
+                if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                    let mut j = i + 3;
+                    while j < bytes.len() && bytes[j] != b'\'' {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        return Some(j + 1);
+                    }
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    return Some(i + 3);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn find_matching_delim(src: &str, open_idx: usize, open: u8, close: u8) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 1usize;
+        let mut i = open_idx + 1;
+        while i < bytes.len() {
+            if let Some(next) = skip_string_or_char(bytes, i) {
+                i = next;
+                continue;
+            }
+            if bytes[i] == open {
+                depth += 1;
+            } else if bytes[i] == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
 
     fn function_body<'a>(source: &'a str, function: &str) -> &'a str {
         let start = source
@@ -1615,52 +1741,226 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         let open = rest
             .find('{')
             .unwrap_or_else(|| panic!("{function:?} has no body"));
-        let body_start = open + 1;
-        let mut depth = 1usize;
-        for (offset, ch) in rest[body_start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &rest[body_start..body_start + offset];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("{function:?} has an unterminated body");
+        let close = find_matching_delim(rest, open, b'{', b'}')
+            .unwrap_or_else(|| panic!("{function:?} has an unterminated body"));
+        &rest[open + 1..close]
     }
 
     fn strip_line_comments(src: &str) -> String {
         src.lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
+            .map(|line| {
+                let bytes = line.as_bytes();
+                let mut i = 0;
+                while i + 1 < bytes.len() {
+                    if let Some(next) = skip_string_or_char(bytes, i) {
+                        i = next;
+                        continue;
+                    }
+                    if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                        return &line[..i];
+                    }
+                    i += 1;
+                }
+                line
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn is_test_only_cfg(inner: &str) -> bool {
+        let compact: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+        compact == "test"
+            || (compact.starts_with("all(")
+                && !compact.contains("any(")
+                && (compact.contains("(test,")
+                    || compact.contains(",test,")
+                    || compact.contains(",test)")))
+    }
+
+    /// Strip `#[cfg(test)]` / `#[cfg(all(test, ...))]` modules and items while preserving
+    /// production `#[cfg(any(feature = "cuda", test))]` blocks.
+    fn strip_cfg_test_only_items(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if let Some(next) = skip_string_or_char(bytes, i) {
+                out.push_str(&src[i..next]);
+                i = next;
+                continue;
+            }
+            if src[i..].starts_with("#[cfg(") {
+                let paren_open = i + "#[cfg".len();
+                if let Some(paren_close) = find_matching_delim(src, paren_open, b'(', b')') {
+                    let inner = &src[paren_open + 1..paren_close];
+                    if is_test_only_cfg(inner) {
+                        let mut j = paren_close + 1;
+                        if j < bytes.len() && bytes[j] == b']' {
+                            j += 1;
+                        }
+                        // Advance past chained attributes (`#[...]`) to the gated item's `;` or `{...}`.
+                        while j < bytes.len() {
+                            if let Some(next) = skip_string_or_char(bytes, j) {
+                                j = next;
+                                continue;
+                            }
+                            if bytes[j] == b'#' && j + 1 < bytes.len() && bytes[j + 1] == b'[' {
+                                if let Some(attr_close) =
+                                    find_matching_delim(src, j + 1, b'[', b']')
+                                {
+                                    j = attr_close + 1;
+                                    continue;
+                                }
+                            }
+                            if bytes[j] == b';' {
+                                j += 1;
+                                break;
+                            }
+                            if bytes[j] == b'{' {
+                                j = find_matching_delim(src, j, b'{', b'}')
+                                    .map_or(bytes.len(), |c| c + 1);
+                                break;
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
     }
 
     fn has_cuda_cfg(body: &str) -> bool {
         let mut rest = body;
         while let Some(offset) = rest.find("#[cfg(") {
-            let predicate = &rest[offset + "#[cfg(".len()..];
-            let mut depth = 1usize;
-            for (end, ch) in predicate.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            let inner = &predicate[..end];
-                            if inner.contains("feature") && inner.contains("\"cuda\"") {
-                                return true;
-                            }
-                            rest = &predicate[end + 1..];
-                            break;
-                        }
-                    }
-                    _ => {}
+            let paren_open = offset + "#[cfg".len();
+            let Some(paren_close) = find_matching_delim(rest, paren_open, b'(', b')') else {
+                break;
+            };
+            let inner = &rest[paren_open + 1..paren_close];
+            if inner.contains("feature") && inner.contains("\"cuda\"") {
+                return true;
+            }
+            rest = &rest[paren_close + 1..];
+        }
+        false
+    }
+
+    fn collect_non_test_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if path.is_dir() {
+                if name == "tests" {
+                    continue;
+                }
+                collect_non_test_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && name != "tests.rs"
+                && !name.ends_with("_tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// True if any route/provider registration function in `src` contains a CUDA `#[cfg(...)]`.
+    fn file_has_cuda_gated_registration(src: &str) -> bool {
+        let bytes = src.as_bytes();
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            if let Some(next) = skip_string_or_char(bytes, i) {
+                i = next;
+                continue;
+            }
+            let at_fn = bytes[i] == b'f'
+                && bytes[i + 1] == b'n'
+                && bytes[i + 2].is_ascii_whitespace()
+                && (i == 0 || !is_ident_byte(bytes[i - 1]));
+            if !at_fn {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let name_start = j;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let fn_name = &src[name_start..j];
+            if fn_name.is_empty() {
+                i += 2;
+                continue;
+            }
+            // Skip optional generics `<...>` and locate parameter list `(...)`.
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'<' {
+                if let Some(close_gen) = find_matching_delim(src, j, b'<', b'>') {
+                    j = close_gen + 1;
                 }
             }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                i = j;
+                continue;
+            }
+            let params_start = j;
+            let Some(params_close) = find_matching_delim(src, params_start, b'(', b')') else {
+                break;
+            };
+            // Scan return type + optional where clause up to `{` or `;`.
+            let mut k = params_close + 1;
+            let mut body_open = None;
+            while k < bytes.len() {
+                if let Some(next) = skip_string_or_char(bytes, k) {
+                    k = next;
+                    continue;
+                }
+                if bytes[k] == b';' {
+                    break;
+                }
+                if bytes[k] == b'{' {
+                    body_open = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            let Some(open) = body_open else {
+                i = k + 1;
+                continue;
+            };
+            let Some(close) = find_matching_delim(src, open, b'{', b'}') else {
+                break;
+            };
+            let sig = &src[params_start..open];
+            let is_registration_fn = fn_name == "register_providers"
+                || fn_name.starts_with("register_memory_")
+                || sig.contains("RouteRecord")
+                || sig.contains("RouteBindings")
+                || sig.contains("ProviderRegistryBuilder");
+            if is_registration_fn && has_cuda_cfg(&src[open + 1..close]) {
+                return true;
+            }
+            i = open + 1;
         }
         false
     }
@@ -1672,8 +1972,11 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         &std::fs::read_to_string(candle_gen_root.join("candle-gen-catalog/src/lib.rs")).unwrap(),
     );
     let catalog_registration = function_body(&catalog_lib, "pub fn register_providers");
+    let contract_surface_registration =
+        function_body(&catalog_lib, "pub fn memory_contract_surface_registry");
 
     let mut cuda_gated = BTreeSet::new();
+    let mut surface_registered = BTreeSet::new();
     let mut crate_dirs: Vec<_> = std::fs::read_dir(candle_gen_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1689,20 +1992,51 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         if dir == "candle-gen-catalog" {
             continue;
         }
-        let provider_call = format!("{}::register_providers(", dir.replace('-', "_"));
+        let crate_ident = dir.replace('-', "_");
+        let provider_call = format!("{crate_ident}::register_providers(");
         if !catalog_registration.contains(&provider_call) {
             continue;
         }
-        let lib_src =
-            strip_line_comments(&std::fs::read_to_string(crate_dir.join("src/lib.rs")).unwrap());
-        let body = function_body(&lib_src, "pub fn register_providers");
-        if has_cuda_cfg(body) {
+        let surface_call = format!("{crate_ident}::register_memory_contract_surfaces(");
+        if contract_surface_registration.contains(&surface_call) {
+            surface_registered.insert(dir.clone());
+        }
+        let mut rs_files = Vec::new();
+        collect_non_test_rs_files(&crate_dir.join("src"), &mut rs_files);
+        let has_cuda_gate = rs_files.iter().any(|path| {
+            let raw = std::fs::read_to_string(path).unwrap();
+            let stripped = strip_cfg_test_only_items(&strip_line_comments(&raw));
+            file_has_cuda_gated_registration(&stripped)
+        });
+        if has_cuda_gate {
             cuda_gated.insert(dir);
         }
     }
+
+    let expected_cuda_gated: BTreeSet<String> = [
+        "candle-gen-bernini",
+        "candle-gen-flux",
+        "candle-gen-flux2",
+        "candle-gen-krea",
+        "candle-gen-lens",
+        "candle-gen-ltx",
+        "candle-gen-mage",
+        "candle-gen-minimax-h3",
+        "candle-gen-qwen-image",
+        "candle-gen-scail2",
+        "candle-gen-wan",
+        "candle-gen-z-image",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     assert!(
-        !cuda_gated.is_empty() && cuda_gated.contains("candle-gen-wan"),
-        "expected CUDA-gated catalog providers including candle-gen-wan, got {cuda_gated:?}"
+        !cuda_gated.is_empty() && expected_cuda_gated.is_subset(&cuda_gated),
+        "expected CUDA-gated catalog providers to cover all {expected_cuda_gated:?}, got {cuda_gated:?}"
+    );
+    assert!(
+        !surface_registered.is_empty() && surface_registered.is_subset(&cuda_gated),
+        "every crate in memory_contract_surface_registry ({surface_registered:?}) must be detected as CUDA-gated ({cuda_gated:?})"
     );
 
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1749,7 +2083,7 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         let forwarding = format!("{provider}/cuda");
         assert!(
             cuda_forwarded.contains(forwarding.as_str()),
-            "{provider} has a CUDA-gated register_providers branch, so candle-gen-catalog's \
+            "{provider} has a CUDA-gated route/provider registration branch, so candle-gen-catalog's \
              cuda feature must forward {forwarding:?}"
         );
     }

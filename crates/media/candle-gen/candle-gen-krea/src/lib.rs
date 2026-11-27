@@ -1646,7 +1646,7 @@ pub(crate) fn route_raw() -> gen_core::RouteRecord {
     route.defaults.shift = None;
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     let mut bindings = gen_core::RouteBindings::generator(raw_descriptor, load_raw)
-        .with_render_plan(compile_raw_render_plan);
+        .with_multiphase_render_plan(compile_raw_render_plan);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings

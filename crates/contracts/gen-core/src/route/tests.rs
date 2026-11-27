@@ -610,6 +610,93 @@ fn tier0_conformance_rejects_negative_fixtures_for_all_behavioural_declarations(
             safety_check: stub_safety_check,
         });
     assert!(verify_route_conformance(&bad_mem).is_err());
+
+    // 16. MultiphaseOnly scope without a render_plan compiler or without supports_multiphase_denoise.
+    let mut bad_scope_no_plan = det.clone();
+    bad_scope_no_plan.bindings.render_plan = None;
+    bad_scope_no_plan.bindings.render_plan_scope = RenderPlanScope::MultiphaseOnly;
+    bad_scope_no_plan.structure.denoiser =
+        ModelBinding::family_model(FamilyModelSpec::new("flux1_mmdit").with_multiphase_denoise());
+    assert!(verify_route_conformance(&bad_scope_no_plan).is_err());
+
+    let mut bad_scope_no_phases = det.clone();
+    bad_scope_no_phases.bindings = bad_scope_no_phases
+        .bindings
+        .with_multiphase_render_plan(stub_compile_plan);
+    assert!(verify_route_conformance(&bad_scope_no_phases).is_err());
+}
+
+#[test]
+fn multiphase_only_render_plan_scope_permits_krea_multiphase_and_refuses_single_and_multipass_features(
+) {
+    let features = FeatureRegistry::standard();
+    let mut route = sample_flux_route();
+    route.bindings.generator = None;
+    route.structure.denoiser = ModelBinding::family_model(
+        FamilyModelSpec::new("krea2_dit")
+            .with_multiphase_denoise()
+            .with_pag(sample_pag()),
+    );
+    route.bindings = route
+        .bindings
+        .with_multiphase_render_plan(stub_compile_plan);
+
+    assert!(
+        verify_route_conformance(&route).is_ok(),
+        "conformance errors: {:?}",
+        route_record_conformance_errors(&route)
+    );
+
+    let structure = route.to_feature_route_structure();
+    assert!(structure.has_render_plan);
+    assert!(structure.supports_multiphase_denoise);
+    assert!(!structure.has_packed_image_trajectory);
+    assert!(!structure.supports_spatial_unpack_repack);
+    assert!(!structure.supports_produced_reference_multipass);
+    assert!(!structure.supports_clean_estimate_renoise_transition);
+    assert_eq!(route.to_json()["render_plan_scope"], "multiphase_only");
+
+    let apps = features.evaluate_route(&structure);
+    assert!(
+        apps["krea_multiphase"].applicable,
+        "multiphase-only render plan must keep krea_multiphase applicable"
+    );
+    assert!(
+        !apps["hires_fix"].applicable,
+        "multiphase-only render plan must refuse hires_fix"
+    );
+    assert!(
+        apps["hires_fix"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingProducedReferenceSupport),
+        "expected MissingProducedReferenceSupport on hires_fix, got {:?}",
+        apps["hires_fix"].reasons
+    );
+    assert!(
+        !apps["inert_phase_split"].applicable,
+        "multiphase-only render plan must refuse inert_phase_split"
+    );
+    assert!(
+        apps["inert_phase_split"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingPackedImageTrajectory),
+        "expected MissingPackedImageTrajectory on inert_phase_split, got {:?}",
+        apps["inert_phase_split"].reasons
+    );
+    assert!(
+        !apps["low_res_start"].applicable,
+        "multiphase-only render plan must refuse low_res_start"
+    );
+    assert!(
+        apps["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingPackedImageTrajectory),
+        "expected MissingPackedImageTrajectory on low_res_start, got {:?}",
+        apps["low_res_start"].reasons
+    );
 }
 
 #[test]

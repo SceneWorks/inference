@@ -349,10 +349,11 @@ pub use route::{
     route_record_conformance_errors, verify_route_conformance, AdapterInstallPolicy,
     AdapterSurface, AudioSurface, ConditioningSurface, FamilyDriverSpec, FamilyModelSpec,
     LatentCodecDeclaration, ModelBinding, OutputSurface, PreviewSupport, ProductLimits,
-    RenderPlanCompiler, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface, RouteBindings,
-    RouteDefaults, RouteFeatureBinding, RouteGeneratorBinding, RouteMemoryBindings, RouteRecord,
-    RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, TextEncoderDeclaration,
-    TextEncoderSurface, UpsamplerSurface, VideoSurface, WeightPlanDeclaration, WeightSourceKind,
+    RenderPlanCompiler, RenderPlanScope, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteFeatureBinding, RouteGeneratorBinding, RouteMemoryBindings,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme,
+    TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface, VideoSurface,
+    WeightPlanDeclaration, WeightSourceKind,
 };
 pub use runtime::{
     with_prompt_encoding, AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactDigestAttestation,

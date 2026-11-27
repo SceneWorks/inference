@@ -9,7 +9,7 @@ use crate::generator::{
 };
 use crate::runtime::Quant;
 
-use super::types::RouteRecord;
+use super::types::{RenderPlanScope, RouteRecord};
 
 impl RouteRecord {
     /// Compute [`Capabilities`] purely from this route's primary declarations (`REG-2`, `AP5`).
@@ -107,12 +107,14 @@ impl RouteRecord {
     pub fn to_feature_route_structure(&self) -> FeatureRouteStructure {
         let s = &self.structure;
         let has_render_plan = self.bindings.render_plan.is_some();
+        let compiles_single_and_multi_pass = has_render_plan
+            && self.bindings.render_plan_scope == RenderPlanScope::SingleAndMultiPass;
         let pixel_stride = s
             .latent_codec
             .effective_pixel_stride(self.limits.size_floor);
         let token_width = s.latent_codec.effective_token_width();
         let has_packed_image_trajectory = self.modality == Modality::Image
-            && has_render_plan
+            && compiles_single_and_multi_pass
             && pixel_stride.is_some_and(|stride| stride > 0)
             && token_width.is_some_and(|width| width > 0);
         let supports_spatial_unpack_repack = self.modality == Modality::Image
@@ -120,11 +122,11 @@ impl RouteRecord {
             && s.latent_codec.supports_spatial_unpack_repack();
         let default_executed_steps = self.defaults.steps;
         let supports_clean_estimate_renoise_transition = s.denoiser.supports_low_res_transition()
-            && has_render_plan
+            && compiles_single_and_multi_pass
             && supports_spatial_unpack_repack
             && default_executed_steps.is_some_and(|steps| steps >= 2);
         let supports_multiphase_denoise = s.denoiser.supports_multiphase_denoise();
-        let supports_produced_reference_multipass = has_render_plan
+        let supports_produced_reference_multipass = compiles_single_and_multi_pass
             && has_packed_image_trajectory
             && s.conditioning.kinds.contains(&ConditioningKind::Reference);
         let supports_expert_switching = s.denoiser.supports_expert_switching();
@@ -191,6 +193,7 @@ impl RouteRecord {
             "output": self.structure.output,
             "has_generator": self.bindings.generator.is_some(),
             "has_render_plan": self.bindings.render_plan.is_some(),
+            "render_plan_scope": self.bindings.render_plan.map(|_| self.bindings.render_plan_scope),
             "has_video_plan": self.bindings.video_plan.is_some(),
             "has_memory_contract": self.bindings.memory.contract.is_some(),
         })

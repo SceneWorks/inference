@@ -5,7 +5,9 @@ use crate::generator::{ConditioningKind, Modality, SizeFloor};
 use crate::registry::model_descriptor_errors;
 use crate::{Error, Result};
 
-use super::types::{AdapterInstallPolicy, ModelBinding, PreviewSupport, RouteRecord};
+use super::types::{
+    AdapterInstallPolicy, ModelBinding, PreviewSupport, RenderPlanScope, RouteRecord,
+};
 
 fn is_registry_ident(s: &str) -> bool {
     !s.is_empty()
@@ -370,7 +372,19 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
         }
     }
 
-    // 10. RouteBindings provider_id consistency.
+    // 10. RouteBindings provider_id and render-plan scope consistency.
+    if record.bindings.render_plan_scope == RenderPlanScope::MultiphaseOnly {
+        if record.bindings.render_plan.is_none() {
+            errs.push(format!(
+                "{ctx}: render_plan_scope is MultiphaseOnly but no render_plan compiler is attached"
+            ));
+        }
+        if !s.denoiser.supports_multiphase_denoise() {
+            errs.push(format!(
+                "{ctx}: render_plan_scope is MultiphaseOnly but denoiser does not declare supports_multiphase_denoise"
+            ));
+        }
+    }
     if let Some(vp) = record.bindings.video_plan {
         if vp.provider_id != record.route_id {
             errs.push(format!(

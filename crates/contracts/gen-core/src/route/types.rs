@@ -703,6 +703,19 @@ pub struct RouteDefaults {
 /// Pre-load render-plan compiler function pointer.
 pub type RenderPlanCompiler = fn(&LoadSpec, &GenerationRequest) -> Result<Option<RenderPlan>>;
 
+/// Structural scope of a route's pre-load [`RenderPlanCompiler`] binding (`HOOK-4`, `AP5`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderPlanScope {
+    /// Compiles ordinary single-pass / pass-0 packed trajectories and (when `Reference`
+    /// conditioning is declared) multi-pass produced-reference trajectories.
+    #[default]
+    SingleAndMultiPass,
+    /// Compiles only explicit multi-phase denoise requests (`req.phases.is_some()`, e.g.
+    /// `krea_multiphase`) and returns `Ok(None)` for ordinary single-phase / multi-pass requests.
+    MultiphaseOnly,
+}
+
 /// Standalone generator factory binding attached to a [`RouteRecord`].
 #[derive(Clone, Copy)]
 pub struct RouteGeneratorBinding {
@@ -822,6 +835,7 @@ impl std::fmt::Debug for RouteMemoryBindings {
 pub struct RouteBindings {
     pub generator: Option<RouteGeneratorBinding>,
     pub render_plan: Option<RenderPlanCompiler>,
+    pub render_plan_scope: RenderPlanScope,
     pub video_plan: Option<VideoPlanRegistration>,
     pub feature_route: Option<RouteFeatureBinding>,
     pub encoder_contract_parent: Option<&'static str>,
@@ -835,6 +849,7 @@ impl std::fmt::Debug for RouteBindings {
         f.debug_struct("RouteBindings")
             .field("generator", &self.generator)
             .field("has_render_plan", &self.render_plan.is_some())
+            .field("render_plan_scope", &self.render_plan_scope)
             .field("has_video_plan", &self.video_plan.is_some())
             .field("feature_route", &self.feature_route)
             .field("encoder_contract_parent", &self.encoder_contract_parent)
@@ -883,9 +898,25 @@ impl RouteBindings {
         self
     }
 
-    /// Attach a pre-load render-plan compiler for this route.
+    /// Attach a pre-load render-plan compiler covering single-pass and multi-pass trajectories.
     pub fn with_render_plan(mut self, compile: RenderPlanCompiler) -> Self {
         self.render_plan = Some(compile);
+        self.render_plan_scope = RenderPlanScope::SingleAndMultiPass;
+        self
+    }
+
+    /// Attach a pre-load render-plan compiler that compiles only explicit multi-phase requests
+    /// (`req.phases.is_some()`) and returns `Ok(None)` for ordinary single-phase / multi-pass
+    /// requests.
+    pub fn with_multiphase_render_plan(mut self, compile: RenderPlanCompiler) -> Self {
+        self.render_plan = Some(compile);
+        self.render_plan_scope = RenderPlanScope::MultiphaseOnly;
+        self
+    }
+
+    /// Override the structural [`RenderPlanScope`] of an attached render-plan compiler.
+    pub fn with_render_plan_scope(mut self, scope: RenderPlanScope) -> Self {
+        self.render_plan_scope = scope;
         self
     }
 
