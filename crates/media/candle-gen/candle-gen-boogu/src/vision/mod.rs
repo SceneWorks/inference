@@ -143,7 +143,9 @@ fn layer_norm(w: &Weights, prefix: &str, eps: f64) -> Result<LayerNorm> {
 fn require_dense(w: &Weights, base: &str, why: &str) -> Result<()> {
     if w.packed().is_some() && stored_ggml(w, base)?.is_some() {
         return Err(candle_gen::candle_core::Error::Msg(format!(
-            "boogu: `{base}.weight` is a stored GGML block tensor, but it is loaded by a              dense-only path ({why}). Reading GGML blocks as floats is silent garbage (sc-14980),              so this snapshot is refused rather than rendered."
+            "boogu: `{base}.weight` is a stored GGML block tensor, but it is loaded by a \
+             dense-only path ({why}). Reading GGML blocks as floats is silent garbage (sc-14980), \
+             so this snapshot is refused rather than rendered."
         )));
     }
     if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
@@ -194,7 +196,8 @@ fn vision_linear(
         if let Some(stored) = stored_ggml(w, base)? {
             if w.contains(&scales_key) {
                 return Err(candle_gen::candle_core::Error::Msg(format!(
-                    "boogu vision `{base}`: `{weight_key}` is a stored GGML block tensor but                      `{scales_key}` is also present — a tier stores a projection one way, never both"
+                    "boogu vision `{base}`: `{weight_key}` is a stored GGML block tensor but \
+                     `{scales_key}` is also present — a tier stores a projection one way, never both"
                 )));
             }
             if let Some([out, inp]) = shape {
@@ -205,7 +208,8 @@ fn vision_linear(
                 .map(|(_, rows, cols)| [rows, cols]);
                 if decoded != Some([out, inp]) {
                     return Err(candle_gen::candle_core::Error::Msg(format!(
-                        "boogu vision `{base}`: stored GGML blocks decode to {decoded:?},                          expected [{out}, {inp}]"
+                        "boogu vision `{base}`: stored GGML blocks decode to {decoded:?}, \
+                         expected [{out}, {inp}]"
                     )));
                 }
             }
