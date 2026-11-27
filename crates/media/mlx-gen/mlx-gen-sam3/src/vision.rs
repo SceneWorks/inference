@@ -20,7 +20,7 @@ use std::rc::Rc;
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::module::Module;
 use mlx_rs::nn::MaxPool2d;
-use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d, negative, stack_axis};
+use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -72,28 +72,22 @@ impl RopeTable {
     }
 }
 
-/// `rotate_pairwise(x)`: pairwise `(a, b) -> (-b, a)` over the last dim (the SAM3 interleaved
-/// convention, paired with `repeat_interleave(2)` cos/sin).
-fn rotate_pairwise(x: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let nd = sh.len();
-    let hd = sh[nd - 1];
-    let mut paired: Vec<i32> = sh[..nd - 1].to_vec();
-    paired.push(hd / 2);
-    paired.push(2);
-    let xr = x.reshape(&paired)?;
-    let last = paired.len() as i32 - 1;
-    let x1 = xr.take_axis(Array::from_int(0), last)?; // even lane
-    let x2 = xr.take_axis(Array::from_int(1), last)?; // odd lane
-    let stacked = stack_axis(&[&negative(&x2)?, &x1], last)?;
-    Ok(stacked.reshape(sh)?)
-}
-
-/// `q_embed = q·cos + rotate_pairwise(q)·sin`. `q`: `[b, nh, seq, hd]`; `cos`/`sin`: `[seq, hd]`.
+/// `q_embed = q·cos + rotate_pairwise(q)·sin` (the SAM3 interleaved convention, paired with
+/// `repeat_interleave(2)` cos/sin). `q`: `[b, nh, seq, hd]`; `cos`/`sin`: `[seq, hd]`. The shared
+/// eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] with [`RopeStyle::InterleavedFull`]
+/// (SW-6140): the same `q·cos + rotate_pairwise(q)·sin` chain over the same per-token broadcast, no
+/// casts. SAM3's table is 2-D axial, so there is no fused route.
+///
+/// [`RopeStyle::InterleavedFull`]: mlx_gen::qkv::RopeStyle::InterleavedFull
 fn apply_rope(q: &Array, table: &RopeTable) -> Result<Array> {
-    let a = q.multiply(&table.cos)?;
-    let b = rotate_pairwise(q)?.multiply(&table.sin)?;
-    Ok(add(&a, &b)?)
+    mlx_gen::qkv::apply_rope_eager(
+        q,
+        mlx_gen::qkv::RopeTables::new(&table.cos, &table.sin),
+        mlx_gen::qkv::RopeStyle::InterleavedFull,
+        mlx_gen::qkv::RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )
 }
 
 /// Two-layer GELU MLP (`mlp.fc1` → exact-gelu → `mlp.fc2`).
@@ -506,7 +500,8 @@ impl Sam3VisionEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{abs, array_eq, max};
+    use mlx_gen::nn::rotate_pairwise;
+    use mlx_rs::ops::{abs, array_eq, max, negative};
 
     /// `window_unpartition ∘ window_partition` is identity over the unpadded region (exercises the
     /// pad-then-crop path with H/W not divisible by the window).

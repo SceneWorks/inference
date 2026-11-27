@@ -1,4 +1,5 @@
 //! Shared CUDA checkpoint FP8 projection.
+use crate::act_quant::ACT_QUANT_FP8_PATH;
 use crate::cublaslt::{quantize_weight_fp8, CublasLt};
 use candle_core::{Device, Result, Tensor};
 use std::sync::Arc;
@@ -17,6 +18,9 @@ pub struct Fp8Linear {
     block_scales: Option<Tensor>,
     row_scales: Option<candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>>,
     scale_w: f32,
+    /// `scale_w` resident on the device (one f32, uploaded once): the dynamic E4M3 forward's fused
+    /// route hands it to cuBLASLt as `A_SCALE_POINTER`, so the forward uploads nothing per call.
+    scale_w_dev: candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
 }
@@ -111,6 +115,7 @@ impl Fp8Linear {
             w_fp8: lt.stage_fp8(&codes)?,
             device,
             scale_w,
+            scale_w_dev: lt.stage_f32(&[scale_w])?,
             input_scale,
             bias,
             lt,
@@ -250,6 +255,11 @@ impl Fp8Linear {
                 self.lt
                     .mxfp8_linear(&self.w_fp8, scales, &flat, self.dims.0)?
             }
+        } else if self.dynamic_quantizer.is_none()
+            && self.input_scale.is_none()
+            && !self.w_fp8.is_e5m2()
+        {
+            self.dynamic_e4m3(&flat)?
         } else {
             let (qx, sx) = if let Some(quantize) = self.dynamic_quantizer {
                 let (codes, scale) = quantize(&flat)?;
@@ -272,6 +282,37 @@ impl Fp8Linear {
             None => y,
         };
         __model_proof_output!(Ok(y))
+    }
+
+    /// The dynamic per-tensor E4M3 GEMM (`Fp8Linear::new`): `(M, K)` activation → bf16 `(M, N)`.
+    ///
+    /// Fused (SW-6126, [`ACT_QUANT_FP8_PATH`]): the on-device quantizer writes the E4M3 codes and
+    /// the scale straight into the GEMM's operand and `B_SCALE_POINTER`, and the weight scale is
+    /// already resident — no host transfer and no stream synchronization in the forward. The
+    /// reference is the pre-SW-6126 route, `CublasLt::scaled_fp8_activation` (a candle amax plus a
+    /// 4-byte device → host scale read) and the host-scale GEMM; both produce the same codes, the
+    /// same scale bits and therefore the same output.
+    fn dynamic_e4m3(&self, flat: &Tensor) -> Result<Tensor> {
+        use crate::act_quant::{fused_fp8_raw, Fp8ScaleRule};
+        let (rows, cols) = flat.dims2()?;
+        ACT_QUANT_FP8_PATH.dispatch(
+            || {
+                fused_fp8_raw(flat, Fp8ScaleRule::Divide)?.try_map(|raw| {
+                    let qx = crate::cublaslt::DevFp8::from_e4m3_codes(raw.codes, rows, cols)?;
+                    self.lt.matmul_fp8_staged_device_scales(
+                        &self.w_fp8,
+                        &self.scale_w_dev,
+                        &qx,
+                        &raw.scale,
+                    )
+                })
+            },
+            || {
+                let (qx, sx) = self.lt.scaled_fp8_activation(flat, None, false)?;
+                self.lt
+                    .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)
+            },
+        )
     }
 }
 

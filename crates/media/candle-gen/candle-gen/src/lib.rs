@@ -115,6 +115,12 @@ pub use fused_attention::{
     Int8AttentionConfig, Int8Refusal, Int8RefusalCounts, KCentering, PvPrecision,
 };
 
+// The media fused-kernel path seam (SW-6126, SW-F287): every fused media kernel's switch
+// (`CANDLE_MEDIA_FUSED_KERNELS` over a per-kernel variable) and its fused-vs-reference counters
+// with typed reasons. Lives in candle-quant-kernels (the lowest crate every kernel shares) and is
+// re-exported here for the providers; see its module docs for the recipe a new kernel follows.
+pub use candle_quant_kernels::fused_path;
+
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
 // guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.

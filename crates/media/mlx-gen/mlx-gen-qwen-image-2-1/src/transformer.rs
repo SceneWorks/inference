@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_tanh, rope_rotate, rope_sincos_from_ids, silu, timestep_sincos};
+use mlx_gen::nn::{gelu_tanh, rope_sincos_from_ids, silu, timestep_sincos};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -42,9 +42,7 @@ use mlx_rs::fast::{
     layer_norm, rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask,
 };
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, mean_axis, multiply, r#where, split, stack_axis, tanh,
-};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, mean_axis, multiply, r#where, split, tanh};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
@@ -192,20 +190,19 @@ fn scale_residual(x: &Array, scale: &Array) -> Result<Array> {
     Ok(multiply(x, &add(&one, scale)?)?)
 }
 
-/// Adjacent-pair complex rotation of `x` `[B, S, H, D]` by `cos`/`sin` `[S, D/2]`, in f32.
+/// Adjacent-pair complex rotation of `x` `[B, S, H, D]` by `cos`/`sin` `[S, D/2]`, in f32 and cast
+/// back to `x`'s dtype: the shared [`mlx_gen::qkv::apply_rope`] (SW-6140) under
+/// `RopeDtype::RestoreInput` — the same `nn::rope_rotate` kernel over the same `[1, S, 1, D/2]`
+/// broadcast this crate's private copy ran.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let dtype = x.dtype();
-    let shape = x.shape().to_vec();
-    let (b, s, h, d) = (shape[0], shape[1], shape[2], shape[3]);
-    let pairs = x.as_dtype(Dtype::Float32)?.reshape(&[b, s, h, d / 2, 2])?;
-    let parts = split(&pairs, 2, 4)?;
-    let real = parts[0].squeeze_axes(&[4])?;
-    let imag = parts[1].squeeze_axes(&[4])?;
-    let cos = cos.reshape(&[1, s, 1, d / 2])?;
-    let sin = sin.reshape(&[1, s, 1, d / 2])?;
-    let (out_real, out_imag) = rope_rotate(&real, &imag, &cos, &sin)?;
-    let out = stack_axis(&[out_real, out_imag], 4)?.reshape(&[b, s, h, d])?;
-    Ok(out.as_dtype(dtype)?)
+    mlx_gen::qkv::apply_rope(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::RestoreInput,
+    )
 }
 
 #[derive(Clone)]
