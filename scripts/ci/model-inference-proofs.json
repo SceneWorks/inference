@@ -322174,6 +322174,174 @@
   },
   {
     "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian weights packed by gen_core::w4a8_int8::quantize_weight at edge-tile shapes and Krea 2 Turbo widths (k 6144, n 1536/6144, up to 4096 tokens), with and without bias.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+    "required_environment": [],
+    "device_witness": "The test counts two fused leaves (activation prep + GEMM) per fused forward and two disabled reference leaves per reference forward on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. The fused int4-weight int8-MMA path and the dequant-tile + cuBLASLt IGEMM path must agree bit for bit for bf16/f16/f32 outputs; asserts the fused GEMM uses no local memory.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run W4A8Linear::forward through the fused path and the reference path for every case and dtype and compare every output bit."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian weights at Krea 2 Turbo projection shapes (6144->6144, 6144->1536, 6144->16384, 16384->6144) packed by gen_core::w4a8_int8::quantize_weight; 64 tokens; bias.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+    "required_environment": [],
+    "device_witness": "The test counts two fused leaves per forward on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the cosine of W4A8Linear::forward vs the CPU dequant reference linear x*decode_dense(W)^T+b; each must be >= 0.999.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run W4A8Linear::forward on the four shapes and compare to the F32 CPU reference linear."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian 96x1024 weight packed by gen_core::w4a8_int8::quantize_weight, written to a temporary safetensors file with gen_core::w4a8_int8::write_checkpoint.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+    "required_environment": [],
+    "device_witness": "The loaded and packer-built projections run on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Weights::from_files_native_int8 + W4A8Linear::from_weights must detect the projection and its output must equal W4A8Linear::from_packed bit for bit.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Write the checkpoint, load it through the native-file loader, run both projections and compare."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
     "target": "integration",
     "target_kind": "test",
     "fqn": "cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",

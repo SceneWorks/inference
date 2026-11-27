@@ -46,6 +46,9 @@
 //! - [`adaln`] — the fused AdaLN / RMS-AdaLN modulation (SW-6127): `norm(x) · (1 + scale) + shift`
 //!   in one launch, bit-identical to the candle norm + modulate chain (public as
 //!   `candle_gen::modulate`).
+//! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
+//!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
+//!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
@@ -96,6 +99,7 @@ pub mod training_attention;
 pub mod vae_norm_silu_pad;
 pub mod veda_int8;
 pub mod veda_score;
+pub mod w4a8_gemm;
 pub mod yue2_stable_conv;
 
 pub use act_quant::{
@@ -175,6 +179,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
+    w4a8_gemm::W4A8_GEMM_SRC,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     GATED_DELTA_SRC,
