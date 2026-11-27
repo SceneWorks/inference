@@ -15,6 +15,7 @@
 //! (vcvars) cargo run --release -p candle-gen --features cuda --example fused_kernels_bench
 //! (vcvars) cargo run --release -p candle-gen --features cuda --example fused_kernels_bench -- act_quant
 //! (vcvars) cargo run --release -p candle-gen --features cuda,flash-attn --example fused_kernels_bench -- int8_attention
+//! (vcvars) cargo run --release -p candle-gen --features cuda,flash-attn --example fused_kernels_bench -- sol_attention
 //! ```
 //!
 //! The optional arguments name the suites to run (all by default). `FUSED_BENCH_ITERS` /
@@ -46,11 +47,16 @@ mod act_quant;
 #[path = "fused_kernels_bench/int8_attention.rs"]
 mod int8_attention;
 
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/sol_attention.rs"]
+mod sol_attention;
+
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
 const SUITES: &[(&str, harness::Suite)] = &[
     ("act_quant", act_quant::rows),
     ("int8_attention", int8_attention::rows),
+    ("sol_attention", sol_attention::rows),
 ];
 
 #[cfg(feature = "cuda")]

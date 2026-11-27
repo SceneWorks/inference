@@ -35,17 +35,22 @@ pub enum AttentionPath {
     Materialized,
     Flash,
     Int8,
+    Sol,
 }
 
 /// Calls of `path` in a window, and every other call (refusals of the opt-in kernel included).
 pub fn path_calls(path: AttentionPath, d: &AttentionPathCounts) -> (u64, u64) {
-    let fused_other = |own: u64| d.flash + d.int8 - own;
+    let fused_other = |own: u64| d.flash + d.int8 + d.sol - own;
     match path {
         AttentionPath::Materialized => (d.materialized, d.total() - d.materialized),
         AttentionPath::Flash => (d.flash, d.total() - d.flash),
         AttentionPath::Int8 => (
             d.int8,
             fused_other(d.int8) + d.budgeted() + d.int8_refusals.total(),
+        ),
+        AttentionPath::Sol => (
+            d.sol,
+            fused_other(d.sol) + d.budgeted() + d.sol_refusals.total(),
         ),
     }
 }
