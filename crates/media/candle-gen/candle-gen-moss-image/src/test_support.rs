@@ -34,7 +34,7 @@ impl Fixture {
             let pin = PinnedWeightsFile::pin(self.data.root.join(relative))?;
             if relative.ends_with(".safetensors") {
                 headers.insert(
-                    *pin.content_sha256(),
+                    *pin.require_content_sha256()?,
                     gen_core::weightsmeta::safetensors_path_tensor_headers(pin.loader_path())?,
                 );
             }
@@ -48,7 +48,7 @@ impl Fixture {
                 MossImageAssetRole::Vae
             };
             ordinary.push(Asset {
-                fixture_digest: Some(*pin.content_sha256()),
+                fixture_digest: Some(*pin.require_content_sha256()?),
                 pin,
                 role,
                 repo: "sceneworks/synthetic-test-fixture",

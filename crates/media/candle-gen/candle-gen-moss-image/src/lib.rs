@@ -173,7 +173,7 @@ impl MossImageGenerator {
                 for h in self
                     .sources
                     .headers
-                    .get(asset.pin.content_sha256())
+                    .get(asset.pin.require_content_sha256()?)
                     .ok_or_else(|| {
                         gen_core::Error::Unsupported(
                             "MOSS missing authenticated VAE residency facts".into(),

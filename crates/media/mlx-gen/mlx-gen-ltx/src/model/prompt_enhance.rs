@@ -512,7 +512,7 @@ pub(super) fn validate_ltx25_enhancer_file(
     }
     // SHA-256 once per immutable file identity (shared, single-flight `ArtifactSeal` memo), so
     // repeated enhanced requests do not re-read the stock model.
-    let actual = ArtifactSeal::pin(&path)?.content_sha256_hex();
+    let actual = ArtifactSeal::pin(&path)?.require_content_sha256_hex()?;
     if actual != expected_sha256 {
         return Err(Error::Msg(format!(
             "ltx_2_5: enhancer asset `{name}` digest mismatch (got {actual}, expected \

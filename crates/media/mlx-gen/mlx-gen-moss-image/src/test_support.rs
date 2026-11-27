@@ -88,7 +88,7 @@ impl Fixture {
                 MossImageAssetRole::Vae
             };
             ordinary.push(Asset {
-                fixture_digest: Some(*pin.content_sha256()),
+                fixture_digest: Some(*pin.require_content_sha256()?),
                 pin,
                 role,
                 repo: "sceneworks/synthetic-test-fixture",

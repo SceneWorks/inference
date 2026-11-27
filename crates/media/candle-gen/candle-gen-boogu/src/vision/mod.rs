@@ -141,6 +141,13 @@ fn layer_norm(w: &Weights, prefix: &str, eps: f64) -> Result<LayerNorm> {
 /// merely happens to carry a similarly-named tensor is untouched — the marker is what makes the
 /// sibling mean "packed".
 fn require_dense(w: &Weights, base: &str, why: &str) -> Result<()> {
+    if w.packed().is_some() && stored_ggml(w, base)?.is_some() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "boogu: `{base}.weight` is a stored GGML block tensor, but it is loaded by a \
+             dense-only path ({why}). Reading GGML blocks as floats is silent garbage (sc-14980), \
+             so this snapshot is refused rather than rendered."
+        )));
+    }
     if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "boogu: `{base}` has a `.scales` sibling in a packed component, but it is loaded by a \
@@ -185,6 +192,33 @@ fn vision_linear(
 ) -> Result<QLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
+    if w.packed().is_some() {
+        if let Some(stored) = stored_ggml(w, base)? {
+            if w.contains(&scales_key) {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "boogu vision `{base}`: `{weight_key}` is a stored GGML block tensor but \
+                     `{scales_key}` is also present — a tier stores a projection one way, never both"
+                )));
+            }
+            if let Some([out, inp]) = shape {
+                let decoded = candle_gen::candle_layers::llm_projection::ggml_block_storage(
+                    true,
+                    stored.dims(),
+                )
+                .map(|(_, rows, cols)| [rows, cols]);
+                if decoded != Some([out, inp]) {
+                    return Err(candle_gen::candle_core::Error::Msg(format!(
+                        "boogu vision `{base}`: stored GGML blocks decode to {decoded:?}, \
+                         expected [{out}, {inp}]"
+                    )));
+                }
+            }
+            let dense_bias = bias
+                .then(|| w.get_f32(&format!("{base}.bias")))
+                .transpose()?;
+            return QLinear::from_stored_ggml(&stored, dense_bias, w.device());
+        }
+    }
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let wq = w.get_native(&weight_key)?;
         if wq.dtype() != DType::U32 {
@@ -207,6 +241,24 @@ fn vision_linear(
         bias,
         shape.as_ref().map(|s| s.as_slice()),
     )?))
+}
+
+/// `{base}.weight` when it is a **stored GGML block tensor** (a Candle-native tier), read at its
+/// native `U8` width; `None` for any other weight (absent, dense, MLX-packed or encoded).
+fn stored_ggml(w: &Weights, base: &str) -> Result<Option<Tensor>> {
+    let key = format!("{base}.weight");
+    if !w.contains(&key) {
+        return Ok(None);
+    }
+    let Some((dtype, shape)) = w.native_header(&key) else {
+        return Ok(None);
+    };
+    if candle_gen::candle_layers::llm_projection::ggml_block_storage(dtype == DType::U8, &shape)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(w.get_native(&key)?))
 }
 
 /// One vision block: pre-LayerNorm full attention + pre-LayerNorm GELU-tanh MLP, both residual.

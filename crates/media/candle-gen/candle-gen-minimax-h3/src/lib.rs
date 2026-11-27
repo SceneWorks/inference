@@ -134,6 +134,7 @@ pub mod decoder;
 pub mod denoise;
 pub mod dit;
 pub mod drivers;
+pub mod ggml_tier;
 pub mod image_memory_strategy;
 pub mod image_model;
 pub mod image_pipeline;

@@ -375,7 +375,7 @@ fn sha256(path: &Path, id: &Identity) -> Result<String> {
             "sd3 calibrated artifact changed while it was hashed".to_owned(),
         ));
     }
-    Ok(seal.content_sha256_hex())
+    Ok(seal.require_content_sha256_hex()?)
 }
 
 fn visible_files(root: &Path) -> Result<BTreeSet<String>> {

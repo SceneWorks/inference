@@ -227,7 +227,8 @@ impl PreparedSvdMemory {
             }
             // The pin's acquisition-time digest: hashed once per file identity (and shared with
             // the prepare-time pin), never re-read here.
-            let digest = pin.content_sha256_hex();
+            let digest =
+                mlx_gen::gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest());
             identity.update(relative.as_bytes());
             identity.update(digest.as_bytes());
             identity.update(resident_bytes.to_le_bytes());

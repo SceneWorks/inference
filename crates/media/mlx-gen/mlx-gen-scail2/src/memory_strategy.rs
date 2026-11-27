@@ -125,7 +125,8 @@ impl AdapterReceipt {
         pin.ensure_unchanged()?;
         let canonical_path = pin.canonical_target_path().to_path_buf();
         // The seal's acquisition-time content digest: hashed once per file identity, not re-read.
-        let digest = pin.content_sha256_hex();
+        let digest =
+            mlx_gen::gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest());
         let (realization, physical_bytes, resident_bytes, transient_bytes) =
             pin.read_unchanged(|path| {
                 let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;

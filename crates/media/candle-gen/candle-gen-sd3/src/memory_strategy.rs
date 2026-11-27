@@ -347,7 +347,7 @@ impl Sd35LoadReceipt {
                 &mut digest,
                 adapter.file.canonical_path.as_os_str().as_encoded_bytes(),
             );
-            update_framed(&mut digest, adapter.file.pin.content_sha256());
+            update_framed(&mut digest, &adapter.file.pin.content_or_identity_digest());
         }
         Some(format!(
             "{ADAPTER_RECEIPT_PREFIX}{}",
@@ -820,7 +820,7 @@ fn physical_identity(
             &mut digest,
             pin.canonical_target_path().as_os_str().as_encoded_bytes(),
         );
-        update_framed(&mut digest, pin.content_sha256());
+        update_framed(&mut digest, &pin.content_or_identity_digest());
     }
     for adapter in adapters {
         update_framed(&mut digest, &(adapter.order as u64).to_le_bytes());

@@ -223,10 +223,22 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The same original and conversion code give byte-identical tiers (weights **and** manifest),
-/// the tier verifies, every copied file is the original's byte for byte, every BF16 tensor keeps
-/// its pinned digest, and every matmul weight — and only the matmul weights — is GGML at the
-/// tier's block type (Q4_K where the input width is 256-aligned, Q4_0 otherwise).
+/// The manifest in `dir` without its per-file produced identities (the one part that names the
+/// local file objects rather than the conversion's bytes).
+fn manifest_without_identities(dir: &Path) -> Value {
+    let mut m: Value =
+        serde_json::from_slice(&std::fs::read(dir.join(TIER_MANIFEST)).unwrap()).unwrap();
+    for rec in m["files"].as_object_mut().unwrap().values_mut() {
+        rec.as_object_mut().unwrap().remove(PRODUCED_IDENTITY);
+    }
+    m
+}
+
+/// The same original and conversion code give byte-identical tiers (weights **and** manifest, but
+/// for the produced-file identities, which name each conversion's own files), the tier verifies,
+/// every copied file is the original's byte for byte, every BF16 tensor keeps its pinned digest,
+/// and every matmul weight — and only the matmul weights — is GGML at the tier's block type (Q4_K
+/// where the input width is 256-aligned, Q4_0 otherwise).
 ///
 /// Mutation run: a wall-clock field in the manifest fails the reproducibility check. A tier that
 /// kept `lm_head` or a NAR head dense, or a Q4 that never took the Q4_K path, fails the storage
@@ -237,13 +249,16 @@ fn conversion_is_deterministic_and_verifies() {
     for tier in [Tier::Q8, Tier::Q4] {
         let a = convert_to(&src, tier, &format!("{tier}-a"));
         let b = convert_to(&src, tier, &format!("{tier}-b"));
-        for file in [WEIGHTS_FILE, TIER_MANIFEST] {
-            assert_eq!(
-                std::fs::read(a.join(file)).unwrap(),
-                std::fs::read(b.join(file)).unwrap(),
-                "{tier}: {file} is not reproducible"
-            );
-        }
+        assert_eq!(
+            std::fs::read(a.join(WEIGHTS_FILE)).unwrap(),
+            std::fs::read(b.join(WEIGHTS_FILE)).unwrap(),
+            "{tier}: {WEIGHTS_FILE} is not reproducible"
+        );
+        assert_eq!(
+            manifest_without_identities(&a),
+            manifest_without_identities(&b),
+            "{tier}: {TIER_MANIFEST} is not reproducible"
+        );
         let v = verify_tier_from(src.source, &a).unwrap();
         assert_eq!(v.tier(), tier);
         let src_dir = src.dirs.snapshot_dir(&REPO).unwrap();
@@ -579,6 +594,103 @@ fn conversion_refusals_leave_nothing_behind() {
     let missing = src.out("missing");
     assert!(convert_from(src.source, &SnapshotDirs::new(), Tier::Q8, &missing).is_err());
     assert!(!missing.exists() && !partial_dir(&missing).exists());
+}
+
+fn hashed_bytes() -> u64 {
+    HASHED_BYTES.with(std::cell::Cell::get)
+}
+
+fn reset_hashed_bytes() {
+    HASHED_BYTES.with(|hashed| hashed.set(0));
+}
+
+/// Every file the conversion wrote or copied carries a produced identity, the conversion's own
+/// final verification and every later load hash ZERO bytes of them, and a same-size rewrite of a
+/// copied file or of the weights is still refused: its identity no longer matches, so it is
+/// hashed, and the hash reports the mismatch.
+///
+/// Mutations run: trusting the identity without `matches` (the rewrites verify), and dropping the
+/// identities from the manifest (the reload hashes every byte), each fail this test.
+#[test]
+fn a_published_tier_reloads_without_rehashing_its_outputs() {
+    let src = source();
+    reset_hashed_bytes();
+    let dir = convert_to(&src, Tier::Q8, "q8");
+    assert_eq!(hashed_bytes(), 0, "the conversion re-hashed its own output");
+    let manifest = read_manifest(&dir).unwrap();
+    let files = manifest["files"].as_object().unwrap();
+    assert_eq!(files.len(), src.source.copied_files().len() + 1);
+    for (name, rec) in files {
+        let identity: gen_core::ProducedFileIdentity =
+            serde_json::from_value(rec[PRODUCED_IDENTITY].clone())
+                .unwrap_or_else(|e| panic!("{name}: no produced identity ({e})"));
+        assert!(identity.is_trustworthy(), "{name}");
+    }
+
+    for _ in 0..2 {
+        assert_eq!(verify_tier_from(src.source, &dir).unwrap().tier(), Tier::Q8);
+        assert_eq!(hashed_bytes(), 0, "a sealed load re-hashed an owned output");
+    }
+
+    let license = dir.join("LICENSE");
+    let mut bytes = std::fs::read(&license).unwrap();
+    bytes[0] ^= 0x20;
+    std::fs::write(&license, &bytes).unwrap();
+    assert!(matches!(
+        expect_refused(&src, &dir, "same-size license"),
+        AssetError::HashMismatch { ref file, .. } if file == "LICENSE"
+    ));
+    assert!(hashed_bytes() > 0, "the changed file was not hashed");
+    bytes[0] ^= 0x20;
+    std::fs::write(&license, &bytes).unwrap();
+    // Restored bytes verify again, by hash: the rewrite moved the file's identity for good.
+    reset_hashed_bytes();
+    assert!(verify_tier_from(src.source, &dir).is_ok());
+    assert_eq!(hashed_bytes(), bytes.len() as u64);
+
+    let weights = dir.join(WEIGHTS_FILE);
+    let mut bytes = std::fs::read(&weights).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&weights, &bytes).unwrap();
+    assert!(matches!(
+        expect_refused(&src, &dir, "same-size weights"),
+        AssetError::HashMismatch { ref file, .. } if file == WEIGHTS_FILE
+    ));
+}
+
+/// A manifest written before produced identities existed verifies exactly as before: by hashing
+/// every file, and refusing a changed one.
+#[test]
+fn a_manifest_without_identities_still_verifies_by_hash() {
+    let src = source();
+    let dir = convert_to(&src, Tier::Q4, "q4");
+    let stripped = manifest_without_identities(&dir);
+    std::fs::write(
+        dir.join(TIER_MANIFEST),
+        serde_json::to_vec_pretty(&stripped).unwrap(),
+    )
+    .unwrap();
+    let total: u64 = stripped["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|rec| rec["bytes"].as_u64().unwrap())
+        .sum();
+    reset_hashed_bytes();
+    assert_eq!(verify_tier_from(src.source, &dir).unwrap().tier(), Tier::Q4);
+    assert_eq!(
+        hashed_bytes(),
+        total,
+        "every file is hashed without identities"
+    );
+    let mut bytes = std::fs::read(dir.join(WEIGHTS_FILE)).unwrap();
+    bytes[0] ^= 0x01;
+    std::fs::write(dir.join(WEIGHTS_FILE), &bytes).unwrap();
+    assert!(matches!(
+        expect_refused(&src, &dir, "old-manifest weights"),
+        AssetError::HashMismatch { ref file, .. } if file == WEIGHTS_FILE
+    ));
 }
 
 /// An asserted tier is checked against the staged snapshot before anything is verified or read:

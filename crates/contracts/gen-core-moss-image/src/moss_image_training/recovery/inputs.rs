@@ -361,6 +361,7 @@ impl FilePin {
             ));
         }
         let token = PinnedWeightsFile::pin(path)?;
+        let expected = *token.require_content_sha256()?;
         let (bytes, dimensions) = token.read_unchanged(|path| {
             let mut file = File::open(path)?;
             let bytes = file.metadata()?.len();
@@ -378,7 +379,7 @@ impl FilePin {
                 }
                 hash.update(&buffer[..count]);
             }
-            if hash.finalize().as_slice() != token.content_sha256() {
+            if hash.finalize().as_slice() != expected {
                 return Err(Error::Unsupported(
                     "dataset file changed during header capture".into(),
                 ));
@@ -404,7 +405,7 @@ impl FilePin {
                     "dataset file size changed before decode".into(),
                 ));
             }
-            read_payload(file, self.bytes, self.token.content_sha256())
+            read_payload(file, self.bytes, self.token.require_content_sha256()?)
         })
     }
     fn decode(&self, budget: u64) -> Result<image::DynamicImage> {
@@ -477,14 +478,18 @@ impl Inputs {
     pub(super) fn image_digest(&self, item: usize) -> Result<[u8; 32]> {
         self.images
             .get(item)
-            .map(|p| *p.token.content_sha256())
-            .ok_or_else(|| Error::Msg("image digest index outside snapshot".into()))
+            .ok_or_else(|| Error::Msg("image digest index outside snapshot".into()))?
+            .token
+            .require_content_sha256()
+            .copied()
     }
     pub(super) fn mask_digest(&self, item: usize) -> Result<Option<[u8; 32]>> {
         self.masks
             .get(item)
-            .map(|p| p.as_ref().map(|p| *p.token.content_sha256()))
-            .ok_or_else(|| Error::Msg("mask digest index outside snapshot".into()))
+            .ok_or_else(|| Error::Msg("mask digest index outside snapshot".into()))?
+            .as_ref()
+            .map(|p| p.token.require_content_sha256().copied())
+            .transpose()
     }
     pub(super) fn dimensions(&self) -> Vec<(u32, u32)> {
         self.images.iter().map(|p| p.dimensions).collect()
@@ -579,10 +584,10 @@ impl Inputs {
             let caption = item.caption.as_bytes();
             hash.update((caption.len() as u64).to_le_bytes());
             hash.update(caption);
-            hash.update(self.images[i].token.content_sha256());
+            hash.update(self.images[i].token.require_content_sha256()?);
             if let Some(mask) = &self.masks[i] {
                 hash.update([1]);
-                hash.update(mask.token.content_sha256());
+                hash.update(mask.token.require_content_sha256()?);
             } else {
                 hash.update([0]);
             }

@@ -800,12 +800,18 @@ impl Pipeline {
         gen_core::model_input_proof::record_inputs(
             "candle-gen-flux2::Pipeline::load_klein_planned_dit/verified-weights",
             gen_core::model_input_proof::InputRole::ModelWeights,
-            &[gen_core::model_input_proof::InputIdentity::validated(
-                dit_file.loader_path(),
-                *dit_file.content_sha256(),
-                "gen-core::ArtifactSeal",
-                "pinned before and after native DiT construction",
-            )],
+            &[match dit_file.content_sha256() {
+                Some(digest) => gen_core::model_input_proof::InputIdentity::validated(
+                    dit_file.loader_path(),
+                    *digest,
+                    "gen-core::ArtifactSeal",
+                    "pinned before and after native DiT construction",
+                ),
+                // Sealed by producer identity: the bytes were never hashed.
+                None => {
+                    gen_core::model_input_proof::InputIdentity::reader_path(dit_file.loader_path())
+                }
+            }],
         );
         self.klein_facts.publish(facts);
         Ok(dit)

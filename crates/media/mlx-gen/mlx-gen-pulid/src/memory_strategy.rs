@@ -188,7 +188,9 @@ pub(crate) fn admitted_identity_inventory(
         })
         .collect::<CoreResult<Vec<_>>>()?;
     for (_, seal, expected, upcast_to_f32) in &files {
-        exact_calibration &= seal.content_sha256_hex() == *expected;
+        exact_calibration &= seal
+            .content_sha256_hex()
+            .is_some_and(|digest| digest == *expected);
         bytes = bytes.saturating_add(materialized_identity_bytes(
             seal.canonical_target_path(),
             *upcast_to_f32,

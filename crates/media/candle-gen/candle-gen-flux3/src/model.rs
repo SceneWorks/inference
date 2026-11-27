@@ -375,9 +375,10 @@ fn cuda_backend(id: &str, _device: &Device) -> Result<ArtifactBackend> {
     )))
 }
 
-/// A native package loads only with its conversion receipt: the owned outputs full-hash
-/// verified, the receipt's algorithm identical to the declared storage, and every EXTERNAL
-/// component full-hash verified where this load actually reads it (the resolved text-encoder
+/// A native package loads only with its conversion receipt: the owned outputs verified (by the
+/// produced identity sealed at publication when unchanged, else by full hash), the receipt's
+/// algorithm identical to the declared storage, and every EXTERNAL component content-verified
+/// through the artifact seal where this load actually reads it (the resolved text-encoder
 /// directory and autoencoder file). A mismatch is refused before any weight is read.
 fn verify_native_package(
     id: &str,
