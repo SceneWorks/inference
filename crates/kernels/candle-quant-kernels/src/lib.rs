@@ -46,6 +46,8 @@
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
+//! - [`vae_norm_silu_pad`] — the fused video-VAE norm + SiLU + temporal pad (SW-6133): Wan's
+//!   channel-L2 / LTX's pixel-RMS norm and SiLU written straight into the padded causal-conv input.
 //! - [`yue2_stable_conv`] — YuE2 VAE BF16 convolution leaves with fixed-order FP32 accumulation
 //!   and BF16 operands/output across full and tiled decoder shapes.
 //!
@@ -85,6 +87,7 @@ pub mod nvfp4_weight;
 pub mod nvrtc;
 pub mod sm120_gate;
 pub mod training_attention;
+pub mod vae_norm_silu_pad;
 pub mod veda_int8;
 pub mod veda_score;
 pub mod yue2_stable_conv;
@@ -147,7 +150,7 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 and fp8 / int8 activation quantizers, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
-/// frozen Veda tile scorer and streaming training attention.
+/// frozen Veda tile scorer, streaming training attention and the video-VAE norm + SiLU + pad.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -170,6 +173,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    vae_norm_silu_pad::VAE_NORM_SILU_PAD_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
