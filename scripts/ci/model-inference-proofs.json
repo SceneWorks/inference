@@ -321890,7 +321890,8 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
     "cargo_features": [
-      "model-inference-proof"
+      "model-inference-proof",
+      "mlx-gen/test-support"
     ],
     "cargo_target_metadata": {
       "name": "integration",
@@ -321952,7 +321953,8 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
     "cargo_features": [
-      "model-inference-proof"
+      "model-inference-proof",
+      "mlx-gen/test-support"
     ],
     "cargo_target_metadata": {
       "name": "integration",
