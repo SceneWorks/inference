@@ -396,7 +396,7 @@ impl Scail2FitProfile {
         let mut hash = Sha256::new();
         hash.update(b"scail2-plural-weights-v1");
         for pin in &pins {
-            hash.update(pin.content_sha256());
+            hash.update(pin.require_content_sha256()?);
         }
         for adapter in &spec.adapters {
             // A zero scale can disable a residual; nonzero finite scale values do not alter

@@ -10,7 +10,8 @@ pub enum ArtifactSealAcquisition {
     MemoryMemo,
     PersistedMemo,
     DriftAudit,
-    /// A caller-supplied digest whose bound target identity matched at pin time (sc-26691).
+    /// A caller-supplied digest, or a producer's identity attestation, whose bound target identity
+    /// matched at pin time (sc-26691).
     Attested,
     /// A seal carried across a hard link this seal itself created (sc-26691).
     Relinked,
@@ -69,7 +70,10 @@ pub struct ArtifactSeal {
     pub(super) path_component_fingerprints: Vec<PathComponentFingerprint>,
     pub(super) entry_fingerprint: FileStatFingerprint,
     pub(super) target_fingerprint: FileStatFingerprint,
-    pub(super) sha256: [u8; 32],
+    /// The full-content SHA-256, or `None` for a file sealed by its producer's identity attestation
+    /// alone (see [`ArtifactIdentityAttestation`]): bytes this process's host wrote itself and that
+    /// were never hashed. Every identity field above is still captured and enforced either way.
+    pub(super) sha256: Option<[u8; 32]>,
     #[cfg(test)]
     pub(super) hash_work: Arc<SealHashWork>,
 }
@@ -169,7 +173,36 @@ pub(super) struct SealIdentity {
 /// could detect is a mutation that misses the memo and re-hashes. On Unix the entry and target
 /// fingerprints carry `ctime`, which a content write always moves and which userspace cannot
 /// backdate the way it can `mtime`.
-static PROVEN_DIGESTS: OnceLock<Mutex<HashMap<SealIdentity, [u8; 32]>>> = OnceLock::new();
+static PROVEN_DIGESTS: OnceLock<Mutex<HashMap<SealIdentity, ProvenContent>>> = OnceLock::new();
+
+/// What the memo proved for one exact [`SealIdentity`].
+///
+/// `ProducerIdentity` records an [`ArtifactIdentityAttestation`] redeemed for that identity: the
+/// host vouched that it wrote these bytes and that the file has not changed since its writer
+/// closed. It authorizes exactly what a digest entry does — this identity, nothing else — but
+/// yields a seal that carries no content digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProvenContent {
+    Sha256([u8; 32]),
+    ProducerIdentity,
+}
+
+impl ProvenContent {
+    pub(super) fn digest(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Sha256(digest) => Some(digest),
+            Self::ProducerIdentity => None,
+        }
+    }
+
+    fn of(digest: Option<[u8; 32]>) -> Self {
+        digest.map_or(Self::ProducerIdentity, Self::Sha256)
+    }
+}
+
+/// Persisted body of a [`ProvenContent::ProducerIdentity`] entry. Never 64 hex digits, so a
+/// gen-core that predates identity attestations reads it as a miss and re-hashes the file.
+const PRODUCER_IDENTITY_ENTRY: &str = "producer-identity-v1";
 
 /// Bound on retained digests. Keyed per file identity, so the live set is the number of distinct
 /// weight files a process touches — small for one model, and growing only across a long-lived worker
@@ -177,11 +210,11 @@ static PROVEN_DIGESTS: OnceLock<Mutex<HashMap<SealIdentity, [u8; 32]>>> = OnceLo
 /// evicted file, which is exactly the pre-memo behaviour; an LRU would buy nothing at this size.
 const PROVEN_DIGEST_CAPACITY: usize = 1024;
 
-fn proven_digests() -> &'static Mutex<HashMap<SealIdentity, [u8; 32]>> {
+fn proven_digests() -> &'static Mutex<HashMap<SealIdentity, ProvenContent>> {
     PROVEN_DIGESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn proven_digest(identity: &SealIdentity) -> Option<[u8; 32]> {
+pub(super) fn proven_digest(identity: &SealIdentity) -> Option<ProvenContent> {
     proven_digests()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -189,14 +222,14 @@ pub(super) fn proven_digest(identity: &SealIdentity) -> Option<[u8; 32]> {
         .copied()
 }
 
-pub(super) fn remember_proven_digest(identity: SealIdentity, sha256: [u8; 32]) {
+pub(super) fn remember_proven_digest(identity: SealIdentity, proven: ProvenContent) {
     let mut digests = proven_digests()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if digests.len() >= PROVEN_DIGEST_CAPACITY {
         digests.clear();
     }
-    digests.insert(identity, sha256);
+    digests.insert(identity, proven);
 }
 
 /// Consumer-chosen directory that carries [`PROVEN_DIGESTS`] across process restarts.
@@ -235,12 +268,16 @@ pub(super) fn proven_digest_store_entry(
     store.join(hex_lower(&key))
 }
 
-fn stored_proven_digest(entry: &Path) -> Option<[u8; 32]> {
+fn stored_proven_digest(entry: &Path) -> Option<ProvenContent> {
     let text = std::fs::read_to_string(entry).ok()?;
-    parse_hex_digest(text.trim())
+    let text = text.trim();
+    if text == PRODUCER_IDENTITY_ENTRY {
+        return Some(ProvenContent::ProducerIdentity);
+    }
+    parse_hex_digest(text).map(ProvenContent::Sha256)
 }
 
-fn store_proven_digest(entry: &Path, sha256: &[u8; 32]) {
+fn store_proven_digest(entry: &Path, proven: ProvenContent) {
     if entry
         .parent()
         .is_none_or(|store| std::fs::create_dir_all(store).is_err())
@@ -249,9 +286,11 @@ fn store_proven_digest(entry: &Path, sha256: &[u8; 32]) {
     }
     // Write-then-rename so a concurrent reader in another worker never sees a torn entry.
     let staging = entry.with_extension(format!("tmp-{}", std::process::id()));
-    if std::fs::write(&staging, hex_lower(sha256)).is_err()
-        || std::fs::rename(&staging, entry).is_err()
-    {
+    let body = match proven {
+        ProvenContent::Sha256(digest) => hex_lower(&digest),
+        ProvenContent::ProducerIdentity => PRODUCER_IDENTITY_ENTRY.to_owned(),
+    };
+    if std::fs::write(&staging, body).is_err() || std::fs::rename(&staging, entry).is_err() {
         let _ = std::fs::remove_file(&staging);
     }
 }
@@ -501,6 +540,48 @@ impl ArtifactDigestAttestation {
     }
 }
 
+/// A host's statement that IT wrote one file, bound to that file's resolved-target identity the
+/// moment its writer closed: the no-hash counterpart of [`ArtifactDigestAttestation`].
+///
+/// Bytes a host produced itself (a normalized checkpoint, a saved quantization, a locally derived
+/// tier) need no content hash to be trusted: the host is the only author, and what it must still
+/// detect is a later change to the file. [`ArtifactSeal::pin_identity_attested`] therefore redeems
+/// this attestation under exactly the predicate a digest attestation uses (a fresh capture whose
+/// target fingerprint is IDENTICAL, Windows ChangeTime / Unix ctime included) and yields a seal
+/// whose [`content_sha256`](ArtifactSeal::content_sha256) is `None`. Any difference falls back to
+/// an ordinary content-hashing [`ArtifactSeal::pin`].
+///
+/// Only the producing host may capture one, and only after the bytes are final. A consumer that
+/// needs the content digest itself (a byte-level re-verification, a content-addressed key) calls
+/// [`ArtifactSeal::require_content_sha256`] and is refused on such a seal instead of trusting a
+/// digest nobody computed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactIdentityAttestation {
+    target_fingerprint: FileStatFingerprint,
+}
+
+impl ArtifactIdentityAttestation {
+    /// Bind the producer's authorship to `path`'s resolved-target identity as it is right now.
+    pub fn capture(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let target_fingerprint = stat_fingerprint(path.as_ref(), true)?;
+        if target_fingerprint.is_symlink || !std::fs::metadata(path.as_ref())?.is_file() {
+            return Err(crate::Error::Msg(format!(
+                "attested weights source is not a regular file: {}",
+                path.as_ref().display()
+            )));
+        }
+        Ok(Self { target_fingerprint })
+    }
+
+    pub(super) fn from_fingerprint(target_fingerprint: FileStatFingerprint) -> Self {
+        Self { target_fingerprint }
+    }
+
+    pub fn target_fingerprint(&self) -> &FileStatFingerprint {
+        &self.target_fingerprint
+    }
+}
+
 /// `fingerprint` with the fields a new hard link legitimately moves (Windows ChangeTime, Unix ctime)
 /// cleared. Every other field — size, mtime, file id/inode, volume/device — must still agree.
 fn without_change_time(fingerprint: &FileStatFingerprint) -> FileStatFingerprint {
@@ -612,7 +693,7 @@ impl ArtifactSeal {
     }
 
     /// Capture and self-verify every identity field of `path` without reading its content. The
-    /// returned seal carries a zero digest and must never escape before one is assigned.
+    /// returned seal carries no digest and must never escape before its content is proven.
     pub(super) fn capture_identity(path: &Path) -> crate::Result<Self> {
         let loader_path = std::path::absolute(path)?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
@@ -631,7 +712,7 @@ impl ArtifactSeal {
             path_component_fingerprints,
             entry_fingerprint,
             target_fingerprint,
-            sha256: [0; 32],
+            sha256: None,
             #[cfg(test)]
             hash_work: Arc::new(SealHashWork(AtomicUsize::new(0))),
         };
@@ -653,15 +734,15 @@ impl ArtifactSeal {
 
     /// Record a digest proven for this seal's exact identity in the process memo and, when one is
     /// configured, the persisted store — the same two places a cold read records it.
-    fn remember_digest(&self, store: Option<&Path>, sha256: [u8; 32]) {
+    fn remember_digest(&self, store: Option<&Path>, proven: ProvenContent) {
         let identity = self.seal_identity();
         if let Some(entry) = store.and_then(|store| {
             let volume = volume_identity(&self.canonical_target_path)?;
             Some(proven_digest_store_entry(store, &identity, &volume))
         }) {
-            store_proven_digest(&entry, &sha256);
+            store_proven_digest(&entry, proven);
         }
-        remember_proven_digest(identity, sha256);
+        remember_proven_digest(identity, proven);
     }
 
     /// [`Self::pin`] for a file whose digest the caller already proved (see
@@ -689,7 +770,7 @@ impl ArtifactSeal {
         if pinned.target_fingerprint == attestation.target_fingerprint {
             pinned.remember_digest(
                 PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
-                attestation.sha256,
+                ProvenContent::Sha256(attestation.sha256),
             );
             observe(&seal_progress(
                 &pinned.loader_path,
@@ -699,9 +780,50 @@ impl ArtifactSeal {
                 Some(pinned.target_fingerprint.size),
             ));
             return Ok(Self {
-                sha256: attestation.sha256,
+                sha256: Some(attestation.sha256),
                 ..pinned
             });
+        }
+        Self::pin_with_progress(path, check, observe)
+    }
+
+    /// Seal a file its host produced, by identity alone (see [`ArtifactIdentityAttestation`]).
+    /// No content is read when the attested target identity still matches; the seal then carries
+    /// no digest, and the identity is remembered (process memo and persisted store) so a later
+    /// ordinary [`Self::pin`] of the unchanged file yields the same digest-free seal without a
+    /// read. Otherwise this is exactly [`Self::pin`], memo and cold read included.
+    pub fn pin_identity_attested(
+        path: impl AsRef<Path>,
+        attestation: &ArtifactIdentityAttestation,
+    ) -> crate::Result<Self> {
+        Self::pin_identity_attested_with_progress(path, attestation, || Ok(()), |_| {})
+    }
+
+    /// Checked, observed form of [`Self::pin_identity_attested`]. A redeemed attestation reports
+    /// [`ArtifactSealAcquisition::Attested`] with zero hashed bytes.
+    pub fn pin_identity_attested_with_progress(
+        path: impl AsRef<Path>,
+        attestation: &ArtifactIdentityAttestation,
+        mut check: impl FnMut() -> crate::Result<()>,
+        mut observe: impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
+        check()?;
+        let pinned = Self::capture_identity(path)?;
+        check()?;
+        if pinned.target_fingerprint == attestation.target_fingerprint {
+            pinned.remember_digest(
+                PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+                ProvenContent::ProducerIdentity,
+            );
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::Attested,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
+            return Ok(pinned);
         }
         Self::pin_with_progress(path, check, observe)
     }
@@ -772,7 +894,10 @@ impl ArtifactSeal {
             return Err(changed());
         }
         check()?;
-        relinked.remember_digest(PROVEN_DIGEST_STORE.get().map(PathBuf::as_path), self.sha256);
+        relinked.remember_digest(
+            PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+            ProvenContent::of(self.sha256),
+        );
         Ok(Self {
             sha256: self.sha256,
             ..relinked
@@ -805,7 +930,7 @@ impl ArtifactSeal {
                 break (pinned, identity, flight);
             }
         };
-        if let Some(sha256) = proven_digest(&identity) {
+        if let Some(proven) = proven_digest(&identity) {
             check()?;
             observe(&seal_progress(
                 &pinned.loader_path,
@@ -814,16 +939,19 @@ impl ArtifactSeal {
                 0,
                 Some(pinned.target_fingerprint.size),
             ));
-            return Ok(Self { sha256, ..pinned });
+            return Ok(Self {
+                sha256: proven.digest(),
+                ..pinned
+            });
         }
         let persisted = store.and_then(|store| {
             let volume = volume_identity(&pinned.canonical_target_path)?;
             Some(proven_digest_store_entry(store, &identity, &volume))
         });
         check()?;
-        if let Some(sha256) = persisted.as_deref().and_then(stored_proven_digest) {
+        if let Some(proven) = persisted.as_deref().and_then(stored_proven_digest) {
             check()?;
-            remember_proven_digest(identity, sha256);
+            remember_proven_digest(identity, proven);
             observe(&seal_progress(
                 &pinned.loader_path,
                 ArtifactSealAcquisition::PersistedMemo,
@@ -831,7 +959,10 @@ impl ArtifactSeal {
                 0,
                 Some(pinned.target_fingerprint.size),
             ));
-            return Ok(Self { sha256, ..pinned });
+            return Ok(Self {
+                sha256: proven.digest(),
+                ..pinned
+            });
         }
         #[cfg(test)]
         {
@@ -849,9 +980,9 @@ impl ArtifactSeal {
             })?;
         check()?;
         if let Some(entry) = &persisted {
-            store_proven_digest(entry, &sha256);
+            store_proven_digest(entry, ProvenContent::Sha256(sha256));
         }
-        remember_proven_digest(identity, sha256);
+        remember_proven_digest(identity, ProvenContent::Sha256(sha256));
         observe(&seal_progress(
             &pinned.loader_path,
             ArtifactSealAcquisition::ColdContentRead,
@@ -859,7 +990,10 @@ impl ArtifactSeal {
             hashed_bytes,
             Some(pinned.target_fingerprint.size),
         ));
-        Ok(Self { sha256, ..pinned })
+        Ok(Self {
+            sha256: Some(sha256),
+            ..pinned
+        })
     }
 
     pub fn loader_path(&self) -> &Path {
@@ -882,14 +1016,54 @@ impl ArtifactSeal {
         &self.target_fingerprint
     }
 
-    /// Full-content digest captured exactly once when this seal was acquired.
-    pub fn content_sha256(&self) -> &[u8; 32] {
-        &self.sha256
+    /// Full-content digest captured exactly once when this seal was acquired, or `None` for a file
+    /// sealed by its producer's identity alone ([`Self::pin_identity_attested`]).
+    pub fn content_sha256(&self) -> Option<&[u8; 32]> {
+        self.sha256.as_ref()
     }
 
     /// [`content_sha256`](Self::content_sha256) as 64 lowercase hex digits.
-    pub fn content_sha256_hex(&self) -> String {
-        hex_lower(&self.sha256)
+    pub fn content_sha256_hex(&self) -> Option<String> {
+        self.sha256.as_ref().map(|digest| hex_lower(digest))
+    }
+
+    /// Whether this seal trusts its file by producer identity rather than a content digest.
+    pub fn is_identity_attested(&self) -> bool {
+        self.sha256.is_none()
+    }
+
+    /// The content digest for a consumer whose correctness depends on the bytes' hash itself.
+    /// Refuses, typed, a seal that carries none instead of letting the caller invent one.
+    pub fn require_content_sha256(&self) -> crate::Result<&[u8; 32]> {
+        self.sha256.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "artifact seal carries no content digest (sealed by producer identity): {}",
+                self.loader_path.display()
+            ))
+        })
+    }
+
+    /// A 32-byte identity for cache keys and receipts that must distinguish sources but do not
+    /// verify bytes: the content digest when the seal has one, otherwise a digest of the
+    /// producer-attested identity (canonical target and its full fingerprint), domain-separated so
+    /// it can never collide with a content digest. Never use it to check content.
+    pub fn content_or_identity_digest(&self) -> [u8; 32] {
+        match &self.sha256 {
+            Some(digest) => *digest,
+            None => Sha256::digest(format!(
+                "gen-core.artifact-seal.producer-identity.v1
+{:?}
+{:?}",
+                self.canonical_target_path, self.target_fingerprint
+            ))
+            .into(),
+        }
+    }
+
+    /// [`require_content_sha256`](Self::require_content_sha256) as 64 lowercase hex digits.
+    pub fn require_content_sha256_hex(&self) -> crate::Result<String> {
+        self.require_content_sha256()
+            .map(|digest| hex_lower(digest))
     }
 
     /// Number of full-content reads performed by this sealed artifact in test builds.
@@ -1008,7 +1182,7 @@ impl ArtifactSeal {
                 path_component_fingerprints,
                 entry_fingerprint,
                 target_fingerprint,
-                sha256: [0; 32],
+                sha256: None,
                 #[cfg(test)]
                 hash_work: Arc::new(SealHashWork(AtomicUsize::new(0))),
             };
@@ -1018,7 +1192,7 @@ impl ArtifactSeal {
                 pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
                 record_full_hash_work();
             }
-            pinned.sha256 = fs::hash(&pinned.loader_path, next)?;
+            pinned.sha256 = Some(fs::hash(&pinned.loader_path, next)?);
             pinned.verify_unchanged_with_capacity(next)?;
             Ok(pinned)
         }
@@ -1137,7 +1311,8 @@ impl ArtifactSeal {
     /// Explicit, operator-requested full-content audit of an otherwise stable seal.
     pub fn audit_content(&self) -> crate::Result<()> {
         self.ensure_unchanged()?;
-        if self.hash_content(&self.loader_path)? != self.sha256 {
+        let expected = *self.require_content_sha256()?;
+        if self.hash_content(&self.loader_path)? != expected {
             return Err(crate::Error::Unsupported(format!(
                 "artifact seal content mismatch after load: {}",
                 self.loader_path.display()
@@ -1194,13 +1369,15 @@ pub(crate) fn record_sealed_input_read_with_role<'a>(
     }
     let identities: Vec<_> = pins
         .into_iter()
-        .map(|pin| {
-            crate::model_input_proof::InputIdentity::validated(
+        .map(|pin| match pin.content_sha256() {
+            Some(digest) => crate::model_input_proof::InputIdentity::validated(
                 pin.loader_path(),
-                *pin.content_sha256(),
+                *digest,
                 "gen-core::ArtifactSeal",
                 "existing retained seal, actual read and pre/post path checks; not an opened-handle or ABA guarantee",
-            )
+            ),
+            // Sealed by producer identity: the bytes were never hashed, so no content is attested.
+            None => crate::model_input_proof::InputIdentity::reader_path(pin.loader_path()),
         })
         .collect();
     crate::model_input_proof::record_inputs(reader, role, &identities);

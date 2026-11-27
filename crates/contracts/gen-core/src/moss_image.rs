@@ -523,7 +523,7 @@ impl MossImageAssetReceipt {
             repository: IMPORTED_TRANSFORMER_REPOSITORY.into(),
             revision: IMPORTED_TRANSFORMER_REVISION.into(),
             relative_path: IMPORTED_TRANSFORMER_PATH.into(),
-            sha256: hex_digest(pin.content_sha256()),
+            sha256: hex_digest(pin.require_content_sha256()?),
         })
     }
 
@@ -544,7 +544,7 @@ impl MossImageAssetReceipt {
             repository: repository.into(),
             revision: revision.into(),
             relative_path: relative_path.into(),
-            sha256: hex_digest(pin.content_sha256()),
+            sha256: hex_digest(pin.require_content_sha256()?),
         })
     }
 }
@@ -1493,7 +1493,7 @@ mod execution_receipt_tests {
         )
         .unwrap();
         assert_eq!(receipt.relative_path, "transformer/config.json");
-        assert_eq!(receipt.sha256, hex_digest(pin.content_sha256()));
+        assert_eq!(receipt.sha256, hex_digest(pin.require_content_sha256().unwrap()));
         assert!(!pin.loader_path().ends_with("transformer/config.json"));
         for (repo, rev, path) in [
             (SFT_REPO, "main", "transformer/config.json"),
