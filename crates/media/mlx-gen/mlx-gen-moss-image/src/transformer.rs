@@ -313,10 +313,18 @@ fn rotate(x: &Array, rope: &Array) -> Result<Array> {
     let cos = slice_axis(rope, 2, half, half)?.expand_dims(2)?;
     let sin = concatenate_axis(&[&sin, &sin], -1)?;
     let cos = concatenate_axis(&[&cos, &cos], -1)?;
-    let a = slice_axis(x, 3, 0, half)?;
-    let b = scale(&slice_axis(x, 3, half, half)?, -1.0)?;
-    let rotated = concatenate_axis(&[&b, &a], -1)?;
-    Ok(add(multiply(x, cos)?, multiply(rotated, sin)?)?)
+    // The packed `[sin | cos]` table is unpacked and tiled above (MOSS layout); the rotation is the
+    // shared eager cos/sin route (SW-6140), `RopeStyle::RotateHalf` with no casts — the same
+    // `x·cos + cat(−x2, x1)·sin` chain as this crate's private copy (its `x2·(−1)` is the same bits
+    // as `−x2`). 4-axis positions, so there is no fused `fast::rope` route.
+    mlx_gen::qkv::apply_rope_eager(
+        x,
+        mlx_gen::qkv::RopeTables::new(&cos, &sin),
+        mlx_gen::qkv::RopeStyle::RotateHalf,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention(
@@ -587,14 +595,8 @@ impl Block {
         }
         let m =
             |i| -> Result<Array> { Ok(slice_axis(modulation, 1, i, 1)?.reshape(&[1, 1, g.dim])?) };
-        let y = add(
-            multiply(
-                self.n1.forward(x)?,
-                add(m(1)?, constant(1.0, modulation.dtype())?)?,
-            )?,
-            m(0)?,
-        )?
-        .as_dtype(self.projections[0].dtype())?;
+        let y = mlx_gen::nn::modulate_eager(&self.n1.forward(x)?, &m(1)?, &m(0)?, true)?
+            .as_dtype(self.projections[0].dtype())?;
         let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?;
         let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?;
         let v = self.projections[2].forward(&y)?;
@@ -610,14 +612,8 @@ impl Block {
             perturbed_video_len,
         )?)?;
         let x = add(x, multiply(a, m(2)?)?)?;
-        let y = add(
-            multiply(
-                self.n2.forward(&x)?,
-                add(m(4)?, constant(1.0, modulation.dtype())?)?,
-            )?,
-            m(3)?,
-        )?
-        .as_dtype(self.projections[0].dtype())?;
+        let y = mlx_gen::nn::modulate_eager(&self.n2.forward(&x)?, &m(4)?, &m(3)?, true)?
+            .as_dtype(self.projections[0].dtype())?;
         let fused = self.projections[4].forward(&y)?;
         let hidden = slice_axis(&fused, 2, 0, g.ffn)?;
         let gate = slice_axis(&fused, 2, g.ffn, g.ffn)?;
@@ -1160,14 +1156,8 @@ impl Block {
     ) -> Result<(Array, Array, Array)> {
         let m =
             |i| -> Result<Array> { Ok(slice_axis(modulation, 1, i, 1)?.reshape(&[1, 1, g.dim])?) };
-        let y = add(
-            multiply(
-                self.n1.forward(x)?,
-                add(m(1)?, constant(1.0, modulation.dtype())?)?,
-            )?,
-            m(0)?,
-        )?
-        .as_dtype(self.projections[0].dtype())?;
+        let y = mlx_gen::nn::modulate_eager(&self.n1.forward(x)?, &m(1)?, &m(0)?, true)?
+            .as_dtype(self.projections[0].dtype())?;
         let shape = [1, x.shape()[1], g.heads, g.dim / g.heads];
         let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?.reshape(&shape)?;
         let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?.reshape(&shape)?;
@@ -1202,14 +1192,8 @@ impl Block {
             x,
             multiply(self.projections[3].forward(&attention)?, m(2)?)?,
         )?;
-        let y = add(
-            multiply(
-                self.n2.forward(&x)?,
-                add(m(4)?, constant(1.0, modulation.dtype())?)?,
-            )?,
-            m(3)?,
-        )?
-        .as_dtype(self.projections[0].dtype())?;
+        let y = mlx_gen::nn::modulate_eager(&self.n2.forward(&x)?, &m(4)?, &m(3)?, true)?
+            .as_dtype(self.projections[0].dtype())?;
         let fused = self.projections[4].forward(&y)?;
         Ok(add(
             x,

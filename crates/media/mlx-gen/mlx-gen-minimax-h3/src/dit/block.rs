@@ -229,8 +229,10 @@ fn modulate(x: &Array, scale: &Array, shift: &Array, indices: &Array) -> Result<
     // Otherwise F32 pruning tables promote a BF16 stream before ConvRot quantizes its input.
     let scale = scale.take_axis(indices, 0)?.as_dtype(x.dtype())?;
     let shift = shift.take_axis(indices, 0)?.as_dtype(x.dtype())?;
-    let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
-    Ok(add(&multiply(x, &add(&one, &scale)?)?, &shift)?)
+    // The gathered rows are the per-token modulation; the affine itself is the shared eager
+    // `nn::modulate_eager(.., one_matches_scale = true)` (SW-6140) — the `1` in the gathered
+    // `scale`'s dtype, the same three-op chain (`1 + scale` commutes) as this crate's private copy.
+    mlx_gen::nn::modulate_eager(x, &scale, &shift, true)
 }
 
 /// Pinned _gated_residual applies each gathered gate at the residual hidden stream's dtype.

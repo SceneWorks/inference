@@ -21,7 +21,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{concatenate_axis, pad, stack_axis};
+use mlx_rs::ops::{concatenate_axis, pad};
 use mlx_rs::{Array, Dtype};
 
 /// Group size of every quantized backbone projection (sc-26266): the codebase default, which the
@@ -528,10 +528,11 @@ impl RmsNorm {
 }
 
 /// `x · (1 + scale) + shift`. The `1` is created in `scale`'s dtype — torch's weak Python scalar —
-/// so a bf16 stream stays bf16 (an f32 `Array` scalar would promote it).
+/// so a bf16 stream stays bf16 (an f32 `Array` scalar would promote it). The shared eager
+/// [`mlx_gen::nn::modulate_eager`] with `one_matches_scale = true` (SW-6140), the same three-op
+/// chain as this crate's private copy.
 pub fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array> {
-    let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
-    Ok(x.multiply(&scale.add(&one)?)?.add(shift)?)
+    mlx_gen::nn::modulate_eager(x, scale, shift, true)
 }
 
 /// Split the last axis into `n` equal chunks (`tensor.chunk(n, dim=-1)`).
@@ -587,19 +588,21 @@ impl Rope {
 
     /// Rotate `x` `[B, N, H, head_dim]` by complex multiplication over **adjacent** channel pairs
     /// (`view_as_complex`), in f32; returns `x`'s dtype.
+    ///
+    /// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] (`RopeStyle::AdjacentPair`,
+    /// token-major, `RopeDtype::RestoreInput`; SW-6140): the same f32 `re·cos − im·sin`,
+    /// `im·cos + re·sin` chain (IEEE products and sums commute) over the same `[1, n, 1, pairs]`
+    /// broadcast as this crate's private copy, cast back to `x`'s dtype. Iris's grid positions are
+    /// 2-D, so there is no fused `fast::rope` route.
     pub fn apply(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, n, h, d) = (sh[0], sh[1], sh[2], sh[3]);
-        let pairs = d / 2;
-        let xf = x.as_dtype(Dtype::Float32)?.reshape(&[b, n, h, pairs, 2])?;
-        let parts = xf.split(2, 4)?;
-        let (re, im) = (parts[0].squeeze_axes(&[4])?, parts[1].squeeze_axes(&[4])?);
-        let cos = self.cos.reshape(&[1, n, 1, pairs])?;
-        let sin = self.sin.reshape(&[1, n, 1, pairs])?;
-        let out_re = re.multiply(&cos)?.subtract(&im.multiply(&sin)?)?;
-        let out_im = re.multiply(&sin)?.add(&im.multiply(&cos)?)?;
-        let out = stack_axis(&[out_re, out_im], 4)?.reshape(&[b, n, h, d])?;
-        Ok(out.as_dtype(x.dtype())?)
+        mlx_gen::qkv::apply_rope_eager(
+            x,
+            mlx_gen::qkv::RopeTables::new(&self.cos, &self.sin),
+            mlx_gen::qkv::RopeStyle::AdjacentPair,
+            mlx_gen::qkv::RotationAxes::TokenMajor,
+            None,
+            mlx_gen::qkv::RopeDtype::RestoreInput,
+        )
     }
 }
 

@@ -12,8 +12,7 @@
 //! The freqs are deterministic (no weights); we rebuild them and gate the result against the
 //! checkpoint's `rope.freqs_cos/sin` buffers. Built in f64 on the host (theta-pow seed), cast to f32.
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, split};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::Result;
 
@@ -83,33 +82,20 @@ impl VisionRope {
 
     /// Apply RoPE to patch-token q/k: `x·cos + rotate_half_interleaved(x)·sin`, computed in f32.
     /// `x`: `[B, heads, grid², head_dim]` (CLS token already sliced off by the caller).
+    ///
+    /// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] (SW-6140) with
+    /// `RopeStyle::InterleavedFull` (the adjacent-pair `rotate_pairwise`, this module's interleaved
+    /// `rotate_half`) and `RopeDtype::RestoreInput` (f32 compute, cast back) — the same per-element
+    /// chain over the same `[1, 1, grid², head_dim]` broadcast as this crate's private copy. The
+    /// table is 2-D (row/column halves), so there is no fused route.
     pub fn apply(&self, x: &Array) -> Result<Array> {
-        let orig = x.dtype();
-        let xf = x.as_dtype(Dtype::Float32)?;
-        // cos/sin [576,64] -> [1,1,576,64] for broadcast over (B, heads)
-        let cos = self
-            .cos
-            .reshape(&[1, 1, self.cos.shape()[0], self.cos.shape()[1]])?;
-        let sin = self
-            .sin
-            .reshape(&[1, 1, self.sin.shape()[0], self.sin.shape()[1]])?;
-        let rot = rotate_half_interleaved(&xf)?;
-        let out = add(&multiply(&xf, &cos)?, &multiply(&rot, &sin)?)?;
-        Ok(out.as_dtype(orig)?)
+        mlx_gen::qkv::apply_rope_eager(
+            x,
+            mlx_gen::qkv::RopeTables::new(&self.cos, &self.sin),
+            mlx_gen::qkv::RopeStyle::InterleavedFull,
+            mlx_gen::qkv::RotationAxes::HeadMajor,
+            None,
+            mlx_gen::qkv::RopeDtype::RestoreInput,
+        )
     }
-}
-
-/// Interleaved `rotate_half`: reshape the last dim `(.. , d, 2)`, then rebuild `(-x_odd, x_even)`.
-/// Result: `out[2i] = -x[2i+1]`, `out[2i+1] = x[2i]`.
-fn rotate_half_interleaved(x: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let last = sh[sh.len() - 1];
-    let mut pair_shape = sh.to_vec();
-    *pair_shape.last_mut().unwrap() = last / 2;
-    pair_shape.push(2);
-    let xr = x.reshape(&pair_shape)?; // [.., d, 2]
-    let axis = (pair_shape.len() - 1) as i32;
-    let halves = split(&xr, 2, axis)?; // even=[..,d,1], odd=[..,d,1]
-    let rotated = concatenate_axis(&[&halves[1].negative()?, &halves[0]], axis)?; // (-odd, even)
-    Ok(rotated.reshape(sh)?)
 }

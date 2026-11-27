@@ -1115,6 +1115,61 @@
       ]
     },
     {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_fused_route_matches_the_cos_sin_route_for_both_pairings",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE parity: the fused fast::rope route of qkv::apply_rope_1d vs the shared cos/sin route, 4 styles x 2 axis orders x full/partial rot_dims x offsets 0/7 x f32/bf16 RestoreInput/bf16 Stream, declared tolerances, max printed.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::a_swapped_pairing_or_offset_fails_the_fused_parity",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE mutation controls: fast::rope with the style-derived pairing passes, the swapped traditional flag or a one-position offset must exceed 100x the declared tolerance, per style.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_shared_cos_sin_route_reproduces_every_removed_private_rope_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE bit-exactness: qkv::apply_rope_eager / apply_rope vs verbatim copies of the removed private rotations (qwen/sam2/minimax/sam3/seedvr2/lens forms), f32 and bf16, array_eq.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::a_multi_axis_table_takes_the_shared_cos_sin_route_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE bit-exactness on a FLUX-style 3-axis id table built by nn::rope_sincos_from_ids, f32 and bf16, plus a control that the table is not a 1-D schedule.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_shared_modulate_helpers_reproduce_the_removed_private_copies_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX modulate bit-exactness: nn::modulate_eager / modulate (glue off) / provider glue bodies / scale_shift vs the removed private copies, both literal-1 dtype policies, f32 and bf16.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
       "package": "mlx-gen-anima",
       "kind": "lib",
       "target": "mlx_gen_anima",
