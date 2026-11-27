@@ -317,9 +317,10 @@ pub fn load_autoencoder(path: &Path) -> Result<Flux3AutoEncoder> {
     Ok(ae)
 }
 
-/// A native package loads only with its conversion receipt: owned outputs full-hash verified, the
-/// receipt's algorithm identical to the declared storage, and every EXTERNAL component full-hash
-/// verified where this load reads it. Twin of the Candle check.
+/// A native package loads only with its conversion receipt: owned outputs verified (by their sealed
+/// produced identity when unchanged, else by full hash), the receipt's algorithm identical to the
+/// declared storage, and every EXTERNAL component content-verified through the artifact seal where
+/// this load reads it. Twin of the Candle check.
 fn verify_native_package(
     route_id: &str,
     package_dir: &Path,

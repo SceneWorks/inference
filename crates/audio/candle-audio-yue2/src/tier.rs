@@ -48,6 +48,17 @@
 //! original's; the weights file's header must be exactly the plan's stored table; no other weights
 //! file may be present; and the weights file must hash to its **pinned conversion output**
 //! ([`TIER_PINS`]) — so a derived tier is as exactly pinned as the original it comes from.
+//!
+//! # Produced-file identity (the conversion's own output is not re-hashed)
+//!
+//! Every file a conversion writes or copies is hashed against its pin ONCE, during the conversion.
+//! After that hash the file is sealed ([`gen_core::ProducedFileIdentity::seal_written`]) and the
+//! record is stored beside its digest as `files.<name>.producedIdentity`. Verification skips the
+//! content read of a file whose recorded digest is the expected one and whose recorded identity
+//! still [`matches`](gen_core::ProducedFileIdentity::matches); a file that changed since, and every
+//! file of a manifest without identities (an older derivation, or a copy such as a saved closure,
+//! whose files are new file objects), is hashed exactly as before. The identities are the one part
+//! of the manifest that differs between two conversions; every other byte is reproducible.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -77,6 +88,15 @@ pub const CONVERSION_ID: &str = "yue2-ggml-tier-v1";
 pub const WEIGHTS_FILE: &str = "model.safetensors";
 /// The component key tier errors are reported under.
 pub const COMPONENT_KEY: &str = "yue2_3b_tier";
+/// The `files.<name>` key holding the [`gen_core::ProducedFileIdentity`] the conversion recorded
+/// for that file once it was final ([module docs](self#produced-file-identity-the-conversions-own-output-is-not-re-hashed)).
+pub const PRODUCED_IDENTITY: &str = "producedIdentity";
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`file_check`] content-hashed on this thread (tests assert a sealed load reads none).
+    pub(crate) static HASHED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// The exact weights file one tier's conversion produces from the pinned original.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +261,46 @@ impl VerifiedTier {
     }
 }
 
-fn file_check(dir: &Path, file: &str, bytes: u64, sha256: &str) -> Result<PathBuf, AssetError> {
+/// The identity the conversion recorded for `file`, used only when the manifest's own record of
+/// that file is exactly the expected size and digest, so an identity never vouches for any digest
+/// but the one being verified. A missing or malformed record yields `None`: the file is hashed.
+fn recorded_identity(
+    files: Option<&Map<String, Value>>,
+    file: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Option<gen_core::ProducedFileIdentity> {
+    let rec = files?.get(file)?;
+    let same = rec.get("sha256").and_then(Value::as_str) == Some(sha256)
+        && rec.get("bytes").and_then(Value::as_u64) == Some(bytes);
+    if !same {
+        return None;
+    }
+    serde_json::from_value(rec.get(PRODUCED_IDENTITY)?.clone()).ok()
+}
+
+/// Seal a file the conversion has finished (written or copied, synced, and hashed against its pin)
+/// and return its manifest record. Sealing is best-effort: a file that cannot be sealed (a
+/// read-only copy on Unix cannot be opened to backdate its modification time) is recorded without
+/// an identity, and is hashed whenever it is verified, as before.
+fn produced_record(path: &Path, sha256: &str, bytes: u64) -> Value {
+    let mut rec = json!({"sha256": sha256, "bytes": bytes});
+    if let Some(identity) = gen_core::ProducedFileIdentity::seal_written(path)
+        .ok()
+        .and_then(|identity| serde_json::to_value(identity).ok())
+    {
+        rec[PRODUCED_IDENTITY] = identity;
+    }
+    rec
+}
+
+fn file_check(
+    dir: &Path,
+    file: &str,
+    bytes: u64,
+    sha256: &str,
+    identity: Option<&gen_core::ProducedFileIdentity>,
+) -> Result<PathBuf, AssetError> {
     let path = snapshot::join_rel(dir, file);
     let meta = match std::fs::metadata(&path) {
         Ok(m) if m.is_file() => m,
@@ -275,6 +334,12 @@ fn file_check(dir: &Path, file: &str, bytes: u64, sha256: &str) -> Result<PathBu
             actual: meta.len(),
         });
     }
+    // The conversion proved these bytes against `sha256` and sealed the file, unchanged since.
+    if identity.is_some_and(|identity| identity.matches(&path)) {
+        return Ok(path);
+    }
+    #[cfg(test)]
+    HASHED_BYTES.with(|hashed| hashed.set(hashed.get() + bytes));
     let actual = snapshot::sha256_file(COMPONENT_KEY, &path)?;
     if actual != sha256 {
         return Err(AssetError::HashMismatch {
@@ -349,9 +414,17 @@ pub(crate) fn verify_tier_from(source: TierSource, dir: &Path) -> Result<Verifie
         )));
     }
 
-    // Every copied file, against the inventory pins.
+    // Every copied file, against the inventory pins (a sealed, unchanged copy is not re-read).
+    let recorded_files = manifest.get("files").and_then(Value::as_object);
     for pinned in source.copied_files() {
-        file_check(dir, pinned.path, pinned.bytes, pinned.sha256)?;
+        let identity = recorded_identity(recorded_files, pinned.path, pinned.bytes, pinned.sha256);
+        file_check(
+            dir,
+            pinned.path,
+            pinned.bytes,
+            pinned.sha256,
+            identity.as_ref(),
+        )?;
     }
 
     // No other weights file anywhere in the tree.
@@ -443,7 +516,14 @@ pub(crate) fn verify_tier_from(source: TierSource, dir: &Path) -> Result<Verifie
             });
         }
     }
-    let weights = file_check(dir, WEIGHTS_FILE, weights_bytes, &weights_sha256)?;
+    let identity = recorded_identity(Some(files), WEIGHTS_FILE, weights_bytes, &weights_sha256);
+    let weights = file_check(
+        dir,
+        WEIGHTS_FILE,
+        weights_bytes,
+        &weights_sha256,
+        identity.as_ref(),
+    )?;
     let table = snapshot::read_tensor_table(COMPONENT_KEY, WEIGHTS_FILE, &weights)?;
     let expected: BTreeMap<String, (String, Vec<usize>)> = plan
         .iter()
@@ -607,10 +687,7 @@ fn assemble(
                     detail: format!("copied bytes hash to {sha}; pinned {}", pinned.sha256),
                 });
             }
-            files.insert(
-                file.file.to_string(),
-                json!({"sha256": sha, "bytes": bytes}),
-            );
+            files.insert(file.file.to_string(), produced_record(&to, &sha, bytes));
         }
     }
 
@@ -665,7 +742,7 @@ fn assemble(
     let (sha, bytes) = durable::sha256_file(&weights)?;
     files.insert(
         WEIGHTS_FILE.to_string(),
-        json!({"sha256": sha, "bytes": bytes}),
+        produced_record(&weights, &sha, bytes),
     );
     let manifest = json!({
         "format": TIER_FORMAT,
@@ -692,6 +769,9 @@ fn assemble(
     });
     durable::write_json(&work.join(TIER_MANIFEST), &manifest)?;
     durable::sync_dir(work)?;
+    // Every file was hashed against its pin above and sealed after that hash, so this checks the
+    // assembled snapshot as a whole (source, plan, tensor table, pins) without reading those bytes
+    // again. Renaming `work` onto `dest` does not change the identities of the files inside it.
     verify_tier_from(source, work).map_err(asset)?;
     Ok(manifest)
 }
