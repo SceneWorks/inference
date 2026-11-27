@@ -65,6 +65,9 @@ clause for every term assigned to a licence family.
   [known holes](licensing/sc-16665-checkpoint-licence-evidence.md#known-holes--the-rows-sc-16665-deliberately-did-not-write)
   section is the authoritative list of checkpoints that were left without a row rather than given a
   guessed one.
+- **[Third-party kernel sources (SW-F287 E10)](licensing/third-party-kernel-sources.md)** — the
+  manifest of nvrtc / Metal kernel sources ported from other projects (comfy-kitchen, thu-ml
+  SageAttention, ...), with upstream revision, license and in-tree attribution.
 
 ## Native H3 ConvRot INT8 checkpoints (sc-26683)
 

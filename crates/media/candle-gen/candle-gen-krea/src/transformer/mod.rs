@@ -33,6 +33,7 @@ use crate::loader::{linear_detect, linear_detect_planned, Weights};
 use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
 use crate::quant::QLinear;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use candle_gen::fused_attention::PvPrecision;
 use rope::RopeTables;
 
 fn request_attention_plan<'a>(
@@ -69,6 +70,34 @@ pub struct Krea2Transformer {
     /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
     /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
     rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
+    /// The `int8_attention` engine option (SW-6131): `Some(pv)` runs the single-stream blocks'
+    /// attention through the opt-in, lossy INT8 QK kernel
+    /// ([`candle_gen::fused_attention::with_int8_attention_config`]) with that `P·V` mode instead
+    /// of FlashAttention. `None` (the default) is off; see [`Self::set_int8_attention`].
+    int8_attention: Option<PvPrecision>,
+}
+
+thread_local! {
+    /// The generator-level `int8_attention` engine option for the render running on this thread
+    /// (see [`with_dit_int8_attention`]); the DiT's own [`Krea2Transformer::set_int8_attention`]
+    /// takes precedence when set.
+    static DIT_INT8_ATTENTION: std::cell::Cell<Option<PvPrecision>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` (one render) with the `int8_attention` engine option set to `mode` for every
+/// [`Krea2Transformer`] denoise forward on this thread; restores the previous value on exit and
+/// unwind. Only the single-stream block attention is affected — the text encoder, the
+/// request-once text fusion and the VAE keep their attention routes.
+pub(crate) fn with_dit_int8_attention<T>(mode: Option<PvPrecision>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PvPrecision>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIT_INT8_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIT_INT8_ATTENTION.replace(mode));
+    f()
 }
 
 /// Request-owned conditioning that is invariant throughout a Krea denoise trajectory.  The text
@@ -351,6 +380,33 @@ impl Krea2Transformer {
             final_sstable,
             phase_adapters: PhaseAdapterBindings::default(),
             rope_cache: RopeCache::new(ROPE_CACHE_CAP),
+            int8_attention: None,
+        })
+    }
+
+    /// The `int8_attention` engine option (SW-6131, default `None` = off): `Some(pv)` runs every
+    /// denoise forward's single-stream block attention inside
+    /// [`candle_gen::fused_attention::enter_int8_attention`] (adaptive K centering, `pv` as the
+    /// `P·V` mode), so eligible calls take the INT8 QK kernel and the rest keep FlashAttention /
+    /// the budgeted path, counted. Lossy (epic E2): an explicit choice, never a default.
+    pub fn set_int8_attention(&mut self, mode: Option<PvPrecision>) {
+        self.int8_attention = mode;
+    }
+
+    /// The INT8 mode this forward requests (the DiT's option, else the render's).
+    pub fn int8_attention(&self) -> Option<PvPrecision> {
+        self.int8_attention.or_else(|| DIT_INT8_ATTENTION.get())
+    }
+
+    /// The INT8 attention scope for one denoise forward, when requested.
+    fn int8_scope(&self) -> Option<candle_gen::fused_attention::Int8AttentionScope> {
+        self.int8_attention().map(|pv| {
+            candle_gen::fused_attention::enter_int8_attention(
+                candle_gen::fused_attention::Int8AttentionConfig {
+                    k_centering: candle_gen::fused_attention::KCentering::Adaptive,
+                    pv,
+                },
+            )
         })
     }
 
@@ -847,6 +903,7 @@ impl Krea2Transformer {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+        let _int8 = self.int8_scope();
         let perturb = |index: usize| {
             perturbed_layers
                 .binary_search(&(index as u32))
@@ -1042,6 +1099,7 @@ impl Krea2Transformer {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+        let _int8 = self.int8_scope();
         let target_offset = prepared.cap_len + prepared.refs.len() * prepared.img_len;
 
         // Target image tokens change per denoise step; text/reference tokens were prepared once.

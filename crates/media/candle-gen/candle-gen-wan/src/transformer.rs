@@ -160,6 +160,48 @@ fn sdpa_budgeted(
     candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, None, softmax, budget)
 }
 
+thread_local! {
+    /// SW-6137: the `sol_attention` engine option of the render running on this thread (see
+    /// [`with_dit_sol_attention`]).
+    static DIT_SOL_ATTENTION: std::cell::Cell<Option<candle_gen::SolConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// SW-6137: run `f` (one render) with the `sol_attention` engine option set to `config` for every
+/// inference DiT block's **self-attention** on this thread; restores the previous value on exit and
+/// unwind. Inside, each block's self-attention runs in a
+/// [`candle_gen::fused_attention::enter_sol_attention`] scope, so an eligible call takes the opt-in,
+/// lossy Sol-Attn sparse kernel and anything else keeps FlashAttention / the budgeted path, counted in
+/// `candle_gen::AttentionPathCounts::sol_refusals`. The text cross-attention, the UMT5 encoder, the
+/// VAE and the training DiT (`dit_train.rs`, its own blocks, under the training scope anyway) are
+/// outside the scope. `None` (the default) is off.
+pub fn with_dit_sol_attention<T>(
+    config: Option<candle_gen::SolConfig>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<candle_gen::SolConfig>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIT_SOL_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIT_SOL_ATTENTION.replace(config));
+    f()
+}
+
+/// The `sol_attention` option of the render on this thread.
+pub fn dit_sol_attention() -> Option<candle_gen::SolConfig> {
+    DIT_SOL_ATTENTION.get()
+}
+
+/// One block's self-attention, inside the Sol-Attn scope when the render asked for it.
+fn self_attention_scope<T>(f: impl FnOnce() -> T) -> T {
+    match DIT_SOL_ATTENTION.get() {
+        Some(config) => candle_gen::with_sol_attention(config, f),
+        None => f(),
+    }
+}
+
 struct Attention {
     to_q: QLinear,
     to_k: QLinear,
@@ -569,7 +611,7 @@ impl Block {
         let hf = hidden.to_dtype(DType::F32)?;
         // 1. self-attention
         let n = wan_adaln(&hf, self.eps, &scale_msa, &shift_msa, dt)?;
-        let a = self.attn1.forward(&n, &n, Some((cos, sin)))?;
+        let a = self_attention_scope(|| self.attn1.forward(&n, &n, Some((cos, sin))))?;
         let hf = (hf + a.to_dtype(DType::F32)?.broadcast_mul(&gate_msa)?)?;
 
         // 2. cross-attention (affine norm2, ungated)

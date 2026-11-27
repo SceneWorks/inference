@@ -1149,6 +1149,50 @@ pub struct Wan14bGenerator {
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
     lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
+    /// Engine options fixed at load ([`load_t2v_14b_with_options`]).
+    engine: Wan14bEngineOptions,
+}
+
+/// Load-time engine options of a Wan2.2 A14B generator ([`load_t2v_14b_with_options`],
+/// [`load_i2v_14b_with_options`]). The default is the historical engine.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Wan14bEngineOptions {
+    /// SW-6137: `Some(config)` runs both experts' denoise **self-attention** through the opt-in
+    /// Sol-Attn sparse block-routed kernel (CUDA sm_80+; lossy by design: 64-token blocks, the top
+    /// `topk_ratio` of the key blocks exact per query block, the rest pooled) instead of
+    /// FlashAttention. Calls the kernel cannot serve keep FlashAttention / the budgeted path, counted
+    /// in `candle_gen::AttentionPathCounts::sol_refusals`. `None`, the default, is off (epic E2).
+    ///
+    /// SW-6132: the same kernel is also one shared, job-level opt-in for every model
+    /// (`candle_gen::set_lossy_attention`, which a product worker sets per job); this engine option
+    /// scopes it to the denoise self-attention and wins over the job switch for those calls.
+    pub sol_attention: Option<candle_gen::SolConfig>,
+}
+
+/// SW-6137: the typed load-time refusal of a `sol_attention` option this engine cannot honour: an
+/// invalid [`candle_gen::SolConfig`], or a DiT whose head dim is wider than the kernel's 128 (a
+/// narrower one is zero-padded by the shared dispatch).
+pub(crate) fn validate_engine_options(
+    dit: &crate::config::TransformerConfig,
+    options: &Wan14bEngineOptions,
+) -> gen_core::Result<()> {
+    let Some(sol) = options.sol_attention else {
+        return Ok(());
+    };
+    sol.validate().map_err(|reason| {
+        gen_core::Error::Unsupported(format!("wan sol_attention option: {reason}"))
+    })?;
+    // A narrower head is zero-padded to the kernel's width by the shared dispatch; a wider one
+    // has no template.
+    let need = candle_gen::fused_attention::SOL_HEAD_DIM;
+    if dit.head_dim == 0 || dit.head_dim > need {
+        return Err(gen_core::Error::Unsupported(format!(
+            "wan sol_attention option: the Sol-Attn kernel takes head_dim up to {need}, this DiT \
+             has {}",
+            dit.head_dim
+        )));
+    }
+    Ok(())
 }
 
 impl Wan14bGenerator {
@@ -1276,20 +1320,29 @@ impl Generator for Wan14bGenerator {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let staged =
             self.offload == OffloadPolicy::Sequential || crate::i2v_memory_strategy::staged(req);
-        let (frames, fps) = if staged {
-            let mut components = candle_gen::lock_recover(&self.components);
-            if components.is_some() {
-                self.device
-                    .synchronize()
-                    .map_err(gen_core::Error::backend)?;
-                drop(components.take());
-            }
-            drop(components);
-            pipe.render_sequential(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
+        candle_gen::execution::policy(
+            "wan/engine/sol_attention",
+            format!("{:?}", self.engine.sol_attention).into(),
+        );
+        let (frames, fps) = crate::transformer::with_dit_sol_attention(
+            self.engine.sol_attention,
+            || -> gen_core::Result<_> {
+                Ok(if staged {
+                    let mut components = candle_gen::lock_recover(&self.components);
+                    if components.is_some() {
+                        self.device
+                            .synchronize()
+                            .map_err(gen_core::Error::backend)?;
+                        drop(components.take());
+                    }
+                    drop(components);
+                    pipe.render_sequential(req, on_progress)?
+                } else {
+                    let components = self.components(&pipe)?;
+                    pipe.render(req, &components, on_progress)?
+                })
+            },
+        )?;
         crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
@@ -1432,6 +1485,7 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         i2v_memory,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        engine: Wan14bEngineOptions::default(),
     })
 }
 
@@ -1478,7 +1532,37 @@ pub fn load_from_comfyui_experts_with_offload(
     i2v: bool,
     offload_policy: OffloadPolicy,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let generator = build_comfyui_generator(
+    load_from_comfyui_experts_with_options(
+        high_file,
+        low_file,
+        te_file,
+        vae_file,
+        snapshot_dir,
+        i2v,
+        offload_policy,
+        Wan14bEngineOptions::default(),
+    )
+}
+
+/// [`load_from_comfyui_experts_with_offload`] with explicit [`Wan14bEngineOptions`] — the ComfyUI
+/// in-place twin of [`load_t2v_14b_with_options`] / [`load_i2v_14b_with_options`], so the
+/// `sol_attention` engine option (SW-6137) reaches this lane too. `Wan14bEngineOptions::default()`
+/// is exactly [`load_from_comfyui_experts_with_offload`]; an option this engine cannot honour is
+/// refused here with the same typed error.
+#[allow(clippy::too_many_arguments)]
+pub fn load_from_comfyui_experts_with_options(
+    high_file: impl Into<PathBuf>,
+    low_file: impl Into<PathBuf>,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let variant = if i2v { Variant::I2v } else { Variant::T2v };
+    validate_engine_options(&variant.dit_cfg(), &options)?;
+    let mut generator = build_comfyui_generator(
         high_file.into(),
         low_file.into(),
         te_file,
@@ -1487,8 +1571,11 @@ pub fn load_from_comfyui_experts_with_offload(
         i2v,
         offload_policy,
     )?;
+    generator.engine = options;
     #[cfg(test)]
     COMFYUI_TEST_OFFLOAD.set(Some(generator.offload));
+    #[cfg(test)]
+    COMFYUI_TEST_ENGINE.set(Some(generator.engine));
     Ok(Box::new(generator))
 }
 
@@ -1502,6 +1589,13 @@ thread_local! {
 #[cfg(test)]
 fn last_public_comfyui_offload_for_test() -> Option<OffloadPolicy> {
     COMFYUI_TEST_OFFLOAD.get()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The engine options the last public ComfyUI load on this thread carried.
+    static COMFYUI_TEST_ENGINE: std::cell::Cell<Option<Wan14bEngineOptions>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn build_comfyui_generator(
@@ -1532,6 +1626,7 @@ fn build_comfyui_generator(
         i2v_memory: None,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        engine: Wan14bEngineOptions::default(),
     })
 }
 
@@ -1548,6 +1643,35 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::I2v)
 }
 
+/// [`load_t2v_14b`] with explicit [`Wan14bEngineOptions`] — the opt-in surface for the Sol-Attn
+/// sparse attention engine option (SW-6137). `Wan14bEngineOptions::default()` is exactly
+/// [`load_t2v_14b`]. An option this engine cannot honour is refused here with a typed error.
+pub fn load_t2v_14b_with_options(
+    spec: &LoadSpec,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_with_options(spec, Variant::T2v, options)
+}
+
+/// [`load_i2v_14b`] with explicit [`Wan14bEngineOptions`] (see [`load_t2v_14b_with_options`]).
+pub fn load_i2v_14b_with_options(
+    spec: &LoadSpec,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_with_options(spec, Variant::I2v, options)
+}
+
+fn load_variant_with_options(
+    spec: &LoadSpec,
+    variant: Variant,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    validate_engine_options(&variant.dit_cfg(), &options)?;
+    let mut generator = build_generator(spec, variant)?;
+    generator.engine = options;
+    Ok(Box::new(generator))
+}
+
 candle_gen::register_generators! {
     pub(crate) const T2V_14B_REGISTRATION = descriptor_t2v_14b => load_t2v_14b
 }
@@ -1558,6 +1682,52 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-6137: the `sol_attention` option is off by default, carried by the options loaders, and
+    /// refused with a typed error when this engine cannot honour it (invalid ratio / sinks, or a DiT
+    /// whose head dim is wider than the kernel's 128; a narrower one is zero-padded).
+    #[test]
+    fn the_sol_attention_option_is_off_by_default_and_refused_when_unservable() {
+        assert_eq!(Wan14bEngineOptions::default().sol_attention, None);
+        let on = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.25)),
+        };
+        for variant in [Variant::T2v, Variant::I2v] {
+            let cfg = variant.dit_cfg();
+            assert_eq!(cfg.head_dim, 128);
+            validate_engine_options(&cfg, &on).unwrap();
+            validate_engine_options(&cfg, &Wan14bEngineOptions::default()).unwrap();
+            let bad_ratio = Wan14bEngineOptions {
+                sol_attention: Some(candle_gen::SolConfig::top_k(1.5)),
+            };
+            assert!(matches!(
+                validate_engine_options(&cfg, &bad_ratio),
+                Err(gen_core::Error::Unsupported(m)) if m.contains("topk_ratio")
+            ));
+            // A narrower head is zero-padded to 128 by the shared dispatch; a wider one is refused.
+            let mut narrow = cfg;
+            narrow.head_dim = 64;
+            validate_engine_options(&narrow, &on).unwrap();
+            let mut wide = cfg;
+            wide.head_dim = 256;
+            assert!(matches!(
+                validate_engine_options(&wide, &on),
+                Err(gen_core::Error::Unsupported(m)) if m.contains("head_dim up to 128")
+            ));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(temp.path().to_path_buf()));
+        let generator = build_generator(&spec, Variant::T2v).unwrap();
+        assert_eq!(generator.engine, Wan14bEngineOptions::default());
+        assert!(load_t2v_14b_with_options(
+            &spec,
+            Wan14bEngineOptions {
+                sol_attention: Some(candle_gen::SolConfig::top_k(0.0)),
+            }
+        )
+        .is_err());
+        assert!(load_t2v_14b_with_options(&spec, on).is_ok());
+    }
 
     #[test]
     fn both_a14b_public_loaders_publish_prepared_contracts_at_every_tier() {
@@ -1974,6 +2144,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    /// PR #1530 review: the ComfyUI in-place lane carries the `sol_attention` engine option too
+    /// (it used to keep `Wan14bEngineOptions::default()`), the offload-only loader stays the
+    /// default engine, and an unservable option is refused at load on this lane as well.
+    #[test]
+    fn comfyui_load_carries_the_engine_options() {
+        let on = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.25)),
+        };
+        let load = |options| {
+            load_from_comfyui_experts_with_options(
+                "/comfy/high.safetensors",
+                "/comfy/low.safetensors",
+                None,
+                None,
+                "/snapshot",
+                false,
+                OffloadPolicy::Sequential,
+                options,
+            )
+        };
+        load(on).unwrap();
+        assert_eq!(COMFYUI_TEST_ENGINE.get(), Some(on));
+        assert_eq!(
+            last_public_comfyui_offload_for_test(),
+            Some(OffloadPolicy::Sequential)
+        );
+        load_from_comfyui_experts_with_offload(
+            "/comfy/high.safetensors",
+            "/comfy/low.safetensors",
+            None,
+            None,
+            "/snapshot",
+            true,
+            OffloadPolicy::Resident,
+        )
+        .unwrap();
+        assert_eq!(
+            COMFYUI_TEST_ENGINE.get(),
+            Some(Wan14bEngineOptions::default())
+        );
+        let bad = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.0)),
+        };
+        assert!(matches!(
+            load(bad),
+            Err(gen_core::Error::Unsupported(m)) if m.contains("topk_ratio")
+        ));
     }
 
     #[test]

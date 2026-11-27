@@ -2213,6 +2213,261 @@
       "package": "candle-quant-kernels",
       "kind": "lib",
       "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_kernels_compile_without_local_memory",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "SW-6131 CUDA: every INT8 QK attention entry point compiles through the nvrtc seam for the live device with zero local memory (prints registers). Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_quantizer_codes_match_the_host_oracle",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "SW-6131 CUDA numerics (E2): the device Hadamard-rotated per-token INT8 Q/K quantizer's codes and the per-channel 16-key-permuted INT8 V quantizer's codes are byte-identical to the host oracles (scales within 1 ULP), d=64/128, bf16/f16, strided operands. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_attention_smoke_and_timing",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "SW-6131 CUDA attention: one Krea-shaped (48x128, S=4096) INT8 QK attention per P.V mode vs the f32 reference (cosine >= 0.999) and its ms/iter. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_contiguous_view_at_an_unaligned_offset",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review regression: contiguous bf16/f16 Q/K/V views at storage offsets that are not multiples of 8 elements are copied to zero-offset buffers before launch (16-bit V cp.async needs 16-byte rows); both P.V modes are bitwise the aligned call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_centered_k_codes_match_the_fixed_order_oracle",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review: with sage_k_sum's grid moved to (chunks, H, B), the K-centering mean is still the fixed-order reduction: centered K codes are byte-identical to a host oracle of that order over several 256-row chunks, ragged lengths, d=64 bf16 and d=128 f16. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_launches_past_65535_centering_chunks",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review boundary: Q [1,1,128,64] vs K/V [1,1,16776961,64] (65,536 K-centering chunks, one past grid.y before the fix) launches with adaptive centering, finite and cosine >= 0.999 vs the uncentered call. ~4.3 GiB bf16 K/V. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_int8_matches_the_f32_reference",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6131 CUDA numerical attention parity (AC1): the opt-in INT8 QK route through the shared helper vs the f32 materialized reference at S=4096/16384, d=64/128, bf16/f16, GQA, both P.V modes (16-bit and comfy-kitchen INT8), K centering off/on/adaptive, with and without a shared K offset; cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_lossy_f32_operands_run_at_bf16_against_the_f32_reference",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6132 (PR #1530 follow-up) CUDA parity: f32 Q/K/V with INT8 or Sol-Attn (top-k 1.0) opted in run the kernel at bf16 in the shared dispatch and return f32 (counted lossy_adapted.f32_cast), d=128 and d=64 (Sol-Attn also padded), vs the f32 materialized reference: cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_lossy_narrow_heads_pad_to_128_against_the_f32_reference",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6132 (PR #1530 follow-up) CUDA parity: head dim 120 (INT8 and Sol-Attn, bf16 and f16) and 64 (Sol-Attn) zero-padded to 128 in the shared dispatch with the original softmax scale, output sliced back (counted lossy_adapted.head_pad), vs the f32 materialized reference: cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_kernels_compile_without_local_memory",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 CUDA: every Sol-Attn entry point (14) compiles through the nvrtc seam for the live device with zero local memory (prints registers). Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_ratio_one_is_dense_attention",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 AC1: with topk_ratio 1.0 every key block is routed (counted) and the kernel equals the f32 dense attention within its declared INT8 tolerance (cosine >= 0.999, rel-L2 < 0.016), bf16/f16, ragged/aligned lengths, batch > 1. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_chunked_equals_unchunked",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 AC1: the chunked-query variant (route + exact per query-block window) is bitwise the unchunked call, top-k and tau with sinks, windows 1/7/64/150 blocks. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_matches_the_reference_at_sparse_budgets",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 E2: the kernel vs the full-precision eager reference (comfy-kitchen's) at top-k 0.05/0.2/0.5 (cosine > 0.995) and tau 0.5/2 (> 0.998), and a bigger budget moves toward dense attention. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_forced_sinks_carry_a_sink_dependent_fixture",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 mutation guard: a sink-dependent fixture (a key block of +-u pairs whose pooled score is ~0) stays >= 0.99 cosine to dense with the forced sink block and falls below it without (dropping the forced sinks fails). Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_wan_shape_smoke",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 CUDA: one Wan2.2 A14B 480x832x81 self-attention shape (40x128, S=32760) per top-k budget: routed density and ms/call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_contiguous_view_at_an_unaligned_offset",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "PR #1530 review regression: contiguous bf16/f16 Q/K/V views at storage offsets that are not multiples of 8 elements ([1,1,64,128] and a ragged [1,2,1000,128]) are copied to zero-offset buffers before the uint4 loads; the call is bitwise the aligned call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_sol_takes_wan_self_attention_through_the_shared_helper",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6137 dispatch: inside a Sol-Attn scope a Wan-shaped self-attention takes the sol kernel (counted) bitwise equal to the direct call, topk 1.0 equals the f32 reference (cosine >= 0.999, rel-L2 < 0.016), the text cross attention is refused as cross_attention, a training scope never takes it. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
       "test": "adaln::cuda_tests::fused_adaln_gpu_is_bit_identical_to_the_reference_chain",
       "source": "crates/kernels/candle-quant-kernels/src/adaln.rs",
       "reason": "SW-6127 CUDA fused AdaLN: bit-identical to the candle norm + (scale+1) + broadcast_mul/add chain over f32/bf16/f16, RMSNorm and LayerNorm, with/without weight and bias, native and f32 norm precision, OnePlus and Direct scale, per-sample [B,1,D] and per-token [B,S,D] modulation, D in {1, 7, 96, 1027, 6144, 6151}. cfg(cuda), Device::new_cuda(0).",

@@ -105,14 +105,14 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 354
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 420
+              "line": 462
             }
           ],
           "release": [
@@ -141,21 +141,21 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1246
+              "line": 1290
             }
           ],
           "creation": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 354
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 420
+              "line": 462
             }
           ],
           "release": [
@@ -184,21 +184,21 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1246
+              "line": 1290
             }
           ],
           "creation": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 354
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 420
+              "line": 462
             }
           ],
           "release": [
@@ -234,14 +234,14 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 354
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 420
+              "line": 462
             }
           ],
           "release": [
@@ -277,14 +277,14 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 354
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 420
+              "line": 462
             }
           ],
           "release": [

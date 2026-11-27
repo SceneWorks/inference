@@ -72,10 +72,10 @@ fn sdpa_planned(
     let head_plan = plan
         .budget
         .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
-    // The fused kernel never materializes the scores the head chunks bound, so a call the shared
-    // router sends to it runs as one launch rather than one per head chunk (SW-6130).
-    let fused = candle_gen::fused_attention::route_attention_kernel(q, k, v, None)
-        == candle_gen::AttentionKernel::Flash;
+    // A fused kernel (flash, or the opt-in INT8 one) never materializes the scores the head chunks
+    // bound, so a call the shared router sends to it runs as one launch rather than one per head
+    // chunk (SW-6130, SW-6131).
+    let fused = candle_gen::fused_attention::route_attention_kernel(q, k, v, None).is_fused();
     if fused || !head_plan.chunks_heads() {
         record_head_chunk_count(1);
         return candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan);

@@ -94,7 +94,9 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
+pub mod sage_attention;
 pub mod sm120_gate;
+pub mod sol_attention;
 pub mod training_attention;
 pub mod vae_norm_silu_pad;
 pub mod veda_int8;
@@ -155,9 +157,12 @@ pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 pub use nvfp4_weight::{
     nvfp4_refusal_for_compute_cap, nvfp4_shape_refusal, Nvfp4Refusal, Nvfp4Weight, NVFP4_CAPABILITY,
 };
+pub use nvrtc::{
+    cuda_grid_fits, nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource,
+    CUDA_GRID_X_MAX, CUDA_GRID_YZ_MAX,
+};
 #[cfg(feature = "cuda")]
 pub use nvrtc::{device_compute_cap, CompiledKernel};
-pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 and fp8 / int8 activation quantizers, the length-aware
@@ -189,6 +194,8 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    sage_attention::SOURCE,
+    sol_attention::SOURCE,
     media_rope::MEDIA_ROPE_SRC,
     vae_norm_silu_pad::VAE_NORM_SILU_PAD_SRC,
 ];

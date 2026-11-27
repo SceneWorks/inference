@@ -110,7 +110,17 @@ mod reference_training_attention;
 pub mod training_attention;
 pub use fused_attention::{
     attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
-    take_attention_path_counts, AttentionKernel, AttentionPathCounts, FlashRefusal,
+    take_attention_path_counts, with_int8_attention, with_int8_attention_config,
+    with_int8_attention_if, AttentionKernel, AttentionPathCounts, FlashRefusal,
+    Int8AttentionConfig, Int8Refusal, Int8RefusalCounts, KCentering, PvPrecision,
+};
+// SW-6137: the opt-in Sol-Attn sparse kernel.
+pub use fused_attention::{
+    with_sol_attention, SolConfig, SolRefusalCounts, SolRouteRefusal, SolSelection,
+};
+// SW-6132: the shared, job-level lossy-attention opt-ins (INT8 / Sol-Attn) for every model.
+pub use fused_attention::{
+    lossy_attention, set_lossy_attention, LossyAttentionOptIns, LossyAttentionRefusal,
 };
 
 // The media fused-kernel path seam (SW-6126, SW-F287): every fused media kernel's switch

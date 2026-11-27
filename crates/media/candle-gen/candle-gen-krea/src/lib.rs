@@ -400,6 +400,25 @@ pub struct KreaGenerator {
     /// this load produced no compiled plan (or has not read anything yet), never "the source stores
     /// nothing quantized".
     checkpoint_facts: gen_core::CheckpointFactsSink,
+    /// Engine options fixed at load ([`load_with_options`]).
+    engine: KreaEngineOptions,
+}
+
+/// Load-time engine options of a Krea 2 generator ([`load_with_options`]). The default is the
+/// historical engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KreaEngineOptions {
+    /// SW-6131: `Some(pv)` runs the DiT's single-stream block attention through the opt-in
+    /// SageAttention-style INT8 QK kernel (CUDA sm_80+; lossy) with `pv` as its `P·V` mode —
+    /// `PvPrecision::ValueDtype` (16-bit `P·V`, the accurate one) or `PvPrecision::Int8`
+    /// (comfy-kitchen's INT8 `P·V`) — instead of FlashAttention. Calls the kernel cannot serve keep
+    /// FlashAttention / the budgeted path, counted in
+    /// `candle_gen::AttentionPathCounts::int8_refusals`. `None`, the default, is off (epic E2).
+    ///
+    /// SW-6132: the same kernel is also one shared, job-level opt-in for every model
+    /// (`candle_gen::set_lossy_attention`, which a product worker sets per job); this engine option
+    /// scopes it to the DiT's single-stream blocks and wins over the job switch for those calls.
+    pub int8_attention: Option<candle_gen::fused_attention::PvPrecision>,
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1141,6 +1160,22 @@ impl KreaGenerator {
     }
 
     fn render(
+        &self,
+        req: &GenerationRequest,
+        plan: Option<&gen_core::RenderPlan>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        candle_gen::execution::policy(
+            "krea/engine/int8_attention",
+            format!("{:?}", self.engine.int8_attention).into(),
+        );
+        transformer::with_dit_int8_attention(self.engine.int8_attention, || {
+            self.render_inner(req, plan, scope, on_progress)
+        })
+    }
+
+    fn render_inner(
         &self,
         req: &GenerationRequest,
         plan: Option<&gen_core::RenderPlan>,
@@ -2037,6 +2072,14 @@ fn validate_native_file_transformer_request(
 }
 
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
+    build_with_options(spec, descriptor, KreaEngineOptions::default())
+}
+
+fn build_with_options(
+    spec: &LoadSpec,
+    descriptor: ModelDescriptor,
+    engine: KreaEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
     // sc-21483: refuse an adapter-bearing load against a descriptor that does not advertise adapter
     // support — the shape an imported-model route takes when its binding declares
     // `inherit_adapters = false` (the registry withdraws `supports_lora`/`supports_lokr` from the
@@ -2243,6 +2286,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         adapters: spec.adapters.clone(),
         file_pin_spec: spec.clone(),
         checkpoint_facts,
+        engine,
     }))
 }
 
@@ -2257,6 +2301,15 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
 /// frozen int8 DiT, and does not combine with PiD overlays.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
+}
+
+/// [`load`] (Krea 2 **Turbo**) with explicit [`KreaEngineOptions`] — the opt-in surface for the
+/// INT8 QK attention engine option (SW-6131). `KreaEngineOptions::default()` is exactly [`load`].
+pub fn load_with_options(
+    spec: &LoadSpec,
+    options: KreaEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    build_with_options(spec, descriptor(), options)
 }
 
 /// Construct a lazy candle Krea 2 **Raw** generator (`krea_2_raw`, sc-9994 / epic 9992). Identical
@@ -7732,6 +7785,7 @@ mod tests {
             has_diff_patch: false,
             file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
             checkpoint_facts: gen_core::CheckpointFactsSink::new(),
+            engine: KreaEngineOptions::default(),
         }
     }
 
@@ -7920,6 +7974,7 @@ mod tests {
                 has_diff_patch: false,
                 file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
                 checkpoint_facts: gen_core::CheckpointFactsSink::new(),
+                engine: KreaEngineOptions::default(),
             };
             let cancel = gen_core::CancelFlag::new();
             let request = GenerationRequest {

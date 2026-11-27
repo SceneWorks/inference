@@ -1490,3 +1490,179 @@ fn wan_sampler_menus_match_mlx_except_the_pinned_14b_fold_in_gap() {
         );
     }
 }
+
+/// SW-6132: every provider a product can run has a stated attention routing, so a job-level
+/// lossy-attention opt-in is either honoured (the shared helpers) or refused upfront (bespoke).
+#[test]
+fn catalog_attention_routing_covers_every_provider() {
+    let registry = super::provider_registry().unwrap();
+    let mut registered: Vec<String> = registry
+        .generators()
+        .map(|r| (r.descriptor)().id.to_string())
+        .chain(
+            registry
+                .transforms()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .captioners()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .image_embedders()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .text_embedders()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .collect();
+    registered.push(candle_gen_pulid::memory_strategy::PROVIDER_ID.to_string());
+    registered.push(candle_gen_instantid::memory_strategy::PROVIDER_ID.to_string());
+    registered.sort();
+    registered.dedup();
+    let mut table: Vec<String> = super::SHARED_ATTENTION_ROUTING
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let rows = table.len();
+    table.sort();
+    table.dedup();
+    assert_eq!(rows, table.len(), "a provider is listed twice");
+    assert_eq!(
+        table, registered,
+        "every registered provider (and only those) states its attention routing"
+    );
+    use super::LossyServe::{Never, Served};
+    use super::SharedAttentionRouting::{self as R, Bespoke, SharedHelpers};
+    let serves = |id: &str| match super::shared_attention_routing(id) {
+        Some(SharedHelpers { int8, sol }) => Some((int8 == Served, sol == Served)),
+        Some(Bespoke) => None,
+        None => panic!("{id} is not listed"),
+    };
+    for (id, want) in [
+        ("krea_2_turbo", Some((true, true))),
+        ("wan2_2_ti2v_5b", Some((true, true))),
+        ("flux1_dev", Some((true, true))),
+        // f32 attention runs at bf16 in the shared dispatch: both kernels.
+        ("ltx_2_3_distilled", Some((true, true))),
+        ("flux2_dev", Some((true, true))),
+        ("svd_xt", Some((true, true))),
+        // 64 / 120-wide heads are zero-padded to the kernels' widths: both kernels.
+        ("sdxl", Some((true, true))),
+        ("instantid", Some((true, true))),
+        ("boogu_image", Some((true, true))),
+        // Real kernel gaps only: a mask on every call, 256-wide heads, no self-attention.
+        ("mochi_1", Some((false, false))),
+        ("sensenova_u1_8b", Some((false, false))),
+        ("ideogram_4", Some((false, false))),
+        ("qwen_image_2_1", Some((true, false))),
+        ("kolors", Some((true, true))),
+        ("moss_image_base", None),
+        ("sana_1600m", None),
+        ("supra2_img", None),
+    ] {
+        assert_eq!(serves(id), want, "{id}");
+    }
+    // Every `Never` carries a reason for the typed refusal.
+    for (id, routing) in super::SHARED_ATTENTION_ROUTING {
+        if let SharedHelpers { int8, sol } = routing {
+            for serve in [int8, sol] {
+                if let Never(why) = serve {
+                    assert!(!why.trim().is_empty(), "{id}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        R::ALL,
+        SharedHelpers {
+            int8: Served,
+            sol: Served
+        }
+    );
+    assert_eq!(super::shared_attention_routing("no_such_model"), None);
+}
+
+/// SW-6132: the upfront admission of a job's lossy-attention opt-ins is typed for every refusal.
+#[test]
+fn lossy_attention_admission_is_typed() {
+    use super::media::fused_attention::{
+        Int8AttentionConfig, LossyAttentionOptIns, SolConfig, INT8_ATTN_COMPILED, SOL_ATTN_COMPILED,
+    };
+    use super::media::gen_core::Error;
+    let admit = super::admit_lossy_attention;
+    let int8 = LossyAttentionOptIns {
+        int8: Some(Int8AttentionConfig::default()),
+        sol: None,
+    };
+    let sol = LossyAttentionOptIns {
+        int8: None,
+        sol: Some(SolConfig::top_k(0.25)),
+    };
+    let unsupported = |r: super::media::gen_core::Result<()>, needle: &str| match r {
+        Err(Error::Unsupported(m)) => assert!(m.contains(needle), "{m}"),
+        other => panic!("expected Unsupported({needle}), got {other:?}"),
+    };
+    // Nothing requested: always admitted, even for a bespoke or unknown id.
+    for id in ["moss_image_base", "no_such_model", "krea_2_turbo"] {
+        admit(id, &LossyAttentionOptIns::OFF).unwrap();
+    }
+    unsupported(admit("moss_image_base", &int8), "runs its own attention");
+    unsupported(admit("sana_1600m", &sol), "runs its own attention");
+    unsupported(admit("no_such_model", &int8), "not a Candle provider");
+    let bad = LossyAttentionOptIns {
+        int8: None,
+        sol: Some(SolConfig::top_k(0.0)),
+    };
+    unsupported(admit("wan2_2_t2v_14b", &bad), "topk_ratio");
+    for (opt_ins, compiled, needle) in [
+        (int8, INT8_ATTN_COMPILED, "INT8 attention kernel"),
+        (sol, SOL_ATTN_COMPILED, "Sol-Attn kernel"),
+    ] {
+        for id in ["krea_2_turbo", "wan2_2_ti2v_5b", "flux1_dev", "pulid_flux"] {
+            let got = admit(id, &opt_ins);
+            if compiled {
+                got.unwrap();
+            } else {
+                unsupported(got, needle);
+            }
+        }
+    }
+    // A kernel the provider's attention can never take is refused upfront with its reason, even
+    // when the other requested kernel would serve (never admitted and then rendered exact).
+    let both = LossyAttentionOptIns {
+        int8: Some(Int8AttentionConfig::default()),
+        sol: Some(SolConfig::top_k(0.25)),
+    };
+    unsupported(
+        admit("mochi_1", &int8),
+        "int8_attention: `mochi_1` attends under its text padding mask",
+    );
+    unsupported(admit("sensenova_u1_8b", &sol), "block-causal mask");
+    unsupported(admit("ideogram_4", &int8), "256-wide attention heads");
+    unsupported(admit("qwen_image_2_1", &sol), "block-causally");
+    unsupported(
+        admit("qwen_image_2_1", &both),
+        "sol_attention: `qwen_image_2_1`",
+    );
+    // Operand layout is never refused: f32 attention and 64 / 120-wide heads take both kernels.
+    if INT8_ATTN_COMPILED && SOL_ATTN_COMPILED {
+        for id in [
+            "flux2_dev",
+            "ltx_2_3_distilled",
+            "svd_xt",
+            "sdxl",
+            "instantid",
+            "boogu_image",
+            "lens",
+            "kolors",
+        ] {
+            admit(id, &both).unwrap();
+        }
+        admit("qwen_image_2_1", &int8).unwrap();
+    }
+}

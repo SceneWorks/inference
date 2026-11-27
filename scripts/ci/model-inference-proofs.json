@@ -100211,6 +100211,64 @@
     "package": "candle-gen-seedvr2",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production SeedVR2-3B (numz/SeedVR2_comfyUI, SEEDVR2_CKPT) VAE/DiT video upscale at bf16 on CUDA, synthetic 8-frame 256^2 -> 512^2 clip, the SW-6132 job-level lossy-attention switch off, int8 and sol (top-k 0.25); crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "required_environment": [
+      "SEEDVR2_CKPT"
+    ],
+    "device_witness": "The off clip counts no INT8 / Sol-Attn route or refusal; the job int8 clip counts INT8 QK calls on the selected CUDA device, and every call of each opt-in clip is the kernel or a counted refusal.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the INT8 / Sol-Attn call and refusal counts, wall time and PSNR vs the off clip (recorded); every frame non-constant; the switch is off after every clip.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Upscale the fixed clip with the job switch off, INT8 and Sol-Attn; check the route and refusal counts and the job-end reset, record PSNR, save the first frame of each."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-seedvr2",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "cuda_video_smoke::cuda_video_hd_tiling_smoke",
     "source": "crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs",
     "cargo_target_metadata": {
@@ -101885,6 +101943,71 @@
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::forced_spatial_tiling_matches_monolithic_with_acceptable_psnr",
+      "requirements": [
+        {
+          "slot": "svd-three-actual-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-svd",
+    "target": "real_weights_smoke",
+    "target_kind": "test",
+    "fqn": "svd_xt_job_level_lossy_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs",
+    "cargo_target_metadata": {
+      "name": "real_weights_smoke",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Production sequential SVD-XT condition encoder/UNet/video decoder (SVD_SNAPSHOT), fixed-seed 8-frame 512^2 x 10-step clip with the SW-6132 job-level lossy-attention switch off, int8, sol (top-k 0.25) and a top-k 1.0 Sol-Attn control (the f32 UNet with 64-wide heads: INT8 serves every call at bf16, Sol-Attn the self-attention at bf16 padded to 128, cross-attention a counted refusal, PSNR vs off recorded); crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
+    "required_environment": [
+      "SVD_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed clip with the job switch off, INT8, Sol-Attn top-k 0.25 and the top-k 1.0 Sol-Attn control; check every call is offered and counted, the f32 cast / head pad adaptation counts, the job-end reset, and that each clip is non-degenerate."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
       "requirements": [
         {
           "slot": "svd-three-actual-model-components",
@@ -322559,6 +322682,238 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 snapshot (KREA_TURBO_DIR) through the registered generator, KreaEngineOptions default (FlashAttention) vs int8_attention: Some(pv) for both P.V modes (16-bit, INT8); fixed seed 7, 1024^2 x 8 steps and 2048^2 x 4 steps; crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "required_environment": [],
+    "device_witness": "The renders count FlashAttention-2 calls (default engine) and one INT8 QK call per denoise block attention (int8 engine) on the selected CUDA device, and replay one captured production attention call on it.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines, PSNR int8 vs flash per size, and the captured-call cosine / rel-L2 of flash and of INT8 (K centering off/on/adaptive) against the f32 materialized reference; each mode's 1024^2 PSNR must be >= 35 dB and every captured INT8 cosine >= 0.999.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render each size with the default engine and the int8_attention engine in both P.V modes (flash, int8 16-bit P.V, int8 INT8 P.V, flash), compare PSNR and s/step, replay the captured attention call (both P.V modes) against the f32 reference, and time alternating DiT forwards of the three engines."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 snapshot (KREA_TURBO_DIR) through the registered krea_2_turbo generator with no engine option, the SW-6132 job-level switch off vs set_lossy_attention(int8: Some(default 16-bit P.V)); fixed seed 7, 1024^2 x 8 steps; crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "required_environment": [],
+    "device_witness": "The off render counts FlashAttention-2 calls and no INT8 / Sol-Attn route or refusal; the job int8 render counts INT8 QK calls (at least one per step) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both renders, the INT8 call / refusal counts and the PSNR of the job-int8 render against the off render, which must be >= 35 dB; the switch is off after each render.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed image with the job switch off and with job-level INT8, check the route counts and the job-end reset, compare PSNR and s/step, save both images."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 transformer weights (KREA_TURBO_DIR), one resident Krea2Transformer, random 128-token context and latent (timing only) at 1024^2 and 2048^2; crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "required_environment": [],
+    "device_witness": "Each timed forward counts its INT8 calls (zero with the option off) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the median synchronized DiT forward seconds of flash and of each INT8 P.V mode over 9 alternating rounds per size.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Alternate synchronized DiT forwards (flash, INT8 16-bit P.V, INT8 INT8 P.V) at 1024^2 and 2048^2 and report medians."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Wan2.2 T2V-A14B snapshot tier (WAN14B_SNAPSHOT, e.g. the SceneWorks q4 tier) through load_t2v_14b_with_options, Wan14bEngineOptions default (FlashAttention) vs sol_attention: Some(top_k(0.25)); fixed seed 42, 832x480 x 17 frames x 6 steps; crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "required_environment": [],
+    "device_witness": "The clips count FlashAttention-2 calls (default engine) and one Sol-Attn call per denoise self-attention (sol engine: 2 CFG forwards x 40 blocks x 6 steps, zero refusals) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines and the sol clip's PSNR against the flash clip (all frames; recorded, not gated: the sparse trajectory diverges from flash), asserts every sol frame keeps a pixel standard deviation of at least 8 (no degenerate decode) and saves the first and last frame of each clip.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed clip with the default engine and with the sol_attention engine (top-k 0.25), check the route counts, compare PSNR and s/step, save frames."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
       "requirements": []
     }
   },
