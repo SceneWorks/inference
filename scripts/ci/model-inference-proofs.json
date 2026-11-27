@@ -271147,6 +271147,41 @@
   },
   {
     "package": "mlx-gen",
+    "target": "mlx_gen",
+    "target_kind": "lib",
+    "fqn": "int8_attention_metal::tests::int8_attention_metal_parity_bench_and_go_no_go",
+    "source": "crates/media/mlx-gen/src/int8_attention_metal/tests.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "SW-6141 source-defined synthetic bf16 Q/K/V: fixed-key N(0,1) and DiT-like (per-channel gains 2 with four outlier channels at 6, +6 shared K offset on eight channels) at B=1, H=24, D=128, S=4096 and 16384, plus ragged S=333 and Sq=200/Sk=333; fixed INT8 matmul2d layout-probe values",
+    "configuration_source": "crates/media/mlx-gen/src/int8_attention_metal/tests.rs::int8_attention_metal::tests::int8_attention_metal_parity_bench_and_go_no_go",
+    "output_contract": "Cosine >= 0.999 vs MLX fused SDPA for the default SIMD-group INT8 route at both lengths and inputs and the ragged shapes; the K-not-rotated mutant must fall below 0.999; NAX INT8 route correct or the run fails INCONCLUSIVE; chip-labelled accuracy and bench tables (median ms/iter, pinned and graph-regime peak MiB) and one SW6141_VERDICT GO/NO-GO line",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "no_default_features": false,
+    "cargo_target_metadata": {
+      "name": "mlx_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "required_environment": [],
+    "reachable_helper_trace": [
+      "crates/media/mlx-gen/src/int8_attention_metal/tests.rs -> mlx_gen::int8_attention_metal::{int8_attention, attend_quantized, attend_nax_unquantized, nax_layout_probe} -> custom Metal kernels (mlx_rs::fast::MetalKernel) on the selected Metal stream; baseline mlx_rs::fast::scaled_dot_product_attention"
+    ],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/src/int8_attention_metal/tests.rs::int8_attention_metal::tests::int8_attention_metal_parity_bench_and_go_no_go; source-defined seeds, shapes, gains/offsets and probe values",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen",
     "target": "integration",
     "target_kind": "test",
     "fqn": "quant_parity::adaptable_linear_quantize_matches_reference",

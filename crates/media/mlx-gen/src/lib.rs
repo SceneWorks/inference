@@ -71,6 +71,9 @@ pub mod driver;
 pub mod error;
 pub mod image_execution;
 pub mod img2img;
+// SW-6141 (SW-F287 M3): the INT8 QK attention Metal POC and its go/no-go proof. No default path
+// calls it; see the module docs.
+pub mod int8_attention_metal;
 pub mod int8_gemm;
 pub mod ios_anchor_law;
 pub mod ios_pricing;
