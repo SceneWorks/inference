@@ -61,6 +61,7 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 pub mod vision;
+pub mod w4a8_tier;
 
 // The candle Krea LoRA/LoKr trainer (sc-7577) + its vendored composable-op trainable DiT. Private
 // (reached through the explicit family registry by id, like the SDXL/Z-Image trainers).
@@ -2563,8 +2564,34 @@ fn native_dit_plan(
         &prefix,
         crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
     );
-    candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+    // SW-6135: a native W4A8 tier's projections are delegated out of the plan exactly as the
+    // loader delegates them, so pricing and loading compile the same plan.
+    candle_gen::logical_weights::plan_logical_weights_delegating_w4a8(path, &mapping, residency)
+        .map(|(plan, _)| plan)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))
+}
+
+/// The W4A8 projections of a native single file (SW-6135): the same delegation the loader computes
+/// before planning, from the header and descriptors only.
+fn native_w4a8_delegation(
+    path: &std::path::Path,
+    headers: &[gen_core::SafetensorsTensorHeader],
+) -> gen_core::Result<gen_core::w4a8_int8::W4A8Delegation> {
+    let descriptors = gen_core::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(".comfy_quant"),
+        gen_core::w4a8_int8::MAX_DESCRIPTOR_BYTES as u64,
+    )?;
+    gen_core::w4a8_int8::delegate_projections(headers, &descriptors)
+        .map_err(|error| gen_core::Error::Msg(format!("{}: {error}", path.display())))
+}
+
+/// Whether a native single file is a Krea **W4A8 tier** (SW-6135). Unreadable reads as `false`
+/// here; the loader surfaces the real error.
+fn is_native_w4a8_file(path: &std::path::Path) -> bool {
+    gen_core::safetensors_path_tensor_headers(path)
+        .and_then(|headers| native_w4a8_delegation(path, &headers))
+        .is_ok_and(|delegation| !delegation.is_empty())
 }
 
 fn is_wide_convrot_bias(header: &gen_core::SafetensorsTensorHeader) -> bool {
@@ -2723,7 +2750,12 @@ fn native_dit_resident_bytes(
             .ok_or_else(overflow)?;
     }
     let bias_extra = retained_convrot_bias_extra(&plan, &headers, |_| DIT_WIDTH)?;
-    total.checked_add(bias_extra).ok_or_else(overflow)
+    // The delegated W4A8 projections (SW-6135) stay packed: codes plus companions, no dense shadow.
+    let w4a8 = native_w4a8_delegation(path, &headers)?.resident_bytes();
+    total
+        .checked_add(bias_extra)
+        .and_then(|total| total.checked_add(w4a8))
+        .ok_or_else(overflow)
 }
 
 /// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
@@ -3107,6 +3139,13 @@ fn krea_provable_artifact_tier(spec: &LoadSpec, provider_id: &str) -> Option<Opt
     match convrot_selector(spec, provider_id) {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return None,
+    }
+    // SW-6135: a native W4A8 tier is none of the measured bf16/q8/q4 cells either; reading it as
+    // the "no quant" (bf16) cell would publish the wrong identity.
+    if let WeightsSource::File(path) = &spec.weights {
+        if is_native_w4a8_file(path) {
+            return None;
+        }
     }
     actual_quant_tier(spec, provider_id).ok()
 }
@@ -5391,6 +5430,36 @@ mod tests {
             "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
              contract prices what the role table builds rather than what the plan priced"
         );
+    }
+
+    /// SW-6135: the memory contract plans a W4A8 tier exactly as the loader does (delegated), prices
+    /// its packed projections at their packed bytes, and publishes no measured-tier calibration
+    /// identity for it (it is none of the bf16/q8/q4 cells).
+    #[test]
+    fn native_w4a8_import_prices_its_packed_projections_and_claims_no_calibration_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, w4a8, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let headers = gen_core::safetensors_path_tensor_headers(&w4a8).unwrap();
+        let delegation = native_w4a8_delegation(&w4a8, &headers).unwrap();
+        assert_eq!(delegation.projections.len(), 1);
+        assert!(is_native_w4a8_file(&w4a8));
+        let dense = candle_gen::logical_weights::CandleCodecResidency::DENSE;
+        let priced = native_dit_resident_bytes(&w4a8, Some(&cfg), &dense).unwrap();
+        let plan = native_dit_plan(&w4a8, &headers, Some(&cfg), &dense).unwrap();
+        let planned: u64 = plan
+            .tensors
+            .iter()
+            .map(|t| t.shape.iter().product::<usize>() as u64 * DIT_WIDTH)
+            .sum();
+        assert_eq!(priced, planned + delegation.resident_bytes());
+
+        let spec = LoadSpec::new(WeightsSource::File(w4a8.clone()))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()));
+        assert_eq!(krea_provable_artifact_tier(&spec, KREA_2_TURBO_ID), None);
+        // The same base with an ordinary dense native file still proves the bf16 cell.
+        let dense_tmp = tempfile::tempdir().unwrap();
+        let (_, dense_file, _) = crate::testfix::tiny_native_transformer_fixture(&dense_tmp);
+        assert!(!is_native_w4a8_file(&dense_file));
     }
 
     #[test]
