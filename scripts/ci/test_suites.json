@@ -1844,6 +1844,28 @@
       "package": "mlx-llm",
       "kind": "lib",
       "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::dropping_the_decay_multiply_fails_the_kernel_fixture",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Mutation check: runs the Metal GDN kernel and a no-decay mutant against the ops reference at T=1/4/512 (GPU recurrence compute).",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::restoring_the_wrong_prefix_state_is_caught",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Mutation check: per-token checkpoint kernel plus a decode step seeded from the wrong ring row (GPU recurrence compute).",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::chunked_prefill_matches_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
       "reason": "Helper expands 512/2048/ragged300-token shapes x three dtypes x zero/carried states on CPU stream; 18 full prefill/reference comparisons.",
