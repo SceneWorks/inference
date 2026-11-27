@@ -226,6 +226,55 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
             }
         }
     }
+    // A Candle-native GGML tier (SW-7285) stores a packed projection as ONE `{base}.weight` of GGML
+    // blocks (`U8 [out, in / 32, block_bytes]`); its block type is its physical width, and it must
+    // agree with the config and every other packed tensor exactly like an affine triple.
+    for key in &tensor_names {
+        let Some(base) = key.strip_suffix(".weight") else {
+            continue;
+        };
+        let Some((dtype, ..)) =
+            candle_gen::quant::stored_ggml::stored_header_geometry(&headers[key])
+        else {
+            continue;
+        };
+        if tensor_names.contains(&format!("{base}.scales"))
+            || tensor_names.contains(&format!("{base}.biases"))
+        {
+            return Err(CandleError::Msg(format!(
+                "anima: `{base}` is stored as GGML blocks and also carries affine sidecars — a tier \
+                 stores a projection one way, never both, in {}",
+                dit_path.display()
+            )));
+        }
+        let observed = match candle_gen::quant::stored_ggml::stored_ggml_bits(dtype) {
+            Some(4) => Quant::Q4,
+            Some(8) => Quant::Q8,
+            _ => {
+                return Err(CandleError::Msg(format!(
+                    "anima: stored `{base}` uses unsupported {dtype:?} blocks in {}",
+                    dit_path.display()
+                )));
+            }
+        };
+        if let Some(config) = packed_config {
+            if i64::from(config.bits) != i64::from(observed.bits()) {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed config Q{} disagrees with physical {observed:?} blocks in {}",
+                    config.bits,
+                    dit_path.display()
+                )));
+            }
+        }
+        if let Some(previous) = tier.replace(observed) {
+            if previous != observed {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed DiT mixes {previous:?} and {observed:?} tensors in {}",
+                    dit_path.display()
+                )));
+            }
+        }
+    }
     for key in &tensor_names {
         if let Some(base) = key.strip_suffix(".biases") {
             if !tensor_names.contains(&format!("{base}.weight"))
@@ -597,6 +646,60 @@ mod tests {
             dit_path_quant_tier(&write_packed("lying-config", 8, Some(8))).is_err(),
             "config Q8 must not relabel physical Q4 codes"
         );
+    }
+
+    /// SW-7285: a Candle-native GGML DiT (stored `U8 [out, in / 32, block_bytes]` blocks, the
+    /// `storage: "ggml"` marker) resolves to the tier its block type encodes; a config that lies about
+    /// it, a both-forms projection, and a mixed-width file are refused. Header-only.
+    #[test]
+    fn stored_ggml_header_derives_its_tier_and_rejects_lies() {
+        let temp = tempfile::tempdir().unwrap();
+        let write =
+            |name: &str, blocks: &[(&str, usize)], config_bits: Option<u8>, scales: bool| {
+                let dir = temp.path().join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("anima.safetensors");
+                let mut tensors = HashMap::new();
+                for (base, block) in blocks {
+                    tensors.insert(
+                        format!("{base}.weight"),
+                        Tensor::zeros((2, 2, *block), DType::U8, &Device::Cpu).unwrap(),
+                    );
+                    if scales {
+                        tensors.insert(
+                            format!("{base}.scales"),
+                            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+                        );
+                    }
+                }
+                candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+                if let Some(bits) = config_bits {
+                    std::fs::write(
+                        dir.join("config.json"),
+                        format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#),
+                    )
+                    .unwrap();
+                }
+                path
+            };
+        let q = "net.x_embedder.proj.1";
+        let o = "net.blocks.0.mlp.fc1";
+        assert_eq!(
+            dit_path_quant_tier(&write("q4", &[(q, 20)], Some(4), false)).unwrap(),
+            Some(Quant::Q4)
+        );
+        assert_eq!(
+            dit_path_quant_tier(&write("q8", &[(q, 34), (o, 34)], Some(8), false)).unwrap(),
+            Some(Quant::Q8)
+        );
+        assert_eq!(
+            dit_path_quant_tier(&write("no-config", &[(q, 34)], None, false)).unwrap(),
+            Some(Quant::Q8),
+            "the blocks alone are physical evidence"
+        );
+        assert!(dit_path_quant_tier(&write("lie", &[(q, 20)], Some(8), false)).is_err());
+        assert!(dit_path_quant_tier(&write("mixed", &[(q, 20), (o, 34)], None, false)).is_err());
+        assert!(dit_path_quant_tier(&write("both", &[(q, 20)], Some(4), true)).is_err());
     }
 
     #[test]

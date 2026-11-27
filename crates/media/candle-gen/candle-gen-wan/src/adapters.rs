@@ -56,7 +56,10 @@ pub fn requires_additive(
     label: &str,
     specs: &[AdapterSpec],
 ) -> Result<bool> {
-    let affine = vb.contains_tensor("proj_out.scales");
+    // A Candle-native GGML tier (SW-7285) packs `proj_out` as stored GGML blocks — the same packed,
+    // immutable base the affine triple loads into, so adapters ride additively over it too.
+    let affine = vb.contains_tensor("proj_out.scales")
+        || candle_gen::quant::stored_ggml::stored_ggml_vb(vb, "proj_out")?.is_some();
     if affine || specs.is_empty() {
         return Ok(affine);
     }

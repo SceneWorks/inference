@@ -44645,6 +44645,60 @@
     "package": "candle-gen-krea",
     "target": "candle_gen_krea",
     "target_kind": "lib",
+    "fqn": "loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/loader.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/loader.rs::loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
     "fqn": "loader::tests::linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged",
     "source": "crates/media/candle-gen/candle-gen-krea/src/loader.rs",
     "cargo_target_metadata": {

@@ -191,7 +191,11 @@ impl Pipeline {
         };
         let adapters = selected_adapters(&self.adapters, expert);
         let vb = self.component_vb(sub, DIT_DTYPE)?;
-        if vb.contains_tensor("blocks.0.attn1.to_q.scales") && !adapters.is_empty() {
+        // A stored GGML block tier (SW-7285) is packed exactly like the affine triple.
+        let packed = vb.contains_tensor("blocks.0.attn1.to_q.scales")
+            || candle_gen::quant::stored_ggml::stored_ggml_vb(&vb, "blocks.0.attn1.to_q")?
+                .is_some();
+        if packed && !adapters.is_empty() {
             return Err(CandleError::Msg(format!(
                 "{MODEL_ID_VACE_FUN}: adapters on a packed VACE-Fun tier are not implemented; \
                  refusing to materialize dense weights for the {expert:?} expert"

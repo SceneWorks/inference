@@ -12,8 +12,9 @@
 
 pub use candle_layers::stored_ggml::{
     config_declares_ggml_storage, guard_dense_vb, qtensor_from_stored, stored_block_geometry,
-    stored_block_tensor, stored_ggml_qtensor_vb, stored_ggml_vb, stored_ggml_vb_key,
-    validate_stored, StoredGgmlRefusal, GGML_STORAGE, SHARED_CONTEXT,
+    stored_block_tensor, stored_ggml_bits, stored_ggml_qtensor_vb, stored_ggml_vb,
+    stored_ggml_vb_key, stored_header_geometry, stored_stacked_header_geometry, validate_stored,
+    StoredGgmlRefusal, GGML_STORAGE, SHARED_CONTEXT,
 };
 
 use candle_core::quantized::{GgmlDType, QTensor};
