@@ -51,6 +51,10 @@ mod rope;
 #[path = "fused_kernels_bench/rope_routes.rs"]
 mod rope_routes;
 
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/vae_norm_silu_pad.rs"]
+mod vae_norm_silu_pad;
+
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
 const SUITES: &[(&str, harness::Suite)] = &[
@@ -59,6 +63,7 @@ const SUITES: &[(&str, harness::Suite)] = &[
     ("adaln_chain", adaln_chain::rows),
     ("rope", rope::rows),
     ("rope_routes", rope_routes::rows),
+    ("vae_norm_silu_pad", vae_norm_silu_pad::rows),
 ];
 
 #[cfg(feature = "cuda")]
