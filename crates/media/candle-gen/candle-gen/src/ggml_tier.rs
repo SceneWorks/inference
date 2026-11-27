@@ -472,9 +472,57 @@ struct ShardFile {
     path: Option<PathBuf>,
     data_base: u64,
     entries: BTreeMap<String, Entry>,
-    /// The header's `__metadata__` (string -> string), when it has one. A split tier keeps it on
-    /// every component (the LTX-2.5 `sceneworks_tier` / `model_version` / config stamps).
-    metadata: Option<HashMap<String, String>>,
+    /// The header's `__metadata__`. A split tier keeps it on every component (the LTX-2.5
+    /// `sceneworks_tier` / `model_version` / config stamps).
+    metadata: Metadata,
+}
+
+/// A safetensors header's `__metadata__`, as far as this builder cares.
+///
+/// Only a split-tier conversion writes metadata back, so only it can be harmed by an unreadable
+/// one; a component conversion ignores the field entirely (the slice-B behaviour), whatever it
+/// holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Metadata {
+    /// No `__metadata__` key, or `"__metadata__": null` (MLX writes the latter, e.g. scail2's
+    /// `dit.safetensors`): there is none, and none is written.
+    #[default]
+    Absent,
+    /// A string -> string map (the safetensors spec form).
+    Map(HashMap<String, String>),
+    /// Anything else (a non-object, or a non-string value). Refused only where it would be
+    /// written.
+    Unreadable(String),
+}
+
+impl Metadata {
+    fn map(&self) -> Option<&HashMap<String, String>> {
+        match self {
+            Metadata::Map(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+fn parse_metadata(v: &Value) -> Metadata {
+    match v {
+        Value::Null => Metadata::Absent,
+        Value::Object(map) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                match v.as_str() {
+                    Some(s) => {
+                        out.insert(k.clone(), s.to_string());
+                    }
+                    None => {
+                        return Metadata::Unreadable(format!("`__metadata__.{k}` is not a string"))
+                    }
+                }
+            }
+            Metadata::Map(out)
+        }
+        other => Metadata::Unreadable(format!("`__metadata__` is {other}, not an object")),
+    }
 }
 
 impl ShardFile {
@@ -511,21 +559,10 @@ impl ShardFile {
             .as_object()
             .ok_or_else(|| bad("header is not a JSON object".into()))?;
         let mut entries = BTreeMap::new();
-        let mut metadata = None;
+        let mut metadata = Metadata::Absent;
         for (name, v) in obj {
             if name == "__metadata__" {
-                let map = v
-                    .as_object()
-                    .ok_or_else(|| bad("`__metadata__` is not an object".into()))?;
-                metadata = Some(
-                    map.iter()
-                        .map(|(k, v)| {
-                            v.as_str()
-                                .map(|v| (k.clone(), v.to_string()))
-                                .ok_or_else(|| bad(format!("`__metadata__.{k}` is not a string")))
-                        })
-                        .collect::<Result<HashMap<_, _>>>()?,
-                );
+                metadata = parse_metadata(v);
                 continue;
             }
             let dtype = v["dtype"]
@@ -1522,7 +1559,13 @@ fn write_shard(
     }
     let target = dir.join(name);
     let metadata = if ctx.keep_metadata {
-        shard.metadata.clone()
+        if let Metadata::Unreadable(detail) = &shard.metadata {
+            return Err(GgmlTierError::BadSafetensors {
+                path: target.display().to_string(),
+                detail: format!("template {detail}; a split tier keeps each file's metadata"),
+            });
+        }
+        shard.metadata.map().cloned()
     } else {
         None
     };
@@ -2991,7 +3034,96 @@ mod tests {
     }
 
     fn read_meta(path: &Path) -> Option<HashMap<String, String>> {
-        ShardFile::open(path).unwrap().metadata
+        ShardFile::open(path).unwrap().metadata.map().cloned()
+    }
+
+    /// Rewrite `path`'s header so `__metadata__` is `value` (raw JSON), keeping the tensors.
+    fn set_raw_metadata(path: &Path, value: &str) {
+        let (header, _) = read_header_bytes(path).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let data = bytes[8 + header.len()..].to_vec();
+        let mut h: Value = serde_json::from_slice(&header).unwrap();
+        h.as_object_mut()
+            .unwrap()
+            .insert("__metadata__".into(), serde_json::from_str(value).unwrap());
+        let mut text = serde_json::to_vec(&h).unwrap();
+        while !(8 + text.len()).is_multiple_of(8) {
+            text.push(b' ');
+        }
+        let mut out = (text.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&text);
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// MLX writes `"__metadata__": null` (the real scail2 `dit.safetensors`): that is "no
+    /// metadata" for a component build, a split build and a header dump. Only an unreadable
+    /// metadata is refused, and only by a split build (the one place metadata is written back).
+    #[test]
+    fn null_metadata_is_absent_and_only_a_split_build_refuses_unreadable_metadata() {
+        assert_eq!(parse_metadata(&Value::Null), Metadata::Absent);
+        assert!(matches!(
+            parse_metadata(&serde_json::json!({"a": 1})),
+            Metadata::Unreadable(_)
+        ));
+        let root = tmp();
+        // Component build over a null-metadata shard.
+        let src = root.path().join("q4");
+        let mut s = HashMap::new();
+        put_triple(&mut s, "blocks.0.q", q4_pack(4, 64, 64, 0));
+        s.insert("n.weight".into(), norm());
+        write_component(&src, 4, 64, &[s]);
+        let shard = src.join("model-00001-of-00001.safetensors");
+        set_raw_metadata(&shard, "null");
+        assert_eq!(ShardFile::open(&shard).unwrap().metadata, Metadata::Absent);
+        let dst = root.path().join("out");
+        let report = convert_component(&src, &dst, &SourceMode::FromMlx, &mut noop).unwrap();
+        assert_eq!(report.converted, 1);
+        assert!(read_meta(&dst.join("model-00001-of-00001.safetensors")).is_none());
+        // Header dumps (dump-headers / fetch-headers) accept it too.
+        let tpl = root.path().join("tpl");
+        assert_eq!(dump_headers(&src, &tpl).unwrap(), 1);
+        let dump = tpl.join("model-00001-of-00001.safetensors.header.json");
+        assert_eq!(
+            ShardFile::open_header_dump(&dump).unwrap().metadata,
+            Metadata::Absent
+        );
+        assert!(write_header_dump(&tpl, "x.safetensors", &std::fs::read(&dump).unwrap()).is_ok());
+        // A component build ignores even unreadable metadata (the slice-B behaviour)...
+        set_raw_metadata(&shard, r#"{"n": 3}"#);
+        convert_component(
+            &src,
+            &root.path().join("o2"),
+            &SourceMode::FromMlx,
+            &mut noop,
+        )
+        .unwrap();
+
+        // ...and a split build with a null-metadata packed file writes none.
+        let split = root.path().join("split");
+        let mut tr = HashMap::new();
+        put_triple(&mut tr, "a", q4_pack(8, 128, 64, 1));
+        put_triple(&mut tr, "b", q4_pack(4, 64, 64, 2));
+        tr.insert("n.weight".into(), norm());
+        split_fixture(&split, "q4", 4, [tr]);
+        set_raw_metadata(&split.join("transformer.safetensors"), "null");
+        let sdst = root.path().join("split_out");
+        convert_split_tier(&split, &sdst, &SourceMode::FromMlx, &mut noop).unwrap();
+        assert!(read_meta(&sdst.join("transformer.safetensors")).is_none());
+        // An unreadable one is refused there, never silently dropped.
+        set_raw_metadata(
+            &split.join("transformer.safetensors"),
+            r#"{"sceneworks_tier": 4}"#,
+        );
+        assert!(matches!(
+            convert_split_tier(
+                &split,
+                &root.path().join("split_bad"),
+                &SourceMode::FromMlx,
+                &mut noop
+            ),
+            Err(GgmlTierError::BadSafetensors { .. })
+        ));
     }
 
     fn manifest_of(dir: &Path) -> Value {
