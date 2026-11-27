@@ -248,12 +248,10 @@ fn rms_norm_last(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     normed.broadcast_mul(weight)
 }
 
-/// adaLN-single affine `norm · (1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`).
-/// `scale`/`shift` are `[B, 1, dim]`, `norm` is `[B, N, dim]` — broadcast over the token axis.
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    let gained = norm.broadcast_mul(&(scale + 1.0)?)?;
-    gained.broadcast_add(shift)
-}
+// adaLN-single affine `norm · (1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`).
+// `scale`/`shift` are `[B, 1, dim]`, `norm` is `[B, N, dim]` — broadcast over the token axis. The
+// shared composable modulate (SW-6129), the exact body of the private copy it replaces.
+use candle_gen::modulate::modulate;
 
 /// Sinusoidal timestep embedding (diffusers `Timesteps`, `flip_sin_to_cos=True` ⇒ `[cos | sin]`).
 /// `t` is `[B]`; returns `[B, dim]`. For SANA: `dim=256, max_period=10000, downscale_freq_shift=0`.

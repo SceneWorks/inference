@@ -35,11 +35,9 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
     xc.broadcast_div(&(var + LN_EPS)?.sqrt()?)
 }
 
-/// `(1 + scale)·norm + shift`, broadcasting modulation `[B,1,D]` over `[B,S,D]`.
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    let one_plus = (scale + 1.0)?;
-    norm.broadcast_mul(&one_plus)?.broadcast_add(shift)
-}
+// `(1 + scale)·norm + shift`, broadcasting modulation `[B,1,D]` over `[B,S,D]`: the shared
+// composable modulate (SW-6129), the exact body of the private copy it replaces.
+use candle_gen::modulate::modulate;
 
 /// `x + gate·y`, broadcasting gate `[B,1,D]`.
 fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {

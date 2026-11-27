@@ -28,6 +28,7 @@ use candle_gen::candle_core::Module as _;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::rope::{RopeLayout, RopeSpec};
 use candle_gen::{CandleError as Error, Result};
 
 /// LayerNorm eps of every `layernorm_modulation` (`F.layer_norm(..., eps=1e-6)`).
@@ -877,8 +878,7 @@ pub fn rmsnorm_rope_training(x: &Tensor, scale: &Tensor, rope: &Rope) -> Result<
 }
 
 fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) -> Result<Tensor> {
-    let (b, h, l, d) = x.dims4()?;
-    let pairs = d / 2;
+    x.dims4()?;
     let xf = to(x, DType::F32)?.contiguous()?;
     let normed = if training && candle_gen::train::policy::legacy_e1() {
         candle_gen::train::profile::cohort_reuse("flux3:comparison-legacy-rms");
@@ -892,17 +892,18 @@ fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) ->
     } else {
         candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS)?
     };
-    let xr = normed.reshape((b, h, l, pairs, 2))?;
-    let re = xr.narrow(4, 0, 1)?.squeeze(4)?;
-    let im = xr.narrow(4, 1, 1)?.squeeze(4)?;
-    let cos = rope.cos.reshape((1, 1, l, pairs))?;
-    let sin = rope.sin.reshape((1, 1, l, pairs))?;
-    // freqs = [[cos, −sin], [sin, cos]]: out0 = cos·x0 − sin·x1, out1 = sin·x0 + cos·x1.
-    let out_re = re.broadcast_mul(&cos)?.sub(&im.broadcast_mul(&sin)?)?;
-    let out_im = re.broadcast_mul(&sin)?.add(&im.broadcast_mul(&cos)?)?;
-    let out = Tensor::stack(&[out_re, out_im], 4)?.reshape((b, h, l, d))?;
+    // freqs = [[cos, −sin], [sin, cos]]: out0 = cos·x0 − sin·x1, out1 = sin·x0 + cos·x1, on the
+    // f32 normed q/k (the norm's f32 result is NOT rounded to `x`'s dtype before the rotation, so
+    // this is the shared apply_rope, not the shared rms_norm_rope whose chain rounds in between).
+    // SW-6129: the fused strided kernel on CUDA, and everywhere else — and for the tracked training
+    // operand — the shared reference chain, bit-identical to the narrow / mul / stack chain this
+    // used to carry.
+    let out = candle_gen::rope::apply_rope(&normed, &rope.cos, &rope.sin, &FLUX3_ROPE)?;
     to(&out, x.dtype())
 }
+
+/// FLUX.3's q/k RoPE convention: adjacent pairs on `[B, H, L, D]`, rotated in f32.
+const FLUX3_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhsd);
 
 /// `packed_attention(q, k, v, bounds)`: per-sample SDPA over `[1, H, L, D]` (samples never attend
 /// each other); returns `[L, H·D]` in token order and the compute dtype. An empty bound
@@ -1535,5 +1536,139 @@ mod tests {
             early.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             v_lhd.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
+    }
+}
+
+/// SW-6129: the rotation of `rmsnorm_rope` is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private inference `rmsnorm_rope`, verbatim.
+    fn former_rmsnorm_rope(x: &Tensor, scale: &Tensor, rope: &Rope) -> Tensor {
+        let (b, h, l, d) = x.dims4().unwrap();
+        let pairs = d / 2;
+        let xf = to(x, DType::F32).unwrap().contiguous().unwrap();
+        let normed = candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS).unwrap();
+        let xr = normed.reshape((b, h, l, pairs, 2)).unwrap();
+        let re = xr.narrow(4, 0, 1).unwrap().squeeze(4).unwrap();
+        let im = xr.narrow(4, 1, 1).unwrap().squeeze(4).unwrap();
+        let cos = rope.cos.reshape((1, 1, l, pairs)).unwrap();
+        let sin = rope.sin.reshape((1, 1, l, pairs)).unwrap();
+        let out_re = re
+            .broadcast_mul(&cos)
+            .unwrap()
+            .sub(&im.broadcast_mul(&sin).unwrap())
+            .unwrap();
+        let out_im = re
+            .broadcast_mul(&sin)
+            .unwrap()
+            .add(&im.broadcast_mul(&cos).unwrap())
+            .unwrap();
+        let out = Tensor::stack(&[out_re, out_im], 4)
+            .unwrap()
+            .reshape((b, h, l, d))
+            .unwrap();
+        to(&out, x.dtype()).unwrap()
+    }
+
+    fn ids(n: usize) -> Vec<[f32; 4]> {
+        (0..n)
+            .map(|i| [0.0, (i / 5) as f32, (i % 5) as f32, 0.0])
+            .collect()
+    }
+
+    /// The shared route equals the former inference chain bit for bit on CPU in f32 / bf16 / f16.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let rope = Rope::new(&ids(15), &[32, 32, 32, 32], 2000.0, &dev).unwrap();
+        let scale = (values(&[128], 9, &dev) * 0.1).unwrap();
+        let x32 = values(&[2, 3, 15, 128], 7, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let got = rmsnorm_rope(&x, &scale, &rope).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(
+                bits(&got),
+                bits(&former_rmsnorm_rope(&x, &scale, &rope)),
+                "{dtype:?}"
+            );
+        }
+    }
+
+    /// SW-6129 CUDA smoke: flux3 rmsnorm_rope (bf16, [1,24,4608,128]) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // 512 text + 64x64 image tokens, 24 heads x 128, bf16 q/k, f32 gain.
+        let rope = Rope::new(&ids(512 + 4096), &[32, 32, 32, 32], 2000.0, &dev).unwrap();
+        let scale = (values(&[128], 9, &dev) * 0.1).unwrap();
+        let q = values(&[1, 24, 512 + 4096, 128], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = values(&[1, 24, 512 + 4096, 128], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    rmsnorm_rope(&q, &scale, &rope).unwrap(),
+                    rmsnorm_rope(&k, &scale, &rope).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("flux3 rmsnorm_rope (bf16, [1,24,4608,128]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
     }
 }

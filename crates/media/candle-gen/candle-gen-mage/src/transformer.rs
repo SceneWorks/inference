@@ -83,8 +83,10 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
     centered.broadcast_div(&denom)?.to_dtype(x.dtype())
 }
 
+/// `x · (1 + scale) + shift` — the shared composable modulate (SW-6129) in this crate's
+/// `(shift, scale)` argument order.
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    x.broadcast_mul(&(scale + 1.)?)?.broadcast_add(shift)
+    candle_gen::modulate::modulate(x, scale, shift)
 }
 
 struct TimestepEmbedder {

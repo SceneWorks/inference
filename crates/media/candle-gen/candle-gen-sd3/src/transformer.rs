@@ -63,13 +63,11 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
         .to_dtype(in_dtype)
 }
 
-/// AdaLN-continuous / AdaLN-Zero apply: `(1 + scale) * norm + shift`, broadcasting modulation
-/// `[B,1,D]` over `[B,S,D]`. **This is the order the SD3.5 port must use** (epic 7841 flagged the
-/// `(1+scale)` vs `scale` and the chunk-order as the bug magnet).
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    let one_plus = (scale + 1.0)?;
-    norm.broadcast_mul(&one_plus)?.broadcast_add(shift)
-}
+// AdaLN-continuous / AdaLN-Zero apply: `(1 + scale) * norm + shift`, broadcasting modulation
+// `[B,1,D]` over `[B,S,D]`. **This is the order the SD3.5 port must use** (epic 7841 flagged the
+// `(1+scale)` vs `scale` and the chunk-order as the bug magnet). The shared composable modulate
+// (SW-6129), the exact body of the private copy it replaces.
+use candle_gen::modulate::modulate;
 
 /// `x + gate * y`, broadcasting gate `[B,1,D]`.
 fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {

@@ -269,7 +269,7 @@ impl DiCoCore {
         let chunks = p.chunk(6, 1)?;
         let e = |i: usize| chunks[i].reshape((chunks[i].dim(0)?, 384, 1, 1));
         let h = layer_norm_channels(x, None, None)?;
-        let h = h.broadcast_mul(&(e(1)? + 1.)?)?.broadcast_add(&e(0)?)?;
+        let h = candle_gen::modulate::modulate(&h, &e(1)?, &e(0)?)?;
         let h = __model_proof_output!(self
             .c2
             .forward(&__model_proof_output!(self.c1.forward(&h))?))?
@@ -280,7 +280,7 @@ impl DiCoCore {
         let h = __model_proof_output!(self.c3.forward(&h.broadcast_mul(&ca)?))?;
         let x = (x + h.broadcast_mul(&e(2)?)?)?;
         let h = layer_norm_channels(&x, None, None)?;
-        let h = h.broadcast_mul(&(e(4)? + 1.)?)?.broadcast_add(&e(3)?)?;
+        let h = candle_gen::modulate::modulate(&h, &e(4)?, &e(3)?)?;
         let h = __model_proof_output!(self
             .c5
             .forward(&__model_proof_output!(self.c4.forward(&h))?.gelu_erf()?))?;
@@ -478,7 +478,7 @@ impl MlpBlock {
             .layer(&x.unsqueeze(2)?.permute((0, 3, 1, 2))?)?
             .permute((0, 2, 3, 1))?
             .squeeze(2)?;
-        let h = h.broadcast_mul(&(scale + 1.)?)?.broadcast_add(&shift)?;
+        let h = candle_gen::modulate::modulate(&h, &scale, &shift)?;
         x + __model_proof_output!(self
             .l2
             .forward(&__model_proof_output!(self.l1.forward(&h))?.silu()?))?

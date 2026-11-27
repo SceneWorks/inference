@@ -6,11 +6,11 @@
 //!
 //! Application is **interleaved** (GPT-J style): lanes `2i` / `2i+1` of each head are the real /
 //! imaginary parts rotated together by `(cos[i], sin[i])` — `out0 = r·cos − i·sin`,
-//! `out1 = i·cos + r·cos`. candle's `candle_nn::rotary_emb::rope_i` implements exactly this
-//! interleaved rotation for `cos`/`sin` of width `head_dim/2`, so it is reused for the apply.
+//! `out1 = i·cos + r·cos`. The apply is the shared [`candle_gen::rope::apply_interleaved_rope`]
+//! (SW-6129): the fused strided RoPE kernel on CUDA, bit-identical on CPU to the candle `rope_i`
+//! (f32 copy, rotate, cast back) this module used to call.
 
 use candle_gen::candle_core::{Device, Result, Tensor};
-use candle_gen::candle_nn::rotary_emb::rope_i;
 
 use crate::config::Flux2Config;
 
@@ -64,13 +64,7 @@ impl Flux2PosEmbed {
     /// Apply the interleaved RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`
     /// (f32, contiguous). Returns the rotated tensor in `x`'s dtype.
     pub fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        // rope_i wants f32 cos/sin and a contiguous x; do the rotation in f32 then cast back.
-        let xf = x
-            .to_dtype(candle_gen::candle_core::DType::F32)?
-            .contiguous()?;
-        let rotated = rope_i(&xf, cos, sin)?;
-        rotated.to_dtype(dtype)
+        candle_gen::rope::apply_interleaved_rope(x, cos, sin)
     }
 }
 
@@ -127,5 +121,112 @@ mod tests {
         for (a, b) in xv.iter().zip(&yv) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+}
+
+/// SW-6129: the RoPE apply is the shared `candle_gen::rope::apply_interleaved_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::DType;
+    use candle_gen::candle_nn::rotary_emb::rope_i;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private apply, verbatim.
+    fn former_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let dtype = x.dtype();
+        let xf = x.to_dtype(DType::F32).unwrap().contiguous().unwrap();
+        rope_i(&xf, cos, sin).unwrap().to_dtype(dtype).unwrap()
+    }
+
+    fn ids(n: usize) -> Vec<[i64; 4]> {
+        (0..n as i64)
+            .map(|i| [0, i / 5, i % 5, (i % 3) - 1])
+            .collect()
+    }
+
+    /// The shared route equals the former apply bit for bit on CPU, f32 / bf16 / f16, at FLUX.2's
+    /// real 4-axis table (klein: 4 x 32 axes, head_dim 128).
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let pe = Flux2PosEmbed::new(&Flux2Config::klein_9b());
+        let (cos, sin) = pe.cos_sin(&ids(23), &Device::Cpu).unwrap();
+        let x32 = values(&[2, 3, 23, 2 * pe.half()], 7, &Device::Cpu);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let got = Flux2PosEmbed::apply(&x, &cos, &sin).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(bits(&got), bits(&former_apply(&x, &cos, &sin)), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: flux2 Flux2PosEmbed::apply (f32, [1,32,4608,128]) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let pe = Flux2PosEmbed::new(&Flux2Config::klein_9b());
+        let (cos, sin) = pe.cos_sin(&ids(512 + 4096), &dev).unwrap();
+        // FLUX.2 computes in f32 (bf16 conversion is SW-F381); joint q and k at 1024^2.
+        let q = values(&[1, 32, 512 + 4096, 2 * pe.half()], 3, &dev);
+        let k = values(&[1, 32, 512 + 4096, 2 * pe.half()], 4, &dev);
+        let run = || {
+            Tensor::cat(
+                &[
+                    Flux2PosEmbed::apply(&q, &cos, &sin).unwrap(),
+                    Flux2PosEmbed::apply(&k, &cos, &sin).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("flux2 Flux2PosEmbed::apply (f32, [1,32,4608,128]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
     }
 }

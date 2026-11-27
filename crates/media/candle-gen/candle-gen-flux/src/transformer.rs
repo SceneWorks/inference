@@ -12,6 +12,7 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant::PackedWeightSidecars;
+use candle_gen::rope::{FreqsCisLayout, RopeLayout, RopeMath, RopeSpec};
 use candle_nn::{LayerNorm, RmsNorm, VarBuilder};
 
 pub use candle_transformers::models::flux::model::Config;
@@ -127,15 +128,18 @@ fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
     out.reshape((b, n, d, 2, 2))
 }
 
+/// FLUX.1's RoPE convention: interleaved pairs on `[B, H, S, D]` q/k, the products and sums in the
+/// activation dtype (the reference `fr0·x0 + fr1·x1` over the `freqs_cis` rotation matrix).
+pub(crate) const FLUX_ROPE: RopeSpec =
+    RopeSpec::interleaved(RopeLayout::Bhsd).with_math(RopeMath::Native);
+
+/// Rotate `x` `[B, H, S, D]` by FLUX's `freq_cis` `[B, 1, S, D/2, 2, 2]` (the `[[cos, −sin], [sin,
+/// cos]]` matrix [`rope`] builds): the shared [`candle_gen::rope::apply_rope_freqs_cis`] (SW-6129) —
+/// the fused strided kernel reading the matrix's cos / sin as views on CUDA, and everywhere else the
+/// shared reference chain, bit-identical to the `fr0·x0 + fr1·x1` chain this used to carry
+/// (`fr0 = (cos, sin)`, `fr1 = (−sin, cos)`: `x0·cos − x1·sin`, `x0·sin + x1·cos`, the negation exact).
 pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
-    let dims = x.dims();
-    let (b_sz, n_head, seq_len, n_embd) = x.dims4()?;
-    let x = x.reshape((b_sz, n_head, seq_len, n_embd / 2, 2))?;
-    let x0 = x.narrow(D::Minus1, 0, 1)?;
-    let x1 = x.narrow(D::Minus1, 1, 1)?;
-    let fr0 = freq_cis.get_on_dim(D::Minus1, 0)?;
-    let fr1 = freq_cis.get_on_dim(D::Minus1, 1)?;
-    (fr0.broadcast_mul(&x0)? + fr1.broadcast_mul(&x1)?)?.reshape(dims.to_vec())
+    candle_gen::rope::apply_rope_freqs_cis(x, freq_cis, FreqsCisLayout::Matrix, &FLUX_ROPE)
 }
 
 /// Perturbed-attention guidance over FLUX.1 `[txt, img]` joint post-RoPE BHSD tensors:
@@ -490,9 +494,7 @@ struct ModulationOut {
 
 impl ModulationOut {
     fn scale_shift(&self, input: &Tensor) -> Result<Tensor> {
-        input
-            .broadcast_mul(&(&self.scale + 1.)?)?
-            .broadcast_add(&self.shift)
+        candle_gen::modulate::modulate(input, &self.scale, &self.shift)
     }
 
     fn gate(&self, input: &Tensor) -> Result<Tensor> {
@@ -1035,9 +1037,11 @@ impl OutputHead {
             Layout::Bfl => (&params[0], &params[1]),
             Layout::Diffusers => (&params[1], &params[0]),
         };
-        let normalized = __model_proof_output!(hidden.apply(&self.norm))?
-            .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
-            .broadcast_add(&shift.unsqueeze(1)?)?;
+        let normalized = candle_gen::modulate::modulate(
+            &__model_proof_output!(hidden.apply(&self.norm))?,
+            &scale.unsqueeze(1)?,
+            &shift.unsqueeze(1)?,
+        )?;
         self.output.forward(&normalized)
     }
 }
@@ -3514,5 +3518,137 @@ mod diffusers_tests {
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense");
         Ok(())
+    }
+}
+
+/// SW-6129: FLUX.1's RoPE is the shared `candle_gen::rope::apply_rope_freqs_cis` on the
+/// `freqs_cis` rotation matrix.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private apply, verbatim.
+    fn former_apply(x: &Tensor, freq_cis: &Tensor) -> Tensor {
+        let dims = x.dims();
+        let (b_sz, n_head, seq_len, n_embd) = x.dims4().unwrap();
+        let x = x.reshape((b_sz, n_head, seq_len, n_embd / 2, 2)).unwrap();
+        let x0 = x.narrow(D::Minus1, 0, 1).unwrap();
+        let x1 = x.narrow(D::Minus1, 1, 1).unwrap();
+        let fr0 = freq_cis.get_on_dim(D::Minus1, 0).unwrap();
+        let fr1 = freq_cis.get_on_dim(D::Minus1, 1).unwrap();
+        (fr0.broadcast_mul(&x0).unwrap() + fr1.broadcast_mul(&x1).unwrap())
+            .unwrap()
+            .reshape(dims.to_vec())
+            .unwrap()
+    }
+
+    /// FLUX.1's `EmbedNd` table (`theta 10000`, axes `[16, 56, 56]`) built straight from the `rope`
+    /// table builder `EmbedNd` runs per axis (no module call).
+    fn pe_table(ids: &Tensor) -> Tensor {
+        let axes = [16usize, 56, 56];
+        let parts: Vec<Tensor> = (0..3)
+            .map(|i| rope(&ids.get_on_dim(D::Minus1, i).unwrap(), axes[i], 10_000).unwrap())
+            .collect();
+        Tensor::cat(&parts, 2).unwrap().unsqueeze(1).unwrap()
+    }
+
+    /// FLUX.1 `[t, h, w]` ids for `txt` text tokens then an `h2 x w2` image grid, `[1, S, 3]`.
+    fn ids(txt: usize, h2: usize, w2: usize, dtype: DType, device: &Device) -> Tensor {
+        let mut v = vec![0f32; txt * 3];
+        for i in 0..h2 {
+            for j in 0..w2 {
+                v.extend([0.0, i as f32, j as f32]);
+            }
+        }
+        Tensor::from_vec(v, (1, txt + h2 * w2, 3), device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    /// The shared route equals the former apply bit for bit on CPU in f32 / bf16 / f16, with the
+    /// real `EmbedNd` (`theta 10000`, axes `[16, 56, 56]`) table in the activation dtype, for a
+    /// shared table and a 2-batch q.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let x32 = values(&[2, 3, 4 + 12, 128], 7, &Device::Cpu);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let pe = pe_table(&ids(4, 3, 4, dtype, &Device::Cpu));
+            let x = x32.to_dtype(dtype).unwrap();
+            let got = apply_rope(&x, &pe).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(bits(&got), bits(&former_apply(&x, &pe)), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: flux apply_rope (bf16, freqs_cis matrix, [1,24,4608,128]) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // FLUX.1-dev at 1024^2: 512 text + 64x64 image tokens, 24 heads x 128, bf16.
+        let pe = pe_table(&ids(512, 64, 64, DType::BF16, &dev));
+        let q = values(&[1, 24, 512 + 4096, 128], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = values(&[1, 24, 512 + 4096, 128], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || {
+            Tensor::cat(
+                &[apply_rope(&q, &pe).unwrap(), apply_rope(&k, &pe).unwrap()],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("flux apply_rope (bf16, freqs_cis matrix, [1,24,4608,128]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
     }
 }

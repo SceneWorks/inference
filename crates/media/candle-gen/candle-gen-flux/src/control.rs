@@ -131,9 +131,8 @@ impl AdaLayerNormZero {
         let p = __model_proof_output!(emb.silu()?.apply(&self.linear))?.chunk(6, D::Minus1)?;
         // shift = p[0], scale = p[1]; normed = norm(hidden) * (1 + scale) + shift.
         let normed = __model_proof_output!(self.norm.forward(hidden))?;
-        let normed = normed
-            .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
-            .broadcast_add(&p[0].unsqueeze(1)?)?;
+        let normed =
+            candle_gen::modulate::modulate(&normed, &p[1].unsqueeze(1)?, &p[0].unsqueeze(1)?)?;
         Ok((
             normed,
             p[2].clone(),
@@ -424,9 +423,11 @@ fn apply_norm_ff(
     let hidden = (hidden + attn.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
     // The diffusers `norm2` (parameter-free, elementwise-affine = False), built once at load and
     // reused here rather than re-allocated each call (sc-9039).
-    let normed = __model_proof_output!(norm.forward(&hidden))?
-        .broadcast_mul(&(scale_mlp.unsqueeze(1)? + 1.0)?)?
-        .broadcast_add(&shift_mlp.unsqueeze(1)?)?;
+    let normed = candle_gen::modulate::modulate(
+        &__model_proof_output!(norm.forward(&hidden))?,
+        &scale_mlp.unsqueeze(1)?,
+        &shift_mlp.unsqueeze(1)?,
+    )?;
     let ff_out = ff.forward(&normed)?;
     hidden.broadcast_add(&ff_out.broadcast_mul(&gate_mlp.unsqueeze(1)?)?)
 }
