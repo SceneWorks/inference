@@ -1256,6 +1256,37 @@ fn pin_produced_seals_an_unchanged_file_without_reading_and_refuses_a_changed_on
     );
 }
 
+/// A file rewritten AND identity-sealed by another producer between the record check and the seal's
+/// own capture must not be accepted: the fallback pin reaches the memo's digest-free seal for the
+/// NEW identity, and only a fingerprint comparison against the recorded attestation can tell.
+#[test]
+fn pin_produced_refuses_a_file_resealed_by_another_producer_mid_pin() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("produced.safetensors");
+    std::fs::write(&file, vec![5_u8; 4096]).expect("write fixture");
+    let record = ProducedFileIdentity::seal_written(&file).expect("seal written");
+
+    let raced = std::cell::Cell::new(false);
+    let result = ArtifactSeal::pin_produced_with_progress(
+        &file,
+        &record,
+        || {
+            if !raced.replace(true) {
+                std::fs::write(&file, vec![6_u8; 8192]).expect("rewrite");
+                let other = ProducedFileIdentity::seal_written(&file).expect("reseal");
+                ArtifactSeal::pin_produced(&file, &other).expect("other producer seals it");
+            }
+            Ok(())
+        },
+        |_| {},
+    );
+    assert!(raced.get(), "the race ran before the outer capture");
+    assert!(
+        matches!(&result, Err(crate::Error::Unsupported(message)) if message.contains("changed")),
+        "a different produced file must be refused, got {result:?}"
+    );
+}
+
 #[test]
 fn pinned_weights_file_detects_target_mutation() {
     let dir = tempfile::tempdir().expect("temp dir");

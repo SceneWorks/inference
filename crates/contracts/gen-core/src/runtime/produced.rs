@@ -37,7 +37,9 @@ pub const PRODUCED_FILE_BACKDATE: Duration = Duration::from_secs(10);
 /// A record younger than this (modification time to observation) is racy and never trusted.
 const RACY_WINDOW_NANOS: i128 = 2_000_000_000;
 
-/// The durable identity of one file its host produced. See the [module docs](self).
+/// The durable identity of one file its host produced: recorded once by the producer after the
+/// bytes are final, compared against a fresh capture instead of hashing the content. Weak (no change
+/// time) and racy (modified too close to the observation) records are never trusted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProducedFileIdentity {
@@ -192,7 +194,12 @@ impl ArtifactSeal {
             )));
         };
         let seal = Self::pin_identity_attested_with_progress(path, &attestation, check, observe)?;
-        if seal.is_identity_attested() {
+        // Digest absence alone is not proof THIS attestation matched: a file rewritten and
+        // identity-sealed by another producer in between reaches the memo's digest-free seal for
+        // ITS identity through the fallback pin. Require the seal to describe the recorded file.
+        if seal.is_identity_attested()
+            && seal.target_fingerprint() == attestation.target_fingerprint()
+        {
             Ok(seal)
         } else {
             // The file moved between the record check and the seal's own capture.
