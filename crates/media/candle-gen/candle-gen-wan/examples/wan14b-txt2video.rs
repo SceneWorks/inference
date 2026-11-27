@@ -16,6 +16,13 @@
 //! tokenizer from `--snapshot`. The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
 //! (`umt5_xxl_fp8_e4m3fn_scaled`) and/or `--comfyui-vae <file>` (`wan_2.1_vae.safetensors`) reads those
 //! components in place too (sc-10909); whichever is omitted falls back to `--snapshot`.
+//!
+//! SW-6137 (opt-in Sol-Attn sparse self-attention, lossy): `--sol-topk <ratio>` loads the generator
+//! with the `sol_attention` engine option (top-k selection at `ratio`), `--sol-sinks <start>:<end>`
+//! adds forced sink key blocks. The run prints the attention path counts, the mean s/step over the
+//! denoise steps and the CUDA pool's peak (`USED_MEM_HIGH`). `--attn-capture <skip>:<file>` saves the
+//! Q/K/V of the opt-in-routed self-attention call after `skip` others to a safetensors file (evidence
+//! tooling for the locality investigation).
 
 use std::path::PathBuf;
 
@@ -127,6 +134,24 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|(_, _, policy)| *policy)
         .unwrap_or_default();
+    // SW-6137: the opt-in Sol-Attn engine option.
+    let sol_attention = arg(&args, "--sol-topk")
+        .map(|ratio| -> Result<candle_gen::SolConfig> {
+            let mut cfg = candle_gen::SolConfig::top_k(ratio.parse()?);
+            if let Some(sinks) = arg(&args, "--sol-sinks") {
+                let (a, b) = sinks.split_once(':').ok_or("--sol-sinks <start>:<end>")?;
+                cfg.sink_blocks = (a.parse()?, b.parse()?);
+            }
+            Ok(cfg)
+        })
+        .transpose()?;
+    println!("[smoke] sol_attention={sol_attention:?}");
+    if let Some(capture) = arg(&args, "--attn-capture") {
+        let (skip, _) = capture
+            .split_once(':')
+            .ok_or("--attn-capture <skip>:<file>")?;
+        candle_gen::fused_attention::arm_int8_operand_capture(skip.parse()?);
+    }
     let gen = match (arg(&args, "--comfyui-high"), arg(&args, "--comfyui-low")) {
         (Some(high), Some(low)) => {
             // `load_from_comfyui_experts` takes no adapters, so `--lora-high/--lora-low` would be
@@ -160,7 +185,15 @@ fn main() -> Result<()> {
             let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)))
                 .with_adapters(adapters)
                 .with_offload_policy(offload);
-            candle_gen_wan::provider_registry()?.load("wan2_2_t2v_14b", &spec)?
+            match sol_attention {
+                None => candle_gen_wan::provider_registry()?.load("wan2_2_t2v_14b", &spec)?,
+                Some(cfg) => candle_gen_wan::wan14b::load_t2v_14b_with_options(
+                    &spec,
+                    candle_gen_wan::wan14b::Wan14bEngineOptions {
+                        sol_attention: Some(cfg),
+                    },
+                )?,
+            }
         }
     };
     println!(
@@ -185,8 +218,10 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let mut step_marks: Vec<std::time::Instant> = Vec::new();
     let mut on_progress = |p: Progress| match p {
         Progress::Step { current, total } => {
+            step_marks.push(std::time::Instant::now());
             print!("\r[smoke] step {current}/{total}   ");
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -199,6 +234,13 @@ fn main() -> Result<()> {
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };
+    #[cfg(feature = "cuda")]
+    let pool = candle_gen::cuda_mempool::MemPool::device_current(0);
+    #[cfg(feature = "cuda")]
+    if let Some(pool) = &pool {
+        pool.reset_used_high_water();
+    }
+    let paths_before = candle_gen::attention_path_counts();
     let t0 = std::time::Instant::now();
     let output = match gen.generate(&req, &mut on_progress) {
         Ok(output) => output,
@@ -212,6 +254,53 @@ fn main() -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let secs = t0.elapsed().as_secs_f32();
+    let paths = candle_gen::attention_path_counts().since(&paths_before);
+    println!(
+        "\n[smoke] attention paths: flash={} sol={} int8={} budgeted={} sol_refusals={:?}",
+        paths.flash,
+        paths.sol,
+        paths.int8,
+        paths.budgeted(),
+        paths.sol_refusals
+    );
+    // Step k's mark is when step k finished; the mean interval over steps 2..n excludes the
+    // first step's lazy load / conditioning.
+    if step_marks.len() >= 2 {
+        let span = step_marks[step_marks.len() - 1]
+            .duration_since(step_marks[0])
+            .as_secs_f64();
+        println!(
+            "[smoke] denoise: {:.3} s/step (mean of {} step intervals)",
+            span / (step_marks.len() - 1) as f64,
+            step_marks.len() - 1
+        );
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(pool) = &pool {
+        println!(
+            "[smoke] CUDA pool peak (USED_MEM_HIGH): {:.2} GiB",
+            pool.used_high().unwrap_or(0) as f64 / (1u64 << 30) as f64
+        );
+    }
+    if let Some(capture) = arg(&args, "--attn-capture") {
+        let (_, file) = capture.split_once(':').ok_or("--attn-capture")?;
+        match candle_gen::fused_attention::take_int8_operand_capture() {
+            Some(c) => {
+                let scale = candle_gen::candle_core::Tensor::new(&[c.scale as f32], c.q.device())?;
+                candle_gen::candle_core::safetensors::save(
+                    &std::collections::HashMap::from([
+                        ("q".to_string(), c.q.contiguous()?),
+                        ("k".to_string(), c.k.contiguous()?),
+                        ("v".to_string(), c.v.contiguous()?),
+                        ("scale".to_string(), scale),
+                    ]),
+                    file,
+                )?;
+                println!("[smoke] captured attention operands -> {file}");
+            }
+            None => println!("[smoke] no opt-in attention call was captured"),
+        }
+    }
     let (frames, fps) = match output {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),
         _ => return Err("expected video, got images".into()),

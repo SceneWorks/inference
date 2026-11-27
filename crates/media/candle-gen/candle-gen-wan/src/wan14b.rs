@@ -1149,6 +1149,42 @@ pub struct Wan14bGenerator {
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
     lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
+    /// Engine options fixed at load ([`load_t2v_14b_with_options`]).
+    engine: Wan14bEngineOptions,
+}
+
+/// Load-time engine options of a Wan2.2 A14B generator ([`load_t2v_14b_with_options`],
+/// [`load_i2v_14b_with_options`]). The default is the historical engine.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Wan14bEngineOptions {
+    /// SW-6137: `Some(config)` runs both experts' denoise **self-attention** through the opt-in
+    /// Sol-Attn sparse block-routed kernel (CUDA sm_80+; lossy by design: 64-token blocks, the top
+    /// `topk_ratio` of the key blocks exact per query block, the rest pooled) instead of
+    /// FlashAttention. Calls the kernel cannot serve keep FlashAttention / the budgeted path, counted
+    /// in `candle_gen::AttentionPathCounts::sol_refusals`. `None`, the default, is off (epic E2).
+    pub sol_attention: Option<candle_gen::SolConfig>,
+}
+
+/// SW-6137: the typed load-time refusal of a `sol_attention` option this engine cannot honour: an
+/// invalid [`candle_gen::SolConfig`], or a DiT whose head dim is not the kernel's 128.
+pub(crate) fn validate_engine_options(
+    dit: &crate::config::TransformerConfig,
+    options: &Wan14bEngineOptions,
+) -> gen_core::Result<()> {
+    let Some(sol) = options.sol_attention else {
+        return Ok(());
+    };
+    sol.validate().map_err(|reason| {
+        gen_core::Error::Unsupported(format!("wan sol_attention option: {reason}"))
+    })?;
+    let need = candle_gen::fused_attention::SOL_HEAD_DIM;
+    if dit.head_dim != need {
+        return Err(gen_core::Error::Unsupported(format!(
+            "wan sol_attention option: the Sol-Attn kernel needs head_dim {need}, this DiT has {}",
+            dit.head_dim
+        )));
+    }
+    Ok(())
 }
 
 impl Wan14bGenerator {
@@ -1276,20 +1312,29 @@ impl Generator for Wan14bGenerator {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let staged =
             self.offload == OffloadPolicy::Sequential || crate::i2v_memory_strategy::staged(req);
-        let (frames, fps) = if staged {
-            let mut components = candle_gen::lock_recover(&self.components);
-            if components.is_some() {
-                self.device
-                    .synchronize()
-                    .map_err(gen_core::Error::backend)?;
-                drop(components.take());
-            }
-            drop(components);
-            pipe.render_sequential(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
+        candle_gen::execution::policy(
+            "wan/engine/sol_attention",
+            format!("{:?}", self.engine.sol_attention).into(),
+        );
+        let (frames, fps) = crate::transformer::with_dit_sol_attention(
+            self.engine.sol_attention,
+            || -> gen_core::Result<_> {
+                Ok(if staged {
+                    let mut components = candle_gen::lock_recover(&self.components);
+                    if components.is_some() {
+                        self.device
+                            .synchronize()
+                            .map_err(gen_core::Error::backend)?;
+                        drop(components.take());
+                    }
+                    drop(components);
+                    pipe.render_sequential(req, on_progress)?
+                } else {
+                    let components = self.components(&pipe)?;
+                    pipe.render(req, &components, on_progress)?
+                })
+            },
+        )?;
         crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
@@ -1432,6 +1477,7 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         i2v_memory,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        engine: Wan14bEngineOptions::default(),
     })
 }
 
@@ -1532,6 +1578,7 @@ fn build_comfyui_generator(
         i2v_memory: None,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        engine: Wan14bEngineOptions::default(),
     })
 }
 
@@ -1548,6 +1595,35 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::I2v)
 }
 
+/// [`load_t2v_14b`] with explicit [`Wan14bEngineOptions`] — the opt-in surface for the Sol-Attn
+/// sparse attention engine option (SW-6137). `Wan14bEngineOptions::default()` is exactly
+/// [`load_t2v_14b`]. An option this engine cannot honour is refused here with a typed error.
+pub fn load_t2v_14b_with_options(
+    spec: &LoadSpec,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_with_options(spec, Variant::T2v, options)
+}
+
+/// [`load_i2v_14b`] with explicit [`Wan14bEngineOptions`] (see [`load_t2v_14b_with_options`]).
+pub fn load_i2v_14b_with_options(
+    spec: &LoadSpec,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_with_options(spec, Variant::I2v, options)
+}
+
+fn load_variant_with_options(
+    spec: &LoadSpec,
+    variant: Variant,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    validate_engine_options(&variant.dit_cfg(), &options)?;
+    let mut generator = build_generator(spec, variant)?;
+    generator.engine = options;
+    Ok(Box::new(generator))
+}
+
 candle_gen::register_generators! {
     pub(crate) const T2V_14B_REGISTRATION = descriptor_t2v_14b => load_t2v_14b
 }
@@ -1558,6 +1634,48 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-6137: the `sol_attention` option is off by default, carried by the options loaders, and
+    /// refused with a typed error when this engine cannot honour it (invalid ratio / sinks, or a DiT
+    /// whose head dim is not the kernel's 128).
+    #[test]
+    fn the_sol_attention_option_is_off_by_default_and_refused_when_unservable() {
+        assert_eq!(Wan14bEngineOptions::default().sol_attention, None);
+        let on = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.25)),
+        };
+        for variant in [Variant::T2v, Variant::I2v] {
+            let cfg = variant.dit_cfg();
+            assert_eq!(cfg.head_dim, 128);
+            validate_engine_options(&cfg, &on).unwrap();
+            validate_engine_options(&cfg, &Wan14bEngineOptions::default()).unwrap();
+            let bad_ratio = Wan14bEngineOptions {
+                sol_attention: Some(candle_gen::SolConfig::top_k(1.5)),
+            };
+            assert!(matches!(
+                validate_engine_options(&cfg, &bad_ratio),
+                Err(gen_core::Error::Unsupported(m)) if m.contains("topk_ratio")
+            ));
+            let mut narrow = cfg;
+            narrow.head_dim = 64;
+            assert!(matches!(
+                validate_engine_options(&narrow, &on),
+                Err(gen_core::Error::Unsupported(m)) if m.contains("head_dim 128")
+            ));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(temp.path().to_path_buf()));
+        let generator = build_generator(&spec, Variant::T2v).unwrap();
+        assert_eq!(generator.engine, Wan14bEngineOptions::default());
+        assert!(load_t2v_14b_with_options(
+            &spec,
+            Wan14bEngineOptions {
+                sol_attention: Some(candle_gen::SolConfig::top_k(0.0)),
+            }
+        )
+        .is_err());
+        assert!(load_t2v_14b_with_options(&spec, on).is_ok());
+    }
 
     #[test]
     fn both_a14b_public_loaders_publish_prepared_contracts_at_every_tier() {
