@@ -42,6 +42,9 @@ mod act_quant;
 #[path = "fused_kernels_bench/adaln.rs"]
 mod adaln;
 #[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/adaln_chain.rs"]
+mod adaln_chain;
+#[cfg(feature = "cuda")]
 #[path = "fused_kernels_bench/rope.rs"]
 mod rope;
 #[cfg(feature = "cuda")]
@@ -53,6 +56,7 @@ mod rope_routes;
 const SUITES: &[(&str, harness::Suite)] = &[
     ("act_quant", act_quant::rows),
     ("adaln", adaln::rows),
+    ("adaln_chain", adaln_chain::rows),
     ("rope", rope::rows),
     ("rope_routes", rope_routes::rows),
 ];

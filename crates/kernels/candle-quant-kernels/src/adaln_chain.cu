@@ -9,6 +9,8 @@
 //   Rms:      y = xc / (xc.sqr().mean_keepdim(-1) + eps).sqrt()
 //   RmsRecip: y = xc * (xc.sqr().mean_keepdim(-1) + eps).sqrt().recip()
 //   [y = y * weight] [y = y + bias]               (separate broadcast ops, compute dtype)
+//   [y = y.to_dtype(T)]                           (cast through T, e.g. back to x's dtype)
+//   [y = y.to_dtype(W) * post_weight]             (a norm weight applied after the cast, in W)
 //   out = (y.to_dtype(M) * (scale + 1) + shift).to_dtype(O)
 //
 // (candle_nn's LayerNorm without a bias is the Layer chain: its `sum_keepdim / n` is the same
@@ -160,7 +162,8 @@ extern "C" __global__ void adaln_chain_modulate(
     const void* x, int dt_x, const void* weight, int weight_kind, const void* bias, int bias_kind,
     const void* scale, const void* shift, int dt_m, void* out, int dt_o, int n, int norm, int bf,
     float inv_n, float eps, int one_plus, long long seq, long long scale_sb, long long scale_ss,
-    long long shift_sb, long long shift_ss, int has_shift) {
+    long long shift_sb, long long shift_ss, int has_shift, int dt_mid, const void* post_weight,
+    int dt_pw) {
     __shared__ float slot[CHAIN_MAX_BLOCK];
     const long long row = blockIdx.x;
     const long long base = row * (long long)n;
@@ -206,6 +209,12 @@ extern "C" __global__ void adaln_chain_modulate(
         }
         if (weight_kind) y = chain_mul(y, chain_load(weight, wdt, col), bf);
         if (bias_kind) y = chain_add(y, chain_load(bias, wdt, col), bf);
+        // Optional cast-through (`dt_mid` >= 0) and post-cast weight in its own dtype (`dt_pw`).
+        if (dt_mid >= 0) y = chain_round(y, dt_mid);
+        if (dt_pw >= 0) {
+            y = chain_round(y, dt_pw);
+            y = chain_round(__fmul_rn(y, chain_load(post_weight, dt_pw, col)), dt_pw);
+        }
         y = chain_round(y, dt_m);
         float sc = chain_load(scale, dt_m, scale_row + col);
         if (one_plus) sc = chain_round(__fadd_rn(sc, 1.0f), dt_m);

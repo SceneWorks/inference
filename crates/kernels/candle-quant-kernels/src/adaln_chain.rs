@@ -14,6 +14,8 @@
 //! Rms:      y = xc / (xc.sqr().mean_keepdim(-1) + eps).sqrt()
 //! RmsRecip: y = xc * (xc.sqr().mean_keepdim(-1) + eps).sqrt().recip()
 //! [y = y * weight] [y = y + bias]
+//! [y = y.to_dtype(T)]                      (cast_through)
+//! [y = y.to_dtype(W) * post_weight]        (with_post_weight, W = the weight's dtype)
 //! out = modulate_with(y.to_dtype(M), scale, shift, form).to_dtype(O)
 //! ```
 //!
@@ -85,6 +87,10 @@ pub struct AdaLnChain<'a> {
     pub modulate_dtype: Option<DType>,
     /// The dtype the modulated result is cast to (`None`: the modulation dtype).
     pub out_dtype: Option<DType>,
+    /// Cast the norm through this dtype before any post weight / the modulation cast.
+    pub cast_through: Option<DType>,
+    /// A norm weight multiplied **after** the cast, in its own dtype (`[D]`).
+    pub post_weight: Option<&'a Tensor>,
     /// `(1 + scale)` or `scale`.
     pub scale_form: ScaleForm,
 }
@@ -99,6 +105,8 @@ impl<'a> AdaLnChain<'a> {
             bias: None,
             modulate_dtype: None,
             out_dtype: None,
+            cast_through: None,
+            post_weight: None,
             scale_form: ScaleForm::OnePlus,
         }
     }
@@ -166,6 +174,23 @@ impl<'a> AdaLnChain<'a> {
         }
     }
 
+    /// Cast the norm through `dtype` first (e.g. back to `x`'s dtype before a promoted weight).
+    pub fn cast_through(self, dtype: DType) -> Self {
+        Self {
+            cast_through: Some(dtype),
+            ..self
+        }
+    }
+
+    /// Multiply the (cast) norm by `weight` in `weight`'s dtype — the `RMSNorm` that rounds to the
+    /// activation dtype before an f32-island weight multiply.
+    pub fn with_post_weight(self, weight: &'a Tensor) -> Self {
+        Self {
+            post_weight: Some(weight),
+            ..self
+        }
+    }
+
     fn compute_dtype(&self, x: DType) -> DType {
         match self.precision {
             ChainPrecision::F32 => DType::F32,
@@ -193,6 +218,12 @@ pub fn adaln_chain_norm_reference(x: &Tensor, spec: &AdaLnChain<'_>) -> Result<T
     }
     if let Some(b) = spec.bias {
         y = y.broadcast_add(&b.to_dtype(cdt)?)?;
+    }
+    if let Some(t) = spec.cast_through {
+        y = y.to_dtype(t)?;
+    }
+    if let Some(pw) = spec.post_weight {
+        y = y.to_dtype(pw.dtype())?.broadcast_mul(pw)?;
     }
     y.to_dtype(spec.modulate_dtype.unwrap_or(x.dtype()))
 }
@@ -317,9 +348,11 @@ pub fn check_adaln_chain(
     out_dtype: DType,
     weight: Option<&OperandMeta<'_>>,
     bias: Option<&OperandMeta<'_>>,
+    post: (Option<DType>, Option<&OperandMeta<'_>>),
     scale: &OperandMeta<'_>,
     shift: &OperandMeta<'_>,
 ) -> std::result::Result<ChainPlan, AdaLnRefusal> {
+    let (cast_through, post_weight) = post;
     let params = [weight, bias];
     let all = || {
         [Some(x), Some(scale), Some(shift)]
@@ -367,7 +400,23 @@ pub fn check_adaln_chain(
     if elems > ADALN_MAX_ELEMS {
         return Err(AdaLnRefusal::TooLarge(elems));
     }
-    for m in params.into_iter().flatten() {
+    if let Some(pw) = post_weight {
+        if !pw.on_device {
+            return Err(AdaLnRefusal::NotCuda);
+        }
+        if pw.tracked {
+            return Err(AdaLnRefusal::Autograd);
+        }
+        if !served(pw.dtype) {
+            return Err(AdaLnRefusal::Dtype(pw.dtype));
+        }
+    }
+    if let Some(t) = cast_through {
+        if !served(t) {
+            return Err(AdaLnRefusal::Dtype(t));
+        }
+    }
+    for m in params.into_iter().chain([post_weight]).flatten() {
         if m.dims != [n] {
             return Err(AdaLnRefusal::Shape);
         }
@@ -400,6 +449,7 @@ pub fn plan_adaln_chain(
 ) -> std::result::Result<ChainPlan, AdaLnRefusal> {
     let weight = spec.weight.map(|w| OperandMeta::of(w, x));
     let bias = spec.bias.map(|b| OperandMeta::of(b, x));
+    let post = spec.post_weight.map(|w| OperandMeta::of(w, x));
     let mdt = spec.modulate_dtype.unwrap_or(x.dtype());
     check_adaln_chain(
         x.device().is_cuda(),
@@ -409,6 +459,7 @@ pub fn plan_adaln_chain(
         spec.out_dtype.unwrap_or(mdt),
         weight.as_ref(),
         bias.as_ref(),
+        (spec.cast_through, post.as_ref()),
         &OperandMeta::of(scale, x),
         &OperandMeta::of(shift, x),
     )
@@ -536,12 +587,13 @@ mod cuda_impl {
         let (hs, hl) = shift.storage_and_layout();
         let ws = spec.weight.map(|w| w.storage_and_layout());
         let bs = spec.bias.map(|b| b.storage_and_layout());
+        let ps = spec.post_weight.map(|p| p.storage_and_layout());
         let (Some(xc), Some(sc), Some(hc)) = (as_cuda(&xs), as_cuda(&ss), as_cuda(&hs)) else {
             return Ok(Attempt::Reference(PathReason::NotCuda));
         };
         let cdt = spec.compute_dtype(plan.x_dtype);
-        let (wp, bp) = (param(&ws), param(&bs));
-        if matches!(wp, Some(None)) || matches!(bp, Some(None)) {
+        let (wp, bp, pp) = (param(&ws), param(&bs), param(&ps));
+        if matches!(wp, Some(None)) || matches!(bp, Some(None)) || matches!(pp, Some(None)) {
             return Ok(Attempt::Reference(PathReason::NotCuda));
         }
         let xv = raw(xc, xl.start_offset(), plan.x_dtype)?;
@@ -549,6 +601,14 @@ mod cuda_impl {
         let hv = raw(hc, hl.start_offset(), plan.modulate_dtype)?;
         let wv = wp.flatten().map(|(c, o)| raw(c, o, cdt)).transpose()?;
         let bv = bp.flatten().map(|(c, o)| raw(c, o, cdt)).transpose()?;
+        let pdt = spec.post_weight.map(|p| p.dtype());
+        let pv = pp
+            .flatten()
+            .zip(pdt)
+            .map(|((c, o), d)| raw(c, o, d))
+            .transpose()?;
+        let dt_mid = spec.cast_through.map_or(-1, dtype_code);
+        let dt_pw = pdt.map_or(-1, dtype_code);
 
         let elems = plan.rows * plan.n;
         // SAFETY: every element is written by the kernel before it is read.
@@ -630,7 +690,13 @@ mod cuda_impl {
             .arg(&sss)
             .arg(&hsb)
             .arg(&hss)
-            .arg(&has_shift);
+            .arg(&has_shift)
+            .arg(&dt_mid);
+        match &pv {
+            Some(v) => arg_raw!(v),
+            None => b.arg(&null),
+        };
+        b.arg(&dt_pw);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (plan.block, 1, 1),
@@ -715,6 +781,7 @@ mod tests {
                 md,
                 wm.as_ref(),
                 None,
+                (None, None),
                 &meta(sd, &m, &ms),
                 &meta(sd, &m, &ms),
             )
@@ -779,6 +846,7 @@ mod tests {
             DType::F32,
             None,
             None,
+            (None, None),
             &meta(DType::F32, &m, &ms),
             &meta(DType::F32, &m, &ms),
         );
@@ -791,6 +859,7 @@ mod tests {
             DType::F32,
             None,
             None,
+            (None, None),
             &meta(DType::F32, &m, &ms),
             &meta(DType::F32, &m, &ms),
         );
@@ -1138,6 +1207,42 @@ mod cuda_tests {
             }
         }
         println!("scale-only adaln: {cases} cases bit-identical (0 ulp)");
+        Ok(())
+    }
+
+    /// The cast-through + post-weight form (an f32 RMS norm rounded to x's dtype, promoted to the
+    /// f32 weight's dtype and multiplied there, then modulated in f32 — MOSS-Image's `Norm`), for
+    /// both RMS forms, bf16 / f16 / f32 x, f32 and native-dtype weights: bit-identical.
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn fused_adaln_chain_post_weight_gpu_is_bit_identical() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut cases = 0usize;
+        for &n in &[7usize, 96, 3072] {
+            let x32 = tensor(&dev, &[2, 6, n], 31, 2.5, 0.2)?;
+            let w32 = tensor(&dev, &[n], 32, 0.4, 1.0)?;
+            for xd in [DType::F32, DType::BF16, DType::F16] {
+                let x = x32.to_dtype(xd)?;
+                for wd in [DType::F32, xd] {
+                    let w = w32.to_dtype(wd)?;
+                    let md = if wd == DType::F32 { DType::F32 } else { xd };
+                    let sc = tensor(&dev, &[2, 1, n], 33, 0.4, 0.0)?.to_dtype(md)?;
+                    let sh = tensor(&dev, &[2, 1, n], 34, 0.4, 0.0)?.to_dtype(md)?;
+                    for base in [AdaLnChain::rms(1e-6), AdaLnChain::rms_recip(1e-6)] {
+                        let spec = base
+                            .cast_through(xd)
+                            .with_post_weight(&w)
+                            .modulate_in(md)
+                            .output(xd);
+                        let want = adaln_chain_reference(&x, &spec, &sc, &sh)?;
+                        let got = fused(&x, &spec, &sc, &sh)?;
+                        assert_eq!(bits(&got)?, bits(&want)?, "n={n} x={xd:?} w={wd:?}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("adaln_chain post-weight: {cases} cases bit-identical (0 ulp)");
         Ok(())
     }
 
