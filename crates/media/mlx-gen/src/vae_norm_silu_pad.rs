@@ -28,10 +28,11 @@
 //! denominator is computed by [`ChannelNorm::denominator`] — the very ops the reference
 //! [`ChannelNorm::apply`] runs, on the same input — so it is bit-identical by construction. The
 //! Metal kernel then performs only the elementwise tail in the reference order with FP contraction
-//! off (the SW-6139 GDN lesson); its f32 output is meant to be bit-identical to the op chain, which
-//! the registered parity tests assert, with E2's `max rel err ≤ 1e-5` as the declared tolerance
-//! gate. Every route returns **f32** for any float input: the reference promotes there too (its
-//! `eps`/`√C` operands are f32 scalars), so bf16/f16 inputs compare against the same f32 values.
+//! off (the SW-6139 GDN lesson) and the metallib's precise `exp` / divide named explicitly; its f32
+//! output targets bit identity with the op chain (reported by the parity tests and proofs), and
+//! E2's `max rel err ≤ 1e-5` is the gate. Every route returns **f32** for any float input: the
+//! reference promotes there too (its `eps`/`√C` operands are f32 scalars), so bf16/f16 inputs
+//! compare against the same f32 values.
 //!
 //! **Telemetry and switch (E1).** The route is [`DEFAULT_ROUTE`], overridable per process by
 //! [`ROUTE_ENV`] (`reference` | `compiled` | `metal`) and per thread by [`RouteGuard`]. Every call
@@ -911,8 +912,9 @@ fn probe(stream: &Stream, key: VariantKey, norm: &ChannelNorm<'_>) -> Result<()>
     Ok(())
 }
 
-/// E2's declared f32 tolerance for an exact kernel: max relative error ≤ 1e-5 (the parity tests
-/// additionally assert bit identity).
+/// E2's declared f32 tolerance for an exact kernel: max relative error ≤ 1e-5. The one gate of the
+/// parity tests, the real-weight proofs and the probe (every route returns f32, so no other dtype
+/// bound applies); bit identity is reported, not asserted.
 pub const TOLERANCE_F32: f32 = 1e-5;
 
 /// Deterministic smooth test data `sin(i·scale + offset)·2` (signed, no RNG).

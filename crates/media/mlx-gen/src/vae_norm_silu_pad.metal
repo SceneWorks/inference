@@ -13,6 +13,14 @@
 // in the reference order (divide, [x sqrt(C), x gamma], sigmoid, multiply), with FP contraction
 // off so no multiply/add pair is fused into an FMA the op chain would round twice.
 //
+// Precise math, explicitly: MLX builds `mlx.metallib` with `-fno-fast-math`, so the reference
+// chain's `Divide` (`x / y`) is the correctly rounded divide and `Sigmoid`'s `metal::exp` resolves
+// to `metal::precise::exp`. This file is JIT-compiled through `metal_kernel`, whose
+// `MTLCompileOptions` set only the math mode, leaving `mathFloatingPointFunctions` at its `Fast`
+// default, so a bare `exp` (and `/`) here can land a few ULP away from the metallib result. Every
+// divide and the exp below therefore name `metal::precise::` directly, which pins them to the
+// metallib's functions whatever the JIT defaults are.
+//
 // MLX `metal_kernel` contract: the first part of this file (up to the marker line) is the kernel
 // `header`; the rest is the kernel body. Inputs: `inp` (x, any float dtype, arbitrary strides),
 // `denom` (f32 [B,1,T,H,W]), `gamma` (C elements, any float dtype; a dummy when !AFFINE),
@@ -25,7 +33,7 @@
 #pragma clang fp contract(off)
 
 inline float sceneworks_vae_silu(float n) {
-  const float y = 1 / (1 + metal::exp(metal::abs(n)));
+  const float y = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(metal::abs(n)));
   const float s = (n < 0) ? y : 1 - y;
   return n * s;
 }
@@ -87,7 +95,7 @@ inline float sceneworks_vae_silu(float n) {
           int64_t(w) * inp_strides[4];
       const int64_t dat = int64_t(b) * denom_strides[0] + int64_t(t) * denom_strides[2] +
           int64_t(h) * denom_strides[3] + int64_t(w) * denom_strides[4];
-      float n = static_cast<float>(inp[xat]) / denom[dat];
+      float n = metal::precise::divide(static_cast<float>(inp[xat]), static_cast<float>(denom[dat]));
       if (AFFINE) {
         n = n * scale;
         n = n * static_cast<float>(gamma[int64_t(c) * gamma_strides[0]]);

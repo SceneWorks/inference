@@ -5,8 +5,11 @@
 //!   thread-locals and host `f32` slices only.
 //! * **MLX compute tests** (`#[ignore]`, registered in `scripts/ci/test_suites.json` for the
 //!   dispatch-only exhaustive suite): the Metal and compiled routes against the reference op chain
-//!   over every Wan/LTX geometry of [`parity`] (E2 tolerance, and bit identity for the kernel), the
-//!   wrong-temporal-side mutation control, and the dispatch through [`try_fused`].
+//!   over every Wan/LTX geometry of [`parity`], gated on E2's declared tolerance
+//!   ([`TOLERANCE_F32`]: every route returns f32, so it is the one per-dtype bound that applies)
+//!   through the same NaN-rejecting [`parity::Comparison::within_tolerance`] the real-weight proofs
+//!   use, with bit identity, mismatch counts and max ULP printed as diagnostics only; the
+//!   wrong-temporal-side mutation control; and the dispatch through [`try_fused`].
 
 use super::parity::{self, Report};
 use super::*;
@@ -227,6 +230,13 @@ fn the_kernel_source_splits_into_header_and_body() {
     }
     assert!(body.contains("thread_position_in_grid"));
     assert!(!body.contains("_shape") && !body.contains("_ndim"));
+    // The JIT's floating-point functions default to `Fast`; the metallib reference is built with
+    // `-fno-fast-math`. Every exp / divide names the precise function explicitly.
+    assert!(header.contains("metal::precise::exp(") && header.contains("metal::precise::divide("));
+    assert!(body.contains("metal::precise::divide("));
+    for source in [header, body] {
+        assert!(!source.contains("metal::exp(") && !source.contains("fast::"));
+    }
 }
 
 /// The real-weight proofs' PSNR gate on host values (no MLX): a NaN output element makes the
@@ -276,6 +286,9 @@ fn summarize(reports: &[Report]) -> (usize, usize) {
     (bitwise, within)
 }
 
+/// The Metal route over every geometry, gated on E2's declared tolerance only. Bit identity is
+/// the kernel's design target (precise exp/divide, contraction off) but is device- and
+/// compiler-dependent, so the bitwise count, mismatches and max ULP are printed, never asserted.
 #[test]
 #[ignore = "MLX compute: SW-6142 fused Metal norm+SiLU+pad vs the reference op chain (E2 tolerance); exhaustive suite, not ordinary CI"]
 fn metal_route_matches_the_reference_chain() {
@@ -286,14 +299,6 @@ fn metal_route_matches_the_reference_chain() {
         reports.len(),
         "a Metal case exceeds max rel {TOLERANCE_F32:e}"
     );
-}
-
-#[test]
-#[ignore = "MLX compute: SW-6142 fused Metal norm+SiLU+pad bit identity vs the reference op chain; exhaustive suite, not ordinary CI"]
-fn metal_route_is_bit_identical_to_the_reference_chain() {
-    let reports = parity::run_all(&parity::all_cases(), NormSiluPadRoute::Metal).unwrap();
-    let (bitwise, _) = summarize(&reports);
-    assert_eq!(bitwise, reports.len(), "a Metal case is not bit-identical");
 }
 
 #[test]

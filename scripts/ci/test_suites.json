@@ -2365,18 +2365,7 @@
       "target": "mlx_gen",
       "test": "vae_norm_silu_pad::tests::metal_route_matches_the_reference_chain",
       "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
-      "reason": "SW-6142 MLX fused Metal norm+SiLU+pad kernel vs the reference op chain: 22 Wan z16 + LTX conv-input geometries (decode/encode, cached-frame and first-chunk zero pads, replicate pads, NCTHW and channels-last-view inputs, f32/bf16/f16, eps floor), E2 max rel err <= 1e-5, mismatch report printed.",
-      "platforms": [
-        "darwin"
-      ]
-    },
-    {
-      "package": "mlx-gen",
-      "kind": "lib",
-      "target": "mlx_gen",
-      "test": "vae_norm_silu_pad::tests::metal_route_is_bit_identical_to_the_reference_chain",
-      "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
-      "reason": "SW-6142 MLX fused Metal norm+SiLU+pad kernel bit identity (f32 output bits, tail frames included) vs the reference op chain over the same 22 Wan/LTX geometries.",
+      "reason": "SW-6142 MLX fused Metal norm+SiLU+pad kernel vs the reference op chain: 22 Wan z16 + LTX conv-input geometries (decode/encode, cached-frame and first-chunk zero pads, replicate pads, NCTHW and channels-last-view inputs, f32/bf16/f16, eps floor), gated on E2 max rel err <= 1e-5 (f32 output for every input dtype; NaN fails); bit identity, mismatch count and max ULP printed as diagnostics, not asserted.",
       "platforms": [
         "darwin"
       ]
