@@ -536,19 +536,19 @@ impl AdaLayerNormOut {
         }
         let idx = timestep_indices.to_dtype(DType::U32)?;
 
-        let normed = self.norm.forward(x)?;
         let seq = s[1];
         let scale = modulation
             .scale
             .index_select(&idx, 0)?
-            .to_dtype(normed.dtype())?
+            .to_dtype(x.dtype())?
             .reshape((1, seq, self.hidden_size))?;
         let shift = modulation
             .shift
             .index_select(&idx, 0)?
-            .to_dtype(normed.dtype())?
+            .to_dtype(x.dtype())?
             .reshape((1, seq, self.hidden_size))?;
-        Ok(candle_gen::modulate::modulate(&normed, &scale, &shift)?)
+        // `norm.forward(x)` then the per-row modulation, as the shared fused AdaLN (SW-6129).
+        self.norm.adaln(x, &scale, &shift)
     }
 
     /// Recover the per-row **timestep** index from the per-row **AdaLN** index the block stack uses.

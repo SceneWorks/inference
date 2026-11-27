@@ -1142,6 +1142,18 @@ impl RmsNorm {
         __model_proof_output!(rms_weighted(x, &self.weight, self.eps))
     }
 
+    /// `forward(x) · (1 + scale) + shift` — [`crate::nn::rms_weighted`]'s f32 RMS times the f32
+    /// weight, cast back to `x`'s dtype, then the modulation in `x`'s dtype (`scale` / `shift` `[B|1,
+    /// S|1, hidden]` in `x`'s dtype) — as the shared fused AdaLN over that exact chain (SW-6129):
+    /// one launch on CUDA, the chain itself elsewhere.
+    pub fn adaln(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+        let w = self.weight.to_dtype(DType::F32)?;
+        let spec = candle_gen::modulate::AdaLnChain::rms(self.eps).with_weight(&w);
+        __model_proof_output!(Ok(candle_gen::modulate::adaln_chain(
+            x, &spec, scale, shift
+        )?))
+    }
+
     /// The one tensor name this norm consumes.
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]

@@ -20,7 +20,7 @@ use candle_gen::rope::GeometryCache;
 use candle_gen_wan::rope::apply_rope;
 
 use crate::common::{
-    conv_as_linear, linear, ln_affine, ln_no_affine, packed_linear, patchify, rms, sdpa, unpatchify,
+    conv_as_linear, linear, ln_affine, packed_linear, patchify, rms, sdpa, unpatchify,
 };
 use crate::config::Scail2Config;
 use crate::rope::ScailRope;
@@ -29,9 +29,13 @@ use crate::rope::ScailRope;
 /// `cfg.eps` (1e-6) instead.
 const IMG_LN_EPS: f64 = 1e-5;
 
-// adaLN affine `m·(1+scale)+shift` (broadcasting `scale`/`shift` `[1,1,dim]` over the token axis):
-// the shared composable modulate (SW-6129); the norm feeding it is the composable `ln_no_affine`.
-use candle_gen::modulate::modulate;
+/// The SCAIL-2 AdaLN `modulate(ln_no_affine(x), scale, shift)` — the f32 non-affine LayerNorm
+/// (`common::ln_no_affine`, now the test oracle) modulated in f32 by `[1,1,dim]` rows — as the shared fused AdaLN over that exact
+/// composable chain (SW-6129): one launch on CUDA, the chain itself elsewhere.
+fn scail_adaln(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(eps).modulate_in(DType::F32);
+    candle_gen::modulate::adaln_chain(x, &spec, scale, shift)
+}
 
 /// Gated residual `x + y·gate`.
 fn gated(x: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {
@@ -194,7 +198,7 @@ impl Block {
         let p = |i: usize| -> Result<Tensor> { m.narrow(1, i, 1) }; // [1, 1, dim]
 
         // self-attention
-        let x_mod = modulate(&ln_no_affine(x, self.eps)?, &p(1)?, &p(0)?)?;
+        let x_mod = scail_adaln(x, self.eps, &p(1)?, &p(0)?)?;
         let y = self.self_attn.forward(&x_mod, cos, sin)?;
         let x = gated(x, &y, &p(2)?)?;
         // cross-attention (affine LN, ungated)
@@ -202,7 +206,7 @@ impl Block {
         let cx = self.cross.forward(&x_cross, text_ctx, img_ctx)?;
         let x = (x + cx)?;
         // feed-forward
-        let x_mod = modulate(&ln_no_affine(&x, self.eps)?, &p(4)?, &p(3)?)?;
+        let x_mod = scail_adaln(&x, self.eps, &p(4)?, &p(3)?)?;
         let y = self.ffn2.forward(&self.ffn0.forward(&x_mod)?.gelu()?)?;
         gated(&x, &y, &p(5)?)
     }
@@ -490,7 +494,7 @@ impl Scail2Dit {
             .broadcast_add(&e.reshape((1, 1, self.cfg.dim))?)?; // [1, 2, dim]
         let shift = m.narrow(1, 0, 1)?;
         let scale = m.narrow(1, 1, 1)?;
-        let x_mod = modulate(&ln_no_affine(x, self.cfg.eps)?, &scale, &shift)?;
+        let x_mod = scail_adaln(x, self.cfg.eps, &scale, &shift)?;
         __model_proof_output!(self.head.forward(&x_mod))
     }
 
@@ -890,5 +894,116 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::q4_and_q8_forwards_consume_additional_references_without_dense_fallback");
+    }
+}
+
+/// SW-6129: the SCAIL-2 AdaLN sites are the shared fused AdaLN over the exact former chain.
+#[cfg(test)]
+mod scail_adaln_route_tests {
+    use super::*;
+    use crate::common::ln_no_affine;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 site, verbatim: `modulate(&ln_no_affine(x, eps)?, scale, shift)`.
+    fn former(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Tensor {
+        ln_no_affine(x, eps)
+            .unwrap()
+            .broadcast_mul(&(scale + 1.0).unwrap())
+            .unwrap()
+            .broadcast_add(shift)
+            .unwrap()
+    }
+
+    /// `x` `[1, L, dim]` and `[1,1,dim]` rows strided out of the `[1, 6, dim]` modulation table.
+    fn operands(dim: usize, dt: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let x = values(&[1, 45, dim], 1, 3.0, 0.2, dev)
+            .to_dtype(dt)
+            .unwrap();
+        let m = values(&[1, 6, dim], 2, 0.5, 0.0, dev);
+        (x, m.narrow(1, 1, 1).unwrap(), m.narrow(1, 0, 1).unwrap())
+    }
+
+    #[test]
+    fn scail_adaln_matches_the_former_chain() {
+        for dim in [1536usize, 5120] {
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (x, scale, shift) = operands(dim, dt, &Device::Cpu);
+                let got = scail_adaln(&x, 1e-6, &scale, &shift).unwrap();
+                assert_eq!(got.dtype(), DType::F32);
+                assert_eq!(
+                    bits(&got),
+                    bits(&former(&x, 1e-6, &scale, &shift)),
+                    "dim={dim} {dt:?}"
+                );
+            }
+        }
+    }
+
+    /// CUDA (the SCAIL-2 DiT streams f32; a bf16 input is the cast-on-load case): the fused kernel
+    /// serves every call and is bit-identical to the switch-off reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x32, scale, shift) = operands(5120, DType::F32, &dev);
+        let xb = x32.to_dtype(DType::BF16).unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    scail_adaln(&x32, 1e-6, &scale, &shift).unwrap(),
+                    scail_adaln(&xb, 1e-6, &scale, &shift).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "scail2 adaln (f32 + bf16 input, dim 5120): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

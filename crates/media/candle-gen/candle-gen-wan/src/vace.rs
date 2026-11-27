@@ -24,7 +24,7 @@ use crate::config::WanVaceConfig;
 use crate::model_vace::ProviderVae;
 use crate::quant::QLinear;
 use crate::scheduler::{Sampler, WanNativeDriver};
-use crate::transformer::{ln_no_affine, timestep_sinusoid, Block, PreparedBlockCrossKv};
+use crate::transformer::{timestep_sinusoid, Block, PreparedBlockCrossKv};
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
 const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
@@ -312,8 +312,7 @@ impl WanVaceTransformer {
         let scale = head_mod.narrow(1, 1, 1)?;
         let hf = hidden.to_dtype(DType::F32)?;
         let normed =
-            candle_gen::modulate::modulate(&ln_no_affine(&hf, self.cfg.base.eps)?, &scale, &shift)?
-                .to_dtype(self.dtype)?;
+            crate::transformer::wan_adaln(&hf, self.cfg.base.eps, &scale, &shift, self.dtype)?;
         let out = self.proj_out.forward(&normed)?; // [B,L,out_c*patch]
         out.reshape(&[b, ppf, pph, ppw, pt, ph, pw, oc][..])?
             .permute(&[0usize, 7, 1, 4, 2, 5, 3, 6][..])?

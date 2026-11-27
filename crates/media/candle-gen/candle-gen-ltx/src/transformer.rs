@@ -35,10 +35,23 @@ fn linear(vb: &VarBuilder, key: &str) -> Result<QLinear> {
     qlinear(vb, key, true)
 }
 
-// `x·(1+scale)+shift` (scale/shift `[B,1,inner]` broadcast over the token axis) is the shared
-// composable modulate (SW-6129); the norm feeding it (`rms_noweight` / `layer_norm_noaffine`) is a
-// composable f32 chain, not candle's `ops::rms_norm`, so the fused `adaln` would not be exact here.
-use candle_gen::modulate::modulate;
+// `x·(1+scale)+shift` (scale/shift `[B,1|S,inner]`) is the shared composable modulate (SW-6129) for
+// the one site without a norm (the prompt-modulated text context); every norm + modulate site is
+// the shared fused AdaLN over its exact composable chain (`ltx_rms_adaln` / `ltx_head_adaln`).
+use candle_gen::modulate::{adaln_chain, modulate, AdaLnChain};
+
+/// `modulate(rms_noweight(x, eps), scale, shift)` — the weightless f32 RMS `x · recip(sqrt(mean(x²) +
+/// eps))` cast back to `x`'s dtype, then `· (1 + scale) + shift` — as the shared fused AdaLN over that
+/// exact chain (SW-6129): one launch on CUDA, the chain itself elsewhere.
+fn ltx_rms_adaln(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    adaln_chain(x, &AdaLnChain::rms_recip(eps), scale, shift)
+}
+
+/// `modulate(layer_norm_noaffine(x, eps), scale, shift)` (the output head) as the shared fused AdaLN
+/// over the f32 non-affine LayerNorm chain cast back (SW-6129).
+fn ltx_head_adaln(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    adaln_chain(x, &AdaLnChain::layer(eps), scale, shift)
+}
 
 /// `x + out·gate`; gate `[B,1,inner]` broadcasts over `out [B,S,inner]`.
 fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
@@ -67,7 +80,9 @@ fn apply_keyframes_embedding(
     x + marker
 }
 
-/// Weightless RMSNorm (unit weight) over the last axis, in f32.
+/// Weightless RMSNorm (unit weight) over the last axis, in f32 — the chain [`ltx_rms_adaln`] fuses;
+/// kept as the tests' oracle.
+#[cfg(test)]
 fn rms_noweight(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?.contiguous()?;
     let inv = (xf.sqr()?.mean_keepdim(D::Minus1)? + eps)?
@@ -393,7 +408,9 @@ impl AdaLayerNormSingle {
     }
 }
 
-/// Affine-false LayerNorm over the last axis (computed in f32, cast back).
+/// Affine-false LayerNorm over the last axis (computed in f32, cast back) — the chain
+/// [`ltx_head_adaln`] fuses; kept as the tests' oracle.
+#[cfg(test)]
 fn layer_norm_noaffine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?.contiguous()?;
     let mean = xf.mean_keepdim(D::Minus1)?;
@@ -556,9 +573,8 @@ impl AvStream {
         scales: &ScaleContext<'_>,
     ) -> Result<Tensor> {
         let (scale, shift) = output_scale_shift(&self.scale_shift_table, emb_ts, self.inner)?;
-        let normed = layer_norm_noaffine(h, self.eps)?;
         self.proj_out
-            .forward_with_scales(&modulate(&normed, &scale, &shift)?, scales)
+            .forward_with_scales(&ltx_head_adaln(h, self.eps, &scale, &shift)?, scales)
     }
 }
 
@@ -925,7 +941,7 @@ impl AvBlock {
     ) -> Result<Tensor> {
         let x = if run_self {
             let msa = ada_values(sst, a.ts_emb, 0, 3)?;
-            let norm = modulate(&rms_noweight(x, self.eps)?, &msa[1], &msa[0])?;
+            let norm = ltx_rms_adaln(x, self.eps, &msa[1], &msa[0])?;
             let attn = attn1.forward(&norm, None, Some((a.cos, a.sin)), None, a.scales)?;
             gated(x, &attn, &msa[2])?
         } else {
@@ -936,7 +952,7 @@ impl AvBlock {
         let context = modulate(a.context, &p[1], &p[0])?;
 
         let ca = ada_values(sst, a.ts_emb, 6, 9)?;
-        let norm_ca = modulate(&rms_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
+        let norm_ca = ltx_rms_adaln(&x, self.eps, &ca[1], &ca[0])?;
         let cross = attn2.forward(&norm_ca, Some(&context), None, None, a.scales)?;
         gated(&x, &cross, &ca[2])
     }
@@ -949,7 +965,7 @@ impl AvBlock {
         args: &AvStreamArgs<'_>,
     ) -> Result<Tensor> {
         let mlp = ada_values(sst, args.ts_emb, 3, 6)?;
-        let norm = modulate(&rms_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
+        let norm = ltx_rms_adaln(x, self.eps, &mlp[1], &mlp[0])?;
         let ff_out = ff.forward(&norm, args.scales)?;
         gated(x, &ff_out, &mlp[2])
     }
@@ -984,9 +1000,10 @@ impl AvBlock {
         )?;
 
         if control.run_cross_modal {
-            // Cross-modal — both directions read the pre-update rms_norm snapshots.
-            let vx_n3 = rms_noweight(&vx, self.eps)?;
-            let ax_n3 = rms_noweight(&ax, self.eps)?;
+            // Cross-modal — both directions read the pre-update rms_norm snapshots: each modulation
+            // re-normalizes the pre-update stream inside the fused AdaLN (deterministic, so every
+            // use sees the same norm as the former single snapshot).
+            let (vx_n3, ax_n3) = (vx.clone(), ax.clone());
             let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
                 &self.ca_audio_ss,
                 &self.ca_audio_gate,
@@ -1002,8 +1019,8 @@ impl AvBlock {
 
             // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
             let a2v = self.a2v.forward(
-                &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
-                Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+                &ltx_rms_adaln(&vx_n3, self.eps, &scv_a2v, &shv_a2v)?,
+                Some(&ltx_rms_adaln(&ax_n3, self.eps, &sca_a2v, &sha_a2v)?),
                 Some((v.cross_cos, v.cross_sin)),
                 Some((a.cross_cos, a.cross_sin)),
                 v.scales,
@@ -1012,8 +1029,8 @@ impl AvBlock {
 
             // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
             let v2a = self.v2a.forward(
-                &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
-                Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+                &ltx_rms_adaln(&ax_n3, self.eps, &sca_v2a, &sha_v2a)?,
+                Some(&ltx_rms_adaln(&vx_n3, self.eps, &scv_v2a, &shv_v2a)?),
                 Some((a.cross_cos, a.cross_sin)),
                 Some((v.cross_cos, v.cross_sin)),
                 a.scales,
@@ -2478,5 +2495,111 @@ impl LoraHost for AvDiT {
                 "ltx training refuses a streamed transformer: trainable adapters must remain attached to the resident AV blocks".into(),
             )),
         }
+    }
+}
+
+/// SW-6129: the LTX DiT AdaLN sites (block self / text-cross / cross-modal / FFN modulations and
+/// the output head) are the shared fused AdaLN over their exact former chains.
+#[cfg(test)]
+mod ltx_adaln_route_tests {
+    use super::*;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// `x` `[2, 33, inner]` in `dt` and per-token `[2, 33, inner]` modulation from `ada_values` (a
+    /// 9-row table plus the token-wise timestep embedding), as the blocks build it.
+    fn operands(inner: usize, dt: DType, dev: &Device) -> (Tensor, Vec<Tensor>) {
+        let x = values(&[2, 33, inner], 1, 3.0, 0.3, dev)
+            .to_dtype(dt)
+            .unwrap();
+        let table = values(&[9, inner], 2, 0.3, 0.0, dev).to_dtype(dt).unwrap();
+        let ts = values(&[2, 33, 9 * inner], 3, 0.3, 0.0, dev)
+            .to_dtype(dt)
+            .unwrap();
+        (x, ada_values(&table, &ts, 0, 3).unwrap())
+    }
+
+    /// CPU: both fused sites are bit-identical to `modulate(rms_noweight(x))` /
+    /// `modulate(layer_norm_noaffine(x))` at the video (4096) and audio (2048) widths.
+    #[test]
+    fn ltx_adaln_matches_the_former_chains() {
+        for inner in [2048usize, 4096] {
+            for dt in [DType::BF16, DType::F32, DType::F16] {
+                let (x, m) = operands(inner, dt, &Device::Cpu);
+                let rms_former = modulate(&rms_noweight(&x, 1e-6).unwrap(), &m[1], &m[0]).unwrap();
+                let rms = ltx_rms_adaln(&x, 1e-6, &m[1], &m[0]).unwrap();
+                assert_eq!(bits(&rms), bits(&rms_former), "rms {inner} {dt:?}");
+                let head_former =
+                    modulate(&layer_norm_noaffine(&x, 1e-6).unwrap(), &m[1], &m[0]).unwrap();
+                let head = ltx_head_adaln(&x, 1e-6, &m[1], &m[0]).unwrap();
+                assert_eq!(bits(&head), bits(&head_former), "head {inner} {dt:?}");
+            }
+        }
+    }
+
+    /// CUDA bf16: the RMS and head AdaLN forms take the fused kernel, bit-identical to the
+    /// switch-off reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, m) = operands(4096, DType::BF16, &dev);
+        let run = || {
+            Tensor::cat(
+                &[
+                    ltx_rms_adaln(&x, 1e-6, &m[1], &m[0]).unwrap(),
+                    ltx_head_adaln(&x, 1e-6, &m[1], &m[0]).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "ltx adaln (bf16, inner 4096, per-token): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

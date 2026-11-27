@@ -267,7 +267,40 @@ impl AdaLnProjection {
     }
 }
 
-/// `x · (1 + scale[idx]) + shift[idx]`, gathering one modulation row per sequence row.
+/// `scale[idx]` / `shift[idx]` gathered one modulation row per sequence row, as `[1, rows, hidden]`
+/// in `dtype`.
+fn modulation_rows(
+    scale: &Tensor,
+    shift: &Tensor,
+    indices: &Tensor,
+    rows: usize,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let gather = |t: &Tensor| -> Result<Tensor> {
+        Ok(t.index_select(indices, 0)?
+            .to_dtype(dtype)?
+            .reshape((1, rows, t.dims()[1]))?)
+    };
+    Ok((gather(scale)?, gather(shift)?))
+}
+
+/// `norm(x) · (1 + scale[idx]) + shift[idx]` — the block's weighted RMSNorm then the per-row
+/// gathered modulation — as the shared fused AdaLN over that exact chain ([`RmsNorm::adaln`],
+/// SW-6129). Bit-identical to `modulate(&norm.forward(x)?, scale, shift, indices)`.
+fn norm_modulate(
+    norm: &RmsNorm,
+    x: &Tensor,
+    scale: &Tensor,
+    shift: &Tensor,
+    indices: &Tensor,
+) -> Result<Tensor> {
+    let (scale, shift) = modulation_rows(scale, shift, indices, x.dims()[1], x.dtype())?;
+    norm.adaln(x, &scale, &shift)
+}
+
+/// `x · (1 + scale[idx]) + shift[idx]`, gathering one modulation row per sequence row (the
+/// pre-SW-6129 form over an already-normalized `x`; the tests' oracle).
+#[cfg(test)]
 fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, indices: &Tensor) -> Result<Tensor> {
     let rows = x.dims()[1];
     let scale = scale
@@ -633,8 +666,9 @@ impl DitBlock {
         let rows = s[1];
 
         let x = {
-            let normed = modulate(
-                &self.norm1.forward(x)?,
+            let normed = norm_modulate(
+                &self.norm1,
+                x,
                 &modulation.scale_msa,
                 &modulation.shift_msa,
                 &idx,
@@ -650,8 +684,9 @@ impl DitBlock {
             x.add(&gate.broadcast_mul(&attn)?)?
         };
 
-        let normed = modulate(
-            &self.norm2.forward(&x)?,
+        let normed = norm_modulate(
+            &self.norm2,
+            &x,
             &modulation.scale_mlp,
             &modulation.shift_mlp,
             &idx,
@@ -1032,5 +1067,121 @@ mod tests {
         )
         .expect_err("a mis-shaped packed projection must be refused");
         assert!(err.to_string().contains("expected"), "{err}");
+    }
+}
+
+/// SW-6129: the MiniMax-H3 DiT AdaLN sites (block norm1 / norm2 per-row modulation and
+/// `norm_out`) are the shared fused AdaLN over the exact former chain.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// A loaded `RmsNorm` (weight at `dt`), `x` `[1, 40, hidden]`, a 6-row f32 modulation table
+    /// pair and per-row indices into it.
+    #[allow(clippy::type_complexity)]
+    fn operands(
+        hidden: usize,
+        dt: DType,
+        dev: &Device,
+    ) -> (RmsNorm, Tensor, Tensor, Tensor, Tensor) {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "n.weight".to_string(),
+            values(&[hidden], 7, 0.4, 1.0, &Device::Cpu),
+        );
+        let norm = RmsNorm::from_weights(&Weights::from_map(map), "n", 1e-5, dt).unwrap();
+        let norm = norm.copy_to_device(dev).unwrap();
+        let x = values(&[1, 40, hidden], 1, 3.0, 0.2, dev)
+            .to_dtype(dt)
+            .unwrap();
+        let scale = values(&[6, hidden], 2, 0.4, 0.0, dev);
+        let shift = values(&[6, hidden], 3, 0.4, 0.0, dev);
+        let idx: Vec<u32> = (0..40u32).map(|i| (i * 7) % 6).collect();
+        let idx = Tensor::from_vec(idx, 40, dev).unwrap();
+        (norm, x, scale, shift, idx)
+    }
+
+    /// CPU: `norm_modulate` is bit-identical to `modulate(&norm.forward(x)?, ...)` (the former
+    /// block site), f32 / bf16 / f16, at the H3 width (5376) and a small one.
+    #[test]
+    fn norm_modulate_matches_the_former_chain() {
+        for hidden in [96usize, 5376] {
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (norm, x, scale, shift, idx) = operands(hidden, dt, &Device::Cpu);
+                let former = modulate(&norm.forward(&x).unwrap(), &scale, &shift, &idx).unwrap();
+                let got = norm_modulate(&norm, &x, &scale, &shift, &idx).unwrap();
+                assert_eq!(got.dtype(), dt);
+                assert_eq!(bits(&got), bits(&former), "hidden={hidden} {dt:?}");
+            }
+        }
+    }
+
+    /// CUDA bf16: the block AdaLN takes the fused kernel, bit-identical to the switch-off
+    /// reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (norm, x, scale, shift, idx) = operands(5376, DType::BF16, &dev);
+        let run = || {
+            Tensor::cat(
+                &[
+                    norm_modulate(&norm, &x, &scale, &shift, &idx).unwrap(),
+                    norm_modulate(&norm, &x, &shift, &scale, &idx).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "minimax-h3 adaln (bf16, hidden 5376, per-row): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }
