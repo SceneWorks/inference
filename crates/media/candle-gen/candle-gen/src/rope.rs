@@ -10,15 +10,24 @@
 //! [`rms_norm_rope_reference`]) as oracle and fallback.
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::rotary_emb::rope_i;
+
+/// The convention of [`apply_interleaved_rope`]: interleaved pairs, `[B, H, S, head_dim]`, f32 math.
+pub const INTERLEAVED_BHSD_F32: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhsd);
 
 /// Apply **interleaved** RoPE (lanes `2i`/`2i+1` are the real/imag pair) to `x` `[B, H, S, head_dim]`
-/// with `cos`/`sin` `[S, head_dim/2]`, via candle's fused `rope_i`. The rotation runs in f32 (the
-/// tables are f32) and the result is cast back to `x`'s dtype.
+/// with `cos`/`sin` `[S, head_dim/2]` (or `[B, S, head_dim/2]`). The rotation runs in f32 (the tables
+/// are f32) and the result is cast back to `x`'s dtype.
+///
+/// SW-6129: this is [`apply_rope`] with [`INTERLEAVED_BHSD_F32`] — the fused strided kernel on CUDA
+/// (no f32 / contiguous copy of `x`), the shared reference chain everywhere else. It used to be
+/// candle's `rope_i` on an f32 contiguous copy: on CPU the reference chain is **bit-identical** to
+/// `rope_i` (both round each product, then the sum; `cpu_rope_i_equals_the_shared_interleaved_chain`
+/// pins it). On CUDA, nvcc contracts `rope_i`'s `a·c − b·s` into an fma while the fused kernel
+/// reproduces the chain's separately rounded products, so the two differ by at most one rounding of
+/// a product — the declared tolerance of `interleaved_rope_gpu` (f32 ≤ 1e-6 of the operand scale; at
+/// most one ulp of the output dtype after the cast).
 pub fn apply_interleaved_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    rope_i(&xf, cos, sin)?.to_dtype(dtype)
+    apply_rope(x, cos, sin, &INTERLEAVED_BHSD_F32)
 }
 
 // ── The shared RoPE apply (SW-6128): one API for every pairing / layout / precision ─────────────
@@ -936,5 +945,31 @@ mod tests {
         assert_eq!(failed.get_or_build(7, || Ok::<_, ()>(70)), Ok(70));
         failed.clear();
         assert_eq!(failed.get_or_build(7, || Ok::<_, ()>(71)), Ok(71));
+    }
+
+    /// SW-6129: [`apply_interleaved_rope`] now runs the shared chain off CUDA; on CPU that chain is
+    /// bit-identical to the candle `rope_i` it replaced (f32 contiguous copy, rotate, cast back), for
+    /// shared `[S, W]` and per-batch `[B, S, W]` tables, f32 / bf16 / f16 and a non-contiguous `x`.
+    #[test]
+    fn cpu_rope_i_equals_the_shared_interleaved_chain() {
+        use candle_nn::rotary_emb::rope_i;
+        let (b, h, s, d) = (2, 3, 7, 10);
+        let angles = (randn(&[b, s, d / 2], 5) * 3.0).unwrap();
+        let (cos3, sin3) = (angles.cos().unwrap(), angles.sin().unwrap());
+        let cos2 = cos3.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+        let sin2 = sin3.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+        // A permuted view: `[B, S, H, D]` storage read as `[B, H, S, D]`.
+        let bshd = randn(&[b, s, h, d], 6);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = bshd.to_dtype(dtype).unwrap().transpose(1, 2).unwrap();
+            for (cos, sin) in [(&cos2, &sin2), (&cos3, &sin3)] {
+                let xf = x.to_dtype(DType::F32).unwrap().contiguous().unwrap();
+                let want = rope_i(&xf, cos, sin).unwrap().to_dtype(dtype).unwrap();
+                let got = apply_interleaved_rope(&x, cos, sin).unwrap();
+                assert_eq!(got.dims(), want.dims());
+                assert_eq!(got.dtype(), dtype);
+                assert_eq!(bits(&got), bits(&want), "{dtype:?} table {:?}", cos.dims());
+            }
+        }
     }
 }

@@ -43,6 +43,9 @@ mod fused_rope_gpu;
 #[path = "int8_per_channel_numerics.rs"]
 mod int8_per_channel_numerics;
 
+#[path = "interleaved_rope_gpu.rs"]
+mod interleaved_rope_gpu;
+
 #[path = "load_progress.rs"]
 mod load_progress;
 

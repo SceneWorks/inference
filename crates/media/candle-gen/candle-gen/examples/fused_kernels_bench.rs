@@ -44,6 +44,9 @@ mod adaln;
 #[cfg(feature = "cuda")]
 #[path = "fused_kernels_bench/rope.rs"]
 mod rope;
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/rope_routes.rs"]
+mod rope_routes;
 
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
@@ -51,6 +54,7 @@ const SUITES: &[(&str, harness::Suite)] = &[
     ("act_quant", act_quant::rows),
     ("adaln", adaln::rows),
     ("rope", rope::rows),
+    ("rope_routes", rope_routes::rows),
 ];
 
 #[cfg(feature = "cuda")]
