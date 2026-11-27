@@ -9,10 +9,10 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, CancelFlag, Capabilities, GenerationOutput, GenerationReport, GenerationRequest,
-    Generator, Image, LoadShape, LoadSpec, MemoryAssetFacts, MemoryProviderContract,
-    MemoryRunContext, MemorySafetyDecision, Modality, ModelDescriptor, OffloadPolicy,
-    PerComponentBytes, Precision, Progress, SizeFloor, WeightsSource,
+    self, CancelFlag, GenerationOutput, GenerationReport, GenerationRequest, Generator, Image,
+    LoadShape, LoadSpec, MemoryAssetFacts, MemoryProviderContract, MemoryRunContext,
+    MemorySafetyDecision, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes, Precision,
+    Progress, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError as Error, Result};
 use candle_gen_sdxl::vae_decoder::SdxlVaeDecoder;
@@ -31,33 +31,100 @@ use crate::dit::SupraDit;
 use crate::memory_strategy;
 use crate::sampling::{self, ContextBatch};
 
-/// The weights-free descriptor (the MLX twin's, with `backend = "candle"` and `mac_only = false`).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // The SD VAE's 4-channel f8 latent, scaled by 0.18215 — the same space SVD's VAE consumes.
-        denoiser_output_latent_space: Some(&gen_core::SVD_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
-        id: PROVIDER_ID,
+/// Primary typed route declaration for Candle Supra2-IMG (`REG-1`, `AP5`).
+pub(crate) fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: PROVIDER_ID,
         family: s2::FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: true,
-            samplers: vec![s2::SAMPLER],
-            schedulers: vec![s2::SCHEDULER],
-            supported_guidance_methods: vec!["cfg"],
-            min_size: s2::IMAGE_SIZE,
-            max_size: s2::IMAGE_SIZE,
-            max_count: s2::MAX_IMAGES,
-            size_floor: SizeFloor::RangeChecked,
-            mac_only: false,
-            max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "flan_t5_base",
+                    Some(s2::MAX_PROMPT_TOKENS),
+                )],
+                max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                supports_negative_prompt: false,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec![s2::SAMPLER],
+                schedulers: vec![s2::SCHEDULER],
+                guidance_methods: vec!["cfg"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "supra2_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sd_vae_ft_mse"),
+                output_latent_space: Some(&gen_core::SVD_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["flan_t5_base"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["supra2_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sd_vae_ft_mse"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: s2::IMAGE_SIZE,
+            max_size: s2::IMAGE_SIZE,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: s2::MAX_IMAGES,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(s2::DEFAULT_STEPS),
+            guidance: Some(s2::DEFAULT_GUIDANCE),
+            sampler: Some(s2::SAMPLER),
+            schedule: Some(s2::SCHEDULER),
+            dimensions: Some((s2::IMAGE_SIZE, s2::IMAGE_SIZE)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_footprint(footprint)
+            .with_memory_registration(MEMORY)
+            .with_resident_only_memory(memory_strategy::witness_specs, memory_strategy::witness),
     }
+}
+
+/// The weights-free descriptor — computed from [`route`].
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// The SD VAE ft-MSE AutoencoderKL geometry ([`gen_core_checkpoint::supra2`]'s pinned constants).
@@ -578,8 +645,6 @@ fn footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
         vae: f.decoder_bytes,
     })
 }
-
-candle_gen::register_generators! {pub(crate) const REGISTRATION = descriptor => load; footprint = footprint}
 
 pub(crate) const MEMORY: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: PROVIDER_ID,

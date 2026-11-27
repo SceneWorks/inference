@@ -290,7 +290,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
     for frame in frames {
         save_rgb8_png_in(
             &artifact_dir(),
-            &format!("{}.png", &format!("{name}_frame{:02}", frame.current)),
+            &format!("{name}_frame{:02}.png", frame.current),
             &frame.image.pixels,
             frame.image.width,
             frame.image.height,
@@ -298,7 +298,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
     }
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("{name}_strip")),
+        &format!("{name}_strip.png"),
         &strip,
         width,
         height,
@@ -631,7 +631,7 @@ fn render_and_assert(
     save_strip(&frames, &name);
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("{name}_final")),
+        &format!("{name}_final.png"),
         &active.pixels,
         active.width,
         active.height,

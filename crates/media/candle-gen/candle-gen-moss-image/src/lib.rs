@@ -789,40 +789,109 @@ fn component_dtypes(mode: MossImageAcceleration, cpu: bool) -> BTreeMap<String, 
     }
     d
 }
-fn descriptor(v: MossImageVariant) -> ModelDescriptor {
-    ModelDescriptor {
-        id: v.provider_id(),
+pub(crate) fn route(v: MossImageVariant) -> gen_core::RouteRecord {
+    let bindings = match v {
+        MossImageVariant::Base => gen_core::RouteBindings::generator(descriptor_base, load_base)
+            .with_footprint(footprint_base)
+            .with_memory(contract_base, memory_strategy::safety_check)
+            .with_resident_only_memory(witness_specs, witness_base),
+        MossImageVariant::Sft => gen_core::RouteBindings::generator(descriptor_sft, load_sft)
+            .with_footprint(footprint_sft)
+            .with_memory(contract_sft, memory_strategy::safety_check)
+            .with_resident_only_memory(witness_specs, witness_sft),
+    };
+    gen_core::RouteRecord {
+        route_id: v.provider_id(),
         family: "moss_image",
         backend: "candle",
         modality: Modality::Image,
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
-        control_kinds: None,
-        required_components: if v == MossImageVariant::Base {
-            &[MOSS_SHARED_SNAPSHOT_COMPONENT]
-        } else {
-            &[]
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen35", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["euler"],
+                schedulers: vec!["moss_training_grid"],
+                guidance_methods: vec!["cfg"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("moss_image_dit")
+                    .with_pag(moss_image_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux2_vae"),
+                output_latent_space: Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen35"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["moss_image_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux2_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: if v == MossImageVariant::Base {
+                    &[MOSS_SHARED_SNAPSHOT_COMPONENT]
+                } else {
+                    &[]
+                },
+                ..Default::default()
+            },
+            ..Default::default()
         },
-        capabilities: Capabilities {
-            supports_lora: true,
-            supports_lokr: true,
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_prompt_batch: true,
-            supports_sequential_offload: true,
-            samplers: vec!["euler"],
-            schedulers: vec!["moss_training_grid"],
-            supported_guidance_methods: vec!["cfg"],
+        limits: gen_core::ProductLimits {
             min_size: SIZE_MULTIPLE,
             max_size: u32::MAX,
-            max_count: u32::MAX,
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
-            pag: Some(moss_image_pag_capability()),
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: u32::MAX,
+            supports_prompt_batch: true,
+        },
+        defaults: gen_core::RouteDefaults {
+            sampler: Some("euler"),
+            schedule: Some("moss_training_grid"),
+            dimensions: Some((1024, 1024)),
             ..Default::default()
         },
+        bindings,
     }
+}
+fn descriptor(v: MossImageVariant) -> ModelDescriptor {
+    route(v).compute_descriptor()
 }
 /// Frozen Base descriptor.
 pub fn descriptor_base() -> ModelDescriptor {
@@ -866,9 +935,8 @@ fn contract_sft(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
         &Sources::new(MossImageVariant::Sft, spec)?,
     )
 }
-candle_gen::register_generators! {pub(crate) const BASE_REGISTRATION=descriptor_base=>load_base;footprint=footprint_base}
-candle_gen::register_generators! {pub(crate) const SFT_REGISTRATION=descriptor_sft=>load_sft;footprint=footprint_sft}
-/// Compose both frozen generator, footprint and memory registrations.
+/// Compose both frozen generator, footprint and memory registrations via one-call
+/// [`ProviderRegistryBuilder::register_route`] (`SW-6979`, `REG-1`).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     registry
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
@@ -882,30 +950,10 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
             }],
             ..gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER
         })
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(SFT_REGISTRATION)
+        .register_route(route(MossImageVariant::Base))
+        .register_route(route(MossImageVariant::Sft))
         .register_trainer(training::BASE_REGISTRATION)
         .register_trainer(training::SFT_REGISTRATION)
-        .register_memory_strategy(MemoryRegistration {
-            provider_id: "moss_image_base",
-            contract: contract_base,
-            safety_check: memory_strategy::safety_check,
-        })
-        .register_memory_strategy(MemoryRegistration {
-            provider_id: "moss_image_sft",
-            contract: contract_sft,
-            safety_check: memory_strategy::safety_check,
-        })
-        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: "moss_image_base",
-            contract: witness_base,
-            surface_specs: witness_specs,
-        })
-        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: "moss_image_sft",
-            contract: witness_sft,
-            surface_specs: witness_specs,
-        })
 }
 
 fn witness_specs() -> Vec<MemoryContractSurfaceSpec> {

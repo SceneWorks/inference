@@ -668,14 +668,14 @@ fn fit_preview_rgb() {
             );
             save_rgb8_png_in(
                 &artifact_dir(),
-                &format!("{}.png", &format!("fit_{split}_{index}_decoded")),
+                &format!("fit_{split}_{index}_decoded.png"),
                 &pair.decoded.pixels,
                 pair.decoded.width,
                 pair.decoded.height,
             );
             save_rgb8_png_in(
                 &artifact_dir(),
-                &format!("{}.png", &format!("fit_{split}_{index}_projected")),
+                &format!("fit_{split}_{index}_projected.png"),
                 &shipped.pixels,
                 shipped.width,
                 shipped.height,

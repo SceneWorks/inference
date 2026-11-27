@@ -75,13 +75,19 @@ pub use model::{
 };
 pub use stages::StageSet;
 
-/// Add the six YuE generators to an explicit audio registry builder (catalog composition).
+/// Add the six YuE generators to an explicit audio registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    REGISTRATIONS
-        .into_iter()
-        .fold(registry, |r, reg| r.register_generator(reg))
+    registry
+        .register_route(model::route_en_cot())
+        .register_route(model::route_en_icl())
+        .register_route(model::route_zh_cot())
+        .register_route(model::route_zh_icl())
+        .register_route(model::route_jp_kr_cot())
+        .register_route(model::route_jp_kr_icl())
 }
 
 /// Build this crate's own explicit provider catalog.

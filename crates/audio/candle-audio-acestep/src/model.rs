@@ -32,9 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
-    self, AudioEditMode, AudioTrack, Capabilities, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, StepSupport,
-    WeightsSource,
+    self, AudioEditMode, AudioTrack, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 
@@ -192,61 +191,109 @@ pub const MAX_STEPS: u32 = 200;
 /// set the model card names — the code is advisory, not a model switch).
 pub const LANGUAGES: &[&str] = &["en", "zh", "ja", "ko", "fr", "de", "es", "it", "pt", "ru"];
 
-/// ACE-Step's identity + capabilities — constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component ([`COVER_COMPONENT_ID`] =
-        // `sft_cover`, read only for a Cover request), NOT a hard requirement — text2music + the
-        // region edit modes load without it — so it is deliberately absent here (mirrors LTX's
-        // optional `uncensored_enhancer`).
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for ACE-Step v1.5 turbo (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "acestep",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            // The turbo checkpoint is guidance-distilled: CFG is baked into the weights, so no
-            // negative-prompt / guidance surface is advertised (an explicit value is a typed
-            // Unsupported / ignored, never a second forward).
-            supports_negative_prompt: false,
-            // Prompted source-audio editing (sc-12847): the SAME turbo weights natively serve
-            // ACE-Step's audio-to-audio task modes, so the edit capability rides this existing
-            // generator via a new conditioning kind rather than a distinct provider id.
-            conditioning: vec![ConditioningKind::AudioEdit],
-            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
-            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
-            // unused 0 rather than a nominal placeholder bound.
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen3_embedding_0_6b",
+                    None,
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Prompted source-audio editing (sc-12847): the SAME turbo weights natively serve
+                // ACE-Step's audio-to-audio task modes.
+                kinds: vec![ConditioningKind::AudioEdit],
+                // The turbo checkpoint is guidance-distilled: CFG is baked into the weights.
+                supports_negative_prompt: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "acestep_v15_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("oobleck_vae"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_embedding_0_6b", "condition_encoder"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["acestep_v15_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["oobleck_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component
+                // ([`COVER_COMPONENT_ID`] = `sft_cover`, read only for a Cover request), NOT a
+                // hard requirement — text2music + the region edit modes load without it.
+                required_components: &[],
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                voices: vec![],
+                languages: LANGUAGES.to_vec(),
+                edit_modes: vec![
+                    AudioEditMode::Inpaint,
+                    AudioEditMode::Repaint,
+                    AudioEditMode::Extend,
+                    AudioEditMode::Cover,
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: 0,
-            // One clip per request (GenerationOutput::Audio carries a single track).
-            max_count: 1,
-            // The provider's 200-step ceiling, advertised rather than hidden (sc-19559).
+            max_size: 0,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            // No voice/speaker surface — music, not TTS.
-            audio_voices: vec![],
-            audio_languages: LANGUAGES.to_vec(),
-            // The edit modes the provider supports. Inpaint / Repaint / Extend ride ACE-Step's
-            // `repaint` task (region regenerate + seamless stitch, sc-12847) on the turbo DiT. Cover
-            // (sc-13251) is the whole-clip restyle: it pulls the FSQ `audio_tokenizer` /
-            // `audio_token_detokenizer` AND the non-distilled `transformer` (the reference's actual
-            // cover DiT) from the sibling sft checkpoint, then restyles the source from a new prompt —
-            // the sft DiT preserves the source's melodic content the distilled turbo DiT does not.
-            audio_edit_modes: vec![
-                AudioEditMode::Inpaint,
-                AudioEditMode::Repaint,
-                AudioEditMode::Extend,
-                AudioEditMode::Cover,
-            ],
             ..Default::default()
         },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS as u32),
+            shift: Some(DEFAULT_SHIFT as f32),
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// ACE-Step's identity + capabilities — computed from [`route`] without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Capability-driven request validation, factored out for weightless unit tests.
