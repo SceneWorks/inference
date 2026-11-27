@@ -321735,5 +321735,63 @@
       "source_identity": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 snapshot (KREA_TURBO_DIR) through the registered generator, KreaEngineOptions default (FlashAttention) vs int8_attention: true; fixed seed 7, 1024^2 x 8 steps and 2048^2 x 4 steps; crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "required_environment": [],
+    "device_witness": "The renders count FlashAttention-2 calls (default engine) and one INT8 QK call per denoise block attention (int8 engine) on the selected CUDA device, and replay one captured production attention call on it.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines, PSNR int8 vs flash per size, and the captured-call cosine / rel-L2 of flash and of INT8 (K centering off/on/adaptive) against the f32 materialized reference; 1024^2 PSNR must be >= 35 dB and every captured INT8 cosine >= 0.999.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render each size with the default and the int8_attention engine (flash, int8, flash), compare PSNR and s/step, and replay the captured attention call against the f32 reference."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+      "requirements": []
+    }
   }
 ]
