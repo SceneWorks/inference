@@ -126,6 +126,9 @@ mod vae16_write_bound_real;
 #[path = "vae22_parity.rs"]
 mod vae22_parity;
 
+#[path = "vae_norm_silu_pad_proof.rs"]
+mod vae_norm_silu_pad_proof;
+
 #[path = "wan_overlap_ab.rs"]
 mod wan_overlap_ab;
 

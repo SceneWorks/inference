@@ -130,6 +130,9 @@ mod vae_decode_sweep;
 #[path = "vae_decode_tiling_parity.rs"]
 mod vae_decode_tiling_parity;
 
+#[path = "vae_norm_silu_pad_proof.rs"]
+mod vae_norm_silu_pad_proof;
+
 #[path = "vae_parity.rs"]
 mod vae_parity;
 

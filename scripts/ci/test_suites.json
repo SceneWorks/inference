@@ -3543,6 +3543,72 @@
       "features": [
         "cuda"
       ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "vae_norm_silu_pad::tests::metal_route_matches_the_reference_chain",
+      "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
+      "reason": "SW-6142 MLX fused Metal norm+SiLU+pad kernel vs the reference op chain: 22 Wan z16 + LTX conv-input geometries (decode/encode, cached-frame and first-chunk zero pads, replicate pads, NCTHW and channels-last-view inputs, f32/bf16/f16, eps floor), gated on E2 max rel err <= 1e-5 (f32 output for every input dtype; NaN fails); bit identity, mismatch count and max ULP printed as diagnostics, not asserted.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "vae_norm_silu_pad::tests::compiled_route_matches_the_reference_chain",
+      "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
+      "reason": "SW-6142 MLX compiled (mx.compile on channels-last views) norm+SiLU+pad route vs the reference op chain over the 22 Wan/LTX geometries, E2 tolerance, bit identity reported.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "vae_norm_silu_pad::tests::a_wrong_side_temporal_pad_fails_parity",
+      "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
+      "reason": "SW-6142 mutation control: the Metal kernel with the temporal pad on the wrong side (zero causal pad and LTX causal replicate pad) must fail parity against the reference on every asymmetric case.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "vae_norm_silu_pad::tests::try_fused_follows_the_switch_and_counts_its_route",
+      "source": "crates/media/mlx-gen/src/vae_norm_silu_pad/tests.rs",
+      "reason": "SW-6142 dispatch: try_fused takes the Metal / compiled / reference route by the RouteGuard switch on the Wan cached-chunk geometry, records each in the route counters, and a rank-4 input falls back with reason rank.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-wan",
+      "kind": "lib",
+      "target": "mlx_gen_wan",
+      "test": "vae::tests::fused_norm_silu_pad_matches_the_reference_chain",
+      "source": "crates/media/mlx-gen/mlx-gen-wan/src/vae.rs",
+      "reason": "SW-6142 fused_norm_silu_pad parity on the Wan z16 conv-input geometries (decode convs, encoder first chunk, cached chunks, offset cache view, bf16/f16) at E2 tolerance plus the wrong-temporal-side causal pad mutation that must fail.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-ltx",
+      "kind": "lib",
+      "target": "mlx_gen_ltx",
+      "test": "vae::tests::fused_norm_silu_pad_matches_the_reference_chain",
+      "source": "crates/media/mlx-gen/mlx-gen-ltx/src/vae.rs",
+      "reason": "SW-6142 fused_norm_silu_pad parity on the LTX conv-input geometries (decoder replicate pads at 128..1024 channels, encoder causal replicate, kt=1, bf16) at E2 tolerance plus the wrong-side causal replicate mutation that must fail.",
+      "platforms": [
+        "darwin"
+      ]
     }
   ]
 }
