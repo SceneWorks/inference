@@ -18,8 +18,14 @@
 //!    even, clamp to ±127). The Q scale also carries `softmax_scale · log2(e)`.
 //! 4. The attention kernel computes `Q·Kᵀ` exactly in `int32` (`mma.m16n8k32.s8`), dequantizes with
 //!    the two row scales, runs an online softmax in **f32** with `exp2`, rounds `P` to the V dtype
-//!    and accumulates `P·V` in f32 on the 16-bit tensor cores (`mma.m16n8k16`). **V stays
-//!    bf16/f16**; the only lossy step is the INT8 `Q·Kᵀ`.
+//!    and accumulates `P·V` in f32 on the 16-bit tensor cores (`mma.m16n8k16`) — [`PvPrecision::ValueDtype`],
+//!    the accurate default, where the only lossy step is the INT8 `Q·Kᵀ`.
+//! 5. [`PvPrecision::Int8`] is comfy-kitchen's `qk_int_sv_i8` `P·V` instead: V is quantized to INT8
+//!    per channel over the whole sequence (`amax / 127`, no smoothing, keys permuted within 16-key
+//!    groups to match the `P` fragment), each 64-key tile of `P` is exponentiated against its own
+//!    max lowered by [`SAGE_U8_OFFSET`] and rounded to U8, `P·V` runs on `mma.m16n8k32.u8.s8`, the
+//!    `int32` tile product is rescaled into the f32 accumulator by `exp2(tile max - running max)`,
+//!    the row sum is the sum of the same U8 values, and the V channel scale is applied once at the end.
 //!
 //! # Envelope
 //!
@@ -31,8 +37,9 @@
 //!
 //! # Prequantize / early release
 //!
-//! `prequantize_qk` (cuda builds) returns `SageQk` (INT8 codes and scales only — it keeps no reference to the
-//! floating-point Q/K), so a caller may drop Q and K before `attend_prequantized` runs.
+//! `prequantize` (cuda builds) returns `SageQk` (INT8 codes and scales only — it keeps no reference to
+//! the floating-point Q/K, nor V in `Int8` mode), so a caller may drop them before
+//! `attend_prequantized` runs.
 //! `sage_attention` is the one-call form.
 
 use crate::nvrtc::KernelSource;
@@ -40,7 +47,7 @@ use candle_core::DType;
 
 /// The INT8 QK attention kernels (quantizer, centering statistics and the attention kernel).
 pub const SOURCE: KernelSource = KernelSource {
-    name: "sage-int8-qk-attention-v1",
+    name: "sage-int8-qk-attention-v2",
     src: include_str!("sage_attention.cu"),
     cc_floor: (8, 0),
 };
@@ -71,6 +78,42 @@ pub enum KCentering {
     /// Per `(batch, kv head)`, when it shrinks the sampled rotated per-row range (the default).
     #[default]
     Adaptive,
+}
+
+/// How the attention kernel computes `P·V`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PvPrecision {
+    /// `P` rounded to V's own bf16 / f16 and `P·V` on the 16-bit tensor cores (f32 accumulate):
+    /// only `Q·Kᵀ` is lossy. The accurate mode, and the default.
+    #[default]
+    ValueDtype,
+    /// comfy-kitchen's `qk_int_sv_i8` `P·V`: V quantized to INT8 per channel over the sequence,
+    /// `P` quantized per 64-key tile to U8, `P·V` on `mma.m16n8k32.u8.s8`.
+    Int8,
+}
+
+/// comfy-kitchen's `S_U8_OFFSET`: the online-softmax max is lowered by it so `exp2(s - max)`
+/// spans `(0, 255]`, the U8 range of `P`.
+pub const SAGE_U8_OFFSET: f32 = 7.994_353_4;
+
+/// comfy-kitchen's `inv_perm16`: the position of key `w` (`0..16`) of a 16-key group in the INT8 V
+/// layout, `{b3,b2,b1,b0} -> {b2,b0,b3,b1}` — the U8 `P` fragment holds keys
+/// `{2t, 2t+1, 8+2t, 9+2t}` of a group in one register.
+pub fn v_position(w: usize) -> usize {
+    (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) | (((w >> 2) & 1) << 3)
+}
+
+/// The kernel's V quantization of one channel over the sequence: `(codes in key order, scale)`
+/// with `scale = max(amax / 127, 1e-12)` and codes rounded to nearest even.
+pub fn quantize_v_channel_reference(values: &[f32]) -> (Vec<i8>, f32) {
+    let amax = values.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let scale = (amax * (1.0 / 127.0)).max(1e-12);
+    let inv = 1.0 / scale;
+    let codes = values
+        .iter()
+        .map(|x| (x * inv).round_ties_even().clamp(-128.0, 127.0) as i8)
+        .collect();
+    (codes, scale)
 }
 
 /// Why a call cannot take the INT8 attention kernel. Every variant is decided before launch.
@@ -255,7 +298,7 @@ pub fn quantize_row_reference(rotated: &[f32], pre: f32) -> (Vec<i8>, f32) {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{attend_prequantized, prequantize_qk, sage_attention, SageQk};
+pub use cuda::{attend_prequantized, prequantize, sage_attention, SageQk};
 
 #[cfg(feature = "cuda")]
 mod cuda {
@@ -266,8 +309,8 @@ mod cuda {
     use candle_core::cuda_backend::CudaDType;
     use candle_core::{op::BackpropOp, CudaStorage, Device, Result, Shape, Storage, Tensor};
 
-    /// Prequantized Q/K for `attend_prequantized`: INT8 codes and per-row scales only — no
-    /// reference to the floating-point Q or K survives in it.
+    /// Prequantized operands for `attend_prequantized`: INT8 codes and scales only — no reference
+    /// to the floating-point Q or K (nor, in [`PvPrecision::Int8`] mode, V) survives in it.
     #[derive(Debug, Clone)]
     pub struct SageQk {
         /// `[B, H, q_pad, D]` INT8 codes, stored as U8.
@@ -278,6 +321,9 @@ mod cuda {
         pub k_codes: Tensor,
         /// `[B, HK, k_pad]` f32 scales.
         pub k_scales: Tensor,
+        /// [`PvPrecision::Int8`]: `[B, HK, D, k_pad]` INT8 V codes (16-key permuted), stored as U8,
+        /// and their `[B, HK, D]` f32 channel scales.
+        pub v_int8: Option<(Tensor, Tensor)>,
         /// The geometry.
         pub plan: SagePlan,
         /// The dtype of the floating-point operands (and of the output).
@@ -361,7 +407,6 @@ mod cuda {
 
     /// Rotate, optionally center, and INT8-quantize one `[batch, heads, len, d]` operand into
     /// `[batch, heads, pad, d]` codes and `[batch, heads, pad]` scales.
-    #[allow(clippy::too_many_arguments)]
     fn quantize<T: CudaDType + DeviceRepr>(
         dev: &candle_core::CudaDevice,
         module: &crate::nvrtc::CompiledKernel,
@@ -456,41 +501,98 @@ mod cuda {
         ))
     }
 
-    /// Quantize `q` (`[B, H, Sq, D]`) and `k` (`[B, HK, Sk, D]`) for `attend_prequantized`.
-    /// `v_dims` / `v_dtype` describe the V that will be attended (checked now, so a refusal comes
-    /// before any work). `scale` is the softmax scale. The result holds no reference to `q` / `k`.
-    pub fn prequantize_qk(
+    /// comfy-kitchen's V quantizer: `[batch, heads, len, d]` V into `[batch, heads, d, pad]`
+    /// 16-key-permuted INT8 codes and `[batch, heads, d]` channel scales.
+    fn quantize_v<T: CudaDType + DeviceRepr>(
+        dev: &candle_core::CudaDevice,
+        module: &crate::nvrtc::CompiledKernel,
+        v: &Tensor,
+        (batch, heads, len, pad, d): (usize, usize, usize, usize, usize),
+    ) -> Result<(Tensor, Tensor)> {
+        let v = operand(v, false)?;
+        let bf = i32::from(v.dtype() == DType::BF16);
+        let [sb, sh, ss] = strides3(&v);
+        let (st, _) = v.storage_and_layout();
+        let vv = view::<T>(&st, &v)?;
+        let (h, s, sp) = (i32_of(heads)?, i32_of(len)?, i32_of(pad)?);
+        let rows = batch * heads;
+        // SAFETY: the V quantizer writes every code (positions >= len as zero) and every scale.
+        let mut codes = unsafe { dev.alloc::<u8>(rows * d * pad) }?;
+        let mut scales = unsafe { dev.alloc::<f32>(rows * d) }?;
+        let quant = module
+            .function(&format!("sage_quant_v_d{d}"))
+            .map_err(candle_core::Error::wrap)?;
+        let stream = dev.cuda_stream();
+        let mut l = stream.launch_builder(&quant);
+        l.arg(&vv)
+            .arg(&sb)
+            .arg(&sh)
+            .arg(&ss)
+            .arg(&h)
+            .arg(&s)
+            .arg(&sp)
+            .arg(&bf)
+            .arg(&mut codes)
+            .arg(&mut scales);
+        // SAFETY: matches `sage_quant_v_d*`: one CTA per (b, head, 8-channel tile).
+        unsafe { l.launch(launch_cfg((rows * d / 8, 1, 1), 256)?) }.map_err(drv)?;
+        drop(st);
+        Ok((
+            wrap(codes, dev, (batch, heads, d, pad)),
+            wrap(scales, dev, (batch, heads, d)),
+        ))
+    }
+
+    /// Quantize `q` (`[B, H, Sq, D]`) and `k` (`[B, HK, Sk, D]`) — and, for
+    /// [`PvPrecision::Int8`], `v` (`[B, HK, Sk, D]`) — for `attend_prequantized`. `scale` is the
+    /// softmax scale. The result holds no reference to the floating-point operands it quantized,
+    /// so a caller may release them (all three in `Int8` mode) before the attention launch.
+    pub fn prequantize(
         q: &Tensor,
         k: &Tensor,
-        v_dims: &[usize],
-        v_dtype: DType,
+        v: &Tensor,
         scale: f64,
         centering: KCentering,
+        pv: PvPrecision,
     ) -> Result<SageQk> {
-        let plan = check_sage_attention(q.dims(), k.dims(), v_dims, q.dtype(), k.dtype(), v_dtype)
-            .map_err(refusal)?;
+        let plan = check_sage_attention(
+            q.dims(),
+            k.dims(),
+            v.dims(),
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+        )
+        .map_err(refusal)?;
         if !(scale.is_finite() && scale > 0.0) {
             return Err(msg(format!(
                 "sage int8 attention: scale {scale} must be finite and positive"
             )));
         }
         let dev = cuda_of(q)?;
-        if !q.device().same_device(k.device()) {
-            return Err(msg("sage int8 attention: q and k on different devices"));
+        if !q.device().same_device(k.device()) || !q.device().same_device(v.device()) {
+            return Err(msg("sage int8 attention: q, k and v on different devices"));
         }
         let module = SOURCE.compiled(dev).map_err(candle_core::Error::wrap)?;
         let pre = (scale as f32) * std::f32::consts::LOG2_E;
         let d = plan.head_dim;
         let qg = (plan.batch, plan.heads, plan.q_len, plan.q_pad, d);
         let kg = (plan.batch, plan.kv_heads, plan.k_len, plan.k_pad, d);
-        let ((q_codes, q_scales), (k_codes, k_scales)) = match q.dtype() {
+        let int8_v = pv == PvPrecision::Int8;
+        let ((q_codes, q_scales), (k_codes, k_scales), v_int8) = match q.dtype() {
             DType::BF16 => (
                 quantize::<half::bf16>(dev, &module, q, qg, pre, KCentering::Off)?,
                 quantize::<half::bf16>(dev, &module, k, kg, 1.0, centering)?,
+                int8_v
+                    .then(|| quantize_v::<half::bf16>(dev, &module, v, kg))
+                    .transpose()?,
             ),
             _ => (
                 quantize::<half::f16>(dev, &module, q, qg, pre, KCentering::Off)?,
                 quantize::<half::f16>(dev, &module, k, kg, 1.0, centering)?,
+                int8_v
+                    .then(|| quantize_v::<half::f16>(dev, &module, v, kg))
+                    .transpose()?,
             ),
         };
         Ok(SageQk {
@@ -498,6 +600,7 @@ mod cuda {
             q_scales,
             k_codes,
             k_scales,
+            v_int8,
             plan,
             dtype: q.dtype(),
         })
@@ -505,27 +608,43 @@ mod cuda {
 
     fn attend_typed<T: CudaDType + DeviceRepr>(
         qk: &SageQk,
-        v: &Tensor,
+        v: Option<&Tensor>,
         dev: &candle_core::CudaDevice,
         module: &crate::nvrtc::CompiledKernel,
         suffix: &str,
     ) -> Result<Tensor> {
         let p = qk.plan;
+        let int8_pv = if qk.v_int8.is_some() { "_i8pv" } else { "" };
         let attn = module
-            .function(&format!("sage_attn_d{}_{suffix}", p.head_dim))
+            .function(&format!("sage_attn_d{}_{suffix}{int8_pv}", p.head_dim))
             .map_err(candle_core::Error::wrap)?;
-        let v = operand(v, true)?;
-        let [vsb, vsh, vss] = strides3(&v);
+        // Each mode binds the pointers it does not read to a live buffer of the other mode.
+        let (v16, vq_t, vsc_t) = match (&qk.v_int8, v) {
+            (Some((codes, scales)), _) => (None, codes.clone(), scales.clone()),
+            (None, Some(v)) => (
+                Some(operand(v, true)?),
+                qk.q_codes.clone(),
+                qk.q_scales.clone(),
+            ),
+            (None, None) => {
+                return Err(msg(
+                    "sage int8 attention: the 16-bit P.V mode needs the V operand",
+                ))
+            }
+        };
+        let [vsb, vsh, vss] = v16.as_ref().map_or([0; 3], strides3);
         let (qst, _) = qk.q_codes.storage_and_layout();
         let (qsst, _) = qk.q_scales.storage_and_layout();
         let (kst, _) = qk.k_codes.storage_and_layout();
         let (ksst, _) = qk.k_scales.storage_and_layout();
-        let (vst, _) = v.storage_and_layout();
+        let (vqst, _) = vq_t.storage_and_layout();
+        let (vscst, _) = vsc_t.storage_and_layout();
         let qv = view::<u8>(&qst, &qk.q_codes)?;
         let qsv = view::<f32>(&qsst, &qk.q_scales)?;
         let kv = view::<u8>(&kst, &qk.k_codes)?;
         let ksv = view::<f32>(&ksst, &qk.k_scales)?;
-        let vv = view::<T>(&vst, &v)?;
+        let vqv = view::<u8>(&vqst, &vq_t)?;
+        let vscv = view::<f32>(&vscst, &vsc_t)?;
         // SAFETY: the attention kernel writes every element of every live query row.
         let out = unsafe { dev.alloc::<T>(p.batch * p.heads * p.q_len * p.head_dim) }?;
         let (h, hk) = (i32_of(p.heads)?, i32_of(p.kv_heads)?);
@@ -536,15 +655,23 @@ mod cuda {
             i32_of(p.k_pad)?,
         );
         let stream = dev.cuda_stream();
+        let cfg = launch_cfg((p.q_pad / SAGE_Q_TILE, p.heads, p.batch), 256)?;
+        let v_storage = v16.as_ref().map(|v| v.storage_and_layout().0);
         let mut l = stream.launch_builder(&attn);
-        l.arg(&qv)
-            .arg(&qsv)
-            .arg(&kv)
-            .arg(&ksv)
-            .arg(&vv)
-            .arg(&vsb)
+        l.arg(&qv).arg(&qsv).arg(&kv).arg(&ksv);
+        let vv = match (&v_storage, &v16) {
+            (Some(st), Some(v)) => Some(view::<T>(st, v)?),
+            _ => None,
+        };
+        match &vv {
+            Some(vv) => l.arg(vv),
+            None => l.arg(&vqv),
+        };
+        l.arg(&vsb)
             .arg(&vsh)
             .arg(&vss)
+            .arg(&vqv)
+            .arg(&vscv)
             .arg(&out)
             .arg(&h)
             .arg(&hk)
@@ -552,24 +679,28 @@ mod cuda {
             .arg(&sqp)
             .arg(&sk)
             .arg(&skp);
-        let cfg = launch_cfg((p.q_pad / SAGE_Q_TILE, p.heads, p.batch), 256)?;
-        // SAFETY: matches `sage_attn_d*_*`; every buffer is sized by the checked plan.
+        // SAFETY: matches `sage_attn_d*_*`; every buffer is sized by the checked plan, and the
+        // pointers a mode does not read are never dereferenced.
         unsafe { l.launch(cfg) }.map_err(drv)?;
-        drop((qst, qsst, kst, ksst, vst));
+        drop(v_storage);
+        drop((qst, qsst, kst, ksst, vqst, vscst));
         Ok(wrap(out, dev, (p.batch, p.heads, p.q_len, p.head_dim)))
     }
 
-    /// The attention over prequantized Q/K and the 16-bit `v` (`[B, HK, Sk, D]`): `[B, H, Sq, D]`
-    /// in `v`'s dtype, contiguous.
-    pub fn attend_prequantized(qk: &SageQk, v: &Tensor) -> Result<Tensor> {
+    /// The attention over prequantized operands: `[B, H, Sq, D]` in the operands' dtype,
+    /// contiguous. `v` (`[B, HK, Sk, D]`) is required in [`PvPrecision::ValueDtype`] mode and
+    /// unused (`None` allowed: the float V may already be released) in [`PvPrecision::Int8`] mode.
+    pub fn attend_prequantized(qk: &SageQk, v: Option<&Tensor>) -> Result<Tensor> {
         let p = qk.plan;
-        if v.dims() != [p.batch, p.kv_heads, p.k_len, p.head_dim] || v.dtype() != qk.dtype {
-            return Err(refusal(SageRefusal::Shape));
+        if let Some(v) = v {
+            if v.dims() != [p.batch, p.kv_heads, p.k_len, p.head_dim] || v.dtype() != qk.dtype {
+                return Err(refusal(SageRefusal::Shape));
+            }
+            if !v.device().same_device(qk.q_codes.device()) {
+                return Err(msg("sage int8 attention: v on a different device"));
+            }
         }
-        let dev = cuda_of(v)?;
-        if !v.device().same_device(qk.q_codes.device()) {
-            return Err(msg("sage int8 attention: v on a different device"));
-        }
+        let dev = cuda_of(&qk.q_codes)?;
         let module = SOURCE.compiled(dev).map_err(candle_core::Error::wrap)?;
         match qk.dtype {
             DType::BF16 => attend_typed::<half::bf16>(qk, v, dev, &module, "bf16"),
@@ -577,19 +708,19 @@ mod cuda {
         }
     }
 
-    /// One-call INT8 QK attention: `prequantize_qk` then `attend_prequantized`.
+    /// One-call INT8 QK attention: `prequantize` then `attend_prequantized`.
     pub fn sage_attention(
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         scale: f64,
         centering: KCentering,
+        pv: PvPrecision,
     ) -> Result<Tensor> {
-        let qk = prequantize_qk(q, k, v.dims(), v.dtype(), scale, centering)?;
-        attend_prequantized(&qk, v)
+        let qk = prequantize(q, k, v, scale, centering, pv)?;
+        attend_prequantized(&qk, Some(v))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +822,30 @@ mod tests {
         assert_eq!((codes, scale), (vec![0; 4], 0.0));
     }
 
+    /// comfy-kitchen's 16-key V permutation is a bijection that puts keys {2t, 2t+1, 8+2t, 9+2t}
+    /// at positions 4t..4t+3 — the order the U8 `P` fragment packs them in.
+    #[test]
+    fn the_v_permutation_matches_the_p_fragment() {
+        let mut seen = [false; 16];
+        for w in 0..16 {
+            seen[v_position(w)] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+        for t in 0..4 {
+            for (j, key) in [2 * t, 2 * t + 1, 8 + 2 * t, 9 + 2 * t]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(v_position(key), 4 * t + j, "key {key}");
+            }
+        }
+        let (codes, scale) = quantize_v_channel_reference(&[1.0, -0.5, 0.0, 0.25]);
+        assert_eq!(codes, vec![127, -64, 0, 32]);
+        assert_eq!(scale, 1.0 / 127.0);
+        assert_eq!(quantize_v_channel_reference(&[0.0; 3]).1, 1e-12);
+        assert!((SAGE_U8_OFFSET - 255f32.log2()).abs() < 1e-6);
+    }
+
     #[test]
     fn workspace_is_the_int8_buffers_and_scales() {
         let q = [1, 48, 4096, 128];
@@ -785,7 +940,7 @@ mod cuda_tests {
             );
             assert_eq!(local, 0, "{entry} spills to local memory");
         }
-        assert_eq!(module.entry_points().len(), 10);
+        assert_eq!(module.entry_points().len(), 16);
     }
 
     /// E2: the device quantizer's codes are byte-identical to the host oracle (centering off), and
@@ -807,10 +962,8 @@ mod cuda_tests {
                 .to_dtype(dtype)?
                 .transpose(1, 2)?;
             let scale = 1.0 / (d as f64).sqrt();
-            let qk = prequantize_qk(&x, &x, x.dims(), dtype, scale, KCentering::Off)?;
+            let qk = prequantize(&x, &x, &x, scale, KCentering::Off, PvPrecision::Int8)?;
             let pre = (scale as f32) * std::f32::consts::LOG2_E;
-            let host = x.to_dtype(DType::F32)?.contiguous()?.to_vec3::<f32>().ok();
-            let _ = host;
             let xs: Vec<f32> = x
                 .to_dtype(DType::F32)?
                 .contiguous()?
@@ -851,13 +1004,38 @@ mod cuda_tests {
                     }
                 }
             }
-            println!("quantizer d={d} {dtype:?}: {mismatches} code mismatches");
+            // V (`PvPrecision::Int8`): per-channel codes at their permuted positions, scales exact.
+            let (v_codes, v_scales) = qk.v_int8.as_ref().expect("int8 V");
+            let v_codes: Vec<u8> = v_codes.flatten_all()?.to_vec1()?;
+            let v_scales: Vec<f32> = v_scales.flatten_all()?.to_vec1()?;
+            let mut v_mismatches = 0usize;
+            for bh in 0..b * h {
+                for ch in 0..d {
+                    let column: Vec<f32> = (0..s).map(|r| xs[(bh * s + r) * d + ch]).collect();
+                    let (want, want_scale) = quantize_v_channel_reference(&column);
+                    let ulps = (v_scales[bh * d + ch].to_bits() as i64
+                        - want_scale.to_bits() as i64)
+                        .abs();
+                    assert!(ulps <= 1, "V scale d={d} {dtype:?} bh={bh} ch={ch}");
+                    let row = &v_codes[(bh * d + ch) * kp..(bh * d + ch + 1) * kp];
+                    for key in 0..kp {
+                        let at = (key & !15) | v_position(key & 15);
+                        let want = if key < s { want[key] } else { 0 };
+                        v_mismatches += usize::from(row[at] as i8 != want);
+                    }
+                }
+            }
+            println!(
+                "quantizer d={d} {dtype:?}: {mismatches} Q/K code mismatches, {v_mismatches} V"
+            );
             assert_eq!(mismatches, 0, "d={d} {dtype:?}");
+            assert_eq!(v_mismatches, 0, "V d={d} {dtype:?}");
         }
         Ok(())
     }
 
-    /// One random case through the one-call API vs the f32 reference (a quick smoke and timing).
+    /// One Krea-shaped case per P.V mode through the one-call API vs the f32 reference (a quick
+    /// smoke and timing).
     #[test]
     #[ignore = "CUDA compute: run by the validation workflow, not CI"]
     fn cuda_sage_attention_smoke_and_timing() -> candle_core::Result<()> {
@@ -871,28 +1049,30 @@ mod cuda_tests {
         let k = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
         let v = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
         let scale = 1.0 / (d as f64).sqrt();
-        let out = sage_attention(&q, &k, &v, scale, KCentering::Adaptive)?;
         let want = reference(&q, &k, &v, scale)?;
-        let (cos, rel) = similarity(&out, &want)?;
-        println!("sage S={s} H={h} d={d}: cosine {cos:.6} rel-L2 {rel:.3e}");
-        // Warm the clocks first (the board idles at a few hundred MHz).
-        for _ in 0..50 {
-            let _ = sage_attention(&q, &k, &v, scale, KCentering::Adaptive)?;
+        for pv in [PvPrecision::ValueDtype, PvPrecision::Int8] {
+            let run = || sage_attention(&q, &k, &v, scale, KCentering::Adaptive, pv);
+            let (cos, rel) = similarity(&run()?, &want)?;
+            // Warm the clocks first (the board idles at a few hundred MHz).
+            for _ in 0..50 {
+                drop(run()?);
+            }
+            dev.synchronize()?;
+            let iters = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                drop(run()?);
+            }
+            dev.synchronize()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            let flops = 4.0 * (b * h * s * s * d) as f64;
+            println!(
+                "sage {pv:?} S={s} H={h} d={d}: cosine {cos:.6} rel-L2 {rel:.3e}, {ms:.3} ms/iter \
+                 ({:.1} TFLOP/s)",
+                flops / ms / 1e9
+            );
+            assert!(cos >= 0.999, "{pv:?} cosine {cos}");
         }
-        dev.synchronize()?;
-        let iters = 20;
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            let _ = sage_attention(&q, &k, &v, scale, KCentering::Adaptive)?;
-        }
-        dev.synchronize()?;
-        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let flops = 4.0 * (b * h * s * s * d) as f64;
-        println!(
-            "sage S={s}: {ms:.3} ms/iter ({:.1} TFLOP/s)",
-            flops / ms / 1e9
-        );
-        assert!(cos >= 0.999, "cosine {cos}");
         Ok(())
     }
 }
