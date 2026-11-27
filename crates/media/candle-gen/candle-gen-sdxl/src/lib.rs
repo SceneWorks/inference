@@ -53,6 +53,7 @@ const _: fn() = || {
 mod control_provider;
 mod memory_strategy;
 mod pipeline;
+mod route_wrappers;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
 pub use pipeline::{SdxlLatentDecoder, PID_BACKBONE};
@@ -1399,6 +1400,10 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_route(route_sdxl())
+        .register_route(route_wrappers::route_sdxl_edit())
+        .register_route(route_wrappers::route_sdxl_detail())
+        .register_route(route_wrappers::route_sdxl_control())
+        .register_route(route_wrappers::route_sdxl_ip_adapter())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 gen_core::CheckpointBackendBindingRegistration {
@@ -1505,7 +1510,16 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit_generators, ["sdxl"]);
+        assert_eq!(
+            explicit_generators,
+            [
+                "sdxl",
+                "sdxl_edit",
+                "sdxl_detail",
+                "sdxl_control",
+                "sdxl_ip_adapter",
+            ]
+        );
         assert_eq!(explicit_trainers, ["sdxl"]);
         let imported = registry
             .imported_model_descriptor(

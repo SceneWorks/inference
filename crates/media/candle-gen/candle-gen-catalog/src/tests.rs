@@ -501,9 +501,9 @@ fn every_registered_generator_advertises_its_exact_latent_space() {
             "qwen-image-2-1" => Some(&QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
             "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
             "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
-            "flux" | "boogu" | "chroma" | "z-image" => Some(&FLUX1_LATENT_SPACE),
+            "flux" | "boogu" | "chroma" | "z-image" | "pulid" => Some(&FLUX1_LATENT_SPACE),
             "stable-diffusion-3" => Some(&SD3_LATENT_SPACE),
-            "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+            "sdxl" | "kolors" | "instantid" => Some(&SDXL_LATENT_SPACE),
             "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
             // FLUX 3's packed 16× latent (its own autoencoder with BatchNorm-stat tokens)
             // has no shared decoder consumer, so nothing is advertised (sc-26235).
@@ -1007,13 +1007,13 @@ fn z_image_and_lens_publish_exact_typed_candle_rung_four_surfaces() {
         (
             "z_image_control",
             6,
-            true,
+            false,
             "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
         ),
         (
             "z_image_turbo_control",
             6,
-            true,
+            false,
             "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
         ),
         // sc-22732: the Lens weights-free surfaces publish a per-cell static behavior identity
@@ -1212,14 +1212,23 @@ fn complete_catalog_has_stable_conforming_surface() {
             "chroma1_flash",
             "flux1_schnell",
             "flux1_dev",
+            "flux1_dev_control",
+            "flux1_dev_ip_adapter",
+            "flux1_schnell_ip_adapter",
             "flux2_klein_9b",
             "flux2_dev",
+            "flux2_klein_9b_edit",
+            "flux2_dev_edit",
+            "flux2_dev_control",
             "flux3_klein",
             "flux3_klein_base",
             "ideogram_4",
             "ideogram_4_turbo",
+            "instantid",
             "iris_3b",
             "kolors",
+            "kolors_ip_adapter",
+            "kolors_control",
             "krea_2_turbo",
             "krea_2_raw",
             "krea_2_edit",
@@ -1240,7 +1249,13 @@ fn complete_catalog_has_stable_conforming_surface() {
             "mochi_1",
             "moss_image_base",
             "moss_image_sft",
+            "pulid_flux",
             "qwen_image",
+            "qwen_image_edit",
+            "qwen_image_edit_2509",
+            "qwen_image_edit_2511",
+            "qwen_image_edit_2511_lightning",
+            "qwen_image_control",
             "qwen_image_2_1",
             "qwen_image_2_1_turbo",
             "sana_1600m",
@@ -1250,6 +1265,10 @@ fn complete_catalog_has_stable_conforming_surface() {
             "sd3_5_large_turbo",
             "sd3_5_medium",
             "sdxl",
+            "sdxl_edit",
+            "sdxl_detail",
+            "sdxl_control",
+            "sdxl_ip_adapter",
             "seedvr2",
             "seedvr2_3b",
             "seedvr2_7b",
@@ -1264,6 +1283,8 @@ fn complete_catalog_has_stable_conforming_surface() {
             "wan2_2_vace_fun_14b",
             "z_image_turbo",
             "z_image",
+            "z_image_turbo_control",
+            "z_image_control",
         ]
     );
     assert_eq!(
@@ -1331,8 +1352,8 @@ fn complete_catalog_has_stable_conforming_surface() {
         .chain(&text_embedders)
         .chain(&transforms)
         .collect();
-    assert_eq!(distinct.len(), 72);
-    assert_eq!(super::provider_components().len(), 62);
+    assert_eq!(distinct.len(), 93);
+    assert_eq!(super::provider_components().len(), 83);
 }
 
 /// The manifest emitter runs on **this** catalog's three slices, and its output is
@@ -1611,7 +1632,10 @@ fn bespoke_memory_route_waivers_are_valid() {
     use std::path::Path;
 
     let waivers = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
-    assert!(!waivers.is_empty(), "expected at least one bespoke waiver");
+    assert!(
+        waivers.is_empty(),
+        "expected zero bespoke waivers after SW-6982 registered pulid_flux and instantid"
+    );
     let waived_crates: BTreeSet<_> = waivers.iter().map(|w| w.crate_name).collect();
     assert_eq!(
         waived_crates.len(),
@@ -1976,11 +2000,17 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         register_providers_body.contains("register_providers_with_flux3_mode("),
         "register_providers must delegate to the shared register_providers_with_flux3_mode spine"
     );
-    let cuda_descriptor_body =
+    let cuda_descriptor_wrapper_body =
         function_body(&catalog_lib, "pub fn cuda_descriptor_provider_registry");
     assert!(
+        cuda_descriptor_wrapper_body.contains("register_cuda_descriptor_providers("),
+        "cuda_descriptor_provider_registry must delegate to register_cuda_descriptor_providers"
+    );
+    let cuda_descriptor_body =
+        function_body(&catalog_lib, "pub fn register_cuda_descriptor_providers");
+    assert!(
         cuda_descriptor_body.contains("register_providers_with_flux3_mode("),
-        "cuda_descriptor_provider_registry must delegate to the shared register_providers_with_flux3_mode spine"
+        "register_cuda_descriptor_providers must delegate to the shared register_providers_with_flux3_mode spine"
     );
     let catalog_registration = function_body(&catalog_lib, "fn register_providers_with_flux3_mode");
     let contract_surface_registration =

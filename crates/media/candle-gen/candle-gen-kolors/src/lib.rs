@@ -39,6 +39,7 @@ mod pipeline;
 // the SDXL four-channel latent space (one byte-identical VAE file, `scaling_factor` 0.13025) and
 // projects through `candle_gen_sdxl::preview` rather than restating the fit.
 pub mod preview;
+mod route_wrappers;
 mod sampler;
 pub use sampler::{KolorsLeadingEulerDriver, KolorsLeadingEulerForward};
 mod tokenizer;
@@ -804,6 +805,8 @@ pub fn register_providers(
     // open no device, so a selector can price Kolors before load on CPU catalogs too.
     registry
         .register_route(route_base())
+        .register_route(route_wrappers::route_ip_adapter())
+        .register_route(route_wrappers::route_control())
         .register_route(route_ip_composed())
         .register_route(route_control_composed())
         .register_trainer(training::TRAINER_REGISTRATION)
@@ -856,7 +859,7 @@ mod sw6979_route_conformance_tests {
     #[test]
     fn sw6979_route_records_pass_tier0_conformance() {
         let registry = super::provider_registry().unwrap();
-        assert_eq!(registry.route_records().len(), 3);
+        assert_eq!(registry.route_records().len(), 5);
         assert!(
             registry.route_conformance_errors().is_empty(),
             "route conformance errors: {:?}",
@@ -880,7 +883,7 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["kolors"]);
+        assert_eq!(explicit, ["kolors", "kolors_ip_adapter", "kolors_control"]);
         let trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())

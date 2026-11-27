@@ -547,6 +547,7 @@ fn pipe12_vector_output_and_per_run_execution_reports_are_typed() {
             viewport: Some([64, 64]),
             svg_sha256: Some("0".repeat(64)),
             element_count: Some(1),
+            ..VectorTerminalMetadata::default()
         },
     };
     let json = serde_json::to_string(&vector).expect("serialize VectorOutput");

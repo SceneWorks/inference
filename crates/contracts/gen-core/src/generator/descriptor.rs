@@ -13,6 +13,11 @@ pub enum Modality {
     /// `width`/`height` are unused, so audio models validate through the size-skipping floor
     /// ([`Capabilities::validate_request_audio`]).
     Audio,
+    /// Autoregressive vector graphics generation — e.g. StarVector (`PIPE-12`). Emits
+    /// [`GenerationOutput::Vector`]; output dimensions come from the sanitized SVG viewBox rather
+    /// than a pixel canvas floor, so vector models validate through
+    /// [`Capabilities::validate_request_vector`].
+    Vector,
 }
 
 /// A model's stable identity + advertised capabilities. Returned by `descriptor()` and also

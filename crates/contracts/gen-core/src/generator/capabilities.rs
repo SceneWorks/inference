@@ -673,6 +673,13 @@ impl Capabilities {
         self.validate_request_inner(id, req, false)
     }
 
+    /// The vector-aware floor (`PIPE-12`): the shared floor **minus the width/height range check**,
+    /// for vector models (`Modality::Vector`, e.g. StarVector) whose output geometry comes from the
+    /// sanitized SVG `viewBox` rather than a pixel canvas floor.
+    pub fn validate_request_vector(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        self.validate_request_inner(id, req, false)
+    }
+
     /// The **approximate-capability plan** for one request — what a provider's denoise will actually
     /// run (sc-18322).
     ///
@@ -750,6 +757,17 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req
+            .extensions
+            .vector
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+            && !self.supports_family_extension(FamilyExtensionKind::Vector)
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: vector extension controls require a vector generation provider"
+            )));
+        }
         if req
             .extensions
             .moss_image

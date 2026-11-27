@@ -36,13 +36,42 @@ pub mod idformer;
 pub mod memory_strategy;
 pub mod preview;
 pub mod pulid_flux;
+mod registry;
 
 pub use pulid_flux::{
     compile_pulid_plan, pulid_load_spec, PulidFlux, PulidFluxPaths, PulidFluxRequest,
     DEFAULT_ID_WEIGHT, SIZE_MULTIPLE,
 };
+pub use registry::{compile_pulid_render_plan, descriptor, load_pulid_flux};
+
+/// Add the Candle PuLID-FLUX generator to an explicit media registry builder (`SW-6982`, `REG-6`).
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_route(registry::route_pulid_flux())
+}
+
+/// Build the complete explicit Candle PuLID provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
 
 /// PuLID-FLUX real-weight GPU validation (sc-5492) — env-driven, `#[ignore]`d integration test (the
 /// analog of the InstantID / IP-Adapter Phase-5 harnesses).
 #[cfg(test)]
 mod validate;
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(explicit, ["pulid_flux"]);
+        assert!(registry.route_conformance_errors().is_empty());
+        assert!(registry.descriptor_conformance_errors().is_empty());
+    }
+}

@@ -137,6 +137,11 @@ impl SdxlControlGenerator {
         })
     }
 
+    pub(super) fn with_descriptor(mut self, descriptor: ModelDescriptor) -> Self {
+        self.descriptor = descriptor;
+        self
+    }
+
     fn components(&self) -> gen_core::Result<ControlComponents> {
         let mut guard = candle_gen::lock_recover(&self.components);
         if let Some(components) = guard.as_ref() {

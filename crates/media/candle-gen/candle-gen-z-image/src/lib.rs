@@ -65,6 +65,7 @@ pub mod base;
 // worker (a bespoke pose stream), not gen-core-registered — the `z_image_turbo` descriptor stays
 // txt2img-only.
 pub mod control;
+mod control_registry;
 
 // Z-Image Fun-ControlNet real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d integration
 // test (with-control vs no-control pixel diff + mid-denoise cancel).
@@ -161,7 +162,7 @@ pub fn register_memory_contract_surfaces(
             },
         )
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: control_memory_contract_surface_specs,
             provider_id: "z_image_turbo_control",
@@ -174,7 +175,7 @@ pub fn register_memory_contract_surfaces(
             },
         )
         .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: control_memory_contract_surface_specs,
             provider_id: "z_image_control",
@@ -880,14 +881,16 @@ pub(crate) fn route_turbo_control() -> gen_core::RouteRecord {
     route.structure.conditioning.modules = vec!["z_image_vace_control"];
     route.structure.weight_plan.requires_control_overlay = true;
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings =
-        gen_core::RouteBindings::feature_route(Some(MODEL_ID), turbo_control_descriptor)
-            .with_render_plan(compile_turbo_control)
-            .with_encoder_contract_parent(MODEL_ID);
+    let mut bindings = gen_core::RouteBindings::generator(
+        turbo_control_descriptor,
+        control_registry::load_turbo_control,
+    )
+    .with_feature_route(Some(MODEL_ID), turbo_control_descriptor)
+    .with_render_plan(compile_turbo_control);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
-            .with_composed_memory_registration(TURBO_CONTROL_MEMORY_REGISTRATION)
+            .with_memory_registration(TURBO_CONTROL_MEMORY_REGISTRATION)
             .with_memory_fixture(
                 control_memory_contract_surface_specs,
                 registered_turbo_control_memory_contract,
@@ -911,14 +914,16 @@ pub(crate) fn route_base_control() -> gen_core::RouteRecord {
     route.structure.conditioning.modules = vec!["z_image_vace_control"];
     route.structure.weight_plan.requires_control_overlay = true;
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings =
-        gen_core::RouteBindings::feature_route(Some(base::MODEL_ID), base_control_descriptor)
-            .with_render_plan(compile_base_control)
-            .with_encoder_contract_parent(base::MODEL_ID);
+    let mut bindings = gen_core::RouteBindings::generator(
+        base_control_descriptor,
+        control_registry::load_base_control,
+    )
+    .with_feature_route(Some(base::MODEL_ID), base_control_descriptor)
+    .with_render_plan(compile_base_control);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
-            .with_composed_memory_registration(BASE_CONTROL_MEMORY_REGISTRATION)
+            .with_memory_registration(BASE_CONTROL_MEMORY_REGISTRATION)
             .with_memory_fixture(
                 control_memory_contract_surface_specs,
                 registered_base_control_memory_contract,
@@ -2261,7 +2266,15 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         explicit_generators.sort();
-        assert_eq!(explicit_generators, ["z_image", "z_image_turbo"]);
+        assert_eq!(
+            explicit_generators,
+            [
+                "z_image",
+                "z_image_control",
+                "z_image_turbo",
+                "z_image_turbo_control",
+            ]
+        );
 
         let explicit_trainers: Vec<String> = registry
             .trainers()

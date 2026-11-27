@@ -92,7 +92,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
     // descriptor would force a nominal placeholder bound purely to satisfy the sweep (the sc-13314
     // wart), so the check is skipped for `Audio` and stays strict for `Image`/`Video`/`Both`, which
     // genuinely carry a spatial size range.
-    if d.modality != Modality::Audio {
+    if !matches!(d.modality, Modality::Audio | Modality::Vector) {
         if caps.min_size == 0 || caps.max_size == 0 {
             errs.push(format!(
                 "{ctx}: min_size={} max_size={} — size bounds left at the Default 0",
@@ -110,7 +110,9 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             errs.push(format!(
                 "{ctx}: explicit-size multiple is 0 — grid validation would be undefined"
             ));
-        } else if d.modality != Modality::Audio && multiple > caps.max_size {
+        } else if !matches!(d.modality, Modality::Audio | Modality::Vector)
+            && multiple > caps.max_size
+        {
             errs.push(format!(
                 "{ctx}: explicit-size multiple {multiple} > max_size {} — no explicit size can pass",
                 caps.max_size
@@ -196,9 +198,10 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
                 | ConditioningKind::VideoSync
                 | ConditioningKind::ReferenceVideo
         );
-        if is_video_kind && d.modality == Modality::Image {
+        if is_video_kind && matches!(d.modality, Modality::Image | Modality::Vector) {
             errs.push(format!(
-                "{ctx}: advertises video conditioning {k:?} but modality is Image"
+                "{ctx}: advertises video conditioning {k:?} but modality is {:?}",
+                d.modality
             ));
         }
     }

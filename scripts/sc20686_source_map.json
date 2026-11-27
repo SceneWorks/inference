@@ -19,7 +19,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 675
+              "line": 856
             }
           ],
           "creation": [

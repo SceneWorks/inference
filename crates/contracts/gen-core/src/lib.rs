@@ -155,6 +155,7 @@ pub mod tiling;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vector;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod w4a8_int8;
@@ -246,7 +247,7 @@ pub use generator::{
     PrecisionFloorComponent, PulidExtension, ReplacementMode, RequestWorkspaceBound, SavedPlan,
     ScheduleId, SeedVr2Extension, SizeFloor, SolverId, SongCover, SongCoverMode, SongCoverVoice,
     SongDecoder, SongParams, SongPlanning, SpeechSegment, StagedResidencyAvailability, StepSupport,
-    SvdExtension, TimeRegion, TokenSampling, VectorFinishReason, VectorOutput,
+    SvdExtension, TimeRegion, TokenSampling, VectorExtension, VectorFinishReason, VectorOutput,
     VectorTerminalMetadata, VideoClipRef, VideoMode, WanExtension,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,

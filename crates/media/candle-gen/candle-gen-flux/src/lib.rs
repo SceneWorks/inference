@@ -1011,7 +1011,16 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["flux1_schnell", "flux1_dev"]);
+        assert_eq!(
+            explicit,
+            [
+                "flux1_schnell",
+                "flux1_dev",
+                "flux1_dev_control",
+                "flux1_dev_ip_adapter",
+                "flux1_schnell_ip_adapter",
+            ]
+        );
     }
 
     #[test]

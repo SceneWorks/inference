@@ -147,13 +147,149 @@ pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
         candle_gen::gen_core::FamilyModelSpec::new("flux2_mmdit")
             .with_pag(Flux2Variant::Dev.pag_capability()),
     );
-    route.bindings = candle_gen::gen_core::RouteBindings::feature_route(
+    route.bindings = candle_gen::gen_core::RouteBindings::generator(
+        control_report_descriptor,
+        load_control,
+    )
+    .with_feature_route(
         Some(crate::config::FLUX2_DEV_ID),
         control_report_descriptor,
     )
-    .with_render_plan(compile_control_feature_route)
-    .with_encoder_contract_parent(crate::config::FLUX2_DEV_ID);
+    .with_render_plan(compile_control_feature_route);
     route
+}
+
+struct Flux2ControlGenerator {
+    descriptor: candle_gen::gen_core::ModelDescriptor,
+    spec: candle_gen::gen_core::LoadSpec,
+    model: Flux2Control,
+}
+
+impl candle_gen::gen_core::Generator for Flux2ControlGenerator {
+    fn descriptor(&self) -> &candle_gen::gen_core::ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("flux2/control_route", self.descriptor.id.into());
+        })
+    }
+
+    fn validate(
+        &self,
+        request: &candle_gen::gen_core::GenerationRequest,
+    ) -> candle_gen::gen_core::Result<()> {
+        let _ = compile_control_feature_route(&self.spec, request)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        request: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        self.validate(request)?;
+        let (control_image, scale) = match request.conditioning.as_slice() {
+            [candle_gen::gen_core::Conditioning::Control { image, scale, .. }] => (image, *scale),
+            _ => {
+                return Err(candle_gen::gen_core::Error::Unsupported(
+                    "flux2_dev_control requires exactly one Control conditioning image".into(),
+                ));
+            }
+        };
+        let steps = request
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(DEFAULT_STEPS_DEV as usize);
+        let guidance = request.guidance.unwrap_or(DEFAULT_GUIDANCE_DEV);
+        let control_scale = scale
+            .or(request.control_scale)
+            .unwrap_or(DEFAULT_CONTROL_SCALE);
+        let base_seed = request.seed.unwrap_or(0);
+        let mut images = Vec::with_capacity(request.count as usize);
+        for idx in 0..request.count {
+            let control_req = Flux2ControlRequest {
+                prompt: request.prompt.clone(),
+                width: request.width,
+                height: request.height,
+                steps,
+                sampler: request.sampler.as_deref().map(str::to_owned),
+                scheduler: request.scheduler.as_deref().map(str::to_owned),
+                scheduler_shift: request.scheduler_shift,
+                guidance,
+                control_scale,
+                seed: base_seed.wrapping_add(idx as u64),
+                use_pid: request.use_pid(),
+                preview: request.preview.clone(),
+                pag: request.features.pag.clone(),
+                cancel: request.cancel.clone(),
+            };
+            images.push(
+                self.model
+                    .generate(&control_req, control_image, on_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?,
+            );
+        }
+        Ok(candle_gen::gen_core::GenerationOutput::Images(images))
+    }
+}
+
+pub(crate) fn load_control(
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    spec.validate_prepared_file_pins()?;
+    candle_gen::gen_core::reject_unknown_components(spec, &[], control_report_descriptor().id)?;
+    if !spec.extra_controls.is_empty()
+        || spec.identity.is_some()
+        || spec.ip_adapter.is_some()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "flux2_dev_control does not accept extra control, identity, or IP-Adapter overlays"
+                .into(),
+        ));
+    }
+    let root = match &spec.weights {
+        candle_gen::gen_core::WeightsSource::Dir(root) => root.clone(),
+        candle_gen::gen_core::WeightsSource::File(_) => {
+            return Err(candle_gen::gen_core::Error::Msg(
+                "flux2_dev_control requires a FLUX.2-dev snapshot directory".into(),
+            ));
+        }
+    };
+    let control = match &spec.control {
+        Some(
+            candle_gen::gen_core::WeightsSource::File(path)
+            | candle_gen::gen_core::WeightsSource::Dir(path),
+        ) => path.clone(),
+        None => {
+            return Err(candle_gen::gen_core::Error::Msg(
+                "flux2_dev_control requires spec.control".into(),
+            ));
+        }
+    };
+    let paths = Flux2ControlPaths {
+        root,
+        control,
+        adapters: spec.adapters.clone(),
+    };
+    let mut model =
+        Flux2Control::load_with_memory_spec(&paths, spec.quantize, spec, GenerationMemory::default())
+            .map_err(candle_gen::gen_core::Error::from)?;
+    if let Some(pid) = &spec.pid {
+        model = model
+            .with_pid(pid)
+            .map_err(candle_gen::gen_core::Error::from)?;
+    }
+    Ok(Box::new(Flux2ControlGenerator {
+        descriptor: control_report_descriptor(),
+        spec: spec.clone(),
+        model,
+    }))
 }
 
 pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {

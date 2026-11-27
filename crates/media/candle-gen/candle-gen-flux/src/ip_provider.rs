@@ -273,18 +273,159 @@ pub(crate) fn route_ip(variant: Variant) -> candle_gen::gen_core::RouteRecord {
     route.seed_and_batch.max_count = 1;
     route.defaults.strength = Some(DEFAULT_IP_SCALE);
     route.bindings = match variant {
-        Variant::Dev => candle_gen::gen_core::RouteBindings::feature_route(
-            Some(crate::FLUX1_DEV_ID),
-            ip_descriptor_dev,
-        )
-        .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Dev, spec, req)),
-        Variant::Schnell => candle_gen::gen_core::RouteBindings::feature_route(
-            Some(crate::FLUX1_SCHNELL_ID),
-            ip_descriptor_schnell,
-        )
-        .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Schnell, spec, req)),
+        Variant::Dev => candle_gen::gen_core::RouteBindings::generator(ip_descriptor_dev, load_ip_dev)
+            .with_feature_route(Some(crate::FLUX1_DEV_ID), ip_descriptor_dev)
+            .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Dev, spec, req)),
+        Variant::Schnell => {
+            candle_gen::gen_core::RouteBindings::generator(ip_descriptor_schnell, load_ip_schnell)
+                .with_feature_route(Some(crate::FLUX1_SCHNELL_ID), ip_descriptor_schnell)
+                .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Schnell, spec, req))
+        }
     };
     route
+}
+
+struct FluxIpAdapterGenerator {
+    descriptor: ModelDescriptor,
+    variant: Variant,
+    spec: LoadSpec,
+    model: IpAdapterFlux,
+}
+
+impl candle_gen::gen_core::Generator for FluxIpAdapterGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        let (reference, strength) = match req.conditioning.as_slice() {
+            [Conditioning::Reference { image, strength }] => (image, *strength),
+            _ => {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{} requires exactly one Reference conditioning image",
+                    self.descriptor.id
+                )));
+            }
+        };
+        let plan = compile_ip_feature_route(self.variant, &self.spec, req)?.ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(format!(
+                "{}: failed to compile IP render plan",
+                self.descriptor.id
+            ))
+        })?;
+        let default_steps = if self.variant.is_dev() { 25 } else { 4 };
+        let ip_req = IpAdapterFluxRequest {
+            prompt: req.prompt.clone(),
+            width: req.width,
+            height: req.height,
+            steps: req.steps.map(|s| s as usize).unwrap_or(default_steps),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
+            scheduler_shift: req.scheduler_shift,
+            guidance: req.guidance.unwrap_or(3.5),
+            ip_adapter_scale: strength.unwrap_or(DEFAULT_IP_SCALE),
+            seed: req.seed.unwrap_or(0),
+            memory: req.memory.unwrap_or_default(),
+            preview: req.preview.clone(),
+            pag: req.features.pag.clone(),
+            cancel: req.cancel.clone(),
+        };
+        self.model
+            .generate_with_execution_report(&ip_req, reference, &plan, on_progress)
+    }
+
+    fn validate(&self, request: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
+        let _ = compile_ip_feature_route(self.variant, &self.spec, request)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        self.generate_with_execution_report(request, on_progress)?
+            .generation
+            .output
+            .ok_or_else(|| {
+                candle_gen::gen_core::Error::Msg(format!(
+                    "{}: generation produced no output",
+                    self.descriptor.id
+                ))
+            })
+    }
+}
+
+fn load_ip_variant(
+    variant: Variant,
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    let descriptor = ip_descriptor(variant);
+    spec.validate_prepared_file_pins()?;
+    candle_gen::gen_core::reject_unknown_components(spec, &["image_encoder"], descriptor.id)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.identity.is_some()
+        || spec.pid.is_some()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{} does not accept control, identity, or PiD overlays",
+            descriptor.id
+        )));
+    }
+    let flux_base = match &spec.weights {
+        WeightsSource::Dir(root) => root.clone(),
+        WeightsSource::File(_) => {
+            return Err(candle_gen::gen_core::Error::Msg(format!(
+                "{} requires a FLUX.1 snapshot directory",
+                descriptor.id
+            )));
+        }
+    };
+    let ip_adapter = match &spec.ip_adapter {
+        Some(WeightsSource::File(path) | WeightsSource::Dir(path)) => path.clone(),
+        None => {
+            return Err(candle_gen::gen_core::Error::Msg(format!(
+                "{} requires spec.ip_adapter",
+                descriptor.id
+            )));
+        }
+    };
+    let image_encoder = match spec.components.get("image_encoder") {
+        Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
+        None => flux_base.join("image_encoder"),
+    };
+    let paths = IpAdapterFluxPaths {
+        flux_base,
+        ip_adapter,
+        image_encoder,
+        adapters: spec.adapters.clone(),
+    };
+    let model = IpAdapterFlux::load_with_memory_spec(&paths, GenerationMemory::default(), spec)
+        .map_err(candle_gen::gen_core::Error::from)?;
+    Ok(Box::new(FluxIpAdapterGenerator {
+        descriptor,
+        variant,
+        spec: spec.clone(),
+        model,
+    }))
+}
+
+pub(crate) fn load_ip_dev(
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    load_ip_variant(Variant::Dev, spec)
+}
+
+pub(crate) fn load_ip_schnell(
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    load_ip_variant(Variant::Schnell, spec)
 }
 
 pub(crate) fn ip_descriptor_dev() -> ModelDescriptor {

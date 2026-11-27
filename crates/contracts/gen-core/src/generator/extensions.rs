@@ -160,6 +160,8 @@ pub enum FamilyExtensionKind {
     Wan,
     /// Krea / Qwen-Image multi-tap text style gain (`KreaExtension`).
     Krea,
+    /// Autoregressive vector generation controls (`VectorExtension`, e.g. StarVector).
+    Vector,
 }
 
 /// MOSS-Image family extension (`REG-4`).
@@ -427,6 +429,94 @@ impl KreaExtension {
     }
 }
 
+/// Autoregressive vector generation extension (`PIPE-12`, `REG-4`, e.g. StarVector).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VectorExtension {
+    /// Maximum newly generated decoder tokens (`None` => provider default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_new_tokens: Option<u32>,
+    /// Maximum raw UTF-8 SVG source bytes accepted before stopping (`None` => sanitizer cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_svg_bytes: Option<usize>,
+    /// Maximum wall-clock decode budget in milliseconds (`None` => provider cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_time_ms: Option<u64>,
+    /// Sampling temperature (`0.0` = greedy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling mass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Top-k sampling truncation (`0` = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Repetition penalty (`1.0` = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// Repetition penalty window in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_context: Option<u32>,
+    /// Whether to populate `VectorOutput::preview` with a derived RGB preview image.
+    #[serde(default = "default_render_preview")]
+    pub render_preview: bool,
+    /// Maximum edge dimension in pixels for the derived preview image (`None` => default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_max_dimension: Option<u32>,
+    /// When `true`, bounded limit outcomes (`token_limit`/`byte_limit`/`wall_time_limit`) return
+    /// a typed `GenerationOutput::Vector` with `truncated: true`, empty `svg`, and populated
+    /// terminal metadata instead of failing with `Error::Msg`.
+    #[serde(default)]
+    pub allow_non_publishable: bool,
+}
+
+const fn default_render_preview() -> bool {
+    true
+}
+
+impl VectorExtension {
+    pub fn is_empty(&self) -> bool {
+        self.max_new_tokens.is_none()
+            && self.max_svg_bytes.is_none()
+            && self.max_wall_time_ms.is_none()
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.repetition_penalty.is_none()
+            && self.repetition_context.is_none()
+            && !self.render_preview
+            && self.preview_max_dimension.is_none()
+            && !self.allow_non_publishable
+    }
+
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        let Self {
+            max_new_tokens: _,
+            max_svg_bytes: _,
+            max_wall_time_ms: _,
+            temperature,
+            top_p,
+            top_k: _,
+            repetition_penalty,
+            repetition_context: _,
+            render_preview: _,
+            preview_max_dimension: _,
+            allow_non_publishable: _,
+        } = self;
+        for (name, val) in [
+            ("vector.temperature", *temperature),
+            ("vector.top_p", *top_p),
+            ("vector.repetition_penalty", *repetition_penalty),
+        ] {
+            if let Some(v) = val {
+                if !v.is_finite() {
+                    return Some((name, v));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Single typed family extension block (`REG-4`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FamilyExtension {
@@ -439,6 +529,7 @@ pub enum FamilyExtension {
     SeedVr2(SeedVr2Extension),
     Wan(WanExtension),
     Krea(KreaExtension),
+    Vector(VectorExtension),
 }
 
 /// Composable container of typed family extension blocks carried on
@@ -457,6 +548,7 @@ pub struct FamilyExtensions {
     pub seedvr2: Option<SeedVr2Extension>,
     pub wan: Option<WanExtension>,
     pub krea: Option<KreaExtension>,
+    pub vector: Option<VectorExtension>,
 }
 
 impl FamilyExtensions {
@@ -471,6 +563,7 @@ impl FamilyExtensions {
             seedvr2,
             wan,
             krea,
+            vector,
         } = self;
         moss_image.as_ref().is_none_or(MossImageExtension::is_empty)
             && flux3.as_ref().is_none_or(Flux3Extension::is_empty)
@@ -481,6 +574,7 @@ impl FamilyExtensions {
             && seedvr2.as_ref().is_none_or(SeedVr2Extension::is_empty)
             && wan.as_ref().is_none_or(WanExtension::is_empty)
             && krea.as_ref().is_none_or(KreaExtension::is_empty)
+            && vector.as_ref().is_none_or(VectorExtension::is_empty)
     }
 
     /// Insert or replace a single typed [`FamilyExtension`] block.
@@ -495,6 +589,7 @@ impl FamilyExtensions {
             FamilyExtension::SeedVr2(v) => self.seedvr2 = Some(v),
             FamilyExtension::Wan(v) => self.wan = Some(v),
             FamilyExtension::Krea(v) => self.krea = Some(v),
+            FamilyExtension::Vector(v) => self.vector = Some(v),
         }
     }
 
@@ -543,6 +638,11 @@ impl FamilyExtensions {
         self.krea.get_or_insert_with(Default::default)
     }
 
+    /// Mutable access to the vector extension block, initializing with defaults if absent.
+    pub fn vector_mut(&mut self) -> &mut VectorExtension {
+        self.vector.get_or_insert_with(Default::default)
+    }
+
     /// Exhaustive non-finite float check across every family extension slot.
     pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
         let Self {
@@ -555,6 +655,7 @@ impl FamilyExtensions {
             seedvr2,
             wan,
             krea,
+            vector,
         } = self;
         if let Some(v) = moss_image
             .as_ref()
@@ -592,7 +693,11 @@ impl FamilyExtensions {
         if let Some(v) = wan.as_ref().and_then(WanExtension::first_nonfinite_float) {
             return Some(v);
         }
-        krea.as_ref()
-            .and_then(KreaExtension::first_nonfinite_float)
+        if let Some(v) = krea.as_ref().and_then(KreaExtension::first_nonfinite_float) {
+            return Some(v);
+        }
+        vector
+            .as_ref()
+            .and_then(VectorExtension::first_nonfinite_float)
     }
 }

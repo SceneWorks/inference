@@ -60,6 +60,11 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+#[cfg(feature = "media")]
+mod facades;
+#[cfg(feature = "media")]
+pub use facades::{calibration, converters, memory_helpers, utilities};
+
 /// Descriptor-less provider memory routes that the CUDA bundle intentionally reconciles outside
 /// the ordinary generator registry.
 #[cfg(feature = "media")]
@@ -88,10 +93,41 @@ pub const SUPPORTED_TARGET_TRIPLES: &[&str] =
 /// Native (non-Cargo) prerequisites required to build and run this bundle.
 pub const NATIVE_PREREQUISITES: &[&str] = &["NVIDIA CUDA toolkit", "supported NVIDIA driver"];
 
+#[cfg(feature = "media")]
+fn load_starvector_1b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+    let text_registry = candle_llm::cuda_text_registry()
+        .map_err(|err| gen_core::Error::Msg(format!("candle cuda text registry: {err}")))?;
+    runtime_catalog::starvector::load_from_text_registry(
+        runtime_catalog::starvector::descriptor_candle_1b(),
+        &text_registry,
+        runtime_catalog::starvector::CANDLE_STARVECTOR_1B_LLM_ID,
+        spec,
+    )
+}
+
+#[cfg(feature = "media")]
+fn load_starvector_8b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+    let text_registry = candle_llm::cuda_text_registry()
+        .map_err(|err| gen_core::Error::Msg(format!("candle cuda text registry: {err}")))?;
+    runtime_catalog::starvector::load_from_text_registry(
+        runtime_catalog::starvector::descriptor_candle_8b(),
+        &text_registry,
+        runtime_catalog::starvector::CANDLE_STARVECTOR_8B_LLM_ID,
+        spec,
+    )
+}
+
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
-        candle_gen_catalog::provider_registry()
+        candle_gen_catalog::register_providers(gen_core::ProviderRegistryBuilder::new())
+            .register_route(runtime_catalog::starvector::route_candle_1b(
+                load_starvector_1b,
+            ))
+            .register_route(runtime_catalog::starvector::route_candle_8b(
+                load_starvector_8b,
+            ))
+            .build()
     }
 
     #[cfg(not(feature = "media"))]
@@ -455,7 +491,7 @@ mod tests {
             assert!(snapshot.audio_embedder_ids.is_empty());
         }
         #[cfg(feature = "media")]
-        assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
+        assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 4);
         assert_eq!(snapshot.to_json()["platform"], "cuda");
     }
 
@@ -576,9 +612,8 @@ mod tests {
         // and it is what a bundle that quietly grew a registration would break.
         let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
         assert!(
-            !waivers.is_empty(),
-            "the CUDA bundle exposes descriptor-less memory routes; an empty waiver table would \
-             make every check below vacuous"
+            waivers.is_empty(),
+            "all bespoke memory routes are registered in SW-6982"
         );
         let registry = super::media_registry().expect("CUDA media registry");
         assert!(
@@ -667,10 +702,20 @@ mod tests {
                 "live runtime-cuda export must report has_memory_behavior=true for `{route_id}`"
             );
         }
+        let descriptor_media = candle_gen_catalog::register_cuda_descriptor_providers(
+            super::gen_core::ProviderRegistryBuilder::new(),
+        )
+        .register_route(runtime_catalog::starvector::route_candle_1b(
+            runtime_catalog::starvector::unavailable_loader,
+        ))
+        .register_route(runtime_catalog::starvector::route_candle_8b(
+            runtime_catalog::starvector::unavailable_loader,
+        ))
+        .build();
         let descriptor_catalog = super::RuntimeCatalog::try_new_with_audio(
             super::PLATFORM,
             super::BACKEND,
-            candle_gen_catalog::cuda_descriptor_provider_registry(),
+            descriptor_media,
             super::llm::cuda_descriptor_text_registry(),
             super::llm::snapshot_preparer_registry(),
             super::audio_lane(),
