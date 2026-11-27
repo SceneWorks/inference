@@ -296,7 +296,7 @@ impl Pipeline {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = run.plan().base_seed();
 
-        let (pos_embeds, neg, pid_decoder) = if req.use_pid {
+        let (pos_embeds, neg, pid_decoder) = if req.use_pid() {
             run.begin_conditioning().map_err(CandleError::from)?;
             let (pos_embeds, neg) = candle_gen::gen_core::with_prompt_encoding(
                 on_progress,
@@ -496,7 +496,7 @@ impl Pipeline {
         candle_gen::check_cancel(&req.cancel)?;
         check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
         let decoder = SynchronizedPhase::new(
-            if req.use_pid {
+            if req.use_pid() {
                 DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(|| {
                     CandleError::Msg(format!(
                         "{}: PiD was requested but no exact PiD load receipt is present",

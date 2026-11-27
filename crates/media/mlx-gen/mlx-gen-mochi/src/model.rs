@@ -67,6 +67,7 @@ pub(crate) fn route_mochi() -> gen_core::RouteRecord {
                 // Not distilled -> true classifier-free guidance over a [neg, pos] batch.
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // A single fixed flow-match Euler integrator; a selectable sampler/scheduler axis is
@@ -123,6 +124,7 @@ pub(crate) fn route_mochi() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,

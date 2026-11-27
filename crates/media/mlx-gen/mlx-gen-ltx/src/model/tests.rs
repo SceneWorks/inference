@@ -260,7 +260,7 @@ fn ltx25_provider_enhancement_is_registered_and_refuses_the_unlicensed_axis() {
         .to_string();
     assert!(err.contains("greedy"), "{err}");
     let forbidden = GenerationRequest {
-        use_uncensored_enhancer: true,
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { use_uncensored_enhancer: true, ..Default::default() }), ..Default::default() },
         ..enhanced
     };
     assert!(Generator::validate(&generator, &forbidden)
@@ -342,17 +342,17 @@ fn ltx25_provider_admits_only_advanced_axes_it_executes() {
         width: 512,
         height: 512,
         frames: Some(17),
-        num_generated_keyframes: Some(1),
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
         ..Default::default()
     };
     assert!(Generator::validate(&generator, &request).is_ok());
     let mut temporal = request.clone();
-    temporal.num_generated_keyframes = None;
-    temporal.temporal_upsample_rounds = Some(1);
+    temporal.extensions.ltx_mut().num_generated_keyframes = None;
+    temporal.extensions.ltx_mut().temporal_upsample_rounds = Some(1);
     assert!(Generator::validate(&generator, &temporal).is_ok());
     let mut automatic = request;
-    automatic.num_generated_keyframes = None;
-    automatic.auto_duration = Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+    automatic.extensions.ltx_mut().num_generated_keyframes = None;
+    automatic.extensions.ltx_mut().auto_duration = Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
         min_seconds: 1.0,
         max_seconds: 2.0,
     });
@@ -376,10 +376,10 @@ fn ltx25_auto_duration_prediction_drives_the_provider_frame_plan() {
         width: 512,
         height: 512,
         fps: Some(24),
-        auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
             min_seconds: 2.0,
             max_seconds: 8.0,
-        }),
+        }), ..Default::default() }), ..Default::default() },
         ..Default::default()
     };
     let calls = std::cell::Cell::new(0usize);
@@ -422,7 +422,7 @@ fn ltx25_dfr_request_plan_drives_temporal_and_generated_slot_execution() {
         width: 512,
         height: 512,
         frames: Some(153),
-        temporal_upsample_rounds: Some(2),
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(2), ..Default::default() }), ..Default::default() },
         ..Default::default()
     };
     let temporal_plan = plan_dfr_request(&temporal)
@@ -457,8 +457,8 @@ fn ltx25_dfr_request_plan_drives_temporal_and_generated_slot_execution() {
     assert_eq!(plain_calls.get(), 0);
 
     let generated = GenerationRequest {
-        num_generated_keyframes: Some(3),
         frames: Some(121),
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(3), ..Default::default() }), ..Default::default() },
         ..temporal
     };
     let generated_plan = plan_dfr_request(&generated)
@@ -858,14 +858,14 @@ fn validate_refuses_dfr_knobs_on_2_3_typed() {
         (
             "num_generated_keyframes",
             GenerationRequest {
-                num_generated_keyframes: Some(3),
+                extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(3), ..Default::default() }), ..Default::default() },
                 ..base.clone()
             },
         ),
         (
             "temporal_upsample_rounds",
             GenerationRequest {
-                temporal_upsample_rounds: Some(1),
+                extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
                 ..base.clone()
             },
         ),
@@ -876,8 +876,7 @@ fn validate_refuses_dfr_knobs_on_2_3_typed() {
     }
     // Zero / unset are the off position, not a refusal.
     let off = GenerationRequest {
-        num_generated_keyframes: Some(0),
-        temporal_upsample_rounds: Some(0),
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(0), temporal_upsample_rounds: Some(0), ..Default::default() }), ..Default::default() },
         ..base
     };
     validate_request(&caps, &off).expect("0 is off");
@@ -1445,37 +1444,36 @@ fn validate_refuses_invalid_render_plan_combinations_without_loading_weights() {
         },
         GenerationRequest {
             sampler: Some("heun".into()),
-            num_generated_keyframes: Some(1),
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
         GenerationRequest {
             sampler: Some("heun".into()),
-            temporal_upsample_rounds: Some(1),
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
         GenerationRequest {
-            num_generated_keyframes: Some(1),
             conditioning: vec![Conditioning::VideoClip {
                 frames: vec![img.clone()],
                 frame_idx: 0,
                 strength: 1.0,
             }],
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
         GenerationRequest {
             frames: Some(1),
-            num_generated_keyframes: Some(1),
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
         GenerationRequest {
             frames: None,
-            auto_duration: None,
-            num_generated_keyframes: Some(1),
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { auto_duration: None, num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
         GenerationRequest {
             frames: Some(1),
-            temporal_upsample_rounds: Some(1),
+            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         },
     ] {
@@ -1489,11 +1487,10 @@ fn validate_refuses_invalid_render_plan_combinations_without_loading_weights() {
     // samplers pre-load.
     let auto_dfr = GenerationRequest {
         frames: None,
-        auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+        extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
             min_seconds: 1.0,
             max_seconds: 2.0,
-        }),
-        num_generated_keyframes: Some(1),
+        }), num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
         ..base_25.clone()
     };
     assert!(Generator::validate(&distilled, &auto_dfr).is_ok());

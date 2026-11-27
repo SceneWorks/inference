@@ -428,20 +428,22 @@ impl SvdParams {
         }
         // `params.fps` is the MOTION-conditioning cadence (from `conditioning_fps`), distinct from
         // `req.fps` (the output/playback cadence applied at return time).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps;
+        if let Some(svd) = req.extensions.svd.as_ref() {
+            if let Some(cfps) = svd.conditioning_fps {
+                params.fps = cfps;
+            }
+            if let Some(m) = svd.motion_bucket_id {
+                params.motion_bucket_id = m;
+            }
+            if let Some(n) = svd.noise_aug_strength {
+                params.noise_aug_strength = n;
+            }
+            if let Some(c) = svd.decode_chunk_size {
+                params.decode_chunk_size = c as usize;
+            }
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
-        }
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as usize;
         }
         params
     }

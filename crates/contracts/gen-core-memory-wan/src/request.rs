@@ -417,10 +417,10 @@ pub fn validate_request(
     let frames = request.frames.unwrap_or_default();
     let fps = request.fps.unwrap_or_default();
     let steps = request.steps.unwrap_or_default();
-    let unsupported_svd = request.motion_bucket_id.is_some()
-        || request.noise_aug_strength.is_some()
-        || request.decode_chunk_size.is_some()
-        || request.conditioning_fps.is_some();
+    let unsupported_svd = request
+        .extensions
+        .svd
+        .is_some_and(|svd| !svd.is_empty());
     let has_lightning = prepared.adapters.first().is_some_and(|receipt| {
         receipt.kind == "lightning_lora"
             && receipt.expert == "high"
@@ -478,7 +478,11 @@ pub fn validate_request(
             | WanPublicMode::ReplacePerson
     ) || (request.strength.is_none()
         && request.true_cfg.is_none()
-        && request.timestep_to_start_cfg.is_none()
+        && request
+            .extensions
+            .pulid
+            .and_then(|p| p.timestep_to_start_cfg)
+            .is_none()
         && request.guidance_method.is_none()
         && request.guidance_eta.is_none()
         && request.guidance_momentum.is_none()
@@ -488,12 +492,20 @@ pub fn validate_request(
                 && request
                     .control_scale
                     .is_some_and(|value| value.is_finite() && value >= 0.0)))
-        && request.text_style_gain.is_none()
+        && request
+            .extensions
+            .krea
+            .and_then(|k| k.text_style_gain)
+            .is_none()
         && request.image_guidance.is_none()
         && request.duration.is_none()
-        && request.trim_first_frames.is_none()
-        && request.softness.is_none()
-        && request.pid_capture_sigma.is_none()
+        && request
+            .extensions
+            .wan
+            .and_then(|w| w.trim_first_frames)
+            .is_none()
+        && request.extensions.seedvr2.and_then(|s| s.softness).is_none()
+        && request.pid_capture_sigma().is_none()
         && request.approximation.is_none());
     if request.count != 1
         || !prepared
@@ -504,12 +516,16 @@ pub fn validate_request(
         || !(1..=100).contains(&steps)
         || request.seed.is_none()
         || request.audio.is_some()
-        || request.phases.is_some()
+        || request.features.phases.is_some()
         || request.scheduler.is_some()
         || request.scheduler_shift.is_some()
-        || request.use_pid
+        || request.use_pid()
         || request.enhance_prompt
-        || request.use_uncensored_enhancer
+        || request
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
         || unsupported_svd
         || !lightning_sampling
         || !sampler_ok

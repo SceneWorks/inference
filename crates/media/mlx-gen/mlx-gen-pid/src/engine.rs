@@ -175,7 +175,7 @@ pub fn resolve_pid_decoder(
     base_seed: u64,
     model_id: &str,
 ) -> Result<Option<PidDecoder>> {
-    if req.use_pid && req.pid_capture_sigma.is_some() {
+    if req.use_pid() && req.pid_capture_sigma().is_some() {
         return Err(Error::Msg(format!(
             "{model_id}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space \
              yet — sc-7993 wired the flow-match qwenimage space (Qwen-Image / Krea); the flux / flux2 \
@@ -212,7 +212,7 @@ pub fn resolve_pid_decoder_with_routes(
     capture_sigma: f32,
     decode_routes: Option<&DecodeRoutes>,
 ) -> Result<Option<PidDecoder>> {
-    if !req.use_pid {
+    if !req.use_pid() {
         return Ok(None);
     }
     let selected = crate::plan::PidDecodePlan::resolve_request_tiling(req, decode_routes)?;
@@ -441,8 +441,8 @@ pub fn flow_capture_for_request(
     start_step: usize,
 ) -> (f32, usize) {
     let plan = req
-        .use_pid
-        .then(|| flow_capture_plan(sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| flow_capture_plan(sigmas, req.pid_capture_sigma()))
         .flatten();
     match plan {
         Some(c) if c.keep > start_step + 1 => (c.sigma, c.keep),
@@ -657,7 +657,7 @@ mod tests {
         // not `Debug`, so match rather than `.expect_err()`.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: true,
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "some_model"));
@@ -671,8 +671,7 @@ mod tests {
         // surfaced before any load. The flow-match qwenimage sites use resolve_pid_decoder_at_sigma.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: true,
-            pid_capture_sigma: Some(0.2),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.2) }), ..Default::default() },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "flux"));
@@ -700,8 +699,7 @@ mod tests {
         // pid_capture_sigma is only consulted under use_pid — off → None (native VAE), no error.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: false,
-            pid_capture_sigma: Some(0.2),
+            features: mlx_gen::gen_core::FeatureParams { pid: if false { Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.2) }) } else { (Some(0.2)).map(mlx_gen::gen_core::PidParams::with_capture_sigma) }, ..Default::default() },
             ..Default::default()
         };
         assert!(resolve_pid_decoder(None, &req, 0, "flux")
@@ -714,13 +712,13 @@ mod tests {
         let routes = DecodeRoutes::new("z_image_turbo", [768, 640, 512], 64).unwrap();
         let unmeasured = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: true,
             memory: Some(mlx_gen::gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(1536),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let err_default = err_string(resolve_pid_decoder_at_sigma(
@@ -737,13 +735,13 @@ mod tests {
 
         let native_edge = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: true,
             memory: Some(mlx_gen::gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let err_routes = err_string(resolve_pid_decoder_with_routes(
@@ -761,13 +759,13 @@ mod tests {
 
         let valid_tile = GenerationRequest {
             prompt: "a fox".into(),
-            use_pid: true,
             memory: Some(mlx_gen::gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(2048),
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let err_missing_engine = err_string(resolve_pid_decoder_with_routes(
@@ -793,8 +791,8 @@ mod selected_tiling_tests {
     fn req(memory: Option<GenerationMemory>) -> GenerationRequest {
         GenerationRequest {
             prompt: "a fox".to_owned(),
-            use_pid: true,
             memory,
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         }
     }

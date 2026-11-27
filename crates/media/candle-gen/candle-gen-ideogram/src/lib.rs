@@ -320,6 +320,7 @@ pub(crate) fn route_quality() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: vec![],
@@ -376,6 +377,7 @@ pub(crate) fn route_quality() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,

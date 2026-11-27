@@ -573,11 +573,11 @@ mod tests {
             MemorySafetyDecision::Accept
         );
         assert!(!fixture.context.has_phases);
-        assert!(fixture.request.phases.is_none());
+        assert!(fixture.request.features.phases.is_none());
         assert_eq!(fixture.request.width, fixture.context.geometry.width);
         assert_eq!(fixture.request.height, fixture.context.geometry.height);
         assert_eq!(fixture.request.count, fixture.context.geometry.batch);
-        assert_eq!(fixture.request.use_pid, fixture.context.use_pid);
+        assert_eq!(fixture.request.use_pid(), fixture.context.use_pid);
         assert!(matches!(
             fixture.request.conditioning.as_slice(),
             [mlx_gen::Conditioning::Reference { .. }]

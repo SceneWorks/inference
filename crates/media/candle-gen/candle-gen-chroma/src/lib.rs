@@ -334,7 +334,7 @@ fn validate_request_for_variant(
             "{id}: bounded decode, attention, and transformer residency are Missing"
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let sigmas = pipeline::resolved_sigmas(variant, req)?;
         low_res.resolve_for_descriptor(
             &descriptor,
@@ -400,7 +400,7 @@ fn compile_variant_plan(
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_load_spec(variant, spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
             variant.id()
@@ -523,6 +523,7 @@ pub(crate) fn route_for(variant: ChromaVariant) -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) plus the legacy
@@ -589,6 +590,7 @@ pub(crate) fn route_for(variant: ChromaVariant) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -995,7 +997,7 @@ mod tests {
                 height: 512,
                 steps: Some(6),
                 seed: Some(77),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
                 ..Default::default()
             };
             let plan = registry

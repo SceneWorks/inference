@@ -1130,7 +1130,7 @@ impl MossImageTrainer {
                     .map_err(admission_error)?;
                 for (index, (prompt, context)) in previews.iter().enumerate() {
                     let edge = candle_gen::train::dataset::bucket_resolution(c.resolution);
-                    let request = gen_core::GenerationRequest {
+                    let mut request = gen_core::GenerationRequest {
                         prompt: prompt.clone(),
                         width: edge,
                         height: edge,
@@ -1138,12 +1138,12 @@ impl MossImageTrainer {
                         guidance: Some(c.sample_guidance_scale),
                         seed: Some(c.seed.wrapping_add(index as u64)),
                         cancel: req.cancel.clone(),
-                        moss_image: Some(MossImageOptions {
-                            uncond_skip_layers: Some(Vec::new()),
-                            ..Default::default()
-                        }),
                         ..Default::default()
                     };
+                    request.extensions.moss_image_mut().options = Some(MossImageOptions {
+                        uncond_skip_layers: Some(Vec::new()),
+                        ..Default::default()
+                    });
                     let resolved = MossImageResolved::resolve(self.variant, &request)?;
                     let positive = Conditioning {
                         rows: vec![context.clone()],

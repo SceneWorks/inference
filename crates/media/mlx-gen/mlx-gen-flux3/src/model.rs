@@ -85,6 +85,7 @@ pub fn route() -> RouteRecord {
                 encoders: vec![TextEncoderDeclaration::new("qwen3_vl_4b", None)],
                 encoder_contract: None,
                 max_prompt_tokens: None,
+                max_enhance_tokens: Some(gen_core::flux3::pup::MAX_TOKENS),
                 supports_caption_overflow_policy: false,
                 supports_prompt_enhancement: true,
             },
@@ -98,6 +99,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: SAMPLERS.to_vec(),
@@ -150,12 +152,14 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,
                 supports_hdr: false,
                 supports_alpha_output: false,
             },
+            supported_family_extensions: vec![gen_core::FamilyExtensionKind::Flux3],
             ..Default::default()
         },
         limits: ProductLimits {
@@ -894,6 +898,8 @@ impl Flux3Klein {
                 prefix_kv_cache: None,
                 pag: pag_report,
                 low_res_start: None,
+                adapter_apply_reports: Vec::new(),
+                family_report: None,
             },
         )
     }
@@ -938,10 +944,6 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Flux3Klein {
-    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        self.adapter_reports.clone()
-    }
-
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -1040,7 +1042,9 @@ impl Flux3Klein {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let mut report = self.generate_impl(req, on_progress)?;
+        report.adapter_apply_reports = self.adapter_reports.clone();
+        Ok(report)
     }
 }
 

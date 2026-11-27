@@ -986,10 +986,8 @@ fn resolve_control_pag(
     req: &Flux2ControlRequest,
 ) -> Result<Option<candle_gen::gen_core::PagResolved>> {
     let desc = control_report_descriptor();
-    let pag_req = candle_gen::gen_core::GenerationRequest {
-        pag: req.pag.clone(),
-        ..Default::default()
-    };
+    let mut pag_req = candle_gen::gen_core::GenerationRequest::default();
+    pag_req.features.pag = req.pag.clone();
     desc.capabilities
         .resolve_pag(desc.id, &pag_req)
         .map_err(CandleError::from)

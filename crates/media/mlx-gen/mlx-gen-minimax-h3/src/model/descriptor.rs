@@ -26,6 +26,7 @@ pub fn route() -> RouteRecord {
                 max_prompt_tokens: None,
                 supports_caption_overflow_policy: false,
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: ConditioningSurface {
                 kinds: vec![
@@ -38,6 +39,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: vec![],
@@ -86,12 +88,17 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,
                 supports_hdr: false,
                 supports_alpha_output: false,
             },
+            supported_family_extensions: vec![
+                mlx_gen::gen_core::FamilyExtensionKind::H3Veda,
+                mlx_gen::gen_core::FamilyExtensionKind::H3Reference,
+            ],
             ..Default::default()
         },
         limits: ProductLimits {

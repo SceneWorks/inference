@@ -509,7 +509,7 @@ impl TrainingProbe {
         let observation = serde_json::json!({
             "request":{"prompt":&request.prompt,"width":request.width,"height":request.height,
                 "seed":request.seed,"steps":request.steps,"guidance":request.guidance,
-                "max_sequence_length":request.moss_image.as_ref().map(|m|m.max_sequence_length)},
+                "max_sequence_length":request.extensions.moss_image.as_ref().and_then(|m|m.options.as_ref()).map(|m|m.max_sequence_length)},
             "baseline_shape":baseline.0,"baseline_elements":baseline.1.len(),
             "trained_shape":trained.0,"zero_strength_shape":disabled.0,
             "trained":compare(baseline.1,trained.1),"zero_strength":compare(baseline.1,disabled.1),

@@ -415,16 +415,19 @@ fn typed_pulid_request(
         steps: Some(steps),
         seed: Some(req.seed),
         guidance: Some(req.guidance),
-        sampler: req.sampler.clone(),
-        scheduler: req.scheduler.clone(),
+        sampler: req.sampler.clone().map(Into::into),
+        scheduler: req.scheduler.clone().map(Into::into),
         scheduler_shift: req.scheduler_shift,
         conditioning: vec![Conditioning::Reference {
             image: reference.clone(),
             strength: Some(req.id_weight),
         }],
-        use_pid: req.use_pid,
+        features: candle_gen::gen_core::FeatureParams {
+            pag: req.pag.clone(),
+            pid: req.use_pid.then(candle_gen::gen_core::PidParams::enabled),
+            ..Default::default()
+        },
         preview: req.preview.clone(),
-        pag: req.pag.clone(),
         cancel: req.cancel.clone(),
         ..Default::default()
     })
@@ -1014,10 +1017,8 @@ fn resolve_pulid_pag(
     req: &PulidFluxRequest,
 ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagResolved>> {
     let descriptor = plan_descriptor();
-    let pag_req = GenerationRequest {
-        pag: req.pag.clone(),
-        ..Default::default()
-    };
+    let mut pag_req = GenerationRequest::default();
+    pag_req.features.pag = req.pag.clone();
     descriptor.capabilities.resolve_pag(descriptor.id, &pag_req)
 }
 

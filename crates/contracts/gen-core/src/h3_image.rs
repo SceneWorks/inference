@@ -467,9 +467,12 @@ pub fn resolve_sampler(
     Ok(sampler)
 }
 
-/// [`resolve_sampler`] over a request's `sampler` and `h3_image_sampler` fields.
+/// [`resolve_sampler`] over a request's `sampler` and `extensions.h3.image_sampler` fields.
 pub fn request_sampler(req: &crate::GenerationRequest) -> Result<H3ImageSampler, H3ImageRefusal> {
-    resolve_sampler(req.sampler.as_deref(), req.h3_image_sampler)
+    resolve_sampler(
+        req.sampler.as_deref(),
+        req.extensions.h3.as_ref().and_then(|h3| h3.image_sampler),
+    )
 }
 
 // ── schedulers (SW-7224) ────────────────────────────────────────────────────────────────────────
@@ -2211,7 +2214,13 @@ mod tests {
             ..Default::default()
         };
         let mut req = crate::GenerationRequest {
-            h3_image_sampler: Some(H3ImageSampler::lcm_default()),
+            extensions: crate::FamilyExtensions {
+                h3: Some(crate::H3Extension {
+                    image_sampler: Some(H3ImageSampler::lcm_default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(
@@ -2220,7 +2229,7 @@ mod tests {
         ));
         caps.supports_h3_image_sampler = true;
         caps.validate_request("minimax_h3_image", &req).unwrap();
-        req.h3_image_sampler = Some(H3ImageSampler::lcm(f32::NAN));
+        req.extensions.h3.as_mut().unwrap().image_sampler = Some(H3ImageSampler::lcm(f32::NAN));
         assert_eq!(req.first_nonfinite_float().map(|(f, _)| f), Some("s_noise"));
     }
 
@@ -2274,10 +2283,13 @@ mod tests {
         let active_req = crate::GenerationRequest {
             width: 2048,
             height: 2048,
-            pag: Some(crate::PagConfig {
-                scale: cap.recommended_scale,
+            features: crate::FeatureParams {
+                pag: Some(crate::PagConfig {
+                    scale: cap.recommended_scale,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         caps.validate_request("minimax_h3_image", &active_req)
@@ -2325,11 +2337,14 @@ mod tests {
         let zero_ok = crate::GenerationRequest {
             width: 2048,
             height: 2048,
-            pag: Some(crate::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![0, 49]),
+            features: crate::FeatureParams {
+                pag: Some(crate::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![0, 49]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         caps.validate_request("minimax_h3_image", &zero_ok).unwrap();
@@ -2343,11 +2358,14 @@ mod tests {
                 let bad_req = crate::GenerationRequest {
                     width: 2048,
                     height: 2048,
-                    pag: Some(crate::PagConfig {
-                        scale,
-                        layers: Some(vec![bad_layer]),
+                    features: crate::FeatureParams {
+                        pag: Some(crate::PagConfig {
+                            scale,
+                            layers: Some(vec![bad_layer]),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
+                    },
                     ..Default::default()
                 };
                 assert!(matches!(

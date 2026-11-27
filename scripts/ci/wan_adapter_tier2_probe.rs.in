@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generator = mlx_gen_wan::provider_registry()?.load(MODEL_ID_T2V_14B, &spec)?;
     assert_eq!(generator.descriptor().id, MODEL_ID_T2V_14B);
     let mut progress = Vec::new();
-    let generated = generator.generate(&request, &mut |event| match event {
+    let gen_report = generator.generate_with_report(&request, &mut |event| match event {
         Progress::Loading(mlx_gen::LoadPhase::Renderer) => progress.push("renderer".into()),
         Progress::Step { current, total } => progress.push(format!("{current}/{total}")),
         Progress::Decoding => progress.push("decode".into()),
@@ -62,7 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actual = Stream::task_local_or_default().get_device()?;
     assert!(matches!(actual.get_type()?, DeviceType::Gpu));
     assert_eq!(actual.get_index()?, 0);
-    let reports = generator.adapter_apply_reports();
+    let reports = &gen_report.adapter_apply_reports;
+    let generated = gen_report.output;
     assert_eq!(reports.len(), spec.adapters.len());
     let adapters: Vec<_> = reports
         .iter()

@@ -111,7 +111,7 @@ fn flux_dev_pid_decode_vs_vae() {
 
     // --- PiD path (same request + use_pid) ---
     let pid_req = GenerationRequest {
-        use_pid: true,
+        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
         ..base.clone()
     };
     let t = Instant::now();
@@ -185,7 +185,7 @@ fn flux_dev_pid_from_ldm_early_stop() {
         count: 1,
         seed: Some(7),
         steps: Some(steps as u32),
-        use_pid: true,
+        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
         ..Default::default()
     };
 
@@ -202,7 +202,7 @@ fn flux_dev_pid_from_ldm_early_stop() {
 
     // from_ldm early-stop at the (env-tunable) capture ceiling.
     let early_req = GenerationRequest {
-        pid_capture_sigma: Some(capture_sigma),
+        features: mlx_gen::gen_core::FeatureParams { pid: (Some(capture_sigma)).map(mlx_gen::gen_core::PidParams::with_capture_sigma), ..Default::default() },
         ..base.clone()
     };
     let t = Instant::now();

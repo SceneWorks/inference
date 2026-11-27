@@ -92,7 +92,7 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         }],
         ..Default::default()
     };
-    assert!(request.phases.is_none());
+    assert!(request.features.phases.is_none());
 
     // Like-for-like Resident request baseline, measured after load with the same Q4 identity stack.
     let mut resident_spec = optimized_spec.clone();
@@ -264,7 +264,7 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     let mut cfg = request.clone();
     cfg.true_cfg = Some(2.0);
     cfg.negative_prompt = Some("blurry, deformed".into());
-    cfg.timestep_to_start_cfg = Some(0);
+    cfg.extensions.pulid_mut().timestep_to_start_cfg = Some(0);
     let mut cfg_scope = model
         .begin_memory_strategy_request(&context)
         .unwrap()

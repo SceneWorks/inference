@@ -144,15 +144,19 @@ impl LayoutCompile for Layout {
 /// Callers without stable identities can use upstream ordinal boxes in oriented/normalized space.
 /// Stable-ID boxes and original-pixel coordinates require explicit resolver-owned bindings.
 pub fn compile_request(req: &gen_core::GenerationRequest) -> Result<Option<CompiledLayout>> {
-    let Some(layout) = &req.flux3_layout else {
-        if !req.flux3_layout_bindings.is_empty() {
+    let flux3 = req.extensions.flux3.as_ref();
+    let Some(layout) = flux3.and_then(|f| f.layout.as_ref()) else {
+        if flux3.is_some_and(|f| !f.layout_bindings.is_empty()) {
             return Err(invalid("reference bindings require a layout document"));
         }
         return Ok(None);
     };
     let plan = references::image_request_plan(req)?;
     let fallback;
-    let bindings = if req.flux3_layout_bindings.is_empty() {
+    let layout_bindings = flux3
+        .map(|f| f.layout_bindings.as_slice())
+        .unwrap_or(&[]);
+    let bindings: &[ReferenceBinding] = if layout_bindings.is_empty() {
         for row in layout.to_json()["boxes"]
             .as_array()
             .expect("validated layout")
@@ -177,7 +181,7 @@ pub fn compile_request(req: &gen_core::GenerationRequest) -> Result<Option<Compi
             .unwrap_or_default();
         &fallback
     } else {
-        &req.flux3_layout_bindings
+        layout_bindings
     };
     let output = plan
         .as_ref()

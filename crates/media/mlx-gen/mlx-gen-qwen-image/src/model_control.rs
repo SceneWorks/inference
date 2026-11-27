@@ -544,7 +544,7 @@ impl QwenImageControl {
         // borrows the warm encoder. `neg` is `None` under Lightning (CFG-distilled → one forward/step).
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |te: &QwenTextEncoder| {
                 let encode_body = || -> Result<_> {

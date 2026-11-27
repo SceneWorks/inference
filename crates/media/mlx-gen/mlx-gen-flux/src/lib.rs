@@ -147,11 +147,11 @@ mod explicit_registry_tests {
             prompt: "a phased test".into(),
             width: 512,
             height: 512,
-            phases: Some(vec![GenerationPhase {
+            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![GenerationPhase {
                 steps: 4,
                 guidance: Some(3.5),
                 adapters: vec![],
-            }]),
+            }]), ..Default::default() },
             ..Default::default()
         };
         for id in ["flux1_schnell", "flux1_dev"] {

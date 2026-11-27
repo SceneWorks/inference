@@ -1647,9 +1647,9 @@ impl LensMemoryScope {
 impl gen_core::MemoryRequestScope for LensMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.use_pid
+        if request.use_pid() != self.use_pid
             || !request.conditioning.is_empty()
-            || request.phases.is_some()
+            || request.features.phases.is_some()
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: optimized memory strategies cover ordinary text-to-image only",
@@ -2173,6 +2173,7 @@ pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy
@@ -2240,6 +2241,7 @@ pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -2337,7 +2339,7 @@ fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let defaults = defaults_for(id);
         let desc = descriptor_for(defaults.id);
         let sigmas = build_schedule_for(defaults, req)?;
@@ -2383,7 +2385,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_load_spec(id, spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         )));
@@ -4350,7 +4352,8 @@ mod integration_tests {
                 GenerationOutput::ImagesRgba(_)
                 | GenerationOutput::Video { .. }
                 | GenerationOutput::Audio(_)
-                | GenerationOutput::Interleaved { .. } => {
+                | GenerationOutput::Interleaved { .. }
+                | GenerationOutput::Vector(_) => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };
@@ -5177,7 +5180,7 @@ mod fingerprint_pin_tests {
                 height: 1024,
                 steps: Some(4),
                 seed: Some(91),
-                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
                 ..Default::default()
             };
             let plan = registry

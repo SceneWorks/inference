@@ -1133,7 +1133,7 @@ fn video_plan_freezes_padded_wan_decode_and_curated_routes_without_weights() {
         frames: Some(5),
         steps: Some(2),
         sampler: Some("heun".into()),
-        trim_first_frames: Some(1),
+        extensions: mlx_gen::gen_core::FamilyExtensions { wan: Some(mlx_gen::gen_core::WanExtension { trim_first_frames: Some(1), ..Default::default() }), ..Default::default() },
         ..req(512, 512)
     };
     let resolve = |id, r: &GenerationRequest| registry.compile_video_plan(id, &spec, r);
@@ -1166,7 +1166,7 @@ fn video_plan_freezes_padded_wan_decode_and_curated_routes_without_weights() {
         (9, 3, 12, 8)
     );
     assert_eq!(p.latent_bytes, 4 * 16 * 3 * 64 * 64);
-    request.trim_first_frames = None;
+    request.extensions.wan_mut().trim_first_frames = None;
     request.conditioning.push(Conditioning::Reference {
         image: dummy_image(),
         strength: Some(1.0),

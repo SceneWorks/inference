@@ -61,7 +61,7 @@ fn render(width: u32, height: u32) -> Image {
         count: 1,
         seed: Some(333_941_069),
         steps: Some(8),
-        use_pid: true,
+        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
         ..Default::default()
     };
     match model.generate(&req, &mut |_| {}).expect("pid generate") {

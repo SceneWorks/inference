@@ -1009,7 +1009,13 @@ impl Pipeline {
         let (canvas_frames, _, mut keyframe_positions) =
             gen_core_ltx::ltx_dfr::resolve_canvas(frames as i64, config::TEMPORAL_SCALE as i64)
                 .map_err(|e| CandleError::Msg(e.to_string()))?;
-        if let Some(count) = req.num_generated_keyframes.filter(|count| *count > 0) {
+        if let Some(count) = req
+            .extensions
+            .ltx
+            .as_ref()
+            .and_then(|ltx| ltx.num_generated_keyframes)
+            .filter(|count| *count > 0)
+        {
             keyframe_positions.extend(gen_core_ltx::ltx_dfr::evenly_spaced_keyframe_positions(
                 count,
                 canvas_frames,
@@ -1066,7 +1072,12 @@ impl Pipeline {
             geometry,
             fps: fps as f32,
             seed,
-            temporal_upsample_rounds: req.temporal_upsample_rounds.unwrap_or(0),
+            temporal_upsample_rounds: req
+                .extensions
+                .ltx
+                .as_ref()
+                .and_then(|ltx| ltx.temporal_upsample_rounds)
+                .unwrap_or(0),
             detailing_downscale: None,
             video_keyframes: &image_keyframes,
         };
@@ -1150,9 +1161,10 @@ impl Pipeline {
             head.predict_seconds(Some(&video_ctx), Some(&audio_ctx))
                 .map_err(|e| gen_core::Error::Msg(e.to_string()))
         };
+        let ltx = req.extensions.ltx.as_ref();
         let frames = gen_core_ltx::duration_head::resolve_request_num_frames(
             req.frames,
-            req.auto_duration,
+            ltx.and_then(|ext| ext.auto_duration),
             fps as f32,
             config::TEMPORAL_SCALE as u32,
             &mut predict,
@@ -1171,9 +1183,11 @@ impl Pipeline {
             fps as f32,
             comps.temporal_upsampler.is_some(),
         )?;
-        let uses_dfr = req.num_generated_keyframes.is_some_and(|count| count > 0)
-            || req
-                .temporal_upsample_rounds
+        let uses_dfr = ltx
+            .and_then(|ext| ext.num_generated_keyframes)
+            .is_some_and(|count| count > 0)
+            || ltx
+                .and_then(|ext| ext.temporal_upsample_rounds)
                 .is_some_and(|rounds| rounds > 0);
         if uses_dfr {
             return self.render_dfr(
@@ -1688,14 +1702,21 @@ fn validate_ltx_request(
     // `max_temporal_upsample_rounds`; going first only preserves the message that names the
     // checkpoint generation which does support them.
     if family == gen_core_ltx::LtxModelFamily::Ltx23 {
-        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+        let ltx = req.extensions.ltx.as_ref();
+        if ltx
+            .and_then(|ext| ext.num_generated_keyframes)
+            .is_some_and(|n| n > 0)
+        {
             return Err(gen_core::Error::Unsupported(
                 "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
                  (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
                     .into(),
             ));
         }
-        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+        if ltx
+            .and_then(|ext| ext.temporal_upsample_rounds)
+            .is_some_and(|r| r > 0)
+        {
             return Err(gen_core::Error::Unsupported(
                 "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
                  keyframe slots + the temporal latent upsampler)"
@@ -2022,6 +2043,7 @@ pub(crate) fn route_ltx_2_3() -> gen_core::RouteRecord {
                 supports_caption_overflow_policy: false,
                 // sc-18764 / R2: this crate has no `enhance` module on either checkpoint generation.
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: gen_core::ConditioningSurface {
                 kinds: vec![
@@ -2035,6 +2057,7 @@ pub(crate) fn route_ltx_2_3() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: candle_gen::menu_with_aliases(
@@ -2099,6 +2122,7 @@ pub(crate) fn route_ltx_2_3() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -3112,10 +3136,10 @@ mod tests {
             .contains("frames"));
 
         let mut dfr = request.clone();
-        dfr.num_generated_keyframes = Some(1);
+        dfr.extensions.ltx_mut().num_generated_keyframes = Some(1);
         Generator::validate(&generator, &dfr).expect("declared generated-keyframe axis must pass");
         let mut temporal = request;
-        temporal.temporal_upsample_rounds = Some(2);
+        temporal.extensions.ltx_mut().temporal_upsample_rounds = Some(2);
         Generator::validate(&generator, &temporal).expect("declared temporal-DFR axis must pass");
 
         assert!(generator.descriptor.capabilities.supports_diffusion_decoder);
@@ -3236,31 +3260,31 @@ mod tests {
             },
             GenerationRequest {
                 sampler: Some("heun".into()),
-                num_generated_keyframes: Some(1),
+                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
                 ..base_25.clone()
             },
             GenerationRequest {
                 sampler: Some("heun".into()),
-                temporal_upsample_rounds: Some(1),
+                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
                 ..base_25.clone()
             },
             GenerationRequest {
-                num_generated_keyframes: Some(1),
                 conditioning: vec![Conditioning::VideoClip {
                     frames: vec![img.clone()],
                     frame_idx: 0,
                     strength: 1.0,
                 }],
+                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
                 ..base_25.clone()
             },
             GenerationRequest {
                 frames: Some(1),
-                num_generated_keyframes: Some(1),
+                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
                 ..base_25.clone()
             },
             GenerationRequest {
                 frames: Some(1),
-                temporal_upsample_rounds: Some(1),
+                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
                 ..base_25.clone()
             },
             GenerationRequest {
@@ -3323,11 +3347,10 @@ mod tests {
         // curated non-Euler samplers are still refused pre-load.
         let auto_dfr = GenerationRequest {
             frames: None,
-            auto_duration: Some(gen_core::duration_head::AutoDurationRange {
+            extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { auto_duration: Some(gen_core::duration_head::AutoDurationRange {
                 min_seconds: 1.0,
                 max_seconds: 2.0,
-            }),
-            num_generated_keyframes: Some(1),
+            }), num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
             ..base_25.clone()
         };
         assert!(Generator::validate(&distilled, &auto_dfr).is_ok());
@@ -4076,14 +4099,14 @@ mod tests {
             (
                 "num_generated_keyframes",
                 GenerationRequest {
-                    num_generated_keyframes: Some(3),
+                    extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(3), ..Default::default() }), ..Default::default() },
                     ..base.clone()
                 },
             ),
             (
                 "temporal_upsample_rounds",
                 GenerationRequest {
-                    temporal_upsample_rounds: Some(1),
+                    extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
                     ..base.clone()
                 },
             ),
@@ -4096,8 +4119,7 @@ mod tests {
             assert!(err.to_string().contains("2.5"), "{label}: {err}");
         }
         let off = GenerationRequest {
-            num_generated_keyframes: Some(0),
-            temporal_upsample_rounds: Some(0),
+            extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(0), temporal_upsample_rounds: Some(0), ..Default::default() }), ..Default::default() },
             ..base
         };
         model.validate(&off).expect("0 is off");

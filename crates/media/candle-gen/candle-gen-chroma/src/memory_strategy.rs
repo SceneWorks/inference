@@ -1424,8 +1424,9 @@ impl RequestBinding {
                 reference_count: request.image_reference_count(),
             },
             memory: request.memory,
-            use_pid: request.use_pid,
+            use_pid: request.use_pid(),
             has_phases: request
+                .features
                 .phases
                 .as_ref()
                 .is_some_and(|phases| !phases.is_empty()),
@@ -1435,8 +1436,8 @@ impl RequestBinding {
             steps: request.steps,
             guidance_bits: request.guidance.map(f32::to_bits),
             true_cfg_bits: request.true_cfg.map(f32::to_bits),
-            sampler: request.sampler.clone(),
-            scheduler: request.scheduler.clone(),
+            sampler: request.sampler.as_deref().map(str::to_owned),
+            scheduler: request.scheduler.as_deref().map(str::to_owned),
             shift_bits: request.scheduler_shift.map(f32::to_bits),
             preview_active: request.preview.is_active(),
         }

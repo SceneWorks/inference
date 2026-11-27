@@ -143,12 +143,12 @@ fn request(size: u32, gain: Option<f32>) -> GenerationRequest {
         height: size,
         seed: Some(1234),
         steps: Some(env_u32("KREA_TSG_STEPS", 8)),
-        text_style_gain: gain,
         conditioning: vec![Conditioning::Control {
             image: fixed_image(512, 512),
             kind: ControlKind::Pose,
             scale: Some(0.6),
         }],
+        extensions: mlx_gen::gen_core::FamilyExtensions { krea: Some(mlx_gen::gen_core::KreaExtension { text_style_gain: gain, ..Default::default() }), ..Default::default() },
         ..Default::default()
     }
 }

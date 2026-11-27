@@ -90,6 +90,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -149,6 +150,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -802,7 +804,7 @@ impl ZImageTurbo {
         let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, strength)?
                 } else {
                     init_time_step(steps, strength)
@@ -840,7 +842,7 @@ impl ZImageTurbo {
             stage_residency,
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: prompt → cap_feats. txt2img runs the DiT in bf16 (the parity-proven path);
             // img2img matches the fork's f32 init latents, so keep cap f32. PARITY-BF16 (sc-2609):
@@ -1002,7 +1004,7 @@ pub(crate) fn validate_request(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == crate::model_control::MODEL_ID || id == crate::model_base_control::MODEL_ID {
             let (desc, shift, default_steps) = if id == crate::model_base_control::MODEL_ID {
                 (
@@ -1062,7 +1064,7 @@ pub(crate) fn validate_request(
         )));
     }
 
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (desc, shift, default_steps) = if id == crate::model_base::MODEL_ID {
             (
                 crate::model_base::descriptor(),
@@ -1126,7 +1128,7 @@ pub(crate) fn compile_trajectory_for(
                     desc.id, img.width, img.height
                 )));
             }
-            if req.low_res_start.is_some() {
+            if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(steps, strength)?
             } else {
                 init_time_step(steps, strength)
@@ -1783,10 +1785,10 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 1.2,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
@@ -1800,10 +1802,10 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 0.0,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());
@@ -1811,11 +1813,11 @@ mod tests {
 
         let bad_layer = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 1.0,
                 layers: Some(vec![30]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &bad_layer).is_err());

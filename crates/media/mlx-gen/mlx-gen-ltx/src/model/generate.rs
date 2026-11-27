@@ -14,7 +14,7 @@ pub(super) fn apply_predicted_frames(
     let mut core_predict = || predict_seconds().map_err(mlx_gen::gen_core::Error::from);
     let frames = gen_core_ltx::duration_head::resolve_request_num_frames(
         req.frames,
-        req.auto_duration,
+        req.extensions.ltx.as_ref().and_then(|ltx| ltx.auto_duration),
         fps,
         TEMPORAL_SCALE,
         &mut core_predict,
@@ -32,8 +32,13 @@ pub(super) fn apply_predicted_frames(
 /// anchors.  The same plan drives noise allocation and the actual `generate_dfr_av_latents` call.
 pub(super) fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan>> {
     let requested_frames = req.frames.unwrap_or(1);
-    let generated_count = req.num_generated_keyframes.unwrap_or(0);
-    let temporal_upsample_rounds = req.temporal_upsample_rounds.unwrap_or(0);
+    let ltx = req.extensions.ltx.as_ref();
+    let generated_count = ltx
+        .and_then(|ext| ext.num_generated_keyframes)
+        .unwrap_or(0);
+    let temporal_upsample_rounds = ltx
+        .and_then(|ext| ext.temporal_upsample_rounds)
+        .unwrap_or(0);
     if generated_count == 0 && temporal_upsample_rounds == 0 {
         return Ok(None);
     }

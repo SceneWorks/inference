@@ -126,6 +126,7 @@ impl ChromaVariant {
                     pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                     supports_negative_prompt: true,
                     modules: vec![],
+                    ..Default::default()
                 },
                 sampling: SamplingSurface {
                     samplers,
@@ -173,6 +174,7 @@ impl ChromaVariant {
                     requires_control_overlay: false,
                     requires_ip_adapter_overlay: false,
                     requires_identity_overlay: false,
+                    ..Default::default()
                 },
                 output: OutputSurface {
                     preview: PreviewSupport::LatentProjection,

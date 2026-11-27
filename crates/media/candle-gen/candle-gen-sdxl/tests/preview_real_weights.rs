@@ -364,7 +364,7 @@ fn base_request(steps: u32, size: u32, sampler: Option<&str>) -> GenerationReque
         count: 1,
         seed: Some(SEED),
         steps: Some(steps),
-        sampler: sampler.map(str::to_string),
+        sampler: (sampler.map(str::to_string)).map(Into::into),
         ..GenerationRequest::default()
     }
 }

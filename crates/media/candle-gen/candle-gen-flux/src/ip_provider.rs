@@ -337,8 +337,8 @@ fn typed_ip_request(
         steps: Some(steps),
         seed: Some(req.seed),
         guidance: variant.supports_guidance().then_some(req.guidance),
-        sampler: req.sampler.clone(),
-        scheduler: req.scheduler.clone(),
+        sampler: req.sampler.clone().map(Into::into),
+        scheduler: req.scheduler.clone().map(Into::into),
         scheduler_shift: req.scheduler_shift,
         conditioning: vec![Conditioning::Reference {
             image: reference.clone(),
@@ -346,7 +346,10 @@ fn typed_ip_request(
         }],
         memory: Some(req.memory),
         preview: req.preview.clone(),
-        pag: req.pag.clone(),
+        features: candle_gen::gen_core::FeatureParams {
+            pag: req.pag.clone(),
+            ..Default::default()
+        },
         cancel: req.cancel.clone(),
         ..Default::default()
     })
@@ -854,10 +857,8 @@ fn resolve_ip_pag(
     req: &IpAdapterFluxRequest,
 ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagResolved>> {
     let descriptor = ip_descriptor(variant);
-    let pag_req = GenerationRequest {
-        pag: req.pag.clone(),
-        ..Default::default()
-    };
+    let mut pag_req = GenerationRequest::default();
+    pag_req.features.pag = req.pag.clone();
     descriptor.capabilities.resolve_pag(descriptor.id, &pag_req)
 }
 

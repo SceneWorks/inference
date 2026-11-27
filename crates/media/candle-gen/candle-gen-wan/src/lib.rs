@@ -1404,7 +1404,15 @@ fn validate_dense_request(
                 .into(),
         ));
     }
-    if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
+    if image_conditioned
+        && req
+            .extensions
+            .wan
+            .as_ref()
+            .and_then(|w| w.trim_first_frames)
+            .unwrap_or(0)
+            > 0
+    {
         return Err(gen_core::Error::Msg(
             "wan: trim_first_frames is not supported with Reference/Keyframe conditioning".into(),
         ));
@@ -2214,7 +2222,7 @@ mod tests {
             Some("dpmpp2m"),
         ] {
             let native = GenerationRequest {
-                sampler: name.map(str::to_owned),
+                sampler: name.map(Into::into),
                 ..Default::default()
             };
             assert!(dense_curated_phase(&native, 37).unwrap().is_none());

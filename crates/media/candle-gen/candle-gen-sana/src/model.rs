@@ -429,7 +429,7 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == SPRINT_MODEL_ID {
             return Err(gen_core::Error::Unsupported(format!(
                 "{id}: low_res_start is not supported on continuous-time consistency SCM Sprint"
@@ -2121,7 +2121,7 @@ mod tests {
         // T2I with low_res_start on sana_1600m compiles a two-phase RenderPlan
         let mut t2i = req(1024, 1024);
         t2i.steps = Some(10);
-        t2i.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        t2i.features.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
         let plan = registry
             .compile_render_plan(MODEL_ID, &spec, &t2i)
             .unwrap()
@@ -2143,7 +2143,7 @@ mod tests {
             image: reference_image(),
             strength: Some(0.6),
         }];
-        i2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        i2i.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
         let i2i_plan = registry
             .compile_render_plan(MODEL_ID, &spec, &i2i)
             .unwrap()

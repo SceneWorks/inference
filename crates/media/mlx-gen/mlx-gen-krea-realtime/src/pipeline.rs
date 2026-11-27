@@ -62,6 +62,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec!["causal_kv_cache"],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: vec![SELF_FORCING_SAMPLER],
@@ -107,6 +108,7 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,
@@ -310,28 +312,36 @@ impl KreaRealtime {
 }
 
 impl Generator for KreaRealtime {
+    fn generate_with_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.adapter_apply_reports = self.current_adapter_apply_reports();
+        Ok(report)
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            let output = self.generate_execution_attempt(req, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
-            })
-            .map(mlx_gen::gen_core::GenerationReport::from_output)
+            })?;
+            let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+            report.adapter_apply_reports = self.current_adapter_apply_reports();
+            Ok(report)
         })
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
-    }
-
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -368,6 +378,13 @@ impl Generator for KreaRealtime {
 }
 
 impl KreaRealtime {
+    pub(crate) fn current_adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn validate_and_compile_plan(&self, req: &GenerationRequest) -> Result<KreaRealtimeRenderPlan> {
         self.descriptor
             .capabilities
@@ -614,7 +631,7 @@ mod tests {
             .unwrap()
             .push(expected.clone());
         assert_eq!(
-            Generator::adapter_apply_reports(&provider),
+            provider.current_adapter_apply_reports(),
             vec![expected],
             "severing the Krea override must not fall back to the empty compatibility default"
         );
@@ -738,7 +755,7 @@ mod tests {
                 .expect("reported generation succeeds");
             assert_eq!(generation.called, Some(expected_route));
             assert_eq!(
-                Generator::adapter_apply_reports(&provider),
+                provider.current_adapter_apply_reports(),
                 vec![actual.clone()],
                 "{expected_route} must publish the actual loader report through the Generator contract"
             );
@@ -1002,7 +1019,7 @@ mod tests {
             height: 512,
             frames: Some(u32::try_from(source_frames).unwrap_or(u32::MAX)),
             count: 1,
-            video_mode: Some("video_to_video".to_owned()),
+            video_mode: Some("video_to_video".into()),
             conditioning: vec![Conditioning::VideoClip {
                 frames: vec![source; source_frames],
                 frame_idx: 0,
@@ -1179,7 +1196,7 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(5),
-            video_mode: Some("video_to_video".to_owned()),
+            video_mode: Some("video_to_video".into()),
             ..Default::default()
         };
         assert!(Generator::validate(&provider, &request)
@@ -1193,7 +1210,7 @@ mod tests {
         let provider = unloaded();
         for crossed_mode in [None, Some("image_to_video")] {
             let mut request = v2v_request(5);
-            request.video_mode = crossed_mode.map(str::to_owned);
+            request.video_mode = crossed_mode.map(Into::into);
             let error = Generator::validate(&provider, &request)
                 .expect_err("a VideoClip must never infer or borrow a non-V2V public mode");
             assert!(
@@ -1442,7 +1459,7 @@ mod tests {
             .unwrap();
         let expected_frames_ptr = mock.frames_vec_ptr;
         let expected_pixel_ptr = mock.frame_pixels_ptr;
-        assert_eq!(Generator::adapter_apply_reports(&provider), vec![report]);
+        assert_eq!(provider.current_adapter_apply_reports(), vec![report]);
 
         let expected_events: Vec<Progress> = [
             Progress::Loading(LoadPhase::TextEncoder),
@@ -1578,6 +1595,6 @@ mod tests {
             })
         );
         assert_eq!(bounded.backpressure_events(), 1);
-        assert_eq!(Generator::adapter_apply_reports(&provider), vec![report]);
+        assert_eq!(provider.current_adapter_apply_reports(), vec![report]);
     }
 }

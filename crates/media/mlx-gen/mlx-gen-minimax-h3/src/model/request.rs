@@ -5,7 +5,7 @@ use super::*;
 
 /// Reject a request this model cannot serve, before any weight is read.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
-    if let Some(veda) = &req.veda {
+    if let Some(veda) = req.extensions.h3.as_ref().and_then(|h3| h3.veda.as_ref()) {
         veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
             .map_err(Error::Msg)?;
     }

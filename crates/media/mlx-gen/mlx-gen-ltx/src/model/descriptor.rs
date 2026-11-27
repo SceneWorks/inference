@@ -37,6 +37,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -94,6 +95,7 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,

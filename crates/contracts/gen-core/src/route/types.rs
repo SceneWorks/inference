@@ -8,7 +8,8 @@ use crate::encoder_contract::EncoderContract;
 use crate::feature::Pass0ConditioningRequirement;
 use crate::generator::{
     ActivationMemoryAnchor, AudioEditMode, ComponentPrecisionFloor, ConditioningKind,
-    GenerationRequest, Generator, Modality, ModelDescriptor, SizeFloor, StepSupport,
+    FamilyExtensionKind, GenerationRequest, Generator, Modality, ModelDescriptor, SizeFloor,
+    StepSupport,
 };
 use crate::latent::{LatentPatchLayout, LatentSpace};
 use crate::memory_strategy::{
@@ -277,6 +278,9 @@ pub struct TextEncoderSurface {
     pub encoder_contract: Option<EncoderContract>,
     /// Advisory longest prompt in model tokens (`Capabilities::max_prompt_tokens`).
     pub max_prompt_tokens: Option<u32>,
+    /// Optional provider-specific prompt-enhancement token ceiling (`Capabilities::max_enhance_tokens`).
+    /// `None` uses the shared default [`crate::generator::MAX_ENHANCE_TOKENS`] (`2048`).
+    pub max_enhance_tokens: Option<u32>,
     /// Whether `GenerationRequest::caption_overflow` is honored.
     pub supports_caption_overflow_policy: bool,
     /// Whether `GenerationRequest::enhance_prompt` modifies the consumed prompt.
@@ -294,6 +298,10 @@ pub struct ConditioningSurface {
     pub control_kinds: Option<AcceptedControlKinds>,
     /// Primary pass-0 conditioning requirement used by `HOOK-4` applicability derivation.
     pub pass0_requirement: Pass0ConditioningRequirement,
+    /// When `true`, single-reference `Conditioning::Reference` img2img cannot combine with
+    /// `low_res_start` (the route requires `GenerationRequest::source_image` instead). Replaces
+    /// shared model-id string heuristics (`REG-4`).
+    pub low_res_start_forbids_reference_conditioning: bool,
     /// Whether this route honors `GenerationRequest::negative_prompt`.
     pub supports_negative_prompt: bool,
     /// Named conditioning modules wired into this route (e.g. `"xlabs_ip_adapter"`, `"flux_controlnet_union"`).
@@ -537,6 +545,9 @@ pub struct WeightPlanDeclaration {
     pub requires_ip_adapter_overlay: bool,
     /// Whether this route requires identity weights in `LoadSpec::identity`.
     pub requires_identity_overlay: bool,
+    /// Whether this route honors autoregressive load-time mode/compute policies (e.g. YuE2 AR mode
+    /// and compute policy). Replaces model-id string gating in registry load admission (`REG-4`).
+    pub supports_ar_load_controls: bool,
 }
 
 /// How intermediate denoise previews are produced by a route.
@@ -611,6 +622,8 @@ pub struct RouteStructure {
     pub output: OutputSurface,
     pub video: VideoSurface,
     pub audio: AudioSurface,
+    /// Typed family request extensions explicitly supported by this route (`REG-4`).
+    pub supported_family_extensions: Vec<FamilyExtensionKind>,
     #[serde(skip)]
     pub execution: ExecutionSurface,
     #[serde(skip)]

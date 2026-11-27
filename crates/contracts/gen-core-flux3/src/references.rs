@@ -417,7 +417,14 @@ fn ordered_inputs(req: &gen_core::GenerationRequest) -> Result<Vec<Input<'_>>> {
             }
         }
     }
-    if inputs.is_empty() && req.flux3_reference_output.is_some() {
+    if inputs.is_empty()
+        && req
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output)
+            .is_some()
+    {
         return Err(invalid("reference-output intent requires 1–10 references"));
     }
     Ok(inputs)
@@ -520,10 +527,14 @@ pub fn upsampler_input(req: &gen_core::GenerationRequest) -> Result<super::pup::
 
 /// Resolve the request's optional intent. Legacy callers with no hint keep explicit dimensions.
 pub fn request_output(req: &gen_core::GenerationRequest) -> ReferenceOutputSize {
-    req.flux3_reference_output.unwrap_or(ReferenceOutputSize {
-        width: Some(req.width),
-        height: Some(req.height),
-    })
+    req.extensions
+        .flux3
+        .as_ref()
+        .and_then(|f| f.reference_output)
+        .unwrap_or(ReferenceOutputSize {
+            width: Some(req.width),
+            height: Some(req.height),
+        })
 }
 
 /// Consistent weights-free memory-route guard; edit/image-to-image names both denote immutable

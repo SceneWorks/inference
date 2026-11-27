@@ -11,19 +11,30 @@ fn output() -> references::OutputGeometry {
 
 #[test]
 fn request_layout_defaults_absent_and_is_scoped_to_flux3() {
-    use gen_core::{Capabilities, GenerationRequest};
+    use gen_core::{Capabilities, FamilyExtensionKind, FamilyExtensions, Flux3Extension, GenerationRequest};
     let mut request = GenerationRequest::default();
-    assert!(request.flux3_layout.is_none());
+    assert!(request.extensions.flux3.is_none());
     let caps = Capabilities {
         min_size: 64,
         max_size: 4096,
         max_count: 8,
         ..Default::default()
     };
+    let flux3_caps = Capabilities {
+        supported_family_extensions: vec![FamilyExtensionKind::Flux3],
+        ..caps.clone()
+    };
     assert!(caps.validate_request("other_family", &request).is_ok());
-    request.flux3_layout = Some(
-        Layout::from_json(json!({"version":1,"boxes":[{"id":"a","bbox":[0,0,1,1]}]})).unwrap(),
-    );
+    request.extensions = FamilyExtensions {
+        flux3: Some(Flux3Extension {
+            layout: Some(
+                Layout::from_json(json!({"version":1,"boxes":[{"id":"a","bbox":[0,0,1,1]}]}))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     assert!(caps
         .validate_request("other_family", &request)
         .unwrap_err()
@@ -34,10 +45,10 @@ fn request_layout_defaults_absent_and_is_scoped_to_flux3() {
         .unwrap_err()
         .to_string()
         .contains("flux3_layout"));
-    assert!(caps
+    assert!(flux3_caps
         .validate_request(gen_core::flux3::DISTILLED_MODEL_ID, &request)
         .is_ok());
-    assert!(caps
+    assert!(flux3_caps
         .validate_request(gen_core::flux3::BASE_MODEL_ID, &request)
         .is_ok());
 }
@@ -253,17 +264,23 @@ fn source_half_even_grid_and_complete_caption_bound() {
 
 #[test]
 fn live_request_locks_layout_before_prompt_seed_for_both_reference_modes() {
-    use gen_core::{Conditioning, GenerationRequest, Image};
+    use gen_core::{Conditioning, FamilyExtensions, Flux3Extension, GenerationRequest, Image};
     for reference in [false, true] {
         let mut req = GenerationRequest {
             prompt: "  move cat\n".into(),
             width: 112,
             height: 80,
-            flux3_layout: Some(Layout::from_json(if reference {
-                json!({"version":1,"boxes":[{"id":"cat","desc":"cat","from":"ref_image_0","src_bbox":[0.1,0.2,0.6,0.7],"tgt_bbox":null}]})
-            } else {
-                json!({"version":1,"boxes":[{"id":"cat","desc":"cat","bbox":[0.1,0.2,0.6,0.7]}]})
-            }).unwrap()),
+            extensions: FamilyExtensions {
+                flux3: Some(Flux3Extension {
+                    layout: Some(Layout::from_json(if reference {
+                        json!({"version":1,"boxes":[{"id":"cat","desc":"cat","from":"ref_image_0","src_bbox":[0.1,0.2,0.6,0.7],"tgt_bbox":null}]})
+                    } else {
+                        json!({"version":1,"boxes":[{"id":"cat","desc":"cat","bbox":[0.1,0.2,0.6,0.7]}]})
+                    }).unwrap()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if reference {
@@ -276,7 +293,14 @@ fn live_request_locks_layout_before_prompt_seed_for_both_reference_modes() {
                 strength: None,
             });
         }
-        let original = req.flux3_layout.clone().unwrap();
+        let original = req
+            .extensions
+            .flux3
+            .as_ref()
+            .unwrap()
+            .layout
+            .clone()
+            .unwrap();
         let input = references::upsampler_input(&req).unwrap();
         assert_eq!(
             input.mode,
@@ -301,15 +325,24 @@ fn live_request_locks_layout_before_prompt_seed_for_both_reference_modes() {
             outcome.report.locked_annotations.as_deref(),
             Some(compiled.rows_json().as_str())
         );
-        assert_eq!(req.flux3_layout.as_ref(), Some(&original));
+        assert_eq!(
+            req.extensions.flux3.as_ref().and_then(|f| f.layout.as_ref()),
+            Some(&original)
+        );
     }
 }
 
 #[test]
 fn malformed_layout_reference_binding_fails_before_admission_and_pup() {
-    use gen_core::{Conditioning, GenerationRequest, Image};
+    use gen_core::{Conditioning, FamilyExtensions, Flux3Extension, GenerationRequest, Image};
     let mut req = GenerationRequest {
-        flux3_layout: Some(Layout::from_json(json!({"version":1,"boxes":[{"id":"cat","from":"ref_image_0","reference_id":"selected","src_bbox":[0,0,1,1],"tgt_bbox":null}]})).unwrap()),
+        extensions: FamilyExtensions {
+            flux3: Some(Flux3Extension {
+                layout: Some(Layout::from_json(json!({"version":1,"boxes":[{"id":"cat","from":"ref_image_0","reference_id":"selected","src_bbox":[0,0,1,1],"tgt_bbox":null}]})).unwrap()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         conditioning: vec![Conditioning::Reference {image:Image {width:80,height:64,pixels:vec![19;80*64*3]},strength:None}],
         ..Default::default()
     };
@@ -317,11 +350,12 @@ fn malformed_layout_reference_binding_fails_before_admission_and_pup() {
         references::request_plan(&req),
         Err(gen_core::Error::Unsupported(_))
     ));
-    req.flux3_layout_bindings = vec![ReferenceBinding::oriented("selected", (79, 64))];
+    req.extensions.flux3.as_mut().unwrap().layout_bindings =
+        vec![ReferenceBinding::oriented("selected", (79, 64))];
     assert!(references::request_plan(&req).is_err());
     assert!(references::upsampler_input(&req).is_err());
-    req.flux3_layout_bindings[0].original_size = (80, 64);
+    req.extensions.flux3.as_mut().unwrap().layout_bindings[0].original_size = (80, 64);
     assert!(references::request_plan(&req).unwrap().is_some());
-    req.flux3_layout = None;
+    req.extensions.flux3.as_mut().unwrap().layout = None;
     assert!(references::request_plan(&req).is_err());
 }

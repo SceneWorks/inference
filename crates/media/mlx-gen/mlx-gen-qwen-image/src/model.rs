@@ -79,6 +79,7 @@ pub(crate) fn route_qwen_image() -> gen_core::RouteRecord {
                 // True CFG with a negative prompt + guidance (not distilled).
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: qwen_samplers(),
@@ -138,6 +139,7 @@ pub(crate) fn route_qwen_image() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -618,7 +620,7 @@ impl QwenImage {
         // negative branch is built only for true CFG (`neg` is `None` under Lightning, CFG-distilled).
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |te: &QwenTextEncoder| {
                 let encode_body = || -> Result<_> {
@@ -889,7 +891,7 @@ pub(crate) fn validate_request(
             }
         }
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let params = resolve_run_params(req, req.width, req.height)?;
         let reference = resolve_reference(req, id)?;
         let start_step = match reference {
@@ -1327,11 +1329,11 @@ mod tests {
         let caps = &base.capabilities;
         let zero_req = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![30]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, caps, &zero_req).is_ok());
@@ -1345,11 +1347,11 @@ mod tests {
 
         let oob_req = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![60]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, caps, &oob_req).is_err());
@@ -1385,10 +1387,10 @@ mod tests {
             seed: Some(42),
             steps: Some(4),
             sampler: Some("euler".into()),
-            low_res_start: Some(
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
                 LowResStartSpec::new(2, Some(0.5))
                     .with_estimate_source(EstimateSource::PreviousEvaluation),
-            ),
+            ), ..Default::default() },
             ..Default::default()
         };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1454,7 +1456,7 @@ mod tests {
             height: 1024,
             steps: Some(20),
             seed: Some(42),
-            low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(7, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -1479,7 +1481,7 @@ mod tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let img2img_plan = registry

@@ -71,6 +71,7 @@ fn route_for(
                     mlx_gen::gen_core::Pass0ConditioningRequirement::RequiresReference,
                 supports_negative_prompt: false,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: mlx_gen::gen_core::SamplingSurface {
                 samplers: vec!["seedvr2_euler"],
@@ -118,6 +119,7 @@ fn route_for(
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: mlx_gen::gen_core::OutputSurface {
                 preview: mlx_gen::gen_core::PreviewSupport::Unsupported,

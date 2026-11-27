@@ -1466,8 +1466,7 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(17),
-            num_generated_keyframes: Some(1),
-            temporal_upsample_rounds: Some(1),
+            extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
             ..Default::default()
         };
         let built = render_plan_for_request(

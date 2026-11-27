@@ -50,6 +50,7 @@ pub(crate) fn route_generation() -> gen_core::RouteRecord {
                 max_prompt_tokens: None,
                 supports_caption_overflow_policy: true,
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: gen_core::ConditioningSurface {
                 kinds: vec![],
@@ -58,6 +59,7 @@ pub(crate) fn route_generation() -> gen_core::RouteRecord {
                 // CFG against the negative prompt run through the same template (default "").
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // The FlowDPM-Solver++ in its two upstream orders: `dpmpp_2m` (order 2, the
@@ -115,6 +117,7 @@ pub(crate) fn route_generation() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 // Pixel space: every step's predicted clean image is the preview, decoded exactly.
@@ -469,6 +472,8 @@ impl Iris3b {
             prefix_kv_cache: None,
             pag: None,
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 
@@ -529,13 +534,6 @@ impl Generator for Iris3b {
         &self.descriptor
     }
 
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .map(|reports| reports.clone())
-            .unwrap_or_default()
-    }
-
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         self.validate_impl(req).map_err(Into::into)
     }
@@ -578,7 +576,13 @@ impl Generator for Iris3b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let mut report = self.generate_impl(req, on_progress)?;
+        report.adapter_apply_reports = self
+            .adapter_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default();
+        Ok(report)
     }
 }
 

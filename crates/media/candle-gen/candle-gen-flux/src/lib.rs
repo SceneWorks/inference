@@ -393,14 +393,14 @@ impl Generator for FluxGenerator {
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // PiD's Gemma caption encode is text conditioning, and its engine arrives with the
             // heavy bundle; an img2img `source_image` also runs its VAE encode inside
             // `render_residency` once the heavy bundle is resident. Both hold Conditioning open
             // until `render_residency` has finished their conditioning work.
             |text| {
-                if req.use_pid || req.source_image.is_some() {
+                if req.use_pid() || req.source_image.is_some() {
                     run.begin_conditioning()?;
                     self.pipe.encode_residency(text, &req.prompt)
                 } else {
@@ -473,7 +473,7 @@ fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core:
                 variant.model_id()
             )));
     }
-    if req.use_pid
+    if req.use_pid()
         && req.memory.is_some_and(|memory| {
             memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
         })
@@ -483,10 +483,10 @@ fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core:
             variant.model_id()
         )));
     }
-    if req.low_res_start.is_some() || req.source_image.is_some() {
+    if req.features.low_res_start.is_some() || req.source_image.is_some() {
         let sigmas = pipeline::base_schedule(variant, req)?;
         let executed_steps = sigmas.len().saturating_sub(1);
-        if let Some(spec) = &req.low_res_start {
+        if let Some(spec) = &req.features.low_res_start {
             spec.resolve_for_descriptor(
                 &descriptor_for(variant),
                 req,
@@ -595,7 +595,7 @@ fn validate_preload_pid(
     req: &GenerationRequest,
     variant: Variant,
 ) -> gen_core::Result<()> {
-    if !req.use_pid {
+    if !req.use_pid() {
         return Ok(());
     }
     if spec.pid.is_none() {
@@ -604,7 +604,7 @@ fn validate_preload_pid(
             variant.model_id()
         )));
     }
-    if req.pid_capture_sigma.is_some() {
+    if req.pid_capture_sigma().is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
             variant.model_id()
@@ -665,6 +665,7 @@ pub(crate) fn route_base(variant: Variant) -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                low_res_start_forbids_reference_conditioning: true,
             },
             sampling: gen_core::SamplingSurface {
                 samplers: candle_gen::curated_sampler_names(),
@@ -724,6 +725,7 @@ pub(crate) fn route_base(variant: Variant) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -1177,11 +1179,11 @@ mod tests {
             prompt: "a blue lamp".into(),
             width: 512,
             height: 512,
-            phases: Some(vec![gen_core::GenerationPhase {
+            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![gen_core::GenerationPhase {
                 steps: 4,
                 guidance: Some(3.5),
                 adapters: vec![],
-            }]),
+            }]), ..Default::default() },
             ..Default::default()
         };
         for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
@@ -1274,7 +1276,7 @@ mod tests {
                 assert!(registry.compile_render_plan(id, spec, &req).is_err());
             }
             let pid_req = GenerationRequest {
-                use_pid: true,
+                features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
                 ..req.clone()
             };
             let no_pid = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1284,7 +1286,7 @@ mod tests {
                 WeightsSource::Dir("/nonexistent/gemma".into()),
             );
             let early_capture = GenerationRequest {
-                pid_capture_sigma: Some(0.2),
+                features: candle_gen::gen_core::FeatureParams { pid: (Some(0.2)).map(candle_gen::gen_core::PidParams::with_capture_sigma), ..Default::default() },
                 ..pid_req
             };
             assert!(registry
@@ -1522,22 +1524,22 @@ mod tests {
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                pag: Some(PagConfig {
+                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                     scale: 1.5,
                     layers: Some(vec![0, 28, 56]),
                     ..Default::default()
-                }),
+                }), ..Default::default() },
                 ..Default::default()
             })
             .is_ok());
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                pag: Some(PagConfig {
+                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                     scale: 0.0,
                     layers: Some(vec![57]),
                     ..Default::default()
-                }),
+                }), ..Default::default() },
                 ..Default::default()
             })
             .is_err());
@@ -1826,7 +1828,7 @@ mod execution_policy_tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..base_req.clone()
         };
 
@@ -1855,7 +1857,7 @@ mod execution_policy_tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
             ..base_req.clone()
         };
         let img2img_plan = compile_base_plan(Variant::Dev, &img2img_ok).unwrap();
@@ -1863,7 +1865,7 @@ mod execution_policy_tests {
         assert_eq!(img2img_plan.denoise_spans(), vec![0..3, 3..4]);
 
         let img2img_bad_k = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..img2img_ok
         };
         assert!(validate_base_request(Variant::Dev, &img2img_bad_k).is_err());
@@ -2210,9 +2212,9 @@ mod execution_policy_tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                low_res_start: Some(
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(
                     LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ),
+                ), ..Default::default() },
                 ..Default::default()
             };
 

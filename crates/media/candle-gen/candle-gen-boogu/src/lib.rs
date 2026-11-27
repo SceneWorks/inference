@@ -592,7 +592,7 @@ pub(crate) fn validate_request(
     } else {
         pipeline::resolve_reference(req, id)?;
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == BOOGU_IMAGE_TURBO_ID {
             return Err(gen_core::Error::Unsupported(format!(
                 "{id}: low_res_start is not supported on the Boogu Turbo DMD student path (ENG-5)"
@@ -988,6 +988,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // Base is rectified-flow Euler over the static-shift schedule, routed through the
@@ -1046,6 +1047,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 // All three registered routes emit one latent preview per outer denoise step. Base
@@ -2247,7 +2249,7 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(10),
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -2268,7 +2270,7 @@ mod tests {
             image: boundary_image(512, 512),
             strength: Some(0.6),
         }];
-        t2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        t2i.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
         let i2i_plan = registry
             .compile_render_plan(BOOGU_IMAGE_ID, &spec, &t2i)
             .unwrap()
@@ -2295,7 +2297,7 @@ mod tests {
         assert_eq!(edit_plan.phase_output_size(0), (1024, 1024));
 
         let mut edit_lrs = edit_req.clone();
-        edit_lrs.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        edit_lrs.features.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
         assert!(registry
             .compile_render_plan(BOOGU_IMAGE_EDIT_ID, &spec, &edit_lrs)
             .is_err());

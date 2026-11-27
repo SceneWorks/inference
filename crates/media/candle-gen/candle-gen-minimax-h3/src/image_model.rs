@@ -149,6 +149,7 @@ pub(crate) fn route_image() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: contract::SAMPLER_NAMES.to_vec(),
@@ -206,6 +207,7 @@ pub(crate) fn route_image() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -1172,7 +1174,7 @@ mod tests {
         let mut r = request(2048, 2048);
         r.sampler = Some("lcm".into());
         validate_image_request(&d, &r).unwrap();
-        r.h3_image_sampler = Some(contract::H3ImageSampler::Lcm {
+        r.extensions.h3_mut().image_sampler = Some(contract::H3ImageSampler::Lcm {
             s_noise: 1.1,
             s_noise_end: 0.9,
             noise_clip_std: 2.0,
@@ -1181,7 +1183,7 @@ mod tests {
         r.sampler = Some("euler".into());
         assert!(validate_image_request(&d, &r).is_err());
         r.sampler = None;
-        r.h3_image_sampler = Some(contract::H3ImageSampler::lcm(-1.0));
+        r.extensions.h3_mut().image_sampler = Some(contract::H3ImageSampler::lcm(-1.0));
         assert!(validate_image_request(&d, &r).is_err());
         let mut r = request(2048, 2048);
         r.sampler = Some("dpmpp_2m".into());
@@ -1577,7 +1579,7 @@ mod tests {
         );
 
         let mut t2i_pag = request(2048, 2048);
-        t2i_pag.pag = Some(PagConfig {
+        t2i_pag.features.pag = Some(PagConfig {
             scale: 1.2,
             ..Default::default()
         });
@@ -1601,7 +1603,7 @@ mod tests {
         );
 
         let mut edit_16_pag = with_refs(16, 64, 64);
-        edit_16_pag.pag = Some(PagConfig {
+        edit_16_pag.features.pag = Some(PagConfig {
             scale: 2.0,
             layers: Some(vec![0, 25, 49]),
             start: Some(0.0),
@@ -1611,7 +1613,7 @@ mod tests {
         validate_image_request(&d, &edit_16_pag).unwrap();
 
         let mut zero_pag = request(2048, 2048);
-        zero_pag.pag = Some(PagConfig {
+        zero_pag.features.pag = Some(PagConfig {
             scale: 0.0,
             layers: Some(vec![25]),
             ..Default::default()
@@ -1625,19 +1627,25 @@ mod tests {
 
         for bad in [
             GenerationRequest {
-                pag: Some(PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![50]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![50]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..request(2048, 2048)
             },
             GenerationRequest {
-                pag: Some(PagConfig {
-                    scale: 1.2,
-                    layers: Some(vec![50]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 1.2,
+                        layers: Some(vec![50]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..request(2048, 2048)
             },
             GenerationRequest {

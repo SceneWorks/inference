@@ -128,10 +128,11 @@ impl Generator for ControlGenerator {
             .capabilities
             .validate_request(self.descriptor.id, request)?;
         if request
+            .features
             .phases
             .as_ref()
             .is_some_and(|phases| !phases.is_empty())
-            || request.use_pid
+            || request.use_pid()
         {
             return Err(gen_core::Error::Unsupported(
                 "Krea pose control does not compose multi-phase or PiD requests".into(),
@@ -197,8 +198,8 @@ impl Generator for ControlGenerator {
             let control_request = Krea2ControlRequest {
                 guidance: request.guidance,
                 negative_prompt: request.negative_prompt.clone(),
-                sampler: request.sampler.clone(),
-                scheduler: request.scheduler.clone(),
+                sampler: request.sampler.as_deref().map(str::to_owned),
+                scheduler: request.scheduler.as_deref().map(str::to_owned),
                 scheduler_shift: request.scheduler_shift,
                 prompt: request.prompt.clone(),
                 width: request.width,
@@ -208,7 +209,11 @@ impl Generator for ControlGenerator {
                 control_scale: scale
                     .or(request.control_scale)
                     .unwrap_or(crate::DEFAULT_CONTROL_SCALE),
-                text_style_gain: request.text_style_gain,
+                text_style_gain: request
+                    .extensions
+                    .krea
+                    .as_ref()
+                    .and_then(|ext| ext.text_style_gain),
                 tile_vae_decode: request.memory.is_some_and(|memory| memory.tile_vae_decode),
                 stage_residency: request.memory.is_some_and(|memory| memory.stage_residency),
                 cancel: request.cancel.clone(),

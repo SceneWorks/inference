@@ -51,7 +51,10 @@ fn image_sampler_ab_renders_2048_on_cuda() {
     #[cfg(feature = "cuda")]
     {
         use candle_gen::gen_core::h3_image::H3ImageSampler;
-        use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+        use candle_gen::gen_core::{
+            FamilyExtensions, GenerationOutput, GenerationRequest, H3Extension, LoadSpec,
+            WeightsSource,
+        };
         use std::path::PathBuf;
 
         let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
@@ -110,8 +113,14 @@ fn image_sampler_ab_renders_2048_on_cuda() {
                         width: 2048,
                         height: 2048,
                         seed: Some(seed),
-                        h3_image_sampler: Some(sampler),
-                        scheduler: scheduler.map(str::to_owned),
+                        scheduler: scheduler.map(Into::into),
+                        extensions: FamilyExtensions {
+                            h3: Some(H3Extension {
+                                image_sampler: Some(sampler),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     };
                     generator.validate(&req).expect("validate");

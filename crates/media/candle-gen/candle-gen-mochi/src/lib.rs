@@ -106,6 +106,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
                 // Not distilled → true classifier-free guidance over a [neg, pos] batch.
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: Vec::new(),
@@ -159,6 +160,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,

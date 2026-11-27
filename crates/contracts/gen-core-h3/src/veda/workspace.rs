@@ -872,10 +872,16 @@ mod tests {
             width: 1344,
             height: 768,
             frames: Some(124),
-            veda: Some(VedaRequest {
-                enabled: true,
+            extensions: gen_core::FamilyExtensions {
+                h3: Some(gen_core::H3Extension {
+                    veda: Some(VedaRequest {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         }
     }
@@ -1024,7 +1030,11 @@ mod tests {
         // stride-32 lattice: 64x115 patches, i.e. 7,360 reference tokens.
         let base = for_request(&req(), Backend::Cuda).unwrap().unwrap();
         let mut refs = req();
-        refs.reference_image_resize_mode = Some(gen_core::ReferenceImageResizeMode::Diffusers);
+        refs.extensions
+            .h3
+            .as_mut()
+            .unwrap()
+            .reference_image_resize_mode = Some(gen_core::ReferenceImageResizeMode::Diffusers);
         refs.conditioning.push(Conditioning::Reference {
             image: gen_core::Image {
                 width: 320,
@@ -1046,7 +1056,12 @@ mod tests {
         // sc-26691: under the default `match` the plate is below the canvas area and is priced at
         // its own 320x576 (10x18 patches).
         let mut matched = refs.clone();
-        matched.reference_image_resize_mode = None;
+        matched
+            .extensions
+            .h3
+            .as_mut()
+            .unwrap()
+            .reference_image_resize_mode = None;
         assert_eq!(sizes(&matched).ref_tokens, 10 * 18);
         let mut keyframe = req();
         keyframe.conditioning.push(Conditioning::Keyframe {
@@ -1075,7 +1090,10 @@ mod tests {
         let mut r = GenerationRequest::default();
         for b in [Backend::Mlx, Backend::Cuda] {
             assert!(for_request(&r, b).unwrap().is_none());
-            r.veda = Some(VedaRequest::default());
+            r.extensions.h3 = Some(gen_core::H3Extension {
+                veda: Some(VedaRequest::default()),
+                ..Default::default()
+            });
             assert!(for_request(&r, b).unwrap().is_none());
         }
     }
@@ -1220,7 +1238,7 @@ mod tests {
             128,
             2,
             Backend::Cuda,
-            req().veda.as_ref().unwrap(),
+            req().extensions.h3.as_ref().unwrap().veda.as_ref().unwrap(),
             Limits::default()
         )
         .is_err());
@@ -1240,7 +1258,14 @@ mod tests {
             VedaBudget::KeyTiles(u32::MAX),
         ] {
             let mut r = req();
-            let controls = r.veda.as_mut().unwrap();
+            let controls = r
+                .extensions
+                .h3
+                .as_mut()
+                .unwrap()
+                .veda
+                .as_mut()
+                .unwrap();
             controls.generated = generated;
             controls.reference = generated;
             controls.full_attention_layers = vec![0, 49];
@@ -1273,7 +1298,7 @@ mod tests {
         let r = req();
         let (plan, grid, layouts) = price_layouts(Request::from(&r)).unwrap();
         let single = bound(
-            r.veda.as_ref().unwrap(),
+            r.extensions.h3.as_ref().unwrap().veda.as_ref().unwrap(),
             Backend::Cuda,
             &plan,
             grid,
@@ -1329,7 +1354,7 @@ mod tests {
         );
         assert_eq!(mlx.predictor_host_bytes, 12 * 50 * 56 * 128 * 128);
         let mut dense = req();
-        dense.veda = Some(VedaRequest {
+        dense.extensions.h3.as_mut().unwrap().veda = Some(VedaRequest {
             enabled: true,
             generated: VedaBudget::SparsityPercent(0.),
             reference: VedaBudget::SparsityPercent(0.),
@@ -1424,7 +1449,15 @@ mod tests {
         assert!(rb.dense_fallback_bytes >= base.dense_fallback_bytes);
         assert!(rb.position_rows_bytes > base.position_rows_bytes);
         let mut dense = req();
-        dense.veda.as_mut().unwrap().generated = VedaBudget::SparsityPercent(0.);
+        dense
+            .extensions
+            .h3
+            .as_mut()
+            .unwrap()
+            .veda
+            .as_mut()
+            .unwrap()
+            .generated = VedaBudget::SparsityPercent(0.);
         let db = for_request(&dense, Backend::Mlx).unwrap().unwrap();
         let sparse = for_request(&req(), Backend::Mlx).unwrap().unwrap();
         for (shape, chunk) in &db.chunks {

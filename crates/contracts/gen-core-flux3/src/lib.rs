@@ -1174,8 +1174,10 @@ impl GenerationParams {
         pup::validate_caption_size(&caption, "effective caption")?;
         let mut effective = req.clone();
         effective.prompt = caption;
-        effective.flux3_layout = None;
-        effective.flux3_layout_bindings.clear();
+        if let Some(flux3) = effective.extensions.flux3.as_mut() {
+            flux3.layout = None;
+            flux3.layout_bindings.clear();
+        }
         Self::resolve(&effective, prompt_seed(&effective.prompt), config)
     }
 
@@ -1361,7 +1363,13 @@ mod tests {
         let original = layouts::Layout::from_json(serde_json::json!({"version":1,"boxes":[{"id":"a","bbox":[0.1,0.2,0.7,0.8],"desc":"x".repeat(9000)}]})).unwrap();
         let req = GenerationRequest {
             prompt: "scene".into(),
-            flux3_layout: Some(original.clone()),
+            extensions: gen_core::FamilyExtensions {
+                flux3: Some(gen_core::Flux3Extension {
+                    layout: Some(original.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         validate_generation_request(DISTILLED_MODEL_ID, &req, &release()).unwrap();
@@ -1380,7 +1388,10 @@ mod tests {
                 GenerationParams::resolve_caption(&req, caption.clone(), &release()).unwrap();
             assert_eq!(params.prompt, caption);
             assert_eq!(params.seed, prompt_seed(&caption));
-            assert_eq!(req.flux3_layout.as_ref(), Some(&original));
+            assert_eq!(
+                req.extensions.flux3.as_ref().and_then(|f| f.layout.as_ref()),
+                Some(&original)
+            );
         }
     }
 
@@ -1863,11 +1874,14 @@ mod tests {
 
         let cfg = release();
         let active_req = GenerationRequest {
-            pag: Some(gen_core::PagConfig {
-                scale: 1.2,
-                layers: Some(vec![32, 0, 19, 19]),
+            features: gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.2,
+                    layers: Some(vec![32, 0, 19, 19]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..request()
         };
         let params =
@@ -1879,10 +1893,13 @@ mod tests {
         assert_eq!(resolved.active_steps(16), 12);
 
         let noop_req = GenerationRequest {
-            pag: Some(gen_core::PagConfig {
-                scale: 0.0,
+            features: gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..request()
         };
         assert_eq!(
@@ -1891,11 +1908,14 @@ mod tests {
         );
 
         let oob_req = GenerationRequest {
-            pag: Some(gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![33]),
+            features: gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![33]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..request()
         };
         assert!(matches!(

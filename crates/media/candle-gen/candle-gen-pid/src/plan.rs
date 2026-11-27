@@ -324,7 +324,7 @@ impl PidDecodePlan {
         seed: u64,
         safe_gib: f64,
     ) -> Result<Self> {
-        if !req.use_pid {
+        if !req.use_pid() {
             return Err(CandleError::from(CoreError::Unsupported(format!(
                 "{model_id}: cannot compile PidDecodePlan when req.use_pid is false"
             ))));
@@ -397,8 +397,7 @@ mod tests {
             width: 512,
             height: 512,
             count: 2,
-            use_pid: true,
-            pid_capture_sigma: Some(0.25),
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams { capture_sigma: Some(0.25) }), ..Default::default() },
             ..Default::default()
         };
         let plan = PidDecodePlan::compile(
@@ -431,13 +430,13 @@ mod tests {
         let bad_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(
@@ -455,13 +454,13 @@ mod tests {
         let good_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(2048),
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let tiled = PidDecodePlan::compile(
@@ -480,7 +479,7 @@ mod tests {
         let huge = GenerationRequest {
             width: 2048,
             height: 2048,
-            use_pid: true,
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(
@@ -490,13 +489,13 @@ mod tests {
         let unmeasured_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(1536),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(

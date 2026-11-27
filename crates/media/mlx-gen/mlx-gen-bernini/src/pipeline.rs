@@ -115,6 +115,7 @@ pub fn route_renderer() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec!["source_id_rotary_packing"],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: vec!["unipc"],
@@ -161,6 +162,7 @@ pub fn route_renderer() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,

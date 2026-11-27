@@ -75,6 +75,7 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
                 encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_4b", None)],
                 encoder_contract: None,
                 max_prompt_tokens: None,
+                max_enhance_tokens: Some(gen_core::flux3::pup::MAX_TOKENS),
                 supports_caption_overflow_policy: false,
                 // The optional native VLM resolves the effective caption before encoding.
                 supports_prompt_enhancement: true,
@@ -90,6 +91,7 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
                 // A flow map: no CFG, so no negative prompt and no guidance scale.
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // The one integrator, the flow-map Euler step; the schedule has no name and its
@@ -157,6 +159,7 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 // No per-step preview: the packed latent has no fitted RGB projection and the
@@ -165,6 +168,7 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
                 supports_hdr: false,
                 supports_alpha_output: false,
             },
+            supported_family_extensions: vec![gen_core::FamilyExtensionKind::Flux3],
             ..Default::default()
         },
         limits: gen_core::ProductLimits {
@@ -794,6 +798,8 @@ impl Flux3Klein {
                 prefix_kv_cache: None,
                 pag: pag_report,
                 low_res_start: None,
+                adapter_apply_reports: Vec::new(),
+                family_report: None,
             },
         )
     }
@@ -838,10 +844,6 @@ fn refuse_unhonored_memory(id: &str, req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Flux3Klein {
-    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        self.adapter_reports.clone()
-    }
-
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -889,7 +891,9 @@ impl Generator for Flux3Klein {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let mut report = self.generate_impl(req, on_progress)?;
+        report.adapter_apply_reports = self.adapter_reports.clone();
+        Ok(report)
     }
 
     fn generate_with_execution_report(

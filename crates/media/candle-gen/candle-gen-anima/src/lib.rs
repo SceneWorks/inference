@@ -133,6 +133,7 @@ pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // Rectified-flow over the unified curated-sampler framework (epic 7114). The native
@@ -196,6 +197,7 @@ pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 // Per-step latent previews: wired by sc-16953 for all three variants at once — they
@@ -353,14 +355,15 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
             frames: request.frames.unwrap_or(1),
             reference_count: request.image_reference_count(),
         };
-        let phases_present = request.phases.is_some();
+        let phases_present = request.features.phases.is_some();
         let has_phases = request
+            .features
             .phases
             .as_ref()
             .is_some_and(|phases| !phases.is_empty());
         if geometry != self.geometry
             || !request.conditioning.is_empty()
-            || request.use_pid != self.use_pid
+            || request.use_pid() != self.use_pid
             || phases_present != self.has_phases
             || has_phases != self.has_phases
         {
@@ -768,7 +771,7 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let sigmas = pipeline::resolved_sigmas(variant, req)?;
         low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
@@ -811,7 +814,7 @@ pub(crate) fn compile_variant_plan(
             "{id}: candle Anima is txt2img only (no control / IP-adapter)"
         )));
     }
-    if req.use_pid {
+    if req.use_pid() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: anima has no PiD decoder"
         )));
@@ -1375,17 +1378,17 @@ mod tests {
         scope.configure_request(&mut admitted).unwrap();
 
         let mut pid = exact();
-        pid.use_pid = true;
+        pid.features.pid = Some(candle_gen::gen_core::PidParams::enabled());
         assert!(scope.configure_request(&mut pid).is_err());
         let mut phases = exact();
-        phases.phases = Some(vec![GenerationPhase {
+        phases.features.phases = Some(vec![GenerationPhase {
             steps: 1,
             guidance: None,
             adapters: Vec::new(),
         }]);
         assert!(scope.configure_request(&mut phases).is_err());
         let mut empty_phases = exact();
-        empty_phases.phases = Some(Vec::new());
+        empty_phases.features.phases = Some(Vec::new());
         assert!(scope.configure_request(&mut empty_phases).is_err());
         let mut conditioning = exact();
         conditioning
@@ -1435,7 +1438,7 @@ mod tests {
                 height: 1024,
                 steps: Some(6),
                 seed: Some(19),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
                 ..Default::default()
             };
             let plan = registry

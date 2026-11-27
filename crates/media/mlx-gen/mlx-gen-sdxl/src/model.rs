@@ -211,6 +211,7 @@ pub(crate) fn route_sdxl() -> mlx_gen::gen_core::RouteRecord {
                     mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec!["sdxl_ip_adapter", "sdxl_controlnet"],
+                ..Default::default()
             },
             sampling: mlx_gen::gen_core::SamplingSurface {
                 samplers: vec![
@@ -279,6 +280,7 @@ pub(crate) fn route_sdxl() -> mlx_gen::gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: mlx_gen::gen_core::OutputSurface {
                 preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,
@@ -1458,7 +1460,7 @@ impl Sdxl {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
                 run.encode(|| encode_conditioning_windows(&text.0, &text.1, &request.tokens))
@@ -1563,7 +1565,7 @@ impl Sdxl {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
                 encode_conditioning_windows(&text.0, &text.1, &request.tokens)
@@ -1809,7 +1811,7 @@ impl Sdxl {
         init: &SdxlInitLatents,
     ) -> Result<Option<VpCapturePlan>> {
         let req = request.req;
-        if !(req.use_pid && req.pid_capture_sigma.is_some()) {
+        if !(req.use_pid() && req.pid_capture_sigma().is_some()) {
             return Ok(None);
         }
         let is_accel = request.sampling.route().is_acceleration();
@@ -1839,7 +1841,7 @@ impl Sdxl {
         let edm_sigmas = if request.sampling.route().is_curated() {
             let full_sigmas = request.sampling.curated_full_sigmas(&self.alpha_schedule)?;
             match init.requested_strength() {
-                Some(strength_opt) if req.low_res_start.is_some() => {
+                Some(strength_opt) if req.features.low_res_start.is_some() => {
                     let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
                     let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                         full_sigmas.len().saturating_sub(1),
@@ -1860,7 +1862,7 @@ impl Sdxl {
             };
             AncestralEuler::new(&self.sampler, eff, start_time)?.edm_sigmas()
         };
-        Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma))
+        Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma()))
     }
 }
 
@@ -2589,7 +2591,7 @@ pub(crate) fn validate_low_res_start_request(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if has_identity || spec.is_some_and(|s| s.identity.is_some()) {
@@ -2649,8 +2651,8 @@ pub(crate) fn validate_low_res_start_request(
         None => full_sigmas,
     };
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,
@@ -2753,7 +2755,7 @@ fn compile_sdxl_for_mode(
             let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
             let run_sigmas = match true_init_strength {
                 Some(strength_opt) => {
-                    if req.low_res_start.is_some() {
+                    if req.features.low_res_start.is_some() {
                         let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
                         let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                             full_sigmas.len().saturating_sub(1),
@@ -2768,8 +2770,8 @@ fn compile_sdxl_for_mode(
                 None => full_sigmas,
             };
             let keep = match req
-                .use_pid
-                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+                .use_pid()
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
                 .flatten()
             {
                 Some(p) => p.keep,
@@ -2813,8 +2815,8 @@ fn compile_sdxl_for_mode(
                 sigmas.push(0.0);
                 sigmas
             };
-            let keep = match (req.use_pid && mask.is_none())
-                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+            let keep = match (req.use_pid() && mask.is_none())
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
                 .flatten()
             {
                 Some(p) => p.keep,

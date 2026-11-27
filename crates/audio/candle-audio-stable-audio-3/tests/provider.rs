@@ -646,7 +646,7 @@ fn run_default_case(case: &Case) {
     let with = |sampler: Option<&str>, guidance: Option<f32>| {
         let mut request = default_request(&prompt, duration, seed);
         request.steps = Some(expected_steps);
-        request.sampler = sampler.map(str::to_owned);
+        request.sampler = sampler.map(Into::into);
         request.guidance = Some(guidance.unwrap_or(variant.default_guidance() as f32));
         match generator
             .generate(&request, &mut |_| {})

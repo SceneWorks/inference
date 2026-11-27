@@ -235,6 +235,7 @@ impl Sd3Variant {
                         mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                     supports_negative_prompt: self.uses_classifier_free_guidance(),
                     modules: Vec::new(),
+                    ..Default::default()
                 },
                 sampling: mlx_gen::gen_core::SamplingSurface {
                     samplers,
@@ -289,6 +290,7 @@ impl Sd3Variant {
                     requires_control_overlay: false,
                     requires_ip_adapter_overlay: false,
                     requires_identity_overlay: false,
+                    ..Default::default()
                 },
                 output: mlx_gen::gen_core::OutputSurface {
                     preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,

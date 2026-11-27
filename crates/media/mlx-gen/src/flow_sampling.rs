@@ -191,8 +191,8 @@ impl ResolvedFlowControls {
             guidance: effective_guidance,
             strength: req.strength,
             reference_strength,
-            use_pid: req.use_pid,
-            pid_capture_sigma: req.pid_capture_sigma,
+            use_pid: req.use_pid(),
+            pid_capture_sigma: req.pid_capture_sigma(),
         })
         .map_err(invalid)?;
         Ok(Self {
@@ -481,16 +481,21 @@ impl FlowSamplingRecipe {
         req
     }
     pub fn apply_to(&self, req: &mut GenerationRequest) -> Result<()> {
-        req.sampler = Some(self.0.solver.clone());
-        req.scheduler = self.0.scheduler.clone();
+        req.sampler = Some(self.0.solver.clone().into());
+        req.scheduler = self.0.scheduler.clone().map(Into::into);
         req.scheduler_shift = self.0.scheduler_shift;
         req.steps = Some(self.0.steps);
         req.guidance = self.0.guidance;
         req.true_cfg = None;
         req.guidance_method = None;
         req.strength = self.0.strength;
-        req.use_pid = self.0.use_pid;
-        req.pid_capture_sigma = self.0.pid_capture_sigma;
+        req.features.pid = if self.0.use_pid || self.0.pid_capture_sigma.is_some() {
+            Some(gen_core::PidParams {
+                capture_sigma: self.0.pid_capture_sigma,
+            })
+        } else {
+            None
+        };
         for c in &mut req.conditioning {
             if let Conditioning::Reference { strength, .. } = c {
                 *strength = self.0.reference_strength;

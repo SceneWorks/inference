@@ -84,7 +84,7 @@ fn base_request(video_mode: &str) -> GenerationRequest {
         guidance: Some(5.0),
         frames: Some(FRAMES),
         fps: Some(16),
-        video_mode: Some(video_mode.to_owned()),
+        video_mode: Some(video_mode.into()),
         control_scale: Some(1.0),
         ..Default::default()
     }

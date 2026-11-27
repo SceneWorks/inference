@@ -45,10 +45,16 @@ fn request() -> GenerationRequest {
                 strength: None,
             })
             .collect(),
-        flux3_reference_output: Some(ReferenceOutputSize {
-            width: Some(128),
-            height: Some(128),
-        }),
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize {
+                    width: Some(128),
+                    height: Some(128),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         steps: Some(7),
         guidance: Some(1.),
         seed: Some(17),
@@ -125,8 +131,8 @@ fn full_guard_rejects_forged_tokens_shapes_order_and_missing_facts_before_delega
     assert_eq!(accepted.seed, original.seed);
     assert_eq!(accepted.count, original.count);
     assert_eq!(
-        accepted.flux3_reference_output,
-        original.flux3_reference_output
+        accepted.extensions.flux3.as_ref().and_then(|f| f.reference_output),
+        original.extensions.flux3.as_ref().and_then(|f| f.reference_output)
     );
     assert_eq!(accepted.conditioning.len(), 2);
 }
@@ -145,7 +151,13 @@ fn legacy_guard_and_standalone_auto_intent_remain_usable() {
             },
             strength: None,
         }],
-        flux3_reference_output: Some(ReferenceOutputSize::default()),
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let plan = references::normalize_request(&mut standalone)
@@ -157,7 +169,7 @@ fn legacy_guard_and_standalone_auto_intent_remain_usable() {
         vec![(2032, 64)]
     );
     assert_eq!(
-        standalone.flux3_reference_output,
+        standalone.extensions.flux3.as_ref().and_then(|f| f.reference_output),
         Some(ReferenceOutputSize::default())
     );
     let mut none = GenerationRequest::default();

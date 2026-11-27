@@ -1056,7 +1056,7 @@ impl Pipeline {
             }
             None => None,
         };
-        if req.use_pid || clean_init.is_some() {
+        if req.use_pid() || clean_init.is_some() {
             self.device.synchronize()?;
             run.end_conditioning().map_err(CandleError::from)?;
         }
@@ -1622,10 +1622,10 @@ pub(crate) fn validate_base_request(
             req.width, req.height
         )));
     }
-    if req.low_res_start.is_some() || req.source_image.is_some() {
+    if req.features.low_res_start.is_some() || req.source_image.is_some() {
         let sigmas = base_schedule_for_request(variant, req)?;
         let executed_steps = sigmas.len().saturating_sub(1);
-        if let Some(spec) = &req.low_res_start {
+        if let Some(spec) = &req.features.low_res_start {
             spec.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
         }
     }
@@ -1678,7 +1678,7 @@ pub fn compile_conditioned_plan(
     }
     let sigmas = base_schedule_for_request(variant, req)?;
     let executed_steps = sigmas.len().saturating_sub(1);
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         low_res.resolve_for_descriptor(descriptor, req, executed_steps, SIZE_MULTIPLE)?;
     }
     let guidance = req.guidance.unwrap_or(variant.default_guidance());
@@ -1703,7 +1703,7 @@ fn validate_preload_pid(
     req: &GenerationRequest,
     variant: Flux2Variant,
 ) -> gen_core::Result<()> {
-    if !req.use_pid {
+    if !req.use_pid() {
         return Ok(());
     }
     if spec.pid.is_none() {
@@ -1712,7 +1712,7 @@ fn validate_preload_pid(
             variant.id()
         )));
     }
-    if req.pid_capture_sigma.is_some() {
+    if req.pid_capture_sigma().is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
             variant.id()
@@ -1893,7 +1893,7 @@ impl Generator for Flux2Generator {
                 self.descriptor.id
             )));
         }
-        if req.use_pid
+        if req.use_pid()
             && req.memory.is_some_and(|memory| {
                 memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
             })
@@ -1917,10 +1917,10 @@ impl Generator for Flux2Generator {
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text| {
-                if req.use_pid || req.source_image.is_some() {
+                if req.use_pid() || req.source_image.is_some() {
                     run.begin_conditioning()?;
                     self.pipe.encode_phase(text, req, plan.guidance())
                 } else {
@@ -2006,6 +2006,7 @@ pub(crate) fn route_base(variant: Flux2Variant) -> gen_core::RouteRecord {
                 // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and
                 // strict control descriptors remain false and fail closed before loading weights.
                 supports_prompt_enhancement: variant.is_dev(),
+                ..Default::default()
             },
             conditioning: gen_core::ConditioningSurface {
                 kinds: vec![],
@@ -2015,6 +2016,7 @@ pub(crate) fn route_base(variant: Flux2Variant) -> gen_core::RouteRecord {
                 // classifier-free negative pass when guidance > 1.
                 supports_negative_prompt: !variant.uses_embedded_guidance(),
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy
@@ -2081,6 +2083,7 @@ pub(crate) fn route_base(variant: Flux2Variant) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -2562,7 +2565,7 @@ mod explicit_registry_tests {
             height: 512,
             steps: Some(4),
             seed: Some(42),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -3779,13 +3782,12 @@ mod tests {
             height: 1024,
             steps: Some(8),
             sampler: Some("euler".into()),
-            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
-            pag: Some(gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 1.5,
                 start: Some(0.0),
                 stop: Some(0.625),
                 ..Default::default()
-            }),
+            }), low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = compile_base_plan(Flux2Variant::Klein9b, &req).unwrap();

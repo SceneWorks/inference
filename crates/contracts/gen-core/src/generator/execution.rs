@@ -148,7 +148,8 @@ fn generation_output_units(report: &GenerationReport) -> Result<usize> {
         Some(
             GenerationOutput::Video { .. }
             | GenerationOutput::Audio(_)
-            | GenerationOutput::Interleaved { .. },
+            | GenerationOutput::Interleaved { .. }
+            | GenerationOutput::Vector(_),
         ) => 1,
         None if report.artifacts.is_some() => 1,
         None => 0,

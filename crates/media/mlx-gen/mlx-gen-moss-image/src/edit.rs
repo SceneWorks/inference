@@ -196,8 +196,10 @@ pub(crate) fn extra_peak(
     const TEXT: u64 = 4096;
     const LATENT: u64 = 128;
     let text_tokens = request
+        .extensions
         .moss_image
         .as_ref()
+        .and_then(|ext| ext.options.as_ref())
         .map_or(4096, |o| o.max_sequence_length) as u64;
     let image_tokens = (request.width as u64 * request.height as u64 / 256).max(reference_tokens);
     let precise_bytes = text_tokens
@@ -963,8 +965,14 @@ mod tests {
             full > smaller + 100_000_000,
             "reference encoder/KV must affect admission"
         );
-        request.moss_image = Some(Default::default());
-        request.moss_image.as_mut().unwrap().max_sequence_length = 256;
+        request.extensions.moss_image_mut().options = Some(Default::default());
+        request
+            .extensions
+            .moss_image_mut()
+            .options
+            .as_mut()
+            .unwrap()
+            .max_sequence_length = 256;
         assert!(
             extra_peak(inputs, &request).unwrap() < full,
             "precise projection scratch tracks context"
@@ -972,7 +980,13 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
             "unused-cold-snapshot",
         )));
-        request.moss_image.as_mut().unwrap().uncond_skip_layers = Some(vec![22]);
+        request
+            .extensions
+            .moss_image_mut()
+            .options
+            .as_mut()
+            .unwrap()
+            .uncond_skip_layers = Some(vec![22]);
         let error = crate::memory_strategy::edit_request_peak(
             mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
             &spec,

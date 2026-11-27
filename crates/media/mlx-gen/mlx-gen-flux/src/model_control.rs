@@ -341,7 +341,7 @@ impl Flux1DevControl {
             false,
             &req.cancel,
             // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &FluxTextOwned| text.encode_materialized(&req.prompt),
             |encoded| {

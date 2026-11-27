@@ -589,6 +589,7 @@ pub(crate) fn route_full() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec!["bernini_mar_planner"],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: vec!["uni_pc", "unipc"],
@@ -650,6 +651,7 @@ pub(crate) fn route_full() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,

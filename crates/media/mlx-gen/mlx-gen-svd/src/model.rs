@@ -86,6 +86,7 @@ pub(crate) fn route_svd() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
                 supports_negative_prompt: false,
                 modules: vec!["clip_vit_h14"],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -138,6 +139,7 @@ pub(crate) fn route_svd() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -355,23 +357,22 @@ impl SvdParams {
         // model was trained on, ~7) — it comes from `conditioning_fps`, NOT `req.fps`. `req.fps` is the
         // OUTPUT/playback cadence and is applied below at return time, so the two are decoupled
         // (diffusers `StableVideoDiffusionPipeline(fps=…)` vs `export_to_video(fps=…)`; sc-3764).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps as i32;
+        if let Some(svd) = req.extensions.svd.as_ref() {
+            if let Some(cfps) = svd.conditioning_fps {
+                params.fps = cfps as i32;
+            }
+            if let Some(m) = svd.motion_bucket_id {
+                params.motion_bucket_id = m;
+            }
+            if let Some(n) = svd.noise_aug_strength {
+                params.noise_aug_strength = n;
+            }
+            if let Some(c) = svd.decode_chunk_size {
+                params.decode_chunk_size = c as i32;
+            }
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
-        }
-        // SVD micro-conditioning knobs (sc-3523): `motion_bucket_id` / `noise_aug_strength` drive the
-        // `added_time_ids` motion conditioning; `decode_chunk_size` is the chunked-VAE memory knob.
-        // Each falls back to the reference default when the request leaves it `None`.
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as i32;
         }
         params
     }
@@ -406,7 +407,8 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
     // The motion-conditioning fps is baked into `added_time_ids` as `fps − 1`; a 0 would feed −1.0 to
     // the model (a silently degenerate micro-conditioning) rather than erroring. Reject it here at the
     // request boundary (L-E).
-    if let Some(fps) = req.conditioning_fps {
+    let svd = req.extensions.svd.as_ref();
+    if let Some(fps) = svd.and_then(|s| s.conditioning_fps) {
         if fps == 0 {
             return Err(Error::Msg(
                 "svd_xt: conditioning_fps must be >= 1 (added_time_ids encodes fps − 1)".into(),
@@ -418,14 +420,14 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
     // provider-specific knob). Require both finite, and `noise_aug_strength >= 0` (it scales added
     // Gaussian noise). Finiteness is also enforced centrally by the shared floor, but the checks here
     // keep `validate_output_params` self-contained/unit-testable without a loaded model.
-    if let Some(m) = req.motion_bucket_id {
+    if let Some(m) = svd.and_then(|s| s.motion_bucket_id) {
         if !m.is_finite() {
             return Err(Error::Msg(format!(
                 "svd_xt: motion_bucket_id must be finite (got {m})"
             )));
         }
     }
-    if let Some(n) = req.noise_aug_strength {
+    if let Some(n) = svd.and_then(|s| s.noise_aug_strength) {
         if !n.is_finite() || n < 0.0 {
             return Err(Error::Msg(format!(
                 "svd_xt: noise_aug_strength must be finite and >= 0 (got {n})"
@@ -925,8 +927,7 @@ mod tests {
         let mk = |m: Option<f32>, n: Option<f32>| GenerationRequest {
             width: 512,
             height: 512,
-            motion_bucket_id: m,
-            noise_aug_strength: n,
+            extensions: mlx_gen::gen_core::FamilyExtensions { svd: Some(mlx_gen::gen_core::SvdExtension { motion_bucket_id: m, noise_aug_strength: n, ..Default::default() }), ..Default::default() },
             ..Default::default()
         };
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

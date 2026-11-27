@@ -105,7 +105,7 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("normal".into()),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -132,7 +132,7 @@ mod explicit_registry_tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(1, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let img_plan = registry
@@ -233,8 +233,7 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            use_pid: true,
-            pid_capture_sigma: Some(0.35),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.35) }), ..Default::default() },
             ..Default::default()
         };
         let pid_plan = registry

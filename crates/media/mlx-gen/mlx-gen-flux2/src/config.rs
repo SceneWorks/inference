@@ -446,6 +446,7 @@ impl Flux2Variant {
                     max_prompt_tokens: None,
                     supports_caption_overflow_policy: false,
                     supports_prompt_enhancement: self.is_dev(),
+                    ..Default::default()
                 },
                 conditioning: ConditioningSurface {
                     kinds: conditioning,
@@ -461,6 +462,7 @@ impl Flux2Variant {
                     } else {
                         vec![]
                     },
+                    ..Default::default()
                 },
                 sampling: SamplingSurface {
                     samplers: curated_sampler_names(),
@@ -503,6 +505,7 @@ impl Flux2Variant {
                     requires_control_overlay: false,
                     requires_ip_adapter_overlay: false,
                     requires_identity_overlay: false,
+                    ..Default::default()
                 },
                 output: OutputSurface {
                     preview: PreviewSupport::LatentProjection,

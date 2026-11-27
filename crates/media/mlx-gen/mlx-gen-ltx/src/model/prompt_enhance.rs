@@ -58,7 +58,12 @@ impl Ltx {
             max_tokens: enhance::clamp_max_tokens(req.enhance_max_tokens),
             seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
         };
-        if req.use_uncensored_enhancer {
+        if req
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             let (model, tokenizer) = self.load_uncensored_enhancer()?;
             let system = if is_i2v {
                 enhance::I2V_SYSTEM_PROMPT
@@ -184,7 +189,12 @@ impl Ltx {
         if !req.enhance_prompt {
             return Ok(None);
         }
-        if req.use_uncensored_enhancer {
+        if req
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             return Err(Error::Unsupported(
                 "ltx_2_5: use_uncensored_enhancer is unsupported; this route uses only the \
                  licensed stock google/gemma-4-12B-it enhancer staged at enhancer/"

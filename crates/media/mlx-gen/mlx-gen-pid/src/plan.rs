@@ -333,7 +333,7 @@ impl PidDecodePlan {
         seed: u64,
         safe_gib: f64,
     ) -> Result<Self> {
-        if !req.use_pid {
+        if !req.use_pid() {
             return Err(CoreError::Unsupported(format!(
                 "{model_id}: cannot compile PidDecodePlan when req.use_pid is false"
             ))
@@ -412,8 +412,7 @@ mod tests {
             width: 512,
             height: 512,
             count: 2,
-            use_pid: true,
-            pid_capture_sigma: Some(0.25),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.25) }), ..Default::default() },
             ..Default::default()
         };
         let plan = PidDecodePlan::compile(
@@ -447,13 +446,13 @@ mod tests {
         let bad_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(
@@ -472,13 +471,13 @@ mod tests {
         let good_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(2048),
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let tiled = PidDecodePlan::compile(
@@ -498,7 +497,7 @@ mod tests {
         let huge = GenerationRequest {
             width: 2048,
             height: 2048,
-            use_pid: true,
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(
@@ -517,7 +516,7 @@ mod tests {
             &GenerationRequest {
                 width: 512,
                 height: 512,
-                use_pid: true,
+                features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
                 ..Default::default()
             },
             f32::NAN,
@@ -532,13 +531,13 @@ mod tests {
         let unmeasured_tile = GenerationRequest {
             width: 512,
             height: 512,
-            use_pid: true,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: Some(1536),
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(

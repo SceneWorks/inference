@@ -2533,8 +2533,8 @@ mod tests {
                     {
                         assert_eq!(fixture.context.mode, mode);
                         assert!(!fixture.context.has_phases, "{provider_id}");
-                        assert!(fixture.request.phases.is_none(), "{provider_id}");
-                        assert!(!fixture.context.use_pid && !fixture.request.use_pid);
+                        assert!(fixture.request.features.phases.is_none(), "{provider_id}");
+                        assert!(!fixture.context.use_pid && !fixture.request.use_pid());
                         assert_eq!(fixture.context.overlay, None);
                         assert_eq!(
                             fixture.request.conditioning.len(),

@@ -57,6 +57,144 @@ impl MossImageEditInputs<'_> {
             .collect()
     }
 }
+
+/// Owned checked CPU embeddings carried inside [`MossImageEditRequest`] on
+/// [`crate::MossImageExtension`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct MossImageOwnedEmbeddings {
+    pub values: Vec<f32>,
+    pub batch: usize,
+    pub sequence: usize,
+    pub mask: Option<Vec<u8>>,
+}
+
+impl MossImageOwnedEmbeddings {
+    pub fn as_borrowed(&self) -> crate::moss_image::MossImageEmbeddings<'_> {
+        crate::moss_image::MossImageEmbeddings {
+            values: &self.values,
+            batch: self.batch,
+            sequence: self.sequence,
+            mask: self.mask.as_deref(),
+        }
+    }
+
+    pub fn from_borrowed(value: crate::moss_image::MossImageEmbeddings<'_>) -> Self {
+        Self {
+            values: value.values.to_vec(),
+            batch: value.batch,
+            sequence: value.sequence,
+            mask: value.mask.map(|m| m.to_vec()),
+        }
+    }
+
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        self.values
+            .iter()
+            .copied()
+            .find(|v| !v.is_finite())
+            .map(|v| ("moss_image.edit.advanced.embeddings", v))
+    }
+}
+
+/// Owned advanced inputs for [`MossImageEditRequest`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MossImageAdvancedRequest {
+    pub positive: Option<MossImageOwnedEmbeddings>,
+    pub negative: Option<MossImageOwnedEmbeddings>,
+    pub negative_prompts: Option<Vec<String>>,
+    pub noise: Option<Vec<f32>>,
+    pub output: crate::moss_image::MossImageOutputKind,
+}
+
+impl MossImageAdvancedRequest {
+    pub fn as_borrowed(&self) -> MossImageAdvancedInputs<'_> {
+        MossImageAdvancedInputs {
+            positive: self.positive.as_ref().map(MossImageOwnedEmbeddings::as_borrowed),
+            negative: self.negative.as_ref().map(MossImageOwnedEmbeddings::as_borrowed),
+            negative_prompts: self.negative_prompts.as_deref(),
+            noise: self.noise.as_deref(),
+            output: self.output,
+        }
+    }
+
+    pub fn from_borrowed(value: MossImageAdvancedInputs<'_>) -> Self {
+        Self {
+            positive: value.positive.map(MossImageOwnedEmbeddings::from_borrowed),
+            negative: value.negative.map(MossImageOwnedEmbeddings::from_borrowed),
+            negative_prompts: value.negative_prompts.map(|v| v.to_vec()),
+            noise: value.noise.map(|v| v.to_vec()),
+            output: value.output,
+        }
+    }
+
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        if let Some(v) = self
+            .positive
+            .as_ref()
+            .and_then(MossImageOwnedEmbeddings::first_nonfinite_float)
+        {
+            return Some(v);
+        }
+        if let Some(v) = self
+            .negative
+            .as_ref()
+            .and_then(MossImageOwnedEmbeddings::first_nonfinite_float)
+        {
+            return Some(v);
+        }
+        self.noise
+            .as_ref()
+            .and_then(|noise| noise.iter().copied().find(|v| !v.is_finite()))
+            .map(|v| ("moss_image.edit.advanced.noise", v))
+    }
+}
+
+/// Owned MOSS-Image-Edit payload carried inside [`crate::MossImageExtension::edit`] so native
+/// MOSS edit executes through the unified [`crate::Generator`] entry points without family-named
+/// trait methods (`PIPE-12`, `REG-4`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MossImageEditRequest {
+    /// One to four ordered RGB slots. Repeated images retain separate ordinals.
+    pub references: Vec<Image>,
+    pub reference_max_edge: u32,
+    pub use_kv_cache: bool,
+    pub advanced: MossImageAdvancedRequest,
+}
+
+impl Default for MossImageEditRequest {
+    fn default() -> Self {
+        Self {
+            references: Vec::new(),
+            reference_max_edge: 512,
+            use_kv_cache: true,
+            advanced: MossImageAdvancedRequest::default(),
+        }
+    }
+}
+
+impl MossImageEditRequest {
+    pub fn as_inputs(&self) -> MossImageEditInputs<'_> {
+        MossImageEditInputs {
+            references: &self.references,
+            reference_max_edge: self.reference_max_edge,
+            use_kv_cache: self.use_kv_cache,
+            advanced: self.advanced.as_borrowed(),
+        }
+    }
+
+    pub fn from_inputs(inputs: MossImageEditInputs<'_>) -> Self {
+        Self {
+            references: inputs.references.to_vec(),
+            reference_max_edge: inputs.reference_max_edge,
+            use_kv_cache: inputs.use_kv_cache,
+            advanced: MossImageAdvancedRequest::from_borrowed(inputs.advanced),
+        }
+    }
+
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        self.advanced.first_nonfinite_float()
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MossImageEditReferenceReceipt {
@@ -231,11 +369,17 @@ mod tests {
         let req = GenerationRequest {
             steps: Some(30),
             guidance: Some(4.0),
-            pag,
-            moss_image: Some(MossImageOptions {
-                uncond_skip_layers: Some(vec![]),
+            features: crate::FeatureParams {
+                pag,
                 ..Default::default()
-            }),
+            },
+            extensions: crate::FamilyExtensions {
+                moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                    uncond_skip_layers: Some(vec![]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved = MossImageResolved::resolve(MossImageVariant::Sft, &req).unwrap();

@@ -1149,37 +1149,52 @@ impl WanMemoryRequestScope {
         if !request.conditioning.is_empty()
             || request.strength.is_some()
             || request.control_scale.is_some()
-            || request.text_style_gain.is_some()
+            || request
+                .extensions
+                .krea
+                .as_ref()
+                .and_then(|ext| ext.text_style_gain)
+                .is_some()
             || request.image_guidance.is_some()
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route requires empty T2V conditioning and no conditioning-only controls"
             )));
         }
-        if request.audio.is_some() || request.phases.is_some() {
+        if request.audio.is_some() || request.features.phases.is_some() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include audio or multi-phase generation"
             )));
         }
         if request.video_mode.is_some()
-            || request.trim_first_frames.is_some()
+            || request
+                .extensions
+                .wan
+                .as_ref()
+                .and_then(|ext| ext.trim_first_frames)
+                .is_some()
             || request.duration.is_some()
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include video mode, trim, or duration variants"
             )));
         }
-        if request.motion_bucket_id.is_some()
-            || request.noise_aug_strength.is_some()
-            || request.decode_chunk_size.is_some()
-            || request.conditioning_fps.is_some()
-        {
+        if request.extensions.svd.as_ref().is_some_and(|svd| {
+            svd.motion_bucket_id.is_some()
+                || svd.noise_aug_strength.is_some()
+                || svd.decode_chunk_size.is_some()
+                || svd.conditioning_fps.is_some()
+        }) {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include SVD controls"
             )));
         }
         if request.enhance_prompt
-            || request.use_uncensored_enhancer
+            || request
+                .extensions
+                .ltx
+                .as_ref()
+                .is_some_and(|ltx| ltx.use_uncensored_enhancer)
             || request.enhance_max_tokens.is_some()
             || request.enhance_temperature.is_some()
         {
@@ -1187,12 +1202,18 @@ impl WanMemoryRequestScope {
                 "{MODEL_ID}: calibrated memory route does not include prompt enhancement"
             )));
         }
-        if request.softness.is_some() {
+        if request
+            .extensions
+            .seedvr2
+            .as_ref()
+            .and_then(|ext| ext.softness)
+            .is_some()
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include SeedVR2 controls"
             )));
         }
-        if request.use_pid || request.pid_capture_sigma.is_some() {
+        if request.use_pid() || request.pid_capture_sigma().is_some() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route uses the native Wan VAE, not PiD"
             )));
@@ -2498,31 +2519,38 @@ mod tests {
                 mutations.push(request);
             }};
         }
+        macro_rules! mutation_fn {
+            ($f:expr) => {{
+                let mut request = fixture.request.clone();
+                ($f)(&mut request);
+                mutations.push(request);
+            }};
+        }
         mutation!(strength = Some(0.5));
         mutation!(control_scale = Some(1.0));
-        mutation!(text_style_gain = Some(1.0));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.krea_mut().text_style_gain = Some(1.0));
         mutation!(image_guidance = Some(1.0));
         mutation!(audio = Some(AudioParams::default()));
-        mutation!(
-            phases = Some(vec![GenerationPhase {
+        mutation_fn!(|r: &mut GenerationRequest| {
+            r.features.phases = Some(vec![GenerationPhase {
                 steps: 1,
                 ..Default::default()
-            }])
-        );
+            }]);
+        });
         mutation!(video_mode = Some("variant".into()));
-        mutation!(trim_first_frames = Some(1));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.wan_mut().trim_first_frames = Some(1));
         mutation!(duration = Some(1.0));
-        mutation!(motion_bucket_id = Some(1.0));
-        mutation!(noise_aug_strength = Some(0.1));
-        mutation!(decode_chunk_size = Some(1));
-        mutation!(conditioning_fps = Some(24));
-        mutation!(softness = Some(0.1));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().motion_bucket_id = Some(1.0));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().noise_aug_strength = Some(0.1));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().decode_chunk_size = Some(1));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().conditioning_fps = Some(24));
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.seedvr2_mut().softness = Some(0.1));
         mutation!(enhance_prompt = true);
-        mutation!(use_uncensored_enhancer = true);
+        mutation_fn!(|r: &mut GenerationRequest| r.extensions.ltx_mut().use_uncensored_enhancer = true);
         mutation!(enhance_max_tokens = Some(1));
         mutation!(enhance_temperature = Some(0.1));
-        mutation!(use_pid = true);
-        mutation!(pid_capture_sigma = Some(0.5));
+        mutation_fn!(|r: &mut GenerationRequest| r.features.pid = Some(gen_core::PidParams::enabled()));
+        mutation_fn!(|r: &mut GenerationRequest| r.features.pid = Some(gen_core::PidParams::with_capture_sigma(0.5)));
         for request in mutations {
             assert_scope_rejects(&spec, &contract, &fixture, request);
         }

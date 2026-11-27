@@ -131,7 +131,7 @@ fn lens_turbo_pid_decode_vs_vae() {
     assert_eq!(vae_img.width, size, "VAE width == native");
 
     let pid_req = GenerationRequest {
-        use_pid: true,
+        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
         ..base.clone()
     };
     let t = Instant::now();

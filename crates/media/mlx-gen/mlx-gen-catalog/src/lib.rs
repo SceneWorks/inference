@@ -1605,9 +1605,9 @@ mod tests {
             assert_eq!(fixtures.len(), 1, "{provider_id}");
             let fixture = &fixtures[0];
             assert!(!fixture.context.has_phases, "{provider_id}");
-            assert!(fixture.request.phases.is_none(), "{provider_id}");
+            assert!(fixture.request.features.phases.is_none(), "{provider_id}");
             assert!(!fixture.context.use_pid, "{provider_id}");
-            assert!(!fixture.request.use_pid, "{provider_id}");
+            assert!(!fixture.request.use_pid(), "{provider_id}");
             if provider_id == "flux1_dev_control" {
                 assert_eq!(fixture.context.mode, MemoryMode::ImageToImage);
                 assert_eq!(fixture.context.geometry.reference_count, 1);
@@ -1664,7 +1664,7 @@ mod tests {
             .map(|fixture| {
                 assert_eq!(fixture.context.overlay, None, "{provider_id}");
                 assert!(!fixture.context.has_phases, "{provider_id}");
-                assert!(fixture.request.phases.is_none(), "{provider_id}");
+                assert!(fixture.request.features.phases.is_none(), "{provider_id}");
                 assert!(!fixture.context.use_pid, "{provider_id}");
                 let shape = match (
                     &fixture.context.mode,
@@ -1758,15 +1758,15 @@ mod tests {
             .map(|fixture| {
                 assert_eq!(fixture.context.overlay, None, "{provider_id}");
                 assert_eq!(
-                    fixture.request.use_pid, fixture.context.use_pid,
+                    fixture.request.use_pid(), fixture.context.use_pid,
                     "{provider_id}"
                 );
                 assert_eq!(
-                    fixture.request.phases.is_some(),
+                    fixture.request.features.phases.is_some(),
                     fixture.context.has_phases,
                     "{provider_id}"
                 );
-                if let Some(phases) = &fixture.request.phases {
+                if let Some(phases) = &fixture.request.features.phases {
                     assert_eq!(phases.len(), 2, "{provider_id}");
                     assert!(phases.iter().all(|phase| phase.steps > 0), "{provider_id}");
                 }

@@ -234,7 +234,7 @@ fn file_footprint(path: &Path, kind: AdapterKind) -> Result<AdapterPhaseFootprin
 /// its distinct-strength derived variants and releases them before the next phase. The ordinary
 /// resident DiT's installed default stack remains live in either snapshot or native-file residency.
 pub fn adapter_phase_additional_bytes(spec: &LoadSpec, req: &GenerationRequest) -> Result<u64> {
-    let Some(phases) = req.phases.as_ref() else {
+    let Some(phases) = req.features.phases.as_ref() else {
         return Ok(0);
     };
     let footprints = spec
@@ -324,7 +324,7 @@ mod pricing_tests {
             weight: Some(value),
         };
         let request = GenerationRequest {
-            phases: Some(vec![
+            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![
                 GenerationPhase {
                     steps: 1,
                     adapters: vec![strength(0.5), strength(0.5), strength(0.7)],
@@ -335,7 +335,7 @@ mod pricing_tests {
                     adapters: vec![strength(0.8)],
                     ..Default::default()
                 },
-            ]),
+            ]), ..Default::default() },
             ..Default::default()
         };
         // One raw source + one ordinary BF16 3x5 delta + two distinct phase deltas.

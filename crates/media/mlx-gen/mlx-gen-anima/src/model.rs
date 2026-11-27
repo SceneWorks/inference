@@ -117,6 +117,7 @@ pub fn route_for(variant: Variant) -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: cfg_capable,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -168,6 +169,7 @@ pub fn route_for(variant: Variant) -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::LatentProjection,
@@ -742,7 +744,7 @@ pub(crate) fn resolved_sampling(
             .scheduler
             .as_deref()
             .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
-            .map(str::to_owned),
+            .map(Into::into),
         scheduler_shift: req.scheduler_shift,
         steps: Some(steps as u32),
         guidance: Some(guidance),
@@ -792,7 +794,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (_, sigmas) = resolved_sampling(variant, req)?;
         low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
@@ -830,7 +832,7 @@ pub(crate) fn compile_variant_plan(
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     validate_load_precision(spec, variant.id())?;
-    if req.use_pid {
+    if req.use_pid() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{}: anima has no PiD decoder",
             variant.id()

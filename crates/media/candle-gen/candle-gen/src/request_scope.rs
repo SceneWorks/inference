@@ -180,10 +180,12 @@ impl CandleRequestScopeCore {
 impl MemoryRequestScope for CandleRequestScopeCore {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.config.use_pid {
+        if request.use_pid() != self.config.use_pid {
             return Err(Error::Unsupported(format!(
                 "{}: request use_pid={} does not match admitted use_pid={}",
-                self.config.provider_id, request.use_pid, self.config.use_pid
+                self.config.provider_id,
+                request.use_pid(),
+                self.config.use_pid
             )));
         }
         // `MemoryGeometry::batch` is the admitted maximum; a request may use any non-zero prefix.

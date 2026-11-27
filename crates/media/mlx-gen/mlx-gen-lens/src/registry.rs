@@ -180,6 +180,7 @@ fn route_for(defaults: Defaults) -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers,
@@ -227,6 +228,7 @@ fn route_for(defaults: Defaults) -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::LatentProjection,
@@ -721,7 +723,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     resolve_root(spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         )));
@@ -905,10 +907,10 @@ impl LensGenerator {
             self.default_stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &LensText| {
-                if req.use_pid {
+                if req.use_pid() {
                     run.begin_conditioning()?;
                     text.encode_prompt_windowed(
                         &req.prompt,
@@ -955,7 +957,7 @@ impl LensGenerator {
                     self.defaults.id,
                     plan.capture_sigma(),
                 )?;
-                if req.use_pid {
+                if req.use_pid() {
                     run.end_conditioning()?;
                 }
                 let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
@@ -1087,7 +1089,7 @@ impl LensGenerator {
             memory.stage_residency,
             memory.stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text| {
                 run.encode(|| {
@@ -1271,7 +1273,7 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let defaults = if id == MODEL_ID_TURBO {
             TURBO_DEFAULTS
         } else {

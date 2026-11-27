@@ -1120,6 +1120,8 @@ impl QwenImage21 {
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 }
@@ -1213,7 +1215,7 @@ pub(crate) fn validate_request_with_schedule(
             )));
         }
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if !req.conditioning.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with pass-0 reference/edit conditioning",
@@ -1981,11 +1983,11 @@ mod execution_policy_tests {
         );
         let zero = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![16]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(&base.capabilities, &zero).is_ok());
@@ -1999,11 +2001,11 @@ mod execution_policy_tests {
 
         let oob = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![32]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(&turbo.capabilities, &oob).is_err());
@@ -2082,7 +2084,7 @@ mod execution_policy_tests {
             width: 1024,
             height: 1024,
             steps: Some(20),
-            low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(6, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let base_plan = compile_render_plan(&spec, &base_req)
@@ -2097,7 +2099,7 @@ mod execution_policy_tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let turbo_plan = compile_render_plan_turbo(&spec, &turbo_req)

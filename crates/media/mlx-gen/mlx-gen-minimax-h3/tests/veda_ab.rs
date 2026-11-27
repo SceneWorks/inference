@@ -397,7 +397,13 @@ fn veda_ab_render_one_cell() {
     let load_s = t_load.elapsed().as_secs_f64();
 
     let req = GenerationRequest {
-        veda,
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            h3: Some(mlx_gen::gen_core::H3Extension {
+                veda,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         prompt,
         width,
         height,
@@ -417,8 +423,8 @@ fn veda_ab_render_one_cell() {
     let started = Instant::now();
     let mut ticks: Vec<Instant> = Vec::new();
     let mut decoding_at: Option<Instant> = None;
-    let output = model
-        .generate(&req, &mut |p| match p {
+    let gen_report = model
+        .generate_with_report(&req, &mut |p| match p {
             Progress::Step { current, total } => {
                 let now = Instant::now();
                 let since = ticks.last().copied().unwrap_or(started);
@@ -437,11 +443,13 @@ fn veda_ab_render_one_cell() {
             | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("generate: {e}"));
+    let report = gen_report.veda_report().cloned();
+    let output = gen_report.output;
     let wall_s = started.elapsed().as_secs_f64();
     let mlx_peak = mlx_rs::memory::get_peak_memory() as u64;
 
     let (frames_out, fps_out, audio) = match output {
-        GenerationOutput::Video { frames, fps, audio } => (frames, fps, audio),
+        Some(GenerationOutput::Video { frames, fps, audio }) => (frames, fps, audio),
         other => panic!("expected a Video output, got {other:?}"),
     };
     let audio = audio.expect("MiniMax-H3 always produces a soundtrack");
@@ -454,7 +462,6 @@ fn veda_ab_render_one_cell() {
         .map(|w| w[1].duration_since(w[0]).as_secs_f64())
         .collect();
     let decode_s = decoding_at.map(|d| wall_s - d.duration_since(started).as_secs_f64());
-    let report = model.veda_execution_report();
 
     let (out_w, out_h) = (frames_out[0].width, frames_out[0].height);
     let mp4 = write_outputs(&out, &frames_out, &audio.samples, fps_out, out_w, out_h);

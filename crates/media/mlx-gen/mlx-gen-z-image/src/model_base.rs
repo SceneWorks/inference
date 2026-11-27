@@ -285,7 +285,7 @@ impl ZImage {
         let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, strength)?
                 } else {
                     init_time_step(steps, strength)
@@ -320,7 +320,7 @@ impl ZImage {
             stage_residency,
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: prompt → (cap, neg_cap). The base is undistilled and runs real CFG; unlike
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
@@ -609,10 +609,10 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 1.5,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
@@ -625,10 +625,10 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 0.0,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());

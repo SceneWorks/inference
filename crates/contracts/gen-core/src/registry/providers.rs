@@ -880,13 +880,19 @@ impl ProviderRegistry {
         spec: &LoadSpec,
         kind: &str,
     ) -> Result<()> {
-        if spec.yue2_ar_mode != crate::Yue2ArMode::Native && id != "yue2" {
+        let supports_ar_load_controls = kind == "generator"
+            && self
+                .generator_descriptor(id)
+                .is_some_and(|descriptor| descriptor.capabilities.supports_ar_load_controls);
+        if spec.yue2_ar_mode != crate::Yue2ArMode::Native && !supports_ar_load_controls {
             return Err(Error::Unsupported(format!(
                 "the YuE2 AR mode {:?} cannot be used by provider '{id}'",
                 spec.yue2_ar_mode
             )));
         }
-        if spec.yue2_compute_policy != crate::Yue2ComputePolicy::Legacy && id != "yue2" {
+        if spec.yue2_compute_policy != crate::Yue2ComputePolicy::Legacy
+            && !supports_ar_load_controls
+        {
             return Err(Error::Unsupported(format!(
                 "the YuE2 compute policy {:?} cannot be used by provider '{id}'",
                 spec.yue2_compute_policy

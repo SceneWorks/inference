@@ -540,7 +540,7 @@ impl Supra2Image {
                 "{PROVIDER_ID}: only resident execution is implemented"
             )));
         }
-        if request.use_pid {
+        if request.use_pid() {
             return Err(Error::Unsupported(format!(
                 "{PROVIDER_ID}: PiD decoding is not available for the SD VAE latent space"
             )));

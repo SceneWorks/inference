@@ -424,6 +424,13 @@ fn output_facts(output: Option<&GenerationOutput>) -> Vec<Value> {
                 .map(|image| json!({"width":image.width,"height":image.height,"channels":3,"format":"rgb8"}))
                 .collect::<Vec<_>>(),
         })],
+        Some(GenerationOutput::Vector(vector)) => vec![json!({
+            "format": "svg-vector",
+            "svg_bytes": vector.svg.len(),
+            "generated_tokens": vector.generated_tokens,
+            "truncated": vector.truncated,
+            "has_preview": vector.preview.is_some(),
+        })],
         None => Vec::new(),
     }
 }
@@ -1185,6 +1192,8 @@ mod tests {
                     prefix_kv_cache: None,
                     pag: Some(pag_report.clone()),
                     low_res_start: None,
+                    adapter_apply_reports: Vec::new(),
+                    family_report: None,
                 })
             });
         assert!(matches!(

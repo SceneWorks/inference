@@ -171,7 +171,7 @@ pub(crate) fn validate_low_res_start_kolors(
     spec: Option<&LoadSpec>,
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if spec.is_some_and(|s| {
@@ -310,7 +310,7 @@ fn compile_kolors_for_mode(
         let mut sigmas =
             candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
         if let Some((_, raw_strength)) = raw_ref {
-            let start = if req.low_res_start.is_some() {
+            let start = if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(
                     sigmas.len().saturating_sub(1),
                     Some(raw_strength),
@@ -332,7 +332,7 @@ fn compile_kolors_for_mode(
     };
 
     let executed_steps = sigmas.len().saturating_sub(1);
-    if executed_steps == 0 && req.low_res_start.is_none() {
+    if executed_steps == 0 && req.features.low_res_start.is_none() {
         return Ok(None);
     }
     let guidance = req.guidance.unwrap_or(config::DEFAULT_GUIDANCE);
@@ -636,6 +636,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: candle_gen::menu_with_aliases(
@@ -698,6 +699,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -1059,7 +1061,7 @@ mod tests {
                 width: 512,
                 height: 512,
                 steps: Some(10),
-                sampler,
+                sampler: sampler.map(Into::into),
                 conditioning: vec![Conditioning::Reference {
                     image: Image {
                         width: 8,
@@ -1170,7 +1172,7 @@ mod tests {
             guidance: Some(5.0),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -1199,7 +1201,7 @@ mod tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..req.clone()
         };
         let img2img_plan = registry
@@ -1295,7 +1297,7 @@ mod tests {
                 },
                 strength: Some(0.05),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
             ..req.clone()
         };
         assert!(g.validate(&small_strength_req).is_ok());
@@ -1316,7 +1318,7 @@ mod tests {
                 },
                 strength: Some(1.5),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..req.clone()
         };
         assert!(matches!(
@@ -1339,7 +1341,7 @@ mod tests {
                 },
                 strength: Some(1.0),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..req.clone()
         };
         assert!(matches!(
@@ -1355,21 +1357,21 @@ mod tests {
         // and illegal phase-0 geometries (`scale: Some(0.3)` or phase-0 dimensions below `min_size`).
         for bad_low_res_req in [
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))), ..Default::default() },
                 ..req.clone()
             },
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))), ..Default::default() },
                 ..req.clone()
             },
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))), ..Default::default() },
                 ..req.clone()
             },
             GenerationRequest {
                 width: 256,
                 height: 256,
-                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
                 ..req.clone()
             },
         ] {

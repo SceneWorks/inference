@@ -213,8 +213,8 @@ impl AdmittedControlGeometry {
             height: self.0.height,
             steps,
             seed,
-            sampler: req.sampler.clone(),
-            scheduler: req.scheduler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
             transformer_window_size,
             memory: req.memory.unwrap_or_default(),
             provider_id: KREA_2_TURBO_CONTROL_ID,
@@ -706,11 +706,16 @@ impl KreaTurboControl {
         // drops it and clears the cache before loading the DiT/VAE/branch below.
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &KreaText| {
-                let context =
-                    maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+                let context = maybe_apply_style_gain(
+                    text.encode(&req.prompt)?,
+                    req.extensions
+                        .krea
+                        .as_ref()
+                        .and_then(|ext| ext.text_style_gain),
+                )?;
                 let negative = (req.guidance.unwrap_or(0.0) != 0.0)
                     .then(|| text.encode(req.negative_prompt.as_deref().unwrap_or("")))
                     .transpose()?;

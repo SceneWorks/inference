@@ -1038,8 +1038,8 @@ pub(crate) fn registered_valid_fixture(
     )?;
     let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(context);
     fixture.request.prompt = "weights-free FLUX.1 memory behavior".to_owned();
-    fixture.request.phases = None;
-    fixture.request.use_pid = spec.pid.is_some();
+    fixture.request.features.phases = None;
+    fixture.request.features.pid = spec.pid.is_some().then(mlx_gen::gen_core::PidParams::enabled);
     let reference = || mlx_gen::media::Image {
         width: 1,
         height: 1,
@@ -1125,7 +1125,7 @@ fn begin_request_with_cleanup(
             mlx_gen::request_scope::selected_transformer_window(contract, context);
         config.set_request_validator(move |request| {
             let admitted_plan = low_res_context.as_ref().and_then(|ctx| ctx.plan.as_ref());
-            let Some(_spec) = &request.low_res_start else {
+            let Some(_spec) = &request.features.low_res_start else {
                 if admitted_plan.is_some() {
                     return Err(CoreError::Unsupported(format!(
                         "{provider_id}: request low_res_start plan changed after memory admission"
@@ -2586,7 +2586,7 @@ mod tests {
         fixture.request.width = 1024;
         fixture.request.height = 1024;
         fixture.request.steps = Some(8);
-        fixture.request.low_res_start = Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
+        fixture.request.features.low_res_start = Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
 
         let plan = crate::model::compile_trajectory_for(
             crate::config::FluxVariant::Dev,
@@ -2640,7 +2640,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         let mut ordinary_req = fixture.request.clone();
-        ordinary_req.low_res_start = None;
+        ordinary_req.features.low_res_start = None;
         one_under_scope
             .configure_request(&mut ordinary_req)
             .expect("ordinary T2I configure_request must succeed");
@@ -2676,7 +2676,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         let mut ordinary_req = fixture.request.clone();
-        ordinary_req.low_res_start = None;
+        ordinary_req.features.low_res_start = None;
         unqualified_scope
             .configure_request(&mut ordinary_req)
             .expect("ordinary T2I under UnqualifiedRealEvidence must succeed");
@@ -2731,7 +2731,7 @@ mod tests {
                 "ordinary control request with posture-only context must pass configure_request",
             );
         let mut low_res_control_req = control_fixture.request.clone();
-        low_res_control_req.low_res_start =
+        low_res_control_req.features.low_res_start =
             Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
         let control_err = control_scope
             .configure_request(&mut low_res_control_req)

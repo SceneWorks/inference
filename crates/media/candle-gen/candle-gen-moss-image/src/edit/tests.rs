@@ -145,11 +145,23 @@ fn edit_peak_prices_reference_context_and_refuses_before_assets() {
         .unwrap()
             + 100_000_000
     );
-    request.moss_image = Some(Default::default());
-    request.moss_image.as_mut().unwrap().max_sequence_length = 256;
+    request.extensions.moss_image_mut().options = Some(Default::default());
+    request
+        .extensions
+        .moss_image_mut()
+        .options
+        .as_mut()
+        .unwrap()
+        .max_sequence_length = 256;
     assert!(extra_peak(inputs, &request).unwrap() < full);
     let spec = LoadSpec::new(WeightsSource::Dir("unused-cold-snapshot".into()));
-    request.moss_image.as_mut().unwrap().uncond_skip_layers = Some(vec![22]);
+    request
+        .extensions
+        .moss_image_mut()
+        .options
+        .as_mut()
+        .unwrap()
+        .uncond_skip_layers = Some(vec![22]);
     for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
         let error = crate::memory_strategy::edit_request_peak(variant, &spec, &request, inputs)
             .unwrap_err()

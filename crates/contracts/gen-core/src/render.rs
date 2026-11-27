@@ -182,8 +182,12 @@ impl From<&GenerationRequest> for ExactImageControls {
     fn from(req: &GenerationRequest) -> Self {
         Self {
             strength_bits: req.strength.map(f32::to_bits),
-            pag: req.pag.clone(),
-            text_style_gain_bits: req.text_style_gain.map(f32::to_bits),
+            pag: req.features.pag.clone(),
+            text_style_gain_bits: req
+                .extensions
+                .krea
+                .and_then(|k| k.text_style_gain)
+                .map(f32::to_bits),
             output_rgba: req.output_channels == crate::OutputChannels::Rgba,
         }
     }
@@ -511,13 +515,13 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                 })
             }
         };
-        let low_res_start = req.low_res_start.map(|spec| LowResStartInput {
+        let low_res_start = req.features.low_res_start.map(|spec| LowResStartInput {
             version: spec.version,
             k: spec.k,
             scale_bits: spec.scale.map(f32::to_bits),
             estimate_source: spec.estimate_source,
         });
-        let adapter_phases = req.phases.as_ref().map(|phases| AdapterPhaseInputs {
+        let adapter_phases = req.features.phases.as_ref().map(|phases| AdapterPhaseInputs {
             authored: phases
                 .iter()
                 .map(|phase| AuthoredAdapterPhase {
@@ -530,8 +534,12 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                         .collect(),
                 })
                 .collect(),
-            pag: req.pag.clone(),
-            text_style_gain_bits: req.text_style_gain.map(f32::to_bits),
+            pag: req.features.pag.clone(),
+            text_style_gain_bits: req
+                .extensions
+                .krea
+                .and_then(|k| k.text_style_gain)
+                .map(f32::to_bits),
             output_rgba: req.output_channels == crate::OutputChannels::Rgba,
         });
         Ok(Self {
@@ -549,16 +557,19 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             adapter_phases,
             exact_controls: None,
             steps: req.steps,
-            sampler: req.sampler.clone(),
-            scheduler: req.scheduler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
             scheduler_shift: req.scheduler_shift,
             guidance: req.guidance,
-            guidance_method: req.guidance_method.clone(),
+            guidance_method: req.guidance_method.as_deref().map(str::to_owned),
             true_cfg_bits: req.true_cfg.map(f32::to_bits),
             image_guidance_bits: req.image_guidance.map(f32::to_bits),
-            timestep_to_start_cfg: req.timestep_to_start_cfg,
-            use_pid: req.use_pid,
-            pid_capture_sigma: req.pid_capture_sigma,
+            timestep_to_start_cfg: req
+                .extensions
+                .pulid
+                .and_then(|p| p.timestep_to_start_cfg),
+            use_pid: req.use_pid(),
+            pid_capture_sigma: req.pid_capture_sigma(),
             enhance_prompt: req.enhance_prompt,
             enhance_temperature_bits: req.enhance_temperature.map(f32::to_bits),
             enhance_max_tokens: req.enhance_max_tokens,
@@ -720,7 +731,7 @@ impl RenderPlan {
         req: &GenerationRequest,
         pass: PackedImagePass<'_>,
     ) -> Result<Self> {
-        if req.phases.is_some() {
+        if req.features.phases.is_some() {
             return Err(Error::Unsupported(format!(
                 "{}: multi-phase denoise (phases) is not supported on this route",
                 descriptor.id
@@ -761,13 +772,13 @@ impl RenderPlan {
         req: &GenerationRequest,
         mut pass: PackedImagePass<'_>,
     ) -> Result<Self> {
-        let authored = req.phases.as_ref().ok_or_else(|| {
+        let authored = req.features.phases.as_ref().ok_or_else(|| {
             Error::Unsupported("Krea multi-phase plan requires requested phases".into())
         })?;
         if !req.conditioning.is_empty()
             || req.source_image.is_some()
-            || req.use_pid
-            || req.low_res_start.is_some()
+            || req.use_pid()
+            || req.features.low_res_start.is_some()
         {
             return Err(Error::Unsupported(format!(
                 "{}: multi-phase denoise requires a noise start and excludes PiD and low-res start",
@@ -891,7 +902,7 @@ impl RenderPlan {
         let tokens = (req.width / pixel_stride)
             .checked_mul(req.height / pixel_stride)
             .ok_or_else(|| Error::Unsupported("packed image token count overflow".into()))?;
-        let low_res_start = match &req.low_res_start {
+        let low_res_start = match &req.features.low_res_start {
             Some(spec) => {
                 Some(spec.resolve_for_descriptor(descriptor, req, executed_steps, pixel_stride)?)
             }

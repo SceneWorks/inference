@@ -69,6 +69,7 @@ pub fn route_quality() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: Vec::new(),
@@ -120,6 +121,7 @@ pub fn route_quality() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::LatentProjection,
@@ -528,7 +530,7 @@ impl Ideogram4 {
 
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: tokenize + Qwen3-VL encode → prompt embeds. Seed-independent; under
             // `Sequential` the shared seam materializes the embeds + DROPS the TE before the DiT/VAE
@@ -570,7 +572,7 @@ impl Ideogram4 {
                         req.width,
                         steps,
                         edit_init.as_ref().map(|e| e.strength),
-                        req.use_pid.then_some(req.pid_capture_sigma).flatten(),
+                        req.use_pid().then_some(req.pid_capture_sigma()).flatten(),
                     )
                     .unwrap_or((0.0, 0));
                 let pid_decoder = resolve_pid_decoder_at_sigma(

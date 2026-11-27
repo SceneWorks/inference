@@ -1602,7 +1602,12 @@ mod tests {
         let referenced = request_rows((&req).into(), 4).unwrap();
         assert!(referenced.packed > base.packed);
         assert!(referenced.conditioning >= base.conditioning);
-        assert!(req.veda.is_none());
+        assert!(req
+            .extensions
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.veda.as_ref())
+            .is_none());
         assert_eq!(
             referenced.schedule, 10,
             "existing S5 two-stream bound includes fixed timesteps"
