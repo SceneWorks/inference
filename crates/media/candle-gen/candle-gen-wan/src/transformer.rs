@@ -14,6 +14,7 @@ use crate::config::TransformerConfig;
 use crate::gguf::{GgufDit, WeightSrc};
 use crate::quant::QLinear;
 use crate::rope::apply_rope;
+use candle_gen::modulate::modulate;
 
 /// Dense Linear loader — retained for the VACE model (`vace.rs`) and the training DiT (`dit_train.rs`),
 /// whose tiers are not packed. The inference DiT Linears route through [`qlinear`] (packed-detect).
@@ -553,10 +554,7 @@ impl Block {
 
         let hf = hidden.to_dtype(DType::F32)?;
         // 1. self-attention
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&(scale_msa + 1.0)?)?
-            .broadcast_add(&shift_msa)?
-            .to_dtype(dt)?;
+        let n = modulate(&ln_no_affine(&hf, self.eps)?, &scale_msa, &shift_msa)?.to_dtype(dt)?;
         let a = self.attn1.forward(&n, &n, Some((cos, sin)))?;
         let hf = (hf + a.to_dtype(DType::F32)?.broadcast_mul(&gate_msa)?)?;
 
@@ -570,10 +568,7 @@ impl Block {
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
         // 3. feed-forward
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&(c_scale + 1.0)?)?
-            .broadcast_add(&c_shift)?
-            .to_dtype(dt)?;
+        let n = modulate(&ln_no_affine(&hf, self.eps)?, &c_scale, &c_shift)?.to_dtype(dt)?;
         let f = self.ffn.forward(&n)?;
         let hf = (hf + f.to_dtype(DType::F32)?.broadcast_mul(&c_gate)?)?;
         hf.to_dtype(dt)
@@ -906,9 +901,7 @@ impl WanTransformer {
         let shift = head_mod.narrow(1, 0, 1)?;
         let scale = head_mod.narrow(1, 1, 1)?;
         let hf = hidden.to_dtype(DType::F32)?;
-        let normed = ln_no_affine(&hf, self.norm_out_eps)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?
+        let normed = modulate(&ln_no_affine(&hf, self.norm_out_eps)?, &scale, &shift)?
             .to_dtype(self.dtype)?;
         self.proj_out.forward(&normed) // [B,L,out_c*patch]
     }
@@ -978,9 +971,7 @@ impl WanTransformer {
         let shift = head_mod.narrow(2, 0, 1)?.squeeze(2)?;
         let scale = head_mod.narrow(2, 1, 1)?.squeeze(2)?;
         let hidden = hidden.to_dtype(DType::F32)?;
-        let normed = ln_no_affine(&hidden, self.norm_out_eps)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?
+        let normed = modulate(&ln_no_affine(&hidden, self.norm_out_eps)?, &scale, &shift)?
             .to_dtype(self.dtype)?;
         let out = self.proj_out.forward(&normed)?;
         self.unpatchify_tokens(&out, grid)

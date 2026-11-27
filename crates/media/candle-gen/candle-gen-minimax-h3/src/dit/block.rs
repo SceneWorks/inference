@@ -278,7 +278,8 @@ fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, indices: &Tensor) -> Res
         .index_select(indices, 0)?
         .to_dtype(x.dtype())?
         .reshape((1, rows, shift.dims()[1]))?;
-    Ok(x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?)
+    // The affine itself is the shared composable modulate (SW-6129).
+    Ok(candle_gen::modulate::modulate(x, &scale, &shift)?)
 }
 
 /// Gather one gate per sequence row, shaped to broadcast over `[B, S, hidden]`.

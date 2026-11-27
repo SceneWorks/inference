@@ -29,10 +29,9 @@ use crate::rope::ScailRope;
 /// `cfg.eps` (1e-6) instead.
 const IMG_LN_EPS: f64 = 1e-5;
 
-/// adaLN affine `m·(1+scale)+shift` (broadcasting `scale`/`shift` `[1,1,dim]` over the token axis).
-fn modulate(m: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    m.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
-}
+// adaLN affine `m·(1+scale)+shift` (broadcasting `scale`/`shift` `[1,1,dim]` over the token axis):
+// the shared composable modulate (SW-6129); the norm feeding it is the composable `ln_no_affine`.
+use candle_gen::modulate::modulate;
 
 /// Gated residual `x + y·gate`.
 fn gated(x: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {

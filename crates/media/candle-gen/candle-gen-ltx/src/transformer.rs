@@ -35,10 +35,10 @@ fn linear(vb: &VarBuilder, key: &str) -> Result<QLinear> {
     qlinear(vb, key, true)
 }
 
-/// `x·(1+scale)+shift`; scale/shift `[B,1,inner]` broadcast over the token axis.
-fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
-}
+// `x·(1+scale)+shift` (scale/shift `[B,1,inner]` broadcast over the token axis) is the shared
+// composable modulate (SW-6129); the norm feeding it (`rms_noweight` / `layer_norm_noaffine`) is a
+// composable f32 chain, not candle's `ops::rms_norm`, so the fused `adaln` would not be exact here.
+use candle_gen::modulate::modulate;
 
 /// `x + out·gate`; gate `[B,1,inner]` broadcasts over `out [B,S,inner]`.
 fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {

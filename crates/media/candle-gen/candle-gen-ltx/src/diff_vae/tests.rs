@@ -1434,3 +1434,127 @@ fn an_unplannable_geometry_is_a_catchable_error_naming_the_budget() {
         "the error must name the mode: {err}"
     );
 }
+
+/// SW-6129 route: `rotate_axis` is the shared `candle_gen::rope::apply_rope`; the former private
+/// chain is the oracle.
+mod rope_route_tests {
+    use super::*;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `rotate_axis`, verbatim.
+    fn former(x: &Tensor, inv: &Tensor, axis: usize) -> Result<Tensor> {
+        let sh = x.dims().to_vec();
+        let d = *sh.last().expect("rank >= 1");
+        let half = d / 2;
+        let split = [sh[0], sh[1], sh[2], sh[3], sh[4], half];
+        let paired = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 2];
+        let stack = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 1];
+        let pairs = x.contiguous()?.reshape(&paired[..])?;
+        let xe = pairs.narrow(6, 0, 1)?.reshape(&split[..])?;
+        let xo = pairs.narrow(6, 1, 1)?.reshape(&split[..])?;
+
+        let len = sh[axis];
+        let positions: Vec<f32> = (0..len).map(|i| i as f32).collect();
+        let pos = Tensor::from_vec(positions, (len, 1), x.device())?;
+        let mut ang_shape = [1usize, 1, 1, 1, 1, half];
+        ang_shape[axis] = len;
+        let ang = pos
+            .broadcast_mul(&inv.reshape((1, half))?)?
+            .reshape(&ang_shape[..])?;
+        let (cos, sin) = (ang.cos()?, ang.sin()?);
+        let re = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
+        let ro = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
+        let stacked = Tensor::cat(&[re.reshape(&stack[..])?, ro.reshape(&stack[..])?], 6)?;
+        stacked.contiguous()?.reshape(sh)
+    }
+
+    /// Bit-identical to the former chain for each axis chunk of a `(B, T, H, W, NH, D)` head split
+    /// sliced like `NaAttention::rope` (a non-contiguous lane slice), in the decoder's f32.
+    #[test]
+    fn rotate_axis_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let x = spread(&[2, 3, 5, 4, 2, 24], 0.4, &dev);
+        let split = [8usize, 8, 8];
+        let mut start = 0;
+        for (axis, chunk) in [(1usize, split[0]), (2, split[1]), (3, split[2])] {
+            let inv = rope_inv_freqs(chunk, 10_000.0, &dev).unwrap();
+            let part = slice_axis(&x, 5, start, start + chunk).unwrap();
+            start += chunk;
+            let got = rotate_axis(&part, &inv, axis).unwrap();
+            let want = former(&part, &inv, axis).unwrap();
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(bits(&got), bits(&want), "axis {axis}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the NaAttention per-axis RoPE (f32 decoder dtype and bf16) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let x32 = spread(&[1, 4, 16, 16, 4, 64], 0.4, &dev);
+        let run = || -> Vec<Tensor> {
+            let mut out = Vec::new();
+            for dtype in [DType::F32, DType::BF16] {
+                let x = x32.to_dtype(dtype).unwrap();
+                let mut start = 0;
+                for (axis, chunk) in [(1usize, 16usize), (2, 24), (3, 24)] {
+                    let inv = rope_inv_freqs(chunk, 10_000.0, &dev).unwrap();
+                    let part = slice_axis(&x, 5, start, start + chunk).unwrap();
+                    start += chunk;
+                    out.push(rotate_axis(&part, &inv, axis).unwrap());
+                }
+            }
+            out
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (6, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 6, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
+    }
+}

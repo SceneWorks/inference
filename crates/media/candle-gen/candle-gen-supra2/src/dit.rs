@@ -31,9 +31,13 @@ fn lin(w: &candle_gen::Weights, prefix: &str, shape: [usize; 2]) -> Result<Linea
 }
 
 /// `x * (1 + scale[:, None]) + shift[:, None]`.
+/// The shared composable modulate (SW-6129); `norm` below is a composable LayerNorm chain.
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    let one = (scale.unsqueeze(1)? + 1.0)?;
-    Ok(x.broadcast_mul(&one)?.broadcast_add(&shift.unsqueeze(1)?)?)
+    Ok(candle_gen::modulate::modulate(
+        x,
+        &scale.unsqueeze(1)?,
+        &shift.unsqueeze(1)?,
+    )?)
 }
 
 /// `F.layer_norm(x, (D,), eps=1e-6)` without affine parameters (`elementwise_affine=False`).

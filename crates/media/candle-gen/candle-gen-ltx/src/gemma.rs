@@ -11,17 +11,22 @@
 //! serves every layer (only the RoPE base differs) — the window never truncates, so it is not
 //! modeled. Runs bf16; RoPE + attention compute in f32 for fidelity.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{ops::rms_norm as candle_rms_norm, ops::softmax_last_dim, VarBuilder};
 
 use crate::config::GemmaConfig;
 use crate::quant::{qembedding, qlinear, QLinear};
 use candle_gen::attention::repeat_kv;
+use candle_gen::rope::{RopeLayout, RopeSpec};
 
 /// Finite large-negative mask value (bf16 min, as f32) — used instead of -∞ so an all-masked row
 /// (a left-padding query position) softmaxes to a finite uniform vector rather than NaN. Those
 /// positions are zeroed downstream by the attention-mask multiply in the aggregator.
 const MASK_NEG: f32 = -3.389_531_4e38;
+
+/// Gemma's RoPE: NeoX rotate-half pairs over `[B, H, L, D]`, `[1, 1, L, D/2]` f32 tables, f32 math
+/// cast back — the shared `candle_gen::rope` convention (SW-6129).
+const GEMMA_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bhsd);
 
 /// `weight + 1.0` (Gemma RMSNorm scale), kept bf16.
 fn norm_alpha(vb: &VarBuilder, key: &str) -> Result<Tensor> {
@@ -110,15 +115,11 @@ impl GemmaEncoder {
     }
 
     /// NeoX rotate-half RoPE in f32: `x` `[B,H,L,D]`, `cos`/`sin` `[1,1,L,D/2]` → rotated, cast back.
+    /// The shared `candle_gen::rope::apply_rope` (SW-6129): the fused strided kernel on CUDA, and
+    /// elsewhere the shared chain, bit-identical to the `[x1·cos − x2·sin, x2·cos + x1·sin]` chain
+    /// this function carried (`rope_route_tests` pins it).
     fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let in_dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let half = x.dim(D::Minus1)? / 2;
-        let x1 = x.narrow(D::Minus1, 0, half)?;
-        let x2 = x.narrow(D::Minus1, half, half)?;
-        let o1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
-        let o2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
-        Tensor::cat(&[&o1, &o2], D::Minus1)?.to_dtype(in_dtype)
+        candle_gen::rope::apply_rope(x, cos, sin, &GEMMA_ROPE)
     }
 
     /// Build `(cos, sin)` `[1,1,L,head_dim/2]` (f32) for a given RoPE base.
@@ -528,5 +529,136 @@ mod hidden_state_pinning_tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::only_the_last_hidden_state_carries_the_final_norm");
+    }
+}
+
+/// SW-6129 route: `GemmaEncoder::apply_rope` is the shared `candle_gen::rope::apply_rope`; the
+/// former private chain is the oracle.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::D;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `GemmaEncoder::apply_rope`, verbatim.
+    fn former(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let in_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let half = x.dim(D::Minus1)? / 2;
+        let x1 = x.narrow(D::Minus1, 0, half)?;
+        let x2 = x.narrow(D::Minus1, half, half)?;
+        let o1 = (x1.broadcast_mul(cos)? - x2.broadcast_mul(sin)?)?;
+        let o2 = (x2.broadcast_mul(cos)? + x1.broadcast_mul(sin)?)?;
+        Tensor::cat(&[&o1, &o2], D::Minus1)?.to_dtype(in_dtype)
+    }
+
+    /// `GemmaEncoder::rope_tables`' `[1, 1, L, D/2]` f32 tables (same formula; no encoder needed).
+    fn tables(l: usize, d: usize, base: f64, dev: &Device) -> (Tensor, Tensor) {
+        let half = d / 2;
+        let (mut cos, mut sin) = (vec![0f32; l * half], vec![0f32; l * half]);
+        for p in 0..l {
+            for i in 0..half {
+                let theta = p as f64 * base.powf(-(2.0 * i as f64) / d as f64);
+                cos[p * half + i] = theta.cos() as f32;
+                sin[p * half + i] = theta.sin() as f32;
+            }
+        }
+        (
+            Tensor::from_vec(cos, (1, 1, l, half), dev).unwrap(),
+            Tensor::from_vec(sin, (1, 1, l, half), dev).unwrap(),
+        )
+    }
+
+    /// Bit-identical to the former chain in f32 / bf16 / f16, at Gemma-3's head_dim 256 with both
+    /// RoPE bases (local 10k, global 1M), for a contiguous `[B,H,L,D]` and a permuted view.
+    #[test]
+    fn apply_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let (l, d) = (37usize, 256usize);
+        let x32 = spread(&[2, 4, l, d], 0.3, &dev);
+        let view32 = spread(&[2, l, 4, d], 1.1, &dev);
+        for base in [10_000.0, 1_000_000.0] {
+            let (cos, sin) = tables(l, d, base, &dev);
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                for x in [
+                    x32.to_dtype(dtype).unwrap(),
+                    view32.to_dtype(dtype).unwrap().transpose(1, 2).unwrap(),
+                ] {
+                    let got = GemmaEncoder::apply_rope(&x, &cos, &sin).unwrap();
+                    let want = former(&x, &cos, &sin).unwrap();
+                    assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+                    assert_eq!(bits(&got), bits(&want), "{dtype:?} base {base}");
+                }
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: Gemma q/k RoPE (bf16, head_dim 256) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let (cos, sin) = tables(512, 256, 1_000_000.0, &dev);
+        let q = spread(&[1, 8, 512, 256], 0.3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = spread(&[1, 4, 512, 256], 0.9, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || -> Vec<Tensor> {
+            vec![
+                GemmaEncoder::apply_rope(&q, &cos, &sin).unwrap(),
+                GemmaEncoder::apply_rope(&k, &cos, &sin).unwrap(),
+            ]
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
     }
 }

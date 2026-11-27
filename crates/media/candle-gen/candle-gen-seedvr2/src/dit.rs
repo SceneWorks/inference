@@ -12,8 +12,10 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Quant;
+use candle_gen::modulate::ScaleForm;
 use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{DenseLinear, QLinear};
+use candle_gen::rope::{RopeLayout, RopeSpec};
 
 use crate::config::DitConfig;
 use crate::nn;
@@ -404,7 +406,9 @@ fn txt_freq_block(freqs: &Tensor, txt_len: usize, dev: &Device) -> Result<Tensor
     Tensor::cat(&[&a, &a, &a], 1)
 }
 
-/// rotate_half on `(..., 2k)`: pairs `(x0,x1) -> (-x1, x0)`.
+/// rotate_half on `(..., 2k)`: pairs `(x0,x1) -> (-x1, x0)` (the former private RoPE's building
+/// block, kept as the test oracle).
+#[cfg(test)]
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let sh = x.dims().to_vec();
     let l = *sh.last().unwrap();
@@ -420,21 +424,19 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 }
 
 /// apply RoPE to `t` `(N, heads, head_dim)` with `freqs` `(N, rot)` (rot ≤ head_dim).
+///
+/// Adjacent pairs with one f32 angle per lane, the first `rot` lanes, f32 math cast back: the
+/// shared `candle_gen::rope::apply_rope` (SW-6129) over `t` viewed as `[1, N, heads, head_dim]` —
+/// the fused strided kernel on CUDA, and elsewhere the shared chain, bit-identical to the
+/// `x·cos + rotate_half(x)·sin` chain + untouched tail this function carried
+/// (`rope_route_tests::apply_rope_matches_the_former_private_chain` pins it).
 fn apply_rope(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
-    let (n, _heads, hd) = t.dims3()?;
+    t.dims3()?;
     let rot = freqs.dim(1)?;
-    let t_mid = t.narrow(2, 0, rot)?; // (N,heads,rot)
-    let cosf = freqs.to_dtype(DType::F32)?.cos()?.reshape((n, 1, rot))?;
-    let sinf = freqs.to_dtype(DType::F32)?.sin()?.reshape((n, 1, rot))?;
-    let mid_f = t_mid.to_dtype(DType::F32)?;
-    let rotated = (mid_f.broadcast_mul(&cosf)? + rotate_half(&mid_f)?.broadcast_mul(&sinf)?)?
-        .to_dtype(t.dtype())?;
-    if rot < hd {
-        let right = t.narrow(2, rot, hd - rot)?;
-        Tensor::cat(&[&rotated, &right], 2)
-    } else {
-        Ok(rotated)
-    }
+    let f = freqs.to_dtype(DType::F32)?;
+    let (cos, sin) = (f.cos()?, f.sin()?); // (N, rot)
+    let spec = RopeSpec::interleaved(RopeLayout::Bshd).with_rotary_dim(rot);
+    candle_gen::rope::apply_rope(&t.unsqueeze(0)?, &cos, &sin, &spec)?.squeeze(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +479,15 @@ fn modulate_in(
     p_shift: &Tensor,
     p_scale: &Tensor,
 ) -> Result<Tensor> {
-    let shift = emb_param(emb, layer_idx, 0)?.broadcast_add(p_shift)?;
-    let scale = emb_param(emb, layer_idx, 1)?.broadcast_add(p_scale)?;
-    hidden.broadcast_mul(&scale)?.broadcast_add(&shift)
+    let shift = ada_param(emb, layer_idx, 0, p_shift)?;
+    let scale = ada_param(emb, layer_idx, 1, p_scale)?;
+    // `hidden · scale + shift`: the shared composable modulate, direct scale form (SW-6129).
+    candle_gen::modulate::modulate_with(hidden, &scale, &shift, ScaleForm::Direct)
+}
+
+/// AdaSingle parameter `emb[:, :, layer, comp] + learned` (`(B, 1, vid_dim)`).
+fn ada_param(emb: &Tensor, layer_idx: usize, comp: usize, learned: &Tensor) -> Result<Tensor> {
+    emb_param(emb, layer_idx, comp)?.broadcast_add(learned)
 }
 fn modulate_out(
     hidden: &Tensor,
@@ -487,7 +495,7 @@ fn modulate_out(
     layer_idx: usize,
     p_gate: &Tensor,
 ) -> Result<Tensor> {
-    let gate = emb_param(emb, layer_idx, 2)?.broadcast_add(p_gate)?;
+    let gate = ada_param(emb, layer_idx, 2, p_gate)?;
     hidden.broadcast_mul(&gate)
 }
 
@@ -1151,5 +1159,130 @@ mod quant_tests {
             diff, 0.0,
             "cached-ones rms_plain must match a fresh one exactly"
         );
+    }
+}
+
+/// SW-6129 route: `apply_rope` is the shared `candle_gen::rope::apply_rope`; the former private
+/// chain is the oracle.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `apply_rope`, verbatim.
+    fn former(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
+        let (n, _heads, hd) = t.dims3()?;
+        let rot = freqs.dim(1)?;
+        let t_mid = t.narrow(2, 0, rot)?; // (N,heads,rot)
+        let cosf = freqs.to_dtype(DType::F32)?.cos()?.reshape((n, 1, rot))?;
+        let sinf = freqs.to_dtype(DType::F32)?.sin()?.reshape((n, 1, rot))?;
+        let mid_f = t_mid.to_dtype(DType::F32)?;
+        let rotated = (mid_f.broadcast_mul(&cosf)? + rotate_half(&mid_f)?.broadcast_mul(&sinf)?)?
+            .to_dtype(t.dtype())?;
+        if rot < hd {
+            let right = t.narrow(2, rot, hd - rot)?;
+            Tensor::cat(&[&rotated, &right], 2)
+        } else {
+            Ok(rotated)
+        }
+    }
+
+    /// Per-lane angles like `axial_1d` (each pair's angle repeated on both lanes).
+    fn freqs(n: usize, rot: usize, dev: &Device) -> Tensor {
+        let vals: Vec<f32> = (0..n * rot)
+            .map(|i| ((i / rot) as f32 + 0.5) * 0.13 * (((i % rot) / 2) as f32 + 1.0).recip())
+            .collect();
+        Tensor::from_vec(vals, (n, rot), dev).unwrap()
+    }
+
+    /// Bit-identical to the former chain in f32 / bf16 / f16, partial (rot < head_dim) and full
+    /// rotary, f32 and bf16 frequency tables.
+    #[test]
+    fn apply_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let n = 30;
+        for (rot, hd) in [(96usize, 128usize), (64, 64)] {
+            let t32 = spread(&[n, 3, hd], 0.5, &dev);
+            for fdt in [DType::F32, DType::BF16] {
+                let f = freqs(n, rot, &dev).to_dtype(fdt).unwrap();
+                for dtype in [DType::F32, DType::BF16, DType::F16] {
+                    let t = t32.to_dtype(dtype).unwrap();
+                    let got = apply_rope(&t, &f).unwrap();
+                    let want = former(&t, &f).unwrap();
+                    assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+                    assert_eq!(
+                        bits(&got),
+                        bits(&want),
+                        "{dtype:?} rot {rot}/{hd} freqs {fdt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the window RoPE of q/k (bf16, 96 of 128 lanes rotated) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let n = 4096;
+        let f = freqs(n, 96, &dev);
+        let q = spread(&[n, 24, 128], 0.5, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = spread(&[n, 24, 128], 1.5, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run =
+            || -> Vec<Tensor> { vec![apply_rope(&q, &f).unwrap(), apply_rope(&k, &f).unwrap()] };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
     }
 }

@@ -311,10 +311,9 @@ impl WanVaceTransformer {
         let shift = head_mod.narrow(1, 0, 1)?;
         let scale = head_mod.narrow(1, 1, 1)?;
         let hf = hidden.to_dtype(DType::F32)?;
-        let normed = ln_no_affine(&hf, self.cfg.base.eps)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?
-            .to_dtype(self.dtype)?;
+        let normed =
+            candle_gen::modulate::modulate(&ln_no_affine(&hf, self.cfg.base.eps)?, &scale, &shift)?
+                .to_dtype(self.dtype)?;
         let out = self.proj_out.forward(&normed)?; // [B,L,out_c*patch]
         out.reshape(&[b, ppf, pph, ppw, pt, ph, pw, oc][..])?
             .permute(&[0usize, 7, 1, 4, 2, 5, 3, 6][..])?

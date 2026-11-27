@@ -548,9 +548,7 @@ impl AdaLayerNormOut {
             .index_select(&idx, 0)?
             .to_dtype(normed.dtype())?
             .reshape((1, seq, self.hidden_size))?;
-        Ok(normed
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?)
+        Ok(candle_gen::modulate::modulate(&normed, &scale, &shift)?)
     }
 
     /// Recover the per-row **timestep** index from the per-row **AdaLN** index the block stack uses.
