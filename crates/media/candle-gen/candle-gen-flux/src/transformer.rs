@@ -53,6 +53,31 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
 }
 
+/// FLUX's parameter-free `LayerNorm(elementwise_affine=False)` (a candle_nn `LayerNorm` without a
+/// bias whose weight is the all-ones constant [`layer_norm`] / the control branch build) followed by
+/// the AdaLN modulation `· (1 + scale) + shift` — the shared fused AdaLN (SW-6129).
+///
+/// candle_nn runs a bias-less LayerNorm as its composable chain (`to_dtype(f32)`, `sum_keepdim / n`,
+/// sub, `sqr`, `sum_keepdim / n`, `+ eps`, `sqrt`, div, cast back, `· weight`), which is
+/// `AdaLnChain::layer(eps)` exactly (the `· ones` is an exact identity), so this is one launch on
+/// CUDA and that very chain elsewhere. A norm outside that form (or a dtype the chain does not
+/// upcast) keeps `apply` + the composable modulate.
+pub(crate) fn ln_modulate(
+    norm: &LayerNorm,
+    x: &Tensor,
+    scale: &Tensor,
+    shift: &Tensor,
+) -> Result<Tensor> {
+    if norm.remove_mean()
+        && norm.bias().is_none()
+        && matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    {
+        let spec = candle_gen::modulate::AdaLnChain::layer(norm.eps());
+        return __model_proof_output!(candle_gen::modulate::adaln_chain(x, &spec, scale, shift));
+    }
+    candle_gen::modulate::modulate(&__model_proof_output!(x.apply(norm))?, scale, shift)
+}
+
 /// i32-overflow-safe SDPA over an N-D `q`/`k`/`v` (leading dims folded to a single batch). Flattens the
 /// leading dims to `[N, Sq, D]`, delegates the budgeted query-row chunking to the shared
 /// [`candle_gen::sdpa_budgeted_flat`] (sc-9570) — which chunks once the `[N,Sq,Sk]` scores tensor would
@@ -493,8 +518,9 @@ struct ModulationOut {
 }
 
 impl ModulationOut {
-    fn scale_shift(&self, input: &Tensor) -> Result<Tensor> {
-        candle_gen::modulate::modulate(input, &self.scale, &self.shift)
+    /// `norm(input) · (1 + scale) + shift` through the shared fused AdaLN ([`ln_modulate`]).
+    fn norm_scale_shift(&self, norm: &LayerNorm, input: &Tensor) -> Result<Tensor> {
+        ln_modulate(norm, input, &self.scale, &self.shift)
     }
 
     fn gate(&self, input: &Tensor) -> Result<Tensor> {
@@ -728,8 +754,8 @@ impl DoubleStream {
     }
 
     fn qkv(&self, input: &Tensor, modulation: &ModulationOut, dims: Dims) -> Result<QueryKeyValue> {
-        let normed = __model_proof_output!(input.apply(&self.before_attention))?;
-        self.attention.qkv(&modulation.scale_shift(&normed)?, dims)
+        let normed = modulation.norm_scale_shift(&self.before_attention, input)?;
+        self.attention.qkv(&normed, dims)
     }
 
     fn finish(
@@ -741,8 +767,8 @@ impl DoubleStream {
     ) -> Result<Tensor> {
         let attention = self.attention.output.forward(attention)?;
         let hidden = (input + attention_mod.gate(&attention)?)?;
-        let normed = __model_proof_output!(hidden.apply(&self.before_mlp))?;
-        let hidden_mlp = self.first.forward(&mlp_mod.scale_shift(&normed)?)?;
+        let normed = mlp_mod.norm_scale_shift(&self.before_mlp, &hidden)?;
+        let hidden_mlp = self.first.forward(&normed)?;
         let activated = if self.erf_gelu {
             hidden_mlp.gelu_erf()?
         } else {
@@ -951,8 +977,7 @@ impl SingleStreamBlock {
         pag_text_len: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
         let [modulation] = modulation(&self.modulation, embedding)?;
-        let normed =
-            modulation.scale_shift(&__model_proof_output!(hidden.apply(&self.pre_norm))?)?;
+        let normed = modulation.norm_scale_shift(&self.pre_norm, hidden)?;
         let ((q, k, v), mlp) = match &self.input {
             SingleInput::Fused(projection) => {
                 let projected = projection.forward(&normed)?;
@@ -1037,8 +1062,9 @@ impl OutputHead {
             Layout::Bfl => (&params[0], &params[1]),
             Layout::Diffusers => (&params[1], &params[0]),
         };
-        let normalized = candle_gen::modulate::modulate(
-            &__model_proof_output!(hidden.apply(&self.norm))?,
+        let normalized = ln_modulate(
+            &self.norm,
+            hidden,
             &scale.unsqueeze(1)?,
             &shift.unsqueeze(1)?,
         )?;
@@ -3649,6 +3675,123 @@ mod sw6129_rope_route_tests {
         let (f, r) = (bits(&fused), bits(&reference));
         let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
         println!("flux apply_rope (bf16, freqs_cis matrix, [1,24,4608,128]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: FLUX's parameter-free LayerNorm + AdaLN modulation is the shared fused composable-chain
+/// AdaLN ([`ln_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The norm FLUX builds (`layer_norm`): candle_nn LayerNorm, no bias, all-ones weight, 1e-6.
+    fn flux_norm(d: usize, dtype: DType, device: &Device) -> LayerNorm {
+        LayerNorm::new_no_bias(Tensor::ones(d, dtype, device).unwrap(), 1e-6)
+    }
+
+    /// The former site, verbatim: `x.apply(norm)` then the composable modulate.
+    fn former(norm: &LayerNorm, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Tensor {
+        let normed = x.apply(norm).unwrap();
+        candle_gen::modulate::modulate(&normed, scale, shift).unwrap()
+    }
+
+    /// CPU: bit-identical to `apply(LayerNorm) + modulate` in f32 / bf16 / f16 at FLUX's hidden
+    /// 3072, per-sample `[B, 1, D]` modulation (blocks and the AdaLN-continuous output head).
+    #[test]
+    fn ln_modulate_matches_the_former_layer_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let x32 = values(&[2, 24, d], 3, 3.0, 0.4, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let norm = flux_norm(d, dtype, &dev);
+            let x = x32.to_dtype(dtype).unwrap();
+            let scale = values(&[2, 1, d], 5, 0.5, 0.0, &dev)
+                .to_dtype(dtype)
+                .unwrap();
+            let shift = values(&[2, 1, d], 7, 0.5, 0.0, &dev)
+                .to_dtype(dtype)
+                .unwrap();
+            let got = ln_modulate(&norm, &x, &scale, &shift).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(
+                bits(&got),
+                bits(&former(&norm, &x, &scale, &shift)),
+                "{dtype:?}"
+            );
+        }
+    }
+
+    /// SW-6129 CUDA smoke: FLUX.1 `ln_modulate` (bf16, the 1024^2 joint `[1, 4608, 3072]` stream
+    /// and the image-only `[1, 4096, 3072]` output head) takes the fused AdaLN (every call counted
+    /// `fused`) and is bit-identical to the same calls with the kernel switch off (the chain).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let d = 3072;
+        let norm = flux_norm(d, DType::BF16, &dev);
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let joint = bf(values(&[1, 512 + 4096, d], 11, 3.0, 0.3, &dev));
+        let image = bf(values(&[1, 4096, d], 12, 3.0, 0.3, &dev));
+        let scale = bf(values(&[1, 1, d], 13, 0.5, 0.0, &dev));
+        let shift = bf(values(&[1, 1, d], 14, 0.5, 0.0, &dev));
+        let run = || {
+            let a = ln_modulate(&norm, &joint, &scale, &shift).unwrap();
+            let b = ln_modulate(&norm, &image, &scale, &shift).unwrap();
+            Tensor::cat(&[&a, &b], 1).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "flux ln_modulate (bf16, [1,4608,3072] + [1,4096,3072]): {mismatches} of {} elements \
+             differ; on {on}, off {off}",
+            f.len()
+        );
         assert_eq!(mismatches, 0);
     }
 }

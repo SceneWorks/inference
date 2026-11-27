@@ -296,6 +296,63 @@ impl Norm {
             .to_dtype(dtype)?
             .broadcast_mul(&self.0.to_dtype(dtype)?)?)
     }
+
+    /// The dtype [`Norm::forward`] returns for an `x` of `x_dtype` (f32 when `x` or the weight is).
+    fn out_dtype(&self, x_dtype: DType) -> DType {
+        if x_dtype == DType::F32 || self.0.dtype() == DType::F32 {
+            DType::F32
+        } else {
+            x_dtype
+        }
+    }
+
+    /// `modulate(forward(x).to_dtype(m), scale.to_dtype(m), shift.to_dtype(m)).to_dtype(out)` —
+    /// this RMSNorm then the AdaLN modulation in the promoted dtype `m` — through the shared fused
+    /// AdaLN (SW-6129). The untracked inference norm is `normalize_composable` (f32
+    /// `sum_keepdim / width`, `+ eps`, `sqrt`, then `/ rms` under `reference_math()` else
+    /// `* recip(rms)`), cast to `x`'s dtype, cast to the weight-promoted dtype, `· weight` there:
+    /// `AdaLnChain::rms` / `rms_recip(1e-6).cast_through(x).with_post_weight(w)` op for op, then
+    /// modulated in `m` and cast to `out`. The comparison / legacy-E1 arms, a graph-retaining
+    /// backward, or any gradient-tracked operand keep [`Norm::forward`] and the composable modulate.
+    fn norm_modulate(
+        &self,
+        x: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        m: DType,
+        out: DType,
+    ) -> Result<Tensor> {
+        let composable = candle_gen::train::policy::legacy_e1()
+            || candle_gen::train::comparison::active_stage().is_some()
+            || candle_gen::candle_core::backprop::grad_do_not_detach()
+            || [x, &self.0, scale, shift].iter().any(|t| t.track_op());
+        if composable {
+            return Ok(candle_gen::modulate::modulate(
+                &self.forward(x)?.to_dtype(m)?,
+                &scale.to_dtype(m)?,
+                &shift.to_dtype(m)?,
+            )?
+            .to_dtype(out)?);
+        }
+        use candle_gen::modulate::{adaln_chain, AdaLnChain};
+        let weight = self.0.to_dtype(self.out_dtype(x.dtype()))?;
+        let norm = if candle_gen::train::profile::reference_math() {
+            AdaLnChain::rms(1e-6)
+        } else {
+            AdaLnChain::rms_recip(1e-6)
+        };
+        let spec = norm
+            .cast_through(x.dtype())
+            .with_post_weight(&weight)
+            .modulate_in(m)
+            .output(out);
+        Ok(adaln_chain(
+            x,
+            &spec,
+            &scale.to_dtype(m)?,
+            &shift.to_dtype(m)?,
+        )?)
+    }
 }
 pub(crate) fn situ(hidden: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let a = ((gate / 4.0)?.tanh()? * 4.0)?;
@@ -592,12 +649,9 @@ impl Block {
         } else {
             x.dtype()
         };
-        let y = candle_gen::modulate::modulate(
-            &self.n1.forward(x)?.to_dtype(dtype)?,
-            &part(1)?.to_dtype(dtype)?,
-            &part(0)?.to_dtype(dtype)?,
-        )?
-        .to_dtype(self.q.dtype())?;
+        let y = self
+            .n1
+            .norm_modulate(x, &part(1)?, &part(0)?, dtype, self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
         let (q, k, v) = if let Some(pack) = &self.projection_pack {
             candle_gen::train::profile::cohort_reuse("moss:frozen-projection-pack");
@@ -642,14 +696,10 @@ impl Block {
             .broadcast_mul(&part(2)?.to_dtype(dtype)?)?;
         let dtype = promoted(x.dtype(), residual.dtype());
         let x = x.to_dtype(dtype)?.add(&residual.to_dtype(dtype)?)?;
-        let normalized = self.n2.forward(&x)?;
-        let dtype = promoted(normalized.dtype(), m.dtype());
-        let y = candle_gen::modulate::modulate(
-            &normalized.to_dtype(dtype)?,
-            &part(4)?.to_dtype(dtype)?,
-            &part(3)?.to_dtype(dtype)?,
-        )?
-        .to_dtype(self.q.dtype())?;
+        let dtype = promoted(self.n2.out_dtype(x.dtype()), m.dtype());
+        let y = self
+            .n2
+            .norm_modulate(&x, &part(4)?, &part(3)?, dtype, self.q.dtype())?;
         let hg = self.up_gate.forward(&y)?;
         let f = hg.dim(2)? / 2;
         let residual = self
@@ -1344,18 +1394,19 @@ impl Transformer {
                     check_cancel(cancel)?;
                 }
             }
-            let y = self
-                .norm
-                .forward(&y.narrow(1, 0, video_len)?.to_dtype(self.norm.0.dtype())?)?;
-            let dtype = if y.dtype() == DType::F32 || head.dtype() == DType::F32 {
+            let y = y.narrow(1, 0, video_len)?.to_dtype(self.norm.0.dtype())?;
+            let normed = self.norm.out_dtype(y.dtype());
+            let dtype = if normed == DType::F32 || head.dtype() == DType::F32 {
                 DType::F32
             } else {
-                y.dtype()
+                normed
             };
-            let y = candle_gen::modulate::modulate(
-                &y.to_dtype(dtype)?,
-                &head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)?,
-                &head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?,
+            let y = self.norm.norm_modulate(
+                &y,
+                &head.i((.., 1, ..))?.unsqueeze(1)?,
+                &head.i((.., 0, ..))?.unsqueeze(1)?,
+                dtype,
+                dtype,
             )?;
             result.push(
                 self.final_linear
@@ -1716,5 +1767,142 @@ mod sw6129_rope_route_tests {
         let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
         println!("moss-image rotate (bf16, [sin|cos] table): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
         assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: the MOSS-Image RMSNorm + AdaLN sites are the shared fused composable-chain AdaLN
+/// ([`Norm::norm_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// The former site, verbatim: `Norm::forward`, the promotion casts, the composable modulate.
+    fn former(
+        n: &Norm,
+        x: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        m: DType,
+        out: DType,
+    ) -> Tensor {
+        candle_gen::modulate::modulate(
+            &n.forward(x).unwrap().to_dtype(m).unwrap(),
+            &scale.to_dtype(m).unwrap(),
+            &shift.to_dtype(m).unwrap(),
+        )
+        .unwrap()
+        .to_dtype(out)
+        .unwrap()
+    }
+
+    /// CPU: bit-identical to the former norm + modulate for f32 / bf16 / f16 streams, bf16 and f32
+    /// ("FP32 island") norm weights, f32 / activation-dtype modulation and an output cast, D 3072.
+    #[test]
+    fn norm_modulate_matches_the_former_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        let w32 = values(&[d], 4, 0.5, 1.0, &dev);
+        for xd in [DType::F32, DType::BF16, DType::F16] {
+            for wd in [DType::F32, xd] {
+                let n = Norm(w32.to_dtype(wd).unwrap());
+                let x = x32.to_dtype(xd).unwrap();
+                for md in [n.out_dtype(xd), DType::F32] {
+                    let scale = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
+                    let shift = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
+                    for out in [md, xd] {
+                        let got = n.norm_modulate(&x, &scale, &shift, md, out).unwrap();
+                        let want = former(&n, &x, &scale, &shift, md, out);
+                        assert_eq!(got.dtype(), want.dtype());
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "x {xd:?} w {wd:?} m {md:?} o {out:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: MOSS-Image `norm_modulate` (bf16 `[1, 4352, 3072]`, a bf16 norm weight
+    /// and an f32 "FP32 island" weight, bf16 modulation rows, bf16 output) is fused (2 calls) and
+    /// bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let x = bf(values(&[1, 4352, d], 11, 3.0, 0.3, &dev));
+        let w = values(&[d], 12, 0.5, 1.0, &dev);
+        let (n_bf, n_f32) = (Norm(bf(w.clone())), Norm(w));
+        let scale = bf(values(&[1, 1, d], 13, 0.5, 0.0, &dev));
+        let shift = bf(values(&[1, 1, d], 14, 0.5, 0.0, &dev));
+        assert_fused_and_bit_identical(
+            "moss norm_modulate (bf16 [1,4352,3072], bf16 + f32 weight)",
+            2,
+            &|| {
+                let a = n_bf.norm_modulate(&x, &scale, &shift, DType::BF16, DType::BF16);
+                let b = n_f32.norm_modulate(&x, &scale, &shift, DType::F32, DType::BF16);
+                Tensor::cat(&[&a.unwrap(), &b.unwrap()], 1).unwrap()
+            },
+        );
     }
 }

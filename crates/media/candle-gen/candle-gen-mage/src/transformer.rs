@@ -71,6 +71,7 @@ fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     candle_gen::train::norm::rms_norm_diff(x, &weight.to_dtype(DType::F32)?, NORM_EPS)
 }
 
+#[cfg(test)]
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?;
     let mean = xf.mean_keepdim(D::Minus1)?;
@@ -85,8 +86,18 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
 
 /// `x · (1 + scale) + shift` — the shared composable modulate (SW-6129) in this crate's
 /// `(shift, scale)` argument order.
+#[cfg(test)]
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
     candle_gen::modulate::modulate(x, scale, shift)
+}
+
+/// `layer_norm(x) · (1 + scale) + shift`, in this crate's `(shift, scale)` order — the shared fused
+/// AdaLN (SW-6129). `layer_norm` is the f32 `mean_keepdim` / sub / `sqr` / `mean_keepdim` /
+/// `affine(1, eps)` / `sqrt` / div chain cast back to `x`'s dtype, i.e. `AdaLnChain::layer(NORM_EPS)`
+/// op for op (`affine(1, eps)` is `+ eps`); the modulation runs in `x`'s dtype as before.
+fn ln_modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(NORM_EPS);
+    candle_gen::modulate::adaln_chain(x, &spec, scale, shift)
 }
 
 struct TimestepEmbedder {
@@ -539,8 +550,8 @@ impl Block {
         let text_ids = Tensor::from_vec(text_ids, layout.text_tokens(), text.device())?;
         let (im1, im2) = Self::mods(&self.image_mod, temb, &image_ids, layout.image_tokens())?;
         let (tx1, tx2) = Self::mods(&self.text_mod, temb, &text_ids, layout.text_tokens())?;
-        let imn = modulate(&layer_norm(&image)?, &im1.shift, &im1.scale)?;
-        let txn = modulate(&layer_norm(&text)?, &tx1.shift, &tx1.scale)?;
+        let imn = ln_modulate(&image, &im1.shift, &im1.scale)?;
+        let txn = ln_modulate(&text, &tx1.shift, &tx1.scale)?;
         let (ia, ta) = self.attention.forward_with_memory(
             &imn,
             &txn,
@@ -551,12 +562,12 @@ impl Block {
         )?;
         let image = (&image + ia.broadcast_mul(&im1.gate)?)?;
         let text = (&text + ta.broadcast_mul(&tx1.gate)?)?;
-        let iff =
-            self.image_ff
-                .forward(&modulate(&layer_norm(&image)?, &im2.shift, &im2.scale)?)?;
+        let iff = self
+            .image_ff
+            .forward(&ln_modulate(&image, &im2.shift, &im2.scale)?)?;
         let tff = self
             .text_ff
-            .forward(&modulate(&layer_norm(&text)?, &tx2.shift, &tx2.scale)?)?;
+            .forward(&ln_modulate(&text, &tx2.shift, &tx2.scale)?)?;
         Ok((
             (&image + iff.broadcast_mul(&im2.gate)?)?,
             (&text + tff.broadcast_mul(&tx2.gate)?)?,
@@ -1114,8 +1125,7 @@ impl MageTransformer {
             .contiguous()?
             .index_select(&ids, 0)?
             .reshape((1, layout.image_tokens(), dim))?;
-        self.output
-            .forward(&modulate(&layer_norm(&image)?, &shift, &scale)?)
+        self.output.forward(&ln_modulate(&image, &shift, &scale)?)
     }
 }
 
@@ -1250,5 +1260,117 @@ mod tests {
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_streamed_projection_loads_prepared_device_format_sidecar");
         Ok(())
+    }
+}
+
+/// SW-6129: the Mage DiT AdaLN sites are the shared fused composable-chain AdaLN.
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// CPU: bit-identical to the former `modulate(&layer_norm(x)?, shift, scale)` for f32 / bf16 /
+    /// f16 at hidden 3072 with per-token `[1, T, D]` (segment-gathered) modulation.
+    #[test]
+    fn ln_modulate_matches_the_former_layer_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = crate::config::HIDDEN_SIZE;
+        let x32 = values(&[1, 24, d], 3, 3.0, 0.4, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let shift = values(&[1, 24, d], 5, 0.5, 0.0, &dev)
+                .to_dtype(dtype)
+                .unwrap();
+            let scale = values(&[1, 24, d], 7, 0.5, 0.0, &dev)
+                .to_dtype(dtype)
+                .unwrap();
+            let want = modulate(&layer_norm(&x).unwrap(), &shift, &scale).unwrap();
+            let got = ln_modulate(&x, &shift, &scale).unwrap();
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: Mage `ln_modulate` (bf16, 1024^2: 4096 image tokens and 512 text tokens,
+    /// per-token modulation) is fused (2 calls) and bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = crate::config::HIDDEN_SIZE;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let image = bf(values(&[1, 4096, d], 11, 3.0, 0.3, &dev));
+        let text = bf(values(&[1, 512, d], 12, 3.0, 0.3, &dev));
+        let mi = (
+            bf(values(&[1, 4096, d], 13, 0.5, 0.0, &dev)),
+            bf(values(&[1, 4096, d], 14, 0.5, 0.0, &dev)),
+        );
+        let mt = (
+            bf(values(&[1, 512, d], 15, 0.5, 0.0, &dev)),
+            bf(values(&[1, 512, d], 16, 0.5, 0.0, &dev)),
+        );
+        assert_fused_and_bit_identical(
+            "mage ln_modulate (bf16, [1,4096,3072] + [1,512,3072], per-token)",
+            2,
+            &|| {
+                let a = ln_modulate(&image, &mi.0, &mi.1).unwrap();
+                let b = ln_modulate(&text, &mt.0, &mt.1).unwrap();
+                Tensor::cat(&[&a, &b], 1).unwrap()
+            },
+        );
     }
 }

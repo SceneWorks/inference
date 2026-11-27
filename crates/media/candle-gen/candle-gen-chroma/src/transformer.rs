@@ -44,7 +44,9 @@ const MAX_PERIOD: f64 = 10000.0;
 
 // ============================ leaf helpers ============================
 
-/// Affine-free LayerNorm over the last axis (eps 1e-6), in f32.
+/// Affine-free LayerNorm over the last axis (eps 1e-6), in f32 — the chain [`ln_modulate`] fuses
+/// (kept as its parity oracle).
+#[cfg(test)]
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
     let mean = x.mean_keepdim(D::Minus1)?;
@@ -54,8 +56,18 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
 }
 
 // adaLN affine `normed·(1+scale) + shift`, broadcasting modulation `[B,1,D]` over `[B,S,D]`: the
-// shared composable modulate (SW-6129), the exact body of the private copy it replaces.
+// shared composable modulate (SW-6129), the exact body of the private copy it replaced.
+#[cfg(test)]
 use candle_gen::modulate::modulate;
+
+/// Chroma's AdaLN `LayerNorm(x) · (1 + scale) + shift` — affine-free f32 LayerNorm (eps 1e-6:
+/// `to_dtype(f32)`, `mean_keepdim`, sub, `sqr`, `mean_keepdim`, `+ eps`, `sqrt`, div, no cast back)
+/// modulated in f32 — through the shared fused AdaLN (SW-6129): `AdaLnChain::layer` with the
+/// modulation in f32 is that chain op for op, one launch on CUDA, the chain itself elsewhere.
+fn ln_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(LN_EPS).modulate_in(DType::F32);
+    candle_gen::modulate::adaln_chain(x, &spec, scale, shift)
+}
 
 /// `x + gate·y`, broadcasting gate `[B,1,D]` over `[B,S,D]`.
 fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
@@ -410,19 +422,19 @@ impl DoubleBlock {
         temb: &Tensor,
         rope: &RopeTable,
     ) -> Result<(Tensor, Tensor)> {
-        let norm_hidden = modulate(&layer_norm(hidden)?, &row(temb, 1)?, &row(temb, 0)?)?;
-        let norm_encoder = modulate(&layer_norm(encoder)?, &row(temb, 7)?, &row(temb, 6)?)?;
+        let norm_hidden = ln_modulate(hidden, &row(temb, 1)?, &row(temb, 0)?)?;
+        let norm_encoder = ln_modulate(encoder, &row(temb, 7)?, &row(temb, 6)?)?;
 
         let (attn_img, attn_txt) = self.attn.forward(&norm_hidden, &norm_encoder, rope)?;
 
         // image stream.
         let hidden = gated(hidden, &row(temb, 2)?, &attn_img)?;
-        let nh = modulate(&layer_norm(&hidden)?, &row(temb, 4)?, &row(temb, 3)?)?;
+        let nh = ln_modulate(&hidden, &row(temb, 4)?, &row(temb, 3)?)?;
         let hidden = gated(&hidden, &row(temb, 5)?, &self.ff.forward(&nh)?)?;
 
         // text stream.
         let encoder = gated(encoder, &row(temb, 8)?, &attn_txt)?;
-        let ne = modulate(&layer_norm(&encoder)?, &row(temb, 10)?, &row(temb, 9)?)?;
+        let ne = ln_modulate(&encoder, &row(temb, 10)?, &row(temb, 9)?)?;
         let encoder = gated(&encoder, &row(temb, 11)?, &self.ff_context.forward(&ne)?)?;
 
         Ok((encoder, hidden))
@@ -524,7 +536,7 @@ impl SingleBlock {
     /// `temb` is the 3-row modulation slice `[B,3,inner]` (shift, scale, gate). `hidden` is the joint
     /// `[text|image]` stream.
     fn forward(&self, hidden: &Tensor, temb: &Tensor, rope: &RopeTable) -> Result<Tensor> {
-        let norm_hidden = modulate(&layer_norm(hidden)?, &row(temb, 1)?, &row(temb, 0)?)?;
+        let norm_hidden = ln_modulate(hidden, &row(temb, 1)?, &row(temb, 0)?)?;
         let mlp = self.proj_mlp.forward(&norm_hidden)?.gelu()?;
         let attn = self.attn.forward(&norm_hidden, rope)?;
         let proj = self
@@ -670,7 +682,7 @@ impl ChromaTransformer {
         let hidden = joint.narrow(1, st, si)?;
         let n = self.cfg.mod_index_len();
         let no = rows(pooled, n - 2, 2)?;
-        let hidden = modulate(&layer_norm(&hidden)?, &row(&no, 1)?, &row(&no, 0)?)?;
+        let hidden = ln_modulate(&hidden, &row(&no, 1)?, &row(&no, 0)?)?;
         self.proj_out.forward(&hidden)
     }
 }
@@ -757,5 +769,106 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(r2, vec![4.0, 5.0]);
+    }
+}
+
+/// SW-6129: Chroma's AdaLN sites are the shared fused composable-chain AdaLN ([`ln_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// CPU: bit-identical to the former `modulate(&layer_norm(x)?, row, row)` (f32 modulation, the
+    /// strided `[B, 1, D]` rows of the `[B, 12, D]` table) for an f32 / bf16 / f16 stream, D 3072.
+    #[test]
+    fn ln_modulate_matches_the_former_layer_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        let temb = values(&[2, 12, d], 5, 0.5, 0.0, &dev);
+        let (scale, shift) = (row(&temb, 1).unwrap(), row(&temb, 0).unwrap());
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let want = modulate(&layer_norm(&x).unwrap(), &scale, &shift).unwrap();
+            let got = ln_modulate(&x, &scale, &shift).unwrap();
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: Chroma `ln_modulate` in f32 (the DiT's compute dtype) at 1024^2 (the
+    /// joint `[1, 4608, 3072]` stream, strided `[1, 12, 3072]` modulation rows) and the image-only
+    /// output head is fused (2 calls) and bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let joint = values(&[1, 512 + 4096, d], 11, 3.0, 0.3, &dev);
+        let image = values(&[1, 4096, d], 12, 3.0, 0.3, &dev);
+        let temb = values(&[1, 12, d], 13, 0.5, 0.0, &dev);
+        assert_fused_and_bit_identical(
+            "chroma ln_modulate (f32, [1,4608,3072] + [1,4096,3072])",
+            2,
+            &|| {
+                let a = ln_modulate(&joint, &row(&temb, 1).unwrap(), &row(&temb, 0).unwrap());
+                let b = ln_modulate(&image, &row(&temb, 4).unwrap(), &row(&temb, 3).unwrap());
+                Tensor::cat(&[&a.unwrap(), &b.unwrap()], 1).unwrap()
+            },
+        );
     }
 }

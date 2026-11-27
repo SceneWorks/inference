@@ -972,6 +972,34 @@ impl RmsNorm {
             self.eps,
         )?))
     }
+
+    /// `modulate(self.forward(x), shift, scale)` — this RMSNorm then the AdaLN modulation — through
+    /// the shared fused AdaLN (SW-6129) wherever [`RmsNorm::forward`] takes candle's fused
+    /// `rms_norm` (f32 copy of `x`, f32 weight, f32 out): `AdaLn::rms(eps).with_weight(w)` on that
+    /// f32 copy is the same op, and [`modulate`]'s two forms map exactly — f32 modulation as
+    /// `(1 + scale)`, a mixed-dtype one as its torch promotion (`1 + scale` rounded in the scale's
+    /// dtype, promoted with the shift to f32) entering as a direct scale. One launch on CUDA, those
+    /// ops elsewhere. Under autograd or a forced-composable region the composable norm keeps
+    /// running, unchanged.
+    pub fn rms_modulate(&self, x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        let xf = to(x, DType::F32)?.contiguous()?;
+        if xf.track_op() || self.weight.track_op() || composable_forced() || xf.rank() != 3 {
+            return modulate(&self.forward(x)?, shift, scale);
+        }
+        use candle_gen::modulate::{adaln, AdaLn};
+        let spec = AdaLn::rms(self.eps as f64).with_weight(&self.weight);
+        if scale.dtype() == DType::F32 && shift.dtype() == DType::F32 {
+            return Ok(__model_proof_output!(adaln(&xf, &spec, scale, shift))?);
+        }
+        let one_plus = to(&(scale + 1.0)?, DType::F32)?;
+        let shift = to(shift, DType::F32)?;
+        Ok(__model_proof_output!(adaln(
+            &xf,
+            &spec.direct_scale(),
+            &one_plus,
+            &shift
+        ))?)
+    }
 }
 
 thread_local! {
@@ -1838,5 +1866,127 @@ mod sw6129_rope_route_tests {
         let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
         println!("iris Rope::apply (bf16, 2-D grid + 1-D text tables): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
         assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: the Iris DiT RMSNorm + AdaLN sites are the shared fused AdaLN
+/// ([`RmsNorm::rms_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    fn norm(d: usize, device: &Device) -> RmsNorm {
+        RmsNorm {
+            weight: values(&[d], 9, 0.5, 1.0, device),
+            eps: 1e-6,
+        }
+    }
+
+    /// CPU: `rms_modulate` is bit-identical to the former `modulate(norm.forward(x), shift,
+    /// scale)` for f32 / bf16 / f16 `x` and both modulation forms (f32, and a bf16 table taking the
+    /// torch promotion), at hidden 3072.
+    #[test]
+    fn rms_modulate_matches_the_former_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let n = norm(d, &dev);
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        for xd in [DType::F32, DType::BF16, DType::F16] {
+            for md in [DType::F32, DType::BF16] {
+                let x = x32.to_dtype(xd).unwrap();
+                let shift = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                let scale = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                let want = modulate(&n.forward(&x).unwrap(), &shift, &scale).unwrap();
+                let got = n.rms_modulate(&x, &shift, &scale).unwrap();
+                assert_eq!(got.dtype(), want.dtype());
+                assert_eq!(bits(&got), bits(&want), "x {xd:?} mod {md:?}");
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: Iris `rms_modulate` (bf16 `[1, 4352, 3072]` stream, f32 and bf16
+    /// modulation rows) is fused (2 calls) and bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let n = norm(d, &dev);
+        let x = values(&[1, 4352, d], 11, 3.0, 0.3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let m32 = (
+            values(&[1, 1, d], 12, 0.5, 0.0, &dev),
+            values(&[1, 1, d], 13, 0.5, 0.0, &dev),
+        );
+        let mbf = (
+            m32.0.to_dtype(DType::BF16).unwrap(),
+            m32.1.to_dtype(DType::BF16).unwrap(),
+        );
+        assert_fused_and_bit_identical(
+            "iris rms_modulate (bf16 [1,4352,3072], f32 + bf16 rows)",
+            2,
+            &|| {
+                let a = n.rms_modulate(&x, &m32.0, &m32.1).unwrap();
+                let b = n.rms_modulate(&x, &mbf.0, &mbf.1).unwrap();
+                Tensor::cat(&[&a, &b], 1).unwrap()
+            },
+        );
     }
 }

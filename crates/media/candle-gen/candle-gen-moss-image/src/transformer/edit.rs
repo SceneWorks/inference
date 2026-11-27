@@ -110,14 +110,10 @@ fn promoted_dtype(a: DType, b: DType) -> DType {
 impl Block {
     fn edit_qkv(&self, x: &Tensor, rope: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let part = |i| m.i((.., i, ..))?.unsqueeze(1);
-        let norm1 = self.n1.forward(x)?;
-        let dtype = promoted_dtype(norm1.dtype(), m.dtype());
-        let y = candle_gen::modulate::modulate(
-            &norm1.to_dtype(dtype)?,
-            &part(1)?.to_dtype(dtype)?,
-            &part(0)?.to_dtype(dtype)?,
-        )?
-        .to_dtype(self.q.dtype())?;
+        let dtype = promoted_dtype(self.n1.out_dtype(x.dtype()), m.dtype());
+        let y = self
+            .n1
+            .norm_modulate(x, &part(1)?, &part(0)?, dtype, self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
         let shape = (b, s, self.heads, d / self.heads);
         let q = self.qn.forward(&self.q.forward(&y)?.reshape(shape)?)?;
@@ -141,14 +137,10 @@ impl Block {
         let x = x
             .to_dtype(x_dtype)?
             .add(&attn_residual.to_dtype(x_dtype)?)?;
-        let norm2 = self.n2.forward(&x)?;
-        let dtype = promoted_dtype(norm2.dtype(), m.dtype());
-        let y = candle_gen::modulate::modulate(
-            &norm2.to_dtype(dtype)?,
-            &part(4)?.to_dtype(dtype)?,
-            &part(3)?.to_dtype(dtype)?,
-        )?
-        .to_dtype(self.q.dtype())?;
+        let dtype = promoted_dtype(self.n2.out_dtype(x.dtype()), m.dtype());
+        let y = self
+            .n2
+            .norm_modulate(&x, &part(4)?, &part(3)?, dtype, self.q.dtype())?;
         let hg = self.up_gate.forward(&y)?;
         let f = hg.dim(2)? / 2;
         let y = self
@@ -456,16 +448,16 @@ impl Transformer {
                 cancel,
             )?;
         }
-        let norm_out = self.norm.forward(
-            &body
-                .narrow(1, text_len, h * w)?
-                .to_dtype(self.norm.0.dtype())?,
-        )?;
-        let head_dtype = promoted_dtype(norm_out.dtype(), head.dtype());
-        let output = candle_gen::modulate::modulate(
-            &norm_out.to_dtype(head_dtype)?,
-            &head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(head_dtype)?,
-            &head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(head_dtype)?,
+        let body = body
+            .narrow(1, text_len, h * w)?
+            .to_dtype(self.norm.0.dtype())?;
+        let head_dtype = promoted_dtype(self.norm.out_dtype(body.dtype()), head.dtype());
+        let output = self.norm.norm_modulate(
+            &body,
+            &head.i((.., 1, ..))?.unsqueeze(1)?,
+            &head.i((.., 0, ..))?.unsqueeze(1)?,
+            head_dtype,
+            head_dtype,
         )?;
         let output = self
             .final_linear
