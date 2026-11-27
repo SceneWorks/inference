@@ -2219,12 +2219,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
 }
 
-/// Construct a lazy candle Krea 2 **Raw** generator (`krea_2_raw`, sc-9994 / epic 9992). Identical
-/// snapshot assembly to [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout
-/// (only distilled-vs-base DiT weights differ), so one `build` serves both — but stores the CFG-capable
-/// [`raw_descriptor`] so `generate` runs the full-CFG [`pipeline::render_base`] path. Accepts the same
-/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; ConvRot supports low-rank adapters but still
-/// rejects PiD, while ControlNet/IP overlays remain outside this registered base generator.
 /// [`load`] (Krea 2 **Turbo**) with explicit [`KreaEngineOptions`] — the opt-in surface for the
 /// INT8 QK attention engine option (SW-6131). `KreaEngineOptions::default()` is exactly [`load`].
 pub fn load_with_options(
@@ -2234,6 +2228,12 @@ pub fn load_with_options(
     build_with_options(spec, descriptor(), options)
 }
 
+/// Construct a lazy candle Krea 2 **Raw** generator (`krea_2_raw`, sc-9994 / epic 9992). Identical
+/// snapshot assembly to [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout
+/// (only distilled-vs-base DiT weights differ), so one `build` serves both — but stores the CFG-capable
+/// [`raw_descriptor`] so `generate` runs the full-CFG [`pipeline::render_base`] path. Accepts the same
+/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; ConvRot supports low-rank adapters but still
+/// rejects PiD, while ControlNet/IP overlays remain outside this registered base generator.
 pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, raw_descriptor())
 }

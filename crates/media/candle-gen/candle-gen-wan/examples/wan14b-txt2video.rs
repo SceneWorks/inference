@@ -12,17 +12,18 @@
 //!
 //! With `--comfyui-high <file> --comfyui-low <file>` it instead loads those two in-place ComfyUI Wan2.2
 //! experts (native-Wan keys, companion scaled-fp8) via
-//! [`candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload`], sourcing the UMT5 TE / VAE /
+//! [`candle_gen_wan::wan14b::load_from_comfyui_experts_with_options`], sourcing the UMT5 TE / VAE /
 //! tokenizer from `--snapshot`. The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
 //! (`umt5_xxl_fp8_e4m3fn_scaled`) and/or `--comfyui-vae <file>` (`wan_2.1_vae.safetensors`) reads those
 //! components in place too (sc-10909); whichever is omitted falls back to `--snapshot`.
 //!
 //! SW-6137 (opt-in Sol-Attn sparse self-attention, lossy): `--sol-topk <ratio>` loads the generator
 //! with the `sol_attention` engine option (top-k selection at `ratio`), `--sol-sinks <start>:<end>`
-//! adds forced sink key blocks. The run prints the attention path counts, the mean s/step over the
-//! denoise steps and the CUDA pool's peak (`USED_MEM_HIGH`). `--attn-capture <skip>:<file>` saves the
-//! Q/K/V of the opt-in-routed self-attention call after `skip` others to a safetensors file (evidence
-//! tooling for the locality investigation).
+//! adds forced sink key blocks (on the snapshot and the `--comfyui-high/--comfyui-low` lanes alike).
+//! The run prints the attention path counts, the mean s/step over the denoise steps and the CUDA
+//! pool's peak (`USED_MEM_HIGH`). `--attn-capture <skip>:<file>` saves the Q/K/V of the
+//! opt-in-routed self-attention call after `skip` others to a safetensors file (evidence tooling for
+//! the locality investigation; it needs `--sol-topk`, the only opt-in this example sets).
 
 use std::path::PathBuf;
 
@@ -146,6 +147,13 @@ fn main() -> Result<()> {
         })
         .transpose()?;
     println!("[smoke] sol_attention={sol_attention:?}");
+    // `--sol-sinks` only modifies `--sol-topk`, and `--attn-capture` captures an opt-in-routed call
+    // (this example's only opt-in is `--sol-topk`): without it either flag would do nothing.
+    for dependent in ["--sol-sinks", "--attn-capture"] {
+        if sol_attention.is_none() && arg(&args, dependent).is_some() {
+            return Err(format!("{dependent} needs --sol-topk <ratio>").into());
+        }
+    }
     if let Some(capture) = arg(&args, "--attn-capture") {
         let (skip, _) = capture
             .split_once(':')
@@ -171,7 +179,8 @@ fn main() -> Result<()> {
                 "[smoke] comfyui experts: high={high} low={low} (in place, scaled-fp8→bf16)\n\
                  [smoke] comfyui te={te_file:?} vae={vae_file:?} (in place when Some, else snapshot)"
             );
-            candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload(
+            // The engine options reach this lane too (`--sol-topk`), as on the snapshot lane.
+            candle_gen_wan::wan14b::load_from_comfyui_experts_with_options(
                 PathBuf::from(&high),
                 PathBuf::from(&low),
                 te_file,
@@ -179,6 +188,7 @@ fn main() -> Result<()> {
                 PathBuf::from(&snapshot),
                 false,
                 offload,
+                candle_gen_wan::wan14b::Wan14bEngineOptions { sol_attention },
             )?
         }
         _ => {

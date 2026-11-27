@@ -1528,7 +1528,37 @@ pub fn load_from_comfyui_experts_with_offload(
     i2v: bool,
     offload_policy: OffloadPolicy,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let generator = build_comfyui_generator(
+    load_from_comfyui_experts_with_options(
+        high_file,
+        low_file,
+        te_file,
+        vae_file,
+        snapshot_dir,
+        i2v,
+        offload_policy,
+        Wan14bEngineOptions::default(),
+    )
+}
+
+/// [`load_from_comfyui_experts_with_offload`] with explicit [`Wan14bEngineOptions`] — the ComfyUI
+/// in-place twin of [`load_t2v_14b_with_options`] / [`load_i2v_14b_with_options`], so the
+/// `sol_attention` engine option (SW-6137) reaches this lane too. `Wan14bEngineOptions::default()`
+/// is exactly [`load_from_comfyui_experts_with_offload`]; an option this engine cannot honour is
+/// refused here with the same typed error.
+#[allow(clippy::too_many_arguments)]
+pub fn load_from_comfyui_experts_with_options(
+    high_file: impl Into<PathBuf>,
+    low_file: impl Into<PathBuf>,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+    options: Wan14bEngineOptions,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let variant = if i2v { Variant::I2v } else { Variant::T2v };
+    validate_engine_options(&variant.dit_cfg(), &options)?;
+    let mut generator = build_comfyui_generator(
         high_file.into(),
         low_file.into(),
         te_file,
@@ -1537,8 +1567,11 @@ pub fn load_from_comfyui_experts_with_offload(
         i2v,
         offload_policy,
     )?;
+    generator.engine = options;
     #[cfg(test)]
     COMFYUI_TEST_OFFLOAD.set(Some(generator.offload));
+    #[cfg(test)]
+    COMFYUI_TEST_ENGINE.set(Some(generator.engine));
     Ok(Box::new(generator))
 }
 
@@ -1552,6 +1585,13 @@ thread_local! {
 #[cfg(test)]
 fn last_public_comfyui_offload_for_test() -> Option<OffloadPolicy> {
     COMFYUI_TEST_OFFLOAD.get()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The engine options the last public ComfyUI load on this thread carried.
+    static COMFYUI_TEST_ENGINE: std::cell::Cell<Option<Wan14bEngineOptions>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn build_comfyui_generator(
@@ -2096,6 +2136,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    /// PR #1530 review: the ComfyUI in-place lane carries the `sol_attention` engine option too
+    /// (it used to keep `Wan14bEngineOptions::default()`), the offload-only loader stays the
+    /// default engine, and an unservable option is refused at load on this lane as well.
+    #[test]
+    fn comfyui_load_carries_the_engine_options() {
+        let on = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.25)),
+        };
+        let load = |options| {
+            load_from_comfyui_experts_with_options(
+                "/comfy/high.safetensors",
+                "/comfy/low.safetensors",
+                None,
+                None,
+                "/snapshot",
+                false,
+                OffloadPolicy::Sequential,
+                options,
+            )
+        };
+        load(on).unwrap();
+        assert_eq!(COMFYUI_TEST_ENGINE.get(), Some(on));
+        assert_eq!(
+            last_public_comfyui_offload_for_test(),
+            Some(OffloadPolicy::Sequential)
+        );
+        load_from_comfyui_experts_with_offload(
+            "/comfy/high.safetensors",
+            "/comfy/low.safetensors",
+            None,
+            None,
+            "/snapshot",
+            true,
+            OffloadPolicy::Resident,
+        )
+        .unwrap();
+        assert_eq!(
+            COMFYUI_TEST_ENGINE.get(),
+            Some(Wan14bEngineOptions::default())
+        );
+        let bad = Wan14bEngineOptions {
+            sol_attention: Some(candle_gen::SolConfig::top_k(0.0)),
+        };
+        assert!(matches!(
+            load(bad),
+            Err(gen_core::Error::Unsupported(m)) if m.contains("topk_ratio")
+        ));
     }
 
     #[test]
