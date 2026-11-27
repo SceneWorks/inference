@@ -1912,11 +1912,13 @@ fn prefill_equals_stepwise_decode() {
     );
 }
 
-/// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
-/// verify) leaves Qwen35 greedy decoding unchanged against the op-by-op reference recurrence —
-/// for a short and a multi-chunk prompt, a speculative-verify-width forward, and the decode
-/// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
-/// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
+/// AC (sc-24443, bitwise since SW-6139): the Gated DeltaNet dispatch (fused Metal kernel for
+/// prefill, decode and verify) leaves Qwen35 greedy decoding unchanged against the op-by-op
+/// reference recurrence — for a short and a multi-chunk prompt, a speculative-verify-width
+/// forward, and the decode steps after it — on the production bf16 path, with every logit
+/// **bit-identical** to the reference's (the kernel replays the op chain exactly, so no logit
+/// may move by even one ULP). Runs on a GPU stream (the kernel's route) whatever the process
+/// default device.
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn greedy_tokens_match_the_ops_reference_recurrence() {
@@ -1986,19 +1988,29 @@ fn greedy_tokens_match_on_the_gpu() {
             !ref_routes.is_empty() && ref_routes.iter().all(|r| *r == Route::Ops),
             "reference routes {ref_routes:?}"
         );
+        assert_eq!(logits.len(), ref_logits.len());
         let md = logits
             .iter()
             .zip(&ref_logits)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        // The logits are bf16: one ULP at the largest reference logit's binade (8 significand
-        // bits, so the spacing in [2^e, 2^(e+1)) is 2^(e-7)) bounds a last-bit rounding flip.
-        let scale = ref_logits.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        let ulp = 2f32.powi(scale.log2().floor() as i32 - 7);
+        let differing: Vec<usize> = logits
+            .iter()
+            .zip(&ref_logits)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, _)| i)
+            .collect();
         eprintln!(
-            "prompt len {}: max logit diff vs ops reference {md:.2e} (bf16 ulp {ulp:.2e} at \
-                 |logit| {scale:.2e})",
-            prompt.len()
+            "prompt len {}: {} of {} logits differ bitwise from the ops reference (max |diff| \
+                 {md:.2e}){}",
+            prompt.len(),
+            differing.len(),
+            logits.len(),
+            differing.first().map_or(String::new(), |&i| format!(
+                "; first at flat {i}: {:e} vs {:e}",
+                logits[i], ref_logits[i]
+            ))
         );
         assert_eq!(
             tokens,
@@ -2007,9 +2019,10 @@ fn greedy_tokens_match_on_the_gpu() {
             prompt.len()
         );
         assert!(
-            md <= ulp,
-            "prompt len {}: max logit diff {md} exceeds one bf16 ulp {ulp}",
-            prompt.len()
+            differing.is_empty(),
+            "prompt len {}: {} logits are not bit-identical to the ops reference (max |diff| {md})",
+            prompt.len(),
+            differing.len()
         );
     }
     crate::model_inference_device::record_model_inference_device();

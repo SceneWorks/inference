@@ -59,16 +59,20 @@ pub fn compute_g(a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
 /// GQA: when `Hv > Hk` each key/query head pairs with `Hv / Hk` value heads (`Hv` must be a
 /// multiple of `Hk`).
 ///
-/// Dispatch (every route matches [`gated_delta_recurrence_ops`] — see the tests' error budgets;
-/// the kernel and chunked routes accumulate in f32 whatever the input dtype, the op route in the
-/// inputs' dtype, which Qwen35 makes f32):
-/// - **GPU, any `T`** — decode (`T = 1`), speculative verify (`T = M`) and prefill: the fused
-///   Metal recurrence ([`gated_delta_kernel`]), one dispatch per [`KERNEL_MAX_STEPS`] tokens with
-///   the state in registers. It is measured faster than the chunkwise form on Metal at every
+/// Dispatch (the kernel and chunked routes accumulate in f32 whatever the input dtype, the op
+/// route in the inputs' dtype, which Qwen35 makes f32):
+/// - **GPU, any `T`, `Dk ≤ `[`KERNEL_MAX_DK`]** — decode (`T = 1`), speculative verify (`T = M`)
+///   and prefill: the fused Metal recurrence ([`gated_delta_kernel`]), one dispatch per
+///   [`KERNEL_MAX_STEPS`] tokens with the state in registers. It is **bit-identical** to the f32
+///   op-by-op reference [`gated_delta_recurrence_ops`] (SW-6139: same IEEE operation per step, no
+///   contraction, and MLX's own row-reduction order for both `Dk` dot products — see
+///   `GDN_KERNEL_SOURCE`), so switching it off ([`GDN_KERNEL`](crate::switches::GDN_KERNEL))
+///   never changes a token. It is measured faster than the chunkwise form on Metal at every
 ///   length (release, Qwen3.6-27B linear-layer dims `Hk = 16, Hv = 48, Dk = Dv = 128`: 1.7 ms vs
-///   2.7 ms at 512 tokens, 7.3 ms vs 11.3 ms at 2048, against 40 / 161 ms for the op loop) and it
-///   is exact f32, whereas MLX runs f32 GEMMs as TF32 on NAX GPUs (M5+), which puts the
-///   chunkwise form ~2e-3 off the reference there.
+///   2.7 ms at 512 tokens, 7.3 ms vs 11.3 ms at 2048, against 40 / 161 ms for the op loop),
+///   whereas MLX runs f32 GEMMs as TF32 on NAX GPUs (M5+), which puts the chunkwise form ~2e-3
+///   off the reference there. A wider `Dk` (whose MLX reduction spans several simdgroups) takes
+///   the op-by-op reference, counted with reason `shape`.
 ///   With the kernel switched off ([`GDN_KERNEL`](crate::switches::GDN_KERNEL)) a GPU stream runs
 ///   the op-by-op reference (the pre-sc-24443 path), not the chunkwise form, whose TF32 GEMMs are
 ///   not exact there.
@@ -90,7 +94,9 @@ pub fn gated_delta_recurrence(
     beta: &Array,
     state: Option<&Array>,
 ) -> Result<(Array, Array)> {
-    use super::fused::{note_fused, note_reference, REASON_CPU_STREAM, REASON_DISABLED};
+    use super::fused::{
+        note_fused, note_reference, REASON_CPU_STREAM, REASON_DISABLED, REASON_SHAPE,
+    };
     #[cfg(test)]
     if FORCE_OPS_REFERENCE.with(|f| f.get()) {
         note_reference(super::fused::REASON_FORCED_REFERENCE);
@@ -105,6 +111,10 @@ pub fn gated_delta_recurrence(
     let (y, next) = if stream_is_gpu(&stream) {
         if !crate::switches::GDN_KERNEL.enabled() {
             note_reference(REASON_DISABLED);
+            return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+        }
+        if !kernel_serves(q.shape()[3]) {
+            note_reference(REASON_SHAPE);
             return gated_delta_recurrence_ops(q, k, v, g, beta, state);
         }
         note_fused();
@@ -127,9 +137,10 @@ pub fn gated_delta_recurrence(
 /// DeltaNet checkpoint ring's input (sc-24435): a partially accepted speculative verify step
 /// restores the row of its last kept token instead of replaying a forward.
 ///
-/// Dispatch: on a GPU stream the fused kernel's checkpoint variant (the same per-step arithmetic
-/// as [`gated_delta_kernel`], plus one state-row write per token); off the GPU the op-by-op
-/// reference, collecting its per-step states. Meant for verify widths (a handful of tokens) —
+/// Dispatch: on a GPU stream the fused kernel's checkpoint variant (the same bit-exact per-step
+/// arithmetic as [`gated_delta_kernel`], plus one state-row write per token; `Dk` above
+/// [`KERNEL_MAX_DK`] takes the op loop, reason `shape`); off the GPU the op-by-op reference,
+/// collecting its per-step states. Meant for verify widths (a handful of tokens) —
 /// `states` holds `T` full recurrent states. Dtypes follow [`gated_delta_recurrence`]: `y` in
 /// `q`'s dtype, both state outputs in the carried state's (or `q`'s from zeros).
 pub fn gated_delta_recurrence_checkpointed(
@@ -146,7 +157,9 @@ pub fn gated_delta_recurrence_checkpointed(
     #[cfg(not(test))]
     let force_ops = false;
     let gpu = stream_is_gpu(&stream);
-    let (y, next, states) = if !force_ops && gpu && crate::switches::GDN_KERNEL.enabled() {
+    let enabled = crate::switches::GDN_KERNEL.enabled();
+    let serves = kernel_serves(q.shape()[3]);
+    let (y, next, states) = if !force_ops && gpu && enabled && serves {
         super::fused::note_fused();
         let (y, next, states) = kernel_segmented(q, k, v, g, beta, state, &stream, true)?;
         (
@@ -159,8 +172,10 @@ pub fn gated_delta_recurrence_checkpointed(
             super::fused::REASON_FORCED_REFERENCE
         } else if !gpu {
             super::fused::REASON_CPU_STREAM
-        } else {
+        } else if !enabled {
             super::fused::REASON_DISABLED
+        } else {
+            super::fused::REASON_SHAPE
         });
         let (y, next, states) = ops_recurrence(q, k, v, g, beta, state, true)?;
         (y, next, states.expect("collected per-token states"))
@@ -177,6 +192,19 @@ pub fn gated_delta_recurrence_checkpointed(
 /// dispatches carrying the state, so no single command stays on the GPU long enough to approach
 /// the Metal watchdog (a dispatch is ~15 ms at Qwen3.6-27B dims) however long the prompt is.
 pub const KERNEL_MAX_STEPS: i32 = 4096;
+
+/// The widest key head [`gated_delta_kernel`] serves. MLX reduces a row of up to 512 elements in
+/// one 32-lane simdgroup (`row_reduce_small` / `row_reduce_simple` / `row_reduce_looped` all
+/// launch 32 threads per row there), an order the kernel replays exactly; a wider row is split
+/// across simdgroups through threadgroup memory, which the kernel does not replay — so it takes
+/// the op-by-op reference rather than an inexact fused path. Every shipped Qwen35-family model
+/// has `Dk = 128`.
+pub const KERNEL_MAX_DK: i32 = 512;
+
+/// Whether the fused kernel serves key-head width `dk` bit-identically (see [`KERNEL_MAX_DK`]).
+pub fn kernel_serves(dk: i32) -> bool {
+    (1..=KERNEL_MAX_DK).contains(&dk)
+}
 
 /// [`gated_delta_kernel`] (or, with `checkpoint`, its per-token-state variant) over `T` in
 /// dispatches of at most [`KERNEL_MAX_STEPS`] tokens. Returns `(y, final_state, states)`, `states`
@@ -310,18 +338,83 @@ fn cast_to(x: Array, dtype: Dtype) -> Result<Array> {
     })
 }
 
-/// The fused recurrence body. One SIMD group (32 lanes) owns one `(batch, value head, value row)`
-/// state row `S[dv, :]`, `ceil(Dk/32)` elements per lane kept in registers across all `T` steps;
-/// each step decays it, reads `S·k` / `S·q` with a `simd_sum`, and writes the delta. GQA maps a
-/// value head to its key head by index (no repeated q/k). Inputs of any float dtype are read as
-/// f32; `y` and `state_out` are f32. Same per-step operation order as
-/// [`gated_delta_recurrence_ops`] (the reductions differ only in summation order).
+/// File-scope prelude of the fused recurrence ([`GDN_KERNEL_SOURCE`]'s MLX `header`).
+///
+/// - `#pragma clang fp contract(off)`: MLX JIT-compiles custom kernels in Metal's *safe* math
+///   mode, whose default (`-ffp-contract=on`) still fuses `a + b * c` written as one expression
+///   into an FMA (one rounding where the op chain's separate `multiply` and `add` kernels round
+///   twice) — the SW-6139 divergence. The body also writes every product and sum as its own
+///   statement, so it stays unfused even where the pragma were ignored.
+/// - `sceneworks_gdn_row_sum`: the sum of one state row's `Dk` products in exactly the order
+///   MLX's GPU `sum` over the last axis of a row-contiguous f32 `[B, Hv, Dv, Dk]` tensor adds
+///   them (mlx v0.32.0 `backend/metal/reduce.cpp` + `kernels/reduction/reduce_row.h`,
+///   `REDUCE_N_READS = 4`; every accumulator starts at `+0` and adds `x + total`):
+///   * `Dk ≤ 64` → `row_reduce_small` (one output per thread: `non_row_reductions = 1 ≤ 8`): a
+///     single left-to-right sum over the whole row. Lane `l` holds elements `4l .. 4l + 3`, so
+///     every lane replays it by shuffling each lane's four products in in lane order.
+///   * `64 < Dk ≤ 512` → `row_reduce_simple` (≥ 32 rows) or `row_reduce_looped` (fewer), both
+///     with a 32-thread threadgroup and the same per-thread loop: thread `l` adds, in order,
+///     elements `128·b + 4l + i` for blocks `b` and `i = 0..3` (the ragged last block keeps only
+///     elements `< Dk`), then one `simd_sum` across the 32 lanes (`simdgroups_per_threadgroup =
+///     1`, so no threadgroup-memory stage). The kernel lays the state row out the same way
+///     (register `r` of lane `l` is element `128·(r/4) + 4l + r%4`), so each lane's partial and
+///     the `simd_sum` see exactly MLX's operands in MLX's lanes.
+const GDN_KERNEL_HEADER: &str = r#"
+#pragma clang fp contract(off)
+
+template <int Dk, int NR>
+inline float sceneworks_gdn_row_sum(const thread float* part, const int lane) {
+    float total = 0.0f;
+    if (Dk <= 64) {
+        for (int src = 0; src < (Dk + 3) / 4; ++src) {
+            for (int i = 0; i < 4; ++i) {
+                const float x = simd_shuffle(part[i], ushort(src));
+                if (4 * src + i < Dk) {
+                    total = total + x;
+                }
+            }
+        }
+        return total;
+    }
+    for (int r = 0; r < NR; ++r) {
+        const int s = (r / 4) * 128 + 4 * lane + (r % 4);
+        if (s < Dk) {
+            total = total + part[r];
+        }
+    }
+    return simd_sum(total);
+}
+"#;
+
+/// The fused recurrence body — **bit-identical** to the f32 op-by-op reference
+/// ([`gated_delta_recurrence_ops`] / `delta_step`) for every `Dk ≤ `[`KERNEL_MAX_DK`] (SW-6139).
+///
+/// Provenance (SW-F287 E10): the launch shape (one simdgroup per state row, the row in registers
+/// across all `T` steps, GQA by head index, pointer walk) follows `mlx_lm.models.gated_delta`'s
+/// Metal kernel (MIT, Copyright © 2023-2025 Apple Inc.); the arithmetic and reduction order are
+/// rewritten here against this crate's op chain.
+///
+/// One SIMD group (32 lanes) owns one `(batch, value head, value row)` state row `S[dv, :]`,
+/// `NR = 4·⌈Dk/128⌉` registers per lane laid out as MLX's row reduction reads the row (see
+/// [`GDN_KERNEL_HEADER`]). Per step, with every value f32 (inputs of any float dtype widen
+/// exactly) and each line one IEEE-rounded operation, as the op chain's kernels compute it:
+///
+/// ```text
+///   s1[e] = S[e] · g                         multiply(state, g)
+///   p[e]  = s1[e] · k[e]                     multiply(state, k)
+///   kv    = row_sum(p)                       sum_axis(-1), MLX's order
+///   d0    = v − kv ;  δ = d0 · β             subtract, multiply
+///   u[e]  = k[e] · δ ;  S[e] = s1[e] + u[e]  multiply(k, δ), add
+///   r[e]  = S[e] · q[e] ;  y = row_sum(r)    multiply(state, q), sum_axis(-1)
+/// ```
+///
+/// `y` and `state_out` are f32.
 const GDN_KERNEL_SOURCE: &str = r#"
     const uint n = thread_position_in_grid.z;
     const uint b_idx = n / Hv;
     const uint hv_idx = n % Hv;
     const uint hk_idx = hv_idx / (Hv / Hk);
-    constexpr int n_per_t = (Dk + 31) / 32;
+    constexpr int n_per_t = 4 * ((Dk + 127) / 128);
     const int lane = thread_position_in_threadgroup.x;
     const uint dv_idx = thread_position_in_grid.y;
     const int steps = t_len;
@@ -337,32 +430,39 @@ const GDN_KERNEL_SOURCE: &str = r#"
     // @checkpoint-init
 
     float st[n_per_t];
+    float part[n_per_t];
     for (int i = 0; i < n_per_t; ++i) {
-        const int s = n_per_t * lane + i;
+        const int s = (i / 4) * 128 + 4 * lane + (i % 4);
         st[i] = s < Dk ? static_cast<float>(i_state[s]) : 0.0f;
     }
     for (int t = 0; t < steps; ++t) {
         const float decay = static_cast<float>(g_[0]);
-        float kv_mem = 0.0f;
         for (int i = 0; i < n_per_t; ++i) {
-            const int s = n_per_t * lane + i;
+            const int s = (i / 4) * 128 + 4 * lane + (i % 4);
+            part[i] = 0.0f;
             if (s < Dk) {
-                st[i] = st[i] * decay;
-                kv_mem += st[i] * static_cast<float>(k_[s]);
+                const float decayed = st[i] * decay;
+                st[i] = decayed;
+                const float recalled = decayed * static_cast<float>(k_[s]);
+                part[i] = recalled;
             }
         }
-        kv_mem = simd_sum(kv_mem);
-        const float delta =
-            (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[0]);
-        float out = 0.0f;
+        const float kv_mem = sceneworks_gdn_row_sum<Dk, n_per_t>(part, lane);
+        const float residual = static_cast<float>(v_[dv_idx]) - kv_mem;
+        const float delta = residual * static_cast<float>(beta_[0]);
+        // @probe-step
         for (int i = 0; i < n_per_t; ++i) {
-            const int s = n_per_t * lane + i;
+            const int s = (i / 4) * 128 + 4 * lane + (i % 4);
+            part[i] = 0.0f;
             if (s < Dk) {
-                st[i] = st[i] + static_cast<float>(k_[s]) * delta;
-                out += st[i] * static_cast<float>(q_[s]);
+                const float rank1 = static_cast<float>(k_[s]) * delta;
+                const float updated = st[i] + rank1;
+                st[i] = updated;
+                const float readout = updated * static_cast<float>(q_[s]);
+                part[i] = readout;
             }
         }
-        out = simd_sum(out);
+        const float out = sceneworks_gdn_row_sum<Dk, n_per_t>(part, lane);
         if (thread_index_in_simdgroup == 0) {
             y_[dv_idx] = out;
         }
@@ -375,7 +475,7 @@ const GDN_KERNEL_SOURCE: &str = r#"
         beta_ += Hv;
     }
     for (int i = 0; i < n_per_t; ++i) {
-        const int s = n_per_t * lane + i;
+        const int s = (i / 4) * 128 + 4 * lane + (i % 4);
         if (s < Dk) {
             o_state[s] = st[i];
         }
@@ -388,18 +488,22 @@ const GDN_KERNEL_SOURCE: &str = r#"
 const GDN_CHECKPOINT_INIT: &str =
     "    auto c_state = states + ((b_idx * steps * Hv + hv_idx) * Dv + dv_idx) * Dk;";
 const GDN_CHECKPOINT_STEP: &str = r#"        for (int i = 0; i < n_per_t; ++i) {
-            const int s = n_per_t * lane + i;
+            const int s = (i / 4) * 128 + 4 * lane + (i % 4);
             if (s < Dk) {
                 c_state[s] = st[i];
             }
         }
         c_state += Hv * Dv * Dk;"#;
 
+/// The splice markers of [`GDN_KERNEL_SOURCE`].
+const CHECKPOINT_INIT_MARKER: &str = "    // @checkpoint-init";
+const CHECKPOINT_STEP_MARKER: &str = "        // @checkpoint-step";
+
 /// [`GDN_KERNEL_SOURCE`] with the per-token state writes spliced in (built once).
 fn checkpoint_kernel_source() -> &'static str {
     static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SOURCE.get_or_init(|| {
-        let (init, step) = ("    // @checkpoint-init", "        // @checkpoint-step");
+        let (init, step) = (CHECKPOINT_INIT_MARKER, CHECKPOINT_STEP_MARKER);
         assert!(
             GDN_KERNEL_SOURCE.matches(init).count() == 1
                 && GDN_KERNEL_SOURCE.matches(step).count() == 1,
@@ -412,10 +516,11 @@ fn checkpoint_kernel_source() -> &'static str {
 }
 
 /// The gated delta recurrence as one fused Metal kernel (decode `T = 1`, verify `T = M`, or any
-/// `T`): the whole `T`-step loop runs on the GPU with the state in registers. Shapes as
-/// [`gated_delta_recurrence`]; inputs may be f32/bf16/f16 and are accumulated in f32; returns
-/// `(y [B,T,Hv,Dv], state [B,Hv,Dv,Dk])`, **both f32**. Dispatches on the task-local default
-/// stream (else the default device's), which must be a GPU stream.
+/// `T`): the whole `T`-step loop runs on the GPU with the state in registers, bit-identical to
+/// the f32 op-by-op reference (`GDN_KERNEL_SOURCE`). Shapes as [`gated_delta_recurrence`];
+/// inputs may be f32/bf16/f16 and are accumulated in f32; returns `(y [B,T,Hv,Dv], state
+/// [B,Hv,Dv,Dk])`, **both f32**. Dispatches on the task-local default stream (else the default
+/// device's), which must be a GPU stream. `Dk` above [`KERNEL_MAX_DK`] is refused.
 pub fn gated_delta_kernel(
     q: &Array,
     k: &Array,
@@ -456,30 +561,82 @@ fn kernel_on(
     } else {
         Route::Kernel
     });
+    let mut out = if checkpoint {
+        launch_kernel(
+            "sceneworks_gated_delta_step_checkpoint_exact",
+            checkpoint_kernel_source(),
+            &["y", "state_out", "states"],
+            &[KernelExtra::PerTokenState],
+            [q, k, v, g, beta],
+            state,
+            stream,
+        )?
+    } else {
+        launch_kernel(
+            "sceneworks_gated_delta_step_exact",
+            GDN_KERNEL_SOURCE,
+            &["y", "state_out"],
+            &[],
+            [q, k, v, g, beta],
+            state,
+            stream,
+        )?
+    };
+    let states = if checkpoint {
+        Some(out.pop().expect("three checkpoint-kernel outputs"))
+    } else {
+        None
+    };
+    let next = out.pop().expect("two kernel outputs");
+    let y = out.pop().expect("two kernel outputs");
+    Ok((y, next, states))
+}
+
+/// An output a kernel variant adds after `y` and `state_out`.
+#[derive(Clone, Copy)]
+enum KernelExtra {
+    /// `[B, T, Hv, Dv, Dk]`: the state after every token.
+    PerTokenState,
+    /// `[B, T, Hv, Dv]`: one per-row value per token (the test-only probe variant).
+    #[cfg(test)]
+    PerTokenRow,
+}
+
+/// Compile (once per name and source — MLX caches the library) and dispatch one variant of the
+/// fused recurrence: outputs `y` `[B,T,Hv,Dv]`, `state_out` `[B,Hv,Dv,Dk]`, then `extra`, all
+/// f32. Refuses a `Dk` the kernel does not replay MLX's reduction for ([`KERNEL_MAX_DK`]).
+fn launch_kernel(
+    name: &str,
+    source: &str,
+    outputs: &[&str],
+    extra: &[KernelExtra],
+    [q, k, v, g, beta]: [&Array; 5],
+    state: Option<&Array>,
+    stream: &Stream,
+) -> Result<Vec<Array>> {
     let qs = q.shape();
     let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
     let vs = v.shape();
     let (hv, dv) = (vs[2], vs[3]);
+    if !kernel_serves(dk) {
+        return Err(Error::Unsupported(format!(
+            "gated_delta_kernel: Dk = {dk} is outside the bit-exact kernel's 1..={KERNEL_MAX_DK}"
+        )));
+    }
     let state = match state {
         Some(s) => s.clone(),
         None => zeros_state(b, hv, dv, dk, Dtype::Float32)?,
     };
     let steps = Array::from_int(t);
-    let kernel = if checkpoint {
-        MetalKernel::new(
-            "sceneworks_gated_delta_step_checkpoint",
-            &["q", "k", "v", "g", "beta", "state_in", "t_len"],
-            &["y", "state_out", "states"],
-            checkpoint_kernel_source(),
-        )?
-    } else {
-        MetalKernel::new(
-            "sceneworks_gated_delta_step",
-            &["q", "k", "v", "g", "beta", "state_in", "t_len"],
-            &["y", "state_out"],
-            GDN_KERNEL_SOURCE,
-        )?
-    };
+    let kernel = MetalKernel::with_options(
+        name,
+        &["q", "k", "v", "g", "beta", "state_in", "t_len"],
+        outputs,
+        source,
+        GDN_KERNEL_HEADER,
+        true,
+        false,
+    )?;
     // Four value rows per threadgroup when they divide `Dv` (the grid is exact either way).
     let rows = if dv % 4 == 0 {
         4
@@ -493,10 +650,14 @@ fn kernel_on(
         .inputs([q, k, v, g, beta, &state, &steps])
         .output_shape([b, t, hv, dv], Dtype::Float32)
         .output_shape([b, hv, dv, dk], Dtype::Float32);
-    if checkpoint {
-        dispatch = dispatch.output_shape([b, t, hv, dv, dk], Dtype::Float32);
+    for e in extra {
+        dispatch = match e {
+            KernelExtra::PerTokenState => dispatch.output_shape([b, t, hv, dv, dk], Dtype::Float32),
+            #[cfg(test)]
+            KernelExtra::PerTokenRow => dispatch.output_shape([b, t, hv, dv], Dtype::Float32),
+        };
     }
-    let mut out = dispatch
+    let out = dispatch
         .template_arg("Dk", dk)
         .template_arg("Dv", dv)
         .template_arg("Hk", hk)
@@ -504,14 +665,7 @@ fn kernel_on(
         .grid(32, dv, b * hv)
         .thread_group(32, rows, 1)
         .run_device(stream)?;
-    let states = if checkpoint {
-        Some(out.pop().expect("three checkpoint-kernel outputs"))
-    } else {
-        None
-    };
-    let next = out.pop().expect("two kernel outputs");
-    let y = out.pop().expect("two kernel outputs");
-    Ok((y, next, states))
+    Ok(out)
 }
 
 /// The gated delta recurrence in its **chunkwise-parallel** form (the WY / flash-linear-attention
@@ -1536,6 +1690,37 @@ fn delta_step(
     dk: i32,
     dv: i32,
 ) -> Result<(Array, Array)> {
+    let parts = delta_step_parts(q, k, v, g, beta, state, b, hv, dk, dv)?;
+    Ok((parts.y, parts.state))
+}
+
+/// Every value one [`delta_step`] computes — the op chain the fused kernel replays, exposed whole
+/// so the kernel's per-step intermediates can be checked against the very same ops.
+#[cfg_attr(not(test), allow(dead_code))]
+struct StepParts {
+    /// `(S·g · k)` summed over `Dk`, `[B,Hv,Dv]`.
+    kv_mem: Array,
+    /// `(v − kv_mem) · β`, `[B,Hv,Dv]`.
+    delta: Array,
+    /// The state after the step, `[B,Hv,Dv,Dk]`.
+    state: Array,
+    /// The step's output, `[B,Hv,Dv]`.
+    y: Array,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delta_step_parts(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    b: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+) -> Result<StepParts> {
     let decay = g.reshape(&[b, hv, 1, 1])?; // [B,Hv,1,1]
     let state = multiply(state, &decay)?; // S · g
     let k_r = k.reshape(&[b, hv, 1, dk])?; // [B,Hv,1,Dk]
@@ -1544,7 +1729,12 @@ fn delta_step(
     let state = add(&state, &multiply(&k_r, &delta.reshape(&[b, hv, dv, 1])?)?)?; // S + Δ⊗k
     let q_r = q.reshape(&[b, hv, 1, dk])?;
     let y = sum_axis(&multiply(&state, &q_r)?, -1, false)?; // (S·q).sum(Dk) → [B,Hv,Dv]
-    Ok((y, state))
+    Ok(StepParts {
+        kv_mem,
+        delta,
+        state,
+        y,
+    })
 }
 
 /// Repeat each head of `x` `[B,T,H,D]` `r` times along the head axis (contiguous), giving
@@ -1923,27 +2113,301 @@ mod tests {
         }
     }
 
-    /// AC (sc-24443): the fused Metal recurrence matches the op-by-op reference within 1e-5
-    /// scale-relative at decode (`T = 1`), verify width (`T = 4`) and prefill (`T = 512`) shapes —
-    /// GQA ×2 at the Qwen3.6 head dims, a batch of two, and tiny non-multiple-of-32 head dims —
-    /// on f32, bf16 and f16 inputs (accumulated in f32), from a zero and from a carried state.
+    /// Distance in units in the last place between two f32 values on the ordered-integer line
+    /// (0 iff bit-identical; `+0` / `−0` are 1 apart, so a sign-of-zero flip is reported too).
+    fn ulps(a: f32, b: f32) -> u64 {
+        let ordered = |x: f32| -> i64 {
+            let bits = i64::from(x.to_bits());
+            if bits & 0x8000_0000 != 0 {
+                0x8000_0000 - bits - 1
+            } else {
+                bits
+            }
+        };
+        (ordered(a) - ordered(b)).unsigned_abs()
+    }
+
+    /// `None` when `got` and `want` are bit-identical; else a report of how many elements differ,
+    /// the first differing element (multi-index — axis 1 is the step for `[B, T, …]` tensors —
+    /// and both values with their bits), the largest |diff| and the largest ULP distance.
+    fn bit_mismatch(got: &Array, want: &Array) -> Option<String> {
+        assert_eq!(got.shape(), want.shape());
+        let shape: Vec<usize> = want.shape().iter().map(|&d| d as usize).collect();
+        let (g, w) = (host32(got), host32(want));
+        let (mut count, mut first, mut max_ulp, mut max_abs) = (0usize, None, 0u64, 0f32);
+        for (i, (&a, &b)) in g.iter().zip(&w).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                count += 1;
+                first.get_or_insert(i);
+                max_ulp = max_ulp.max(ulps(a, b));
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        let i = first?;
+        let mut at = vec![0usize; shape.len()];
+        let mut rest = i;
+        for d in (0..shape.len()).rev() {
+            at[d] = rest % shape[d];
+            rest /= shape[d];
+        }
+        Some(format!(
+            "{count}/{} elements differ; first at {at:?}: got {:e} ({:#010x}) want {:e} \
+             ({:#010x}) = {} ulp; max |diff| {max_abs:.3e}, max {max_ulp} ulp",
+            g.len(),
+            g[i],
+            g[i].to_bits(),
+            w[i],
+            w[i].to_bits(),
+            ulps(g[i], w[i]),
+        ))
+    }
+
+    /// Assert every `(what, got, want)` bit-identical, printing a line per comparison and, on
+    /// failure, every mismatch report at once (so one GPU round trip shows the whole picture).
+    fn assert_all_bitwise(context: &str, checks: &[(String, Array, Array)]) {
+        let mut failures = Vec::new();
+        for (what, got, want) in checks {
+            match bit_mismatch(got, want) {
+                None => eprintln!("{context} {what}: bit-identical"),
+                Some(report) => {
+                    eprintln!("{context} {what}: MISMATCH {report}");
+                    failures.push(format!("{context} {what}: {report}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} bitwise mismatches:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The geometries the bit-exact kernel must hold at: the Qwen3.6/3.8 linear-layer dims
+    /// (`Hk = 16, Hv = 48, Dk = Dv = 128`) at decode and verify width, GQA ×2 decode / verify /
+    /// 512- and 2048-token prefill, and one case per MLX row-reduction class the kernel replays —
+    /// `row_reduce_small` (`Dk ≤ 64`: 4, 33, 64), `row_reduce_simple` (`64 < Dk ≤ 512` with ≥ 32
+    /// rows: 96, 128, 200, 256, 512) and `row_reduce_looped` (the same widths with < 32 rows).
+    const BITWISE_CASES: &[(&str, [i32; 6])] = &[
+        ("qwen-decode", [1, 1, 16, 48, 128, 128]),
+        ("qwen-verify", [1, 4, 16, 48, 128, 128]),
+        ("decode", [1, 1, 2, 4, 128, 128]),
+        ("verify", [1, 4, 2, 4, 128, 128]),
+        ("prefill", [1, 512, 2, 4, 128, 128]),
+        ("prefill", [1, 2048, 2, 4, 128, 128]),
+        ("batch2-small", [2, 5, 1, 2, 64, 32]),
+        ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+        ("small-odd", [1, 3, 1, 2, 33, 16]),
+        ("simple-ragged", [1, 3, 1, 2, 96, 16]),
+        ("simple-2blocks", [1, 3, 1, 2, 256, 16]),
+        ("simple-ragged-2blocks", [1, 3, 1, 2, 200, 16]),
+        ("simple-max", [1, 2, 1, 1, 512, 32]),
+        ("looped", [1, 3, 1, 1, 128, 8]),
+        ("looped-max", [1, 2, 1, 1, 512, 8]),
+    ];
+
+    /// Run `path` against the f32 GPU op-by-op reference over `cases` × {f32, bf16, f16} inputs
+    /// × {zero, carried state}, asserting `y` and the final state **bit-identical**.
+    fn assert_bitwise_reference(path: Path, name: &str, cases: &[(&str, [i32; 6])]) {
+        let mut failures = Vec::new();
+        for &(label, dims) in cases {
+            for dtype in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float16] {
+                for carry in [false, true] {
+                    let x = inputs(dims, dtype, dims.iter().product::<i32>() as u64);
+                    let state = carry.then_some(&x.state);
+                    let (y, s) = path(&x.q, &x.k, &x.v, &x.g, &x.beta, state).unwrap();
+                    let (y_ref, s_ref) = reference(&x, carry);
+                    assert_eq!(y.shape(), y_ref.shape());
+                    assert_eq!(s.shape(), s_ref.shape());
+                    let case = format!("{name} {label} {dims:?} {dtype:?} carry={carry}");
+                    for (what, got, want) in [("y", &y, &y_ref), ("state", &s, &s_ref)] {
+                        match bit_mismatch(got, want) {
+                            None => eprintln!("{case} {what}: bit-identical"),
+                            Some(report) => {
+                                eprintln!("{case} {what}: MISMATCH {report}");
+                                failures.push(format!("{case} {what}: {report}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} kernel/reference bitwise mismatches:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// AC (SW-6139, tightening sc-24443's 1e-5 budget): the fused Metal recurrence is
+    /// **bit-identical** to the op-by-op reference run on the GPU — `y` and the final state, at
+    /// decode, verify and prefill widths, the Qwen3.6/3.8 linear-layer dims, and every MLX
+    /// row-reduction class it replays ([`BITWISE_CASES`]) — on f32, bf16 and f16 inputs (widened
+    /// exactly, accumulated in f32), from a zero and from a carried state. A token-level kernel
+    /// vs ops divergence (the 2-of-5-prompt Qwen3.8 drift of run 45986818819) cannot hide inside
+    /// a tolerance here.
     #[test]
     fn metal_kernel_matches_ops_reference() {
         mlx_rs::with_new_default_stream(Stream::gpu(), || {
-            assert_matches_reference(
-                gated_delta_kernel,
-                "kernel",
-                &[
-                    ("decode", [1, 1, 2, 4, 128, 128]),
-                    ("verify", [1, 4, 2, 4, 128, 128]),
-                    ("prefill", [1, 512, 2, 4, 128, 128]),
-                    ("prefill", [1, 2048, 2, 4, 128, 128]),
-                    ("batch2", [2, 5, 1, 2, 64, 32]),
-                    ("tiny-dims", [1, 7, 2, 4, 4, 6]),
-                ],
-                1e-5,
-                1e-5,
-            )
+            assert_bitwise_reference(gated_delta_kernel, "kernel", BITWISE_CASES)
+        });
+    }
+
+    /// The test-only probe splice: lane 0 of each row also writes the step's `kv_mem` and `delta`.
+    const GDN_PROBE_STEP: &str = r#"        if (thread_index_in_simdgroup == 0) {
+            kv_probe[((b_idx * steps + t) * Hv + hv_idx) * Dv + dv_idx] = kv_mem;
+            delta_probe[((b_idx * steps + t) * Hv + hv_idx) * Dv + dv_idx] = delta;
+        }"#;
+
+    /// The checkpoint kernel with [`GDN_PROBE_STEP`] spliced in: `[y, state_out, states,
+    /// kv_probe, delta_probe]`, every per-token intermediate the reference also produces.
+    fn probe_kernel(x: &Inputs, carry: bool) -> Vec<Array> {
+        let base = checkpoint_kernel_source();
+        let marker = "        // @probe-step";
+        assert_eq!(base.matches(marker).count(), 1, "the probe splice marker");
+        let source = base.replace(marker, GDN_PROBE_STEP);
+        launch_kernel(
+            "sceneworks_gated_delta_step_probe_exact",
+            &source,
+            &["y", "state_out", "states", "kv_probe", "delta_probe"],
+            &[
+                KernelExtra::PerTokenState,
+                KernelExtra::PerTokenRow,
+                KernelExtra::PerTokenRow,
+            ],
+            [&x.q, &x.k, &x.v, &x.g, &x.beta],
+            carry.then_some(&x.state),
+            &Stream::task_local_or_default(),
+        )
+        .unwrap()
+    }
+
+    /// SW-6139 diagnostic: per op and per step, the kernel against the op chain **from the
+    /// kernel's own pre-step state** — `kv_mem` (the `S·k` reduction), `delta`, the post-step
+    /// state and `y` (the `S·q` reduction) — so a mismatch names the first op that rounds
+    /// differently (with its ULP distance) instead of a drifted end state; then the whole
+    /// trajectory against [`ops_recurrence`]. Every comparison must be bit-identical.
+    #[test]
+    fn kernel_matches_each_reference_op_step_by_step() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let mut failures = Vec::new();
+            // `denormal`: gates cycling through subnormal, zero, smallest-normal and ordinary
+            // values (real Qwen3.8 gates underflow this far), so a flush-to-zero difference
+            // between the JIT kernel and MLX's metallib kernels shows up as its own op mismatch.
+            for &(label, dims, denormal) in &[
+                ("qwen-verify", [1, 6, 16, 48, 128, 128], false),
+                ("denormal-gates", [1, 6, 2, 4, 128, 128], true),
+                ("small", [1, 4, 1, 2, 33, 16], false),
+                ("simple-2blocks", [1, 4, 1, 2, 256, 16], false),
+                ("looped", [1, 4, 1, 1, 200, 8], false),
+            ] {
+                let [_, t, hk, hv, _, _] = dims;
+                for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+                    for carry in [false, true] {
+                        let mut x = inputs(
+                            dims,
+                            dtype,
+                            0x6139_0b17 ^ dims.iter().product::<i32>() as u64,
+                        );
+                        if denormal {
+                            const GATES: [f32; 8] =
+                                [1e-40, 2.5e-39, 0.0, 1.2e-38, 0.9, 1.0, 5e-42, 0.3];
+                            let n = x.g.size();
+                            let g: Vec<f32> = (0..n).map(|i| GATES[i % GATES.len()]).collect();
+                            x.g = Array::from_slice(&g, x.g.shape());
+                        }
+                        let out = probe_kernel(&x, carry);
+                        let [y, last, states, kv, delta] = <[Array; 5]>::try_from(out)
+                            .unwrap_or_else(|_| panic!("five probe-kernel outputs"));
+                        let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+                        let (q32, k32) = if hv != hk {
+                            (
+                                repeat_heads(&f(&x.q), hv / hk).unwrap(),
+                                repeat_heads(&f(&x.k), hv / hk).unwrap(),
+                            )
+                        } else {
+                            (f(&x.q), f(&x.k))
+                        };
+                        let (v32, g32, b32) = (f(&x.v), f(&x.g), f(&x.beta));
+                        let s0 = if carry {
+                            f(&x.state)
+                        } else {
+                            let s = x.state.shape();
+                            zeros_state(s[0], s[1], s[2], s[3], Dtype::Float32).unwrap()
+                        };
+                        let case = format!("{label} {dims:?} {dtype:?} carry={carry}");
+                        let mut first_bad: Option<String> = None;
+                        for ti in 0..t {
+                            let prev = if ti == 0 {
+                                s0.clone()
+                            } else {
+                                row(&states, ti - 1)
+                            };
+                            let qs = q32.shape();
+                            let parts = delta_step_parts(
+                                &row(&q32, ti),
+                                &row(&k32, ti),
+                                &row(&v32, ti),
+                                &row(&g32, ti),
+                                &row(&b32, ti),
+                                &prev,
+                                qs[0],
+                                hv,
+                                qs[3],
+                                v32.shape()[3],
+                            )
+                            .unwrap();
+                            for (op, got, want) in [
+                                ("kv_mem = sum(S*g*k)", row(&kv, ti), parts.kv_mem),
+                                ("delta = (v - kv)*beta", row(&delta, ti), parts.delta),
+                                ("state = S*g + k*delta", row(&states, ti), parts.state),
+                                ("y = sum(state*q)", row(&y, ti), parts.y),
+                            ] {
+                                if let Some(report) = bit_mismatch(&got, &want) {
+                                    let line = format!("{case} step {ti} op `{op}`: {report}");
+                                    eprintln!("MISMATCH {line}");
+                                    first_bad.get_or_insert(line.clone());
+                                    failures.push(line);
+                                }
+                            }
+                        }
+                        // The whole trajectory (each side from its own state) and the final row.
+                        let carried = carry.then(|| f(&x.state));
+                        let (y_ref, last_ref, states_ref) = ops_recurrence(
+                            &f(&x.q),
+                            &f(&x.k),
+                            &v32,
+                            &g32,
+                            &b32,
+                            carried.as_ref(),
+                            true,
+                        )
+                        .unwrap();
+                        for (what, got, want) in [
+                            ("trajectory y", &y, &y_ref),
+                            ("trajectory final", &last, &last_ref),
+                            ("trajectory states", &states, states_ref.as_ref().unwrap()),
+                        ] {
+                            if let Some(report) = bit_mismatch(got, want) {
+                                let line = format!("{case} {what}: {report}");
+                                eprintln!("MISMATCH {line}");
+                                failures.push(line);
+                            }
+                        }
+                        match first_bad {
+                            None => eprintln!("{case}: every op of every step bit-identical"),
+                            Some(line) => eprintln!("{case}: FIRST DIVERGENCE {line}"),
+                        }
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} per-op kernel/reference mismatches:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
         });
     }
 
@@ -2001,8 +2465,16 @@ mod tests {
                 );
             }
             let (y_ref, s_ref) = reference(&x, true);
-            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
-            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "t={t}: y {ey:?} state {es:?}");
+            if route[0] == Route::Chunked {
+                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+                assert!(ey.0 < 2e-5 && es.0 < 2e-5, "t={t}: y {ey:?} state {es:?}");
+            } else {
+                // The kernel (SW-6139) and the op loop are the reference bit for bit.
+                assert_all_bitwise(
+                    &format!("t={t} {route:?}"),
+                    &[("y".into(), y, y_ref), ("state".into(), s, s_ref)],
+                );
+            }
         };
         mlx_rs::with_new_default_stream(Stream::gpu(), || {
             for t in [1, 4, 200] {
@@ -2013,6 +2485,25 @@ mod tests {
                 [1, 2, 32, 8],
                 &[Route::Kernel, Route::Kernel],
             );
+            // A key head wider than the kernel replays MLX's reduction for takes the op loop on
+            // the GPU, counted as a `shape` reference — never an inexact fused result.
+            let x = inputs([1, 2, 1, 1, KERNEL_MAX_DK + 128, 4], Dtype::Float32, 7);
+            let tally = crate::primitives::fused::fused_tally();
+            let (_, routes) = recording_routes(|| {
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+                gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
+            });
+            assert_eq!(routes, [Route::Ops, Route::Ops]);
+            let ran = crate::primitives::fused::fused_tally().since(&tally);
+            assert_eq!(
+                (ran.fused, ran.reference, ran.reference_reason),
+                (0, 2, Some(crate::primitives::fused::REASON_SHAPE))
+            );
+            assert!(
+                gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, None).is_err(),
+                "the public kernel refuses a Dk it cannot run exactly"
+            );
+            assert!(kernel_serves(KERNEL_MAX_DK) && !kernel_serves(KERNEL_MAX_DK + 1));
         });
         mlx_rs::with_new_default_stream(Stream::cpu(), || {
             for t in [3, CHUNKED_PREFILL_MIN_TOKENS - 1] {
@@ -2058,8 +2549,11 @@ mod tests {
                 (ran.fused, ran.reference, ran.reference_reason),
                 (0, 1, Some(crate::primitives::fused::REASON_DISABLED))
             );
-            let (ey, es) = (errors(&y_off, &y_on), errors(&s_off, &s_on));
-            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "y {ey:?} state {es:?}");
+            // SW-6139: switching the kernel off changes no bit.
+            assert_all_bitwise(
+                "kernel off vs on",
+                &[("y".into(), y_off, y_on), ("state".into(), s_off, s_on)],
+            );
 
             let checkpointed =
                 || gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, None);
@@ -2097,13 +2591,20 @@ mod tests {
                 });
                 assert_eq!(routes, [Route::Kernel]);
                 let (y_ref, s_ref) = reference(&x, true);
-                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
-                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "y {ey:?} state {es:?}");
+                assert_all_bitwise(
+                    "dispatch",
+                    &[
+                        ("y".into(), y, y_ref.clone()),
+                        ("state".into(), s, s_ref.clone()),
+                    ],
+                );
                 // The public kernel entry point dispatches on the same task-local stream.
                 let (y, s) =
                     gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
-                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
-                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "kernel y {ey:?} state {es:?}");
+                assert_all_bitwise(
+                    "kernel",
+                    &[("y".into(), y, y_ref), ("state".into(), s, s_ref)],
+                );
             });
             let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 22);
             let (_, routes) = recording_routes(|| {
@@ -2118,21 +2619,26 @@ mod tests {
         slice_time(x, t).unwrap()
     }
 
-    /// AC (sc-24435): the fused kernel's checkpoint variant writes every token's state, each
-    /// within 1e-5 scale-relative (and absolute) of the op-by-op reference's per-step state, with
-    /// `y` and the final state matching the reference as the plain kernel's do and the last row
-    /// equal to the final state bit for bit — at verify widths up to `1 + 8` (GQA ×2 at the
-    /// Qwen3.6 head dims), a batch of two and tiny head dims, on f32/bf16/f16 inputs from a zero
-    /// and from a carried state. Every call takes exactly the checkpoint-kernel route.
+    /// AC (sc-24435, bitwise since SW-6139): the fused kernel's checkpoint variant writes every
+    /// token's state **bit-identical** to the op-by-op reference's per-step state, with `y` and
+    /// the final state bit-identical too and the last row equal to the final state — at verify
+    /// widths up to `1 + 8` (GQA ×2 at the Qwen3.6 head dims, and the Qwen3.6/3.8 linear-layer
+    /// dims), a batch of two, tiny head dims and the other MLX reduction classes, on f32/bf16/f16
+    /// inputs from a zero and from a carried state. Every call takes exactly the
+    /// checkpoint-kernel route.
     #[test]
     fn checkpoint_kernel_per_token_states_match_ops_reference() {
         mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let mut failures = Vec::new();
             for (label, dims) in [
                 ("verify2", [1, 2, 2, 4, 128, 128]),
                 ("verify5", [1, 5, 2, 4, 128, 128]),
                 ("verify9", [1, 9, 2, 4, 128, 128]),
+                ("qwen-verify4", [1, 4, 16, 48, 128, 128]),
                 ("batch2", [2, 4, 1, 2, 64, 32]),
                 ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+                ("simple-2blocks", [1, 3, 1, 2, 256, 16]),
+                ("looped", [1, 3, 1, 1, 200, 8]),
             ] {
                 let [b, t, _, hv, dk, dv] = dims;
                 for dtype in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float16] {
@@ -2172,28 +2678,37 @@ mod tests {
                             ));
                         }
                         for (what, got, want) in &checks {
-                            let (rel, abs) = errors(got, want);
-                            assert!(
-                                rel <= 1e-5 && abs <= 1e-5,
-                                "{label} {dtype:?} carry={carry} {what}: rel {rel} abs {abs}"
-                            );
+                            let context = format!("{label} {dtype:?} carry={carry} {what}");
+                            match bit_mismatch(got, want) {
+                                None => eprintln!("{context}: bit-identical"),
+                                Some(report) => {
+                                    eprintln!("{context}: MISMATCH {report}");
+                                    failures.push(format!("{context}: {report}"));
+                                }
+                            }
                         }
                         assert_eq!(
-                            host32(&row(&states, t - 1)),
-                            host32(&last),
+                            bit_mismatch(&row(&states, t - 1), &last),
+                            None,
                             "{label} {dtype:?} carry={carry}: the last row is the final state"
                         );
                     }
                 }
             }
+            assert!(
+                failures.is_empty(),
+                "{} checkpoint-kernel bitwise mismatches:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
         });
     }
 
-    /// SW-6139 mutation check 1 ("drop the decay multiply"): the fixture's 1e-5 budget has to
-    /// *discriminate*. A kernel that skipped the per-token decay `g` would equal the reference run
-    /// with `g = 1`; here that mutant's outputs and final state sit orders of magnitude outside
-    /// the budget the real kernel meets, at decode, verify and prefill widths, so the kernel arm
-    /// of [`metal_kernel_matches_ops_reference`] fails for it.
+    /// SW-6139 mutation check 1 ("drop the decay multiply"): the fixture has to *discriminate*. A
+    /// kernel that skipped the per-token decay `g` would equal the reference run with `g = 1`;
+    /// here the real kernel is the reference bit for bit while that mutant's outputs and final
+    /// state sit orders of magnitude away, at decode, verify and prefill widths, so the kernel
+    /// arm of [`metal_kernel_matches_ops_reference`] fails for it.
     #[test]
     fn dropping_the_decay_multiply_fails_the_kernel_fixture() {
         mlx_rs::with_new_default_stream(Stream::gpu(), || {
@@ -2206,10 +2721,12 @@ mod tests {
                 let (y, s) =
                     gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
                 let (y_ok, s_ok) = reference(&x, true);
-                let (ok_y, ok_s) = (errors(&y, &y_ok), errors(&s, &s_ok));
-                assert!(
-                    ok_y.0 <= 1e-5 && ok_s.0 <= 1e-5,
-                    "{dims:?}: the real kernel is in budget"
+                assert_all_bitwise(
+                    &format!("{dims:?} the real kernel"),
+                    &[
+                        ("y".into(), y.clone(), y_ok),
+                        ("state".into(), s.clone(), s_ok),
+                    ],
                 );
                 // The mutant: the reference with the decay replaced by 1 (no decay).
                 let no_decay = Array::ones::<f32>(x.g.shape()).unwrap();
@@ -2224,8 +2741,8 @@ mod tests {
                 .unwrap();
                 let (bad_y, bad_s) = (errors(&y, &y_mut), errors(&s, &s_mut));
                 assert!(
-                    bad_s.0 > 1e-3 && bad_s.0 > 1e3 * ok_s.0.max(1e-7),
-                    "{dims:?}: dropping the decay must blow the state budget: {bad_s:?} vs {ok_s:?}"
+                    bad_s.0 > 1e-3,
+                    "{dims:?}: dropping the decay must move the state far from the kernel: {bad_s:?}"
                 );
                 // `y` at T = 1 reads the decayed carried state, so it too must separate.
                 assert!(
@@ -2272,10 +2789,10 @@ mod tests {
                 )
                 .unwrap();
                 let right = row(&states, n - 1);
-                let (rel, abs) = errors(&right, &prefix);
-                assert!(
-                    rel <= 1e-5 && abs <= 1e-5,
-                    "n={n}: the right prefix row is in budget"
+                assert_eq!(
+                    bit_mismatch(&right, &prefix),
+                    None,
+                    "n={n}: the right prefix row is the reference's prefix state"
                 );
                 let wrong = row(&states, n);
                 let (wrong_rel, _) = errors(&wrong, &prefix);
@@ -2284,12 +2801,13 @@ mod tests {
                     "n={n}: the wrong prefix row must be rejected: {wrong_rel}"
                 );
                 // The decode step after the rollback diverges too (what MTP equivalence sees).
-                let (y_ok, _) = errors(&step(&right), &step(&prefix));
-                let (y_bad, _) = errors(&step(&wrong), &step(&prefix));
-                assert!(
-                    y_ok <= 1e-5 && y_bad > 1e-3,
-                    "n={n}: next step {y_ok} vs {y_bad}"
+                assert_eq!(
+                    bit_mismatch(&step(&right), &step(&prefix)),
+                    None,
+                    "n={n}: the next step from the right row"
                 );
+                let (y_bad, _) = errors(&step(&wrong), &step(&prefix));
+                assert!(y_bad > 1e-3, "n={n}: next step from the wrong row {y_bad}");
             }
         });
     }

@@ -2679,6 +2679,12 @@ mod cuda_impl {
     }
 
     impl DevInt8 {
+        /// The staged `U8 [rows, cols]` two's-complement code bytes (a shared handle, not a copy):
+        /// the operand a kernel other than cuBLASLt (the fused W4A8 GEMM) reads.
+        pub fn codes(&self) -> &Tensor {
+            &self.buf
+        }
+
         /// The staged code bytes, read back (tests compare them byte for byte).
         #[cfg(test)]
         pub(crate) fn bytes_to_host(&self) -> Result<Vec<u8>> {
