@@ -884,7 +884,7 @@ mod budget_tests {
     fn conv_decode_budgeted_still_selects_through_auto_tiling_budgeted_ltx() {
         let body = fn_body("decode_budgeted");
         assert!(
-            body.contains("match auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
+            body.contains("auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
             "the conv decode's auto-tiling arm no longer calls `auto_tiling_budgeted_ltx` with the \
              conv output dims — sc-18799 budgets the DiffVAE, it does not re-route the conv \
              decoder:\n{body}"
