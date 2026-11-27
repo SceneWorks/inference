@@ -76,6 +76,16 @@ pub fn gated_delta_available(device: &Device) -> Result<(), String> {
     }
 }
 
+/// The telemetry label of why the fused step cannot serve `device` (`not_cuda`, or the cached
+/// compile error's [`label`](crate::nvrtc::KernelCompileError::label)); `None` when it can.
+pub fn gated_delta_unavailable_label(device: &Device) -> Option<&'static str> {
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(dev) => GATED_DELTA_SRC.compiled(dev).err().map(|e| e.label()),
+        _ => Some("not_cuda"),
+    }
+}
+
 /// One fused gated-delta step over `T` tokens.
 ///
 /// `q`, `k`: `[B, T, Hk, Dk]`; `v`: `[B, T, Hv, Dv]`; `g` (the multiplicative decay) and `beta`:

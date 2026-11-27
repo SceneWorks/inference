@@ -22,7 +22,6 @@
 //! parity gate, bf16 in production). RoPE is applied in f32.
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, gelu_tanh, silu};
 use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::{Error, Result};
@@ -49,9 +48,10 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, None, None, eps)?)
 }
 
-/// adaLN affine `m·(1+scale)+shift`.
+/// adaLN affine `m·(1+scale)+shift`, strong-f32 `1`: the shared eager
+/// [`mlx_gen::nn::modulate_eager`] (SW-6140), the same three-op chain as this crate's private copy.
 fn modulate(m: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)?)
+    mlx_gen::nn::modulate_eager(m, scale, shift, false)
 }
 
 /// Gated residual `x + y·gate`.

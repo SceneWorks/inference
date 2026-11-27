@@ -13,6 +13,16 @@
 //! `cases` is a `,`- or `+`-separated list from `greedy,t04,json,greedy_mtp,t04_mtp,json_mtp`
 //! (default: all; also `greedy_json`, `greedy_json_mtp`, and `t04_auto` / `json_auto` for
 //! `Speculative::Auto`).
+//!
+//! `parity` (SW-6136) is the fused-vs-ops evidence run: for greedy decode with MTP off and with
+//! MTP on it decodes `max_new_tokens` (default 256) twice, once with the fused-kernel switch off
+//! (the op-chain reference, every fused primitive including the Gated DeltaNet kernels) and once
+//! on, and exits non-zero unless the token ids, the MTP accept counts and the fused-primitive path
+//! reports are as expected (`reference`/`disabled` off, `fused` on). It prints tokens/s both ways:
+//!
+//! ```text
+//! CANDLE_LLM_QWEN35_MODEL=<snapshot dir> //!   cargo run --release --features cuda --example qwen35_decode_bench -- parity 256
+//! ```
 
 use core_llm::{
     Constraint, LoadSpec, Message, Sampling, Speculative, SpeculativeProposer, StreamEvent,
@@ -45,6 +55,10 @@ fn main() {
     eprintln!("LOAD {:.1}s", t.elapsed().as_secs_f64());
 
     let mtp = Some(Speculative::proposer(SpeculativeProposer::Mtp, mtp_depth));
+    if cases == "parity" {
+        parity(&*model, mtp, max_new);
+        return;
+    }
     // Warm-up (graph capture, kernel JIT).
     run(&*model, "warmup", 0.0, None, None, 64);
     for case in cases.split([',', '+']) {
@@ -129,5 +143,78 @@ fn run(
     );
     if std::env::var("BENCH_PRINT").is_ok() {
         eprintln!("TEXT[{label}] {text}");
+    }
+}
+
+/// One greedy decode of the bench prompt: the generated token ids and the full output.
+fn greedy_ids(
+    model: &dyn core_llm::TextLlm,
+    speculative: Option<Speculative>,
+    max_new: u32,
+) -> (Vec<u32>, core_llm::TextLlmOutput) {
+    let request = TextLlmRequest {
+        messages: vec![Message::user(PROMPT.to_owned())],
+        sampling: Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            ..Sampling::default()
+        },
+        max_new_tokens: max_new,
+        seed: Some(7),
+        thinking: ThinkingMode::Disabled,
+        speculative,
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    let out = model
+        .generate(&request, &mut |ev| {
+            if let StreamEvent::Token { id, .. } = ev {
+                ids.push(id);
+            }
+        })
+        .expect("generate");
+    (ids, out)
+}
+
+/// The fused-vs-ops token-identity run (see the module docs): MTP off then on, switch off then on.
+fn parity(model: &dyn core_llm::TextLlm, mtp: Option<Speculative>, max_new: u32) {
+    use candle_llm::primitives::set_fused_kernels;
+    for (label, speculative) in [("mtp_off", None), ("mtp_on", mtp)] {
+        let mut runs = Vec::new();
+        for enabled in [false, true] {
+            set_fused_kernels(Some(enabled));
+            greedy_ids(model, speculative, 32); // untimed warm-up
+            let (ids, out) = greedy_ids(model, speculative, max_new);
+            let decode = out.timings.as_ref().map_or(0.0, |t| t.decode.as_secs_f64());
+            let report = out.decode.as_ref().map(|r| r.fused_primitives.clone());
+            eprintln!(
+                "PARITY {label} fused={enabled} tokens={} decode_s={decode:.3} tok_s={:.2}                  fused_primitives={report:?} mtp={:?}",
+                ids.len(),
+                ids.len() as f64 / decode.max(1e-9),
+                out.mtp,
+            );
+            runs.push((ids, report, out.mtp));
+        }
+        set_fused_kernels(None);
+        let (off, on) = (&runs[0], &runs[1]);
+        let diverged = off.0.iter().zip(&on.0).position(|(a, b)| a != b);
+        assert_eq!(
+            diverged, None,
+            "{label}: fused diverged at token {diverged:?}"
+        );
+        assert_eq!(off.0, on.0, "{label}: token ids differ");
+        assert_eq!(off.0.len(), max_new as usize, "{label}: stopped early");
+        assert_eq!(off.2, on.2, "{label}: MTP accepted different drafts");
+        let (off_path, on_path) = (off.1.as_ref().unwrap(), on.1.as_ref().unwrap());
+        assert_eq!(
+            (off_path.path.as_str(), off_path.reason.as_deref()),
+            ("reference", Some("disabled")),
+            "{label}"
+        );
+        assert_eq!(
+            on_path.path, "fused",
+            "{label}: a fused-on decode fell back"
+        );
+        eprintln!("PARITY {label} token-identical over {max_new} tokens");
     }
 }

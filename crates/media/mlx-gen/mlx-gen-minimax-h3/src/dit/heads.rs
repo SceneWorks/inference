@@ -592,8 +592,9 @@ impl AdaLayerNormOut {
             .shift
             .take_axis(&idx, 0)?
             .as_dtype(normed.dtype())?;
-        let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
-        Ok(add(&multiply(&normed, &add(&one, &scale)?)?, &shift)?)
+        // `1` in the gathered `scale`'s dtype: the shared eager `nn::modulate_eager` (SW-6140), the
+        // same three-op chain (`1 + scale` commutes) as the inline affine it replaced.
+        mlx_gen::nn::modulate_eager(&normed, &scale, &shift, true)
     }
 
     /// Recover the per-row **timestep** index from the per-row **AdaLN** index the block stack uses.

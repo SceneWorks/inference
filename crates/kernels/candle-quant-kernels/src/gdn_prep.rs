@@ -41,6 +41,16 @@ pub fn gdn_prep_available(device: &Device) -> Result<(), String> {
     }
 }
 
+/// The telemetry label of why the fused GDN-prep kernels cannot serve `device` (`not_cuda`, or the
+/// cached compile error's label); `None` when they can.
+pub fn gdn_prep_unavailable_label(device: &Device) -> Option<&'static str> {
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(dev) => GDN_PREP_SRC.compiled(dev).err().map(|e| e.label()),
+        _ => Some("not_cuda"),
+    }
+}
+
 fn require_bf16(name: &str, x: &Tensor) -> candle_core::Result<()> {
     if x.dtype() != DType::BF16 {
         return Err(msg(format!(

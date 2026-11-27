@@ -1362,6 +1362,82 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(unpaired["CANDLE_CUDA.device_positions"]["outcome"], "unmeasured")
         self.assertEqual(unpaired["MLX.speculative"]["outcome"], "unmeasured")
 
+    def test_a_switch_twin_whose_greedy_token_streams_differ_is_never_recommended_on(self) -> None:
+        """SW-6139: a faster kernel row that changed the greedy accepted tokens is a defect."""
+
+        def digest_row(row_id, state, speed, digest_for, temperature=0.0):
+            def make(run, k):
+                return document(
+                    run,
+                    effective={"CANDLE_LLM_CUDA_GRAPHS": state},
+                    value=lambda p, o, m: (speed if m == "decode_tok_s" else 100.0) + jitter(k),
+                    row_extra=lambda p, o: {"token_digest": digest_for(p, o)},
+                    sampling={"temperature": temperature},
+                )
+
+            return {
+                "id": row_id,
+                "runs": ["epic"],
+                "switches": {"CANDLE_LLM_CUDA_GRAPHS": "1" if state else "0"},
+                "document": make,
+            }
+
+        same = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"abc-{p}:256"),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(same["outcome"], "on")
+        self.assertEqual(same["token_identity"]["mismatches"], [])
+        self.assertGreater(same["token_identity"]["checked_cells"], 0)
+        # Drop-the-decay style defect: the kernel row streams other tokens (or an MTP option
+        # diverges from `off`): faster, but refused.
+        drift = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"bad-{p}:256"),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual((drift["outcome"], drift["recommended_on"]), ("off", False))
+        self.assertIn("token streams differ", drift["reason"])
+        wrong_prefix = self.decisions(
+            [
+                digest_row(
+                    "on", True, 60.0, lambda p, o: f"abc-{p}:256" if o == "off" else f"x-{p}:256"
+                ),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(wrong_prefix["outcome"], "off")
+        # Options may differ from each other (verify-vs-decode near-ties) without blaming the
+        # switch, as long as each option streams the same tokens on both twins.
+        per_option = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"{o}-{p}:256"),
+                digest_row("off", False, 50.0, lambda p, o: f"{o}-{p}:256"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(per_option["outcome"], "on")
+        self.assertEqual(per_option["token_identity"]["mismatches"], [])
+        # A negative temperature is greedy too (`Sampling::is_greedy`: temperature <= 0).
+        negative = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"bad-{p}:256", temperature=-1.0),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256", temperature=-1.0),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual((negative["outcome"], negative["recommended_on"]), ("off", False))
+        self.assertIn("token streams differ", negative["reason"])
+        # A sampled (positive-temperature) campaign is not judged for identity.
+        sampled = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"bad-{p}:256", temperature=0.7),
+                digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256", temperature=0.7),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(sampled["token_identity"]["checked_cells"], 0)
+
     def test_the_speculative_and_prefix_cache_defaults_are_decided_from_their_pairs(self) -> None:
         def speculative_row(auto_speed):
             def make(run, k):
