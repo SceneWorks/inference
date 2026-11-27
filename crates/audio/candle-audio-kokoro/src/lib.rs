@@ -124,10 +124,10 @@ mod tests {
         assert_eq!(desc.capabilities.max_size, 0);
         assert_eq!(desc.capabilities.max_count, 1);
         assert_eq!(desc.capabilities.audio_sample_rates, vec![24_000]);
-        assert_eq!(
-            desc.capabilities.max_audio_duration_secs,
-            Some(model::MAX_DURATION_SECS)
-        );
+        fn audio_limit_matches(caps: &gen_core::Capabilities) -> bool {
+            caps.max_audio_duration_secs == Some(model::MAX_DURATION_SECS)
+        }
+        assert!(audio_limit_matches(&desc.capabilities));
         assert_eq!(desc.capabilities.audio_voices, VOICES.to_vec());
         assert_eq!(desc.capabilities.audio_languages, LANGUAGES.to_vec());
         assert!(!desc.capabilities.mac_only);

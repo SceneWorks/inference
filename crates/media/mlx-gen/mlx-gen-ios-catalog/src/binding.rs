@@ -96,6 +96,8 @@ impl fmt::Debug for GenerationView<'_> {
             .field("preview", &r.preview)
             .field("hdr", &r.hdr)
             .field("output_channels", &r.output_channels)
+            .field("low_res_start", &r.low_res_start)
+            .field("source_image", &r.source_image)
             .finish()
     }
 }

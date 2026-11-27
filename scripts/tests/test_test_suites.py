@@ -165,7 +165,8 @@ class TestSuites(unittest.TestCase):
         # 24 conditional pre-load plan/refusal and preview source-scan controls.
         # SW-7232/7234 add eleven source-file/owner planning and packed-view controls.
         # The breadth follow-up adds eleven native report, receipt, window and adapter controls.
-        self.assertEqual(len(controls), 128)
+        # SW-6979 (REG-2) removes the 6 deleted preview_advertising.rs source-scan controls.
+        self.assertEqual(len(controls), 122)
         flux_plan_sources = {
             "crates/contracts/gen-core/src/render/tests.rs": 9,
             "crates/media/mlx-gen/mlx-gen-flux/src/model.rs": 4,
@@ -177,7 +178,6 @@ class TestSuites(unittest.TestCase):
             "crates/media/candle-gen/candle-gen-flux/src/preview.rs": 2,
             "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs": 1,
             "crates/media/candle-gen/candle-gen-pulid/src/preview.rs": 1,
-            "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs": 6,
         }
         for source, count in flux_plan_sources.items():
             self.assertEqual(sum(control["source"] == source for control in controls), count, source)

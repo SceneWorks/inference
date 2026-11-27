@@ -13,9 +13,6 @@ use super::types::RouteRecord;
 
 impl RouteRecord {
     /// Compute [`Capabilities`] purely from this route's primary declarations (`REG-2`, `AP5`).
-    // Keep `..Default::default()` so the `capabilities_are_constructed_additively` guard stays
-    // green while Stage B finishes migrating remaining providers.
-    #[allow(clippy::needless_update)]
     pub fn compute_capabilities(&self) -> Capabilities {
         let s = &self.structure;
         let supports_low_res_start = self.modality == Modality::Image
@@ -84,7 +81,6 @@ impl RouteRecord {
             pag: s.denoiser.pag().cloned(),
             supports_phases: s.denoiser.supports_multiphase_denoise(),
             supports_low_res_start,
-            ..Default::default()
         }
     }
 

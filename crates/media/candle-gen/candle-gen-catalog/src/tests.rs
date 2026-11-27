@@ -83,8 +83,14 @@ fn canonical_mappings_are_backed_by_declared_implementations() {
     // and the fused-transform geometry from it); the id surface is config-independent.
     let flux2_cfg = candle_gen_flux2::config::Flux2Variant::Klein9b.config();
     let flux2 = candle_gen_flux2::Flux2BflToDiffusersMapping::new(&flux2_cfg);
-    let implementations: &[&dyn LogicalKeyMapping] =
-        &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea, &flux2];
+    let flux2_dev_cfg = candle_gen_flux2::config::Flux2Variant::Dev.config();
+    let flux2_dev = candle_gen_flux2::Flux2BflToDiffusersMapping::for_dev(&flux2_dev_cfg);
+    let implementations: &[&dyn LogicalKeyMapping] = &[
+        &candle_gen_wan::WanNativeToDiffusersMapping,
+        &krea,
+        &flux2,
+        &flux2_dev,
+    ];
 
     let mut declared_here = 0usize;
     for adapter in registry.checkpoint_adapters() {
@@ -1489,4 +1495,266 @@ fn wan_sampler_menus_match_mlx_except_the_pinned_14b_fold_in_gap() {
             "{id}: the Candle 14B denoise has no gen-core fold-in (MLX advertises one)"
         );
     }
+}
+
+/// SW-6979 (`REG-1`, `REG-2`, `AP5`): every registered generator in the Candle media catalog is
+/// backed by a [`RouteRecord`], and both route-record and descriptor conformance sweeps pass on
+/// both the production catalog and the weights-free contract-surface catalog.
+#[test]
+fn every_registered_generator_is_backed_by_a_conforming_route_record() {
+    for (label, registry) in [
+        ("provider_registry", super::provider_registry().unwrap()),
+        (
+            "memory_contract_surface_registry",
+            super::memory_contract_surface_registry().unwrap(),
+        ),
+    ] {
+        let generators: Vec<&'static str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert!(
+            !generators.is_empty(),
+            "Candle {label} registered no generators"
+        );
+        for id in &generators {
+            assert!(
+                registry.route_record(id).is_some(),
+                "Candle {label} generator `{id}` must register through a RouteRecord (REG-1)"
+            );
+        }
+        assert_eq!(
+            registry.route_conformance_errors(),
+            Vec::<String>::new(),
+            "Candle {label} route-record conformance sweep failed"
+        );
+        assert_eq!(
+            registry.descriptor_conformance_errors(),
+            Vec::<String>::new(),
+            "Candle {label} descriptor conformance sweep failed"
+        );
+    }
+}
+
+/// Machine-readable bespoke memory waivers remain well-formed, point to existing crate files,
+/// and stay absent from the ordinary generator and memory-strategy registries.
+#[test]
+fn bespoke_memory_route_waivers_are_valid() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let waivers = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+    assert!(!waivers.is_empty(), "expected at least one bespoke waiver");
+    let waived_crates: BTreeSet<_> = waivers.iter().map(|w| w.crate_name).collect();
+    assert_eq!(
+        waived_crates.len(),
+        waivers.len(),
+        "the waiver table must not repeat a crate"
+    );
+
+    let registry = super::memory_contract_surface_registry().unwrap();
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(4)
+        .expect("candle-gen-catalog sits four levels below the workspace root");
+    for waiver in waivers {
+        assert!(
+            super::BESPOKE_UTILITY_CRATES.contains(&waiver.crate_name),
+            "waived crate {:?} is not a declared bespoke utility crate",
+            waiver.crate_name
+        );
+        assert_eq!(waiver.owner, format!("candle-gen-{}", waiver.crate_name));
+        assert!(
+            !waiver.provider_id.trim().is_empty() && !waiver.reason.trim().is_empty(),
+            "waiver {:?} must name a route and a reason",
+            waiver.crate_name
+        );
+        for path in [waiver.contract_path, waiver.verification_path] {
+            let expected_prefix = format!("crates/media/candle-gen/{}/src/", waiver.owner);
+            assert!(
+                path.starts_with(&expected_prefix),
+                "waiver {:?} cites {path:?}, outside its owning crate",
+                waiver.crate_name
+            );
+            assert!(
+                repo_root.join(path).is_file(),
+                "waiver {:?} cites missing file {path:?}",
+                waiver.crate_name
+            );
+        }
+        assert!(
+            registry.generators().all(|registration| {
+                let id = (registration.descriptor)().id;
+                id != waiver.provider_id && id != waiver.crate_name
+            }),
+            "waived route {:?} has a generator registration after all",
+            waiver.provider_id
+        );
+        assert!(
+            registry
+                .memory_strategy_registrations()
+                .all(|registration| registration.provider_id != waiver.provider_id),
+            "waived route {:?} has a memory-strategy registration after all",
+            waiver.provider_id
+        );
+    }
+}
+
+/// Every catalog provider whose `register_providers` body gates registration on `feature = "cuda"`
+/// must receive that feature from `candle-gen-catalog`'s `cuda` feature.
+#[test]
+fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn function_body<'a>(source: &'a str, function: &str) -> &'a str {
+        let start = source
+            .find(function)
+            .unwrap_or_else(|| panic!("missing {function:?}"));
+        let rest = &source[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("{function:?} has no body"));
+        let body_start = open + 1;
+        let mut depth = 1usize;
+        for (offset, ch) in rest[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[body_start..body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{function:?} has an unterminated body");
+    }
+
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn has_cuda_cfg(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(offset) = rest.find("#[cfg(") {
+            let predicate = &rest[offset + "#[cfg(".len()..];
+            let mut depth = 1usize;
+            for (end, ch) in predicate.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let inner = &predicate[..end];
+                            if inner.contains("feature") && inner.contains("\"cuda\"") {
+                                return true;
+                            }
+                            rest = &predicate[end + 1..];
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    let candle_gen_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("candle-gen-catalog sits under crates/media/candle-gen");
+    let catalog_lib = strip_line_comments(
+        &std::fs::read_to_string(candle_gen_root.join("candle-gen-catalog/src/lib.rs")).unwrap(),
+    );
+    let catalog_registration = function_body(&catalog_lib, "pub fn register_providers");
+
+    let mut cuda_gated = BTreeSet::new();
+    let mut crate_dirs: Vec<_> = std::fs::read_dir(candle_gen_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("src/lib.rs").is_file())
+        .collect();
+    crate_dirs.sort();
+    for crate_dir in crate_dirs {
+        let dir = crate_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if dir == "candle-gen-catalog" {
+            continue;
+        }
+        let provider_call = format!("{}::register_providers(", dir.replace('-', "_"));
+        if !catalog_registration.contains(&provider_call) {
+            continue;
+        }
+        let lib_src =
+            strip_line_comments(&std::fs::read_to_string(crate_dir.join("src/lib.rs")).unwrap());
+        let body = function_body(&lib_src, "pub fn register_providers");
+        if has_cuda_cfg(body) {
+            cuda_gated.insert(dir);
+        }
+    }
+    assert!(
+        !cuda_gated.is_empty() && cuda_gated.contains("candle-gen-wan"),
+        "expected CUDA-gated catalog providers including candle-gen-wan, got {cuda_gated:?}"
+    );
+
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(4)
+        .expect("candle-gen-catalog sits four levels below the workspace root");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(workspace_root.join("Cargo.toml"))
+        .output()
+        .expect("cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let features = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "candle-gen-catalog")
+        .unwrap()["features"]
+        .as_object()
+        .unwrap();
+    let feature_members = |feature: &str| {
+        features[feature]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member.as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+    };
+
+    let cuda_forwarded = feature_members("cuda");
+    for provider in &cuda_gated {
+        let forwarding = format!("{provider}/cuda");
+        assert!(
+            cuda_forwarded.contains(forwarding.as_str()),
+            "{provider} has a CUDA-gated register_providers branch, so candle-gen-catalog's \
+             cuda feature must forward {forwarding:?}"
+        );
+    }
+    assert!(
+        feature_members("metal").contains("candle-gen-minimax-h3/metal"),
+        "candle-gen-catalog's metal feature must forward candle-gen-minimax-h3/metal"
+    );
 }

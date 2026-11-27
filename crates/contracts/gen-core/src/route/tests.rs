@@ -377,7 +377,10 @@ fn register_route_one_call_registers_all_tables_and_computes_capabilities() {
         .to_json();
     assert_eq!(audio_json["defaults"]["audio_voice"], "af_heart");
     assert_eq!(audio_json["defaults"]["audio_sample_rate"], 24_000);
-    assert_eq!(audio_json["limits"]["max_audio_duration_secs"], 30.0);
+    fn has_expected_audio_limit(json: &serde_json::Value) -> bool {
+        json["limits"]["max_audio_duration_secs"] == 30.0
+    }
+    assert!(has_expected_audio_limit(&audio_json));
 }
 
 #[test]

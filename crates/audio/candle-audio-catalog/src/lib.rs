@@ -1678,4 +1678,35 @@ mod tests {
     fn connected_sa3_sfx_snapshot_resolves_through_the_composed_lane_preparer() {
         assert_sa3_snapshot_prepares("SA3_SMALL_SFX_SNAPSHOT");
     }
+
+    /// SW-6979 (`REG-1`, `REG-2`, `AP5`): every registered generator in the Candle audio catalog is
+    /// backed by a [`RouteRecord`], and both route-record and descriptor conformance sweeps pass.
+    #[test]
+    fn every_registered_generator_is_backed_by_a_conforming_route_record() {
+        let registry = super::provider_registry().unwrap();
+        let generators: Vec<&'static str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert!(
+            !generators.is_empty(),
+            "Candle audio catalog registered no generators"
+        );
+        for id in &generators {
+            assert!(
+                registry.route_record(id).is_some(),
+                "Candle audio generator `{id}` must register through a RouteRecord (REG-1)"
+            );
+        }
+        assert_eq!(
+            registry.route_conformance_errors(),
+            Vec::<String>::new(),
+            "Candle audio route-record conformance sweep failed"
+        );
+        assert_eq!(
+            registry.descriptor_conformance_errors(),
+            Vec::<String>::new(),
+            "Candle audio descriptor conformance sweep failed"
+        );
+    }
 }

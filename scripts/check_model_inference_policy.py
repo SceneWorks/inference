@@ -890,7 +890,7 @@ class RunGraph:
             # and dense-materialization methods panic; only installation/routing is exercised.
             # MLX source format reporting and load-admission controls use only JSON and measured metadata.
             # Includes iOS fake-provider receipt forwarding and source-aware window metadata controls.
-            controls_sha = '34df6fed1d42a1a8bf462989c729403c4eb7b21a4f1d44200ee34f5431cb962e'
+            controls_sha = '250647d9914841d34ad7327135d4fafc7fbafcef85a887d014e5305fa597a18b'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
