@@ -357,6 +357,18 @@ mod tests {
             stored_stacked_header_geometry(&header(Dtype::U8, &[8, 4, 20])),
             None
         );
+        // The contract-layer mirror (`gen_core`'s header predicate) agrees with this module's
+        // classification for every persisted block type.
+        for dtype in crate::llm_projection::STORED_GGML {
+            let h = header(Dtype::U8, &[8, 4, dtype.type_size()]);
+            assert!(h.is_stored_ggml_block(), "{dtype:?}");
+            assert_eq!(
+                h.stored_ggml_block_bits(),
+                stored_ggml_bits(dtype),
+                "{dtype:?}"
+            );
+            assert!(stored_header_geometry(&h).is_some(), "{dtype:?}");
+        }
         assert_eq!(stored_ggml_bits(GgmlDType::Q4_1), Some(4));
         assert_eq!(stored_ggml_bits(GgmlDType::Q8_0), Some(8));
         assert_eq!(stored_ggml_bits(GgmlDType::F16), None);

@@ -620,6 +620,30 @@ pub(super) fn packed_transformer_bytes(
         .collect::<BTreeMap<_, _>>();
     let mut packed_bases = BTreeSet::new();
     let mut packed = 0_u64;
+    // A Candle-native GGML tier (SW-7285): `{base}.weight` stored as GGML blocks `U8 [out, in / 32,
+    // block_bytes]`, no affine leaves. The Candle loader builds the blocks as published, so they are
+    // resident at their stored bytes; MLX has no reader for them, so that backend refuses.
+    for weight in tensors
+        .values()
+        .filter(|header| header.name.ends_with(".weight") && header.is_stored_ggml_block())
+    {
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        if backend == WanI2vBackend::Mlx
+            || tensors.contains_key(&format!("{base}.scales"))
+            || tensors.contains_key(&format!("{base}.biases"))
+            || weight.stored_ggml_block_bits() != Some(quant.bits() as usize)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} stored GGML {base} is not a Q{} Candle block weight stored one way",
+                path.display(),
+                quant.bits()
+            )));
+        }
+        packed = packed
+            .checked_add(weight.data_bytes)
+            .ok_or_else(|| gen_core::Error::Msg("Wan packed resident total overflow".to_owned()))?;
+        packed_bases.insert(base.to_owned());
+    }
     for weight in tensors
         .values()
         .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)

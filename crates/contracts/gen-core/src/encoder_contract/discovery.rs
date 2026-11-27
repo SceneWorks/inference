@@ -521,7 +521,9 @@ pub(super) fn validate_quantization_evidence(
             return false;
         }
         let base = header.name.strip_suffix(".weight").unwrap_or(&header.name);
+        // A Candle-native GGML tier's stored blocks (SW-7285) are packed evidence too.
         header.dtype == Dtype::U32
+            || header.is_stored_ggml_block()
             || names.contains(format!("{base}.scales").as_str())
             || names.contains(format!("{base}.biases").as_str())
     });

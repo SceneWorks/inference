@@ -462,6 +462,7 @@ impl EncoderContract {
         for weight in headers.iter().filter(|header| {
             header.name.ends_with(".weight")
                 && (header.dtype == Dtype::U32
+                    || header.is_stored_ggml_block()
                     || find(&format!(
                         "{}.scales",
                         header.name.strip_suffix(".weight").unwrap_or(&header.name)
@@ -487,6 +488,12 @@ impl EncoderContract {
             }
             let scales = find(&format!("{base}.scales"));
             let biases = find(&format!("{base}.biases"));
+            // A stored GGML block projection (SW-7285) on an allowed base: its width and matrix
+            // are checked by `validate_matrix`; a sibling `.scales` / `.biases` falls through to
+            // the triple check below, which refuses its U8 weight.
+            if weight.is_stored_ggml_block() && scales.is_none() && biases.is_none() {
+                continue;
+            }
             let (Some(scales), Some(biases)) = (scales, biases) else {
                 return Err(self.mismatch(
                     path,
@@ -720,6 +727,47 @@ impl EncoderContract {
             .iter()
             .find(|header| header.name == format!("{base}.biases"));
         match (scales, biases) {
+            // A Candle-native GGML tier (SW-7285): ONE stored block weight `U8 [out, in / 32,
+            // block_bytes]` is the packed surface, at the declared width and the exact matrix.
+            (None, None) if weight.shape.len() == 3 && weight.is_stored_ggml_block() => {
+                if !must_be_packed {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_surface",
+                        format!("dense weight for {base}"),
+                        "stored GGML blocks",
+                    ));
+                }
+                let quant = packed_quant.ok_or_else(|| {
+                    self.mismatch(
+                        path,
+                        "quantization",
+                        "sibling config.json with bits",
+                        format!("stored GGML blocks {base} without authoritative metadata"),
+                    )
+                })?;
+                let bits = weight.stored_ggml_block_bits();
+                if bits != Some(quant.bits) {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_dtype",
+                        format!("Q{} GGML blocks", quant.bits),
+                        format!("{:?} with {bits:?}-bit blocks", weight.shape),
+                    ));
+                }
+                let block_elements = if weight.shape[2] == 144 { 256 } else { 32 };
+                if weight.shape[0] != expected_output {
+                    return Err(self.mismatch(path, field, expected_output, weight.shape[0]));
+                }
+                if weight.shape[1].checked_mul(block_elements) != Some(expected_input) {
+                    return Err(self.mismatch(
+                        path,
+                        "hidden_size",
+                        expected_input,
+                        format!("{:?} stored blocks", weight.shape),
+                    ));
+                }
+            }
             (None, None) => {
                 if must_be_packed {
                     return Err(self.mismatch(

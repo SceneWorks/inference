@@ -999,9 +999,18 @@ pub struct Ltx25TierManifest {
     pub quant: Ltx25Quant,
     /// One row per component, in manifest order.
     pub components: Vec<Ltx25ManifestComponent>,
+    /// The optional `quantization_storage` marker (SW-7285): `Some("ggml")` for a Candle-native
+    /// GGML split tier, whose packed Linears are stored GGML blocks rather than affine triples.
+    pub storage: Option<String>,
 }
 
 impl Ltx25TierManifest {
+    /// Whether this manifest declares a Candle-native GGML split tier
+    /// (`quantization_storage == "ggml"`, SW-7285).
+    pub fn is_ggml_storage(&self) -> bool {
+        self.storage.as_deref() == Some(candle_gen::quant::stored_ggml::GGML_STORAGE)
+    }
+
     /// The row for `name`, if the manifest carries one.
     pub fn component(&self, name: &str) -> Option<&Ltx25ManifestComponent> {
         self.components.iter().find(|c| c.name == name)
@@ -1055,6 +1064,7 @@ impl Ltx25TierManifest {
                 group: json_usize(source, json, "quantization_group_size")?,
             },
             components,
+            storage: optional_json_string(source, json, "quantization_storage")?,
         })
     }
 }
@@ -1352,7 +1362,13 @@ impl Ltx25Tier {
                         tensor: header.name.clone(),
                     });
                 };
-                let detail = if by_name.contains_key(format!("{base}.scales").as_str()) {
+                let detail = if !self.manifest.is_ggml_storage() {
+                    Some(
+                        "is stored as GGML blocks, but the manifest does not declare \
+                         `quantization_storage: \"ggml\"`"
+                            .to_string(),
+                    )
+                } else if by_name.contains_key(format!("{base}.scales").as_str()) {
                     Some(format!(
                         "also carries `{base}.scales` — a projection is stored as GGML blocks or as \
                          an affine triple, never both"
@@ -1389,6 +1405,19 @@ impl Ltx25Tier {
                     tensor: header.name.clone(),
                 });
             };
+            // A GGML split tier (SW-7285) stores every packed Linear as GGML blocks: an affine
+            // `.scales` leg anywhere in it is a component from another tier.
+            if self.manifest.is_ggml_storage() {
+                return Err(Ltx25TierError::StoredGgmlMismatch {
+                    component: row.name.clone(),
+                    path: path.to_path_buf(),
+                    base: base.to_string(),
+                    detail: format!(
+                        "carries `{base}.scales`, but the manifest declares a GGML split tier \
+                         (`quantization_storage: \"ggml\"`) whose packed Linears are stored blocks"
+                    ),
+                });
+            }
             packed += 1;
             // (5) A triple is `{base}.weight` + `{base}.scales` + `{base}.biases`. A missing leg
             // would otherwise surface as a `get_unchecked` failure mid-load, after the caller has

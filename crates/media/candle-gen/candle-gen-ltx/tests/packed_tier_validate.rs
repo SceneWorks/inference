@@ -830,6 +830,8 @@ pub(crate) mod ltx25_fixture {
         pub manifest_group: Option<usize>,
         pub model_version: &'static str,
         pub components: Vec<Comp>,
+        /// The manifest's `quantization_storage` marker (SW-7285), when written.
+        pub storage: Option<&'static str>,
     }
 
     /// The reasons the shipped q4 tier actually declares, so the fixture exercises the same strings
@@ -859,6 +861,7 @@ pub(crate) mod ltx25_fixture {
                 bits: Q4,
                 group: GROUP,
                 manifest_group: None,
+                storage: None,
                 model_version: V25,
                 components: vec![
                     Comp::packed("transformer", 2),
@@ -942,7 +945,7 @@ pub(crate) mod ltx25_fixture {
                 }
                 rows.push(serde_json::Value::Object(row));
             }
-            let manifest = serde_json::json!({
+            let mut manifest = serde_json::json!({
                 "format": "split",
                 "model_version": self.model_version,
                 "variant": "distilled",
@@ -953,6 +956,9 @@ pub(crate) mod ltx25_fixture {
                 "components": self.components.iter().map(|c| c.name).collect::<Vec<_>>(),
                 "component_detail": rows,
             });
+            if let Some(storage) = self.storage {
+                manifest["quantization_storage"] = storage.into();
+            }
             std::fs::write(
                 dir.join("split_model.json"),
                 serde_json::to_string_pretty(&manifest).expect("manifest json"),
@@ -1212,11 +1218,33 @@ mod ltx25_validation {
     #[test]
     fn a_stored_ggml_q4_bundle_validates_with_blocks_counted_as_packed() {
         let mut spec = BundleSpec::q4();
+        spec.storage = Some("ggml");
         spec.comp("transformer").storage = Storage::Stored(2, 20);
         spec.comp("connector").storage = Storage::Stored(1, 20);
+        spec.comp("vae_diffusion_decoder").storage = Storage::Stored(1, 20);
         let (result, _root) = validate(&spec);
         let report = result.expect("stored Q4_1 blocks are the q4 tier's packed Linears");
         assert_eq!(report.packed_total(), 4);
+
+        // The `quantization_storage` marker is the tier's declaration: stored blocks without it,
+        // and an affine triple inside a declared GGML tier, are each a component from another tier.
+        let mut unmarked = spec.clone();
+        unmarked.storage = None;
+        let (result, _root) = validate(&unmarked);
+        let err = result.expect_err("stored blocks need the ggml manifest marker");
+        assert!(
+            matches!(&err, Ltx25TierError::StoredGgmlMismatch { detail, .. }
+                if detail.contains("does not declare")),
+            "{err}"
+        );
+        let mut mixed = spec.clone();
+        mixed.comp("connector").storage = Storage::Packed(1);
+        let (result, _root) = validate(&mixed);
+        let err = result.expect_err("an affine triple inside a GGML split tier");
+        assert!(
+            matches!(&err, Ltx25TierError::StoredGgmlMismatch { component, .. } if *component == "connector"),
+            "{err}"
+        );
     }
 
     /// `Q8_0` blocks inside a q4 tier, a stored block in the dense tier, and a projection stored
@@ -1224,6 +1252,9 @@ mod ltx25_validation {
     #[test]
     fn stored_ggml_blocks_of_the_wrong_width_tier_or_form_are_refused() {
         let mut spec = BundleSpec::q4();
+        spec.storage = Some("ggml");
+        spec.comp("connector").storage = Storage::Stored(1, 20);
+        spec.comp("vae_diffusion_decoder").storage = Storage::Stored(1, 20);
         spec.comp("transformer").storage = Storage::Stored(2, 34);
         let (result, _root) = validate(&spec);
         let err = result.expect_err("Q8_0 blocks are not a q4 tier");
@@ -1241,15 +1272,23 @@ mod ltx25_validation {
             "{err}"
         );
 
-        let mut spec = BundleSpec::q4();
-        spec.comp("connector").storage = Storage::StoredBothForms(20);
-        let (result, _root) = validate(&spec);
-        let err = result.expect_err("a projection stored both ways");
-        assert!(
-            matches!(&err, Ltx25TierError::StoredGgmlMismatch { component, detail, .. }
-                if *component == "connector" && detail.contains("never both")),
-            "{err}"
-        );
+        for storage in [None, Some("ggml")] {
+            let mut spec = BundleSpec::q4();
+            spec.storage = storage;
+            if storage.is_some() {
+                // Every other packed component of a declared GGML tier is stored blocks.
+                spec.comp("transformer").storage = Storage::Stored(2, 20);
+                spec.comp("vae_diffusion_decoder").storage = Storage::Stored(1, 20);
+            }
+            spec.comp("connector").storage = Storage::StoredBothForms(20);
+            let (result, _root) = validate(&spec);
+            let err = result.expect_err("a projection stored both ways");
+            assert!(
+                matches!(&err, Ltx25TierError::StoredGgmlMismatch { component, .. }
+                    if *component == "connector"),
+                "{storage:?}: {err}"
+            );
+        }
     }
 
     /// A packed tensor inside the tier that declares itself dense.
