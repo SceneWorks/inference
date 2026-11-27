@@ -1390,7 +1390,7 @@ class CompareTests(unittest.TestCase):
         )["CANDLE_CUDA.cuda_graphs"]
         self.assertEqual(same["outcome"], "on")
         self.assertEqual(same["token_identity"]["mismatches"], [])
-        self.assertGreater(same["token_identity"]["checked_prompts"], 0)
+        self.assertGreater(same["token_identity"]["checked_cells"], 0)
         # Drop-the-decay style defect: the kernel row streams other tokens (or an MTP option
         # diverges from `off`): faster, but refused.
         drift = self.decisions(
@@ -1410,6 +1410,16 @@ class CompareTests(unittest.TestCase):
             ]
         )["CANDLE_CUDA.cuda_graphs"]
         self.assertEqual(wrong_prefix["outcome"], "off")
+        # Options may differ from each other (verify-vs-decode near-ties) without blaming the
+        # switch, as long as each option streams the same tokens on both twins.
+        per_option = self.decisions(
+            [
+                digest_row("on", True, 60.0, lambda p, o: f"{o}-{p}:256"),
+                digest_row("off", False, 50.0, lambda p, o: f"{o}-{p}:256"),
+            ]
+        )["CANDLE_CUDA.cuda_graphs"]
+        self.assertEqual(per_option["outcome"], "on")
+        self.assertEqual(per_option["token_identity"]["mismatches"], [])
         # A negative temperature is greedy too (`Sampling::is_greedy`: temperature <= 0).
         negative = self.decisions(
             [
@@ -1426,7 +1436,7 @@ class CompareTests(unittest.TestCase):
                 digest_row("off", False, 50.0, lambda p, o: f"abc-{p}:256", temperature=0.7),
             ]
         )["CANDLE_CUDA.cuda_graphs"]
-        self.assertEqual(sampled["token_identity"]["checked_prompts"], 0)
+        self.assertEqual(sampled["token_identity"]["checked_cells"], 0)
 
     def test_the_speculative_and_prefix_cache_defaults_are_decided_from_their_pairs(self) -> None:
         def speculative_row(auto_speed):
