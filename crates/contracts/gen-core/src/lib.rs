@@ -147,6 +147,7 @@ pub use load_activity::{
 };
 pub mod safetensors_shards;
 pub mod sampling;
+pub mod stored_ggml;
 pub mod text_embed;
 pub mod tier_integrity;
 pub mod tiling;

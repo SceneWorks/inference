@@ -122,10 +122,21 @@ impl ValidatedEncoderSource {
     }
 
     /// The affine group size of the packed tier this exact validated source stores, or `None` for
-    /// a dense source. Paired with [`Self::packed_quant_bits`] so a backend can build the packed
-    /// parts from the validated source instead of re-reading the on-disk `quantization` block.
+    /// a dense source **and for a stored-GGML source** (whose group is fixed by its block type; see
+    /// [`Self::packed_quant_is_stored_ggml`]). Paired with [`Self::packed_quant_bits`] so a backend
+    /// can build the packed parts from the validated source instead of re-reading the on-disk
+    /// `quantization` block.
     pub fn packed_quant_group_size(&self) -> Option<i32> {
-        self.packed_quant.map(|quant| quant.group_size as i32)
+        self.packed_quant
+            .and_then(PackedQuantization::group_size)
+            .map(|group_size| group_size as i32)
+    }
+
+    /// Whether this exact validated source is a Candle-native stored-GGML tier (SW-7285): every
+    /// packed matrix is one U8 block tensor, built as stored rather than repacked from an MLX
+    /// affine triple. Only the Candle loaders consume this form.
+    pub fn packed_quant_is_stored_ggml(&self) -> bool {
+        self.packed_quant.is_some_and(PackedQuantization::is_ggml)
     }
 
     /// Derive the load-time conversion from the quantization evidence retained by this exact
@@ -539,12 +550,48 @@ pub(super) fn collect_unique_encoder_headers(
     Ok(headers.into_values().collect())
 }
 
-/// One affine packed-quantization marker as a selected encoder's `config.json` declares it
-/// (`quantization: {bits, group_size}`).
+/// One packed-quantization marker as a selected encoder's `config.json` declares it: either the
+/// MLX affine triple (`quantization: {bits, group_size}`) or a Candle-native stored GGML tier
+/// (`quantization: {bits, storage: "ggml"}`, SW-7285).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PackedQuantization {
     pub(super) bits: usize,
-    pub(super) group_size: usize,
+    pub(super) storage: PackedStorage,
+}
+
+/// How a packed encoder persists each quantized matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PackedStorage {
+    /// `{base}.weight` (U32 codes) + `{base}.scales` + `{base}.biases` at one affine group size.
+    MlxAffine { group_size: usize },
+    /// One `{base}.weight` U8 `[out, in / block_size, block_bytes]` stored GGML block tensor
+    /// ([`crate::stored_ggml`]) whose block type stores `bits`; no affine siblings.
+    Ggml,
+}
+
+impl PackedQuantization {
+    /// The affine group size, `None` for stored GGML blocks (their group is fixed by block type).
+    pub(super) fn group_size(self) -> Option<usize> {
+        match self.storage {
+            PackedStorage::MlxAffine { group_size } => Some(group_size),
+            PackedStorage::Ggml => None,
+        }
+    }
+
+    pub(super) fn is_ggml(self) -> bool {
+        matches!(self.storage, PackedStorage::Ggml)
+    }
+}
+
+impl std::fmt::Display for PackedQuantization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.storage {
+            PackedStorage::MlxAffine { group_size } => {
+                write!(f, "Q{} group_size {group_size}", self.bits)
+            }
+            PackedStorage::Ggml => write!(f, "Q{} stored GGML blocks", self.bits),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

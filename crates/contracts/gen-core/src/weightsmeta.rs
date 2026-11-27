@@ -555,9 +555,10 @@ impl SafetensorsTensorHeader {
     /// (SW-7285): `U8 [out, in / 32, block_bytes]` (rank 3), or the stacked fused-MoE form
     /// `U8 [E, out, in / 32, block_bytes]` (rank 4), whose last axis is one persisted block size —
     /// `Q4_0` 18, `Q4_1` 20, `Q8_0` 34 or `Q4_K` 144 bytes. Its resident bytes are its stored
-    /// [`data_bytes`](Self::data_bytes). This is the contract-layer mirror of
-    /// `candle_layers::llm_projection::ggml_block_storage` (a candle-layers test pins the two
-    /// agree); the nominal bit width is [`stored_ggml_block_bits`](Self::stored_ggml_block_bits).
+    /// [`data_bytes`](Self::data_bytes). The rule is [`crate::stored_ggml`]'s — the one definition
+    /// `candle_layers::llm_projection::ggml_block_storage` also derives from — restricted to the
+    /// rank-3 / rank-4 forms a tier persists; the nominal bit width is
+    /// [`stored_ggml_block_bits`](Self::stored_ggml_block_bits).
     pub fn is_stored_ggml_block(&self) -> bool {
         self.stored_ggml_block_bits().is_some()
     }
@@ -565,14 +566,10 @@ impl SafetensorsTensorHeader {
     /// The nominal weight bit width of a [stored GGML block](Self::is_stored_ggml_block) header
     /// (`Q4_*` → 4, `Q8_0` → 8), or `None` for any other tensor.
     pub fn stored_ggml_block_bits(&self) -> Option<usize> {
-        if self.dtype != Dtype::U8 || !matches!(self.shape.len(), 3 | 4) {
+        if !matches!(self.shape.len(), 3 | 4) {
             return None;
         }
-        match self.shape.last()? {
-            18 | 20 | 144 => Some(4),
-            34 => Some(8),
-            _ => None,
-        }
+        crate::stored_ggml::stored_ggml_header_geometry(self).map(|g| g.block.bits())
     }
 
     /// Checked element count described by the tensor shape.

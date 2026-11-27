@@ -318,6 +318,7 @@ impl VisionEncoderContract {
             .filter(|header| {
                 owns_tensor(&header.name)
                     && (header.dtype == Dtype::U32
+                        || crate::stored_ggml::stored_ggml_header_geometry(header).is_some()
                         || header.name.ends_with(".scales")
                         || header.name.ends_with(".biases"))
             })

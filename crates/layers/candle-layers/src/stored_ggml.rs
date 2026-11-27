@@ -34,16 +34,13 @@ use crate::llm_projection::{from_ggml_block_tensor, ggml_block_storage};
 /// The `quantization.storage` value a Candle-native tier's component `config.json` carries: every
 /// packed projection is persisted as a stored GGML block tensor rather than an MLX affine triple.
 /// The same tag `candle-llm`'s prepared tiers use.
-pub const GGML_STORAGE: &str = "ggml";
+pub const GGML_STORAGE: &str = gen_core::stored_ggml::GGML_STORAGE;
 
 /// Whether a component `config.json` declares a Candle-native GGML tier
 /// (`quantization.storage == "ggml"`). Informational only: every loader classifies each tensor by
 /// its header, so a mislabelled config can neither hide nor invent a stored block.
 pub fn config_declares_ggml_storage(cfg: &serde_json::Value) -> bool {
-    cfg.get("quantization")
-        .and_then(|q| q.get("storage"))
-        .and_then(|s| s.as_str())
-        == Some(GGML_STORAGE)
+    gen_core::stored_ggml::config_declares_ggml_storage(cfg)
 }
 
 /// The GGML block type and logical `(rows, cols)` of a **rank-3** stored GGML block tensor with the
