@@ -38,6 +38,18 @@ mod harness;
 #[cfg(feature = "cuda")]
 #[path = "fused_kernels_bench/act_quant.rs"]
 mod act_quant;
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/adaln.rs"]
+mod adaln;
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/adaln_chain.rs"]
+mod adaln_chain;
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/rope.rs"]
+mod rope;
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/rope_routes.rs"]
+mod rope_routes;
 
 #[cfg(feature = "cuda")]
 #[path = "fused_kernels_bench/vae_norm_silu_pad.rs"]
@@ -47,6 +59,10 @@ mod vae_norm_silu_pad;
 #[cfg(feature = "cuda")]
 const SUITES: &[(&str, harness::Suite)] = &[
     ("act_quant", act_quant::rows),
+    ("adaln", adaln::rows),
+    ("adaln_chain", adaln_chain::rows),
+    ("rope", rope::rows),
+    ("rope_routes", rope_routes::rows),
     ("vae_norm_silu_pad", vae_norm_silu_pad::rows),
 ];
 

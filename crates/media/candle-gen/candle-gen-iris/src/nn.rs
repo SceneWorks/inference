@@ -27,6 +27,7 @@ use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{CancelFlag, Quant};
 use candle_gen::quant::{LokrFactors, QLinear};
+use candle_gen::rope::{RopeLayout, RopeSpec};
 use candle_gen::{CandleError as Error, Result};
 use gen_core_iris as iris;
 
@@ -66,8 +67,14 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Ok(to(a, dt)?.broadcast_mul(&to(b, dt)?)?)
 }
 
-/// `x · (1 + scale) + shift`, promoting like torch.
+/// `x · (1 + scale) + shift`, promoting like torch. One dtype throughout (the DiT's case) is the
+/// shared composable modulate (SW-6129), the exact chain; a mixed-dtype call keeps the torch
+/// promotion (`1 + scale` rounds in `scale`'s dtype, then the product and sum promote to f32), which
+/// the same-dtype shared helper cannot express.
 pub fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    if x.dtype() == scale.dtype() && x.dtype() == shift.dtype() {
+        return Ok(candle_gen::modulate::modulate(x, scale, shift)?);
+    }
     let one_plus = (scale + 1.0)?;
     add(&mul(x, &one_plus)?, shift)
 }
@@ -965,6 +972,34 @@ impl RmsNorm {
             self.eps,
         )?))
     }
+
+    /// `modulate(self.forward(x), shift, scale)` — this RMSNorm then the AdaLN modulation — through
+    /// the shared fused AdaLN (SW-6129) wherever [`RmsNorm::forward`] takes candle's fused
+    /// `rms_norm` (f32 copy of `x`, f32 weight, f32 out): `AdaLn::rms(eps).with_weight(w)` on that
+    /// f32 copy is the same op, and [`modulate`]'s two forms map exactly — f32 modulation as
+    /// `(1 + scale)`, a mixed-dtype one as its torch promotion (`1 + scale` rounded in the scale's
+    /// dtype, promoted with the shift to f32) entering as a direct scale. One launch on CUDA, those
+    /// ops elsewhere. Under autograd or a forced-composable region the composable norm keeps
+    /// running, unchanged.
+    pub fn rms_modulate(&self, x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        let xf = to(x, DType::F32)?.contiguous()?;
+        if xf.track_op() || self.weight.track_op() || composable_forced() || xf.rank() != 3 {
+            return modulate(&self.forward(x)?, shift, scale);
+        }
+        use candle_gen::modulate::{adaln, AdaLn};
+        let spec = AdaLn::rms(self.eps as f64).with_weight(&self.weight);
+        if scale.dtype() == DType::F32 && shift.dtype() == DType::F32 {
+            return Ok(__model_proof_output!(adaln(&xf, &spec, scale, shift))?);
+        }
+        let one_plus = to(&(scale + 1.0)?, DType::F32)?;
+        let shift = to(shift, DType::F32)?;
+        Ok(__model_proof_output!(adaln(
+            &xf,
+            &spec.direct_scale(),
+            &one_plus,
+            &shift
+        ))?)
+    }
 }
 
 thread_local! {
@@ -985,6 +1020,10 @@ pub fn with_composable<T>(f: impl FnOnce() -> T) -> T {
     FORCE_COMPOSABLE.with(|c| c.set(prev));
     out
 }
+
+/// Iris's RoPE convention: adjacent `(re, im)` pairs on `[B, N, H, head_dim]`, rotated in f32 and
+/// rounded once to the activation dtype.
+pub const IRIS_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bshd);
 
 /// Rotation tables `(cos, sin)`, `[n, pairs]` f32, for [`Rope::apply`].
 #[derive(Clone)]
@@ -1041,18 +1080,17 @@ impl Rope {
 
     /// Rotate `x` `[B, N, H, head_dim]` by complex multiplication over **adjacent** channel pairs
     /// (`view_as_complex`), in f32; returns `x`'s dtype.
+    ///
+    /// The shared [`candle_gen::rope::apply_rope`] (SW-6129, [`IRIS_ROPE`]): the fused strided kernel
+    /// on CUDA, and everywhere else — and inside a forced-composable checkpoint region
+    /// ([`composable_forced`]) — the shared reference chain, bit-identical to the `re·cos − im·sin`,
+    /// `re·sin + im·cos`, stack chain this used to carry.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, n, h, d) = x.dims4()?;
-        let pairs = d / 2;
-        let xf = to(x, DType::F32)?.reshape((b, n, h, pairs, 2))?;
-        let re = xf.narrow(4, 0, 1)?.squeeze(4)?;
-        let im = xf.narrow(4, 1, 1)?.squeeze(4)?;
-        let cos = self.cos.reshape((1, n, 1, pairs))?;
-        let sin = self.sin.reshape((1, n, 1, pairs))?;
-        let out_re = re.broadcast_mul(&cos)?.sub(&im.broadcast_mul(&sin)?)?;
-        let out_im = re.broadcast_mul(&sin)?.add(&im.broadcast_mul(&cos)?)?;
-        let out = Tensor::stack(&[out_re, out_im], 4)?.reshape((b, n, h, d))?;
-        to(&out, x.dtype())
+        Ok(if composable_forced() {
+            candle_gen::rope::apply_rope_reference(x, &self.cos, &self.sin, &IRIS_ROPE)?
+        } else {
+            candle_gen::rope::apply_rope(x, &self.cos, &self.sin, &IRIS_ROPE)?
+        })
     }
 }
 
@@ -1668,5 +1706,294 @@ mod tests {
             );
         });
         assert!(attention_scope().is_none());
+    }
+}
+
+/// SW-6129: the DiT `Rope::apply` is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private apply, verbatim.
+    fn former_apply(rope: &Rope, x: &Tensor) -> Tensor {
+        let (b, n, h, d) = x.dims4().unwrap();
+        let pairs = d / 2;
+        let xf = to(x, DType::F32)
+            .unwrap()
+            .reshape((b, n, h, pairs, 2))
+            .unwrap();
+        let re = xf.narrow(4, 0, 1).unwrap().squeeze(4).unwrap();
+        let im = xf.narrow(4, 1, 1).unwrap().squeeze(4).unwrap();
+        let cos = rope.cos.reshape((1, n, 1, pairs)).unwrap();
+        let sin = rope.sin.reshape((1, n, 1, pairs)).unwrap();
+        let out_re = re
+            .broadcast_mul(&cos)
+            .unwrap()
+            .sub(&im.broadcast_mul(&sin).unwrap())
+            .unwrap();
+        let out_im = re
+            .broadcast_mul(&sin)
+            .unwrap()
+            .add(&im.broadcast_mul(&cos).unwrap())
+            .unwrap();
+        let out = Tensor::stack(&[out_re, out_im], 4)
+            .unwrap()
+            .reshape((b, n, h, d))
+            .unwrap();
+        to(&out, x.dtype()).unwrap()
+    }
+
+    /// The shared route equals the former apply bit for bit on CPU in f32 / bf16 / f16, for the
+    /// real 2-D grid table and the 1-D text table, and inside a forced-composable region.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let grid = Rope::grid_2d(64, 4, 6, 10_000.0, 1.0, &dev).unwrap();
+        let line = Rope::line_1d(64, 9, 10_000.0, &dev).unwrap();
+        for (rope, n) in [(&grid, 24usize), (&line, 9)] {
+            let x32 = values(&[2, n, 3, 64], 7, &dev);
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let x = x32.to_dtype(dtype).unwrap();
+                let want = bits(&former_apply(rope, &x));
+                let got = rope.apply(&x).unwrap();
+                assert_eq!(got.dtype(), dtype);
+                assert_eq!(bits(&got), want, "{dtype:?}");
+                let forced = with_composable(|| rope.apply(&x).unwrap());
+                assert_eq!(bits(&forced), want, "{dtype:?} (forced composable)");
+            }
+        }
+    }
+
+    /// The same-dtype modulate is the shared helper, bit for bit the former promoting chain; a
+    /// mixed-dtype call keeps the torch promotion.
+    #[test]
+    fn modulate_matches_the_former_promoting_chain() {
+        let dev = Device::Cpu;
+        let x = values(&[2, 5, 8], 1, &dev);
+        let shift = values(&[2, 1, 8], 2, &dev);
+        let scale = values(&[2, 1, 8], 3, &dev);
+        let former = |x: &Tensor, shift: &Tensor, scale: &Tensor| {
+            add(&mul(x, &(scale + 1.0).unwrap()).unwrap(), shift).unwrap()
+        };
+        for (xd, sd) in [
+            (DType::F32, DType::F32),
+            (DType::BF16, DType::BF16),
+            (DType::F32, DType::BF16),
+            (DType::BF16, DType::F32),
+        ] {
+            let (x, shift, scale) = (
+                x.to_dtype(xd).unwrap(),
+                shift.to_dtype(sd).unwrap(),
+                scale.to_dtype(sd).unwrap(),
+            );
+            let got = modulate(&x, &shift, &scale).unwrap();
+            let want = former(&x, &shift, &scale);
+            assert_eq!(got.dtype(), want.dtype());
+            assert_eq!(bits(&got), bits(&want), "{xd:?} / {sd:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: iris Rope::apply (bf16, 2-D grid + 1-D text tables) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // A 1024^2 image grid (64x64 patch tokens) and a 256-token text line, 32 heads x 128, bf16.
+        let grid = Rope::grid_2d(128, 64, 64, 10_000.0, 1.0, &dev).unwrap();
+        let line = Rope::line_1d(128, 256, 10_000.0, &dev).unwrap();
+        let qi = values(&[1, 4096, 32, 128], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let qt = values(&[1, 256, 32, 128], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    grid.apply(&qi).unwrap().flatten_all().unwrap(),
+                    line.apply(&qt).unwrap().flatten_all().unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("iris Rope::apply (bf16, 2-D grid + 1-D text tables): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: the Iris DiT RMSNorm + AdaLN sites are the shared fused AdaLN
+/// ([`RmsNorm::rms_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    fn norm(d: usize, device: &Device) -> RmsNorm {
+        RmsNorm {
+            weight: values(&[d], 9, 0.5, 1.0, device),
+            eps: 1e-6,
+        }
+    }
+
+    /// CPU: `rms_modulate` is bit-identical to the former `modulate(norm.forward(x), shift,
+    /// scale)` for f32 / bf16 / f16 `x` and both modulation forms (f32, and a bf16 table taking the
+    /// torch promotion), at hidden 3072.
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn rms_modulate_matches_the_former_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let n = norm(d, &dev);
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        for xd in [DType::F32, DType::BF16, DType::F16] {
+            for md in [DType::F32, DType::BF16] {
+                let x = x32.to_dtype(xd).unwrap();
+                let shift = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                let scale = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                let want = modulate(&n.forward(&x).unwrap(), &shift, &scale).unwrap();
+                let got = __model_proof_output!(n.rms_modulate(&x, &shift, &scale)).unwrap();
+                assert_eq!(got.dtype(), want.dtype());
+                assert_eq!(bits(&got), bits(&want), "x {xd:?} mod {md:?}");
+            }
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate");
+    }
+
+    /// SW-6129 CUDA smoke: Iris `rms_modulate` (bf16 `[1, 4352, 3072]` stream, f32 and bf16
+    /// modulation rows) is fused (2 calls) and bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let n = norm(d, &dev);
+        let x = values(&[1, 4352, d], 11, 3.0, 0.3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let m32 = (
+            values(&[1, 1, d], 12, 0.5, 0.0, &dev),
+            values(&[1, 1, d], 13, 0.5, 0.0, &dev),
+        );
+        let mbf = (
+            m32.0.to_dtype(DType::BF16).unwrap(),
+            m32.1.to_dtype(DType::BF16).unwrap(),
+        );
+        assert_fused_and_bit_identical(
+            "iris rms_modulate (bf16 [1,4352,3072], f32 + bf16 rows)",
+            2,
+            &|| {
+                let a = __model_proof_output!(n.rms_modulate(&x, &m32.0, &m32.1)).unwrap();
+                let b = n.rms_modulate(&x, &mbf.0, &mbf.1).unwrap();
+                Tensor::cat(&[&a, &b], 1).unwrap()
+            },
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

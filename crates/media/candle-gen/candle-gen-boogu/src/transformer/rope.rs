@@ -13,7 +13,12 @@
 //! `cos`/`sin` tables are built on the host in f32 (the reference builds the freqs in f32), uploaded
 //! to the model device, and sliced into the text-only / image-only sub-ranges.
 
-use candle_gen::candle_core::{Device, Result, Tensor, D};
+use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::rope::{RopeLayout, RopeSpec};
+
+/// Boogu's RoPE convention (the Lumina complex-interleaved pairs on `[b, s, heads, head_dim]`, half
+/// tables, rotated in f32 and cast back) — the same as Krea's `KREA_ROPE`.
+pub const BOOGU_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bshd);
 
 /// Precomputed `cos`/`sin` rotary tables for one forward pass.
 ///
@@ -198,31 +203,12 @@ fn from_positions(
 /// `(x[2k], x[2k+1])`:
 ///   `out[2k]   = x[2k]·cos_k − x[2k+1]·sin_k`
 ///   `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k`
-/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype.
+/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype. SW-6129: this is
+/// [`candle_gen::rope::apply_rope`] with [`BOOGU_ROPE`] — the fused strided kernel on CUDA, and on
+/// every other path the shared reference chain, op for op this function's former body
+/// (`rope_route_tests` pins the bit identity).
 pub fn apply_interleaved_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dt = x.dtype();
-    let (b, s, h, hd) = x.dims4()?;
-    let half = hd / 2;
-
-    // cos/sin: [1, s, half] → [1, s, 1, half] (broadcast over heads + the pair axis). They arrive as
-    // `narrow`ed slices of the rope table, so contiguate before the reshape.
-    let cos = cos.contiguous()?.reshape((1, s, 1, half))?;
-    let sin = sin.contiguous()?.reshape((1, s, 1, half))?;
-
-    // [b, s, h, hd] → [b, s, h, half, 2]; the last axis holds the (even, odd) complex pair.
-    let xr = x
-        .to_dtype(candle_gen::candle_core::DType::F32)?
-        .reshape((b, s, h, half, 2))?;
-    // `narrow` yields a strided view; contiguate before the reshape (candle reshape needs contiguous).
-    let xe = xr.narrow(4, 0, 1)?.contiguous()?.reshape((b, s, h, half))?;
-    let xo = xr.narrow(4, 1, 1)?.contiguous()?.reshape((b, s, h, half))?;
-
-    let out_e = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
-    let out_o = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
-
-    // Re-interleave: stack on a new trailing axis → [b, s, h, half, 2] → [b, s, h, hd].
-    let out = Tensor::stack(&[&out_e, &out_o], D::Minus1)?.reshape((b, s, h, hd))?;
-    out.to_dtype(dt)
+    candle_gen::rope::apply_rope(x, cos, sin, &BOOGU_ROPE)
 }
 
 #[cfg(test)]
@@ -268,5 +254,100 @@ mod tests {
         assert_eq!(r.text().unwrap().0.dim(1).unwrap(), 5);
         assert_eq!(r.ref_image().unwrap().0.dim(1).unwrap(), 64);
         assert_eq!(r.image().unwrap().0.dim(1).unwrap(), 256);
+    }
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::{DType, D};
+
+    /// The pre-SW-6129 `apply_interleaved_rope`, verbatim (the oracle).
+    fn former(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let (b, s, h, hd) = x.dims4()?;
+        let half = hd / 2;
+
+        // cos/sin: [1, s, half] → [1, s, 1, half] (broadcast over heads + the pair axis). They arrive as
+        // `narrow`ed slices of the rope table, so contiguate before the reshape.
+        let cos = cos.contiguous()?.reshape((1, s, 1, half))?;
+        let sin = sin.contiguous()?.reshape((1, s, 1, half))?;
+
+        // [b, s, h, hd] → [b, s, h, half, 2]; the last axis holds the (even, odd) complex pair.
+        let xr = x
+            .to_dtype(candle_gen::candle_core::DType::F32)?
+            .reshape((b, s, h, half, 2))?;
+        // `narrow` yields a strided view; contiguate before the reshape (candle reshape needs contiguous).
+        let xe = xr.narrow(4, 0, 1)?.contiguous()?.reshape((b, s, h, half))?;
+        let xo = xr.narrow(4, 1, 1)?.contiguous()?.reshape((b, s, h, half))?;
+
+        let out_e = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
+        let out_o = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
+
+        // Re-interleave: stack on a new trailing axis → [b, s, h, half, 2] → [b, s, h, hd].
+        let out = Tensor::stack(&[&out_e, &out_o], D::Minus1)?.reshape((b, s, h, hd))?;
+        out.to_dtype(dt)
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The real edit-layout table (`[text; ref; noise]`) and its narrowed sub-range views.
+    fn tables(dev: &Device) -> Vec<(Tensor, Tensor)> {
+        let r = RopeTables::build_edit(7, &[(4, 4)], 8, 8, 40, 10000.0, dev).unwrap();
+        vec![r.joint(), r.image().unwrap(), r.text().unwrap()]
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU, f32 / bf16 /
+    /// f16, over the joint table and the narrowed (strided-view) sub-tables.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        for (cos, sin) in tables(&dev) {
+            let s = cos.dim(1).unwrap();
+            let x32 = Tensor::randn(0f32, 1.0, (2, s, 3, 120), &dev).unwrap();
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let x = x32.to_dtype(dt).unwrap();
+                let got = apply_interleaved_rope(&x, &cos, &sin).unwrap();
+                let want = former(&x, &cos, &sin).unwrap();
+                assert_eq!(bits(&got), bits(&want), "{dt:?} s={s}");
+            }
+        }
+    }
+
+    /// CUDA bf16 smoke: Boogu's RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // Boogu 1024^2 edit: 256 text + 64x64 ref + 64x64 noise tokens, 28 heads x 120.
+        let r = RopeTables::build_edit(256, &[(64, 64)], 64, 64, 40, 10000.0, &dev).unwrap();
+        for (cos, sin) in [r.joint(), r.image().unwrap()] {
+            let s = cos.dim(1).unwrap();
+            let x = Tensor::randn(0f32, 1.0, (1, s, 28, 120), &dev).unwrap();
+            let x = x.to_dtype(DType::BF16).unwrap();
+            ROPE_PATH.set_enabled(Some(true));
+            let start = ROPE_PATH.thread_counts();
+            let on = apply_interleaved_rope(&x, &cos, &sin).unwrap();
+            let c = ROPE_PATH.thread_counts().since(&start);
+            assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+            ROPE_PATH.set_enabled(Some(false));
+            let off = apply_interleaved_rope(&x, &cos, &sin).unwrap();
+            ROPE_PATH.set_enabled(Some(true));
+            assert_eq!(bits(&on), bits(&off));
+            assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
+        }
     }
 }

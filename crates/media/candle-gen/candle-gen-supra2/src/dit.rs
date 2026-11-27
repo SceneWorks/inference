@@ -30,10 +30,17 @@ fn lin(w: &candle_gen::Weights, prefix: &str, shape: [usize; 2]) -> Result<Linea
     Ok(layer)
 }
 
-/// `x * (1 + scale[:, None]) + shift[:, None]`.
-fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    let one = (scale.unsqueeze(1)? + 1.0)?;
-    Ok(x.broadcast_mul(&one)?.broadcast_add(&shift.unsqueeze(1)?)?)
+/// `norm(x) * (1 + scale[:, None]) + shift[:, None]` — [`norm`]'s composable LayerNorm in `x`'s own
+/// dtype, then the modulation — as the shared fused AdaLN over that exact chain (SW-6129): one
+/// launch on CUDA, the chain itself elsewhere. `shift` / `scale` are `[B, D]` rows.
+fn norm_modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(LN_EPS).native();
+    Ok(candle_gen::modulate::adaln_chain(
+        x,
+        &spec,
+        &scale.unsqueeze(1)?,
+        &shift.unsqueeze(1)?,
+    )?)
 }
 
 /// `F.layer_norm(x, (D,), eps=1e-6)` without affine parameters (`elementwise_affine=False`).
@@ -107,7 +114,7 @@ impl Block {
         let h = self.heads;
 
         // Self-attention (no mask), AdaLN-Zero gated.
-        let y = modulate(&norm(x)?, shift_sa, scale_sa)?;
+        let y = norm_modulate(x, shift_sa, scale_sa)?;
         let qkv = self.qkv.forward(&y)?;
         let (b, n, c3) = qkv.dims3()?;
         // qkv.view(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
@@ -132,7 +139,7 @@ impl Block {
         let x = (x + self.cross_proj.forward(&cross)?)?;
 
         // MLP (GELU tanh approximation), AdaLN-Zero gated.
-        let y = modulate(&norm(&x)?, shift_mlp, scale_mlp)?;
+        let y = norm_modulate(&x, shift_mlp, scale_mlp)?;
         let y = self.mlp2.forward(&self.mlp0.forward(&y)?.gelu()?)?;
         Ok((&x + gate_mlp.unsqueeze(1)?.broadcast_mul(&y)?)?)
     }
@@ -288,11 +295,118 @@ impl SupraDit {
         let m = self.final_adaln.forward(&cond.silu()?)?.chunk(2, 1)?;
         let x = self
             .final_linear
-            .forward(&modulate(&norm(&x)?, &m[0], &m[1])?)?;
+            .forward(&norm_modulate(&x, &m[0], &m[1])?)?;
         // x.view(B, h, w, C, P, P).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
         Ok(x.reshape((b, h, w, ch, p, p))?
             .permute((0, 3, 1, 4, 2, 5))?
             .contiguous()?
             .reshape((b, ch, hh, ww))?)
+    }
+}
+
+/// SW-6129: the Supra2 AdaLN sites are the shared fused AdaLN over the exact former chain.
+#[cfg(test)]
+mod supra_adaln_route_tests {
+    use super::*;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 site, verbatim: `modulate(&norm(x)?, shift, scale)` with the
+    /// `scale[:, None]` / `shift[:, None]` rows.
+    fn former(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Tensor {
+        norm(x)
+            .unwrap()
+            .broadcast_mul(&(scale.unsqueeze(1).unwrap() + 1.0).unwrap())
+            .unwrap()
+            .broadcast_add(&shift.unsqueeze(1).unwrap())
+            .unwrap()
+    }
+
+    /// `x` `[2, 256, d]` and `[2, d]` rows chunked out of the `[2, 6·d]` adaLN projection.
+    fn operands(d: usize, dt: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let x = values(&[2, 256, d], 1, 3.0, 0.2, dev).to_dtype(dt).unwrap();
+        let m = values(&[2, 6 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dt)
+            .unwrap()
+            .chunk(6, 1)
+            .unwrap();
+        (x, m[0].clone(), m[1].clone())
+    }
+
+    #[test]
+    fn supra_adaln_matches_the_former_chain() {
+        for d in [384usize, 1152] {
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (x, shift, scale) = operands(d, dt, &Device::Cpu);
+                let got = norm_modulate(&x, &shift, &scale).unwrap();
+                assert_eq!(
+                    bits(&got),
+                    bits(&former(&x, &shift, &scale)),
+                    "d={d} {dt:?}"
+                );
+            }
+        }
+    }
+
+    /// CUDA: the f32 DiT (and a bf16 stream, the native-bf16 chain) take the fused kernel,
+    /// bit-identical to the switch-off reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x32, sh32, sc32) = operands(1152, DType::F32, &dev);
+        let (xb, shb, scb) = operands(1152, DType::BF16, &dev);
+        let run = || {
+            let a = norm_modulate(&x32, &sh32, &sc32).unwrap();
+            let b = norm_modulate(&xb, &shb, &scb).unwrap();
+            Tensor::cat(&[a, b.to_dtype(DType::F32).unwrap()], 0).unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "supra2 adaln (f32 + native bf16, d 1152): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

@@ -73,6 +73,7 @@ use serde_json::Value;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::ops::{rms_norm, silu, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use gen_core_ltx::ltx_checkpoint::LtxCheckpointMetadata;
 
 use crate::vae::{patchify, unpatchify};
@@ -1190,33 +1191,36 @@ fn rope_inv_freqs(dim: usize, base: f64, device: &Device) -> Result<Tensor> {
     Tensor::from_vec(values, dim / 2, device)
 }
 
+/// The NaAttention RoPE convention: adjacent pairs, `[lead, len, rest, D]` with the rotated axis as
+/// the sequence axis, every op in the activation dtype (`candle_gen::rope`, SW-6129).
+const AXIS_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bshd).with_math(RopeMath::Native);
+
+/// `(cos, sin)` `[len, D/2]` of the absolute positions `0..len` times the inverse frequencies.
+fn axis_angle_tables(len: usize, inv: &Tensor, device: &Device) -> Result<(Tensor, Tensor)> {
+    let half = inv.elem_count();
+    let positions: Vec<f32> = (0..len).map(|i| i as f32).collect();
+    let pos = Tensor::from_vec(positions, (len, 1), device)?;
+    let ang = pos.broadcast_mul(&inv.reshape((1, half))?)?;
+    Ok((ang.cos()?, ang.sin()?))
+}
+
 /// Rotate one axis chunk of `(B, T, H, W, NH, D)` by absolute positions along `axis`
 /// (1 = T, 2 = H, 3 = W). Pairs are adjacent (`[x0, x1], [x2, x3], ...`).
+///
+/// The rotation only depends on the index along `axis`, so the contiguous chunk folds to
+/// `[B·…, len, …·NH, D]` with `axis` as the sequence axis and goes through the shared
+/// `candle_gen::rope::apply_rope` (SW-6129): the fused strided kernel on CUDA, the shared chain
+/// elsewhere — bit-identical to the `xe·cos − xo·sin` / `xe·sin + xo·cos` chain this function
+/// carried (`tests::rotate_axis_matches_the_former_private_chain` pins it).
 fn rotate_axis(x: &Tensor, inv: &Tensor, axis: usize) -> Result<Tensor> {
     let sh = x.dims().to_vec();
-    let d = *sh.last().expect("rank >= 1");
-    let half = d / 2;
-    let split = [sh[0], sh[1], sh[2], sh[3], sh[4], half];
-    let paired = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 2];
-    let stack = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 1];
-    let pairs = x.contiguous()?.reshape(&paired[..])?;
-    let xe = pairs.narrow(6, 0, 1)?.reshape(&split[..])?;
-    let xo = pairs.narrow(6, 1, 1)?.reshape(&split[..])?;
-
+    let d = sh[5];
     let len = sh[axis];
-    let positions: Vec<f32> = (0..len).map(|i| i as f32).collect();
-    let pos = Tensor::from_vec(positions, (len, 1), x.device())?;
-    let mut ang_shape = [1usize, 1, 1, 1, 1, half];
-    ang_shape[axis] = len;
-    let ang = pos
-        .broadcast_mul(&inv.reshape((1, half))?)?
-        .reshape(&ang_shape[..])?;
-    let (cos, sin) = (ang.cos()?, ang.sin()?);
-
-    let re = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
-    let ro = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
-    let stacked = Tensor::cat(&[re.reshape(&stack[..])?, ro.reshape(&stack[..])?], 6)?;
-    stacked.contiguous()?.reshape(sh)
+    let (cos, sin) = axis_angle_tables(len, inv, x.device())?;
+    let lead: usize = sh[..axis].iter().product();
+    let rest: usize = sh[axis + 1..5].iter().product();
+    let folded = x.contiguous()?.reshape((lead, len, rest, d))?;
+    candle_gen::rope::apply_rope(&folded, &cos, &sin, &AXIS_ROPE)?.reshape(sh)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1423,24 +1427,37 @@ impl DiffusionBlock {
         let (scale_mlp, shift_mlp) = (chunk(3)?, chunk(4)?);
 
         let x = (x + self.context_proj.forward(context)?)?;
-        let y = modulate(
-            &rms_norm(&x.contiguous()?, &self.norm1, NORM_EPS)?,
-            &scale_msa,
-            &shift_msa,
-        )?;
+        let y = rms_modulate(&x, &self.norm1, &scale_msa, &shift_msa)?;
         let x = (&x + self.attn.forward(&y)?)?;
-        let y = modulate(
-            &rms_norm(&x.contiguous()?, &self.norm2, NORM_EPS)?,
-            &scale_mlp,
-            &shift_mlp,
-        )?;
+        let y = rms_modulate(&x, &self.norm2, &scale_mlp, &shift_mlp)?;
         &x + self.mlp.forward(&y)?
     }
 }
 
-/// `x * (1 + scale) + shift` (upstream `layers.modulate`).
-fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
+/// `rms_norm(x, weight) · (1 + scale) + shift` (upstream `layers.modulate` over the block's
+/// RMSNorm) for a channels-last `x` `(B, T, H, W, C)` and `(1, 1, 1, 1, C)` modulation — the shared
+/// fused AdaLN (SW-6129): one launch on CUDA, bit-identical to candle's `ops::rms_norm` followed by
+/// the shared `modulate`, which is exactly the chain this block ran before and runs everywhere else.
+/// The token axes fold to `[B, T·H·W, C]` (a free reshape of the contiguous `x`); a modulation that
+/// is not one row per sample keeps the unfolded chain.
+fn rms_modulate(x: &Tensor, weight: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let (b, c) = (dims[0], dims[dims.len() - 1]);
+    let row = |t: &Tensor| t.dims()[t.rank() - 1] == c && t.elem_count() == t.dims()[0] * c;
+    if dims.len() < 2 || !row(scale) || !row(shift) {
+        let normed = rms_norm(&x.contiguous()?, weight, NORM_EPS)?;
+        return candle_gen::modulate::modulate(&normed, scale, shift);
+    }
+    let x3 = x.contiguous()?.reshape((b, x.elem_count() / (b * c), c))?;
+    let fold = |t: &Tensor| t.reshape((t.dims()[0], 1, c));
+    candle_gen::modulate::rms_adaln(
+        &x3,
+        Some(weight),
+        f64::from(NORM_EPS),
+        &fold(scale)?,
+        &fold(shift)?,
+    )?
+    .reshape(dims)
 }
 
 /// `Linear` + channels-last pixel shuffle (upstream `LinearPixelShuffleUpsample`).

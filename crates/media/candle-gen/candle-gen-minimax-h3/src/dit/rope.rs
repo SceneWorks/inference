@@ -78,6 +78,7 @@
 //! convention because the cross-backend gate compares them.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use candle_gen::{CandleError, Result};
 
 /// Precomputed `(cos, sin)` for one packed sequence, `[seq_len, rotary_dim]` each.
@@ -237,24 +238,16 @@ impl MmRope {
         // are f32; they are narrowed to the ACTIVATION's dtype here, before the multiply-add —
         // reference-faithful (`cos.to(hidden_states.dtype)`, `transformer_minimax_h3.py:66-67`),
         // NOT a missed upcast.
-        let stream = x.dtype();
-        let cos_t = tables.cos.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
-        let sin_t = tables.sin.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
-
-        let head = x.narrow(3, 0, rotary)?.contiguous()?;
-        let half = rotary / 2;
-        let x1 = head.narrow(3, 0, half)?;
-        let x2 = head.narrow(3, half, rotary - half)?;
-        let rotated = Tensor::cat(&[x2.neg()?, x1], 3)?;
-        let out = head
-            .broadcast_mul(&cos_t)?
-            .add(&rotated.broadcast_mul(&sin_t)?)?;
-
-        if rotary == d {
-            return Ok(out.contiguous()?);
-        }
-        let tail = x.narrow(3, rotary, d - rotary)?;
-        Ok(Tensor::cat(&[out, tail], 3)?.contiguous()?)
+        //
+        // The rotation is the shared `candle_gen::rope::apply_rope` (SW-6129) — split-half pairs,
+        // `[B, S, H, D]`, `rotary` leading lanes, native (stream-dtype) math with the `[seq, rotary]`
+        // tables broadcast over batch and heads: the fused strided kernel on CUDA, and elsewhere the
+        // shared chain, bit-identical to the `head·cos + rotate_half(head)·sin` chain + untouched
+        // tail this method carried (`tests::apply_matches_the_former_private_chain` pins it).
+        let spec = RopeSpec::split_half(RopeLayout::Bshd)
+            .with_rotary_dim(rotary)
+            .with_math(RopeMath::Native);
+        Ok(candle_gen::rope::apply_rope(x, &tables.cos, &tables.sin, &spec)?.contiguous()?)
     }
 }
 
@@ -507,5 +500,182 @@ mod tests {
             "a bf16 rope table must be measurably different, else this fix is cosmetic; got \
              {drift:.3e}"
         );
+    }
+}
+
+/// SW-6129 route: `MmRope::apply` (the DiT) and `crate::rope::Rope3d::apply` (the video VAE) are the
+/// shared `candle_gen::rope::apply_rope`; the former private chains are the oracles.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use crate::rope::{create_token_ids, Rope3d};
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `MmRope::apply` rotation (after its shape validation), verbatim.
+    fn former_mm(x: &Tensor, tables: &MmRopeTables) -> Result<Tensor> {
+        let shape = x.dims();
+        let (seq, d) = (shape[1], shape[3]);
+        let rotary = tables.rotary_dim();
+        let stream = x.dtype();
+        let cos_t = tables.cos.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
+        let sin_t = tables.sin.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
+
+        let head = x.narrow(3, 0, rotary)?.contiguous()?;
+        let half = rotary / 2;
+        let x1 = head.narrow(3, 0, half)?;
+        let x2 = head.narrow(3, half, rotary - half)?;
+        let rotated = Tensor::cat(&[x2.neg()?, x1], 3)?;
+        let out = head
+            .broadcast_mul(&cos_t)?
+            .add(&rotated.broadcast_mul(&sin_t)?)?;
+
+        if rotary == d {
+            return Ok(out.contiguous()?);
+        }
+        let tail = x.narrow(3, rotary, d - rotary)?;
+        Ok(Tensor::cat(&[out, tail], 3)?.contiguous()?)
+    }
+
+    /// The pre-SW-6129 VAE `Rope3d::apply` rotation (after its shape validation), verbatim.
+    fn former_vae(
+        t: &Tensor,
+        tables: &crate::rope::RopeTables,
+        apply_dim: usize,
+    ) -> Result<Tensor> {
+        let d = t.dims()[3];
+        let cos_t = tables.cos.to_dtype(t.dtype())?;
+        let sin_t = tables.sin.to_dtype(t.dtype())?;
+
+        let half = apply_dim / 2;
+        let rotate = |x: &Tensor| -> Result<Tensor> {
+            let x1 = x.narrow(3, 0, half)?;
+            let x2 = x.narrow(3, half, half)?;
+            Ok(Tensor::cat(&[&x2.neg()?, &x1], 3)?)
+        };
+
+        let head = t.narrow(3, 0, apply_dim)?.contiguous()?;
+        let rotated = head
+            .broadcast_mul(&cos_t)?
+            .add(&rotate(&head)?.broadcast_mul(&sin_t)?)?;
+        if apply_dim == d {
+            return Ok(rotated);
+        }
+        let tail = t.narrow(3, apply_dim, d - apply_dim)?;
+        Ok(Tensor::cat(&[&rotated, &tail], 3)?)
+    }
+
+    /// `seq` positional rows `[seq, 3]` (frame, height, width).
+    fn rows(seq: usize, dev: &Device) -> Tensor {
+        let ids: Vec<f32> = (0..seq)
+            .flat_map(|i| [(i / 12) as f32, ((i / 4) % 3) as f32, (i % 4) as f32])
+            .collect();
+        Tensor::from_vec(ids, (seq, 3), dev).unwrap()
+    }
+
+    /// Bit-identical to the former chains in f32 / bf16 / f16, partial (96 of 128) and full rotary,
+    /// at the shipped DiT geometry (rope_freq_dim 16) and a VAE `apply_dim` of 48 of 64.
+    #[test]
+    fn apply_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let seq = 24;
+        for (freqs, head_dim) in [(16usize, 128usize), (16, 96)] {
+            let rope = MmRope::new(freqs, 10_000.0).unwrap();
+            let tables = rope.tables(&rows(seq, &dev)).unwrap();
+            let x32 = spread(&[2, seq, 3, head_dim], 0.2, &dev);
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let x = x32.to_dtype(dtype).unwrap();
+                let got = rope.apply(&x, &tables).unwrap();
+                let want = former_mm(&x, &tables).unwrap();
+                assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+                assert_eq!(bits(&got), bits(&want), "dit {dtype:?} head_dim {head_dim}");
+            }
+        }
+        let vae = Rope3d::new(48, 10_000.0).unwrap();
+        let ids = create_token_ids(2, 3, 4, &dev).unwrap();
+        let tables = vae.tables(&ids).unwrap();
+        for head_dim in [64usize, 48] {
+            let t32 = spread(&[1, 24, 2, head_dim], 0.7, &dev);
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let t = t32.to_dtype(dtype).unwrap();
+                let got = vae.apply(&t, &tables).unwrap();
+                let want = former_vae(&t, &tables, 48).unwrap();
+                assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+                assert_eq!(bits(&got), bits(&want), "vae {dtype:?} head_dim {head_dim}");
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the DiT mm-rope (96 of 128) and the video-VAE rope (48 of 64), bf16 on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let seq = 1024;
+        let rope = MmRope::new(16, 10_000.0).unwrap();
+        let tables = rope.tables(&rows(seq, &dev)).unwrap();
+        let x = spread(&[1, seq, 24, 128], 0.2, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let vae = Rope3d::new(48, 10_000.0).unwrap();
+        let ids = create_token_ids(4, 8, 8, &dev).unwrap();
+        let vae_tables = vae.tables(&ids).unwrap();
+        let t = spread(&[1, 256, 8, 64], 0.7, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || -> Vec<Tensor> {
+            vec![
+                rope.apply(&x, &tables).unwrap(),
+                vae.apply(&t, &vae_tables).unwrap(),
+            ]
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
     }
 }

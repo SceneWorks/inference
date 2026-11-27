@@ -1103,11 +1103,7 @@ impl Krea2Transformer {
         let m = t.broadcast_add(&self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
         let scale = m.narrow(1, 0, 1)?; // [b, 1, hidden]
         let shift = m.narrow(1, 1, 1)?;
-        let normed = self
-            .final_norm
-            .forward(x)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?;
+        let normed = self.final_norm.modulate(x, &scale, &shift)?;
         self.final_linear.forward_phase(&normed, phase)
     }
 }

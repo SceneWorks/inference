@@ -20,7 +20,8 @@ use candle_gen::candle_core::{DType, Tensor, D};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::{CandleError, Result as CResult};
 
-use crate::nn::{layer_norm, lin_bias};
+use crate::nn::lin_bias;
+use candle_gen::modulate::{adaln_chain, AdaLnChain};
 
 const LN_EPS: f64 = 1e-6;
 
@@ -107,9 +108,33 @@ impl FlowMatchScheduler {
 // SimpleMLPAdaLN building blocks.
 // ---------------------------------------------------------------------------
 
-/// `x*(1+scale) + shift` (DiT adaLN modulation).
-fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> CResult<Tensor> {
-    Ok(((x * (scale + 1.0)?)? + shift)?)
+/// `modulate(LN(x), shift, scale)` = `LN(x)·(1+scale) + shift` over [`crate::nn::layer_norm`]
+/// (f32 mean / centre / biased variance / `sqrt` / divide, then `· weight`, `+ bias`, cast back):
+/// the shared fused AdaLN over that composable chain (SW-6129, [`AdaLnChain::layer`] with the f32
+/// weight / bias), bit-identical to it + the elementwise modulate, which it runs everywhere else.
+/// The MLP's `[N, width]` rows (`x`, `shift`, `scale` all that shape) go through as `[N, 1, width]`.
+fn ln_modulate(
+    x: &Tensor,
+    weight: Option<&Tensor>,
+    bias: Option<&Tensor>,
+    shift: &Tensor,
+    scale: &Tensor,
+) -> CResult<Tensor> {
+    let wf = weight.map(|w| w.to_dtype(DType::F32)).transpose()?;
+    let bf = bias.map(|b| b.to_dtype(DType::F32)).transpose()?;
+    let mut spec = AdaLnChain::layer(LN_EPS);
+    if let Some(w) = &wf {
+        spec = spec.with_weight(w);
+    }
+    if let Some(b) = &bf {
+        spec = spec.with_bias(b);
+    }
+    if x.rank() == 2 && scale.dims() == x.dims() && shift.dims() == x.dims() {
+        let rows = |t: &Tensor| t.unsqueeze(1);
+        let out = adaln_chain(&rows(x)?, &spec, &rows(scale)?, &rows(shift)?)?;
+        return Ok(out.squeeze(1)?);
+    }
+    Ok(adaln_chain(x, &spec, scale, shift)?)
 }
 
 /// GLIDE sinusoidal timestep embedding `[N, dim]` (f32): `half = dim/2`,
@@ -180,13 +205,13 @@ impl ResBlock {
         let shift = mods.narrow(D::Minus1, 0, w)?;
         let scale = mods.narrow(D::Minus1, w, w)?;
         let gate = mods.narrow(D::Minus1, 2 * w, w)?;
-        let h = __model_proof_output!(layer_norm(
+        let h = __model_proof_output!(ln_modulate(
             x,
             Some(&self.in_ln_w),
             Some(&self.in_ln_b),
-            LN_EPS
+            &shift,
+            &scale
         ))?;
-        let h = modulate(&h, &shift, &scale)?;
         let h = __model_proof_output!(self
             .mlp2
             .forward(&__model_proof_output!(self.mlp0.forward(&h))?.silu()?))?;
@@ -213,8 +238,7 @@ impl FinalLayer {
         let w = mods.dim(D::Minus1)? / 2;
         let shift = mods.narrow(D::Minus1, 0, w)?;
         let scale = mods.narrow(D::Minus1, w, w)?;
-        let h = layer_norm(x, None, None, LN_EPS)?; // norm_final: elementwise_affine=False
-        let h = modulate(&h, &shift, &scale)?;
+        let h = ln_modulate(x, None, None, &shift, &scale)?; // norm_final: elementwise_affine=False
         Ok(__model_proof_output!(self.linear.forward(&h))?)
     }
 }
@@ -414,5 +438,113 @@ mod tests {
         let mut sched = FlowMatchScheduler::new(2.0, true);
         sched.set_timesteps(3);
         assert_eq!(sched.timesteps().len(), 3);
+    }
+}
+
+/// SW-6129: the SimpleMLPAdaLN AdaLN sites are the shared fused AdaLN, bit-identical to
+/// `layer_norm` + modulate.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use crate::nn::layer_norm;
+    use candle_gen::candle_core::Device;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The clip-diff MLP rows (width 3584, the in/out channel count): `x [6, W]`, a `[6, 3·W]` adaLN table, the in_ln affine.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+        let w = 3584;
+        let x = values(&[6, w], 1, 3.0, 0.3, dev).to_dtype(dtype).unwrap();
+        let mods = values(&[6, 3 * w], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let shift = mods.narrow(D::Minus1, 0, w).unwrap();
+        let scale = mods.narrow(D::Minus1, w, w).unwrap();
+        let lw = values(&[w], 3, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        let lb = values(&[w], 4, 0.2, 0.0, dev).to_dtype(dtype).unwrap();
+        (x, shift, scale, lw, lb)
+    }
+
+    /// The former site: `layer_norm` then the elementwise `x*(1+scale) + shift`.
+    fn former(
+        x: &Tensor,
+        w: Option<&Tensor>,
+        b: Option<&Tensor>,
+        shift: &Tensor,
+        scale: &Tensor,
+    ) -> Tensor {
+        let h = layer_norm(x, w, b, LN_EPS).unwrap();
+        ((h * (scale + 1.0).unwrap()).unwrap() + shift).unwrap()
+    }
+
+    #[test]
+    fn fused_adaln_sites_match_the_former_chain() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, shift, scale, lw, lb) = operands(dtype, &Device::Cpu);
+            let got = ln_modulate(&x, Some(&lw), Some(&lb), &shift, &scale).unwrap();
+            let want = former(&x, Some(&lw), Some(&lb), &shift, &scale);
+            assert_eq!(bits(&got), bits(&want), "res block {dtype:?}");
+            let got = ln_modulate(&x, None, None, &shift, &scale).unwrap();
+            let want = former(&x, None, None, &shift, &scale);
+            assert_eq!(bits(&got), bits(&want), "final layer {dtype:?}");
+        }
+    }
+
+    /// CUDA bf16: the ResBlock (affine LN) and FinalLayer (affine-free LN) sites take the fused
+    /// AdaLN and are bit-identical to the same calls with the kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, shift, scale, lw, lb) = operands(DType::BF16, &dev);
+        let run = || {
+            let a = ln_modulate(&x, Some(&lw), Some(&lb), &shift, &scale).unwrap();
+            let b = ln_modulate(&x, None, None, &shift, &scale).unwrap();
+            Tensor::cat(&[a, b], 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!("bernini clip_diff adaln (bf16, W=3584): {mismatches} of {} differ; on {c_on}, off {c_off}", a.len());
+        assert_eq!(mismatches, 0);
     }
 }

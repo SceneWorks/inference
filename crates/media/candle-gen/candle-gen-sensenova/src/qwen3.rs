@@ -30,6 +30,11 @@ use crate::config::NeoChatConfig;
 use crate::distill::DistillLora;
 use crate::quant::{detect_linear, get_f32};
 use candle_gen::attention::repeat_kv;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// NEO-chat Qwen3's RoPE: HF half-split pairs on `[B, S, H, dim]`, full-width `[1, S, dim]` tables,
+/// rotated in the activation dtype.
+const QWEN3_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bshd).with_math(RopeMath::Native);
 
 /// Disallowed-attention fill for the additive mask (a large finite negative, matching the candle
 /// Kolors slice — avoids `-inf` propagation through the softmax kernel).
@@ -296,15 +301,11 @@ fn rope_cos_sin(
 
 /// HF half-split rotary: `x·cos + rotate_half(x)·sin`, with `cos`/`sin` `[1,S,dim]` broadcast over the
 /// head axis of `x` `[B,S,H,dim]`.
+///
+/// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`QWEN3_ROPE`] — fused on CUDA, elsewhere
+/// the shared reference chain, op for op this function's former body (`rope_route_tests`).
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CResult<Tensor> {
-    let d = x.dim(3)?;
-    let half = d / 2;
-    let x1 = x.narrow(3, 0, half)?;
-    let x2 = x.narrow(3, half, half)?;
-    let rot = Tensor::cat(&[&x2.neg()?, &x1], 3)?; // rotate_half = cat(-x2, x1)
-    let cos = cos.unsqueeze(2)?; // [1,S,1,dim]
-    let sin = sin.unsqueeze(2)?;
-    x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?
+    candle_gen::rope::apply_rope(x, cos, sin, &QWEN3_ROPE)
 }
 
 /// The dense dual-path Qwen3 backbone: token embeddings, the decoder stack, the dual final norm, and
@@ -815,5 +816,85 @@ mod tests {
             assert_eq!(row[2], 0.0);
             assert_eq!(row[3], 0.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+
+    /// The pre-SW-6129 `apply_rope`, verbatim (the oracle).
+    fn former(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CResult<Tensor> {
+        let d = x.dim(3)?;
+        let half = d / 2;
+        let x1 = x.narrow(3, 0, half)?;
+        let x2 = x.narrow(3, half, half)?;
+        let rot = Tensor::cat(&[&x2.neg()?, &x1], 3)?; // rotate_half = cat(-x2, x1)
+        let cos = cos.unsqueeze(2)?; // [1,S,1,dim]
+        let sin = sin.unsqueeze(2)?;
+        x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?
+    }
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The real `rope_cos_sin` tables (the temporal 64-wide part and a 32-wide spatial part).
+    fn tables(s: usize, dim: usize, dt: DType, dev: &Device) -> (Tensor, Tensor) {
+        let pos: Vec<i32> = (0..s as i32).map(|p| p * 3 % 17).collect();
+        let (c, sn) = rope_cos_sin(&pos, dim, 1_000_000.0, dev).unwrap();
+        (c.to_dtype(dt).unwrap(), sn.to_dtype(dt).unwrap())
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU, f32 / bf16 /
+    /// f16, over the narrowed-contiguous q/k parts `qk_rope` rotates.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        for dim in [64usize, 32] {
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (cos, sin) = tables(13, dim, dt, &dev);
+                let x = Tensor::randn(0f32, 1.0, (2, 13, 4, dim), &dev).unwrap();
+                let x = x.to_dtype(dt).unwrap();
+                let got = apply_rope(&x, &cos, &sin).unwrap();
+                assert_eq!(
+                    bits(&got),
+                    bits(&former(&x, &cos, &sin).unwrap()),
+                    "{dt:?} {dim}"
+                );
+            }
+        }
+    }
+
+    /// CUDA bf16 smoke: the Qwen3 RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        const CALLS: u64 = 1;
+        // SenseNova-U1 (Qwen3-8B-shaped): 32 heads, the 64-wide temporal part, 4096 tokens.
+        let (cos, sin) = tables(4096, 64, DType::BF16, &dev);
+        let x = Tensor::randn(0f32, 1.0, (1, 4096, 32, 64), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = apply_rope(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (CALLS, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = apply_rope(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
     }
 }

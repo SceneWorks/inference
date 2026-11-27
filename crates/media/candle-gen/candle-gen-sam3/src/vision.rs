@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::Quant;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use candle_gen::{CandleError, Result};
 
 use crate::common::{
@@ -114,6 +115,7 @@ impl RopeTable {
 
 /// `rotate_pairwise(x)`: pairwise `(a, b) -> (-b, a)` over the last dim (the SAM3 interleaved
 /// convention, paired with `repeat_interleave(2)` cos/sin).
+#[cfg(test)]
 fn rotate_pairwise(x: &Tensor) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     let hd = *dims.last().expect("rope input has rank >= 1");
@@ -129,11 +131,19 @@ fn rotate_pairwise(x: &Tensor) -> Result<Tensor> {
     Ok(stacked.reshape(dims)?)
 }
 
+/// The SAM3 RoPE convention: adjacent pairs over `[b, nh, seq, hd]` with one angle per lane
+/// (`repeat_interleave(2)` tables), every op in the activation dtype (`candle_gen::rope`, SW-6129).
+pub(crate) const SAM3_ROPE: RopeSpec =
+    RopeSpec::interleaved(RopeLayout::Bhsd).with_math(RopeMath::Native);
+
 /// `q_embed = q·cos + rotate_pairwise(q)·sin`. `q`: `[b, nh, seq, hd]`; `cos`/`sin`: `[seq, hd]`.
+/// The shared `candle_gen::rope::apply_rope` (SW-6129): the fused strided kernel on CUDA, and
+/// elsewhere the shared chain, bit-identical to this chain (`tests::apply_rope_matches_the_former_
+/// private_chain` pins it).
 fn apply_rope(q: &Tensor, table: &RopeTable) -> Result<Tensor> {
-    let a = q.broadcast_mul(&table.cos)?;
-    let b = rotate_pairwise(q)?.broadcast_mul(&table.sin)?;
-    Ok(a.add(&b)?)
+    Ok(candle_gen::rope::apply_rope(
+        q, &table.cos, &table.sin, &SAM3_ROPE,
+    )?)
 }
 
 /// Two-layer GELU MLP (`mlp.fc1` → exact-gelu → `mlp.fc2`). exact GELU = candle `gelu_erf`.
@@ -585,5 +595,105 @@ mod tests {
             .unwrap();
         assert!(cos0.iter().all(|&c| (c - 1.0).abs() < 1e-6));
         assert!(sin0.iter().all(|&s| s.abs() < 1e-6));
+    }
+}
+
+/// SW-6129 route: `apply_rope` is the shared `candle_gen::rope::apply_rope`; the former private
+/// chain is the oracle.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::DType;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `apply_rope`, verbatim.
+    fn former(q: &Tensor, table: &RopeTable) -> Result<Tensor> {
+        let a = q.broadcast_mul(&table.cos)?;
+        let b = rotate_pairwise(q)?.broadcast_mul(&table.sin)?;
+        Ok(a.add(&b)?)
+    }
+
+    /// Bit-identical to the former chain on the real 2-D axial table, in the tower's f32 (and in
+    /// bf16 / f16 with the table cast to the activation dtype, the native-math contract).
+    #[test]
+    fn apply_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let table = RopeTable::new(8, 1.0, 10_000.0, 64, &dev).unwrap();
+        let q32 = spread(&[1, 2, 64, 64], 0.6, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let q = q32.to_dtype(dtype).unwrap();
+            let cast = RopeTable {
+                cos: table.cos.to_dtype(dtype).unwrap(),
+                sin: table.sin.to_dtype(dtype).unwrap(),
+            };
+            let got = apply_rope(&q, &table).unwrap();
+            let want = former(&q, &cast).unwrap();
+            assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the vision tower's q/k RoPE (bf16 and f32, 72x72 grid, head_dim 64) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let table = RopeTable::new(72, 1.0, 10_000.0, 64, &dev).unwrap();
+        let q32 = spread(&[1, 16, 72 * 72, 64], 0.6, &dev);
+        let run = || -> Vec<Tensor> {
+            vec![
+                apply_rope(&q32, &table).unwrap(),
+                apply_rope(&q32.to_dtype(DType::BF16).unwrap(), &table).unwrap(),
+            ]
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
     }
 }

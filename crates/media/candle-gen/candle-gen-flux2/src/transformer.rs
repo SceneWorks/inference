@@ -26,7 +26,9 @@ use crate::quant::{rms_norm_to, QLinear};
 const LN_EPS: f64 = 1e-6;
 const RMS_EPS: f64 = 1e-5;
 
-/// Affine-free LayerNorm over the last axis (eps 1e-6), in f32.
+/// Affine-free LayerNorm over the last axis (eps 1e-6), in f32 — the chain [`ln_modulate`] fuses
+/// (kept as its parity oracle).
+#[cfg(test)]
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
     let mean = x.mean_keepdim(D::Minus1)?;
@@ -35,10 +37,18 @@ fn layer_norm(x: &Tensor) -> Result<Tensor> {
     xc.broadcast_div(&(var + LN_EPS)?.sqrt()?)
 }
 
-/// `(1 + scale)·norm + shift`, broadcasting modulation `[B,1,D]` over `[B,S,D]`.
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    let one_plus = (scale + 1.0)?;
-    norm.broadcast_mul(&one_plus)?.broadcast_add(shift)
+// `(1 + scale)·norm + shift`, broadcasting modulation `[B,1,D]` over `[B,S,D]`: the shared
+// composable modulate (SW-6129), the exact body of the private copy it replaced.
+#[cfg(test)]
+use candle_gen::modulate::modulate;
+
+/// The FLUX.2 AdaLN `LayerNorm(x) · (1 + scale) + shift` — affine-free f32 LayerNorm (eps 1e-6:
+/// `to_dtype(f32)`, `mean_keepdim`, sub, `sqr`, `mean_keepdim`, `+ eps`, `sqrt`, div, no cast back)
+/// modulated in f32 — through the shared fused AdaLN (SW-6129): `AdaLnChain::layer` with the
+/// modulation in f32 is that chain op for op, one launch on CUDA, the chain itself elsewhere.
+fn ln_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(LN_EPS).modulate_in(DType::F32);
+    candle_gen::modulate::adaln_chain(x, &spec, scale, shift)
 }
 
 /// `x + gate·y`, broadcasting gate `[B,1,D]`.
@@ -506,8 +516,8 @@ impl DoubleBlock {
         let (c_shift_msa, c_scale_msa, c_gate_msa) = &txt_mod[0];
         let (c_shift_mlp, c_scale_mlp, c_gate_mlp) = &txt_mod[1];
 
-        let norm_img = modulate(&layer_norm(img)?, scale_msa, shift_msa)?;
-        let norm_txt = modulate(&layer_norm(txt)?, c_scale_msa, c_shift_msa)?;
+        let norm_img = ln_modulate(img, scale_msa, shift_msa)?;
+        let norm_txt = ln_modulate(txt, c_scale_msa, c_shift_msa)?;
         let (img_attn, txt_attn) = self.attn.forward(
             &norm_img,
             &norm_txt,
@@ -519,11 +529,11 @@ impl DoubleBlock {
         let mut img = gated(img, gate_msa, &img_attn)?;
         let mut txt = gated(txt, c_gate_msa, &txt_attn)?;
 
-        let norm_img2 = modulate(&layer_norm(&img)?, scale_mlp, shift_mlp)?;
+        let norm_img2 = ln_modulate(&img, scale_mlp, shift_mlp)?;
         let img_ff = self.ff.forward(&norm_img2)?;
         img = gated(&img, gate_mlp, &img_ff)?;
 
-        let norm_txt2 = modulate(&layer_norm(&txt)?, c_scale_mlp, c_shift_mlp)?;
+        let norm_txt2 = ln_modulate(&txt, c_scale_mlp, c_shift_mlp)?;
         let txt_ff = self.ff_context.forward(&norm_txt2)?;
         txt = gated(&txt, c_gate_mlp, &txt_ff)?;
 
@@ -580,7 +590,7 @@ impl SingleBlock {
         pag: Option<(usize, usize)>,
     ) -> GenResult<Tensor> {
         let (shift, scale, gate) = m;
-        let norm = modulate(&layer_norm(hidden)?, scale, shift)?;
+        let norm = ln_modulate(hidden, scale, shift)?;
         let proj = self.to_qkv_mlp.forward(&norm)?;
         let inner = self.inner;
         let q = proj.narrow(D::Minus1, 0, inner)?;
@@ -637,7 +647,7 @@ impl NormOut {
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?; // scale first
         let shift = p.narrow(D::Minus1, inner, inner)?;
-        modulate(&layer_norm(x)?, &scale, &shift)
+        ln_modulate(x, &scale, &shift)
     }
 }
 
@@ -1775,5 +1785,100 @@ mod tests {
                 .unwrap(),
             want_target.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
+    }
+}
+
+/// SW-6129: the FLUX.2 AdaLN sites are the shared fused composable-chain AdaLN ([`ln_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// CPU: bit-identical to the former `modulate(&layer_norm(x)?, scale, shift)` (f32 modulation)
+    /// for an f32 / bf16 / f16 stream at FLUX.2's hidden 6144.
+    #[test]
+    fn ln_modulate_matches_the_former_layer_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 6144;
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        let scale = values(&[2, 1, d], 5, 0.5, 0.0, &dev);
+        let shift = values(&[2, 1, d], 7, 0.5, 0.0, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let want = modulate(&layer_norm(&x).unwrap(), &scale, &shift).unwrap();
+            let got = ln_modulate(&x, &scale, &shift).unwrap();
+            assert_eq!(got.dtype(), DType::F32);
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: FLUX.2 `ln_modulate` in f32 (the DiT's compute dtype) at the 1024^2
+    /// image `[1, 4096, 6144]` and text `[1, 512, 6144]` streams takes the fused AdaLN (every call
+    /// `fused`) and is bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let d = 6144;
+        let img = values(&[1, 4096, d], 11, 3.0, 0.3, &dev);
+        let txt = values(&[1, 512, d], 12, 3.0, 0.3, &dev);
+        let scale = values(&[1, 1, d], 13, 0.5, 0.0, &dev);
+        let shift = values(&[1, 1, d], 14, 0.5, 0.0, &dev);
+        let run = || {
+            let a = ln_modulate(&img, &scale, &shift).unwrap();
+            let b = ln_modulate(&txt, &scale, &shift).unwrap();
+            Tensor::cat(&[&a, &b], 1).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "flux2 ln_modulate (f32, [1,4096,6144] + [1,512,6144]): {mismatches} of {} elements \
+             differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

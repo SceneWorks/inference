@@ -122,6 +122,10 @@ pub use candle_quant_kernels::fused_path;
 // norm with SiLU, written straight into the padded causal-conv input (path `vae_norm_silu_pad`).
 pub use candle_quant_kernels::vae_norm_silu_pad;
 
+// The shared AdaLN modulation (SW-6127): the composable `modulate` every DiT shares, and the
+// fused `norm(x) · (1 + scale) + shift` (`adaln`) with its bit-identical reference chain.
+pub mod modulate;
+
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
 // guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.

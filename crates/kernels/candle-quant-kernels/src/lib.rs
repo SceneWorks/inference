@@ -43,6 +43,9 @@
 //!   `candle_layers::fused`).
 //! - [`act_quant`] — the fused per-tensor fp8 / int8 activation quantizer (SW-6126): amax → scale
 //!   → cast on the device, byte-identical to the op chain it replaces, scale kept on the device.
+//! - [`adaln`] — the fused AdaLN / RMS-AdaLN modulation (SW-6127): `norm(x) · (1 + scale) + shift`
+//!   in one launch, bit-identical to the candle norm + modulate chain (public as
+//!   `candle_gen::modulate`).
 //! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
 //!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
 //!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
@@ -67,6 +70,8 @@ const _: fn() = || {
 };
 
 pub mod act_quant;
+pub mod adaln;
+pub mod adaln_chain;
 pub mod convrot;
 pub mod convrot_int8;
 pub mod cublaslt;
@@ -80,6 +85,7 @@ pub mod fused_decode;
 pub mod fused_path;
 pub mod gated_delta;
 pub mod gdn_prep;
+pub mod media_rope;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -168,6 +174,8 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
     ACT_QUANT_SRC,
+    adaln::ADALN_SRC,
+    adaln_chain::ADALN_CHAIN_SRC,
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
@@ -181,6 +189,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    media_rope::MEDIA_ROPE_SRC,
     vae_norm_silu_pad::VAE_NORM_SILU_PAD_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
