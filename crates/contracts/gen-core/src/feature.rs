@@ -2504,10 +2504,11 @@ pub struct FeatureMemoryEffect {
 }
 
 /// What pass 0 of a route requires on its conditioning axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pass0ConditioningRequirement {
     /// Pass 0 can start from pure noise (text-to-image).
+    #[default]
     NoiseStartSupported,
     /// Pass 0 requires a reference/identity image (e.g. IP-Adapter or PuLID route).
     RequiresReference,
@@ -2541,6 +2542,12 @@ pub struct FeatureRouteStructure {
 }
 
 impl FeatureRouteStructure {
+    /// Derive structural route facts purely from a primary [`crate::RouteRecord`] declaration
+    /// without any hardcoded model-ID table or string-matching heuristics (`HOOK-4`, `AP5`, `REG-2`).
+    pub fn from_route_record(record: &crate::RouteRecord) -> Self {
+        record.to_feature_route_structure()
+    }
+
     /// Derive structural route facts from a [`ModelDescriptor`] and its optional pre-load
     /// [`RenderPlanRegistration`] without any hardcoded model-ID lookup table.
     pub fn from_descriptor_and_plan(
@@ -4549,6 +4556,16 @@ impl FeatureRegistry {
             map.insert(spec.id().to_string(), spec.applicability(route));
         }
         map
+    }
+
+    /// Compute applicability for every registered [`FeatureSpec`] directly from a primary
+    /// [`crate::RouteRecord`] declaration (`HOOK-4`, `REG-2`).
+    pub fn evaluate_route_record(
+        &self,
+        record: &crate::RouteRecord,
+    ) -> BTreeMap<String, FeatureApplicability> {
+        let structure = FeatureRouteStructure::from_route_record(record);
+        self.evaluate_route(&structure)
     }
 
     /// Validate and compose an active set of [`FeatureInvocation`]s onto `base_plan` (HOOK-3).

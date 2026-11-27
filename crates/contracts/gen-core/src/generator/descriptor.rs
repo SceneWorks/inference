@@ -17,7 +17,7 @@ pub enum Modality {
 
 /// A model's stable identity + advertised capabilities. Returned by `descriptor()` and also
 /// constructible without loading weights (registry introspection).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelDescriptor {
     /// Exact text-encoder architecture/output contract for safe [`crate::LoadSpec::text_encoder`]
     /// substitution. `None` means the provider has not advertised a substitutable encoder.

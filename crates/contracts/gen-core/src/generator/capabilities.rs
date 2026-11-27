@@ -45,7 +45,7 @@ use super::*;
 ///
 /// Reproduce the parent count with the same parser the guard uses — it is the guard, run over a
 /// different revision.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
     pub supports_guidance: bool,
