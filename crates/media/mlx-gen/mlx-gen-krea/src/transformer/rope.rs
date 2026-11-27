@@ -20,8 +20,7 @@
 //! Inverse frequencies + angles are built on the host in **f64** (the reference's `rope` uses
 //! `torch.float64`), then the `cos`/`sin` tables are materialized as f32 (`rope(...).float()`).
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::Result;
 
@@ -148,25 +147,21 @@ fn from_positions(positions: &[(f64, f64, f64)], axes: [usize; 3], theta: f64) -
 ///   `out[2k]   = x[2k]·cos_k − x[2k+1]·sin_k`
 ///   `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k`
 /// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype.
+///
+/// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] (SW-6140) with
+/// `RopeStyle::AdjacentPair` and `RopeDtype::RestoreInput` — the same per-element chain (IEEE
+/// addition commutes, so `x[2k]·sin + x[2k+1]·cos` is `x[2k+1]·cos + x[2k]·sin`) over the same
+/// `[1, s, 1, head_dim/2]` f32 broadcast as this crate's private copy. 3-axis positions, so no fused
+/// route.
 pub fn apply_interleaved_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let dt = x.dtype();
-    let sh = x.shape();
-    let (b, s, h, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-
-    let cos = cos.as_dtype(Dtype::Float32)?.expand_dims(2)?; // [1, s, 1, half]
-    let sin = sin.as_dtype(Dtype::Float32)?.expand_dims(2)?;
-
-    let xr = x.as_dtype(Dtype::Float32)?.reshape(&[b, s, h, half, 2])?;
-    let parts = split(&xr, 2, 4)?; // 2 × [b, s, h, half, 1]
-    let xe = parts[0].reshape(&[b, s, h, half])?;
-    let xo = parts[1].reshape(&[b, s, h, half])?;
-
-    let out_e = subtract(&multiply(&xe, &cos)?, &multiply(&xo, &sin)?)?;
-    let out_o = add(&multiply(&xe, &sin)?, &multiply(&xo, &cos)?)?;
-
-    let out = concatenate_axis(&[&out_e.expand_dims(4)?, &out_o.expand_dims(4)?], 4)?;
-    Ok(out.reshape(&[b, s, h, hd])?.as_dtype(dt)?)
+    mlx_gen::qkv::apply_rope_eager(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::RestoreInput,
+    )
 }
 
 #[cfg(test)]

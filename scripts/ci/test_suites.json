@@ -1115,6 +1115,61 @@
       ]
     },
     {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_fused_route_matches_the_cos_sin_route_for_both_pairings",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE parity: the fused fast::rope route of qkv::apply_rope_1d vs the shared cos/sin route, 4 styles x 2 axis orders x full/partial rot_dims x offsets 0/7 x f32/bf16 RestoreInput/bf16 Stream, declared tolerances, max printed.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::a_swapped_pairing_or_offset_fails_the_fused_parity",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE mutation controls: fast::rope with the style-derived pairing passes, the swapped traditional flag or a one-position offset must exceed 100x the declared tolerance, per style.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_shared_cos_sin_route_reproduces_every_removed_private_rope_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE bit-exactness: qkv::apply_rope_eager / apply_rope vs verbatim copies of the removed private rotations (qwen/sam2/minimax/sam3/seedvr2/lens forms), f32 and bf16, array_eq.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::a_multi_axis_table_takes_the_shared_cos_sin_route_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX RoPE bit-exactness on a FLUX-style 3-axis id table built by nn::rope_sincos_from_ids, f32 and bf16, plus a control that the table is not a 1-D schedule.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::rope_route_tests::the_shared_modulate_helpers_reproduce_the_removed_private_copies_bitwise",
+      "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
+      "reason": "SW-6140 MLX modulate bit-exactness: nn::modulate_eager / modulate (glue off) / provider glue bodies / scale_shift vs the removed private copies, both literal-1 dtype policies, f32 and bf16.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
       "package": "mlx-gen-anima",
       "kind": "lib",
       "target": "mlx_gen_anima",
@@ -2135,6 +2190,81 @@
       "test": "quant::w4a8_int8::tests::w4a8_gemm_gpu_refuses_misaligned_operand_views_and_realigns_them",
       "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
       "reason": "SW-6134 CUDA W4A8 GEMM operand-alignment regression (review finding 4717213323): contiguous U8 activation / packed-weight views at non-16-byte offsets are refused with the typed misaligned reason before launch (no misaligned-address fault), w4a8_gemm_aligned realigns them, and the output is bit-identical to the aligned baseline; 16-byte aligned nonzero offsets are served uncopied. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::fp8_codes_are_byte_identical_to_the_candle_chain",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused fp8 activation quantizer: E4M3 codes and scale bit-identical to the candle reference chain (CPU-cast) over F32/BF16/F16, tails, zeros, signed zeros, E4M3 ties, underflow, inf/NaN. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::int8_codes_are_byte_identical_to_the_candle_chain",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused int8 activation quantizer: F32 codes and scale bit-identical to the candle round/clamp chain, and i8 bytes identical to the cuBLASLt stage of the reference codes, over the same input matrix. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::fp8_divide_rule_matches_the_fp8_linear_quantizer",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused fp8 quantizer, Fp8Linear route: codes and scale bit-identical to CublasLt::scaled_fp8_activation (hardware cvt.rn.satfinite) on the same inputs. cfg(cuda), Device::new_cuda(0), sm_89+.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::the_e4m3_rounding_matches_float8_on_a_bit_pattern_sweep",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA software E4M3 rounding vs the float8 crate on a strided sweep of every 251st binary32 bit pattern (about 9M values) plus specials, scale 1. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::the_public_quantizers_report_their_path",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA path telemetry: quantize_activation_fp8/int8 record fused on CUDA, disabled with the switch off (identical output), not_cuda for a CPU tensor. cfg(cuda), Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"

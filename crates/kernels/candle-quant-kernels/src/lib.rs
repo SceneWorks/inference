@@ -37,6 +37,12 @@
 //!   from a load-time device table of expert addresses — GGML (candle's own decode MMVQ, every
 //!   type it serves), dense, Q8_0-dequant and NVFP4 (the decode GEMV's core) banks.
 //!
+//! - [`fused_path`] — the media fused-kernel path seam (SW-6126): a per-kernel switch under the
+//!   media-wide `CANDLE_MEDIA_FUSED_KERNELS`, and per-kernel fused-vs-reference counters with typed
+//!   reasons, shared by every Candle media / audio fused kernel (the LLM decode leaves keep
+//!   `candle_layers::fused`).
+//! - [`act_quant`] — the fused per-tensor fp8 / int8 activation quantizer (SW-6126): amax → scale
+//!   → cast on the device, byte-identical to the op chain it replaces, scale kept on the device.
 //! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
 //!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
 //!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
@@ -58,6 +64,7 @@ const _: fn() = || {
         __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
 };
 
+pub mod act_quant;
 pub mod convrot;
 pub mod convrot_int8;
 pub mod cublaslt;
@@ -68,6 +75,7 @@ pub mod flux3_quant;
 #[cfg(feature = "cuda")]
 pub mod fp8_linear;
 pub mod fused_decode;
+pub mod fused_path;
 pub mod gated_delta;
 pub mod gdn_prep;
 pub mod moe_gemv;
@@ -85,9 +93,14 @@ pub mod veda_score;
 pub mod w4a8_gemm;
 pub mod yue2_stable_conv;
 
+pub use act_quant::{
+    check_act_quant, ActQuantPlan, ActQuantRefusal, DeviceQuantized, Fp8ScaleRule, Int8Output,
+    ACT_QUANT_FP8_PATH, ACT_QUANT_INT8_PATH, ACT_QUANT_SRC,
+};
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
-    quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
+    quantize_activation_fp8_reference, quantize_activation_int8,
+    quantize_activation_int8_reference, quantize_weight_fp8, quantize_weight_int8,
     quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
     F8E4M3_MAX, FP8_COMPUTE_CAP_FLOOR, I8_MAX, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_K_ALIGN,
     NVFP4_N_ALIGN,
@@ -138,7 +151,7 @@ pub use nvrtc::{device_compute_cap, CompiledKernel};
 pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
-/// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
+/// primitives, the NVFP4 decode GEMV, the fused NVFP4 and fp8 / int8 activation quantizers, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
 /// frozen Veda tile scorer, streaming training attention and the fused W4A8 GEMM.
 ///
@@ -150,6 +163,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    ACT_QUANT_SRC,
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,

@@ -22,7 +22,7 @@ use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split, 
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{rotate_half, silu};
+use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -333,13 +333,12 @@ impl Qwen25VlText {
 
     /// Apply MRoPE to a `[B, L, H, head_dim]` projection given assembled `cos`/`sin` `[1, L, head_dim]`
     /// (broadcast over the head axis): `x*cos + rotate_half(x)*sin`.
+    ///
+    /// The shared [`mlx_gen::nn::apply_text_rope`] (SW-6140): the identical `expand_dims(2)` broadcast
+    /// and `x·cos + rotate_half(x)·sin` op sequence this crate's private copy ran. M-RoPE positions
+    /// are per-channel-section, so there is no fused `fast::rope` route.
     fn apply_mrope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-        let cos = cos.expand_dims(2)?; // [1, L, 1, head_dim]
-        let sin = sin.expand_dims(2)?;
-        Ok(add(
-            &multiply(x, &cos)?,
-            &multiply(&rotate_half(x)?, &sin)?,
-        )?)
+        mlx_gen::nn::apply_text_rope(x, cos, sin)
     }
 
     /// Eager attention with an external additive 4D `mask` (`[*,*,L,L]`, broadcast): q/k/v project →
@@ -422,6 +421,7 @@ impl Qwen25VlText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::nn::rotate_half;
 
     /// MRoPE channel stitch: for a text segment all three position rows are equal, so the assembled
     /// cos/sin must equal a plain 1D rotary table (the reference note: "the three rotary position
