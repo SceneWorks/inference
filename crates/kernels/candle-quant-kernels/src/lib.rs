@@ -74,6 +74,7 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
+pub mod sage_attention;
 pub mod sm120_gate;
 pub mod training_attention;
 pub mod veda_int8;
@@ -133,7 +134,8 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
-/// frozen Veda tile scorer and streaming training attention.
+/// frozen Veda tile scorer, streaming training attention and the SageAttention-style INT8 QK
+/// attention (SW-6131).
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -155,6 +157,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    sage_attention::SOURCE,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
