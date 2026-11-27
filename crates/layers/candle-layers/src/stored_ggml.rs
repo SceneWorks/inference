@@ -61,6 +61,50 @@ pub fn stored_block_tensor(t: &Tensor) -> Option<(GgmlDType, usize, usize)> {
     stored_block_geometry(t.dtype(), t.dims())
 }
 
+/// [`stored_block_geometry`] read off a safetensors **header** (no payload): the tier validators and
+/// memory pricers that walk `gen_core` headers classify a stored block by this one rule. Rank 3 only;
+/// a stacked rank-4 MoE tensor is [`stored_stacked_header_geometry`].
+pub fn stored_header_geometry(
+    header: &gen_core::SafetensorsTensorHeader,
+) -> Option<(GgmlDType, usize, usize)> {
+    if header.shape.len() != 3 {
+        return None;
+    }
+    ggml_block_storage(
+        header.dtype == gen_core::weightsmeta::Dtype::U8,
+        &header.shape,
+    )
+}
+
+/// A **stacked** stored block header (`U8 [E, out, in / 32, block_bytes]`, the fused-MoE form):
+/// `(dtype, experts, out, in)`. `None` for any other tensor.
+pub fn stored_stacked_header_geometry(
+    header: &gen_core::SafetensorsTensorHeader,
+) -> Option<(GgmlDType, usize, usize, usize)> {
+    let [experts, out, ..] = header.shape[..] else {
+        return None;
+    };
+    if header.shape.len() != 4 {
+        return None;
+    }
+    let (dtype, _, cols) = ggml_block_storage(
+        header.dtype == gen_core::weightsmeta::Dtype::U8,
+        &header.shape,
+    )?;
+    Some((dtype, experts, out, cols))
+}
+
+/// The nominal weight bit width a persisted GGML block type stands for — the `bits` a tier's
+/// `quantization` marker declares for it (`Q4_*` → 4, `Q8_0` → 8). `None` for a block type no
+/// SceneWorks q4/q8 tier persists.
+pub fn stored_ggml_bits(dtype: GgmlDType) -> Option<usize> {
+    match dtype {
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q4K => Some(4),
+        GgmlDType::Q8_0 => Some(8),
+        _ => None,
+    }
+}
+
 /// A typed refusal of a malformed stored GGML projection. `context` names the loader (e.g.
 /// `minimax-h3 dit`, `stored-ggml`) so the message attributes the failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -282,6 +326,52 @@ mod tests {
         assert_eq!(stored_block_geometry(DType::U8, &[32, 80]), None);
         assert_eq!(stored_block_geometry(DType::U8, &[2, 32, 4, 20]), None);
         assert_eq!(stored_block_geometry(DType::U8, &[32, 4, 21]), None);
+    }
+
+    #[test]
+    fn header_helpers_classify_stored_blocks_and_their_bits() {
+        use gen_core::weightsmeta::Dtype;
+        let header = |dtype, shape: &[usize]| gen_core::SafetensorsTensorHeader {
+            name: "p.weight".into(),
+            dtype,
+            shape: shape.to_vec(),
+            data_bytes: shape.iter().product::<usize>() as u64,
+        };
+        assert_eq!(
+            stored_header_geometry(&header(Dtype::U8, &[8, 4, 34])),
+            Some((GgmlDType::Q8_0, 8, 128))
+        );
+        assert_eq!(
+            stored_header_geometry(&header(Dtype::U32, &[8, 4, 34])),
+            None
+        );
+        assert_eq!(
+            stored_header_geometry(&header(Dtype::U8, &[2, 8, 4, 20])),
+            None
+        );
+        assert_eq!(
+            stored_stacked_header_geometry(&header(Dtype::U8, &[2, 8, 4, 20])),
+            Some((GgmlDType::Q4_1, 2, 8, 128))
+        );
+        assert_eq!(
+            stored_stacked_header_geometry(&header(Dtype::U8, &[8, 4, 20])),
+            None
+        );
+        // The contract-layer mirror (`gen_core`'s header predicate) agrees with this module's
+        // classification for every persisted block type.
+        for dtype in crate::llm_projection::STORED_GGML {
+            let h = header(Dtype::U8, &[8, 4, dtype.type_size()]);
+            assert!(h.is_stored_ggml_block(), "{dtype:?}");
+            assert_eq!(
+                h.stored_ggml_block_bits(),
+                stored_ggml_bits(dtype),
+                "{dtype:?}"
+            );
+            assert!(stored_header_geometry(&h).is_some(), "{dtype:?}");
+        }
+        assert_eq!(stored_ggml_bits(GgmlDType::Q4_1), Some(4));
+        assert_eq!(stored_ggml_bits(GgmlDType::Q8_0), Some(8));
+        assert_eq!(stored_ggml_bits(GgmlDType::F16), None);
     }
 
     #[test]

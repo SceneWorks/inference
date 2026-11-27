@@ -1535,6 +1535,38 @@ fn ignored_vision_packing_does_not_determine_the_language_tier() {
     assert!(error.contains("direct-shard surface is dense"), "{error}");
 }
 
+/// SW-7285: a Candle-native GGML text encoder's stored blocks (`U8 [out, in / 32, block_bytes]`,
+/// no affine sidecars) are packed evidence for a declared tier, and undeclared evidence still
+/// fails closed.
+#[test]
+fn stored_ggml_blocks_are_packed_quantization_evidence() {
+    let stored = |block: usize| SafetensorsTensorHeader {
+        name: "model.layers.0.self_attn.q_proj.weight".into(),
+        dtype: Dtype::U8,
+        shape: vec![64, 2, block],
+        data_bytes: (64 * 2 * block) as u64,
+    };
+    assert_eq!(stored(20).stored_ggml_block_bits(), Some(4));
+    assert_eq!(stored(34).stored_ggml_block_bits(), Some(8));
+    assert_eq!(stored(21).stored_ggml_block_bits(), None);
+    let declared = PackedQuantization {
+        bits: 8,
+        group_size: 64,
+    };
+    assert_eq!(
+        validate_quantization_evidence(&[stored(34)], Path::new("fixture"), Some(declared))
+            .unwrap(),
+        Some(declared)
+    );
+    let error = validate_quantization_evidence(&[stored(34)], Path::new("fixture"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("requires authoritative config.json"),
+        "{error}"
+    );
+}
+
 #[test]
 fn ignored_decoder_tail_packing_does_not_determine_the_language_tier() {
     let headers = vec![

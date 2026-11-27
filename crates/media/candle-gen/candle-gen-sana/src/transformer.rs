@@ -110,18 +110,55 @@ fn validate_packed_tier(
     cfg: &SanaTransformerConfig,
 ) -> candle_gen::Result<Option<usize>> {
     let bases = packed_linear_bases(cfg);
+    use candle_gen::quant::stored_ggml::{stored_ggml_bits, stored_ggml_storage};
+    // A Candle-native GGML tier (SW-7285) stores a projection as ONE `{base}.weight` of GGML blocks
+    // (`U8 [out, in / 32, block_bytes]`) — the packed equivalent of the affine triple.
     let is_packed = bases.iter().any(|(base, _)| {
-        w.contains(&format!("{base}.scales")) || w.is_affine_codes(&format!("{base}.weight"))
+        w.contains(&format!("{base}.scales"))
+            || w.is_affine_codes(&format!("{base}.weight"))
+            || stored_ggml_storage(w, base).is_some()
     });
     if !is_packed {
         return Ok(None);
     }
 
     let mut bits = None;
+    let mut merge_bits = |base: &str, this_bits: usize| -> candle_gen::Result<()> {
+        match bits {
+            Some(expected) if expected != this_bits => Err(candle_gen::CandleError::Msg(format!(
+                "SANA packed tier mixes Q{expected} and Q{this_bits} projections ({base}); select \
+                 one coherent Q4 or Q8 tier"
+            ))),
+            _ => {
+                bits = Some(this_bits);
+                Ok(())
+            }
+        }
+    };
     for (base, has_bias) in bases {
         let weight_key = format!("{base}.weight");
         let scales_key = format!("{base}.scales");
         let biases_key = format!("{base}.biases");
+        if let Some((dtype, ..)) = stored_ggml_storage(w, &base) {
+            if w.contains(&scales_key) || w.contains(&biases_key) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "SANA packed tier stores {base} as GGML blocks and also carries affine parts — \
+                     a tier stores a projection one way, never both"
+                )));
+            }
+            if has_bias && !w.contains(&format!("{base}.bias")) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "SANA packed tier is incomplete: missing {base}.bias for its biased projection"
+                )));
+            }
+            let this_bits = stored_ggml_bits(dtype).ok_or_else(|| {
+                candle_gen::CandleError::Msg(format!(
+                    "SANA packed tier stores {base} as unsupported {dtype:?} blocks"
+                ))
+            })?;
+            merge_bits(&base, this_bits)?;
+            continue;
+        }
         for key in [&weight_key, &scales_key, &biases_key] {
             if !w.contains(key) {
                 return Err(candle_gen::CandleError::Msg(format!(
@@ -158,15 +195,7 @@ fn validate_packed_tier(
                 "SANA packed tier has unsupported Q{this_bits} affine layout for {base}; expected Q4 or Q8 group-{MLX_PACKED_GROUP}"
             )));
         }
-        if let Some(expected) = bits {
-            if expected != this_bits {
-                return Err(candle_gen::CandleError::Msg(format!(
-                    "SANA packed tier mixes Q{expected} and Q{this_bits} projections; select one coherent Q4 or Q8 tier"
-                )));
-            }
-        } else {
-            bits = Some(this_bits);
-        }
+        merge_bits(&base, this_bits)?;
     }
     Ok(bits)
 }
@@ -1495,6 +1524,48 @@ mod tests {
                     "{variant} Q{bits} tier must not silently retain a dense DiT projection"
                 );
             }
+        }
+    }
+
+    /// SW-7285: a Candle-native GGML SANA trunk (every converter target stored as GGML blocks, no
+    /// affine parts) is the packed tier of its block width — never mistaken for a dense checkpoint —
+    /// and a both-forms projection is refused. Validation only; no trunk is built.
+    #[test]
+    fn stored_ggml_trunk_validates_as_the_packed_tier_of_its_block_width() {
+        let dev = Device::Cpu;
+        let cfg = nvfp4_eligible_cfg();
+        for bits in [4usize, 8] {
+            let mut map = synthetic_trunk_map(&cfg, &dev);
+            for (base, _) in packed_linear_bases(&cfg) {
+                let weight = map.remove(&format!("{base}.weight")).unwrap();
+                let (wq, s, b) =
+                    candle_gen::quant::pack_mlx_affine(&weight, bits, MLX_PACKED_GROUP).unwrap();
+                let qt = candle_gen::quant::repack_packed_weight_uncached(
+                    &wq,
+                    &s,
+                    &b,
+                    MLX_PACKED_GROUP,
+                    &dev,
+                )
+                .unwrap();
+                map.insert(
+                    format!("{base}.weight"),
+                    candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(&qt).unwrap(),
+                );
+            }
+            assert_eq!(
+                validate_packed_tier(&Weights::from_map(map.clone()), &cfg).unwrap(),
+                Some(bits)
+            );
+            let (base, _) = packed_linear_bases(&cfg).into_iter().next().unwrap();
+            map.insert(
+                format!("{base}.scales"),
+                Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            );
+            let error = validate_packed_tier(&Weights::from_map(map), &cfg)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("never both"), "{error}");
         }
     }
 

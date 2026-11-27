@@ -383,6 +383,22 @@ fn packed_aware_headers_bytes(
                     packed_triple_dense_bytes(header, scales, group_size, float_width)?
                 }
             }
+        } else if let Some((rows, cols)) = header.stored_ggml_block_matrix() {
+            // A Candle-native GGML tier's stored blocks (SW-7285): resident as published on a
+            // QTensor loader, dequantized to a dense `[rows, cols]` matrix by the VAE.
+            match residency {
+                PackedResidency::Qtensor => header.data_bytes,
+                PackedResidency::Dense { float_width } => u64::try_from(rows)
+                    .ok()
+                    .zip(u64::try_from(cols).ok())
+                    .and_then(|(rows, cols)| rows.checked_mul(cols)?.checked_mul(float_width))
+                    .ok_or_else(|| {
+                        gen_core::Error::Msg(format!(
+                            "stored dense byte overflow for {:?}",
+                            header.name
+                        ))
+                    })?,
+            }
         } else {
             dense(header)?
         };
@@ -1294,6 +1310,51 @@ fn generation_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-7285: a stored GGML VAE block is priced at the dense `[rows, cols]` matrix the VAE
+    /// dequantizes it to (at the pipeline and reference-encoder widths), and at its stored bytes on
+    /// a QTensor loader. Header-only.
+    #[test]
+    fn stored_ggml_vae_blocks_are_priced_dense() {
+        let header = |name: &str, dtype, shape: Vec<usize>, data_bytes| {
+            gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.into(),
+                dtype,
+                shape,
+                data_bytes,
+            }
+        };
+        use gen_core::weightsmeta::Dtype;
+        let headers = vec![
+            header(
+                &format!("{VAE_ENCODER_PREFIX}mid.attn.to_q.weight"),
+                Dtype::U8,
+                vec![8, 4, 34],
+                8 * 4 * 34,
+            ),
+            header("decoder.norm.weight", Dtype::F32, vec![8], 32),
+        ];
+        let vae = VaeBytes::from_headers(&headers, candle_gen::quant::MLX_GROUP_SIZE).unwrap();
+        assert_eq!(
+            vae.resident,
+            8 * 128 * PIPELINE_FLOAT_WIDTH + 8 * PIPELINE_FLOAT_WIDTH
+        );
+        assert_eq!(
+            vae.reference_encoder,
+            8 * 128 * REFERENCE_ENCODER_FLOAT_WIDTH
+        );
+        assert_eq!(
+            packed_aware_headers_bytes(
+                &headers[..1],
+                candle_gen::quant::MLX_GROUP_SIZE,
+                PackedResidency::Qtensor,
+                "transformer",
+                |_| Ok(0),
+            )
+            .unwrap(),
+            8 * 4 * 34
+        );
+    }
 
     /// sc-22727: `selected_encoder_discovery_roots` widened confinement to the Hugging Face cache
     /// **repository** so a snapshot's `blobs/` symlink targets are admitted. This crate's own

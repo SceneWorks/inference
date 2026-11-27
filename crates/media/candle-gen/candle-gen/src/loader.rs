@@ -85,12 +85,34 @@ pub fn dequantized_vae_vb(
     let st = mmap_safetensors_multi(files)?;
     let mut views = std::collections::BTreeMap::new();
     let mut overrides = std::collections::HashMap::new();
-    for (key, _) in st.tensors() {
+    for (key, view) in st.tensors() {
         if key.ends_with(".scales") || key.ends_with(".biases") {
             continue;
         }
         if let Some(base) = key.strip_suffix(".weight") {
             let scales = format!("{base}.scales");
+            // A Candle-native GGML tier (SW-7285) stores the VAE's quantized matrices as GGML
+            // blocks (`U8 [out, in / 32, block_bytes]`); the stock diffusers VAE is dense, so the
+            // blocks dequantize once on the host — the same grid the affine triple decodes to.
+            let stored = DType::try_from(view.dtype()).ok().and_then(|dtype| {
+                crate::quant::stored_ggml::stored_block_geometry(dtype, view.shape())
+            });
+            if let Some((ggml, ..)) = stored {
+                crate::quant::stored_ggml::validate_stored(
+                    "vae",
+                    base,
+                    (ggml, 0, 0),
+                    st.get(&scales).is_ok(),
+                    None,
+                )
+                .map_err(|e| CandleError::Msg(e.to_string()))?;
+                let blocks = st.load(&key, &Device::Cpu)?;
+                let weight = crate::quant::stored_ggml::qtensor_from_stored(&blocks, &Device::Cpu)?
+                    .dequantize(&Device::Cpu)?
+                    .to_dtype(dtype)?;
+                overrides.insert(key, weight);
+                continue;
+            }
             if st.get(&scales).is_ok() {
                 let codes = st.load(&key, &Device::Cpu)?;
                 if codes.dtype() != DType::U32 {
@@ -537,6 +559,72 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(name.to_string(), t);
         candle_core::safetensors::save(&map, path).unwrap();
+    }
+
+    /// SW-7285: a Candle-native GGML VAE (the FLUX.1 / Z-Image tiers quantize the mid-block
+    /// attention matrices) loads through the dense diffusers VAE seam: each stored GGML block
+    /// dequantizes to the dense `[out, in]` grid the MLX triple decodes to, a dense leaf passes
+    /// through untouched, and a block stored beside a `.scales` sibling is refused. No forward runs.
+    #[test]
+    fn dequantized_vae_vb_dequantizes_stored_ggml_blocks() {
+        use crate::quant::{pack_mlx_affine, repack_packed_weight_uncached, MLX_GROUP_SIZE};
+        let tmp = tempfile::tempdir().unwrap();
+        let dense = Tensor::arange(0f32, (8 * 128) as f32, &Device::Cpu)
+            .unwrap()
+            .reshape((8, 128))
+            .unwrap()
+            .affine(0.003, -1.0)
+            .unwrap();
+        for bits in [4usize, 8] {
+            let (wq, s, b) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+            let grid = crate::quant::dequant_vae_grid(&wq, &s, &b).unwrap();
+            let qt =
+                repack_packed_weight_uncached(&wq, &s, &b, MLX_GROUP_SIZE, &Device::Cpu).unwrap();
+            let stored = crate::candle_layers::llm_projection::to_ggml_block_tensor(&qt).unwrap();
+            let path = tmp.path().join(format!("vae-{bits}.safetensors"));
+            let norm = Tensor::ones(8, DType::F32, &Device::Cpu).unwrap();
+            candle_core::safetensors::save(
+                &std::collections::HashMap::from([
+                    ("mid.attn.to_q.weight".to_owned(), stored.clone()),
+                    ("mid.norm.weight".to_owned(), norm.clone()),
+                ]),
+                &path,
+            )
+            .unwrap();
+            let vb =
+                dequantized_vae_vb(std::slice::from_ref(&path), DType::F32, &Device::Cpu).unwrap();
+            let weight = vb.get((8, 128), "mid.attn.to_q.weight").unwrap();
+            let diff = (weight - &grid)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 2e-2,
+                "q{bits}: stored blocks decode to the triple's grid ({diff})"
+            );
+            let n = vb.get(8, "mid.norm.weight").unwrap();
+            assert_eq!(n.to_vec1::<f32>().unwrap(), norm.to_vec1::<f32>().unwrap());
+
+            let (_, s, _) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+            let both = tmp.path().join(format!("both-{bits}.safetensors"));
+            candle_core::safetensors::save(
+                &std::collections::HashMap::from([
+                    ("mid.attn.to_q.weight".to_owned(), stored),
+                    ("mid.attn.to_q.scales".to_owned(), s),
+                ]),
+                &both,
+            )
+            .unwrap();
+            let err = dequantized_vae_vb(std::slice::from_ref(&both), DType::F32, &Device::Cpu)
+                .err()
+                .expect("both forms refused")
+                .to_string();
+            assert!(err.contains("never both"), "{err}");
+        }
     }
 
     fn tmp_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {

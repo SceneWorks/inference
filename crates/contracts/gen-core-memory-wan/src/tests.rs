@@ -10,6 +10,7 @@ fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
         let width = match dtype {
             "F32" | "U32" => 4,
             "F16" | "BF16" => 2,
+            "U8" => 1,
             _ => panic!("dtype"),
         };
         let bytes = shape.iter().product::<usize>() * width;
@@ -1263,6 +1264,38 @@ fn a_packed_file_prices_a_dense_output_head_but_still_refuses_stripped_quant_met
     let path = tmp.path().join("dense_only.safetensors");
     write_safetensors(&path, &[("head.head.weight", "BF16", &[64, 64])]);
     assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+}
+
+/// SW-7285: a Candle-native GGML Wan transformer (stored `U8 [out, in / 32, block_bytes]` blocks,
+/// no affine leaves) is priced on the Candle backend at the blocks' stored bytes plus the dense
+/// residual; MLX (no reader), the other width, and a both-forms projection are refused.
+#[test]
+fn stored_ggml_blocks_are_priced_at_their_stored_bytes_on_candle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("high_noise_model.safetensors");
+    write_safetensors(
+        &path,
+        &[
+            ("blocks.0.self_attn.q.weight", "U8", &[64, 2, 20]),
+            ("blocks.0.norm1.weight", "BF16", &[64]),
+            ("head.head.weight", "BF16", &[64, 64]),
+        ],
+    );
+    assert_eq!(
+        packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).unwrap(),
+        64 * 2 * 20 + (64 + 64 * 64) * 2
+    );
+    assert!(packed_transformer_bytes(&path, Quant::Q8, WanI2vBackend::Candle).is_err());
+    assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+    write_safetensors(
+        &path,
+        &[
+            ("blocks.0.self_attn.q.weight", "U8", &[64, 2, 20]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+        ],
+    );
+    assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).is_err());
 }
 
 fn request(route: WanI2vRoute) -> GenerationRequest {

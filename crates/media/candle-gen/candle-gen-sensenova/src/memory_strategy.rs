@@ -216,7 +216,7 @@ impl CheckpointInventory {
     }
 
     pub(crate) fn validate_numeric_tier(&self, spec: &LoadSpec) -> gen_core::Result<()> {
-        let actual = detect_checkpoint_quantization(&self.files)?;
+        let (actual, stored_blocks) = detect_checkpoint_quantization(&self.files)?;
         let declared = spec.quantize.map(|quant| quant.bits() as u8);
         if declared != actual {
             return Err(gen_core::Error::Unsupported(format!(
@@ -251,7 +251,12 @@ impl CheckpointInventory {
                     .get("group_size")
                     .and_then(|value| value.as_u64()),
             );
-            if recorded != (actual.map(u64::from), Some(64)) {
+            // A Candle-native GGML tier (SW-7285) records `{bits, storage: "ggml"}` and no group:
+            // its stored blocks carry their own block geometry.
+            let ggml = quantization.get("storage").and_then(|value| value.as_str())
+                == Some(candle_gen::quant::stored_ggml::GGML_STORAGE);
+            let expected_group = if ggml { None } else { Some(64) };
+            if recorded != (actual.map(u64::from), expected_group) || ggml != stored_blocks {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: config quantization provenance {recorded:?} crosses checkpoint tensor packing {:?}/group64",
                     actual
@@ -367,10 +372,12 @@ fn is_backbone_linear(base: &str) -> bool {
     })
 }
 
-/// Header-only mirror of `quant::detect_linear`: no tensor data is materialized.
+/// Header-only mirror of `quant::detect_linear`: no tensor data is materialized. Returns the
+/// packed bit width (`None` for dense) and whether the packed projections are Candle-native stored
+/// GGML blocks (SW-7285) rather than affine triples.
 fn detect_checkpoint_quantization(
     files: &[(PathBuf, gen_core::PinnedWeightsFile)],
-) -> gen_core::Result<Option<u8>> {
+) -> gen_core::Result<(Option<u8>, bool)> {
     // Capped header reads (no mmap); the retained pins reject mutation. Shards are concatenated in
     // order, exactly as the previous multi-file mapping enumerated them.
     let mut views = Vec::new();
@@ -383,6 +390,7 @@ fn detect_checkpoint_quantization(
         .collect::<std::collections::BTreeSet<_>>();
     let mut detected = None;
     let mut projections = 0_usize;
+    let mut stored_form = false;
     for weight in &views {
         let name = &weight.name;
         let Some(base) = name.strip_suffix(".weight") else {
@@ -395,7 +403,29 @@ fn detect_checkpoint_quantization(
         let scales_name = format!("{base}.scales");
         let biases_name = format!("{base}.biases");
         let packed = names.contains(scales_name.as_str());
-        let tier = if packed {
+        let stored = weight.shape.len() == 3 && weight.is_stored_ggml_block();
+        if projections > 1 && stored != stored_form {
+            return Err(gen_core::Error::Unsupported(
+                "sensenova: checkpoint mixes stored GGML blocks with other projection storage"
+                    .into(),
+            ));
+        }
+        stored_form = stored;
+        let tier = if stored {
+            // A Candle-native GGML tier (SW-7285): the stored block type is the tier; a projection
+            // is stored one way, never as blocks AND an affine triple.
+            if packed || names.contains(biases_name.as_str()) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "sensenova: projection {base} is stored as GGML blocks and also carries \
+                     affine sidecars — never both"
+                )));
+            }
+            let bits = weight
+                .stored_ggml_block_bits()
+                .and_then(|bits| u8::try_from(bits).ok())
+                .expect("a stored GGML block header has a bit width");
+            Some(bits)
+        } else if packed {
             if !names.contains(biases_name.as_str()) {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base} has scales but no affine biases"
@@ -484,7 +514,7 @@ fn detect_checkpoint_quantization(
             "sensenova: checkpoint contains no recognizable decoder projection weights".into(),
         ));
     }
-    Ok(detected)
+    Ok((detected, stored_form))
 }
 
 pub(crate) fn validate_load_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<()> {
@@ -1945,6 +1975,51 @@ mod tests {
         )
         .unwrap();
         assert!(inventory.ensure_unchanged().is_err());
+    }
+
+    /// SW-7285: a Candle-native GGML SenseNova tier (stored `U8 [out, in / 32, block_bytes]`
+    /// projections, `{bits, storage: "ggml"}` provenance with no group) is the tier its block type
+    /// encodes; a crossed provenance, the other request and a both-forms projection are refused.
+    #[test]
+    fn stored_ggml_tier_matches_its_block_width_and_storage_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tier");
+        let base = "language_model.model.layers.0.self_attn.k_proj";
+        let write = |block: usize, config: &str, scales: bool| {
+            std::fs::create_dir_all(&root).unwrap();
+            let mut tensors = HashMap::from([(
+                format!("{base}.weight"),
+                Tensor::zeros((2, 2, block), DType::U8, &Device::Cpu).unwrap(),
+            )]);
+            if scales {
+                tensors.insert(
+                    format!("{base}.scales"),
+                    Tensor::ones((2, 1), DType::BF16, &Device::Cpu).unwrap(),
+                );
+            }
+            candle_gen::candle_core::safetensors::save(&tensors, root.join("model.safetensors"))
+                .unwrap();
+            std::fs::write(root.join("config.json"), config).unwrap();
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        for (bits, block, quant, other) in
+            [(4, 20, Quant::Q4, Quant::Q8), (8, 34, Quant::Q8, Quant::Q4)]
+        {
+            let ggml = format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#);
+            write(block, &ggml, false);
+            validate_artifact_tier(&spec.clone().with_quant(quant)).unwrap();
+            assert!(validate_artifact_tier(&spec.clone().with_quant(other)).is_err());
+            assert!(validate_artifact_tier(&spec).is_err(), "dense request");
+            // An affine provenance (group 64, no storage marker) crosses stored blocks.
+            write(
+                block,
+                &format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                false,
+            );
+            assert!(validate_artifact_tier(&spec.clone().with_quant(quant)).is_err());
+            write(block, &ggml, true);
+            assert!(validate_artifact_tier(&spec.clone().with_quant(quant)).is_err());
+        }
     }
 
     #[test]

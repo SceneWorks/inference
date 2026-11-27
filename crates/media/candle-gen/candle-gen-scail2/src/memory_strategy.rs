@@ -443,6 +443,33 @@ fn packed_dit_bytes(path: &Path, quant: Quant) -> gen_core::Result<u64> {
         .collect::<BTreeMap<_, _>>();
     let mut packed_bases = BTreeSet::new();
     let mut packed = 0_u64;
+    // A Candle-native GGML tier (SW-7285): the stored blocks ARE the resident GGUF weight, so they
+    // are charged their own stored bytes — never a float width — and must be the declared width.
+    for weight in tensors
+        .values()
+        .filter(|header| header.name.ends_with(".weight"))
+    {
+        let Some((dtype, ..)) = candle_gen::quant::stored_ggml::stored_header_geometry(weight)
+        else {
+            continue;
+        };
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        if tensors.contains_key(&format!("{base}.scales"))
+            || tensors.contains_key(&format!("{base}.biases"))
+            || candle_gen::quant::stored_ggml::stored_ggml_bits(dtype)
+                != Some(quant.bits() as usize)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: stored {dtype:?} projection {base} is not a Q{} GGML block weight \
+                 stored one way",
+                quant.bits()
+            )));
+        }
+        packed = packed.checked_add(weight.data_bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!("{PROVIDER_ID}: packed resident total overflow"))
+        })?;
+        packed_bases.insert(base.to_owned());
+    }
     for weight in tensors
         .values()
         .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
@@ -1723,6 +1750,49 @@ pub(crate) mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    /// SW-7285: a stored-GGML DiT prices each stored block at its own stored bytes (the resident
+    /// GGUF weight, never a float width) and refuses blocks of the other width or stored both ways.
+    #[test]
+    fn packed_dit_bytes_prices_stored_ggml_blocks_at_their_stored_bytes() {
+        use safetensors::{serialize, tensor::TensorView, Dtype};
+        let temp = tempfile::tempdir().unwrap();
+        for (quant, block, other) in [(Quant::Q4, 20_usize, Quant::Q8), (Quant::Q8, 34, Quant::Q4)]
+        {
+            let path = temp.path().join(format!("stored-{block}.safetensors"));
+            let (rows, blocks) = (2_usize, 2_usize);
+            let weight = vec![0_u8; rows * blocks * block];
+            let bias = vec![0_u8; rows * 4];
+            let write = |extra: bool| {
+                let mut tensors = vec![
+                    (
+                        "proj.weight",
+                        TensorView::new(Dtype::U8, vec![rows, blocks, block], &weight).unwrap(),
+                    ),
+                    (
+                        "proj.bias",
+                        TensorView::new(Dtype::F32, vec![rows], &bias).unwrap(),
+                    ),
+                ];
+                if extra {
+                    tensors.push((
+                        "proj.scales",
+                        TensorView::new(Dtype::F32, vec![rows, 1], &bias[..rows * 4]).unwrap(),
+                    ));
+                }
+                std::fs::write(&path, serialize(tensors, None).unwrap()).unwrap();
+            };
+            write(false);
+            assert_eq!(
+                packed_dit_bytes(&path, quant).unwrap(),
+                (rows * blocks * block + rows * 4) as u64,
+                "stored blocks at their bytes + the F32 bias"
+            );
+            assert!(packed_dit_bytes(&path, other).is_err());
+            write(true);
+            assert!(packed_dit_bytes(&path, quant).is_err(), "stored both ways");
+        }
     }
 
     /// A canonical packed-tier fixture: the `q4` / `q8` sibling of [`candle_fixture`].

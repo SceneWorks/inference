@@ -252,6 +252,23 @@ pub(crate) fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<Co
     if w.is_convrot() {
         return Ok(ComposableLinear::ConvRot(linear_detect(w, path, bias)?));
     }
+    // A Candle-native GGML tier (SW-7285): the stored blocks are the packed base as published — no
+    // repack, no cache entry — and carry their own `[out, in]`.
+    if let Some(qt) = w.load_stored_ggml(path, w.device())? {
+        let (out_f, in_f) = qt.shape().dims2()?;
+        let dense_bias = if bias {
+            Some(w.get(&format!("{path}.bias"))?)
+        } else {
+            None
+        };
+        let ql = SharedQLinear::from_qtensor_dequant(std::sync::Arc::new(qt), dense_bias);
+        return Ok(ComposableLinear::Adapt(LoraLinear::from_qlinear(
+            ql,
+            in_f,
+            out_f,
+            path.to_string(),
+        )));
+    }
     let scales_key = format!("{path}.scales");
     match w.packed() {
         Some(cfg) if w.contains(&scales_key) => {

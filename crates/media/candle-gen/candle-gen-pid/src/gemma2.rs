@@ -83,9 +83,14 @@ fn validate_packed_tier(w: &Weights, prefix: &str, cfg: &Gemma2Config) -> Result
             .iter()
             .map(move |tail| format!("{prefix}layers.{index}.{tail}"))
     });
+    use candle_gen::quant::stored_ggml::{stored_ggml_bits, stored_ggml_storage};
     let bases = bases.collect::<Vec<_>>();
+    // A Candle-native GGML tier (SW-7285) stores a projection as ONE `{base}.weight` of GGML blocks
+    // (`U8 [out, in / 32, block_bytes]`) — the packed equivalent of the affine triple.
     let packed = bases.iter().any(|base| {
-        w.contains(&format!("{base}.scales")) || w.is_affine_codes(&format!("{base}.weight"))
+        w.contains(&format!("{base}.scales"))
+            || w.is_affine_codes(&format!("{base}.weight"))
+            || stored_ggml_storage(w, base).is_some()
     });
     if !packed {
         return Ok(None);
@@ -96,6 +101,28 @@ fn validate_packed_tier(w: &Weights, prefix: &str, cfg: &Gemma2Config) -> Result
         let weight_key = format!("{base}.weight");
         let scales_key = format!("{base}.scales");
         let biases_key = format!("{base}.biases");
+        if let Some((dtype, ..)) = stored_ggml_storage(w, &base) {
+            if w.contains(&scales_key) || w.contains(&biases_key) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "Gemma packed tier stores {base} as GGML blocks and also carries affine parts — \
+                     a tier stores a projection one way, never both"
+                )));
+            }
+            let this_bits = stored_ggml_bits(dtype).ok_or_else(|| {
+                candle_gen::CandleError::Msg(format!(
+                    "Gemma packed tier stores {base} as unsupported {dtype:?} blocks"
+                ))
+            })?;
+            if bits.is_some_and(|expected| expected != this_bits) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "Gemma packed tier mixes Q{} and Q{this_bits} projections; select one coherent \
+                     Q4 or Q8 tier",
+                    bits.unwrap_or_default()
+                )));
+            }
+            bits = Some(this_bits);
+            continue;
+        }
         for key in [&weight_key, &scales_key, &biases_key] {
             if !w.contains(key) {
                 return Err(candle_gen::CandleError::Msg(format!(
@@ -430,5 +457,71 @@ mod tests {
             .expect_err("orphaned U32 Gemma codes must fail before construction")
             .to_string();
         assert!(error.contains("packed tier is incomplete"), "got: {error}");
+    }
+
+    /// SW-7285: a Candle-native GGML Gemma tier (stored blocks, no affine parts) validates at the
+    /// width its blocks encode — including beside MLX triples of the same width — while a mixed
+    /// width or a both-forms projection is refused. Construction-free.
+    #[test]
+    fn stored_ggml_gemma_projections_validate_at_their_block_width() {
+        let dev = Device::Cpu;
+        let cfg = Gemma2Config {
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 64,
+            intermediate_size: 64,
+            rope_theta: 10_000.0,
+            attn_softcap: 50.0,
+            query_pre_attn_scalar: 64.0,
+            rms_eps: 1e-6,
+        };
+        let targets = [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ];
+        let dense = Tensor::zeros((2, 64), DType::F32, &dev).unwrap();
+        let stored = |bits: usize| {
+            let (wq, s, b) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+            let qt =
+                candle_gen::quant::repack_packed_weight_uncached(&wq, &s, &b, MLX_GROUP_SIZE, &dev)
+                    .unwrap();
+            candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(&qt).unwrap()
+        };
+        for bits in [4usize, 8] {
+            let mut map = HashMap::new();
+            for (i, tail) in targets.iter().enumerate() {
+                let base = format!("layers.0.{tail}");
+                if i == 0 {
+                    // One MLX triple of the same width beside the stored blocks.
+                    let (wq, s, b) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+                    map.insert(format!("{base}.weight"), wq);
+                    map.insert(format!("{base}.scales"), s);
+                    map.insert(format!("{base}.biases"), b);
+                } else {
+                    map.insert(format!("{base}.weight"), stored(bits));
+                }
+            }
+            assert_eq!(
+                validate_packed_tier(&Weights::from_map(map.clone()), "", &cfg).unwrap(),
+                Some(bits)
+            );
+            let other = if bits == 4 { 8 } else { 4 };
+            let mut mixed = map.clone();
+            mixed.insert("layers.0.mlp.down_proj.weight".into(), stored(other));
+            assert!(validate_packed_tier(&Weights::from_map(mixed), "", &cfg).is_err());
+            let (_, s, _) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+            map.insert("layers.0.mlp.up_proj.scales".into(), s);
+            let error = validate_packed_tier(&Weights::from_map(map), "", &cfg)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("never both"), "{error}");
+        }
     }
 }

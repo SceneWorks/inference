@@ -304,6 +304,45 @@ fn strip_diffusion_prefix(key: &str) -> String {
         .to_string()
 }
 
+/// The header facts of a remapped key, as the remap backend's own reads would present the tensor
+/// (SW-7285). The stored dtype is forwarded, so a stored GGML block (`U8 [rows, blocks,
+/// block_bytes]`) reaching one of these dense-only components is classified — and refused by the
+/// shared dense-only guard — rather than cast to a float. A stored block's shape is reported raw
+/// (it is not a conv weight); every other tensor reports the shape after `permute` (the axis order
+/// the backend's `get_unchecked` returns), `None` meaning unpermuted.
+fn remapped_tensor_info(
+    inner: &VarBuilder<'static>,
+    key: &str,
+    permute: impl Fn(&[usize]) -> Option<&'static [usize]>,
+) -> candle_gen::candle_core::Result<Option<candle_gen::candle_nn::var_builder::TensorInfo>> {
+    let Some(mut info) = inner.tensor_info(key)? else {
+        return Ok(None);
+    };
+    let stored = info.dtype.is_some_and(|dtype| {
+        candle_gen::quant::stored_ggml::stored_block_geometry(dtype, info.shape.dims()).is_some()
+    });
+    if !stored {
+        if let Some(order) = permute(info.shape.dims()) {
+            let dims = info.shape.dims();
+            info.shape = order
+                .iter()
+                .map(|&axis| dims[axis])
+                .collect::<Vec<_>>()
+                .into();
+        }
+    }
+    Ok(Some(info))
+}
+
+/// The channels-last → channels-first conv axis order [`VaeRemapBackend::permute_conv`] applies.
+fn conv_axis_order(dims: &[usize]) -> Option<&'static [usize]> {
+    match dims.len() {
+        5 => Some(&[0, 4, 1, 2, 3]),
+        4 => Some(&[0, 3, 1, 2]),
+        _ => None,
+    }
+}
+
 /// A `SimpleBackend` for the tier's `vae_decoder.safetensors` that (1) strips the crate's `vae.` /
 /// `vae.decoder.` prefix, (2) renames the `mean-of-means`/`std-of-means` stats to the tier's
 /// `mean`/`std`, and (3) **permutes** every conv weight from the tier's channels-last `[O,kt,kh,kw,I]`
@@ -350,6 +389,16 @@ impl VaeRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeRemapBackend {
+    fn tensor_info(
+        &self,
+        name: &str,
+    ) -> candle_gen::candle_core::Result<Option<candle_gen::candle_nn::var_builder::TensorInfo>>
+    {
+        let (k, is_conv) = Self::remap(name);
+        remapped_tensor_info(&self.inner, &k, |dims| {
+            is_conv.then(|| conv_axis_order(dims)).flatten()
+        })
+    }
     fn native_linear_weight(
         &self,
         name: &str,
@@ -427,6 +476,16 @@ impl VaeEncoderRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeEncoderRemapBackend {
+    fn tensor_info(
+        &self,
+        name: &str,
+    ) -> candle_gen::candle_core::Result<Option<candle_gen::candle_nn::var_builder::TensorInfo>>
+    {
+        let (k, is_conv) = Self::remap(name);
+        remapped_tensor_info(&self.inner, &k, |dims| {
+            is_conv.then(|| conv_axis_order(dims)).flatten()
+        })
+    }
     fn native_linear_weight(
         &self,
         name: &str,
@@ -524,6 +583,16 @@ impl AudioVaeRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for AudioVaeRemapBackend {
+    fn tensor_info(
+        &self,
+        name: &str,
+    ) -> candle_gen::candle_core::Result<Option<candle_gen::candle_nn::var_builder::TensorInfo>>
+    {
+        let (key, is_conv) = Self::remap(name);
+        remapped_tensor_info(&self.inner, &key, |dims| {
+            is_conv.then(|| conv_axis_order(dims)).flatten()
+        })
+    }
     fn native_linear_weight(
         &self,
         name: &str,
@@ -618,6 +687,17 @@ impl VocoderRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VocoderRemapBackend {
+    fn tensor_info(
+        &self,
+        name: &str,
+    ) -> candle_gen::candle_core::Result<Option<candle_gen::candle_nn::var_builder::TensorInfo>>
+    {
+        let (key, rank3_weight, transposed) = Self::remap(name);
+        let order: &'static [usize] = if transposed { &[2, 0, 1] } else { &[0, 2, 1] };
+        remapped_tensor_info(&self.inner, &key, |dims| {
+            (rank3_weight && dims.len() == 3).then_some(order)
+        })
+    }
     fn native_linear_weight(
         &self,
         name: &str,
@@ -919,9 +999,18 @@ pub struct Ltx25TierManifest {
     pub quant: Ltx25Quant,
     /// One row per component, in manifest order.
     pub components: Vec<Ltx25ManifestComponent>,
+    /// The optional `quantization_storage` marker (SW-7285): `Some("ggml")` for a Candle-native
+    /// GGML split tier, whose packed Linears are stored GGML blocks rather than affine triples.
+    pub storage: Option<String>,
 }
 
 impl Ltx25TierManifest {
+    /// Whether this manifest declares a Candle-native GGML split tier
+    /// (`quantization_storage == "ggml"`, SW-7285).
+    pub fn is_ggml_storage(&self) -> bool {
+        self.storage.as_deref() == Some(candle_gen::quant::stored_ggml::GGML_STORAGE)
+    }
+
     /// The row for `name`, if the manifest carries one.
     pub fn component(&self, name: &str) -> Option<&Ltx25ManifestComponent> {
         self.components.iter().find(|c| c.name == name)
@@ -975,6 +1064,7 @@ impl Ltx25TierManifest {
                 group: json_usize(source, json, "quantization_group_size")?,
             },
             components,
+            storage: optional_json_string(source, json, "quantization_storage")?,
         })
     }
 }
@@ -1257,6 +1347,53 @@ impl Ltx25Tier {
             headers.iter().map(|h| (h.name.as_str(), h)).collect();
         let mut packed = 0_usize;
         for header in headers {
+            // A Candle-native GGML tier (SW-7285) stores a packed Linear as ONE `{base}.weight` of
+            // GGML blocks (`U8 [out, in / 32, block_bytes]`) — the packed equivalent of a triple, so
+            // it counts toward `quantized_linears`. Its block type must be the declared width, and
+            // it must not also carry a triple.
+            if let (Some(base), Some((dtype, ..))) = (
+                header.name.strip_suffix(".weight"),
+                candle_gen::quant::stored_ggml::stored_header_geometry(header),
+            ) {
+                let Some(quant) = self.manifest.quant() else {
+                    return Err(Ltx25TierError::PackedTensorInDenseTier {
+                        component: row.name.clone(),
+                        path: path.to_path_buf(),
+                        tensor: header.name.clone(),
+                    });
+                };
+                let detail = if !self.manifest.is_ggml_storage() {
+                    Some(
+                        "is stored as GGML blocks, but the manifest does not declare \
+                         `quantization_storage: \"ggml\"`"
+                            .to_string(),
+                    )
+                } else if by_name.contains_key(format!("{base}.scales").as_str()) {
+                    Some(format!(
+                        "also carries `{base}.scales` — a projection is stored as GGML blocks or as \
+                         an affine triple, never both"
+                    ))
+                } else if candle_gen::quant::stored_ggml::stored_ggml_bits(dtype)
+                    != Some(quant.bits)
+                {
+                    Some(format!(
+                        "stores {dtype:?} blocks, which is not the manifest's {} bits",
+                        quant.bits
+                    ))
+                } else {
+                    None
+                };
+                if let Some(detail) = detail {
+                    return Err(Ltx25TierError::StoredGgmlMismatch {
+                        component: row.name.clone(),
+                        path: path.to_path_buf(),
+                        base: base.to_string(),
+                        detail,
+                    });
+                }
+                packed += 1;
+                continue;
+            }
             let Some(base) = header.name.strip_suffix(".scales") else {
                 continue;
             };
@@ -1268,6 +1405,19 @@ impl Ltx25Tier {
                     tensor: header.name.clone(),
                 });
             };
+            // A GGML split tier (SW-7285) stores every packed Linear as GGML blocks: an affine
+            // `.scales` leg anywhere in it is a component from another tier.
+            if self.manifest.is_ggml_storage() {
+                return Err(Ltx25TierError::StoredGgmlMismatch {
+                    component: row.name.clone(),
+                    path: path.to_path_buf(),
+                    base: base.to_string(),
+                    detail: format!(
+                        "carries `{base}.scales`, but the manifest declares a GGML split tier \
+                         (`quantization_storage: \"ggml\"`) whose packed Linears are stored blocks"
+                    ),
+                });
+            }
             packed += 1;
             // (5) A triple is `{base}.weight` + `{base}.scales` + `{base}.biases`. A missing leg
             // would otherwise surface as a `get_unchecked` failure mid-load, after the caller has
@@ -1283,6 +1433,19 @@ impl Ltx25Tier {
                     has_biases: biases.is_some(),
                 });
             };
+            // A `.scales` sibling of a stored GGML block (SW-7285) is the both-forms fault, whichever
+            // of the two headers this walk reaches first.
+            if candle_gen::quant::stored_ggml::stored_header_geometry(weight).is_some() {
+                return Err(Ltx25TierError::StoredGgmlMismatch {
+                    component: row.name.clone(),
+                    path: path.to_path_buf(),
+                    base: base.to_string(),
+                    detail: format!(
+                        "also carries `{base}.scales` — a projection is stored as GGML blocks or \
+                         as an affine triple, never both"
+                    ),
+                });
+            }
             // (5) The codes are bit-packed, not numeric. Stored at a float dtype they would be
             // *readable* — and every value would be wrong.
             if weight.dtype != Dtype::U32 {
@@ -1567,6 +1730,18 @@ pub enum Ltx25TierError {
         /// The `.scales` grid's shape and the packed weight's.
         shapes: Box<PackedShapes>,
     },
+    /// A stored GGML block projection (SW-7285) disagrees with the manifest's width, or is also
+    /// stored as an affine triple.
+    StoredGgmlMismatch {
+        /// The component id.
+        component: String,
+        /// The file.
+        path: PathBuf,
+        /// The projection's base key.
+        base: String,
+        /// What disagreed.
+        detail: String,
+    },
     /// A packed tensor was found inside a tier the manifest declares dense.
     PackedTensorInDenseTier {
         /// The component id.
@@ -1728,6 +1903,16 @@ impl std::fmt::Display for Ltx25TierError {
                 shapes.scales,
                 declared.bits,
                 declared.group,
+            ),
+            Ltx25TierError::StoredGgmlMismatch {
+                component,
+                path,
+                base,
+                detail,
+            } => write!(
+                f,
+                "ltx 2.5 tier: `{component}` ({}) stored GGML projection `{base}` {detail}",
+                path.display()
             ),
             Ltx25TierError::PackedTensorInDenseTier {
                 component,

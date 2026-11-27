@@ -289,6 +289,24 @@ fn detect_tier(root: &Path) -> gen_core::Result<Option<Quant>> {
             let scales = by_name.get(format!("{base}.scales").as_str());
             let biases = by_name.get(format!("{base}.biases").as_str());
             match (scales, biases) {
+                // A Candle-native GGML tier (SW-7285): the stored block type is the physical tier.
+                (None, None) if weight.is_stored_ggml_block() => {
+                    let tier = match weight.stored_ggml_block_bits() {
+                        Some(4) => Quant::Q4,
+                        Some(8) => Quant::Q8,
+                        _ => {
+                            return Err(gen_core::Error::Unsupported(format!(
+                                "boogu: unsupported stored GGML tensor {base}"
+                            )))
+                        }
+                    };
+                    if observed.is_some_and(|prior| prior != tier) {
+                        return Err(gen_core::Error::Unsupported(
+                            "boogu: artifact mixes q4 and q8 packed tensors".into(),
+                        ));
+                    }
+                    observed = Some(tier);
+                }
                 (None, None) => {
                     if !matches!(
                         weight.dtype,
@@ -383,7 +401,13 @@ fn validate_packing_configs(root: &Path, tier: Option<Quant>) -> gen_core::Resul
                 let group = quant
                     .and_then(|q| q.get("group_size"))
                     .and_then(|v| v.as_u64());
-                if bits != Some(tier.bits() as u64) || group != Some(GROUP_SIZE as u64) {
+                // A Candle-native GGML tier (SW-7285) declares `storage: "ggml"` and no group: its
+                // stored blocks carry their own block geometry.
+                let ggml = quant
+                    .and_then(|q| q.get("storage"))
+                    .and_then(|v| v.as_str())
+                    == Some(candle_gen::quant::stored_ggml::GGML_STORAGE);
+                if bits != Some(tier.bits() as u64) || (!ggml && group != Some(GROUP_SIZE as u64)) {
                     return Err(gen_core::Error::Unsupported(format!("boogu: {component} packing marker crossed actual {:?}/group-{GROUP_SIZE} tensor geometry", tier)));
                 }
             }
@@ -571,6 +595,9 @@ fn projected_component(
             candle_gen::quant::mlx_packed_qtensor_resident_bytes(
                 tensor, scales, biases, GROUP_SIZE,
             )?
+        } else if tensor.is_stored_ggml_block() {
+            // A stored GGML block (SW-7285) is built as published: its stored bytes are resident.
+            tensor.data_bytes
         } else {
             tensor.materialized_bytes(dense_width)?
         };
@@ -1507,6 +1534,52 @@ mod tests {
     use candle_gen::candle_core::{
         safetensors as candle_safetensors, DType as CandleDType, Tensor,
     };
+
+    /// SW-7285: a snapshot of stored GGML blocks resolves to the tier its block type encodes, and
+    /// a mixed-width snapshot is refused. Header-only.
+    #[test]
+    fn stored_ggml_snapshot_detects_its_block_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |root: &Path, block: usize| {
+            for component in ["transformer", "mllm"] {
+                let dir = root.join(component);
+                std::fs::create_dir_all(&dir).unwrap();
+                let tensors = HashMap::from([(
+                    "a.weight".to_owned(),
+                    Tensor::zeros(
+                        (4, 2, block),
+                        CandleDType::U8,
+                        &candle_gen::candle_core::Device::Cpu,
+                    )
+                    .unwrap(),
+                )]);
+                candle_safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+            }
+        };
+        write(&tmp.path().join("q4"), 20);
+        assert_eq!(
+            detect_tier(&tmp.path().join("q4")).unwrap(),
+            Some(Quant::Q4)
+        );
+        write(&tmp.path().join("q8"), 34);
+        assert_eq!(
+            detect_tier(&tmp.path().join("q8")).unwrap(),
+            Some(Quant::Q8)
+        );
+        let mixed = tmp.path().join("mixed");
+        write(&mixed, 20);
+        let tensors = HashMap::from([(
+            "a.weight".to_owned(),
+            Tensor::zeros(
+                (4, 2, 34),
+                CandleDType::U8,
+                &candle_gen::candle_core::Device::Cpu,
+            )
+            .unwrap(),
+        )]);
+        candle_safetensors::save(&tensors, mixed.join("mllm/model.safetensors")).unwrap();
+        assert!(detect_tier(&mixed).is_err());
+    }
 
     /// A snapshot whose `transformer/config.json` carries the published Boogu-Image-0.1 axes the
     /// loader reads through [`config::BooguConfig::from_snapshot`]. `num_layers` is a parameter so

@@ -87,7 +87,26 @@ pub fn inspect_transformer_source(
     // maps the file through the audited loader seam rather than a header-only reader.
     let st = candle_gen::mmap_safetensors(path)?;
     let tensors = st.tensors();
-    let has_mlx = tensors.iter().any(|(name, _)| name.ends_with(".scales"));
+    // Candle-native GGML tier projections (SW-7285): `{base}.weight` stored as GGML blocks
+    // `U8 [out, in / 32, block_bytes]`, no affine sidecars — the packed equivalent of a triple.
+    let stored: Vec<(&str, Option<usize>)> = tensors
+        .iter()
+        .filter_map(|(name, view)| {
+            let base = name.strip_suffix(".weight")?;
+            if view.shape().len() != 3 {
+                return None;
+            }
+            let (dtype, ..) = candle_gen::candle_layers::llm_projection::ggml_block_storage(
+                view.dtype() == SafetensorDtype::U8,
+                view.shape(),
+            )?;
+            Some((
+                base,
+                candle_gen::quant::stored_ggml::stored_ggml_bits(dtype),
+            ))
+        })
+        .collect();
+    let has_mlx = !stored.is_empty() || tensors.iter().any(|(name, _)| name.ends_with(".scales"));
     let has_i8 = tensors
         .iter()
         .any(|(name, view)| name.ends_with(".weight") && view.dtype() == SafetensorDtype::I8);
@@ -144,6 +163,21 @@ pub fn inspect_transformer_source(
                 if bits != expected_bits {
                     return Err(invalid(format!(
                         "packed projection `{base}` is {bits}-bit by its stored shapes, expected {expected_bits}-bit"
+                    )));
+                }
+                keys.insert(base.to_owned());
+            }
+            for &(base, bits) in &stored {
+                if keys.contains(base) || st.get(&format!("{base}.scales")).is_ok() {
+                    return Err(invalid(format!(
+                        "packed projection `{base}` is stored both as GGML blocks and as an \
+                         MLX-affine triple — a tier stores a projection one way, never both"
+                    )));
+                }
+                if bits != Some(expected_bits) {
+                    return Err(invalid(format!(
+                        "packed projection `{base}` is stored as {bits:?}-bit GGML blocks, \
+                         expected {expected_bits}-bit"
                     )));
                 }
                 keys.insert(base.to_owned());
@@ -723,6 +757,59 @@ mod tests {
         );
         assert!(inspect_transformer_source(&convrot, Ltx25QuantMode::PackedQ8).is_err());
         assert!(inspect_transformer_source(&nvfp4, Ltx25QuantMode::Int8ConvRot).is_err());
+    }
+
+    /// SW-7285: a Candle-native GGML transformer (stored `U8 [out, in / 32, block_bytes]` blocks, no
+    /// affine sidecars) is the packed source of its own width — and only that width — while the bf16
+    /// baseline and a projection stored both ways stay refused. Header inspection only.
+    #[test]
+    fn stored_ggml_blocks_satisfy_the_matching_packed_mode_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for (mode, other, block) in [
+            (Ltx25QuantMode::Q4, Ltx25QuantMode::PackedQ8, 20usize),
+            (Ltx25QuantMode::PackedQ8, Ltx25QuantMode::Q4, 34),
+        ] {
+            let path = dir.path().join(format!("stored-{block}.safetensors"));
+            let blocks = vec![0u8; 4 * 2 * block];
+            let tensors = BTreeMap::from([(
+                "model.diffusion_model.block.to_q.weight",
+                safetensors::tensor::TensorView::new(
+                    SafetensorDtype::U8,
+                    vec![4, 2, block],
+                    &blocks,
+                )
+                .unwrap(),
+            )]);
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
+            inspect_transformer_source(&path, mode).unwrap();
+            assert!(inspect_transformer_source(&path, other).is_err(), "{block}");
+            assert!(inspect_transformer_source(&path, Ltx25QuantMode::Bf16).is_err());
+
+            let scales = vec![0u8; 4 * 2];
+            let both = dir.path().join(format!("both-{block}.safetensors"));
+            let tensors = BTreeMap::from([
+                (
+                    "model.diffusion_model.block.to_q.weight",
+                    safetensors::tensor::TensorView::new(
+                        SafetensorDtype::U8,
+                        vec![4, 2, block],
+                        &blocks,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "model.diffusion_model.block.to_q.scales",
+                    safetensors::tensor::TensorView::new(
+                        SafetensorDtype::BF16,
+                        vec![4, 1],
+                        &scales,
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            safetensors::serialize_to_file(tensors, None, &both).unwrap();
+            assert!(inspect_transformer_source(&both, mode).is_err());
+        }
     }
 
     #[test]

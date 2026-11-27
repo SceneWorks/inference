@@ -433,6 +433,11 @@ fn f32_or_packed_tensor_headers(
         }
 
         let loaded = match tensor.dtype {
+            // A Candle-native GGML tier's stored blocks (SW-7285) are built as-is: their stored
+            // bytes ARE the resident GGUF weight — never cast to F32, never re-folded.
+            _ if tensor.name.ends_with(".weight") && tensor.is_stored_ggml_block() => {
+                tensor.data_bytes
+            }
             // Both the imported map (`build_comfyui_dit_map`) and snapshot VarBuilders request the
             // pipeline's F32 dtype. Accepted integer tensors are therefore cast to F32 too; a rank-2
             // projection then takes the same GGML fold as a floating source when Q4/Q8 is selected.

@@ -650,7 +650,34 @@ fn inspect_component_tier(paths: &[PathBuf], component: &str) -> gen_core::Resul
         .keys()
         .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
         .collect::<BTreeSet<_>>();
+    // A Candle-native GGML tier (SW-7285): stored block weights carry their tier in their block
+    // type, with no affine sidecars. Every one must agree, and none may also carry a triple.
+    let mut stored_bits = None;
+    for header in headers.values().filter(|h| h.name.ends_with(".weight")) {
+        let Some(bits) = header.stored_ggml_block_bits() else {
+            continue;
+        };
+        let base = header.name.strip_suffix(".weight").expect("suffix checked");
+        if packed.contains(base)
+            || headers.contains_key(&format!("{base}.biases"))
+            || stored_bits.replace(bits).is_some_and(|prior| prior != bits)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "ideogram: mixed or both-forms stored {component} {base}"
+            )));
+        }
+    }
     if packed.is_empty() {
+        if let Some(bits) = stored_bits {
+            if headers.values().any(|header| {
+                !header.is_stored_ggml_block() && !matches!(header.dtype, Dtype::BF16 | Dtype::F32)
+            }) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ideogram: stored {component} contains a non-BF16/F32 dense tensor"
+                )));
+            }
+            return Ok(Some(if bits == 4 { Quant::Q4 } else { Quant::Q8 }));
+        }
         if headers
             .values()
             .any(|header| !matches!(header.dtype, Dtype::BF16 | Dtype::F32))
@@ -709,6 +736,7 @@ fn inspect_component_tier(paths: &[PathBuf], component: &str) -> gen_core::Resul
             })?;
         if rows != scale_rows
             || !matches!(bits, 4 | 8)
+            || stored_bits.is_some_and(|stored| stored != bits)
             || resolved_bits
                 .replace(bits)
                 .is_some_and(|prior| prior != bits)
@@ -773,6 +801,11 @@ fn capture_component(
                         biases,
                         candle_gen::quant::MLX_GROUP_SIZE,
                     );
+                }
+                // A stored GGML block (SW-7285) is built as published: its stored bytes are
+                // resident (never a float width).
+                if tier.is_some() && header.is_stored_ggml_block() {
+                    return Ok(header.data_bytes);
                 }
                 if tier.is_some() && header.dtype == gen_core::weightsmeta::Dtype::U32 {
                     return Err(gen_core::Error::Unsupported(
@@ -2112,6 +2145,54 @@ mod tests {
         AdapterSpec, LoadShape, MemoryBudget, MemoryCacheState, MemorySelection,
         MemoryStrategyParameters, OffloadPolicy,
     };
+
+    /// SW-7285: a component of stored GGML blocks resolves to the tier its block type encodes;
+    /// mixed widths and a both-forms projection are refused. Header-only.
+    #[test]
+    fn stored_ggml_component_resolves_its_block_tier() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, tensors: Vec<(&str, Tensor)>| {
+            let path = tmp.path().join(name);
+            let map = tensors
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect::<std::collections::HashMap<_, _>>();
+            candle_gen::candle_core::safetensors::save(&map, &path).unwrap();
+            vec![path]
+        };
+        let u8s = |block: usize| Tensor::zeros((4, 2, block), DType::U8, &Device::Cpu).unwrap();
+        let norm = || Tensor::zeros(4, DType::BF16, &Device::Cpu).unwrap();
+        let q4 = write(
+            "q4.safetensors",
+            vec![("a.weight", u8s(20)), ("n.weight", norm())],
+        );
+        assert_eq!(
+            inspect_component_tier(&q4, "transformer").unwrap(),
+            Some(Quant::Q4)
+        );
+        let q8 = write("q8.safetensors", vec![("a.weight", u8s(34))]);
+        assert_eq!(
+            inspect_component_tier(&q8, "transformer").unwrap(),
+            Some(Quant::Q8)
+        );
+        let mixed = write(
+            "mixed.safetensors",
+            vec![("a.weight", u8s(20)), ("b.weight", u8s(34))],
+        );
+        assert!(inspect_component_tier(&mixed, "transformer").is_err());
+        let both = write(
+            "both.safetensors",
+            vec![
+                ("a.weight", u8s(20)),
+                (
+                    "a.scales",
+                    Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+            ],
+        );
+        assert!(inspect_component_tier(&both, "transformer").is_err());
+    }
 
     /// AC (epic SC-22657, E2): both Ideogram providers publish the geometry the loader actually
     /// builds — the `Ideogram4DitConfig::v4` trunk plus the `crate::config` latent/patch/decoder

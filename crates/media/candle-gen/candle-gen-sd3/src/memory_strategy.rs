@@ -629,7 +629,14 @@ fn inspect_transformer(
         .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let config_packed = config_quant(config)?;
-    if packed_bases.is_empty() {
+    // A Candle-native GGML tier (SW-7285): `{base}.weight` stored as GGML blocks (`U8 [out, in /
+    // 32, block_bytes]`, no affine sidecars), resident at its stored bytes.
+    let stored_bases = headers
+        .values()
+        .filter(|header| header.is_stored_ggml_block())
+        .filter_map(|header| header.name.strip_suffix(".weight").map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    if packed_bases.is_empty() && stored_bases.is_empty() {
         if config_packed.is_some() || headers.values().any(|header| header.dtype != Dtype::BF16) {
             return Err(gen_core::Error::Unsupported(
                 "SD3.5 dense transformer requires BF16 tensors and no packing config".into(),
@@ -655,6 +662,22 @@ fn inspect_transformer(
         )));
     }
     let mut bytes = 0_u64;
+    if !stored_bases.is_empty() && !packed_bases.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "SD3.5 transformer mixes stored GGML blocks with affine triples".into(),
+        ));
+    }
+    for base in &stored_bases {
+        let weight = &headers[&format!("{base}.weight")];
+        if headers.contains_key(&format!("{base}.biases"))
+            || weight.stored_ggml_block_bits() != Some(usize::from(bits))
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "SD3.5 stored GGML {base} crosses config width q{bits} or carries affine sidecars"
+            )));
+        }
+        bytes = checked_add(bytes, weight.data_bytes, "stored transformer bytes")?;
+    }
     for base in &packed_bases {
         let weight = headers.get(&format!("{base}.weight")).ok_or_else(|| {
             gen_core::Error::Unsupported(format!("SD3.5 packed {base} lacks weight"))
@@ -709,6 +732,12 @@ fn inspect_transformer(
             .or_else(|| name.strip_suffix(".scales"))
             .or_else(|| name.strip_suffix(".biases"));
         if base.is_some_and(|base| packed_bases.contains(base)) {
+            continue;
+        }
+        if name
+            .strip_suffix(".weight")
+            .is_some_and(|base| stored_bases.contains(base))
+        {
             continue;
         }
         if header.dtype != Dtype::BF16 {
@@ -1801,6 +1830,59 @@ mod tests {
         AdapterSpec, LoadShape, MemoryBudget, MemoryCacheState, MemorySelection,
         MemoryStrategyParameters, OffloadPolicy,
     };
+
+    /// SW-7285: a Candle-native GGML SD3.5 transformer (stored `U8 [out, in / 32, block_bytes]`
+    /// blocks under a `{bits, storage: "ggml"}` config) resolves to its block tier, prices the
+    /// blocks at their stored bytes plus the bf16 residual, and refuses the other width, a missing
+    /// config and a both-forms projection. Header-only.
+    #[test]
+    fn stored_ggml_transformer_resolves_and_prices_its_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (bits, block, other) in [(4u8, 20usize, 34usize), (8, 34, 20)] {
+            let dir = tmp.path().join(format!("q{bits}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("model.safetensors");
+            let config = dir.join("config.json");
+            let pin = |marker: bool| {
+                let body = if marker {
+                    format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#)
+                } else {
+                    "{}".to_owned()
+                };
+                std::fs::write(&config, body).unwrap();
+                gen_core::PinnedWeightsFile::pin(&config).unwrap()
+            };
+            let files = vec![model.clone()];
+            write_safetensors(
+                &model,
+                None,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("n.weight", "BF16", &[4], 8),
+                ],
+            );
+            let (tier, _, bytes) = inspect_transformer(&files, &pin(true)).unwrap();
+            assert_eq!(tier.map(|q| q.bits()), Some(i32::from(bits)));
+            assert_eq!(bytes, (4 * 2 * block + 4 * 2) as u64);
+            assert!(inspect_transformer(&files, &pin(false)).is_err());
+            write_safetensors(
+                &model,
+                None,
+                &[("a.weight", "U8", &[4, 2, other], 4 * 2 * other)],
+            );
+            assert!(inspect_transformer(&files, &pin(true)).is_err());
+            write_safetensors(
+                &model,
+                None,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("a.scales", "BF16", &[4, 1], 8),
+                    ("a.biases", "BF16", &[4, 1], 8),
+                ],
+            );
+            assert!(inspect_transformer(&files, &pin(true)).is_err());
+        }
+    }
 
     fn write_safetensors(
         path: &Path,

@@ -551,6 +551,42 @@ impl SafetensorsTensorHeader {
         )
     }
 
+    /// Whether this header is a **stored GGML block projection** of a Candle-native q4/q8 tier
+    /// (SW-7285): `U8 [out, in / 32, block_bytes]` (rank 3), or the stacked fused-MoE form
+    /// `U8 [E, out, in / 32, block_bytes]` (rank 4), whose last axis is one persisted block size —
+    /// `Q4_0` 18, `Q4_1` 20, `Q8_0` 34 or `Q4_K` 144 bytes. Its resident bytes are its stored
+    /// [`data_bytes`](Self::data_bytes). This is the contract-layer mirror of
+    /// `candle_layers::llm_projection::ggml_block_storage` (a candle-layers test pins the two
+    /// agree); the nominal bit width is [`stored_ggml_block_bits`](Self::stored_ggml_block_bits).
+    pub fn is_stored_ggml_block(&self) -> bool {
+        self.stored_ggml_block_bits().is_some()
+    }
+
+    /// The nominal weight bit width of a [stored GGML block](Self::is_stored_ggml_block) header
+    /// (`Q4_*` → 4, `Q8_0` → 8), or `None` for any other tensor.
+    pub fn stored_ggml_block_bits(&self) -> Option<usize> {
+        if self.dtype != Dtype::U8 || !matches!(self.shape.len(), 3 | 4) {
+            return None;
+        }
+        match self.shape.last()? {
+            18 | 20 | 144 => Some(4),
+            34 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// The logical `(rows, cols)` a rank-3 [stored GGML block](Self::is_stored_ggml_block) header
+    /// decodes to — what a loader that dequantizes the blocks to a dense matrix materializes
+    /// (`Q4_K` packs 256 weights per 144-byte block, every other persisted type 32). `None` for any
+    /// other tensor, including the stacked rank-4 form.
+    pub fn stored_ggml_block_matrix(&self) -> Option<(usize, usize)> {
+        if self.shape.len() != 3 || !self.is_stored_ggml_block() {
+            return None;
+        }
+        let per_block = if self.shape[2] == 144 { 256 } else { 32 };
+        Some((self.shape[0], self.shape[1].checked_mul(per_block)?))
+    }
+
     /// Checked element count described by the tensor shape.
     pub fn element_count(&self) -> Result<u64> {
         self.shape.iter().try_fold(1_u64, |count, dimension| {
