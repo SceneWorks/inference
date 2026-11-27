@@ -38,8 +38,8 @@ use candle_gen::Result as CResult;
 use crate::config::{Vae16Config, LATENTS16_MEAN, LATENTS16_STD};
 use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
 use crate::vae::{
-    candle_error, causal, preflight_streaming_decode, run_streaming_chunks, ChanNorm, Conv2dW,
-    MidAttn, Resnet, Upsampler,
+    candle_error, causal, norm_silu_conv, preflight_streaming_decode, run_streaming_chunks,
+    ChanNorm, Conv2dW, MidAttn, Resnet, Upsampler,
 };
 
 /// One z16 decoder up-stage: residual blocks then an optional spatial/temporal upsampler (no `Dup`
@@ -286,8 +286,7 @@ impl Encoder {
         h = self.mid_resnet0.forward(&h, ctx)?;
         h = self.mid_attn.forward(&h)?;
         h = self.mid_resnet1.forward(&h, ctx)?;
-        let h = self.norm_out.forward(&h)?.silu()?;
-        self.conv_out.forward(&h, ctx)
+        norm_silu_conv(&self.norm_out, &self.conv_out, &h, ctx)
     }
 
     fn reset_cache(&self) {
@@ -590,8 +589,8 @@ impl WanVae16 {
         for ub in &self.up_blocks {
             h = ub.forward(&h, ctx)?;
         }
-        let h = self.norm_out.forward(&h)?.silu()?;
-        self.conv_out.forward(&h, ctx) // [B,3,T',8H,8W] — no unpatchify (z16 has no spatial patchify)
+        // [B,3,T',8H,8W] — no unpatchify (z16 has no spatial patchify)
+        norm_silu_conv(&self.norm_out, &self.conv_out, &h, ctx)
     }
 
     /// Encode a conditioning video `[B,3,T,H,W]` (`T = 1 + 4·k`, values in `[-1,1]`) → normalized latent
@@ -1355,5 +1354,184 @@ mod tests {
                 "message reports dropped count and t: {msg}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_norm_silu_pad_gate {
+    //! SW-6133 decode-level gate: a fixed latent through the **real** Wan 2.x z16 VAE (the A14B
+    //! VAE, `$WAN_VAE16_SNAPSHOT/vae`), decoded with the fused norm + SiLU + causal pad OFF (the op
+    //! chain) and ON, at the production bf16 dtype and at f32. Gate: PSNR >= 50 dB fused vs op chain
+    //! (over the `[-1, 1]` range, peak-to-peak 2), every norm site taking the fused kernel, and a
+    //! lower decode peak (CUDA stream-ordered pool `USED_MEM_HIGH` above the pre-decode live bytes).
+    //! Mutation: the causal zero pad written on the wrong temporal side must fail the gate.
+    //!
+    //! ```text
+    //! set WAN_VAE16_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--wan2.2-t2v-a14b-candle\snapshots\<hash>\q4
+    //! cargo test -p candle-gen-wan --features cuda --release --lib fused_norm_silu_pad_gate -- --ignored --nocapture
+    //! ```
+    use super::WanVae16;
+    use crate::config::Vae16Config;
+    use crate::conv3d::MUTATE_PAD_SIDE;
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::cuda_mempool::MemPool;
+    use candle_gen::fused_path::media_fused_policy_guard;
+    use candle_gen::vae_norm_silu_pad::VAE_NORM_SILU_PAD_PATH;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    /// A fixed standard-normal latent (xorshift + Box-Muller on the host: identical every run).
+    fn fixed_latent(dims: (usize, usize, usize, usize, usize), dev: &Device) -> Result<Tensor> {
+        let n = dims.0 * dims.1 * dims.2 * dims.3 * dims.4;
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut uniform = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                let (u1, u2) = (uniform(), uniform());
+                ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev)
+    }
+
+    fn psnr(a: &Tensor, b: &Tensor) -> Result<f64> {
+        let mse = (a - b)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f64;
+        Ok(if mse <= 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (4.0 / mse).log10()
+        })
+    }
+
+    struct Run {
+        video: Tensor,
+        ms: f64,
+        peak_mib: f64,
+    }
+
+    fn decode(vae: &WanVae16, z: &Tensor, dev: &Device, pool: &MemPool) -> Result<Run> {
+        dev.synchronize()?;
+        let baseline = pool.used().expect("pool USED_MEM_CURRENT");
+        assert!(pool.reset_used_high_water(), "reset USED_MEM_HIGH");
+        let start = Instant::now();
+        let video = vae.decode(z)?;
+        dev.synchronize()?;
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        let high = pool.used_high().expect("pool USED_MEM_HIGH");
+        Ok(Run {
+            video: video.to_dtype(DType::F32)?,
+            ms,
+            peak_mib: high.saturating_sub(baseline) as f64 / (1024.0 * 1024.0),
+        })
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_real_z16_decode_fused_norm_silu_pad_gate() -> Result<()> {
+        let Ok(snap) = std::env::var("WAN_VAE16_SNAPSHOT") else {
+            eprintln!("WAN_VAE16_SNAPSHOT unset - skipping");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/src/vae16.rs (fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate): WAN_VAE16_SNAPSHOT is unset, so the real z16 VAE decode did not run.");
+            return Ok(());
+        };
+        let dev = Device::new_cuda(0)?;
+        let pool = MemPool::device_current(0).expect("a current CUDA memory pool");
+        let file = PathBuf::from(snap)
+            .join("vae")
+            .join("diffusion_pytorch_model.safetensors");
+        let _media = media_fused_policy_guard(Some(true));
+        // A 480x832 output, 17 frames: 5 latent frames (frame 0 plus four 4-frame chunks), so the
+        // first-chunk zero pad, the warming cache and the steady cached chunks all run.
+        let z = fixed_latent((1, 16, 5, 60, 104), &dev)?;
+        for dtype in [DType::BF16, DType::F32] {
+            // SAFETY: mmap of a read-only weight file named by the caller; not mutated behind the
+            // mapping — the standard candle loading path.
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&file], dtype, &dev)? };
+            let vae = WanVae16::new(&Vae16Config::wan21(), vb)?;
+            // Warm both paths (nvrtc compile, cuBLAS handles, pool growth) on a small latent.
+            let warm = fixed_latent((1, 16, 2, 8, 8), &dev)?;
+            for on in [false, true] {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(on));
+                vae.decode(&warm)?;
+            }
+            let (mut reference, before_off) = {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(false));
+                let before = VAE_NORM_SILU_PAD_PATH.thread_counts();
+                (decode(&vae, &z, &dev, &pool)?, before)
+            };
+            let off = VAE_NORM_SILU_PAD_PATH.thread_counts().since(&before_off);
+            let (mut fused, before_on) = {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(true));
+                let before = VAE_NORM_SILU_PAD_PATH.thread_counts();
+                (decode(&vae, &z, &dev, &pool)?, before)
+            };
+            let on = VAE_NORM_SILU_PAD_PATH.thread_counts().since(&before_on);
+            // Wall time is the faster of two alternating decodes per path (the dev box GPU is
+            // shared); peaks are deterministic and taken from the first pair.
+            for on in [false, true] {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(on));
+                let again = decode(&vae, &z, &dev, &pool)?;
+                let best = if on { &mut fused } else { &mut reference };
+                best.ms = best.ms.min(again.ms);
+            }
+            let mutated = {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(true));
+                MUTATE_PAD_SIDE.with(|m| m.set(true));
+                let run = decode(&vae, &z, &dev, &pool);
+                MUTATE_PAD_SIDE.with(|m| m.set(false));
+                run?
+            };
+            assert_eq!(fused.video.dims(), &[1, 3, 17, 480, 832]);
+            assert_eq!(off.fused, 0, "{dtype:?} off: {off}");
+            assert!(off.reference_for("disabled") > 0, "{dtype:?} off: {off}");
+            assert_eq!(
+                on.reference_total(),
+                0,
+                "{dtype:?} on: every site fused: {on}"
+            );
+            assert_eq!(
+                on.fused,
+                off.reference_for("disabled"),
+                "{dtype:?}: {on} vs {off}"
+            );
+            let gate = psnr(
+                &__model_proof_output!(Ok::<_, candle_gen::candle_core::Error>(
+                    fused.video.clone()
+                ))?,
+                &reference.video,
+            )?;
+            let mutated_psnr = psnr(&mutated.video, &reference.video)?;
+            println!(
+                "SW-6133 gate z16 {dtype:?} 480x832x17 (sm_120 dev box, GPU 0): PSNR fused vs op chain \
+                 {gate:.2} dB; decode peak {:.1} MiB -> {:.1} MiB ({:+.1}%); decode {:.0} ms -> {:.0} ms; \
+                 fused sites {}; wrong-side pad PSNR {mutated_psnr:.2} dB",
+                reference.peak_mib,
+                fused.peak_mib,
+                100.0 * (fused.peak_mib / reference.peak_mib - 1.0),
+                reference.ms,
+                fused.ms,
+                on.fused,
+            );
+            assert!(gate >= 50.0, "{dtype:?}: PSNR {gate:.2} dB < 50 dB");
+            assert!(
+                mutated_psnr < 50.0,
+                "{dtype:?}: a wrong-side pad passed the gate ({mutated_psnr:.2} dB)"
+            );
+            assert!(
+                fused.peak_mib < reference.peak_mib,
+                "{dtype:?}: the fused decode peak {:.1} MiB is not below the op chain's {:.1} MiB",
+                fused.peak_mib,
+                reference.peak_mib
+            );
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate");
+        Ok(())
     }
 }
