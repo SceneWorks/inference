@@ -1,3 +1,8 @@
+// Provenance (SW-F287 E10): an original implementation of the published Gated DeltaNet recurrence
+// (Yang et al., "Gated Delta Networks"), written against this repository's candle op chain bit for
+// bit (inference PR #1469). No source is copied from comfy-kitchen's or mlx_lm's kernels, so no
+// third-party licence applies.
+//
 // Fused gated delta recurrence for decode and speculative verify (Gated DeltaNet linear attention).
 //
 // One warp owns one (batch, value head, value row) row of the recurrent state S [B, Hv, Dv, Dk]

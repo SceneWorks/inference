@@ -259,6 +259,7 @@ fn the_baseline_driver_writes_the_harness_schema() {
         prompt_tokens: 9,
         generated_tokens: 4,
         timing_source: "backend",
+        token_digest: String::new(),
         report: Some(report.clone()),
         samples: repeats
             .iter()

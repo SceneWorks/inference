@@ -2189,6 +2189,111 @@ mod tests {
         });
     }
 
+    /// SW-6139 mutation check 1 ("drop the decay multiply"): the fixture's 1e-5 budget has to
+    /// *discriminate*. A kernel that skipped the per-token decay `g` would equal the reference run
+    /// with `g = 1`; here that mutant's outputs and final state sit orders of magnitude outside
+    /// the budget the real kernel meets, at decode, verify and prefill widths, so the kernel arm
+    /// of [`metal_kernel_matches_ops_reference`] fails for it.
+    #[test]
+    fn dropping_the_decay_multiply_fails_the_kernel_fixture() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            for dims in [
+                [1, 1, 2, 4, 128, 128],
+                [1, 4, 2, 4, 128, 128],
+                [1, 512, 2, 4, 128, 128],
+            ] {
+                let x = inputs(dims, Dtype::Float32, 0x6139 ^ dims[1] as u64);
+                let (y, s) =
+                    gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+                let (y_ok, s_ok) = reference(&x, true);
+                let (ok_y, ok_s) = (errors(&y, &y_ok), errors(&s, &s_ok));
+                assert!(
+                    ok_y.0 <= 1e-5 && ok_s.0 <= 1e-5,
+                    "{dims:?}: the real kernel is in budget"
+                );
+                // The mutant: the reference with the decay replaced by 1 (no decay).
+                let no_decay = Array::ones::<f32>(x.g.shape()).unwrap();
+                let (y_mut, s_mut) = gated_delta_recurrence_ops(
+                    &x.q,
+                    &x.k,
+                    &x.v,
+                    &no_decay,
+                    &x.beta,
+                    Some(&x.state),
+                )
+                .unwrap();
+                let (bad_y, bad_s) = (errors(&y, &y_mut), errors(&s, &s_mut));
+                assert!(
+                    bad_s.0 > 1e-3 && bad_s.0 > 1e3 * ok_s.0.max(1e-7),
+                    "{dims:?}: dropping the decay must blow the state budget: {bad_s:?} vs {ok_s:?}"
+                );
+                // `y` at T = 1 reads the decayed carried state, so it too must separate.
+                assert!(
+                    bad_y.0 > 1e-3,
+                    "{dims:?}: dropping the decay must move y: {bad_y:?}"
+                );
+            }
+        });
+    }
+
+    /// SW-6139 mutation check 2 ("restore the wrong prefix state"): a speculative verify that
+    /// accepted `n` tokens resumes from row `n - 1` of the checkpoint states. Restoring the
+    /// neighbouring row (an off-by-one prefix) lands outside the budget every correct row meets,
+    /// and the next decode step seeded from it emits different outputs — so the MTP equivalence
+    /// tests, which compare accepted tokens after a rollback, fail for the mutant.
+    #[test]
+    fn restoring_the_wrong_prefix_state_is_caught() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 5, 2, 4, 128, 128], Dtype::Float32, 0x6139_0005);
+            let (_, _, states) = gated_delta_recurrence_checkpointed(
+                &x.q,
+                &x.k,
+                &x.v,
+                &x.g,
+                &x.beta,
+                Some(&x.state),
+            )
+            .unwrap();
+            let next = inputs([1, 1, 2, 4, 128, 128], Dtype::Float32, 0x6139_0006);
+            let step = |from: &Array| {
+                gated_delta_recurrence(&next.q, &next.k, &next.v, &next.g, &next.beta, Some(from))
+                    .unwrap()
+                    .0
+            };
+            for n in 1..5 {
+                let head = |a: &Array| slice_axis(a, 1, 0, n).unwrap();
+                let (_, prefix) = gated_delta_recurrence_ops(
+                    &head(&x.q),
+                    &head(&x.k),
+                    &head(&x.v),
+                    &head(&x.g),
+                    &head(&x.beta),
+                    Some(&x.state),
+                )
+                .unwrap();
+                let right = row(&states, n - 1);
+                let (rel, abs) = errors(&right, &prefix);
+                assert!(
+                    rel <= 1e-5 && abs <= 1e-5,
+                    "n={n}: the right prefix row is in budget"
+                );
+                let wrong = row(&states, n);
+                let (wrong_rel, _) = errors(&wrong, &prefix);
+                assert!(
+                    wrong_rel > 1e-3,
+                    "n={n}: the wrong prefix row must be rejected: {wrong_rel}"
+                );
+                // The decode step after the rollback diverges too (what MTP equivalence sees).
+                let (y_ok, _) = errors(&step(&right), &step(&prefix));
+                let (y_bad, _) = errors(&step(&wrong), &step(&prefix));
+                assert!(
+                    y_ok <= 1e-5 && y_bad > 1e-3,
+                    "n={n}: next step {y_ok} vs {y_bad}"
+                );
+            }
+        });
+    }
+
     /// The checkpointed entry point's dispatch: the checkpoint kernel on a GPU stream, the op
     /// loop (collecting its per-step states) on a CPU stream — whose row `t` is exactly the final
     /// state of the reference over the first `t + 1` tokens — with `y` in `q`'s dtype and both
