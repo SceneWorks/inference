@@ -43,10 +43,7 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_memory_strategy(memory::IMAGE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory::IMAGE_MEMORY_CONTRACT_FIXTURE)
-        .register_memory_behavior(memory::IMAGE_MEMORY_BEHAVIOR)
+        .register_route(model::route())
         .register_trainer(crate::training::TRAINER_REGISTRATION)
 }
 
@@ -62,6 +59,7 @@ mod registry_tests {
         let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
         assert_eq!(ids, vec![super::IMAGE_MODEL_ID]);
         assert_eq!(registry.memory_strategy_registrations().len(), 1);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     /// SW-7094: the shared weights-free conformance over the image registration at both load

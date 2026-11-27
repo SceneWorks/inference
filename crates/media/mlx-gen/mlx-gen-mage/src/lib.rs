@@ -148,9 +148,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model::REGISTRATION_BASE)
+        .register_route(model::route())
+        .register_route(model::route_base())
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[mlx_gen::gen_core::CheckpointBackendBindingRegistration {
                 backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
@@ -162,104 +161,10 @@ pub fn register_providers(
             }],
             ..mlx_gen::gen_core::MAGE_FLOW_CHECKPOINT_ADAPTER
         })
-        .register_generator(model::REGISTRATION_TURBO)
-        .register_generator(model::REGISTRATION_EDIT)
-        .register_generator(model::REGISTRATION_EDIT_BASE)
-        .register_generator(model::REGISTRATION_EDIT_TURBO)
-        .register_memory_strategy(model::MEMORY_REGISTRATION)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow",
-            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow", spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow", surface)
-                },
-            },
-        )
-        .register_memory_strategy(model::MEMORY_REGISTRATION_BASE)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_BASE)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow_base",
-            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_base", spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow_base",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow_base", surface)
-                },
-            },
-        )
-        .register_memory_strategy(model::MEMORY_REGISTRATION_TURBO)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_TURBO)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow_turbo",
-            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_turbo", spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow_turbo",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow_turbo", surface)
-                },
-            },
-        )
-        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow_edit",
-            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_edit", spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow_edit",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow_edit", surface)
-                },
-            },
-        )
-        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_BASE)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_BASE)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow_edit_base",
-            contract: |spec| {
-                model::weights_free_memory_strategy_contract("mage_flow_edit_base", spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow_edit_base",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow_edit_base", surface)
-                },
-            },
-        )
-        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_TURBO)
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_TURBO)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "mage_flow_edit_turbo",
-            contract: |spec| {
-                model::weights_free_memory_strategy_contract("mage_flow_edit_turbo", spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: "mage_flow_edit_turbo",
-                contract: |surface| {
-                    model::weights_free_memory_surface_contract("mage_flow_edit_turbo", surface)
-                },
-            },
-        )
+        .register_route(model::route_turbo())
+        .register_route(model::route_edit())
+        .register_route(model::route_edit_base())
+        .register_route(model::route_edit_turbo())
         // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
         .register_trainer(training::REGISTRATION)
 }
@@ -324,6 +229,7 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
         let root = snapshot(&tmp);
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
         for id in MODEL_IDS {

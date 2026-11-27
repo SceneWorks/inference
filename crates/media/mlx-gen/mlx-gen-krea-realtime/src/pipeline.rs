@@ -17,10 +17,18 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyDriverSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, StepSupport, TextEncoderDeclaration, TextEncoderSurface,
+    WeightPlanDeclaration, WeightSourceKind, WAN_Z16_VIDEO_LATENT_SPACE,
+};
 use mlx_gen::{
-    default_seed, AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
-    ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
+    default_seed, AdapterApplyReport, AdapterSpec, CancelFlag, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, Modality, ModelDescriptor,
+    Progress, Quant, Result, SizeFloor, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -35,72 +43,109 @@ use crate::t2v::{
 /// knows this model runs the AR few-step regime.
 pub const SELF_FORCING_SAMPLER: &str = "self_forcing";
 
-/// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,
-/// autoregressive self-forcing **text-to-video**; **CFG off** → no negative prompt / no guidance; a
-/// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Krea Realtime 14B (`REG-1`, `AP5`).
+pub fn route() -> RouteRecord {
+    RouteRecord {
+        route_id: MODEL_ID,
         family: "krea_realtime",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // CFG-off model: the AR few-step denoise runs a single batch-1 forward per step with no
-            // unconditional branch, so there is no negative-prompt / guidance axis (sc-8437 S4).
-            supports_negative_prompt: false,
-            // Direct provider capability remains broader than SC-20770's worker/admission route.
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            // Wan-family style-LoRA / LoKr (sc-15015 S14; extended to the packed tiers by sc-15203 S19):
-            // Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya /
-            // LoKr file installs onto the DiT as **forward-time residuals** via the shared
-            // diff-patch-aware strict path. Low-rank residuals stay additive over dense or packed
-            // bases, while lightx2v `.diff_b`/norm `.diff` targets fold through dense parameters that
-            // exist on every tier (sc-15326).
-            // `LoadSpec::adapters` is honored on every tier in the load path (`t2v::load_transformer`),
-            // so advertising these is capability-honest at Q4/Q8 as well as bf16.
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: vec![SELF_FORCING_SAMPLER],
-            // H/W align to patch×vae_stride = 16 (z16 VAE spatial stride 8, patch 2); mirror Wan's cap.
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            // Three tiers (sc-15203, S19): **Q4** (~7 GB) / **Q8** (~14 GB) / **bf16** (~28 GB, the
-            // absence of a `Quant`). A 14B bf16 DiT is ~28 GB resident and barely runnable on Mac, so the
-            // quantized tiers are the practically-usable ones — the SceneWorks manifest picks **Q4** as
-            // the default for this dense-video engine (sc-10750's dense-video convention); this slice is
-            // the engine's advertised surface, the per-model default tier is a manifest field
-            // (`mlx.quantize`) that rides S11 (sc-8444) in the SceneWorks repo, not a gen-core one.
-            //
-            // The tiers ship **pre-quantized (packed) on disk** — `dit.safetensors` carries the MLX
-            // affine triple for the Wan `_quantize_predicate` Linears and the reused
-            // `WanTransformer::from_weights` builds them packed (`load::resolve_snapshot_quant`). A
-            // load-time `LoadSpec::quantize` over a *dense* bf16 snapshot is also honored (the
-            // `AdaptableLinear::quantize` path the sibling Wan/SCAIL-2 providers use), and a request that
-            // conflicts with a packed snapshot's own tier is a hard error rather than a silent downgrade
-            // (`load::resolve_load_time_quant`). Both are what this slice advertises.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // The AR regime is built on a rolling causal KV cache (sc-8436 S3 / sc-8438 S5).
-            supports_kv_cache: true,
-            // Every route calls `stage_components`: UMT5 is loaded, evaluated, and dropped before
-            // the DiT + VAE phase. There is no request-selectable Resident mode.
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: true,
-            // Batch whole-clip form in S6; the realtime streaming decode is the streaming epic.
-            supports_preview: false,
-            // No audio surface: pure video model.
-            audio_sample_rates: vec![],
-            // z16 VAE stride 8 × the Wan DiT's 2×2 latent patch: explicit dimensions must land
-            // on a 16px grid or integer division would silently render a smaller clip.
-            size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec!["causal_kv_cache"],
+            },
+            sampling: SamplingSurface {
+                samplers: vec![SELF_FORCING_SAMPLER],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_driver(FamilyDriverSpec::new(
+                crate::generate::krea_realtime_driver_support(),
+            )),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(16),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["umt5_xxl"], true),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["wan2_1_causal_dit"],
+                        false,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["wan_z16_vae"], false),
+                ],
+                supports_sequential_offload: false,
+                unconditionally_engages_staged_residency: true,
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(4),
+            guidance: None,
+            sampler: Some(SELF_FORCING_SAMPLER),
+            schedule: None,
+            shift: Some(5.0),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_memory_registration(crate::memory_strategy::REGISTRATION)
+            .with_resident_only_memory_registration(crate::memory_strategy::RESIDENT_ONLY_WITNESS),
     }
+}
+
+/// Stable identity + advertised capabilities for Krea Realtime 14B, computed from [`route`].
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// The loaded Krea Realtime 14B model: the resolved config + the snapshot dir. The heavy components
@@ -252,7 +297,7 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
 
 // The registration constant the platform catalog composes (explicit, not linker-discovered); bridges
 // the crate `Result` into backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+
 
 impl KreaRealtime {
     fn generate_execution_attempt(

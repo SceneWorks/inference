@@ -8,14 +8,22 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
-use mlx_gen::gen_core::{self, MemoryRequestScope, RenderPlan, RenderRun};
+use mlx_gen::gen_core::{
+    self, AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, MemoryRequestScope, ModelBinding, OutputSurface,
+    Pass0ConditioningRequirement, PreviewSupport, ProductLimits, RenderPlan, RenderRun,
+    ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface, RouteBindings, RouteDefaults,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    StepSupport, TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface,
+    WeightPlanDeclaration, WeightSourceKind, QWEN_KREA_Z16_LATENT_SPACE,
+};
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
-    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
+    curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result,
+    WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -343,121 +351,259 @@ pub fn raw_pag_capability() -> mlx_gen::gen_core::PagCapability {
     }
 }
 
-/// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
-/// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
-/// distillation baked the guided velocity into the weights, so no unconditional branch / `guidance`),
-/// no user negative prompt, no img2img/control conditioning on the Turbo checkpoint.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: KREA_2_TURBO_ID,
+/// Primary typed route declaration for Krea 2 Turbo (`REG-1`, `AP5`).
+pub fn route_turbo() -> RouteRecord {
+    RouteRecord {
+        route_id: KREA_2_TURBO_ID,
         family: "krea_2",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
-            supports_guidance: true,
-            supports_negative_prompt: true,
-            // Reference-image conditioning = img2img latent-init (epic 8588 slice A, sc-10135): a single
-            // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
-            // reference (see [`generate_impl`] → `generate_turbo_img2img_with_progress`). Turbo only; the
-            // Raw descriptor clears this (no Raw img2img entrypoint yet).
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr trained on the undistilled Raw DiT (sc-7577) apply at Turbo inference via the
-            // shared `apply_adapters_strict_with_diff_patch` seam onto the `Krea2Transformer` adapter
-            // host (sc-7911; the seam also folds a ComfyUI `.diff`/`.diff_b` diff-patch, sc-13825).
-            // Family-match cross-apply, no base-model gating (the Lens / Z-Image precedent).
-            supports_lora: true,
-            supports_lokr: true,
-            // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
-            // distilled-coherent sampler subset is narrowed by the real-weight survey at e2e (sc-7571,
-            // the Boogu Turbo precedent); the scaffold advertises the full curated menu as a starting
-            // point. The native distilled loop stays the byte-exact default (`req.sampler == None`).
-            samplers: curated_sampler_names(),
-            schedulers: curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // The turnkey ships pre-packed Q8/Q4 ([`crate::convert::assemble_quantized_snapshot`]);
-            // load-time quantize over a dense bf16 build is a no-op on an already-packed snapshot.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            pag: Some(turbo_pag_capability()),
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("qwen3_vl_4b", None)],
+                encoder_contract: Some(ENCODER_CONTRACT),
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: false,
+                supports_prompt_enhancement: false,
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_model(
+                FamilyModelSpec::new("krea2_dit").with_pag(turbo_pag_capability()),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("qwen_image_vae"),
+                output_latent_space: Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_4b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["krea2_dit"], false),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Decode,
+                        ["qwen_image_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::DirectoryOrFile,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(0.0),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: Some(crate::schedule::TURBO_MU as f32),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_render_plan(compile_turbo_render_plan)
+            .with_activation_memory(crate::TURBO_ACTIVATION_MEMORY_REGISTRATION.anchor)
+            .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::mlx_memory_contract_surface_specs,
+                |spec| {
+                    crate::block_memory_strategy::weights_free_memory_strategy_contract(
+                        KREA_2_TURBO_ID,
+                        spec,
+                    )
+                },
+            )
+            .with_memory_surface_resolver(|surface| {
+                crate::block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                    KREA_2_TURBO_ID,
+                    surface,
+                )
+            })
+            .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR),
     }
 }
 
-/// Krea 2 **Raw** identity + capabilities — the undistilled 12B DiT run with **true classifier-free
-/// guidance** (two DiT forwards/step: cond vs uncond) at 52 steps, unlike the CFG-free distilled Turbo.
-/// Same architecture / snapshot layout as Turbo (only the DiT weights differ, distilled vs base), so it
-/// shares `load_variant` + the whole [`crate::pipeline::KreaPipeline`]. Exposes a real guidance scale AND a user
-/// negative prompt — the reference `sample()` accepts `negative_prompts` (richer than Boogu's base,
-/// which fixes the uncond to the empty prompt). NOT guidance-distilled, so `supports_true_cfg` stays
-/// false: there is no separate embedded-guidance axis to layer a `true_cfg_scale` over — the two-forward
-/// CFG IS the guidance (the Boogu-base precedent). Derived from [`descriptor`] so the shared surface
-/// (family/backend/samplers/quants/size/LoRA) stays in lockstep.
+/// Primary typed route declaration for Krea 2 Raw (`REG-1`, `AP5`).
+pub fn route_raw() -> RouteRecord {
+    let mut route = route_turbo();
+    route.route_id = KREA_2_RAW_ID;
+    route.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+    route.structure.conditioning.supports_negative_prompt = true;
+    route.structure.sampling.supports_guidance = true;
+    route.structure.sampling.supports_true_cfg = false;
+    route.structure.denoiser = ModelBinding::family_model(
+        FamilyModelSpec::new("krea2_dit")
+            .with_multiphase_denoise()
+            .with_pag(raw_pag_capability()),
+    );
+    route.defaults = RouteDefaults {
+        steps: Some(DEFAULT_RAW_STEPS),
+        guidance: Some(DEFAULT_RAW_GUIDANCE),
+        sampler: Some("euler"),
+        schedule: None,
+        shift: None,
+        strength: None,
+        dimensions: Some((1024, 1024)),
+        ..Default::default()
+    };
+    route.bindings =
+        RouteBindings::generator(raw_descriptor, |spec| load_raw(spec).map_err(Into::into))
+            .with_footprint(raw_component_footprint)
+            .with_render_plan(compile_raw_render_plan)
+            .with_memory_registration(RAW_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::block_memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_RAW_ID,
+                    spec,
+                )
+            })
+            .with_memory_surface_resolver(|surface| {
+                crate::block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                    KREA_2_RAW_ID,
+                    surface,
+                )
+            })
+            .with_memory_behavior_registration(RAW_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Primary typed route declaration for Krea 2 Edit (`REG-1`, `AP5`).
+pub fn route_edit() -> RouteRecord {
+    let mut route = route_raw();
+    route.route_id = KREA_2_EDIT_ID;
+    route.structure.conditioning.kinds = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    route.structure.conditioning.pass0_requirement = Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["krea2_kontext_edit"];
+    route.structure.denoiser = ModelBinding::family_model(
+        FamilyModelSpec::new("krea2_dit").with_pag(raw_pag_capability()),
+    );
+    route.bindings =
+        RouteBindings::generator(edit_descriptor, |spec| load_edit(spec).map_err(Into::into))
+            .with_footprint(edit_component_footprint)
+            .with_memory_registration(EDIT_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::block_memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_EDIT_ID,
+                    spec,
+                )
+            })
+            .with_memory_surface_resolver(|surface| {
+                crate::block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                    KREA_2_EDIT_ID,
+                    surface,
+                )
+            })
+            .with_memory_behavior_registration(EDIT_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Primary typed route declaration for Krea 2 Turbo Edit (`REG-1`, `AP5`).
+pub fn route_turbo_edit() -> RouteRecord {
+    let mut route = route_turbo();
+    route.route_id = KREA_2_TURBO_EDIT_ID;
+    route.structure.conditioning.kinds = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    route.structure.conditioning.pass0_requirement = Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["krea2_kontext_edit"];
+    route.bindings = RouteBindings::generator(turbo_edit_descriptor, |spec| {
+        load_turbo_edit(spec).map_err(Into::into)
+    })
+    .with_footprint(turbo_edit_component_footprint)
+    .with_memory_registration(TURBO_EDIT_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::block_memory_strategy::weights_free_memory_strategy_contract(
+            KREA_2_TURBO_EDIT_ID,
+            spec,
+        )
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::block_memory_strategy::weights_free_memory_strategy_surface_contract(
+            KREA_2_TURBO_EDIT_ID,
+            surface,
+        )
+    })
+    .with_memory_behavior_registration(TURBO_EDIT_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Krea 2 Turbo identity + capabilities, computed from [`route_turbo`].
+pub fn descriptor() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
+}
+
+/// Krea 2 **Raw** identity + capabilities, computed from [`route_raw`].
 pub fn raw_descriptor() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = KREA_2_RAW_ID;
-    d.capabilities.supports_negative_prompt = true;
-    d.capabilities.supports_guidance = true;
-    d.capabilities.supports_true_cfg = false;
-    d.capabilities.supports_phases = true;
-    d.capabilities.pag = Some(raw_pag_capability());
-    // img2img reference latent-init (epic 8588 slice A, sc-10224): Raw advertises `Reference` just like
-    // Turbo, but routes to the CFG entrypoint `generate_base_img2img_with_progress` (honoring guidance +
-    // negative prompt), NOT the CFG-free Turbo one. Inherited from `descriptor()` — same single-Reference
-    // surface — so this is a no-op re-affirmation kept explicit for the reader.
-    d.capabilities.conditioning = vec![ConditioningKind::Reference];
-    d
+    route_raw().compute_descriptor()
 }
 
-/// Krea 2 **image-edit** identity + capabilities (epic 10871). Same full-CFG surface as
-/// [`raw_descriptor`] — an edit denoises from noise under true CFG, honoring guidance + a negative
-/// prompt — but with the distinct [`KREA_2_EDIT_ID`] so the worker's edit lane can select it. Carries the
-/// single-`Reference` (source) conditioning + LoRA/LoKr (the `krea2_identity_edit` edit LoRA). Derived
-/// from [`raw_descriptor`] so the shared surface (family/backend/samplers/quants/size/CFG) stays in
-/// lockstep; only the id (→ the `generate_impl` edit branch) differs.
+/// Krea 2 **image-edit** identity + capabilities, computed from [`route_edit`].
 pub fn edit_descriptor() -> ModelDescriptor {
-    let mut d = raw_descriptor();
-    d.id = KREA_2_EDIT_ID;
-    d.capabilities.supports_phases = false;
-    // Edit accepts a single source (`Reference`) OR a scene+person pair (`MultiReference`, epic 10871
-    // P1.3 — scene = image 1, person = image 2, fixed order). The img2img Raw/Turbo descriptors stay
-    // single-`Reference`; only the edit surface advertises `MultiReference`, so `validate_request`
-    // accepts a two-source edit here while still rejecting it on the img2img path.
-    d.capabilities.conditioning = vec![
-        ConditioningKind::Reference,
-        ConditioningKind::MultiReference,
-    ];
-    d
+    route_edit().compute_descriptor()
 }
 
-/// Krea 2 **CFG-free Turbo image-edit** identity + capabilities (sc-11640). Same Kontext edit
-/// conditioning surface as [`edit_descriptor`] (single `Reference` source OR a scene+person
-/// `MultiReference`, + the `krea2_identity_edit` LoRA) but derived from the distilled Turbo
-/// [`descriptor`] rather than Raw: **CFG-free** (`supports_guidance = false`, no user negative prompt),
-/// so the edit runs a single conditional forward on the few-step `turbo_schedule`. Only the id (→ the
-/// `generate_impl` `is_turbo_edit` branch: `turbo_schedule` / 8-step default / `guidance = 0`) and the
-/// widened `conditioning` differ from [`descriptor`].
+/// Krea 2 **CFG-free Turbo image-edit** identity + capabilities, computed from [`route_turbo_edit`].
 pub fn turbo_edit_descriptor() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = KREA_2_TURBO_EDIT_ID;
-    // Same edit conditioning surface as `edit_descriptor` — a single source `Reference` or one
-    // scene+person `MultiReference`. The Turbo img2img descriptor stays single-`Reference`; only the
-    // edit surfaces advertise `MultiReference`.
-    d.capabilities.conditioning = vec![
-        ConditioningKind::Reference,
-        ConditioningKind::MultiReference,
-    ];
-    d
+    route_turbo_edit().compute_descriptor()
 }
 
 /// A loaded Krea 2 generator (Turbo, Raw, or edit): the cached descriptor + a component-residency
@@ -2417,11 +2563,6 @@ pub(crate) fn control_component_footprint(
     component_footprint_for(crate::model_control::KREA_2_TURBO_CONTROL_ID, spec)
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
 macro_rules! memory_registration {
     ($name:ident, $behavior:ident, $provider_id:expr) => {
         pub const $name: mlx_gen::gen_core::MemoryRegistration =
@@ -2464,18 +2605,7 @@ memory_registration!(
     TURBO_EDIT_MEMORY_BEHAVIOR,
     KREA_2_TURBO_EDIT_ID
 );
-mlx_gen::register_generators! {
-    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
-    footprint = raw_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit;
-    footprint = edit_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit;
-    footprint = turbo_edit_component_footprint
-}
+
 
 #[cfg(test)]
 mod tests {

@@ -63,17 +63,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_generator(model::BASE_REGISTRATION)
-        .register_reference_workspace(memory_strategy::REFERENCE_WORKSPACE_REGISTRATION)
-        .register_reference_workspace(memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION)
+        .register_route(model::route())
+        .register_route(model::route_base())
         .register_trainer(training::trainer::TRAINER_REGISTRATION)
-        .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
-        .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX FLUX 3 provider catalog.
@@ -105,6 +97,7 @@ mod tests {
             .collect();
         assert_eq!(ids, ["flux3_klein", "flux3_klein_base"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
         assert_eq!(registry.memory_strategy_registrations().len(), 2);
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 2);
     }

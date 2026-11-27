@@ -96,7 +96,7 @@ where
     }
 }
 
-fn flux3_driver_support(driver_id: &'static str) -> mlx_gen::driver::DriverSupport {
+pub(crate) fn flux3_driver_support(driver_id: &'static str) -> mlx_gen::driver::DriverSupport {
     mlx_gen::driver::DriverSupport {
         driver_id,
         arbitrary_slice: true,

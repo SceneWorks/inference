@@ -14,12 +14,20 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core::{
+    AdapterSurface, ConditioningSurface, FamilyDriverSpec, FamilyModelSpec, LatentCodecDeclaration,
+    ModelBinding, OutputSurface, Pass0ConditioningRequirement, PreviewSupport, ProductLimits,
+    ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface, RouteBindings, RouteDefaults,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    StepSupport, TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface,
+    WeightPlanDeclaration, WeightSourceKind, FLUX1_LATENT_SPACE,
+};
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec,
+    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
+    WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
@@ -65,51 +73,107 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 const DEFAULT_TURBO_STEPS: u32 = 4;
 const DEFAULT_TURBO_SIGMA: f32 = 0.001;
 
-/// Boogu Base's identity + capabilities — constructible without loading weights (registry
-/// introspection / capability advertisement). True-CFG text-to-image: `guidance` is offered, the
-/// CFG-negative is the model's own fixed empty/drop instruction (not a user negative prompt), and a
-/// single `Reference` opts into img2img latent-init (sc-10191, shared with Turbo via clone).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: BOOGU_IMAGE_ID,
+/// Primary typed route declaration for Boogu Base (`REG-1`, `AP5`).
+pub fn route_base() -> RouteRecord {
+    RouteRecord {
+        route_id: BOOGU_IMAGE_ID,
         family: "boogu",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // The CFG-negative is a fixed empty/drop instruction, not a user negative prompt.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img
-            // latent-init (epic 8588 A4.3, sc-10191): VAE-encode the reference + noise-blend at a
-            // strength-derived start step. The instruction-edit MultiReference path (Qwen3-VL semantic
-            // edit) is the Edit checkpoint's alone (`descriptor_edit`); Turbo inherits this via clone.
-            conditioning: vec![ConditioningKind::Reference],
-            // Base/Edit are rectified-flow Euler over a static-shift (`mu = 1.15`) schedule, routed
-            // through the unified curated-sampler framework (epic 7114). Turbo overrides these to empty
-            // (its DMD distillation sampler is not an ODE — see `descriptor_turbo`).
-            samplers: curated_sampler_names(),
-            schedulers: curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // The turnkey ships pre-packed Q8 (default) + bf16; load-time quantize (Q4/Q8) over the
-            // dense bf16 build is a no-op on an already-packed snapshot. The DiT + Qwen3-VL text
-            // tower are quantized; the FLUX.1 VAE + (edit-only) vision tower stay dense.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam (epic 10834, sc-10840): under Sequential the
-            // ~17.5 GB Qwen3-VL `mllm/` encoder is dropped after conditioning + `clear_cache()` before
-            // the ~20.6 GB DiT + VAE load, bounding peak unified memory to `max(mllm, DiT+VAE)`. Cloned
-            // onto Turbo/Edit below. The small PiD overlay + tokenizer stay resident on the generator.
-            supports_sequential_offload: true,
-            supports_low_res_start: true,
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("qwen3_vl_8b", None)],
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_model(
+                FamilyModelSpec::new("boogu_dit").with_low_res_start(),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&FLUX1_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: AdapterSurface::unsupported(),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["qwen3_vl_8b"], true),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["boogu_dit"], false),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux1_ae"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: Some(1.15),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_render_plan(compile_render_plan),
     }
+}
+
+/// Boogu Base's identity + capabilities, computed from [`route_base`].
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
 }
 
 /// The curated samplers the Turbo DMD student stays coherent under (real-weight survey, sc-7491). The
@@ -123,39 +187,58 @@ pub fn descriptor() -> ModelDescriptor {
 /// (`req.sampler == None`) stays the byte-exact default.
 const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
 
-/// Boogu **Turbo** identity + capabilities. Same surface as [`descriptor`] except it is **CFG-free**
-/// — the DMD student distilled the guided velocity into the weights, so `guidance` is not offered
-/// (no unconditional branch). Few-step (`DEFAULT_TURBO_STEPS`).
-pub fn descriptor_turbo() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = BOOGU_IMAGE_TURBO_ID;
-    d.capabilities.supports_guidance = true;
-    d.capabilities.supports_low_res_start = false;
-    // The Turbo student is a DMD distillation sampler (predict clean estimate → flow-renoise with fresh
-    // noise). Its native loop (`generate_turbo`, `req.sampler == None`) stays the byte-exact default; a
-    // real-weight survey (sc-7491) showed the curated *stochastic* solvers ([`TURBO_SAMPLERS`]) — `lcm`
-    // most of all — match its re-noised regime and render at native quality over the curated σ schedules
-    // (the ComfyUI `lcm`/`sgm_uniform` combo), so the sampler AND scheduler axes are both selectable. The
-    // deterministic ODE solvers degrade on the few-step student (out-of-regime) and are not advertised.
-    d.capabilities.samplers = TURBO_SAMPLERS.to_vec();
-    d.capabilities.schedulers = curated_scheduler_names();
-    d
+/// Primary typed route declaration for Boogu Turbo (`REG-1`, `AP5`).
+pub fn route_turbo() -> RouteRecord {
+    let mut route = route_base();
+    route.route_id = BOOGU_IMAGE_TURBO_ID;
+    route.structure.sampling.samplers = TURBO_SAMPLERS.to_vec();
+    route.structure.sampling.schedulers = curated_scheduler_names();
+    route.structure.sampling.supports_guidance = true;
+    route.structure.denoiser = ModelBinding::family_driver(FamilyDriverSpec::new(
+        crate::pipeline::boogu_turbo_driver_support(),
+    ));
+    route.defaults = RouteDefaults {
+        steps: Some(DEFAULT_TURBO_STEPS),
+        guidance: Some(1.0),
+        sampler: None,
+        schedule: None,
+        shift: None,
+        strength: None,
+        dimensions: Some((1024, 1024)),
+        ..Default::default()
+    };
+    route.bindings =
+        RouteBindings::generator(descriptor_turbo, |spec| load_turbo(spec).map_err(Into::into))
+            .with_footprint(component_footprint);
+    route
 }
 
-/// Boogu **Edit** identity + capabilities. Same true-CFG surface as [`descriptor`] plus instruction-edit
-/// source images: one [`ConditioningKind::Reference`] or up to `MAX_EDIT_REFS` via
-/// [`ConditioningKind::MultiReference`]. Each source image is read by the Qwen3-VL vision tower
-/// (semantic edit) and VAE-encoded into the DiT's spatial reference sequence (`image_index_embedding`
-/// has 5 per-image slots, so 2–5 references compose into one edit, e.g. subject-from-A in scene-from-B).
-pub fn descriptor_edit() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = BOOGU_IMAGE_EDIT_ID;
-    d.capabilities.supports_low_res_start = false;
-    d.capabilities.conditioning = vec![
+/// Boogu **Turbo** identity + capabilities, computed from [`route_turbo`].
+pub fn descriptor_turbo() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
+}
+
+/// Primary typed route declaration for Boogu Edit (`REG-1`, `AP5`).
+pub fn route_edit() -> RouteRecord {
+    let mut route = route_base();
+    route.route_id = BOOGU_IMAGE_EDIT_ID;
+    route.structure.conditioning.kinds = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
-    d
+    route.structure.conditioning.pass0_requirement = Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["qwen3_vl_vision_tower"];
+    route.structure.denoiser = ModelBinding::family_model(FamilyModelSpec::new("boogu_dit"));
+    route.bindings =
+        RouteBindings::generator(descriptor_edit, |spec| load_edit(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_render_plan(compile_edit_render_plan);
+    route
+}
+
+/// Boogu **Edit** identity + capabilities, computed from [`route_edit`].
+pub fn descriptor_edit() -> ModelDescriptor {
+    route_edit().compute_descriptor()
 }
 
 /// A loaded Boogu generator: the always-warm tokenizer + PiD overlay, the cached descriptor (which
@@ -1131,19 +1214,6 @@ pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["mllm"], &["transformer"], &["vae"])
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
-    footprint = component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit;
-    footprint = component_footprint
 }
 
 pub const BASE_RENDER_PLAN_REGISTRATION: mlx_gen::gen_core::RenderPlanRegistration =

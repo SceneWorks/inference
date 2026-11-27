@@ -393,10 +393,12 @@ pub struct Ltx25 {
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+#[cfg(test)]
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
 
+#[cfg(test)]
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION_25 = descriptor_25 => load_25
 }

@@ -423,6 +423,7 @@ impl Generator for MiniMaxH3 {
     }
 }
 
+#[cfg(test)]
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }

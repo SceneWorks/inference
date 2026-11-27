@@ -215,10 +215,7 @@ pub use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(pipeline::REGISTRATION)
-        .register_memory_strategy(memory_strategy::REGISTRATION)
-        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
+    registry.register_route(pipeline::route())
 }
 
 /// Build the complete explicit MLX Krea Realtime provider catalog.
@@ -244,6 +241,7 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
 
         // `load(id, spec)` routes to this provider by id (it fails on the nonexistent snapshot dir, not
         // on an unknown id) — proving `mlx_gen::load("krea_realtime_14b", spec)` reaches the generator.

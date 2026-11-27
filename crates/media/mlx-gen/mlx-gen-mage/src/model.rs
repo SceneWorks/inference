@@ -28,18 +28,23 @@
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
-    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
+    adapter_stack_resident_bytes, AdapterInstallPolicy, AdapterResidencyMode, AdapterSurface,
+    ConditioningSurface, Error as CoreError, FamilyDriverSpec, LatentCodecDeclaration,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryMode, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
+    MemorySafetyDecision, MemoryStrategy, ModelBinding, OutputSurface,
+    Pass0ConditioningRequirement, PreviewSupport, ProductLimits, ResidencyPhaseKind,
+    ResidencyPhaseNode, ResidencySurface, Result as CoreResult, RouteBindings, RouteDefaults,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    StepSupport, TextEncoderDeclaration, TextEncoderSurface, WeightPlanDeclaration,
+    WeightSourceKind, MAGE_LATENT_SPACE,
 };
 #[cfg(test)]
 use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome, MemorySelection};
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -867,60 +872,235 @@ const EDIT_IDENTITY_SHA256: &str =
 
 /// Build a variant's weights-free descriptor.
 ///
-/// Capability fields that later stories own are left at their conservative `Default` (`false` /
-/// empty) rather than pre-announced: quant tiers are sc-14046, LoRA/LoKr routing is sc-14057, and
-/// the curated sampler/scheduler menus are sc-14041's once the flow-match loop exists. A
-/// descriptor is a promise to the worker, so the scaffold promises only what it can point at in
-/// the published configs.
-pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::MAGE_LATENT_SPACE),
-        control_kinds: None,
-        // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
-        // variants — only the 8.232 GB DiT differs — so the SceneWorks mirrors host them once in a
-        // shared components repo and stage them as caller-provisioned co-requisite dirs
-        // (sc-14979): 58.65 GB for a full six-variant install instead of 105.04 GB. The DiT still
-        // arrives as the base `WeightsSource::Dir`. A spec that stages neither falls back to the
-        // flat published layout — see `resolve_component_dirs`.
-        required_components: REQUIRED_COMPONENTS,
-        id: variant.id(),
+/// Primary typed route declaration for a Mage-Flow variant (`REG-1`, `AP5`).
+pub fn route_for(variant: MageVariant) -> RouteRecord {
+    let id = variant.id();
+    type LoadFn = fn(&LoadSpec) -> CoreResult<Box<dyn Generator>>;
+    let (descriptor_fn, load_fn, mem_reg, mem_beh): (
+        fn() -> ModelDescriptor,
+        LoadFn,
+        mlx_gen::gen_core::MemoryRegistration,
+        mlx_gen::gen_core::MemoryBehaviorRegistration,
+    ) = match variant {
+        MageVariant::Rl => (
+            descriptor,
+            |spec| load_rl(spec).map_err(Into::into),
+            MEMORY_REGISTRATION,
+            MEMORY_BEHAVIOR_REGISTRATION,
+        ),
+        MageVariant::Base => (
+            descriptor_base,
+            |spec| load_base(spec).map_err(Into::into),
+            MEMORY_REGISTRATION_BASE,
+            MEMORY_BEHAVIOR_REGISTRATION_BASE,
+        ),
+        MageVariant::Turbo => (
+            descriptor_turbo,
+            |spec| load_turbo(spec).map_err(Into::into),
+            MEMORY_REGISTRATION_TURBO,
+            MEMORY_BEHAVIOR_REGISTRATION_TURBO,
+        ),
+        MageVariant::Edit => (
+            descriptor_edit,
+            |spec| load_edit(spec).map_err(Into::into),
+            MEMORY_REGISTRATION_EDIT,
+            MEMORY_BEHAVIOR_REGISTRATION_EDIT,
+        ),
+        MageVariant::EditBase => (
+            descriptor_edit_base,
+            |spec| load_edit_base(spec).map_err(Into::into),
+            MEMORY_REGISTRATION_EDIT_BASE,
+            MEMORY_BEHAVIOR_REGISTRATION_EDIT_BASE,
+        ),
+        MageVariant::EditTurbo => (
+            descriptor_edit_turbo,
+            |spec| load_edit_turbo(spec).map_err(Into::into),
+            MEMORY_REGISTRATION_EDIT_TURBO,
+            MEMORY_BEHAVIOR_REGISTRATION_EDIT_TURBO,
+        ),
+    };
+    let mut bindings = RouteBindings::generator(descriptor_fn, load_fn)
+        .with_footprint(component_footprint)
+        .with_memory_registration(mem_reg)
+        .with_memory_behavior_registration(mem_beh)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            match variant {
+                MageVariant::Rl => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow", spec)
+                }
+                MageVariant::Base => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow_base", spec)
+                }
+                MageVariant::Turbo => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow_turbo", spec)
+                }
+                MageVariant::Edit => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow_edit", spec)
+                }
+                MageVariant::EditBase => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow_edit_base", spec)
+                }
+                MageVariant::EditTurbo => {
+                    |spec| weights_free_memory_strategy_contract("mage_flow_edit_turbo", spec)
+                }
+            },
+        )
+        .with_memory_surface_resolver(match variant {
+            MageVariant::Rl => {
+                |surface| weights_free_memory_surface_contract("mage_flow", surface)
+            }
+            MageVariant::Base => {
+                |surface| weights_free_memory_surface_contract("mage_flow_base", surface)
+            }
+            MageVariant::Turbo => {
+                |surface| weights_free_memory_surface_contract("mage_flow_turbo", surface)
+            }
+            MageVariant::Edit => {
+                |surface| weights_free_memory_surface_contract("mage_flow_edit", surface)
+            }
+            MageVariant::EditBase => {
+                |surface| weights_free_memory_surface_contract("mage_flow_edit_base", surface)
+            }
+            MageVariant::EditTurbo => {
+                |surface| weights_free_memory_surface_contract("mage_flow_edit_turbo", surface)
+            }
+        });
+    if variant == MageVariant::Rl {
+        bindings = bindings.with_activation_memory(crate::ACTIVATION_MEMORY_REGISTRATION.anchor);
+    }
+
+    RouteRecord {
+        route_id: id,
         family: FAMILY,
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Real CFG (`guidance_embed: false`) on the undistilled checkpoints; the distilled
-            // ones run at cfg 1.0, where the reference never builds the negative branch.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: if variant.is_edit() {
-                vec![
-                    ConditioningKind::Reference,
-                    ConditioningKind::MultiReference,
-                ]
-            } else {
-                Vec::new()
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("qwen3_vl_4b", None)],
+                ..Default::default()
             },
-            // LoRA and LoKr both install through the one strict seam
-            // ([`crate::adapters::apply_mage_adapters`] → `apply_adapters_strict`), applied in
-            // [`assemble`] for EVERY variant — the adapter host is `MageTransformer`, which the
-            // edit and generate variants share verbatim. Stated as engine capability, not product
-            // exposure: which variants a user may attach an adapter to is decided by the catalog
-            // manifest's `loraCompatibility` and the router, not here (sc-15328).
-            supports_lora: true,
-            supports_lokr: true,
-            // Q4/Q8 tiers are sc-14046; `&[]` means dense-only, which is what the scaffold is.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
-            min_size: MIN_SIZE,
-            max_size: MAX_SIZE,
-            // A platform request has one geometry/prompt and `count` independent seeds. The
-            // pipeline additionally exposes heterogeneous geometry/prompt packs directly.
-            max_count: MAX_COUNT,
-            mac_only: true,
+            conditioning: ConditioningSurface {
+                kinds: if variant.is_edit() {
+                    vec![
+                        ConditioningKind::Reference,
+                        ConditioningKind::MultiReference,
+                    ]
+                } else {
+                    Vec::new()
+                },
+                control_kinds: None,
+                pass0_requirement: if variant.is_edit() {
+                    Pass0ConditioningRequirement::RequiresEdit
+                } else {
+                    Pass0ConditioningRequirement::NoiseStartSupported
+                },
+                supports_negative_prompt: true,
+                modules: if variant.is_edit() {
+                    vec!["qwen3_vl_vision_tower"]
+                } else {
+                    vec![]
+                },
+            },
+            sampling: SamplingSurface {
+                samplers: vec![],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_driver(FamilyDriverSpec::new(
+                crate::pipeline::mage_driver_support(id),
+            )),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("mage_vae"),
+                output_latent_space: Some(&MAGE_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_4b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["mage_nr_mmdit"], false),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["mage_vae"], false),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+                required_components: REQUIRED_COMPONENTS,
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: Some(variant.default_cfg()),
+            sampler: None,
+            schedule: None,
+            shift: Some(crate::pipeline::STATIC_SHIFT),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+pub fn route() -> RouteRecord {
+    route_for(MageVariant::Rl)
+}
+pub fn route_base() -> RouteRecord {
+    route_for(MageVariant::Base)
+}
+pub fn route_turbo() -> RouteRecord {
+    route_for(MageVariant::Turbo)
+}
+pub fn route_edit() -> RouteRecord {
+    route_for(MageVariant::Edit)
+}
+pub fn route_edit_base() -> RouteRecord {
+    route_for(MageVariant::EditBase)
+}
+pub fn route_edit_turbo() -> RouteRecord {
+    route_for(MageVariant::EditTurbo)
+}
+
+/// Weights-free descriptor for a Mage-Flow variant, computed from [`route_for`].
+pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 /// Construct a Mage-Flow generator from a [`LoadSpec`].

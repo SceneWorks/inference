@@ -1501,17 +1501,61 @@ memory_registration!(
     crate::CHROMA1_FLASH_ID
 );
 
-mlx_gen::register_generators! {
-    pub(crate) const HD_REGISTRATION = descriptor_hd => load_hd;
-    footprint = component_footprint
+pub fn route_hd() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = ChromaVariant::Hd.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_hd, |spec| {
+        load_hd(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(ChromaVariant::Hd, spec, req))
+    .with_memory_registration(HD_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(crate::CHROMA1_HD_ID, spec),
+    )
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_surface_contract(crate::CHROMA1_HD_ID, surface)
+    })
+    .with_memory_behavior_registration(HD_MEMORY_BEHAVIOR);
+    route
 }
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
-    footprint = component_footprint
+
+pub fn route_base() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = ChromaVariant::Base.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_base, |spec| {
+        load_base(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(ChromaVariant::Base, spec, req))
+    .with_memory_registration(BASE_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(crate::CHROMA1_BASE_ID, spec),
+    )
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_surface_contract(crate::CHROMA1_BASE_ID, surface)
+    })
+    .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR);
+    route
 }
-mlx_gen::register_generators! {
-    pub(crate) const FLASH_REGISTRATION = descriptor_flash => load_flash;
-    footprint = component_footprint
+
+pub fn route_flash() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = ChromaVariant::Flash.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_flash, |spec| {
+        load_flash(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(ChromaVariant::Flash, spec, req))
+    .with_memory_registration(FLASH_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(crate::CHROMA1_FLASH_ID, spec),
+    )
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_surface_contract(crate::CHROMA1_FLASH_ID, surface)
+    })
+    .with_memory_behavior_registration(FLASH_MEMORY_BEHAVIOR);
+    route
 }
 
 #[cfg(test)]
