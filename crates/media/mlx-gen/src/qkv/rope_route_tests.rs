@@ -361,13 +361,13 @@ mod removed {
         let sh = x.shape();
         let (b, seq, heads, hd) = (sh[0], sh[1], sh[2], sh[3]);
         let half = hd / 2;
-        let parts = split(&x.reshape(&[b, seq, heads, half, 2]).unwrap(), 2, 4).unwrap();
+        let parts = split(x.reshape(&[b, seq, heads, half, 2]).unwrap(), 2, 4).unwrap();
         let xr = parts[0].reshape(&[b, seq, heads, half]).unwrap();
         let xi = parts[1].reshape(&[b, seq, heads, half]).unwrap();
         let cos = cos.reshape(&[1, seq, 1, half]).unwrap();
         let sin = sin.reshape(&[1, seq, 1, half]).unwrap();
-        let out_r = subtract(&multiply(&xr, &cos).unwrap(), &multiply(&xi, &sin).unwrap()).unwrap();
-        let out_i = add(&multiply(&xr, &sin).unwrap(), &multiply(&xi, &cos).unwrap()).unwrap();
+        let out_r = subtract(multiply(&xr, &cos).unwrap(), multiply(&xi, &sin).unwrap()).unwrap();
+        let out_i = add(multiply(&xr, &sin).unwrap(), multiply(&xi, &cos).unwrap()).unwrap();
         concatenate_axis(
             &[
                 &out_r.expand_dims(4).unwrap(),
@@ -390,13 +390,13 @@ mod removed {
         let cos = cos.reshape(&[1, 1, n, d / 2]).unwrap();
         let sin = sin.reshape(&[1, 1, n, d / 2]).unwrap();
         let oe = subtract(
-            &multiply(&even, &cos).unwrap(),
-            &multiply(&odd, &sin).unwrap(),
+            multiply(&even, &cos).unwrap(),
+            multiply(&odd, &sin).unwrap(),
         )
         .unwrap();
         let oo = add(
-            &multiply(&even, &sin).unwrap(),
-            &multiply(&odd, &cos).unwrap(),
+            multiply(&even, &sin).unwrap(),
+            multiply(&odd, &cos).unwrap(),
         )
         .unwrap();
         stack_axis(&[&oe, &oo], 4)
@@ -426,8 +426,8 @@ mod removed {
         let halves = split(head, 2, 3).unwrap();
         let rotated = concatenate_axis(&[&negative(&halves[1]).unwrap(), &halves[0]], -1).unwrap();
         let out = add(
-            &multiply(head, &cos_t).unwrap(),
-            &multiply(&rotated, &sin_t).unwrap(),
+            multiply(head, &cos_t).unwrap(),
+            multiply(&rotated, &sin_t).unwrap(),
         )
         .unwrap();
         if rot == d {
@@ -457,7 +457,7 @@ mod removed {
             .unwrap()
             .reshape(&sh)
             .unwrap();
-        add(&multiply(x, cos).unwrap(), &multiply(&rot, sin).unwrap()).unwrap()
+        add(multiply(x, cos).unwrap(), multiply(&rot, sin).unwrap()).unwrap()
     }
 
     /// lens gpt-oss `apply_half_rope`: halves rotated against `[1, 1, L, d/2]` tables.
@@ -465,13 +465,13 @@ mod removed {
         let parts = split(x, 2, -1).unwrap();
         let (first, second) = (&parts[0], &parts[1]);
         let a = subtract(
-            &multiply(first, cos).unwrap(),
-            &multiply(second, sin).unwrap(),
+            multiply(first, cos).unwrap(),
+            multiply(second, sin).unwrap(),
         )
         .unwrap();
         let b = add(
-            &multiply(second, cos).unwrap(),
-            &multiply(first, sin).unwrap(),
+            multiply(second, cos).unwrap(),
+            multiply(first, sin).unwrap(),
         )
         .unwrap();
         concatenate_axis(&[a, b], -1).unwrap()
@@ -484,7 +484,7 @@ mod removed {
         } else {
             Array::from_f32(1.0)
         };
-        add(&multiply(x, &add(scale, &one).unwrap()).unwrap(), shift).unwrap()
+        add(multiply(x, add(scale, &one).unwrap()).unwrap(), shift).unwrap()
     }
 }
 
@@ -726,7 +726,7 @@ fn the_shared_modulate_helpers_reproduce_the_removed_private_copies_bitwise() {
                 Dtype::Float32
             );
         }
-        let want = add(&multiply(&x, &scale).unwrap(), &shift).unwrap();
+        let want = add(multiply(&x, &scale).unwrap(), &shift).unwrap();
         assert!(
             bits(&scale_shift(&x, &scale, &shift).unwrap(), &want),
             "{dtype:?}: scale_shift"

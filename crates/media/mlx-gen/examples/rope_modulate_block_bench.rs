@@ -168,7 +168,7 @@ fn flux_like(warmup: usize, iters: usize) -> Row {
             scaled_dot_product_attention(&qr, &kr, &v, (hd as f32).powf(-0.5), None, None).unwrap();
         // One output carrying both the modulated stream and the attention.
         mlx_rs::ops::add(
-            &o.transpose_axes(&[0, 2, 1, 3])
+            o.transpose_axes(&[0, 2, 1, 3])
                 .unwrap()
                 .reshape(&[1, seq, dim])
                 .unwrap(),
