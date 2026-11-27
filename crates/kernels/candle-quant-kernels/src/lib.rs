@@ -37,6 +37,10 @@
 //!   from a load-time device table of expert addresses — GGML (candle's own decode MMVQ, every
 //!   type it serves), dense, Q8_0-dequant and NVFP4 (the decode GEMV's core) banks.
 //!
+//! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
+//!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
+//!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
+//!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
 //! - [`yue2_stable_conv`] — YuE2 VAE BF16 convolution leaves with fixed-order FP32 accumulation
@@ -78,6 +82,7 @@ pub mod sm120_gate;
 pub mod training_attention;
 pub mod veda_int8;
 pub mod veda_score;
+pub mod w4a8_gemm;
 pub mod yue2_stable_conv;
 
 pub use cublaslt::{
@@ -133,7 +138,7 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
-/// frozen Veda tile scorer and streaming training attention.
+/// frozen Veda tile scorer, streaming training attention and the fused W4A8 GEMM.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -146,6 +151,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
+    w4a8_gemm::W4A8_GEMM_SRC,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     GATED_DELTA_SRC,
