@@ -27,7 +27,10 @@ pub mod utilities {
 
     /// SenseNova understanding / multimodal model helpers outside the `Generator` trait.
     pub mod sensenova {
-        pub use candle_gen_catalog::providers::sensenova::T2iModel;
+        pub use candle_gen_catalog::providers::sensenova::{
+            load_understanding_with_spec, smart_resize, tensor_to_image, Sampler, T2iModel,
+            T2iOptions, INTERLEAVE_RESOLUTIONS, INTERLEAVE_SYSTEM_MESSAGE,
+        };
     }
 }
 
@@ -48,10 +51,11 @@ pub mod converters {
         pub use candle_gen_catalog::providers::flux3::convert;
     }
     pub mod krea {
+        pub use candle_gen_catalog::providers::krea::pipeline::MAX_TEXT_TOKENS;
         pub use candle_gen_catalog::providers::krea::{
             actual_quant_tier, control, convert, hires_encoder_weights, phase_adapter_memory,
-            Krea2Config, KreaTokenizer, PhaseAdapterMemory, DEFAULT_CONTROL_SCALE,
-            KREA_HIRES_ATTENTION_SCORE_BUDGET,
+            Krea2Config, Krea2Control, Krea2ControlPaths, Krea2ControlRequest, KreaTokenizer,
+            PhaseAdapterMemory, DEFAULT_CONTROL_SCALE, KREA_HIRES_ATTENTION_SCORE_BUDGET,
         };
     }
     pub mod ltx {
@@ -84,6 +88,27 @@ pub mod converters {
 /// Family memory-strategy, decode-tiling, and residency admission helpers.
 pub mod memory_helpers {
     pub use candle_gen_catalog::BESPOKE_UTILITY_CRATES;
+
+    /// Pinned request width/height stride constants per image family (re-exported directly from
+    /// the linked Candle provider crates, never restated as literals).
+    pub mod image_strides {
+        pub use candle_gen_catalog::providers::anima::RES_MULTIPLE as ANIMA;
+        pub use candle_gen_catalog::providers::boogu::SIZE_MULTIPLE as BOOGU;
+        pub use candle_gen_catalog::providers::chroma::SIZE_MULTIPLE as CHROMA;
+        pub use candle_gen_catalog::providers::flux::SIZE_MULTIPLE as FLUX;
+        pub use candle_gen_catalog::providers::flux2::SIZE_MULTIPLE as FLUX2;
+        pub use candle_gen_catalog::providers::ideogram::SIZE_MULTIPLE as IDEOGRAM;
+        pub use candle_gen_catalog::providers::kolors::SIZE_MULTIPLE as KOLORS;
+        pub use candle_gen_catalog::providers::krea::SIZE_MULTIPLE as KREA;
+        pub use candle_gen_catalog::providers::lens::VAE_SCALE_FACTOR as LENS;
+        pub use candle_gen_catalog::providers::qwen_image::SIZE_MULTIPLE as QWEN_IMAGE;
+        pub use candle_gen_catalog::providers::sana::RES_MULTIPLE as SANA;
+        pub use candle_gen_catalog::providers::sd3::SIZE_MULTIPLE as SD3;
+        pub use candle_gen_catalog::providers::sdxl::SIZE_MULTIPLE as SDXL;
+        pub use candle_gen_catalog::providers::sensenova::SIZE_MULTIPLE as SENSENOVA;
+        pub use candle_gen_catalog::providers::wan::config::SIZE_MULTIPLE_14B as WAN_14B;
+        pub use candle_gen_catalog::providers::z_image::SIZE_MULTIPLE as Z_IMAGE;
+    }
 
     pub mod anima {
         pub use candle_gen_catalog::providers::anima::memory_strategy;
@@ -121,9 +146,13 @@ pub mod memory_helpers {
         pub use candle_gen_catalog::providers::mage::memory_strategy;
     }
     pub mod minimax_h3 {
-        pub use candle_gen_catalog::providers::minimax_h3::memory_strategy;
+        pub use candle_gen_catalog::providers::minimax_h3::{
+            denoise, image_memory_strategy, image_model, memory_strategy, pipeline,
+        };
     }
     pub mod moss_image {
+        #[cfg(feature = "test-support")]
+        pub use candle_gen_catalog::providers::moss_image::test_support;
         pub use candle_gen_catalog::providers::moss_image::{memory_strategy, training};
     }
     pub mod pulid {
@@ -133,7 +162,12 @@ pub mod memory_helpers {
         pub use candle_gen_catalog::providers::qwen_image::MEMORY_CALIBRATION_FINGERPRINT;
     }
     pub mod qwen_image_2_1 {
-        pub use candle_gen_catalog::providers::qwen_image_2_1::memory_strategy;
+        pub use candle_gen_catalog::providers::qwen_image_2_1::{
+            memory_strategy, quant, Variant, UPSTREAM_TURBO_HF_REPO, UPSTREAM_TURBO_HF_REVISION,
+        };
+    }
+    pub mod sana {
+        pub use candle_gen_catalog::providers::sana::memory_strategy;
     }
     pub mod scail2 {
         pub use candle_gen_catalog::providers::scail2::{memory_strategy, vae_tiling};
@@ -154,7 +188,9 @@ pub mod memory_helpers {
         pub use candle_gen_catalog::providers::supra2::memory_strategy;
     }
     pub mod wan {
-        pub use candle_gen_catalog::providers::wan::{memory_strategy, vae_tiling};
+        pub use candle_gen_catalog::providers::wan::{
+            i2v_memory_strategy, memory_strategy, vae_tiling,
+        };
     }
     pub mod z_image {
         pub use candle_gen_catalog::providers::z_image::{accel_attn_enabled, set_accel_attn};
@@ -171,6 +207,9 @@ pub mod calibration {
             REQUIRED_COMPONENTS,
         };
     }
+    pub mod iris {
+        pub use candle_gen_catalog::providers::iris::{memory_strategy, IrisRestorer};
+    }
     pub mod pulid {
         pub use candle_gen_catalog::providers::pulid::{
             compile_pulid_plan, memory_strategy, pulid_flux, pulid_load_spec, PulidFlux,
@@ -183,16 +222,24 @@ pub mod calibration {
             KolorsControl, KolorsControlPaths, KolorsControlRequest,
         };
     }
+    pub mod krea {
+        pub use candle_gen_catalog::providers::krea::{
+            Krea2Control, Krea2ControlPaths, Krea2ControlRequest,
+        };
+    }
+    pub mod lens {
+        pub use candle_gen_catalog::providers::lens::STATIC_BEHAVIOR_FINGERPRINT;
+    }
     pub mod flux {
         pub use candle_gen_catalog::providers::flux::{
-            memory_strategy, Flux1ControlPaths, Flux1ControlRequest, Flux1DevControl,
-            IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest,
+            control_provider, ip_provider, memory_strategy, Flux1ControlPaths, Flux1ControlRequest,
+            Flux1DevControl, IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest,
         };
     }
     pub mod flux2 {
         pub use candle_gen_catalog::providers::flux2::{
-            memory_strategy, Flux2Control, Flux2ControlPaths, Flux2ControlRequest, Flux2Edit,
-            Flux2EditPaths, Flux2EditRequest,
+            memory_strategy, register_providers, Flux2Control, Flux2ControlPaths,
+            Flux2ControlRequest, Flux2Edit, Flux2EditPaths, Flux2EditRequest,
         };
     }
     pub mod qwen_image {
@@ -215,7 +262,30 @@ pub mod calibration {
         };
     }
     pub use crate::memory_helpers::{
-        anima, bernini, boogu, flux3, iris, ltx, mage, minimax_h3, moss_image, qwen_image_2_1,
+        anima, bernini, boogu, flux3, ltx, mage, minimax_h3, moss_image, qwen_image_2_1, sana,
         scail2, sd3, sensenova, supra2, wan,
     };
+}
+
+/// Opt-in test fixtures, trainer probes, and proof observation hooks (`REG-5`); disabled in
+/// default/production builds.
+#[cfg(any(
+    feature = "test-support",
+    feature = "testkit",
+    feature = "model-inference-proof"
+))]
+pub mod test_support {
+    #[cfg(feature = "test-support")]
+    pub mod moss_image {
+        pub use candle_gen_catalog::providers::moss_image::test_support::{
+            generation_request, Fixture, HostFixture, HOST_CAP_BYTES,
+        };
+        pub use candle_gen_catalog::providers::moss_image::training::MossImageTrainer;
+    }
+    #[cfg(feature = "testkit")]
+    pub use candle_gen_catalog::media::testkit::PeakSampler;
+    #[cfg(feature = "model-inference-proof")]
+    pub use candle_gen_catalog::media::train::profile::with_bounded_cohort_for;
+    #[cfg(feature = "test-support")]
+    pub use moss_image::{generation_request, Fixture, MossImageTrainer};
 }

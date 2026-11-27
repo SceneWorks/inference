@@ -1209,7 +1209,7 @@ fn validate_agrees_with_generate_on_edit_requests() {
     // Valid edit request passes validate.
     assert!(generator.validate(&make_edit_req()).is_ok());
 
-    // Non-Images output is rejected by validate (matches generate).
+    // Latents output is accepted by validate (matches typed GenerationOutput::Latents).
     let mut latent_edit = make_edit_req();
     latent_edit
         .extensions
@@ -1219,11 +1219,7 @@ fn validate_agrees_with_generate_on_edit_requests() {
         .unwrap()
         .advanced
         .output = MossImageOutputKind::Latents;
-    let err = generator.validate(&latent_edit).unwrap_err();
-    assert!(
-        matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("image output"),
-        "expected Unsupported image output refusal, got {err}"
-    );
+    assert!(generator.validate(&latent_edit).is_ok());
 
     // Edit + DMD is rejected by validate (matches generate).
     let mut dmd_edit = make_edit_req();

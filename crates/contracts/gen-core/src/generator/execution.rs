@@ -145,6 +145,22 @@ fn generation_output_units(report: &GenerationReport) -> Result<usize> {
     let units = match &report.output {
         Some(GenerationOutput::Images(images)) => images.len(),
         Some(GenerationOutput::ImagesRgba(images)) => images.len(),
+        Some(GenerationOutput::Latents { values, shape }) => {
+            let valid_length = shape.iter().try_fold(1usize, |elements, dimension| {
+                elements.checked_mul(*dimension)
+            });
+            if shape[0] == 0
+                || shape[1] == 0
+                || shape[2] == 0
+                || shape[3] == 0
+                || valid_length != Some(values.len())
+            {
+                return Err(Error::Msg(
+                    "completed latent output needs a nonempty [batch,channels,height,width] shape matching its values".into(),
+                ));
+            }
+            shape[0]
+        }
         Some(
             GenerationOutput::Video { .. }
             | GenerationOutput::Audio(_)

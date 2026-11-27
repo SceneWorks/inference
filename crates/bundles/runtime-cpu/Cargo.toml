@@ -27,6 +27,11 @@ media = ["dep:candle-gen-catalog"]
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.
 audio = ["dep:candle-audio-catalog"]
+# Opt-in test fixtures, trainer probes, and proof observation hooks for downstream integration
+# tests (REG-5). Never enabled in default/production builds.
+test-support = ["media", "candle-gen-catalog?/test-support"]
+testkit = ["media", "candle-gen-catalog?/testkit"]
+model-inference-proof = ["media", "testkit", "candle-gen-catalog?/model-inference-proof"]
 
 [[bin]]
 name = "sga-capabilities-export-candle"

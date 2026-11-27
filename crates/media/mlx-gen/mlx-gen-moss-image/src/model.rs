@@ -398,11 +398,6 @@ impl MossImage {
             .and_then(|ext| ext.edit.as_ref());
         if let Some(edit) = edit_req {
             let inputs = edit.as_inputs();
-            if inputs.advanced.output != MossImageOutputKind::Images {
-                return Err(gen_core::Error::Unsupported(
-                    "generic MOSS generation requires image output".into(),
-                ));
-            }
             inputs.validate()?;
             let normalized = edit_request(request)?;
             Ok((
@@ -1229,11 +1224,6 @@ impl Generator for MossImage {
         let is_edit = edit_inputs.is_some();
         let (output, pag, execution) =
             self.execute_with_execution(&request, advanced, progress, edit_inputs)?;
-        let MossImageAdvancedOutput::Images(images) = output else {
-            return Err(gen_core::Error::Unsupported(
-                "generic MOSS generation requires image output".into(),
-            ));
-        };
         let apply_reports = self.last_adapter_apply_reports();
         let family_report = if is_edit {
             self.edit_report
@@ -1248,7 +1238,7 @@ impl Generator for MossImage {
                 .and_then(|s| s.report.clone())
                 .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
         };
-        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::from(output));
         report.pag = pag;
         report.adapter_apply_reports = apply_reports;
         report.family_report = family_report;
@@ -1610,7 +1600,7 @@ mod cpu_tests {
         )
         .is_ok());
 
-        // Non-Images output is rejected by validate (matches generate).
+        // Latents output is accepted by validate (matches typed GenerationOutput::Latents).
         let mut latent_edit = make_edit_req();
         latent_edit
             .extensions
@@ -1620,17 +1610,12 @@ mod cpu_tests {
             .unwrap()
             .advanced
             .output = MossImageOutputKind::Latents;
-        let err = MossImage::validate_generator_request_policy(
+        assert!(MossImage::validate_generator_request_policy(
             MossImageVariant::Sft,
             &spec,
             &latent_edit,
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, gen_core::Error::Unsupported(_))
-                && err.to_string().contains("image output"),
-            "expected Unsupported image output refusal, got {err}"
-        );
+        .is_ok());
 
         // Edit + DMD is rejected by validate (matches generate).
         let mut dmd_edit = make_edit_req();

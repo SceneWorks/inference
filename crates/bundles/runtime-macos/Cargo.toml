@@ -58,6 +58,9 @@ perf-bench = [
   "dep:sha2",
   "dep:tempfile",
 ]
+# Opt-in test fixtures and trainer probes for downstream integration tests (REG-5).
+# Never enabled in default/production builds.
+test-support = ["media", "mlx-gen-catalog?/test-support"]
 
 [[bin]]
 name = "mlx-perf-bench"

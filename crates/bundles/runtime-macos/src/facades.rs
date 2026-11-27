@@ -24,10 +24,16 @@ pub mod utilities {
         };
     }
 
+    /// SDXL tokenizer helpers outside the `Generator` trait.
+    pub mod sdxl {
+        pub use mlx_gen_catalog::providers::sdxl::{load_tokenizer, LDM_TOKENIZER_COMPONENT};
+    }
+
     /// SenseNova understanding / chat-template / tokenizer helpers outside the `Generator` trait.
     pub mod sensenova {
         pub use mlx_gen_catalog::providers::sensenova::{
-            load_raw, load_tokenizer, NeoChatConfig, T2iModel,
+            load_raw, load_runtime, load_tokenizer, smart_resize, NeoChatConfig, Sampler, T2iModel,
+            T2iOptions, INTERLEAVE_RESOLUTIONS, INTERLEAVE_SYSTEM_MESSAGE,
         };
     }
 }
@@ -64,6 +70,7 @@ pub mod converters {
         pub use mlx_gen_catalog::providers::kolors::convert;
     }
     pub mod krea {
+        pub use mlx_gen_catalog::providers::krea::text_encoder::tokenizer::MAX_TEXT_TOKENS;
         pub use mlx_gen_catalog::providers::krea::{
             block_stream_diagnostics, convert, descriptor, load_control_from_native_dit_file,
             load_from_native_dit_file, multiphase, reset_block_stream_diagnostics,
@@ -124,6 +131,27 @@ pub mod converters {
 pub mod memory_helpers {
     pub use mlx_gen_catalog::BESPOKE_UTILITY_CRATES;
 
+    /// Pinned request width/height stride constants per image family (re-exported directly from
+    /// the linked MLX provider crates, never restated as literals).
+    pub mod image_strides {
+        pub use mlx_gen_catalog::providers::anima::RES_MULTIPLE as ANIMA;
+        pub use mlx_gen_catalog::providers::boogu::RES_MULTIPLE as BOOGU;
+        pub use mlx_gen_catalog::providers::chroma::SIZE_MULTIPLE as CHROMA;
+        pub use mlx_gen_catalog::providers::flux::SIZE_MULTIPLE as FLUX;
+        pub use mlx_gen_catalog::providers::flux2::SIZE_MULTIPLE as FLUX2;
+        pub use mlx_gen_catalog::providers::ideogram::RES_MULTIPLE as IDEOGRAM;
+        pub use mlx_gen_catalog::providers::kolors::SIZE_MULTIPLE as KOLORS;
+        pub use mlx_gen_catalog::providers::krea::RES_MULTIPLE as KREA;
+        pub use mlx_gen_catalog::providers::lens::VAE_SCALE_FACTOR as LENS;
+        pub use mlx_gen_catalog::providers::qwen_image::SIZE_MULTIPLE as QWEN_IMAGE;
+        pub use mlx_gen_catalog::providers::sana::RES_MULTIPLE as SANA;
+        pub use mlx_gen_catalog::providers::sd3::SIZE_MULTIPLE as SD3;
+        pub use mlx_gen_catalog::providers::sdxl::SIZE_MULTIPLE as SDXL;
+        pub use mlx_gen_catalog::providers::sensenova::CELL as SENSENOVA;
+        pub use mlx_gen_catalog::providers::wan::config::SIZE_MULTIPLE_14B as WAN_14B;
+        pub use mlx_gen_catalog::providers::z_image::SIZE_MULTIPLE as Z_IMAGE;
+    }
+
     pub mod anima {
         pub use mlx_gen_catalog::providers::anima::memory_strategy;
     }
@@ -177,6 +205,8 @@ pub mod memory_helpers {
         };
     }
     pub mod moss_image {
+        #[cfg(feature = "test-support")]
+        pub use mlx_gen_catalog::providers::moss_image::test_support;
         pub use mlx_gen_catalog::providers::moss_image::{memory_strategy, training};
     }
     pub mod pulid {
@@ -186,7 +216,9 @@ pub mod memory_helpers {
         pub use mlx_gen_catalog::providers::qwen_image::memory_strategy;
     }
     pub mod qwen_image_2_1 {
-        pub use mlx_gen_catalog::providers::qwen_image_2_1::memory_strategy;
+        pub use mlx_gen_catalog::providers::qwen_image_2_1::{
+            memory_strategy, quant, Variant, UPSTREAM_TURBO_HF_REPO, UPSTREAM_TURBO_HF_REVISION,
+        };
     }
     pub mod sana {
         pub use mlx_gen_catalog::providers::sana::memory_strategy;
@@ -198,7 +230,9 @@ pub mod memory_helpers {
         pub use mlx_gen_catalog::providers::sd3::memory_strategy;
     }
     pub mod sdxl {
-        pub use mlx_gen_catalog::providers::sdxl::memory_strategy;
+        pub use mlx_gen_catalog::providers::sdxl::{
+            load_tokenizer, memory_strategy, LDM_TOKENIZER_COMPONENT,
+        };
     }
     pub mod sensenova {
         pub use mlx_gen_catalog::providers::sensenova::memory_strategy;
@@ -221,14 +255,23 @@ pub mod memory_helpers {
 
 /// Calibration and memory-adapter harness helpers (`sceneworks-memory-adapter`).
 pub mod calibration {
+    pub mod flux2 {
+        pub use mlx_gen_catalog::providers::flux2::{memory_strategy, register_providers};
+    }
     pub mod instantid {
         pub use mlx_gen_catalog::providers::instantid::{
             memory_strategy, InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE,
             DEFAULT_IP_SCALE, DEFAULT_OPENPOSE_SCALE,
         };
     }
+    pub mod iris {
+        pub use mlx_gen_catalog::providers::iris::{memory_strategy, IrisRestorer};
+    }
     pub mod pulid {
         pub use mlx_gen_catalog::providers::pulid::{memory_strategy, pulid_flux};
+    }
+    pub mod qwen_image {
+        pub use mlx_gen_catalog::providers::qwen_image::{load_vae, memory_strategy, QwenVae};
     }
     pub mod sensenova {
         pub use mlx_gen_catalog::providers::sensenova::{
@@ -236,8 +279,20 @@ pub mod calibration {
         };
     }
     pub use crate::memory_helpers::{
-        anima, bernini, chroma, flux, flux2, flux3, ideogram, iris, kolors, krea, krea_realtime,
-        lens, ltx, mage, minimax_h3, moss_image, qwen_image, qwen_image_2_1, sana, scail2, sd3,
-        sdxl, supra2, svd, wan, z_image,
+        anima, bernini, chroma, flux, flux3, ideogram, kolors, krea, krea_realtime, lens, ltx,
+        mage, minimax_h3, moss_image, qwen_image_2_1, sana, scail2, sd3, sdxl, supra2, svd, wan,
+        z_image,
     };
+}
+
+/// Opt-in test fixtures and trainer probes (`REG-5`); disabled in default/production builds.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub mod moss_image {
+        pub use mlx_gen_catalog::providers::moss_image::test_support::{
+            generation_request, Fixture, HostFixture, HOST_CAP_BYTES,
+        };
+        pub use mlx_gen_catalog::providers::moss_image::training::MossImageTrainer;
+    }
+    pub use moss_image::{generation_request, Fixture, MossImageTrainer};
 }

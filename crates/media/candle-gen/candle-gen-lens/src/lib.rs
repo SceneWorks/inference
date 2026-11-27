@@ -4347,7 +4347,8 @@ mod integration_tests {
                 | GenerationOutput::Video { .. }
                 | GenerationOutput::Audio(_)
                 | GenerationOutput::Interleaved { .. }
-                | GenerationOutput::Vector(_) => {
+                | GenerationOutput::Vector(_)
+                | GenerationOutput::Latents { .. } => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };

@@ -123,6 +123,8 @@ pub mod providers {
 
 #[cfg(feature = "media")]
 mod facades;
+#[cfg(all(feature = "media", feature = "test-support"))]
+pub use facades::test_support;
 #[cfg(feature = "media")]
 pub use facades::{calibration, converters, memory_helpers, utilities};
 

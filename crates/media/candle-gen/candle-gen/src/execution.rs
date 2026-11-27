@@ -431,6 +431,10 @@ fn output_facts(output: Option<&GenerationOutput>) -> Vec<Value> {
             "truncated": vector.truncated,
             "has_preview": vector.preview.is_some(),
         })],
+        Some(GenerationOutput::Latents { shape, .. }) => vec![json!({
+            "format": "f32-latents",
+            "shape": shape,
+        })],
         None => Vec::new(),
     }
 }

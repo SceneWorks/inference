@@ -434,6 +434,14 @@ pub enum MossImageAdvancedOutput {
     Images(Vec<Image>),
     Latents { values: Vec<f32>, shape: [usize; 4] },
 }
+impl From<MossImageAdvancedOutput> for crate::GenerationOutput {
+    fn from(output: MossImageAdvancedOutput) -> Self {
+        match output {
+            MossImageAdvancedOutput::Images(images) => Self::Images(images),
+            MossImageAdvancedOutput::Latents { values, shape } => Self::Latents { values, shape },
+        }
+    }
+}
 impl Serialize for MossImageAcceleration {
     fn serialize<S: serde::Serializer>(
         &self,

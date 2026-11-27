@@ -619,4 +619,38 @@ fn pipe12_vector_output_and_per_run_execution_reports_are_typed() {
         completed.generation.output,
         Some(GenerationOutput::Vector(_))
     ));
+
+    // PIPE-12: typed family-agnostic latent batch output validates shape/length and counts batch
+    // elements as output units through CompletedGeneration::new.
+    let latent_report = GenerationReport::from_output(GenerationOutput::Latents {
+        values: vec![0.25; 2 * 128],
+        shape: [2, 128, 1, 1],
+    });
+    let latent_completed = gen_core::generator::CompletedGeneration::new(
+        latent_report,
+        ExecutionIdentity::provider_default(),
+        &descriptor,
+    )
+    .expect("valid Latents batch validates through CompletedGeneration::new");
+    assert!(matches!(
+        latent_completed.generation.output,
+        Some(GenerationOutput::Latents {
+            shape: [2, 128, 1, 1],
+            ..
+        })
+    ));
+
+    let bad_latent = GenerationReport::from_output(GenerationOutput::Latents {
+        values: vec![0.25; 4],
+        shape: [2, 128, 1, 1],
+    });
+    assert!(
+        gen_core::generator::CompletedGeneration::new(
+            bad_latent,
+            ExecutionIdentity::provider_default(),
+            &descriptor,
+        )
+        .is_err(),
+        "mismatched Latents value length must fail CompletedGeneration::new"
+    );
 }

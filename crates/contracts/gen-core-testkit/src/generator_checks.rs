@@ -127,6 +127,9 @@ pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
             .copied()
             .chain(vector.preview.iter().flat_map(|i| i.pixels.iter().copied()))
             .collect(),
+        GenerationOutput::Latents { values, .. } => {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
     }
 }
 
@@ -436,6 +439,7 @@ pub(super) fn output_variant_name(out: &GenerationOutput) -> &'static str {
         GenerationOutput::Audio(_) => "GenerationOutput::Audio",
         GenerationOutput::Interleaved { .. } => "GenerationOutput::Interleaved",
         GenerationOutput::Vector(_) => "GenerationOutput::Vector",
+        GenerationOutput::Latents { .. } => "GenerationOutput::Latents",
     }
 }
 

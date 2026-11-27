@@ -104,6 +104,12 @@ pub enum GenerationOutput {
     /// Sanitized canonical SVG plus its optional rendered preview and terminal metadata for
     /// vector generation (`PIPE-12`, ready for StarVector).
     Vector(VectorOutput),
+    /// Raw FP32 NCHW latent batch `[batch, channels, height, width]` emitted when a provider's
+    /// request selects latent-space output rather than RGB/RGBA decode (`PIPE-12`).
+    Latents {
+        values: Vec<f32>,
+        shape: [usize; 4],
+    },
 }
 
 /// The caption-overflow policy ([`GenerationRequest::caption_overflow`], epic sc-25678): what a

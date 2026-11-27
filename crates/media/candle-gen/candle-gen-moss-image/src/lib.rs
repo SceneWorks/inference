@@ -667,11 +667,6 @@ impl Generator for MossImageGenerator {
             .and_then(|ext| ext.edit.as_ref());
         let (output, pag, execution, is_edit) = if let Some(edit_req) = edit_req {
             let inputs = edit_req.as_inputs();
-            if inputs.advanced.output != MossImageOutputKind::Images {
-                return Err(gen_core::Error::Unsupported(
-                    "generic MOSS generation requires image output".into(),
-                ));
-            }
             let (output, pag, execution) =
                 self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
             (output, pag, execution, true)
@@ -683,9 +678,6 @@ impl Generator for MossImageGenerator {
                 progress,
             )?;
             (output, pag, execution, false)
-        };
-        let MossImageAdvancedOutput::Images(images) = output else {
-            unreachable!("default image output")
         };
         let (family_report, apply_reports) = {
             let state = candle_gen::lock_recover(&self.state);
@@ -702,7 +694,7 @@ impl Generator for MossImageGenerator {
             };
             (family_report, state.apply_reports.clone())
         };
-        let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = GenerationReport::from_output(GenerationOutput::from(output));
         report.pag = pag;
         report.adapter_apply_reports = apply_reports;
         report.family_report = family_report;
@@ -755,11 +747,6 @@ impl Generator for MossImageGenerator {
         let normalized;
         let (req, advanced) = if let Some(edit) = edit_req {
             let inputs = edit.as_inputs();
-            if inputs.advanced.output != MossImageOutputKind::Images {
-                return Err(gen_core::Error::Unsupported(
-                    "generic MOSS generation requires image output".into(),
-                ));
-            }
             inputs.validate()?;
             edit::check_precision(&self.device)?;
             normalized = edit_request(req)?;
