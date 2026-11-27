@@ -11,6 +11,8 @@
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::fused_path::Attempt;
+use candle_gen::vae_norm_silu_pad::{norm_silu_pad, ConvInputLayout, TemporalPad, VaeNorm};
 
 use crate::quant::guard_no_scales;
 
@@ -234,17 +236,62 @@ impl CausalConv3d {
             x.clone()
         };
 
+        self.accumulate_taps(b, t, |kd| {
+            // The T frames this tap convolves: x_pad[:, :, kd : kd+T].
+            let frames = xpad.narrow(2, kd, t)?;
+            // [B, C, T, H, W] → [B*T, C, H, W] for conv2d.
+            frames
+                .permute((0, 2, 1, 3, 4))?
+                .reshape((b * t, c, h, w))?
+                .contiguous()
+        })
+    }
+
+    /// `forward(&silu(pixel_norm(x)), causal)` with the norm, SiLU and frame-replication pad fused
+    /// into one kernel (SW-6133) that writes the padded conv input **frame-major**
+    /// (`[B, T+kt-1, C, H, W]`): the normalized and SiLU tensors and the replication `cat` are never
+    /// materialized, and each tap's `T` frames are already the merged `[B·T, C, H, W]` conv2d batch
+    /// (a view when `B == 1`). `Attempt::Reference(reason)` when the kernel does not serve the call;
+    /// the caller then runs the op chain — see `crate::vae::norm_silu_conv`.
+    pub(crate) fn forward_norm_silu(
+        &self,
+        x: &Tensor,
+        norm: &VaeNorm<'_>,
+        causal: bool,
+    ) -> Result<Attempt<Tensor>> {
+        let (b, c, t, h, w) = x.dims5()?;
+        // The same replication `forward` builds: causal = `kt-1` copies of the first frame in front;
+        // otherwise `(kt-1)/2` copies of the first frame in front and of the last frame behind.
+        let pad = match (self.kt > 1, causal) {
+            (false, _) => TemporalPad::default(),
+            (true, true) => TemporalPad {
+                replicate_front: self.kt - 1,
+                ..TemporalPad::default()
+            },
+            (true, false) => TemporalPad {
+                replicate_front: (self.kt - 1) / 2,
+                replicate_back: (self.kt - 1) / 2,
+                ..TemporalPad::default()
+            },
+        };
+        norm_silu_pad(x, norm, None, pad, ConvInputLayout::FrameMajor)?.try_map(|xpad| {
+            self.accumulate_taps(b, t, |kd| xpad.narrow(1, kd, t)?.reshape((b * t, c, h, w)))
+        })
+    }
+
+    /// `Σ_kd conv2d(tap_input(kd), W[:, :, kd]) + bias`, reshaped to `[B, O, T, H, W]`; `tap_input`
+    /// yields tap `kd`'s merged `[B·T, C, H, W]` frames.
+    fn accumulate_taps(
+        &self,
+        b: usize,
+        t: usize,
+        mut tap_input: impl FnMut(usize) -> Result<Tensor>,
+    ) -> Result<Tensor> {
         let mut acc: Option<Tensor> = None;
         for kd in 0..self.kt {
             // Tap W[:, :, kd] → [O, I, kh, kw].
             let wk = self.weight.narrow(2, kd, 1)?.squeeze(2)?.contiguous()?;
-            // The T frames this tap convolves: x_pad[:, :, kd : kd+T].
-            let frames = xpad.narrow(2, kd, t)?;
-            // [B, C, T, H, W] → [B*T, C, H, W] for conv2d.
-            let merged = frames
-                .permute((0, 2, 1, 3, 4))?
-                .reshape((b * t, c, h, w))?
-                .contiguous()?;
+            let merged = tap_input(kd)?;
             let y = chunked_conv2d(&merged, &wk, self.spatial_pad)?;
             acc = Some(match acc {
                 Some(a) => (a + y)?,

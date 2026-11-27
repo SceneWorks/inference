@@ -25,6 +25,7 @@ use std::sync::Mutex;
 
 use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
 use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
+use candle_gen::vae_norm_silu_pad::{VaeNorm, VAE_NORM_SILU_PAD_PATH};
 
 const NORM_EPS: f64 = 1e-12;
 
@@ -119,6 +120,33 @@ impl ChanNorm {
         };
         __model_proof_output!(normed.broadcast_mul(&self.gamma.reshape(gshape)?))
     }
+
+    /// This norm as the fused kernel's [`VaeNorm::ChannelL2`] (same `γ`, `√C` and floor).
+    pub(crate) fn spec(&self) -> VaeNorm<'_> {
+        VaeNorm::ChannelL2 {
+            gamma: &self.gamma,
+            scale: self.sqrt_c,
+            eps: NORM_EPS,
+        }
+    }
+}
+
+/// `conv(silu(norm(x)))` — every Wan VAE `norm → SiLU → CausalConv3d` site (the resnet convs and the
+/// encoder / decoder `conv_out`, z48 and z16). On CUDA the norm, SiLU and causal pad run as one fused
+/// kernel writing the conv input ([`CausalConv3d::forward_norm_silu`], SW-6133); the op chain
+/// `conv.forward(&norm.forward(x)?.silu()?)` stays as the parity oracle and the path for CPU, Metal,
+/// an unserved input or a failed compile, and which path ran is counted on
+/// [`VAE_NORM_SILU_PAD_PATH`] (`CANDLE_FUSED_VAE_NORM_SILU_PAD` turns the kernel off).
+pub(crate) fn norm_silu_conv(
+    norm: &ChanNorm,
+    conv: &CausalConv3d,
+    x: &Tensor,
+    ctx: &Ctx,
+) -> Result<Tensor> {
+    VAE_NORM_SILU_PAD_PATH.dispatch(
+        || conv.forward_norm_silu(x, &norm.spec(), ctx),
+        || conv.forward(&norm.forward(x)?.silu()?, ctx),
+    )
 }
 
 /// A native 2-D conv applied per video frame (resample / attention 1×1 convs). `pub(crate)` for the
@@ -189,8 +217,8 @@ impl Resnet {
             Some(c) => c.forward(x, ctx)?,
             None => x.clone(),
         };
-        let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?, ctx)?;
-        let y = self.conv2.forward(&self.norm2.forward(&y)?.silu()?, ctx)?;
+        let y = norm_silu_conv(&self.norm1, &self.conv1, x, ctx)?;
+        let y = norm_silu_conv(&self.norm2, &self.conv2, &y, ctx)?;
         y + h
     }
 
@@ -689,8 +717,7 @@ impl Encoder {
         h = self.mid_resnet0.forward(&h, ctx)?;
         h = self.mid_attn.forward(&h)?;
         h = self.mid_resnet1.forward(&h, ctx)?;
-        self.conv_out
-            .forward(&self.norm_out.forward(&h)?.silu()?, ctx)
+        norm_silu_conv(&self.norm_out, &self.conv_out, &h, ctx)
     }
 
     fn reset_cache(&self) {
@@ -1046,8 +1073,7 @@ impl WanVae {
         for ub in &self.up_blocks {
             h = ub.forward(&h, ctx)?;
         }
-        let h = self.norm_out.forward(&h)?.silu()?;
-        let h = self.conv_out.forward(&h, ctx)?; // [B,12,T',H8,W8]
+        let h = norm_silu_conv(&self.norm_out, &self.conv_out, &h, ctx)?; // [B,12,T',H8,W8]
         self.unpatchify(&h)
     }
 
@@ -1701,6 +1727,177 @@ mod norm_tests {
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED vae::norm_tests::chan_norm_f32_forward_is_unchanged"
         );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_norm_silu_pad_tests {
+    //! SW-6133: the fused norm + SiLU + causal pad inside a real Wan `Resnet` (two `ChanNorm →
+    //! SiLU → CausalConv3d` sites plus a 1×1 shortcut) on synthetic weights, on CUDA, streamed one
+    //! frame at a time through the `feat_cache` exactly as the decode runs it. Model work (learned
+    //! module forwards): `#[ignore]`d and registered as explicit model proofs.
+    //!
+    //! Criteria: f32 fused vs op chain rel-L2 <= 1e-5 (the convs are bit-identical given identical
+    //! inputs; only the norm's `Σ x²` order differs); bf16 fused no worse than the bf16 chain against
+    //! the f32 block (rel-L2 within 1.05x + 1e-4) — the fused kernel rounds once, the chain after
+    //! every op; mixed fused / reference chunks share one cache; a wrong-side pad fails.
+    use super::Resnet;
+    use crate::conv3d::{Ctx, MUTATE_PAD_SIDE};
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::fused_path::media_fused_policy_guard;
+    use candle_gen::vae_norm_silu_pad::VAE_NORM_SILU_PAD_PATH;
+    use std::collections::HashMap;
+
+    fn weights(in_c: usize, out_c: usize) -> Result<HashMap<String, Tensor>> {
+        let cpu = Device::Cpu;
+        let mut m = HashMap::new();
+        let mut put = |k: &str, shape: &[usize], mean: f32, std: f32| -> Result<()> {
+            m.insert(k.to_string(), Tensor::randn(mean, std, shape, &cpu)?);
+            Ok(())
+        };
+        put("norm1.gamma", &[in_c], 1.0, 0.2)?;
+        put(
+            "conv1.weight",
+            &[out_c, in_c, 3, 3, 3],
+            0.0,
+            0.5 / ((in_c * 27) as f32).sqrt(),
+        )?;
+        put("conv1.bias", &[out_c], 0.0, 0.02)?;
+        put("norm2.gamma", &[out_c], 1.0, 0.2)?;
+        put(
+            "conv2.weight",
+            &[out_c, out_c, 3, 3, 3],
+            0.0,
+            0.5 / ((out_c * 27) as f32).sqrt(),
+        )?;
+        put("conv2.bias", &[out_c], 0.0, 0.02)?;
+        if in_c != out_c {
+            put(
+                "conv_shortcut.weight",
+                &[out_c, in_c, 1, 1, 1],
+                0.0,
+                1.0 / (in_c as f32).sqrt(),
+            )?;
+            put("conv_shortcut.bias", &[out_c], 0.0, 0.02)?;
+        }
+        Ok(m)
+    }
+
+    fn resnet(
+        w: &HashMap<String, Tensor>,
+        in_c: usize,
+        out_c: usize,
+        dt: DType,
+        dev: &Device,
+    ) -> Result<Resnet> {
+        let on_dev = w
+            .iter()
+            .map(|(k, t)| Ok((k.clone(), t.to_device(dev)?.to_dtype(dt)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        Resnet::new(in_c, out_c, VarBuilder::from_tensors(on_dev, dt, dev))
+    }
+
+    /// Stream `x` one frame at a time; `fused[f]` picks frame `f`'s path.
+    fn stream(r: &Resnet, x: &Tensor, fused: impl Fn(usize) -> bool) -> Result<Tensor> {
+        r.reset_cache();
+        let t = x.dim(2)?;
+        let mut out = Vec::with_capacity(t);
+        for f in 0..t {
+            let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(fused(f)));
+            let xf = x.narrow(2, f, 1)?.contiguous()?;
+            out.push(r.forward(&xf, &Ctx::streaming(f == 0))?);
+        }
+        r.reset_cache();
+        Tensor::cat(&out, 2)?.to_dtype(DType::F32)
+    }
+
+    fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let num = (a - b)?.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        let den = b.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        Ok(num / den.max(f32::MIN_POSITIVE))
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let _media = media_fused_policy_guard(Some(true));
+        for (in_c, out_c, h, w) in [(96usize, 192usize, 24usize, 40usize), (192, 192, 18, 30)] {
+            let wts = weights(in_c, out_c)?;
+            let t = 5;
+            let x = (Tensor::randn(0f32, 1.0, (1, in_c, t, h, w), &dev)? * 2.0)?;
+            let r32 = resnet(&wts, in_c, out_c, DType::F32, &dev)?;
+
+            let before = VAE_NORM_SILU_PAD_PATH.thread_counts();
+            let reference = stream(&r32, &x, |_| false)?;
+            let mid = VAE_NORM_SILU_PAD_PATH.thread_counts();
+            let fused = __model_proof_output!(stream(&r32, &x, |_| true))?;
+            let after = VAE_NORM_SILU_PAD_PATH.thread_counts();
+            let (off, on) = (mid.since(&before), after.since(&mid));
+            assert_eq!(off.reference_for("disabled"), 2 * t as u64, "{off}");
+            assert_eq!((on.fused, on.reference_total()), (2 * t as u64, 0), "{on}");
+            let rel = rel_l2(&fused, &reference)?;
+            assert!(
+                rel <= 1e-5,
+                "f32 {in_c}->{out_c}: fused vs op chain rel-L2 {rel:e}"
+            );
+
+            // Cache interop: frames 0..2 fused, the rest on the op chain (and the reverse).
+            let mixed = stream(&r32, &x, |f| f < 2)?;
+            let rel_mixed = rel_l2(&mixed, &reference)?;
+            assert!(
+                rel_mixed <= 1e-5,
+                "mixed fused->reference rel-L2 {rel_mixed:e}"
+            );
+            let mixed = stream(&r32, &x, |f| f >= 2)?;
+            let rel_mixed_rev = rel_l2(&mixed, &reference)?;
+            assert!(
+                rel_mixed_rev <= 1e-5,
+                "mixed reference->fused rel-L2 {rel_mixed_rev:e}"
+            );
+
+            // The causal identity holds on the fused path too: one single pass over all frames.
+            let single = {
+                let _kernel = VAE_NORM_SILU_PAD_PATH.guard(Some(true));
+                r32.reset_cache();
+                r32.forward(&x, &Ctx::single_pass())?.to_dtype(DType::F32)?
+            };
+            let rel_single = rel_l2(&single, &reference)?;
+            assert!(
+                rel_single <= 1e-5,
+                "fused single pass vs streamed op chain {rel_single:e}"
+            );
+
+            // Mutation: the zero pad on the wrong temporal side must fail parity.
+            MUTATE_PAD_SIDE.with(|m| m.set(true));
+            let mutated = stream(&r32, &x, |_| true);
+            MUTATE_PAD_SIDE.with(|m| m.set(false));
+            let rel_mut = rel_l2(&mutated?, &reference)?;
+            assert!(
+                rel_mut > 1e-2,
+                "a wrong-side causal pad passed parity ({rel_mut:e})"
+            );
+
+            // bf16 (the A14B z16 VAE dtype): no worse than the bf16 op chain vs the f32 block.
+            let r16 = resnet(&wts, in_c, out_c, DType::BF16, &dev)?;
+            let xb = x.to_dtype(DType::BF16)?;
+            let oracle = stream(&r32, &xb.to_dtype(DType::F32)?, |_| false)?;
+            let chain16 = rel_l2(&stream(&r16, &xb, |_| false)?, &oracle)?;
+            let fused16 = rel_l2(&stream(&r16, &xb, |_| true)?, &oracle)?;
+            println!(
+                "resnet {in_c}->{out_c} {h}x{w} T{t}: f32 fused rel-L2 {rel:.3e} (mixed {rel_mixed:.3e} / \
+                 {rel_mixed_rev:.3e}, single pass {rel_single:.3e}, wrong-side pad {rel_mut:.3e}); bf16 vs \
+                 f32 block: fused {fused16:.3e}, op chain {chain16:.3e}"
+            );
+            assert!(
+                fused16 <= 1.05 * chain16 + 1e-4,
+                "bf16 fused rel-L2 {fused16:e} vs op chain {chain16:e}"
+            );
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain");
         Ok(())
     }
 }
