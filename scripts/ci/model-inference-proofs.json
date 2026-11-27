@@ -322056,7 +322056,7 @@
     "device_binding": "runtime-stream",
     "fixture_identity": "product-pinned Wan 2.1 z16 VAE: vae.safetensors of SceneWorks/wan2.2-t2v-a14b-mlx@991eb255c544bbb2e1f1e07da4355c2f0a5337b7/q4 staged into the runner Hub cache (WAN_Z16_VAE_SNAPSHOT); seeded latent [1,16,4,60,60], clip [1,3,9,256,256] and source-generated Wan/LTX parity geometries",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes; their input receipts and in-scope MODEL_INFERENCE_DEVICE observations are forwarded, and the parent fails unless every child observed mlx-metal), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
     "cargo_features": [
       "model-inference-proof",
       "mlx-gen/test-support"
@@ -322119,7 +322119,7 @@
     "device_binding": "runtime-stream",
     "fixture_identity": "product-pinned LTX-2.3 video VAE: vae_decoder/vae_encoder.safetensors + embedded_config.json of SceneWorks/ltx-2.3-mlx@01df27d308466533aa09d251e3aebdcc627d07eb/q4 staged into the runner Hub cache (LTX_VAE_SNAPSHOT); seeded latent [1,128,3,12,16], clip [1,3,9,256,256] and source-generated LTX parity geometries",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes and only their input receipts are forwarded), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes; their input receipts and in-scope MODEL_INFERENCE_DEVICE observations are forwarded, and the parent fails unless every child observed mlx-metal), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
     "cargo_features": [
       "model-inference-proof",
       "mlx-gen/test-support"

@@ -15,9 +15,12 @@
 //! 3. Each fused route's decode/encode vs the reference route: PSNR and bit identity.
 //!
 //! Everything is printed before anything is asserted. Asserted: Metal parity within E2 tolerance,
-//! every mutation fails, every normed conv of the Metal child took the Metal kernel, and the Metal
-//! decode **and** encode are ≥ 50 dB from the reference route. The compiled route is measured and
-//! reported, not gated (it is the candidate mechanism the story compares against).
+//! every mutation fails, every normed conv of the Metal child took the Metal kernel, the Metal
+//! decode **and** encode are ≥ 50 dB from the reference route (NaN fails), and **every** child
+//! observed `mlx-metal` inside its decode and encode scopes and emitted that
+//! `MODEL_INFERENCE_DEVICE` line (forwarded by the parent; a child with no or another device
+//! observation fails the proof). The compiled route is measured and reported, not gated (it is
+//! the candidate mechanism the story compares against).
 //!
 //! `WAN_Z16_VAE_SNAPSHOT` is the pinned `SceneWorks/wan2.2-t2v-a14b-mlx` q4 snapshot directory
 //! (its `vae.safetensors` is the f32 Wan 2.1 z16 VAE); `model-inference-proofs.yml` stages it.
@@ -54,6 +57,12 @@ const ROUTES: [NormSiluPadRoute; 3] = [
     NormSiluPadRoute::Metal,
 ];
 const MIB: f64 = 1024.0 * 1024.0;
+/// The Metal route's decode/encode PSNR floor against the reference route.
+const PSNR_FLOOR_DB: f64 = 50.0;
+/// The registered case the proof workflow runs (inherited by every per-route child).
+const CASE_ENV: &str = "MODEL_INFERENCE_CASE_FQN";
+/// The device every child's real-weight decode/encode must observe.
+const METAL: &str = "mlx-metal";
 
 fn eval(x: &Array) {
     mlx_rs::transforms::eval([x]).unwrap();
@@ -84,22 +93,6 @@ fn read_f32(path: &Path) -> Vec<f32> {
         .collect()
 }
 
-/// PSNR of `got` against `want` over `want`'s peak-to-peak range (2 for the clamped video).
-fn psnr_db(got: &[f32], want: &[f32], range: f64) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let mse = got
-        .iter()
-        .zip(want)
-        .map(|(a, b)| f64::from(a - b).powi(2))
-        .sum::<f64>()
-        / want.len().max(1) as f64;
-    if mse == 0.0 {
-        f64::INFINITY
-    } else {
-        10.0 * (range * range / mse).log10()
-    }
-}
-
 fn peak_to_peak(values: &[f32]) -> f64 {
     let (lo, hi) = values
         .iter()
@@ -117,6 +110,55 @@ fn chip() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace(' ', "_"))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// The kind of the stream the child's model work runs on, read exactly as
+/// `model_inference_device::record_model_inference_device` reads it (the selected stream, no
+/// extra stream, no evaluation). Called inside the child's decode/encode scopes.
+fn selected_device_kind() -> &'static str {
+    match mlx_rs::Stream::task_local_or_default()
+        .get_device()
+        .and_then(|d| d.get_type())
+    {
+        Ok(mlx_rs::DeviceType::Cpu) => "mlx-cpu",
+        Ok(mlx_rs::DeviceType::Gpu) => METAL,
+        Err(_) => "mlx-unknown",
+    }
+}
+
+/// A child's device evidence, checked by the parent before it accepts the proof: the child's
+/// decode and encode scopes both observed Metal, and under the proof workflow the child emitted
+/// at least one `MODEL_INFERENCE_DEVICE` line, every one of them `<case> mlx-metal`. A child that
+/// observed nothing is a failure, never a pass.
+fn child_device_failures(
+    route: NormSiluPadRoute,
+    fields: &HashMap<String, String>,
+    stdout: &str,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for key in ["decode_device", "encode_device"] {
+        let observed = fields.get(key).map(String::as_str);
+        if observed != Some(METAL) {
+            failures.push(format!(
+                "{} child {key} = {observed:?}, expected {METAL}",
+                route.label()
+            ));
+        }
+    }
+    if let Ok(case) = std::env::var(CASE_ENV) {
+        let want = format!("MODEL_INFERENCE_DEVICE {case} {METAL}");
+        let lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.starts_with("MODEL_INFERENCE_DEVICE "))
+            .collect();
+        if lines.is_empty() || lines.iter().any(|l| l.trim_end() != want) {
+            failures.push(format!(
+                "{} child device observations {lines:?}, expected [{want:?}]",
+                route.label()
+            ));
+        }
+    }
+    failures
 }
 
 /// The conv input of the decoder's final-stage residual conv, by `route`, as the contiguous
@@ -198,6 +240,7 @@ fn child(route: NormSiluPadRoute, out_dir: &Path) {
         video
     });
     let decode_counts = norm_silu_pad::thread_counts().since(&start);
+    let decode_device = selected_device_kind();
     write_f32(
         &out_dir.join(format!("decode-{}.f32", route.label())),
         &parity::host_f32(&video).unwrap(),
@@ -216,10 +259,14 @@ fn child(route: NormSiluPadRoute, out_dir: &Path) {
         z
     });
     let encode_counts = norm_silu_pad::thread_counts().since(&start);
+    let encode_device = selected_device_kind();
     write_f32(
         &out_dir.join(format!("encode-{}.f32", route.label())),
         &parity::host_f32(&latent_out).unwrap(),
     );
+    // This child's own in-scope device observation of the real-weight work above (the parent
+    // forwards it and refuses the proof unless it is Metal).
+    crate::model_inference_device::record_model_inference_device();
 
     let served = |c: &norm_silu_pad::RouteCounts| match route {
         NormSiluPadRoute::Reference => c.reference,
@@ -227,7 +274,8 @@ fn child(route: NormSiluPadRoute, out_dir: &Path) {
         NormSiluPadRoute::Metal => c.metal,
     };
     println!(
-        "SW6142_WAN_CHILD route={} load_ms={load_ms:.1} bench_ms={bench_ms:.2} \
+        "SW6142_WAN_CHILD route={} decode_device={decode_device} encode_device={encode_device} \
+         load_ms={load_ms:.1} bench_ms={bench_ms:.2} \
          bench_peak_bytes={bench_peak} decode_ms={decode_ms:.1} decode_peak_bytes={decode_peak} \
          decode_sites={} decode_refused={} encode_ms={encode_ms:.1} encode_peak_bytes={encode_peak} \
          encode_sites={} encode_refused={} video_shape={video_shape:?} latent_shape={:?}",
@@ -299,7 +347,9 @@ fn wan_z16_vae_norm_silu_pad_decode_proof() {
             "SW6142_MUTATION case={} mismatches={} max_abs={:.3e}",
             case.name, c.mismatches, c.max_abs
         );
-        if c.bitwise() || c.max_abs <= 1e-2 {
+        // Stated as the positive condition so a NaN `max_abs` counts as "did not fail parity".
+        let broke_parity = !c.bitwise() && c.max_abs > 1e-2;
+        if !broke_parity {
             failures.push(format!("mutation {} did not fail parity", case.name));
         }
     }
@@ -329,13 +379,17 @@ fn wan_z16_vae_norm_silu_pad_decode_proof() {
             String::from_utf8_lossy(&output.stderr)
         );
         let fields = parse_child(&stdout);
-        // The child's result line, and its in-scope input receipts (the children are the ones
-        // that read the pinned weights; libtest summaries stay in the child's own output).
+        // The child's result line and its in-scope input receipts and device observations (the
+        // children are the ones that read the pinned weights and run the real-weight
+        // decode/encode; libtest summaries stay in the child's own output).
         for line in stdout.lines().filter(|l| {
-            l.starts_with("SW6142_WAN_CHILD ") || l.starts_with("MODEL_INFERENCE_INPUT_USED ")
+            l.starts_with("SW6142_WAN_CHILD ")
+                || l.starts_with("MODEL_INFERENCE_INPUT_USED ")
+                || l.starts_with("MODEL_INFERENCE_DEVICE ")
         }) {
             println!("\n{line}");
         }
+        failures.extend(child_device_failures(route, &fields, &stdout));
         children.insert(route, fields);
     }
 
@@ -354,8 +408,8 @@ fn wan_z16_vae_norm_silu_pad_decode_proof() {
     for route in [NormSiluPadRoute::Compiled, NormSiluPadRoute::Metal] {
         let (video, latent) = (read("decode", route), read("encode", route));
         let (decode_db, encode_db) = (
-            psnr_db(&video, &ref_video, 2.0),
-            psnr_db(&latent, &ref_latent, latent_range),
+            parity::psnr_db(&video, &ref_video, 2.0),
+            parity::psnr_db(&latent, &ref_latent, latent_range),
         );
         println!(
             "SW6142_WAN_DECODE device={device} route={} latent={LATENT:?} decode_psnr_db={decode_db:.2} \
@@ -375,9 +429,13 @@ fn wan_z16_vae_norm_silu_pad_decode_proof() {
             field(reference, "encode_peak_bytes") / MIB,
         );
         if route == NormSiluPadRoute::Metal {
-            if decode_db < 50.0 || encode_db < 50.0 {
+            // NaN-rejecting (`>=`): a NaN output scores NaN and fails; identical scores +inf.
+            let clears = parity::psnr_clears(decode_db, PSNR_FLOOR_DB)
+                && parity::psnr_clears(encode_db, PSNR_FLOOR_DB);
+            if !clears {
                 failures.push(format!(
-                    "metal decode {decode_db:.2} dB / encode {encode_db:.2} dB below 50 dB"
+                    "metal decode {decode_db:.2} dB / encode {encode_db:.2} dB not at least \
+                     {PSNR_FLOOR_DB} dB"
                 ));
             }
             let (decode_sites, encode_sites) =

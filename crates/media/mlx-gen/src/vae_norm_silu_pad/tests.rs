@@ -1,7 +1,8 @@
 //! SW-6142 route tests.
 //!
 //! * **Pure tests** (ordinary CI): [`plan_norm_silu_pad`]'s admission and refusals, the route
-//!   switch/guard and the counters. They touch shapes, dtypes and thread-locals only.
+//!   switch/guard, the counters and the proofs' host-side PSNR gate. They touch shapes, dtypes,
+//!   thread-locals and host `f32` slices only.
 //! * **MLX compute tests** (`#[ignore]`, registered in `scripts/ci/test_suites.json` for the
 //!   dispatch-only exhaustive suite): the Metal and compiled routes against the reference op chain
 //!   over every Wan/LTX geometry of [`parity`] (E2 tolerance, and bit identity for the kernel), the
@@ -226,6 +227,43 @@ fn the_kernel_source_splits_into_header_and_body() {
     }
     assert!(body.contains("thread_position_in_grid"));
     assert!(!body.contains("_shape") && !body.contains("_ndim"));
+}
+
+/// The real-weight proofs' PSNR gate on host values (no MLX): a NaN output element makes the
+/// score NaN and the gate rejects it (a `db < 50` failure check would have accepted it), while
+/// bit-identical outputs score `+inf` and pass.
+#[test]
+fn the_psnr_gate_rejects_a_nan_output_and_accepts_identical_outputs() {
+    const FLOOR_DB: f64 = 50.0;
+    let want = [0.25f32, -0.5, 0.75, 1.0];
+
+    let identical = parity::psnr_db(&want, &want, 2.0);
+    assert_eq!(identical, f64::INFINITY);
+    assert!(parity::psnr_clears(identical, FLOOR_DB));
+
+    let mut nan_output = want;
+    nan_output[2] = f32::NAN;
+    let nan_db = parity::psnr_db(&nan_output, &want, 2.0);
+    assert!(nan_db.is_nan(), "{nan_db}");
+    assert!(!parity::psnr_clears(nan_db, FLOOR_DB));
+    // The NaN-blind failure check this gate replaces does not fire on it.
+    let blind_check_fires = nan_db < FLOOR_DB;
+    assert!(!blind_check_fires);
+    // A NaN on both sides (a corrupted reference route) is rejected too.
+    let both = parity::psnr_db(&nan_output, &nan_output, 2.0);
+    assert!(!parity::psnr_clears(both, FLOOR_DB), "{both}");
+
+    let mut close = want;
+    close[0] += 1e-4;
+    let close_db = parity::psnr_db(&close, &want, 2.0);
+    assert!(parity::psnr_clears(close_db, FLOOR_DB), "{close_db}");
+    // A NaN range is rejected even for a close output.
+    let nan_range = parity::psnr_db(&close, &want, f64::NAN);
+    assert!(!parity::psnr_clears(nan_range, FLOOR_DB), "{nan_range}");
+    let mut far = want;
+    far[0] += 0.5;
+    let far_db = parity::psnr_db(&far, &want, 2.0);
+    assert!(!parity::psnr_clears(far_db, FLOOR_DB), "{far_db}");
 }
 
 fn summarize(reports: &[Report]) -> (usize, usize) {

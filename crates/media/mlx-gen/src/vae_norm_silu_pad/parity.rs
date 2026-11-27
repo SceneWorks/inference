@@ -410,6 +410,35 @@ pub fn compare(got: &Array, want: &Array) -> Result<Comparison> {
     })
 }
 
+/// PSNR (dB) of host values `got` against `want` over a peak-to-peak `range`: `+inf` when every
+/// element agrees, and **NaN** when any element of either side is NaN (the squared error is NaN),
+/// so a corrupted output never turns into a finite score. Gate the result with [`psnr_clears`].
+pub fn psnr_db(got: &[f32], want: &[f32], range: f64) -> f64 {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "psnr_db compares equally long buffers"
+    );
+    let mse = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| f64::from(a - b).powi(2))
+        .sum::<f64>()
+        / want.len().max(1) as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (range * range / mse).log10()
+    }
+}
+
+/// The PSNR acceptance gate: `db` is at least `floor_db`. Written as `>=` so a NaN score is
+/// **rejected** (every comparison with NaN is false; a `db < floor` failure check would let it
+/// pass) while `+inf` (bit-identical outputs) is accepted.
+pub fn psnr_clears(db: f64, floor_db: f64) -> bool {
+    db >= floor_db
+}
+
 /// One case × route result.
 #[derive(Clone, Copy, Debug)]
 pub struct Report {
