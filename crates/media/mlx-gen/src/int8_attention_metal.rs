@@ -79,7 +79,7 @@ const NAX_PROBE_ARRAY: &str = include_str!("int8_attention_metal/nax_probe_array
 
 /// The only head dimension the kernels are specialised for (every DiT this POC targets).
 pub const HEAD_DIM: usize = 128;
-/// Largest number of rows one quantization scale may span (one threadgroup of 32 SIMD groups).
+/// Largest number of rows one quantization scale may span (one quantizer threadgroup).
 pub const MAX_BLOCK_TOKENS: usize = 32;
 /// Rows per quantization scale by default: per-block, as the story specifies.
 pub const DEFAULT_BLOCK_TOKENS: usize = 32;
@@ -292,10 +292,13 @@ fn grid_i32(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(-1)
 }
 
-/// `(grid, threadgroup)` of the quantizer: one threadgroup of `32 · block` threads per block of
-/// `block` rows, blocks along `x`, `(batch, head)` rows along `y`.
+/// SIMD groups of one quantizer threadgroup at most (each owns `ceil(block / groups)` rows).
+pub const QUANT_MAX_SIMD_GROUPS: usize = 8;
+
+/// `(grid, threadgroup)` of the quantizer: one threadgroup of `32 · min(block, 8)` threads per
+/// block of `block` rows, blocks along `x`, `(batch, head)` rows along `y`.
 pub fn quantize_dispatch(rows: usize, len: usize, block: usize) -> Dispatch {
-    let threads = 32 * block;
+    let threads = 32 * block.clamp(1, QUANT_MAX_SIMD_GROUPS);
     (
         (
             grid_i32(len.div_ceil(block).saturating_mul(threads)),

@@ -98,10 +98,19 @@ fn check_admits_dit_shapes_and_refuses_the_rest() {
 
 #[test]
 fn dispatch_geometry_covers_every_row_exactly_once() {
-    for (rows, len, block) in [(1, 1, 1), (24, 4096, 32), (2, 333, 32), (30, 16416, 1)] {
+    for (rows, len, block) in [
+        (1, 1, 1),
+        (24, 4096, 32),
+        (2, 333, 32),
+        (2, 333, 5),
+        (30, 16416, 1),
+    ] {
         let ((gx, gy, gz), (tx, ty, tz)) = quantize_dispatch(rows, len, block);
         assert_eq!((gz, ty, tz), (1, 1, 1));
-        assert_eq!((tx as usize, gy as usize), (32 * block, rows));
+        assert_eq!(
+            (tx as usize, gy as usize),
+            (32 * block.min(QUANT_MAX_SIMD_GROUPS), rows)
+        );
         assert_eq!(gx % tx, 0);
         let groups = (gx / tx) as usize;
         assert!(groups * block >= len && (groups - 1) * block < len);
@@ -177,6 +186,9 @@ fn the_metal_sources_carry_the_cuda_twin_sign_words() {
     }
     // Each body references only the kernel's declared inputs/outputs and template names.
     assert!(QUANTIZE.contains("QB") && QUANTIZE.contains("ROTATE"));
+    // The quantizer's SIMD-group cap matches the host dispatch.
+    assert!(QUANTIZE.contains(&format!("uint(QB) < {QUANT_MAX_SIMD_GROUPS}u")));
+    assert!(QUANTIZE.contains(&format!("block_peak[{QUANT_MAX_SIMD_GROUPS}]")));
     assert!(ATTEND_NAX.contains("QUANT"));
     assert!(NAX_HEADER.contains("MetalPerformancePrimitives"));
     assert!(!HEADER.contains("MetalPerformancePrimitives"));
