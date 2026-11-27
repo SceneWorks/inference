@@ -56,6 +56,10 @@ impl Bench {
         let pool = MemPool::device_current(ordinal as i32).ok_or_else(|| {
             candle_gen::candle_core::Error::Msg("no current CUDA memory pool".into())
         })?;
+        // A bench row's "fused" column must time the fused kernel: override an inherited
+        // `CANDLE_MEDIA_FUSED_KERNELS=0`. [`Bench::compare`] still verifies every fused window
+        // (a per-kernel switch or a cached compile failure would fall back).
+        candle_gen::fused_path::set_media_fused_kernels(Some(true));
         Ok(Self {
             dev,
             device_label: format!("sm_{cap}"),
@@ -87,6 +91,11 @@ impl Bench {
     }
 
     /// One row: `reference` and `fused` measured back to back on the same inputs.
+    ///
+    /// The fused window is verified on the media fused-path counters: it must record fused
+    /// calls and no reference call, or the row is refused with the counters it saw, so a fallback
+    /// (a switch turned off, a cached compile failure, unsupported input) is never published as
+    /// a fused timing.
     pub fn compare(
         &self,
         kernel: &str,
@@ -95,7 +104,17 @@ impl Bench {
         mut fused: impl FnMut() -> Result<()>,
     ) -> Result<Row> {
         let reference = self.measure(&mut reference)?;
+        let before = path_totals();
         let fused = self.measure(&mut fused)?;
+        let after = path_totals();
+        let (fused_calls, reference_calls) = (after.0 - before.0, after.1 - before.1);
+        if fused_calls == 0 || reference_calls != 0 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "{kernel} {shape}: the fused column did not run only the fused kernel \
+                 ({fused_calls} fused, {reference_calls} reference calls): {:?}",
+                candle_gen::fused_path::fused_path_counts()
+            )));
+        }
         Ok(Row {
             kernel: kernel.to_string(),
             shape: shape.to_string(),
@@ -103,6 +122,15 @@ impl Bench {
             fused,
         })
     }
+}
+
+/// Process-wide (fused, reference) call totals over every media fused-path kernel.
+fn path_totals() -> (u64, u64) {
+    candle_gen::fused_path::fused_path_counts()
+        .iter()
+        .fold((0, 0), |(f, r), (_, c)| {
+            (f + c.fused, r + c.reference_total())
+        })
 }
 
 /// Print every row as one Markdown table.
