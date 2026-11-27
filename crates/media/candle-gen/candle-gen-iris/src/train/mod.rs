@@ -341,16 +341,44 @@ fn generation_training_policy(
 }
 
 fn checked_generation_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
-    let expected = candle_gen::train::policy::bind_state_identity(
+    checked_bound_state_identity(
+        "iris resume",
+        "; use load_from for a weights-only start",
+        saved,
         expected_private_state,
-        candle_gen::train::policy::active_profile(),
-    );
-    if saved != expected {
-        return Err(Error::Msg(
-            "iris resume: private execution-profile/state identity differs".into(),
-        ));
+    )
+}
+
+/// Verify a native checkpoint's bound state identity (`<private state>` plus the execution-profile
+/// tag `bind_state_identity` appends) against this run's private state under the active profile,
+/// and return the private state for the shared contract checker.
+///
+/// Both halves must match. Which half differs decides the refusal: a different private state is
+/// the contract's own "trained a different state" refusal (an adapter shape or training-config
+/// change), naming both identities exactly as `check_resume` would; only a matching state bound
+/// to a different execution profile is the execution-profile refusal.
+pub(super) fn checked_bound_state_identity(
+    context: &str,
+    different_state_hint: &str,
+    saved: &str,
+    expected_private_state: &str,
+) -> Result<String> {
+    use candle_gen::train::policy::{active_profile, bind_state_identity, private_state_of};
+    let expected = bind_state_identity(expected_private_state, active_profile());
+    if saved == expected {
+        return Ok(expected_private_state.into());
     }
-    Ok(expected_private_state.into())
+    let saved_private = private_state_of(saved);
+    if saved_private != expected_private_state {
+        return Err(Error::Msg(format!(
+            "{context}: the checkpoint trained a different state ({saved_private}) than this run \
+             ({expected_private_state}){different_state_hint}"
+        )));
+    }
+    Err(Error::Msg(format!(
+        "{context}: the checkpoint's private execution-profile identity ({saved}) differs from \
+         this run's ({expected})"
+    )))
 }
 
 /// A [`Collective`] that records the first typed distributed failure it surfaces.
@@ -2503,12 +2531,29 @@ mod production_policy_metadata_tests {
                 checked_generation_state_identity(&identity, "private-training-config").unwrap(),
                 "private-training-config"
             );
-            assert!(checked_generation_state_identity(
+            // Same private state, different profile binding: the execution-profile refusal.
+            let profile = checked_generation_state_identity(
                 "private-training-config",
-                "private-training-config"
+                "private-training-config",
             )
-            .is_err());
-            assert!(checked_generation_state_identity(&identity, "wrong-config").is_err());
+            .unwrap_err()
+            .to_string();
+            assert!(profile.contains("execution-profile identity"), "{profile}");
+            assert!(!profile.contains("different state"), "{profile}");
+            // A different private state (e.g. another adapter rank) is the contract's
+            // "different state" refusal naming both private identities, whatever the binding.
+            for saved in [identity.as_str(), "private-training-config"] {
+                let state = checked_generation_state_identity(saved, "wrong-config")
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    state.contains(
+                        "different state (private-training-config) than this run (wrong-config)"
+                    ),
+                    "{state}"
+                );
+                assert!(state.contains("use load_from"), "{state}");
+            }
         });
         let historical = job
             .with_native_resume_profile(

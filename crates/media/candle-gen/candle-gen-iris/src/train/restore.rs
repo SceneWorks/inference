@@ -294,16 +294,7 @@ fn restore_training_policy(
 }
 
 fn checked_restore_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
-    let expected = candle_gen::train::policy::bind_state_identity(
-        expected_private_state,
-        candle_gen::train::policy::active_profile(),
-    );
-    if saved != expected {
-        return Err(Error::Msg(
-            "iris restore resume: private execution-profile/state identity differs".into(),
-        ));
-    }
-    Ok(expected_private_state.into())
+    super::checked_bound_state_identity("iris restore resume", "", saved, expected_private_state)
 }
 
 fn adamw_plan(lr: f64, betas: (f64, f64), weight_decay: f64) -> OptimizerPlan {
