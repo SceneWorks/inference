@@ -2255,6 +2255,21 @@
       ]
     },
     {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_contiguous_view_at_an_unaligned_offset",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review regression: contiguous bf16/f16 Q/K/V views at storage offsets that are not multiples of 8 elements are copied to zero-offset buffers before launch (16-bit V cp.async needs 16-byte rows); both P.V modes are bitwise the aligned call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-gen",
       "kind": "lib",
       "target": "candle_gen",
@@ -2351,6 +2366,21 @@
       "test": "sol_attention::cuda_tests::cuda_sol_wan_shape_smoke",
       "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
       "reason": "SW-6137 CUDA: one Wan2.2 A14B 480x832x81 self-attention shape (40x128, S=32760) per top-k budget: routed density and ms/call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_contiguous_view_at_an_unaligned_offset",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "PR #1530 review regression: contiguous bf16/f16 Q/K/V views at storage offsets that are not multiples of 8 elements ([1,1,64,128] and a ragged [1,2,1000,128]) are copied to zero-offset buffers before the uint4 loads; the call is bitwise the aligned call. Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"

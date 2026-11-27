@@ -555,8 +555,10 @@ mod cuda {
     }
 
     /// `t` itself when its last dim is unit-stride and every row / head / batch stride and the
-    /// start offset are multiples of 8 elements (the kernels' 16-byte loads), else a contiguous
-    /// copy.
+    /// start offset are multiples of 8 elements (the kernels' 16-byte loads), else a fresh
+    /// zero-offset contiguous copy. `force_contiguous`, not `contiguous`: an already-contiguous
+    /// view (a flat buffer narrowed at element 1, or an odd stride on a size-1 dim) is returned
+    /// as-is by `contiguous`, offset and all, and would issue misaligned `uint4` loads.
     fn operand(t: &Tensor) -> Result<Tensor> {
         let st = t.stride();
         let off = t.layout().start_offset();
@@ -567,7 +569,7 @@ mod cuda {
         if ok {
             Ok(t.clone())
         } else {
-            t.contiguous()
+            t.force_contiguous()
         }
     }
 
@@ -1376,6 +1378,44 @@ mod cuda_tests {
                 stats.density()
             );
             assert!(stats.density() > 0.0 && stats.density() <= 1.0);
+        }
+        Ok(())
+    }
+
+    /// `t`'s values as a *contiguous* view whose storage offset is `off` elements: a flat buffer
+    /// narrowed at `off` and reshaped back, exactly the layout `Tensor::contiguous` returns
+    /// unchanged.
+    fn offset_view(t: &Tensor, off: usize) -> candle_core::Result<Tensor> {
+        let pad = Tensor::zeros(off, t.dtype(), t.device())?;
+        let flat = Tensor::cat(&[&pad, &t.flatten_all()?], 0)?;
+        let view = flat.narrow(0, off, t.elem_count())?.reshape(t.dims())?;
+        assert!(view.is_contiguous() && view.layout().start_offset() == off);
+        Ok(view)
+    }
+
+    /// Review regression (PR #1530): a contiguous bf16/f16 operand whose storage offset is not a
+    /// multiple of 8 elements is copied to a zero-offset buffer before launch (the `uint4` loads
+    /// need 16-byte rows), so the call succeeds and is bitwise the aligned call. Before the fix
+    /// `Tensor::contiguous` returned the view unchanged and the kernels read misaligned
+    /// addresses.
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_sol_contiguous_view_at_an_unaligned_offset() -> candle_core::Result<()> {
+        for (b, h, t, dtype) in [(1, 1, 64, DType::BF16), (1, 2, 1000, DType::F16)] {
+            let (q, k, v) = qkv(b, h, t, dtype)?;
+            let cfg = SolConfig::top_k(0.5);
+            let want = sol_attention(&q, &k, &v, SCALE, &cfg)?;
+            let (qo, ko, vo) = (
+                offset_view(&q, 1)?,
+                offset_view(&k, 3)?,
+                offset_view(&v, 5)?,
+            );
+            let got = sol_attention(&qo, &ko, &vo, SCALE, &cfg)?;
+            let diff = (&got.to_dtype(DType::F32)? - &want.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(diff, 0.0, "[{b},{h},{t}] {dtype:?}");
         }
         Ok(())
     }

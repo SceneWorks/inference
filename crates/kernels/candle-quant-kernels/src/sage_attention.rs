@@ -355,7 +355,11 @@ mod cuda {
     }
 
     /// `t` itself when its last dim is unit-stride (and, for `aligned`, every row starts on a
-    /// 16-byte boundary, which `cp.async` needs), else its contiguous copy.
+    /// 16-byte boundary, which `cp.async` needs), else a fresh zero-offset contiguous copy.
+    /// `force_contiguous`, not `contiguous`: an already-contiguous view whose start offset is not
+    /// a multiple of 8 elements (a flat buffer narrowed at element 1, or an odd stride on a size-1
+    /// dim) is returned as-is by `contiguous`, offset and all, and the 16-bit V `cp.async` would
+    /// then read misaligned addresses.
     fn operand(t: &Tensor, aligned: bool) -> Result<Tensor> {
         let st = t.stride();
         let off = t.layout().start_offset();
@@ -365,7 +369,7 @@ mod cuda {
         if ok {
             Ok(t.clone())
         } else {
-            t.contiguous()
+            t.force_contiguous()
         }
     }
 
@@ -1077,6 +1081,53 @@ mod cuda_tests {
                 flops / ms / 1e9
             );
             assert!(cos >= 0.999, "{pv:?} cosine {cos}");
+        }
+        Ok(())
+    }
+
+    /// `t`'s values as a *contiguous* view whose storage offset is `off` elements: a flat buffer
+    /// narrowed at `off` and reshaped back, exactly the layout `Tensor::contiguous` returns
+    /// unchanged.
+    fn offset_view(t: &Tensor, off: usize) -> candle_core::Result<Tensor> {
+        let pad = Tensor::zeros(off, t.dtype(), t.device())?;
+        let flat = Tensor::cat(&[&pad, &t.flatten_all()?], 0)?;
+        let view = flat.narrow(0, off, t.elem_count())?.reshape(t.dims())?;
+        assert!(view.is_contiguous() && view.layout().start_offset() == off);
+        Ok(view)
+    }
+
+    /// Review regression (PR #1530): a contiguous bf16/f16 V whose storage offset is not a
+    /// multiple of 8 elements is copied to a zero-offset buffer before the 16-bit P.V mode's
+    /// `cp.async` (16-byte rows), so the call succeeds and is bitwise the aligned call; Q/K at
+    /// odd offsets (scalar loads) and the INT8 P.V mode are covered too. Before the fix
+    /// `Tensor::contiguous` returned the view unchanged and the attention kernel read misaligned
+    /// addresses.
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_sage_contiguous_view_at_an_unaligned_offset() -> candle_core::Result<()> {
+        let dev = device();
+        for (h, s, d, dtype) in [(1, 64, 128, DType::BF16), (2, 1000, 64, DType::F16)] {
+            let mk = || -> candle_core::Result<Tensor> {
+                Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?.to_dtype(dtype)
+            };
+            let (q, k, v) = (mk()?, mk()?, mk()?);
+            let scale = 1.0 / (d as f64).sqrt();
+            let (qo, ko, vo) = (
+                offset_view(&q, 1)?,
+                offset_view(&k, 3)?,
+                offset_view(&v, 5)?,
+            );
+            for pv in [PvPrecision::ValueDtype, PvPrecision::Int8] {
+                let want = sage_attention(&q, &k, &v, scale, KCentering::Adaptive, pv)?;
+                for (qx, kx, vx) in [(&q, &k, &vo), (&qo, &ko, &vo)] {
+                    let got = sage_attention(qx, kx, vx, scale, KCentering::Adaptive, pv)?;
+                    let diff = (&got.to_dtype(DType::F32)? - &want.to_dtype(DType::F32)?)?
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    assert_eq!(diff, 0.0, "h={h} s={s} d={d} {dtype:?} {pv:?}");
+                }
+            }
         }
         Ok(())
     }
