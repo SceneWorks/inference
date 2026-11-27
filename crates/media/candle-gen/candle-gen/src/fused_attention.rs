@@ -92,8 +92,9 @@
 //! opts in for a stretch of work on its own thread with [`with_int8_attention`] /
 //! [`enter_int8_attention`] (Krea's `int8_attention` engine option is the one adopter). Inside that
 //! scope the router tries it **first**, after the shared materialized / autograd gate (training
-//! never sees it) and before FlashAttention: an eligible call (CUDA sm_80+, bf16/f16, no mask,
-//! head dim 64 or 128, every INT8 buffer within `i32` indexing, kernel compiled) takes
+//! never sees it) and before FlashAttention: an eligible call (CUDA sm_80+, bf16/f16 — or f32, run
+//! at bf16 — no mask, head dim up to 128 — zero-padded to 64 / 128, [`LossyOperandAdapt`] — every
+//! INT8 buffer within `i32` indexing, kernel compiled) takes
 //! [`AttentionKernel::Int8`]; any other call falls through to the flash rule unchanged and the reason
 //! is counted in [`AttentionPathCounts::int8_refusals`]. The flash toggle does not gate it — the
 //! scope is its own explicit switch. It is one-plus-quantizer launches per call, so the planned
@@ -107,8 +108,9 @@
 //! only, like INT8: [`with_sol_attention`] / [`enter_sol_attention`] with a [`SolConfig`] (Wan's
 //! `sol_attention` engine option is the one adopter). Inside that scope the router offers the call
 //! to it **first** (before INT8 and FlashAttention), after the same materialized / autograd gate,
-//! so training never reaches it (E9). An eligible call (CUDA sm_80+, bf16/f16, no mask, head dim
-//! 128, self-attention `Sq == Sk` with K/V shaped like Q, at most 8,192 blocks, every buffer within
+//! so training never reaches it (E9). An eligible call (CUDA sm_80+, bf16/f16 — or f32, run at
+//! bf16 — no mask, head dim up to 128 — zero-padded to 128, [`LossyOperandAdapt`] —
+//! self-attention `Sq == Sk` with K/V shaped like Q, at most 8,192 blocks, every buffer within
 //! `i32` indexing, kernel compiled) takes [`AttentionKernel::Sol`]; any other call (Wan's text
 //! cross-attention, for one) falls through to the INT8 / flash rule unchanged and the reason is
 //! counted in [`AttentionPathCounts::sol_refusals`]. It is a fixed sequence of launches per call,
@@ -561,13 +563,14 @@ pub enum Int8Refusal {
     NotCuda,
     /// The CUDA device's compute capability (`None`: unreadable) is below [`INT8_MIN_COMPUTE_CAP`].
     UnsupportedArch(Option<u32>),
-    /// The dtype has no INT8 kernel (only bf16 / f16 do).
+    /// The dtype has no INT8 kernel (bf16 / f16 run as they are, f32 at bf16).
     Dtype(DType),
     /// q / k / v disagree on dtype or device.
     MixedDtypeOrDevice,
     /// The call carries an additive mask.
     Masked,
-    /// The head dim is not 64 or 128 (or differs across q / k / v).
+    /// The head dim is above 128 (no template; narrower heads are zero-padded) or differs across
+    /// q / k / v.
     HeadDim(usize),
     /// Rank, batch, K/V shape, empty sequence or head-group mismatch.
     Shape,
@@ -595,7 +598,86 @@ pub fn int8_device(device: &candle_core::Device) -> Int8Device {
     }
 }
 
-/// The pure INT8 eligibility rule (the envelope of `candle_quant_kernels::sage_attention`).
+/// How a lossy kernel (INT8 / Sol-Attn) takes operands it has no native template for: an exact
+/// layout adaptation in the shared dispatch, so every provider routed through the shared helpers
+/// can opt in (SW-6132), counted in [`AttentionPathCounts::lossy_adapted`].
+///
+/// - **f32 operands** run at bf16 and the output is cast back to f32. The kernels quantize `Q·Kᵀ`
+///   to INT8 and run `P·V` at bf16 / INT8 anyway, so the bf16 operand rounding adds nothing of
+///   substance, and bf16 keeps f32's exponent range (nothing overflows).
+/// - **A head dim the kernel has no template for** (INT8: below 128 and not 64; Sol-Attn: below
+///   128) is zero-padded to the next served width and the output sliced back. Exact: zero channels
+///   add nothing to `q·k` (the INT8 kernel's Hadamard rotation over the padded width is still
+///   orthogonal and applied to Q and K alike), zero V channels only produce the sliced-off output
+///   columns, and the softmax scale stays the caller's, for the original head dim (both kernels take
+///   it explicitly).
+///
+/// Head dims above 128 are never adapted: the kernels have no wider template, and padding cannot
+/// shrink a head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LossyOperandAdapt {
+    /// The f32 operands run at bf16 (the output is cast back to f32).
+    pub cast_f32: bool,
+    /// The head dim is zero-padded to this width (the output is sliced back).
+    pub pad_head_dim: Option<usize>,
+}
+
+impl LossyOperandAdapt {
+    /// No adaptation: the kernel takes the operands as they are.
+    pub fn is_identity(self) -> bool {
+        !self.cast_f32 && self.pad_head_dim.is_none()
+    }
+}
+
+/// The adaptation the INT8 kernel applies to `dtype` operands of head dim `head_dim`.
+pub fn int8_operand_adapt(dtype: DType, head_dim: usize) -> LossyOperandAdapt {
+    LossyOperandAdapt {
+        cast_f32: dtype == DType::F32,
+        pad_head_dim: match head_dim {
+            1..=63 => Some(64),
+            65..=127 => Some(128),
+            _ => None,
+        },
+    }
+}
+
+/// The adaptation the Sol-Attn kernel applies to `dtype` operands of head dim `head_dim`.
+pub fn sol_operand_adapt(dtype: DType, head_dim: usize) -> LossyOperandAdapt {
+    LossyOperandAdapt {
+        cast_f32: dtype == DType::F32,
+        pad_head_dim: (1..SOL_HEAD_DIM)
+            .contains(&head_dim)
+            .then_some(SOL_HEAD_DIM),
+    }
+}
+
+/// One operand's dtype and dims as the kernel sees them after `adapt`.
+fn adapted_operand(op: FlashOperand<'_>, adapt: LossyOperandAdapt) -> (DType, Vec<usize>) {
+    let dtype = if adapt.cast_f32 && op.dtype == DType::F32 {
+        DType::BF16
+    } else {
+        op.dtype
+    };
+    let dims = match (adapt.pad_head_dim, op.dims) {
+        (Some(pad), &[b, h, s, _]) => vec![b, h, s, pad],
+        _ => op.dims.to_vec(),
+    };
+    (dtype, dims)
+}
+
+/// The adaptation `kernel` (INT8 or Sol-Attn) applies to a call whose query is `q` (the identity
+/// for every other kernel).
+fn lossy_adapt_for(kernel: AttentionKernel, q: &Tensor) -> LossyOperandAdapt {
+    let head_dim = q.dims().last().copied().unwrap_or(0);
+    match kernel {
+        AttentionKernel::Int8 => int8_operand_adapt(q.dtype(), head_dim),
+        AttentionKernel::Sol => sol_operand_adapt(q.dtype(), head_dim),
+        _ => LossyOperandAdapt::default(),
+    }
+}
+
+/// The pure INT8 eligibility rule (the envelope of `candle_quant_kernels::sage_attention`), on the
+/// operands as [`int8_operand_adapt`] presents them to the kernel.
 pub fn int8_eligibility(
     compiled: bool,
     device: Int8Device,
@@ -622,7 +704,17 @@ pub fn int8_eligibility(
     if masked {
         return Err(Int8Refusal::Masked);
     }
-    check_sage_attention(q.dims, k.dims, v.dims, q.dtype, k.dtype, v.dtype)
+    // The adaptation is one dtype's (f32 -> bf16): operands that disagree are refused before it.
+    if k.dtype != q.dtype || v.dtype != q.dtype {
+        return Err(Int8Refusal::MixedDtypeOrDevice);
+    }
+    let adapt = int8_operand_adapt(q.dtype, q.dims.last().copied().unwrap_or(0));
+    let ((qt, qd), (kt, kd), (vt, vd)) = (
+        adapted_operand(q, adapt),
+        adapted_operand(k, adapt),
+        adapted_operand(v, adapt),
+    );
+    check_sage_attention(&qd, &kd, &vd, qt, kt, vt)
         .map(|_| ())
         .map_err(|r| match r {
             SageRefusal::Dtype(d) => Int8Refusal::Dtype(d),
@@ -735,13 +827,14 @@ pub enum SolRouteRefusal {
     NotCuda,
     /// The CUDA device's compute capability (`None`: unreadable) is below [`SOL_MIN_COMPUTE_CAP`].
     UnsupportedArch(Option<u32>),
-    /// The dtype has no Sol-Attn kernel (only bf16 / f16 do).
+    /// The dtype has no Sol-Attn kernel (bf16 / f16 run as they are, f32 at bf16).
     Dtype(DType),
     /// q / k / v disagree on dtype or device.
     MixedDtypeOrDevice,
     /// The call carries an additive mask.
     Masked,
-    /// The head dim is not 128 (or differs across q / k / v).
+    /// The head dim is above 128 (no template; narrower heads are zero-padded) or differs across
+    /// q / k / v.
     HeadDim(usize),
     /// Rank, batch, K/V shape, empty sequence or grouped KV heads.
     Shape,
@@ -757,7 +850,8 @@ pub enum SolRouteRefusal {
     Config,
 }
 
-/// The pure Sol-Attn eligibility rule (the envelope of `candle_quant_kernels::sol_attention`).
+/// The pure Sol-Attn eligibility rule (the envelope of `candle_quant_kernels::sol_attention`), on
+/// the operands as [`sol_operand_adapt`] presents them to the kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn sol_eligibility(
     compiled: bool,
@@ -789,7 +883,17 @@ pub fn sol_eligibility(
     if masked {
         return Err(SolRouteRefusal::Masked);
     }
-    check_sol_attention(q.dims, k.dims, v.dims, q.dtype, k.dtype, v.dtype)
+    // The adaptation is one dtype's (f32 -> bf16): operands that disagree are refused before it.
+    if k.dtype != q.dtype || v.dtype != q.dtype {
+        return Err(SolRouteRefusal::MixedDtypeOrDevice);
+    }
+    let adapt = sol_operand_adapt(q.dtype, q.dims.last().copied().unwrap_or(0));
+    let ((qt, qd), (kt, kd), (vt, vd)) = (
+        adapted_operand(q, adapt),
+        adapted_operand(k, adapt),
+        adapted_operand(v, adapt),
+    );
+    check_sol_attention(&qd, &kd, &vd, qt, kt, vt)
         .map(|_| ())
         .map_err(|r| match r {
             SolRefusal::Dtype(d) => SolRouteRefusal::Dtype(d),
@@ -1326,9 +1430,11 @@ pub(crate) fn route_ready(
     }
 }
 
-/// Count one routed call: its path, and its opt-in refusals if any.
-pub(crate) fn record_route(kernel: AttentionKernel, refusals: OptInRefusals) {
+/// Count one routed call: its path, the operand adaptation a lossy kernel applies to it
+/// ([`LossyOperandAdapt`]), and its opt-in refusals if any. `q` is the call's query.
+pub(crate) fn record_route(kernel: AttentionKernel, refusals: OptInRefusals, q: &Tensor) {
     record_attention_path(kernel);
+    record_lossy_adapt(lossy_adapt_for(kernel, q));
     if let Some(refusal) = refusals.int8 {
         record_int8_refusal(refusal);
     }
@@ -1348,7 +1454,7 @@ pub(crate) fn take_fused(
     mask: Option<&Tensor>,
 ) -> Option<FusedKernel> {
     let (kernel, refusals, requested) = route_ready(q, k, v, mask);
-    record_route(kernel, refusals);
+    record_route(kernel, refusals, q);
     // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
     // `Materialized` first.
     if kernel == AttentionKernel::Budgeted(FlashRefusal::GradTracked)
@@ -1372,12 +1478,54 @@ pub(crate) fn fused_bhsd(
         FusedKernel::Flash => flash_bhsd(q, k, v, scale),
         FusedKernel::Int8(config) => {
             capture_int8_call(q, k, v, scale);
-            int8_bhsd(q, k, v, scale, config)
+            let adapt = lossy_adapt_for(AttentionKernel::Int8, q);
+            run_adapted(adapt, q, k, v, |q, k, v| int8_bhsd(q, k, v, scale, config))
         }
         FusedKernel::Sol(config) => {
             capture_int8_call(q, k, v, scale);
-            sol_bhsd(q, k, v, scale, &config)
+            let adapt = lossy_adapt_for(AttentionKernel::Sol, q);
+            run_adapted(adapt, q, k, v, |q, k, v| sol_bhsd(q, k, v, scale, &config))
         }
+    }
+}
+
+/// Run a lossy kernel `f` over the operands as `adapt` presents them (bf16 for f32, the head dim
+/// zero-padded), then undo the adaptation on its output: the contiguous `[B, H, Sq, D]` result in
+/// the operands' dtype. The softmax scale `f` closes over is the caller's, for the original head
+/// dim.
+fn run_adapted(
+    adapt: LossyOperandAdapt,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    f: impl FnOnce(&Tensor, &Tensor, &Tensor) -> candle_core::Result<Tensor>,
+) -> candle_core::Result<Tensor> {
+    if adapt.is_identity() {
+        return f(q, k, v);
+    }
+    let d = q.dim(candle_core::D::Minus1)?;
+    let cast = adapt.cast_f32 && q.dtype() == DType::F32;
+    let prep = |t: &Tensor| -> candle_core::Result<Tensor> {
+        let t = if cast {
+            t.to_dtype(DType::BF16)?
+        } else {
+            t.clone()
+        };
+        match adapt.pad_head_dim {
+            Some(pad) if pad > d => t.pad_with_zeros(candle_core::D::Minus1, 0, pad - d),
+            _ => Ok(t),
+        }
+    };
+    let out = f(&prep(q)?, &prep(k)?, &prep(v)?)?;
+    let out = if adapt.pad_head_dim.is_some() {
+        out.narrow(candle_core::D::Minus1, 0, d)?
+    } else {
+        out
+    };
+    if cast {
+        out.to_dtype(DType::F32)
+    } else {
+        out.contiguous()
     }
 }
 
@@ -1545,6 +1693,19 @@ pub struct AttentionPathCounts {
     pub sol: u64,
     /// Sol-Attn-scope calls that did not take the Sol-Attn kernel, by reason.
     pub sol_refusals: SolRefusalCounts,
+    /// INT8 / Sol-Attn calls whose operands the shared dispatch adapted ([`LossyOperandAdapt`]):
+    /// a side tally of the `int8` / `sol` calls, by adaptation (one call may count under both).
+    pub lossy_adapted: LossyAdaptCounts,
+}
+
+/// Per-adaptation count of the INT8 / Sol-Attn calls the shared dispatch adapted
+/// ([`LossyOperandAdapt`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LossyAdaptCounts {
+    /// f32 operands run at bf16, the output cast back.
+    pub f32_cast: u64,
+    /// The head dim zero-padded to the kernel's width, the output sliced back.
+    pub head_pad: u64,
 }
 
 /// Per-reason count of Sol-Attn-scope calls that fell through to the INT8 / flash rule
@@ -1563,7 +1724,7 @@ pub struct SolRefusalCounts {
     pub mixed_dtype_or_device: u64,
     /// An additive mask.
     pub masked: u64,
-    /// The head dim is not 128.
+    /// The head dim is above 128 or differs across q / k / v.
     pub head_dim: u64,
     /// Rank, batch, K/V shape or grouped KV heads.
     pub shape: u64,
@@ -1613,7 +1774,7 @@ pub struct Int8RefusalCounts {
     pub mixed_dtype_or_device: u64,
     /// An additive mask.
     pub masked: u64,
-    /// The head dim is not 64 or 128.
+    /// The head dim is above 128 or differs across q / k / v.
     pub head_dim: u64,
     /// Rank, batch, K/V shape or head-group mismatch.
     pub shape: u64,
@@ -1709,14 +1870,32 @@ impl AttentionPathCounts {
                 compile: d(sr.compile, se.compile),
                 config: d(sr.config, se.config),
             },
+            lossy_adapted: LossyAdaptCounts {
+                f32_cast: d(self.lossy_adapted.f32_cast, earlier.lossy_adapted.f32_cast),
+                head_pad: d(self.lossy_adapted.head_pad, earlier.lossy_adapted.head_pad),
+            },
         }
     }
 }
 
 /// One counter slot per [`AttentionPathCounts`] path field (slots `0..14`, field order but `int8`
 /// last), then one per [`Int8RefusalCounts`] field (slots `14..24`), the `sol` path (slot 24) and
-/// one per [`SolRefusalCounts`] field (slots `25..38`).
-const PATH_SLOTS: usize = 38;
+/// one per [`SolRefusalCounts`] field (slots `25..38`), then one per [`LossyAdaptCounts`] field
+/// (slots `38..40`).
+const PATH_SLOTS: usize = 40;
+
+/// The first [`LossyAdaptCounts`] slot.
+const LOSSY_ADAPT_SLOT: usize = 38;
+
+/// Count one lossy call's operand adaptation (nothing for the identity).
+fn record_lossy_adapt(adapt: LossyOperandAdapt) {
+    if adapt.cast_f32 {
+        PATH_COUNTS[LOSSY_ADAPT_SLOT].fetch_add(1, Ordering::Relaxed);
+    }
+    if adapt.pad_head_dim.is_some() {
+        PATH_COUNTS[LOSSY_ADAPT_SLOT + 1].fetch_add(1, Ordering::Relaxed);
+    }
+}
 static PATH_COUNTS: [AtomicU64; PATH_SLOTS] = [const { AtomicU64::new(0) }; PATH_SLOTS];
 
 /// The first [`Int8RefusalCounts`] slot.
@@ -1852,6 +2031,10 @@ fn counts_from_slots(c: &[u64; PATH_SLOTS]) -> AttentionPathCounts {
             index_overflow: c[35],
             compile: c[36],
             config: c[37],
+        },
+        lossy_adapted: LossyAdaptCounts {
+            f32_cast: c[38],
+            head_pad: c[39],
         },
     }
 }
@@ -2902,17 +3085,31 @@ mod tests {
             Err(Int8Refusal::MixedDtypeOrDevice)
         );
         assert_eq!(e(true, sm120, true, bf, bf, true), Err(Int8Refusal::Masked));
+        // f32 runs at bf16 (cast in the shared dispatch); only a dtype with no such cast refuses.
         let f32op = op(DType::F32, &H3);
+        assert_eq!(e(true, sm120, true, f32op, f32op, false), Ok(()));
+        let f64op = op(DType::F64, &H3);
         assert_eq!(
-            e(true, sm120, true, f32op, f32op, false),
-            Err(Int8Refusal::Dtype(DType::F32))
+            e(true, sm120, true, f64op, f64op, false),
+            Err(Int8Refusal::Dtype(DType::F64))
+        );
+        assert_eq!(
+            e(true, sm120, true, f32op, bf, false),
+            Err(Int8Refusal::MixedDtypeOrDevice)
         );
         assert_eq!(
             e(true, sm120, true, bf, op(DType::F16, &H3), false),
             Err(Int8Refusal::MixedDtypeOrDevice)
         );
-        // Head dims other than 64 / 128 (flash still serves 72, 256, ...).
-        for d in [72usize, 96, 256] {
+        // Head dims below 128 are zero-padded to 64 / 128; wider ones have no template.
+        for (d, want) in [
+            (40usize, Ok(())),
+            (72, Ok(())),
+            (96, Ok(())),
+            (120, Ok(())),
+            (160, Err(Int8Refusal::HeadDim(160))),
+            (256, Err(Int8Refusal::HeadDim(256))),
+        ] {
             let dims = [1, 8, 1024, d];
             let sd = contiguous(&dims);
             let o = FlashOperand {
@@ -2922,7 +3119,8 @@ mod tests {
             };
             assert_eq!(
                 int8_eligibility(true, sm120, true, o, o, o, false),
-                Err(Int8Refusal::HeadDim(d))
+                want,
+                "d={d}"
             );
         }
         let gqa_bad = [1, 5, 4096, 128];
@@ -3121,6 +3319,154 @@ mod tests {
         Ok(())
     }
 
+    /// One opt-in lossy call through the shared planned helper, inside its scope: the output and
+    /// the call's path-counter delta.
+    #[cfg(feature = "cuda")]
+    fn lossy_call(
+        kernel: AttentionKernel,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        plan: AttentionPlan<'_>,
+    ) -> crate::Result<(Tensor, AttentionPathCounts)> {
+        let before = attention_path_counts();
+        let out = match kernel {
+            AttentionKernel::Int8 => {
+                let _scope = enter_int8_attention(Int8AttentionConfig::default());
+                sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan)?
+            }
+            AttentionKernel::Sol => {
+                // Every key block routed: dense attention up to the kernel's INT8 arithmetic.
+                let _scope = enter_sol_attention(SolConfig::top_k(1.0));
+                sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan)?
+            }
+            other => panic!("not a lossy kernel: {other:?}"),
+        };
+        Ok((out, attention_path_counts().since(&before)))
+    }
+
+    /// PR #1530 follow-up (SW-6132): an **f32** call (FLUX.2 / LTX / SVD / Chroma attend at f32)
+    /// with INT8 or Sol-Attn opted in runs the kernel at bf16 inside the shared dispatch and returns
+    /// f32, counted as `lossy_adapted.f32_cast`; it matches the f32 materialized reference at the
+    /// story's bar (cosine >= 0.999, S6 AC1). d=128, and d=64 (SVD's heads), where Sol-Attn also
+    /// zero-pads to 128.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_lossy_f32_operands_run_at_bf16_against_the_f32_reference() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
+        let dev = Device::new_cuda(0)?;
+        let plan = AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(
+            ATTN_SCORES_BUDGET,
+        ));
+        for (s, h, d) in [(4096usize, 8usize, 128usize), (4096, 10, 64)] {
+            let q = Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?;
+            let k = Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?;
+            let v = Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?;
+            let scale = 1.0 / (d as f64).sqrt();
+            let want =
+                sdpa_planned_bhsd_materialized(&q, &k, &v, scale, None, softmax_last_dim, plan)?;
+            for kernel in [AttentionKernel::Int8, AttentionKernel::Sol] {
+                let (got, delta) = lossy_call(kernel, &q, &k, &v, scale, plan)?;
+                let taken = if kernel == AttentionKernel::Int8 {
+                    delta.int8
+                } else {
+                    delta.sol
+                };
+                assert_eq!(taken, 1, "{kernel:?} d={d}: {delta:?}");
+                assert_eq!(delta.lossy_adapted.f32_cast, 1, "{delta:?}");
+                let padded = kernel == AttentionKernel::Sol && d < 128;
+                assert_eq!(delta.lossy_adapted.head_pad, u64::from(padded), "{delta:?}");
+                assert_eq!((got.dtype(), got.dims()), (DType::F32, q.dims()));
+                let (cos, rel, max) = int8_errors(&got, &want)?;
+                println!(
+                    "f32 through {} s={s} h={h} d={d}: cosine {cos:.6} rel-L2 {rel:.3e} \
+                     max|d| {max:.3e}",
+                    kernel.name()
+                );
+                assert!(cos >= 0.999, "{kernel:?} d={d}: cosine {cos} < 0.999");
+            }
+        }
+        Ok(())
+    }
+
+    /// PR #1530 follow-up (SW-6132): a head dim the kernel has no template for — Boogu's 120 for
+    /// both kernels, the 64 of Lens / SDXL / SD3 for Sol-Attn — is zero-padded to 128 inside the
+    /// shared dispatch with the softmax scale of the ORIGINAL head dim, the output sliced back,
+    /// counted as `lossy_adapted.head_pad`; it matches the f32 materialized reference at the story's
+    /// bar (cosine >= 0.999), bf16 and f16.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_lossy_narrow_heads_pad_to_128_against_the_f32_reference() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
+        let dev = Device::new_cuda(0)?;
+        let plan = AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(
+            ATTN_SCORES_BUDGET,
+        ));
+        for (s, h, d, dtype, kernels) in [
+            (
+                4096usize,
+                8usize,
+                120usize,
+                DType::BF16,
+                &[AttentionKernel::Int8, AttentionKernel::Sol][..],
+            ),
+            (
+                2048,
+                8,
+                120,
+                DType::F16,
+                &[AttentionKernel::Int8, AttentionKernel::Sol][..],
+            ),
+            (4096, 10, 64, DType::BF16, &[AttentionKernel::Sol][..]),
+        ] {
+            let mk = || -> crate::Result<Tensor> {
+                Ok(Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?.to_dtype(dtype)?)
+            };
+            let (q, k, v) = (mk()?, mk()?, mk()?);
+            let scale = 1.0 / (d as f64).sqrt();
+            let f32 = |t: &Tensor| t.to_dtype(DType::F32);
+            let want = sdpa_planned_bhsd_materialized(
+                &f32(&q)?,
+                &f32(&k)?,
+                &f32(&v)?,
+                scale,
+                None,
+                softmax_last_dim,
+                plan,
+            )?;
+            for &kernel in kernels {
+                let (got, delta) = lossy_call(kernel, &q, &k, &v, scale, plan)?;
+                let taken = if kernel == AttentionKernel::Int8 {
+                    delta.int8
+                } else {
+                    delta.sol
+                };
+                assert_eq!(taken, 1, "{kernel:?} d={d}: {delta:?}");
+                assert_eq!(
+                    (delta.lossy_adapted.head_pad, delta.lossy_adapted.f32_cast),
+                    (1, 0),
+                    "{delta:?}"
+                );
+                assert_eq!((got.dtype(), got.dims()), (dtype, q.dims()));
+                assert!(got.is_contiguous());
+                let (cos, rel, max) = int8_errors(&got, &want)?;
+                println!(
+                    "d={d} padded through {} s={s} h={h} {dtype:?}: cosine {cos:.6} \
+                     rel-L2 {rel:.3e} max|d| {max:.3e}",
+                    kernel.name()
+                );
+                assert!(
+                    cos >= 0.999,
+                    "{kernel:?} d={d} {dtype:?}: cosine {cos} < 0.999"
+                );
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------------------------
     // SW-6137: the opt-in Sol-Attn sparse kernel. GPU cases are `#[ignore]`d (CUDA compute):
     //
@@ -3213,17 +3559,26 @@ mod tests {
             e(true, sm120, true, bf, bf, true, &cfg),
             Err(SolRouteRefusal::Masked)
         );
+        // f32 runs at bf16 (cast in the shared dispatch); only a dtype with no such cast refuses.
         let f32op = op(DType::F32, &WAN);
+        assert_eq!(e(true, sm120, true, f32op, f32op, false, &cfg), Ok(()));
+        let f64op = op(DType::F64, &WAN);
         assert_eq!(
-            e(true, sm120, true, f32op, f32op, false, &cfg),
-            Err(SolRouteRefusal::Dtype(DType::F32))
+            e(true, sm120, true, f64op, f64op, false, &cfg),
+            Err(SolRouteRefusal::Dtype(DType::F64))
         );
         assert_eq!(
             e(true, sm120, true, bf, op(DType::F16, &WAN), false, &cfg),
             Err(SolRouteRefusal::MixedDtypeOrDevice)
         );
-        // Head dims other than 128 (flash and INT8 still serve 64).
-        for d in [64usize, 72, 256] {
+        // Head dims below 128 are zero-padded to 128; wider ones have no template.
+        for (d, want) in [
+            (64usize, Ok(())),
+            (72, Ok(())),
+            (120, Ok(())),
+            (160, Err(SolRouteRefusal::HeadDim(160))),
+            (256, Err(SolRouteRefusal::HeadDim(256))),
+        ] {
             let dims = [1, 8, 1024, d];
             let sd = contiguous(&dims);
             let o = FlashOperand {
@@ -3233,7 +3588,8 @@ mod tests {
             };
             assert_eq!(
                 sol_eligibility(true, sm120, true, o, o, o, false, &cfg),
-                Err(SolRouteRefusal::HeadDim(d))
+                want,
+                "d={d}"
             );
         }
         // Wan's text cross attention: 512 keys.
@@ -3638,12 +3994,88 @@ mod tests {
         // Counted like a scoped call: one path, one refusal per kernel.
         let before = attention_path_counts();
         let (kernel, refusals, _) = route_ready(&q, &k, &v, None);
-        record_route(kernel, refusals);
+        record_route(kernel, refusals, &q);
         let delta = attention_path_counts().since(&before);
         assert_eq!(delta.total(), 1, "{delta:?}");
         assert_eq!(delta.int8_refusals.total(), 1, "{delta:?}");
         assert_eq!(delta.sol_refusals.total(), 1, "{delta:?}");
         Ok(())
+    }
+
+    /// The shared dispatch's operand adaptations for the lossy kernels (pure; no compute): f32 runs
+    /// at bf16, a head dim below the kernel's template is zero-padded to it, and nothing is adapted
+    /// for operands the kernel takes as they are, or for a head dim above 128.
+    #[test]
+    fn lossy_kernels_cast_f32_and_pad_narrow_heads_and_nothing_else() {
+        let adapt = |cast_f32, pad_head_dim| LossyOperandAdapt {
+            cast_f32,
+            pad_head_dim,
+        };
+        for dtype in [DType::BF16, DType::F16] {
+            assert!(int8_operand_adapt(dtype, 64).is_identity());
+            assert!(int8_operand_adapt(dtype, 128).is_identity());
+            assert!(sol_operand_adapt(dtype, 128).is_identity());
+        }
+        // Boogu (120): both kernels pad to 128. Lens / SDXL / SD3 / SVD (64): Sol-Attn pads.
+        assert_eq!(
+            int8_operand_adapt(DType::BF16, 120),
+            adapt(false, Some(128))
+        );
+        assert_eq!(sol_operand_adapt(DType::BF16, 120), adapt(false, Some(128)));
+        assert_eq!(sol_operand_adapt(DType::BF16, 64), adapt(false, Some(128)));
+        assert_eq!(int8_operand_adapt(DType::F16, 40), adapt(false, Some(64)));
+        // The f32 models (FLUX.2, LTX, SVD, ...): cast, and padded too where the head is narrow.
+        assert_eq!(int8_operand_adapt(DType::F32, 128), adapt(true, None));
+        assert_eq!(sol_operand_adapt(DType::F32, 128), adapt(true, None));
+        assert_eq!(sol_operand_adapt(DType::F32, 64), adapt(true, Some(128)));
+        // Ideogram (256), a VAE mid block (512): no template, no adaptation (refused as head dim).
+        for d in [160, 256, 512] {
+            assert_eq!(int8_operand_adapt(DType::BF16, d), adapt(false, None));
+            assert_eq!(sol_operand_adapt(DType::BF16, d), adapt(false, None));
+        }
+        // Only the lossy kernels adapt; flash / budgeted calls are never touched.
+        let cpu = candle_core::Device::Cpu;
+        let q = Tensor::zeros((1, 2, 8, 120), DType::F32, &cpu).unwrap();
+        assert_eq!(
+            lossy_adapt_for(AttentionKernel::Int8, &q),
+            adapt(true, Some(128))
+        );
+        assert_eq!(
+            lossy_adapt_for(AttentionKernel::Sol, &q),
+            adapt(true, Some(128))
+        );
+        assert!(lossy_adapt_for(AttentionKernel::Flash, &q).is_identity());
+        assert!(lossy_adapt_for(AttentionKernel::Budgeted(FlashRefusal::Masked), &q).is_identity());
+    }
+
+    /// The adapted INT8 / Sol-Attn calls are counted by adaptation, beside their path.
+    #[test]
+    fn lossy_adaptations_land_in_their_own_counters() {
+        let cpu = candle_core::Device::Cpu;
+        let f32_narrow = Tensor::zeros((1, 2, 8, 64), DType::F32, &cpu).unwrap();
+        let bf16_wide = Tensor::zeros((1, 2, 8, 128), DType::BF16, &cpu).unwrap();
+        let before = attention_path_counts();
+        record_route(AttentionKernel::Sol, OptInRefusals::default(), &f32_narrow);
+        record_route(AttentionKernel::Int8, OptInRefusals::default(), &bf16_wide);
+        record_route(
+            AttentionKernel::Flash,
+            OptInRefusals::default(),
+            &f32_narrow,
+        );
+        let delta = attention_path_counts().since(&before);
+        // Paths are shared with concurrent tests (>=); only these calls adapt operands on CPU.
+        assert!(
+            delta.sol >= 1 && delta.int8 >= 1 && delta.flash >= 1,
+            "{delta:?}"
+        );
+        assert_eq!(
+            delta.lossy_adapted,
+            LossyAdaptCounts {
+                f32_cast: 1,
+                head_pad: 1,
+            },
+            "{delta:?}"
+        );
     }
 
     #[test]

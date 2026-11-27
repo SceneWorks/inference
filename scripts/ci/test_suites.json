@@ -2285,6 +2285,36 @@
       ]
     },
     {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_lossy_f32_operands_run_at_bf16_against_the_f32_reference",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6132 (PR #1530 follow-up) CUDA parity: f32 Q/K/V with INT8 or Sol-Attn (top-k 1.0) opted in run the kernel at bf16 in the shared dispatch and return f32 (counted lossy_adapted.f32_cast), d=128 and d=64 (Sol-Attn also padded), vs the f32 materialized reference: cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_lossy_narrow_heads_pad_to_128_against_the_f32_reference",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6132 (PR #1530 follow-up) CUDA parity: head dim 120 (INT8 and Sol-Attn, bf16 and f16) and 64 (Sol-Attn) zero-padded to 128 in the shared dispatch with the original softmax scale, output sliced back (counted lossy_adapted.head_pad), vs the f32 materialized reference: cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-quant-kernels",
       "kind": "lib",
       "target": "candle_quant_kernels",

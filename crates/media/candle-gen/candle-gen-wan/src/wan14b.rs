@@ -1170,7 +1170,8 @@ pub struct Wan14bEngineOptions {
 }
 
 /// SW-6137: the typed load-time refusal of a `sol_attention` option this engine cannot honour: an
-/// invalid [`candle_gen::SolConfig`], or a DiT whose head dim is not the kernel's 128.
+/// invalid [`candle_gen::SolConfig`], or a DiT whose head dim is wider than the kernel's 128 (a
+/// narrower one is zero-padded by the shared dispatch).
 pub(crate) fn validate_engine_options(
     dit: &crate::config::TransformerConfig,
     options: &Wan14bEngineOptions,
@@ -1181,10 +1182,13 @@ pub(crate) fn validate_engine_options(
     sol.validate().map_err(|reason| {
         gen_core::Error::Unsupported(format!("wan sol_attention option: {reason}"))
     })?;
+    // A narrower head is zero-padded to the kernel's width by the shared dispatch; a wider one
+    // has no template.
     let need = candle_gen::fused_attention::SOL_HEAD_DIM;
-    if dit.head_dim != need {
+    if dit.head_dim == 0 || dit.head_dim > need {
         return Err(gen_core::Error::Unsupported(format!(
-            "wan sol_attention option: the Sol-Attn kernel needs head_dim {need}, this DiT has {}",
+            "wan sol_attention option: the Sol-Attn kernel takes head_dim up to {need}, this DiT \
+             has {}",
             dit.head_dim
         )));
     }
@@ -1681,7 +1685,7 @@ mod tests {
 
     /// SW-6137: the `sol_attention` option is off by default, carried by the options loaders, and
     /// refused with a typed error when this engine cannot honour it (invalid ratio / sinks, or a DiT
-    /// whose head dim is not the kernel's 128).
+    /// whose head dim is wider than the kernel's 128; a narrower one is zero-padded).
     #[test]
     fn the_sol_attention_option_is_off_by_default_and_refused_when_unservable() {
         assert_eq!(Wan14bEngineOptions::default().sol_attention, None);
@@ -1700,11 +1704,15 @@ mod tests {
                 validate_engine_options(&cfg, &bad_ratio),
                 Err(gen_core::Error::Unsupported(m)) if m.contains("topk_ratio")
             ));
+            // A narrower head is zero-padded to 128 by the shared dispatch; a wider one is refused.
             let mut narrow = cfg;
             narrow.head_dim = 64;
+            validate_engine_options(&narrow, &on).unwrap();
+            let mut wide = cfg;
+            wide.head_dim = 256;
             assert!(matches!(
-                validate_engine_options(&narrow, &on),
-                Err(gen_core::Error::Unsupported(m)) if m.contains("head_dim 128")
+                validate_engine_options(&wide, &on),
+                Err(gen_core::Error::Unsupported(m)) if m.contains("head_dim up to 128")
             ));
         }
         let temp = tempfile::tempdir().unwrap();

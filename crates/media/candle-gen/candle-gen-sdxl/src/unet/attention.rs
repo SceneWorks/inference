@@ -299,10 +299,10 @@ impl CrossAttention {
 
     /// The shared fused attention for the native-dtype (f16/bf16) operands, when the shared router
     /// selects a fused kernel (SW-6130): FlashAttention, or the opted-in INT8 QK kernel (SW-6131 /
-    /// SW-6132). Each keeps its scores and softmax in f32 internally, so the f32 upcast below —
-    /// which exists for the materialized path's numerics — has nothing to add, and would make the
-    /// INT8 kernel refuse the call. `None` (CPU, Metal, f32, no fused kernel compiled, the toggle
-    /// off, a training step) keeps that path.
+    /// SW-6132; f32 operands — Kolors' packed UNet — run at bf16 inside the shared dispatch). Each
+    /// keeps its scores and softmax in f32 internally, so the f32 upcast below — which exists for
+    /// the materialized path's numerics — has nothing to add. `None` (CPU, Metal, no fused kernel
+    /// compiled or eligible, the toggle off, a training step) keeps that path.
     fn fused_attention(
         &self,
         query: &Tensor,
@@ -1530,8 +1530,8 @@ mod fused_route_tests {
     use super::takes_native_fused_path;
     use candle_core::DType;
     use candle_gen::fused_attention::{
-        int8_eligibility, int8_route, sol_eligibility, FlashGate, FlashOperand, FlashRefusal,
-        Int8Device, Int8Refusal, SolConfig, SolRouteRefusal,
+        int8_eligibility, int8_operand_adapt, int8_route, sol_eligibility, sol_operand_adapt,
+        FlashGate, FlashOperand, FlashRefusal, Int8Device, SolConfig, SolRouteRefusal,
     };
     use candle_gen::AttentionKernel;
 
@@ -1545,7 +1545,9 @@ mod fused_route_tests {
     /// An SDXL 1024² f16 UNet call on sm_120 with INT8 opted in: the self-attention (4096 tokens)
     /// and the text cross-attention (77 tokens) of a 64-wide, 10-head block are both INT8-eligible,
     /// and that route keeps the native-dtype shared-helper path instead of the f32-upcast fallback
-    /// (which INT8 refuses as a dtype, so the call would lose flash without running INT8).
+    /// (before the fix the call lost flash and ran the materialized path). Sol-Attn takes the
+    /// self-attention with its 64-wide heads zero-padded to 128, and Kolors' f32 packed UNet takes
+    /// INT8 at bf16.
     #[test]
     fn an_int8_route_keeps_the_native_dtype_shared_helper_path() {
         static Q: [usize; 4] = [2, 10, 4096, 64];
@@ -1566,18 +1568,27 @@ mod fused_route_tests {
                 });
                 assert_eq!(routed, Some(Ok(())), "{dtype:?} {:?}", k.dims);
             }
-            // Sol-Attn never serves SDXL's 64-wide heads (the catalog refuses it upfront).
+            // Sol-Attn: the self-attention, its 64-wide heads zero-padded to 128; never the
+            // 77-token cross-attention.
+            let sol = SolConfig::top_k(0.25);
             assert_eq!(
-                sol_eligibility(true, sm120, true, q, q, q, false, &SolConfig::top_k(0.25)),
-                Err(SolRouteRefusal::HeadDim(64))
+                sol_eligibility(true, sm120, true, q, q, q, false, &sol),
+                Ok(())
             );
+            assert_eq!(
+                sol_eligibility(true, sm120, true, q, text, text, false, &sol),
+                Err(SolRouteRefusal::CrossAttention)
+            );
+            assert_eq!(sol_operand_adapt(dtype, 64).pad_head_dim, Some(128));
+            assert!(int8_operand_adapt(dtype, 64).is_identity());
         }
-        // The f32 operands of the upcast fallback are what INT8 would see without the fix.
+        // Kolors' packed UNet runs this attention at f32: INT8 takes it at bf16.
         let f32_q = op(DType::F32, &Q, &Q_ST);
         assert_eq!(
             int8_eligibility(true, sm120, true, f32_q, f32_q, f32_q, false),
-            Err(Int8Refusal::Dtype(DType::F32))
+            Ok(())
         );
+        assert!(int8_operand_adapt(DType::F32, 64).cast_f32);
         assert!(takes_native_fused_path(AttentionKernel::Int8));
         assert!(takes_native_fused_path(AttentionKernel::Sol));
         assert!(takes_native_fused_path(AttentionKernel::Flash));
