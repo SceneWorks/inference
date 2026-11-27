@@ -351,6 +351,19 @@ impl Weights {
                 if let Some(base) = key.strip_suffix(".scales") {
                     packed_bases.insert(base.to_owned());
                 }
+                // A stored GGML block tensor (a Candle-native pre-quantized tier) is already in
+                // its device format; it stays on the host only so its one upload is the final
+                // `QTensor` build, never a device round-trip through `from_ggml_block_tensor`.
+                if let Some(base) = key.strip_suffix(".weight") {
+                    if candle_layers::llm_projection::ggml_block_storage(
+                        view.dtype() == safetensors::Dtype::U8,
+                        view.shape(),
+                    )
+                    .is_some()
+                    {
+                        packed_bases.insert(base.to_owned());
+                    }
+                }
             }
         }
         let source =
@@ -876,8 +889,20 @@ impl Weights {
                 if weights.encoded_keys.contains(&key) || weights.companion_keys.contains(&key) {
                     continue;
                 }
+                // A stored GGML block tensor (a Candle-native pre-quantized tier) stays on the
+                // host: its consumer builds the device `QTensor` from these bytes, so uploading
+                // them first would hold every projection on the device twice until the map drops.
+                let stored_ggml = key.ends_with(".weight")
+                    && candle_layers::llm_projection::ggml_block_storage(
+                        view.dtype() == safetensors::Dtype::U8,
+                        view.shape(),
+                    )
+                    .is_some();
                 let tensor = if view.dtype() == safetensors::Dtype::I8 {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
+                } else if stored_ggml {
+                    weights.target = Some(device.clone());
+                    st.load(&key, &Device::Cpu)?
                 } else {
                     st.load(&key, device)?
                 };
