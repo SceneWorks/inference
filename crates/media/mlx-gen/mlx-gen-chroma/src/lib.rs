@@ -37,66 +37,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_HD_ID,
-            compile: |spec, req| model::compile_base(ChromaVariant::Hd, spec, req),
-        })
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_BASE_ID,
-            compile: |spec, req| model::compile_base(ChromaVariant::Base, spec, req),
-        })
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_FLASH_ID,
-            compile: |spec, req| model::compile_base(ChromaVariant::Flash, spec, req),
-        })
-        .register_generator(model::HD_REGISTRATION)
-        .register_memory_strategy(model::HD_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: CHROMA1_HD_ID,
-            contract: |spec| memory_strategy::weights_free_contract(CHROMA1_HD_ID, spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: CHROMA1_HD_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_surface_contract(CHROMA1_HD_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::HD_MEMORY_BEHAVIOR)
-        .register_generator(model::BASE_REGISTRATION)
-        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: CHROMA1_BASE_ID,
-            contract: |spec| memory_strategy::weights_free_contract(CHROMA1_BASE_ID, spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: CHROMA1_BASE_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_surface_contract(CHROMA1_BASE_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
-        .register_generator(model::FLASH_REGISTRATION)
-        .register_memory_strategy(model::FLASH_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: CHROMA1_FLASH_ID,
-            contract: |spec| memory_strategy::weights_free_contract(CHROMA1_FLASH_ID, spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: CHROMA1_FLASH_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_surface_contract(CHROMA1_FLASH_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::FLASH_MEMORY_BEHAVIOR)
+        .register_route(model::route_hd())
+        .register_route(model::route_base())
+        .register_route(model::route_flash())
 }
 
 /// Build the complete explicit MLX Chroma provider catalog.
@@ -115,6 +58,7 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     #[test]

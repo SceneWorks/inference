@@ -51,9 +51,14 @@ use mlx_gen::gen_core::h3_image::{
     FIXED_STEPS, REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
-    reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, StepSupport,
-    WeightsSource,
+    reject_unknown_components, AdapterInstallPolicy, AdapterSurface, Capabilities,
+    ConditioningKind, ConditioningSurface, FamilyDriverSpec, GenerationOutput, GenerationRequest,
+    Generator, LatentCodecDeclaration, LoadSpec, Modality, ModelBinding, ModelDescriptor,
+    OutputSurface, Pass0ConditioningRequirement, Precision, PreviewSupport, ProductLimits,
+    Progress, Quant, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface, RouteBindings,
+    RouteDefaults, RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme,
+    SizeFloor, StepSupport, TextEncoderDeclaration, TextEncoderSurface, WeightPlanDeclaration,
+    WeightSourceKind, WeightsSource,
 };
 use mlx_gen::{default_seed, Error, Result};
 
@@ -97,59 +102,127 @@ pub struct MiniMaxH3Image {
     load_shape: mlx_gen::gen_core::LoadShape,
 }
 
-/// The identity, modality and capability surface.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        // The text encoder is not advertised as substitutable, and the denoiser's 24-channel
-        // latent is decoded only by this family's own 2-D VAE: `None` fails every external
-        // decoder swap closed.
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: IMAGE_MODEL_ID,
+/// Primary typed route declaration for MiniMax-H3-Image (`REG-1`, `AP5`).
+pub fn route() -> RouteRecord {
+    RouteRecord {
+        route_id: IMAGE_MODEL_ID,
         family: FAMILY,
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Guidance-distilled: no unconditional branch. Guidance 1.0 is accepted as the
-            // documented no-op (`validate` clears it before the shared floor).
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            // `edit`: 1..=16 reference images, as single references and/or one multi-reference
-            // list, in request order. No reference is `text2image`.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            // SW-7096: H3's adapter install over the image DiT's block/refiner surface --
-            // diffusers/PEFT, kohya `lora_unet_`, ComfyUI and LoKr, each at its own scale.
-            supports_lora: true,
-            supports_lokr: true,
-            // Pre-quantized tiers only (SW-7093): packed offline by
-            // `crate::convert::quantize_minimax_h3_image_dit`, staged as the DiT component.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Upstream requires only a positive size: no maximum area or edge.
-            min_size: 1,
-            max_size: u32::MAX,
-            max_count: MAX_COUNT,
-            supported_steps: StepSupport::Exact(vec![FIXED_STEPS]),
-            mac_only: false,
-            // TE -> DiT -> VAE are built, used and released in order in `generate_impl`, so every
-            // selection stages whatever residency it names.
-            unconditionally_engages_staged_residency: true,
-            max_prompt_tokens: Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
-            // SW-7106: ComfyUI's stochastic LCM (the default, 1.1 → 0.9) or the released Euler on
-            // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
-            samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
-            supports_h3_image_sampler: true,
-            // SW-7224: ComfyUI's schedulers over H3-Image's model sampling; no scheduler is the
-            // published grid.
-            schedulers: mlx_gen::gen_core::h3_image::SCHEDULER_NAMES.to_vec(),
-            pag: Some(mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability()),
+        mac_only: false,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new(
+                    "qwen3_vl_32b",
+                    Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
+                )],
+                encoder_contract: None,
+                max_prompt_tokens: Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
+                supports_caption_overflow_policy: false,
+                supports_prompt_enhancement: false,
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+            },
+            sampling: SamplingSurface {
+                samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
+                schedulers: mlx_gen::gen_core::h3_image::SCHEDULER_NAMES.to_vec(),
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: true,
+            },
+            denoiser: ModelBinding::family_driver(
+                FamilyDriverSpec::new(crate::drivers::h3_driver_support(IMAGE_MODEL_ID))
+                    .with_pag(mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability()),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("minimax_h3_image_vae"),
+                output_latent_space: None,
+                pixel_stride: Some(VAE_SPATIAL_RATIO * 2),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_32b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["minimax_h3_image_dit"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Decode,
+                        ["minimax_h3_image_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                unconditionally_engages_staged_residency: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: 1,
+            max_size: u32::MAX,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Exact(vec![FIXED_STEPS]),
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(FIXED_STEPS),
+            guidance: None,
+            sampler: Some(mlx_gen::gen_core::h3_image::SAMPLER_NAMES[0]),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_memory_registration(crate::h3_image::memory::IMAGE_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::h3_image::memory::IMAGE_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(crate::h3_image::memory::IMAGE_MEMORY_BEHAVIOR),
     }
+}
+
+/// The identity, modality and capability surface, computed from [`route`].
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Resolve the text-encoder directory: the staged [`TEXT_ENCODER_COMPONENT`] (an H3 snapshot's
@@ -1031,10 +1104,6 @@ impl Generator for MiniMaxH3Image {
     {
         crate::h3_image::memory::begin_request(&self.memory_strategy, self.memory_tier, context)
     }
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

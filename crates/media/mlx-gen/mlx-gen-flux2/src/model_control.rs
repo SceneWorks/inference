@@ -24,11 +24,10 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, gen_core, require_base_dir, require_control,
-    run_flow_sampler_with_phase_transition_spans, Capabilities, Conditioning, ConditioningKind,
-    ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
-    SamplerRun, TimestepConvention,
+    gen_core, require_base_dir, require_control, run_flow_sampler_with_phase_transition_spans,
+    Conditioning, ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    Residency, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
@@ -46,59 +45,41 @@ use crate::transformer::Flux2ControlTransformer;
 use crate::vae::Flux2Vae;
 use crate::{loader, CONTROL_IN_DIM};
 
-/// The control variant's identity + capabilities. The guidance-distilled dev base (embedded
-/// guidance, no negative prompt / true-CFG) plus `Control` conditioning (the required pose/union
-/// skeleton) and an optional `Reference` (an img2img init image, the fork's `inpaint_image`/`image`
-/// init seed). Mac-only, like every FLUX.2 variant.
+/// Primary typed route declaration for the FLUX.2-dev Fun-Controlnet-Union variant (`REG-1`, `AP5`).
+pub fn route_dev_control() -> gen_core::RouteRecord {
+    let mut route = crate::config::Flux2Variant::Dev.route_record();
+    route.route_id = FLUX2_DEV_CONTROL_ID;
+    route.structure.text_encoders.encoder_contract = Some(crate::config::DEV_ENCODER_CONTRACT);
+    route.structure.text_encoders.supports_prompt_enhancement = false;
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.control_kinds = Some(mlx_gen::AcceptedControlKinds::Any);
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["flux2_controlnet_union"];
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("flux2_dev_mmdit_control")
+            .with_pag(crate::config::Flux2Variant::Dev.pag_capability()),
+    );
+    route.structure.upsamplers.components.clear();
+    route.structure.adapters.install_policy = gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.bindings = gen_core::RouteBindings::generator(descriptor_dev_control, |spec| {
+        load_dev_control(spec).map_err(Into::into)
+    })
+    .with_footprint(crate::model::dev_control_component_footprint)
+    .with_render_plan(compile_dev_control)
+    .with_memory_registration(DEV_CONTROL_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        gen_core::mlx_memory_contract_surface_specs,
+        crate::memory_strategy::registered_dev_control_contract,
+    )
+    .with_memory_behavior_registration(DEV_CONTROL_MEMORY_BEHAVIOR);
+    route
+}
+
+/// The control variant's identity + capabilities, computed from [`route_dev_control`].
 pub fn descriptor_dev_control() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::config::DEV_ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-        // Deliberately input-agnostic, not undeclared: the Fun-Controlnet-Union checkpoint runs
-        // pose / canny / depth down one VAE-encoded path with no mode index, so every kind is
-        // genuinely accepted. Declaring `Some(Any)` says that; leaving it `None` would say "nobody
-        // checked".
-        control_kinds: Some(mlx_gen::AcceptedControlKinds::Any),
-        required_components: &[],
-        id: FLUX2_DEV_CONTROL_ID,
-        family: "flux2",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
-            supports_guidance: true,
-            // Control (required, the pose/union skeleton) + an optional img2img Reference init.
-            conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
-            // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
-            supports_lora: true,
-            supports_lokr: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
-            samplers: curated_sampler_names(),
-            // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.
-            schedulers: {
-                let mut s = curated_scheduler_names();
-                s.push("flow_match_euler");
-                s
-            },
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            requires_sigma_shift: true,
-            // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
-            // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
-            // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
-            supports_sequential_offload: true,
-            supports_preview: true,
-            // sc-18317: the dev-control route shares the base double/single stacks, so it shares
-            // their activation levers; `generate` threads the request through
-            // `MemoryConfig::with_request` into `Flux2ControlTransformer::forward_with_mem`.
-            execution: crate::chunk::EXECUTION_SURFACE,
-            pag: Some(crate::config::Flux2Variant::Dev.pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_dev_control().compute_descriptor()
 }
 
 /// The heavy render-phase components for the FLUX.2 control variant — the control transformer (the dev
@@ -846,6 +827,7 @@ impl Flux2DevControl {
 // callback mapping is mechanically testable without opening model artifacts. The `impl Generator`
 // above stays hand-written because `validate` adds a control-conditioning check beyond the shared
 // `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
+#[cfg(test)]
 pub(crate) const DEV_CONTROL_REGISTRATION: gen_core::ModelRegistration =
     gen_core::ModelRegistration {
         descriptor: descriptor_dev_control,

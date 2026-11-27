@@ -619,6 +619,26 @@ pub struct BooguTurboDmdDriver<F> {
     forward: F,
 }
 
+/// Primary [`DriverSupport`] declaration for Boogu Turbo DMD denoising.
+pub(crate) fn boogu_turbo_driver_support() -> DriverSupport {
+    DriverSupport {
+        driver_id: "boogu_turbo_dmd",
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: true,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean: "Boogu Turbo DMD owns its internal clean-to-renoise step and refuses external Renoise transitions",
+            geometry_change: "Boogu Turbo DMD does not support mid-trajectory spatial resampling",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F> BooguTurboDmdDriver<F>
 where
     F: Fn(&Array, f32, usize) -> Result<Array>,
@@ -626,22 +646,7 @@ where
     /// Construct a Boogu Turbo DMD driver over the active clean-fraction `sigmas` and `forward` seam.
     pub fn new(sigmas: Vec<f32>, step_offset: usize, forward: F) -> Self {
         Self {
-            support: DriverSupport {
-                driver_id: "boogu_turbo_dmd",
-                arbitrary_slice: true,
-                carry_history: true,
-                reset_history: true,
-                renoise_from_clean: false,
-                geometry_change: false,
-                read_only_boundary_estimate: true,
-                previous_estimate_capture: false,
-                uses_global_rng: false,
-                refusal_reasons: DriverRefusalReasons {
-                    renoise_from_clean: "Boogu Turbo DMD owns its internal clean-to-renoise step and refuses external Renoise transitions",
-                    geometry_change: "Boogu Turbo DMD does not support mid-trajectory spatial resampling",
-                    ..DriverRefusalReasons::default()
-                },
-            },
+            support: boogu_turbo_driver_support(),
             sigmas,
             step_offset,
             forward,

@@ -41,6 +41,27 @@ pub struct IrisFlowDpmDriver<F> {
     forward: RefCell<F>,
 }
 
+/// Primary [`DriverSupport`] declaration for Iris pixel-space FlowDPM-Solver++.
+pub(crate) fn iris_flow_dpm_driver_support(first_order_only: bool) -> DriverSupport {
+    DriverSupport {
+        driver_id: "iris_flow_dpm",
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: first_order_only,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: true,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            reset_history: "Iris FlowDPM-Solver++ 2nd-order multistep plan requires carrying prev_x0 history across slices",
+            renoise_from_clean: "Iris FlowDPM-Solver++ is a deterministic pixel-space ODE solver and refuses external Renoise transitions",
+            geometry_change: "Iris FlowDPM-Solver++ does not support mid-trajectory spatial resampling",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F> IrisFlowDpmDriver<F>
 where
     F: FnMut(&Array, &DpmStep) -> Result<Array>,
@@ -60,23 +81,7 @@ where
             .iter()
             .all(|step| matches!(step.update, DpmUpdate::First { .. }));
         Self {
-            support: DriverSupport {
-                driver_id: "iris_flow_dpm",
-                arbitrary_slice: true,
-                carry_history: true,
-                reset_history: first_order_only,
-                renoise_from_clean: false,
-                geometry_change: false,
-                read_only_boundary_estimate: true,
-                previous_estimate_capture: false,
-                uses_global_rng: false,
-                refusal_reasons: DriverRefusalReasons {
-                    reset_history: "Iris FlowDPM-Solver++ 2nd-order multistep plan requires carrying prev_x0 history across slices",
-                    renoise_from_clean: "Iris FlowDPM-Solver++ is a deterministic pixel-space ODE solver and refuses external Renoise transitions",
-                    geometry_change: "Iris FlowDPM-Solver++ does not support mid-trajectory spatial resampling",
-                    ..DriverRefusalReasons::default()
-                },
-            },
+            support: iris_flow_dpm_driver_support(first_order_only),
             plan,
             prediction,
             emit_diagnostics,
@@ -511,7 +516,7 @@ mod driver_conformance_tests {
             events.len(),
             plan.len() * 2,
             "expected strictly paired Checked/Synchronized STEP_QUANTUM per step, got {:?}",
-            &*events
+            *events
         );
         for (step_idx, pair) in events.chunks_exact(2).enumerate() {
             let expected_scratch = step_scratch(initial.size() as u64, &plan[step_idx].update);

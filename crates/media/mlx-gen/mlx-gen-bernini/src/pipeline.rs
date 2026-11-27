@@ -37,13 +37,19 @@ use mlx_gen::driver::{
     run_mlx_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
     DriverRunState, DriverSupport, FamilyDriver, SliceInput, SliceSpec, SliceTransition, StepHooks,
 };
-use mlx_gen::gen_core::BoundaryState;
+use mlx_gen::gen_core::{
+    AdapterSurface, BoundaryState, ConditioningSurface, FamilyDriverSpec, LatentCodecDeclaration,
+    ModelBinding, OutputSurface, Pass0ConditioningRequirement, PreviewSupport, ProductLimits,
+    ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface, RouteBindings, RouteDefaults,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    StepSupport, TextEncoderDeclaration, TextEncoderSurface, WeightPlanDeclaration,
+    WeightSourceKind, WAN_Z16_VIDEO_LATENT_SPACE,
+};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
-    WeightsSource,
+    CancelFlag, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
@@ -62,50 +68,149 @@ use crate::{decoded_output_geometry, ProviderVae, PROVIDER_VAE_STRIDE};
 
 pub const MODEL_ID: &str = "bernini_renderer";
 
-/// Stable identity + advertised capabilities for the Bernini renderer (Wan2.2-A14B dual-expert with
-/// source-id rotary + token-packed conditioning + APG guidance; t2v/t2i/i2i/v2v/r2v/rv2v).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary [`DriverSupport`] declaration for Bernini Stage 2 dual-expert denoising.
+pub(crate) fn bernini_stage2_driver_support(driver_id: &'static str) -> DriverSupport {
+    DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean:
+                "native MLX Bernini Stage 2 driver does not re-noise from clean estimates",
+            geometry_change:
+                "native MLX Bernini Stage 2 driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "native MLX Bernini Stage 2 driver does not expose read-only boundary clean estimates",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
+/// Primary typed route declaration for the Bernini renderer (`REG-1`, `AP5`).
+pub fn route_renderer() -> RouteRecord {
+    RouteRecord {
+        route_id: MODEL_ID,
         family: "bernini",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Source media: a single Reference (i2i) / MultiReference (r2v refs) / VideoClip (v2v/rv2v
-            // source video). Text-only modes (t2i/t2v) need no conditioning.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-                ConditioningKind::VideoClip,
-            ],
-            // LoRA/quant are follow-ons (sc-5146); the renderer ships dense bf16.
-            supports_lora: false,
-            samplers: vec!["unipc"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: true,
-            // The renderer is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds
-            // NO component weights on the generator and loads per generate in phase order — UMT5-XXL T5
-            // → drop → (source-VAE encoder for i2i/v2v/r2v) → drop → the two co-resident MoE experts +
-            // z16 VAE — dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified
-            // memory is already bounded to the dominant expert phase. The shared per-component footprint
-            // reports the two experts as the DiT phase (the peak), so the fit-gate's staged estimate is
-            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle, so this
-            // is unconditional physical staging rather than a selectable offload control.
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: true,
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                    ConditioningKind::VideoClip,
+                ],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["source_id_rotary_packing"],
+            },
+            sampling: SamplingSurface {
+                samplers: vec!["unipc"],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_driver(
+                FamilyDriverSpec::new(bernini_stage2_driver_support("bernini_renderer"))
+                    .with_expert_switching(),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: None,
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::unsupported(),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["umt5_xxl"], true),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["wan2_2_high_noise_expert", "wan2_2_low_noise_expert"],
+                        false,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["wan_z16_vae"], false),
+                ],
+                supports_sequential_offload: false,
+                unconditionally_engages_staged_residency: true,
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(Defaults::STEPS as u32),
+            guidance: Some(Defaults::OMEGA_TXT),
+            sampler: Some("unipc"),
+            schedule: None,
+            shift: Some(BerniniKnobs::default().shift),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_memory_registration(crate::memory_strategy::RENDERER_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(
+                        crate::memory_strategy::RENDERER_ID,
+                        spec,
+                    )
+                },
+            )
+            .with_memory_behavior_registration(crate::memory_strategy::RENDERER_MEMORY_BEHAVIOR),
     }
+}
+
+/// Stable identity + advertised capabilities for the Bernini renderer, computed from
+/// [`route_renderer`].
+pub fn descriptor() -> ModelDescriptor {
+    route_renderer().compute_descriptor()
 }
 
 /// The loaded Bernini renderer: resolved Wan2.2 config + Bernini knobs + the snapshot dir. The heavy
@@ -187,10 +292,7 @@ pub(crate) fn component_footprint(
     )
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const RENDERER_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
+
 
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).
@@ -391,26 +493,7 @@ pub struct BerniniDualExpertDriver<F> {
 
 impl<F: BerniniStage2Forward> BerniniDualExpertDriver<F> {
     fn build_support(driver_id: &'static str) -> DriverSupport {
-        DriverSupport {
-            driver_id,
-            arbitrary_slice: true,
-            carry_history: true,
-            reset_history: true,
-            renoise_from_clean: false,
-            geometry_change: false,
-            read_only_boundary_estimate: false,
-            previous_estimate_capture: false,
-            uses_global_rng: false,
-            refusal_reasons: DriverRefusalReasons {
-                renoise_from_clean:
-                    "native MLX Bernini Stage 2 driver does not re-noise from clean estimates",
-                geometry_change:
-                    "native MLX Bernini Stage 2 driver does not support geometry-changing phase boundaries",
-                read_only_boundary_estimate:
-                    "native MLX Bernini Stage 2 driver does not expose read-only boundary clean estimates",
-                ..DriverRefusalReasons::default()
-            },
-        }
+        bernini_stage2_driver_support(driver_id)
     }
 
     #[allow(clippy::too_many_arguments)]
