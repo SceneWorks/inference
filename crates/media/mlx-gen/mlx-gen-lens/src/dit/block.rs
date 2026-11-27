@@ -229,7 +229,8 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
     // DiT, silently defeating bf16 (no compute win, and a training peak ABOVE f32 from the f32 weight
     // up-casts). Casting `one` to the modulation dtype keeps the bf16 stream bf16. No-op in f32 mode
     // (the cast is identity), so the f32 grad-parity gates and f32 inference stay bit-identical.
-    let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(mod_params.dtype())?;
-    let out = add(&multiply(x, &add(&scale, &one)?)?, &shift)?;
+    // `scale` is a slice of `mod_params`, so its dtype IS the modulation dtype: this is the shared
+    // eager `nn::modulate_eager(.., one_matches_scale = true)` (SW-6140), the same three-op chain.
+    let out = mlx_gen::nn::modulate_eager(x, &scale, &shift, true)?;
     Ok((out, gate))
 }

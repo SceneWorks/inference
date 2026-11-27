@@ -466,7 +466,12 @@ fn compiled_rope_rotate(inp: &[Array]) -> std::result::Result<Vec<Array>, Except
     rope_rotate_impl(inp)
 }
 
-fn modulate_matching_one_impl(
+/// Provider compiled-glue body: the adaLN affine `norm·(1 + scale) + shift` with the literal `1`
+/// cast to `scale`'s dtype (torch's weak Python `1`, so `1 + scale` rounds in the modulation dtype).
+/// The body [`modulate`]`(.., true)` and [`modulate_eager`]`(.., true)` run, and the one a family
+/// [`DitGlue`] hands to `mx.compile` (LTX) — one definition so the fused and eager forms of every
+/// family cannot drift (SW-6140).
+pub fn modulate_matching_one_impl(
     (norm, scale, shift): (&Array, &Array, &Array),
 ) -> std::result::Result<Array, Exception> {
     let one = scalar(1.0).as_dtype(scale.dtype())?;
@@ -480,7 +485,11 @@ fn compiled_modulate_matching_one(
     modulate_matching_one_impl(args)
 }
 
-fn modulate_f32_one_impl(
+/// Provider compiled-glue body: the adaLN affine `norm·(1 + scale) + shift` with a **strong f32**
+/// literal `1`, so a bf16 `scale` promotes `1 + scale` (and the modulated stream) to f32. The body
+/// [`modulate`]`(.., false)` and [`modulate_eager`]`(.., false)` run, and the one the Wan
+/// [`DitGlue`] and the Qwen-Image block glue hand to `mx.compile` (SW-6140).
+pub fn modulate_f32_one_impl(
     (norm, scale, shift): (&Array, &Array, &Array),
 ) -> std::result::Result<Array, Exception> {
     add(&multiply(norm, &add(scale, scalar(1.0))?)?, shift)
@@ -870,6 +879,54 @@ pub fn modulate(
             Ok(modulate_f32_one_impl((norm, scale, shift))?)
         }
     }
+}
+
+/// The **eager** adaLN affine `norm·(1 + scale) + shift`: exactly [`modulate`]'s glue-off arm, but
+/// never routed through `mx.compile` and recording no diagnostics, whatever this thread's
+/// [`compile_glue`] setting. `one_matches_scale` is the same literal-`1` dtype policy as
+/// [`modulate`].
+///
+/// This is the shared form of the private eager `modulate` copies the family crates carried
+/// (SW-6140): a family that never compiled its modulation keeps byte-identical numerics, including
+/// inside another stage's [`CompileGlueGuard`] scope, where routing it through [`modulate`] would
+/// newly fuse an f32 affine (and an `mx.compile` f32 fusion may round differently from the eager
+/// chain — see [`COMPILED_GLUE_F32_ULP_TOL`]). Whether a family later opts its modulation into the
+/// compiled glue is its own measured decision, not a side effect of deduplication.
+pub fn modulate_eager(
+    norm: &Array,
+    scale: &Array,
+    shift: &Array,
+    one_matches_scale: bool,
+) -> Result<Array> {
+    if one_matches_scale {
+        Ok(modulate_matching_one_impl((norm, scale, shift))?)
+    } else {
+        Ok(modulate_f32_one_impl((norm, scale, shift))?)
+    }
+}
+
+/// The eager adaLN-**single** affine `x·scale + shift`, for the families whose modulation table
+/// already carries the full scale (no `1 +`): SeedVR2's `x·(emb_scale + p_scale) + (emb_shift +
+/// p_shift)`. Same eager two-op sequence its private copy ran (SW-6140).
+pub fn scale_shift(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
+    Ok(add(&multiply(x, scale)?, shift)?)
+}
+
+/// The **eager** complex RoPE rotation `(real + imag·i)·(cos + sin·i)`: exactly [`rope_rotate`]'s
+/// glue-off arm — `real·cos − imag·sin`, `imag·cos + real·sin` — but never compiled and recording
+/// no diagnostics. The shared form of the private eager rotations the family crates carried
+/// (SW-6140); see [`modulate_eager`] for why an eager site does not silently join the glue.
+pub fn rope_rotate_eager(
+    real: &Array,
+    imag: &Array,
+    cos: &Array,
+    sin: &Array,
+) -> Result<(Array, Array)> {
+    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
+    let mut out = rope_rotate_impl(&args)?;
+    let out1 = out.pop().unwrap();
+    let out0 = out.pop().unwrap();
+    Ok((out0, out1))
 }
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight + bias (PyTorch `nn.Linear` convention).
@@ -1268,6 +1325,27 @@ pub fn rotate_half(x: &Array) -> Result<Array> {
         &[&parts[1].negative()?, &parts[0]],
         ax,
     )?)
+}
+
+/// The **adjacent-pair** (interleaved, GPT-J) `rotate_pairwise` on the last axis: lanes
+/// `(x[2i], x[2i+1]) → (−x[2i+1], x[2i])`. Rank-agnostic. The rotation partner of a full-width,
+/// repeat-interleaved `(cos, sin)` table (`x·cos + rotate_pairwise(x)·sin`) — the SAM3, SeedVR2 and
+/// PuLID EVA-CLIP form, each of which open-coded it (SW-6140); see
+/// [`RopeStyle::InterleavedFull`](crate::qkv::RopeStyle::InterleavedFull). NOT [`rotate_half`],
+/// whose partner is lane `i + d/2`.
+pub fn rotate_pairwise(x: &Array) -> Result<Array> {
+    let sh = x.shape().to_vec();
+    let last = *sh
+        .last()
+        .ok_or_else(|| Error::Msg("nn::rotate_pairwise needs a rank >= 1 input".to_string()))?;
+    let mut paired: Vec<i32> = sh[..sh.len() - 1].to_vec();
+    paired.push(last / 2);
+    paired.push(2);
+    let xr = x.reshape(&paired)?; // [.., d/2, 2]
+    let axis = (paired.len() - 1) as i32;
+    let lanes = mlx_rs::ops::split(&xr, 2, axis)?; // even = [.., d/2, 1], odd = [.., d/2, 1]
+    let rotated = mlx_rs::ops::concatenate_axis(&[&lanes[1].negative()?, &lanes[0]], axis)?;
+    Ok(rotated.reshape(&sh)?)
 }
 
 /// Vision-tower half-split RoPE computed **in f32** and cast back to `x`'s dtype:

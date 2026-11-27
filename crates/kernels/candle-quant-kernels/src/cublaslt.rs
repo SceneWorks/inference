@@ -34,9 +34,12 @@
 //! identity the tests pin against an f32 reference.
 //!
 //! Everything on the cuBLASLt handle is `#[cfg(feature = "cuda")]`; the CPU/Metal builds see only the
-//! small dtype helpers ([`quantize_activation_fp8`] / [`quantize_activation_int8`], pure candle ops).
+//! small dtype helpers ([`quantize_activation_fp8`] / [`quantize_activation_int8`]: pure candle ops
+//! there, the fused on-device quantizer of [`crate::act_quant`] on CUDA).
 
 use candle_core::{DType, Device, Result, Tensor};
+
+use crate::act_quant::{ACT_QUANT_FP8_PATH, ACT_QUANT_INT8_PATH};
 
 /// Device allocation held by one shared cuBLASLt context, also used by native admission.
 pub const CUBLASLT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
@@ -61,19 +64,48 @@ pub fn eight_bit_layout_supported(shape: &[usize]) -> bool {
     matches!(shape, [n, k] if *n > 0 && *k > 0 && n.is_multiple_of(16) && k.is_multiple_of(16))
 }
 
-/// Dynamic per-tensor **fp8 E4M3** activation quant (v1, pure candle ops — a fused amax→scale→cast
-/// kernel is a later optimization if the bench shows it dominates). `scale = absmax / 448`, then
-/// `q = cast_f8e4m3(x / scale)`.
+/// Dynamic per-tensor **fp8 E4M3** activation quant: `scale = absmax / 448` (floored at
+/// `f32::MIN_POSITIVE`), then `q = cast_f8e4m3(x / scale)`, `q` on `x`'s device.
 ///
-/// **The final `f32 → F8E4M3` cast is done on the CPU** and the result moved back to `x`'s device.
-/// candle's CUDA fp8-cast kernel (`cast_f32_f8_e4m3`) is `#if __CUDA_ARCH__ >= 800`-gated in
-/// candle-kernels and is **not present** in the repo's cap=80 fatbin on this sm_120 box (the cast
-/// dispatch fails with `CUDA_ERROR_NOT_FOUND "named symbol not found"` — sc-7544 territory, but for a
-/// dense-PTX cast rather than a quant matmul). The CPU cast is byte-identical (the `float8` crate does
-/// the same E4M3 rounding on host) so it is a correctness-neutral workaround; wiring the device cast
-/// (re-vendor candle-kernels with the fp8 casts in the multi-arch fatbin) is a perf follow-up (sc-9299
-/// note → sc-9300). The divide/amax stay on-device; only the tiny elementwise cast round-trips.
+/// On CUDA this runs the fused on-device quantizer ([`crate::act_quant`], SW-6126): two launches,
+/// no activation data leaves the device, and the codes are byte-identical to the reference op chain
+/// [`quantize_activation_fp8_reference`]. The one host transfer left is this function's contract:
+/// [`QuantizedActivation::scale`] is a host `f32`, so the 4-byte device scale is read back (a stream
+/// sync). Callers that can keep the scale on the device (`Fp8Linear`'s forward) use the device
+/// form instead. Every other input — CPU / Metal, another dtype, an empty tensor, either fused
+/// switch off, a cached compile failure — runs the reference, recorded on
+/// [`ACT_QUANT_FP8_PATH`] with its reason.
 pub fn quantize_activation_fp8(x: &Tensor) -> Result<QuantizedActivation> {
+    ACT_QUANT_FP8_PATH.dispatch(
+        || {
+            #[cfg(feature = "cuda")]
+            {
+                crate::act_quant::fused_fp8(x, crate::act_quant::Fp8ScaleRule::Reciprocal)?
+                    .try_map(host_scale)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Ok(crate::fused_path::Attempt::Reference(
+                    crate::fused_path::PathReason::CudaFeatureOff,
+                ))
+            }
+        },
+        || quantize_activation_fp8_reference(x),
+    )
+}
+
+/// The reference op chain of [`quantize_activation_fp8`] (the fused kernel's parity oracle and the
+/// CPU / non-CUDA path; E1).
+///
+/// **The final `f32 → F8E4M3` cast is done on the CPU** and the result moved back to `x`'s device,
+/// because candle cannot cast to fp8 on CUDA: its dispatch asks for `cast_f32_f8e4m3` (the dtype's
+/// `as_str`), while candle-kernels' `cast.cu` defines `cast_f32_f8_e4m3`, so the launch fails with
+/// `CUDA_ERROR_NOT_FOUND "named symbol not found"` on every architecture — a name mismatch, not the
+/// missing-fatbin-arch problem this was first taken for (re-checked on sm_120 by SW-6126's bench,
+/// which still cannot run the stock device cast). The CPU cast is byte-identical (the `float8` crate
+/// does the same E4M3 rounding on host), so the round trip is correctness-neutral; on CUDA the fused
+/// quantizer replaces the whole chain.
+pub fn quantize_activation_fp8_reference(x: &Tensor) -> Result<QuantizedActivation> {
     let absmax = x.abs()?.flatten_all()?.max(0)?.to_dtype(DType::F32)?;
     let scale = (absmax.to_scalar::<f32>()? / F8E4M3_MAX).max(f32::MIN_POSITIVE);
     let scaled = (x.to_dtype(DType::F32)? / scale as f64)?;
@@ -84,14 +116,46 @@ pub fn quantize_activation_fp8(x: &Tensor) -> Result<QuantizedActivation> {
     Ok(QuantizedActivation { q, scale })
 }
 
-/// Dynamic per-tensor **int8** activation quant (v1). `scale = absmax / 127`, `q = round(x/scale)`
+/// Dynamic per-tensor **int8** activation quant. `scale = absmax / 127`, `q = round(x/scale)`
 /// clamped to `[-127, 127]`, returned in `F32` (the rounded codes).
+///
+/// On CUDA the fused on-device quantizer serves it (byte-identical F32 codes, one 4-byte scale
+/// read for the host [`QuantizedActivation::scale`]); otherwise the reference
+/// [`quantize_activation_int8_reference`], recorded on
+/// [`ACT_QUANT_INT8_PATH`] with its reason.
 pub fn quantize_activation_int8(x: &Tensor) -> Result<QuantizedActivation> {
+    ACT_QUANT_INT8_PATH.dispatch(
+        || {
+            #[cfg(feature = "cuda")]
+            {
+                crate::act_quant::fused_int8(x, crate::act_quant::Int8Output::F32Codes)?
+                    .try_map(host_scale)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Ok(crate::fused_path::Attempt::Reference(
+                    crate::fused_path::PathReason::CudaFeatureOff,
+                ))
+            }
+        },
+        || quantize_activation_int8_reference(x),
+    )
+}
+
+/// The reference op chain of [`quantize_activation_int8`] (parity oracle and non-CUDA path; E1).
+pub fn quantize_activation_int8_reference(x: &Tensor) -> Result<QuantizedActivation> {
     let absmax = x.abs()?.flatten_all()?.max(0)?.to_dtype(DType::F32)?;
     let scale = (absmax.to_scalar::<f32>()? / I8_MAX).max(f32::MIN_POSITIVE);
     let scaled = (x.to_dtype(DType::F32)? / scale as f64)?;
     let q = scaled.round()?.clamp(-I8_MAX, I8_MAX)?;
     Ok(QuantizedActivation { q, scale })
+}
+
+/// A fused result in the host-scale contract: the 4-byte device scale read back.
+#[cfg(feature = "cuda")]
+fn host_scale(q: crate::act_quant::DeviceQuantized) -> Result<QuantizedActivation> {
+    let scale = q.scale.to_vec1::<f32>()?[0];
+    Ok(QuantizedActivation { q: q.codes, scale })
 }
 
 /// Quantize a weight `(N, K)` to fp8 E4M3 once (per-tensor), returning the packed tensor + scale.
@@ -1146,6 +1210,30 @@ mod cuda_impl {
             acc.broadcast_mul(&row)?.to_dtype(DType::BF16)
         }
 
+        /// [`Self::matmul_int8_per_channel_staged_ondevice`] with every operand already on the
+        /// device (SW-6126): the staged activation bytes, the resident `[1, N]` F32 row scale and the
+        /// fused quantizer's `[1]` F32 activation scale. The fold is the same f32 arithmetic in the
+        /// same order (`row = scale_w · scale_x`, then `acc · row`), so the bf16 output is identical
+        /// to the host-scale form — without uploading the row vector or reading the scale back.
+        pub(crate) fn matmul_int8_per_channel_staged_ondevice_device_scales(
+            &self,
+            w: &DevInt8,
+            scale_w: &Tensor,
+            x: &DevInt8,
+            scale_x: &Tensor,
+        ) -> Result<Tensor> {
+            if scale_w.dims() != [1, w.rows] {
+                candle_core::bail!(
+                    "device row scale {:?} != [1, {}] (N = out)",
+                    scale_w.dims(),
+                    w.rows
+                );
+            }
+            let acc = self.matmul_int8_staged(w, x)?.to_dtype(DType::F32)?;
+            let row = scale_w.broadcast_mul(&scale_x.reshape((1, 1))?)?;
+            acc.broadcast_mul(&row)?.to_dtype(DType::BF16)
+        }
+
         /// fp8 GEMM over a **pre-staged** device weight + activation (no per-call operand clone). The
         /// bench's honest fp8 compute path.
         pub fn matmul_fp8_staged(
@@ -1155,7 +1243,7 @@ mod cuda_impl {
             x: &DevFp8,
             scale_x: f32,
         ) -> Result<Tensor> {
-            self.scalar_gemm::<half::bf16>(w, scale_w, x, scale_x)
+            self.scalar_gemm::<half::bf16>(w, Fp8Scale::Host(scale_w), x, Fp8Scale::Host(scale_x))
         }
 
         pub fn matmul_fp8_staged_f32(
@@ -1165,7 +1253,26 @@ mod cuda_impl {
             x: &DevFp8,
             scale_x: f32,
         ) -> Result<Tensor> {
-            self.scalar_gemm::<f32>(w, scale_w, x, scale_x)
+            self.scalar_gemm::<f32>(w, Fp8Scale::Host(scale_w), x, Fp8Scale::Host(scale_x))
+        }
+
+        /// [`Self::matmul_fp8_staged`] with both per-tensor scales already **on the device**
+        /// (SW-6126): cuBLASLt reads them through its `A_SCALE_POINTER` / `B_SCALE_POINTER` at
+        /// execution time, so neither scale is uploaded nor read back — the fused activation
+        /// quantizer's device scale feeds the GEMM with no host synchronization.
+        pub(crate) fn matmul_fp8_staged_device_scales(
+            &self,
+            w: &DevFp8,
+            scale_w: &cudarc::driver::CudaSlice<f32>,
+            x: &DevFp8,
+            scale_x: &cudarc::driver::CudaSlice<f32>,
+        ) -> Result<Tensor> {
+            self.scalar_gemm::<half::bf16>(
+                w,
+                Fp8Scale::Device(scale_w),
+                x,
+                Fp8Scale::Device(scale_x),
+            )
         }
 
         /// Matmul with FP8 weight storage and an unquantized activation in its own dtype.
@@ -1259,9 +1366,9 @@ mod cuda_impl {
         fn scalar_gemm<T: Fp8Output>(
             &self,
             w: &DevFp8,
-            scale_w: f32,
+            scale_w: Fp8Scale<'_>,
             x: &DevFp8,
-            scale_x: f32,
+            scale_x: Fp8Scale<'_>,
         ) -> Result<Tensor> {
             let (m, k, n) = (x.rows, x.cols, w.rows);
             if x.cols != w.cols {
@@ -1278,6 +1385,9 @@ mod cuda_impl {
                 if !x.is_e5m2() {
                     candle_core::bail!("E5M2 weights require E5M2 activation codes");
                 }
+                let (Fp8Scale::Host(scale_w), Fp8Scale::Host(scale_x)) = (scale_w, scale_x) else {
+                    candle_core::bail!("the E5M2 GEMM takes host scales");
+                };
                 use cudarc::driver::{LaunchConfig, PushKernelArg};
                 let (m32, n32, k32) = (
                     u32::try_from(m).map_err(candle_core::Error::wrap)?,
@@ -1319,8 +1429,21 @@ mod cuda_impl {
                     false,
                 ));
             }
-            let sa = self.upload_scalar(scale_w)?;
-            let sb = self.upload_scalar(scale_x)?;
+            let (sa_owned, sb_owned);
+            let sa = match scale_w {
+                Fp8Scale::Host(v) => {
+                    sa_owned = self.upload_scalar(v)?;
+                    &sa_owned
+                }
+                Fp8Scale::Device(s) => s,
+            };
+            let sb = match scale_x {
+                Fp8Scale::Host(v) => {
+                    sb_owned = self.upload_scalar(v)?;
+                    &sb_owned
+                }
+                Fp8Scale::Device(s) => s,
+            };
             {
                 let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
                 let (b_ptr, _gb) = x.buf.device_ptr(&self.stream);
@@ -2179,6 +2302,14 @@ mod cuda_impl {
         }
     }
 
+    /// Where a per-tensor fp8 GEMM scale lives: a host value (uploaded per call) or a one-element
+    /// device buffer the GEMM reads in place (the fused activation quantizer's scale, SW-6126).
+    #[derive(Clone, Copy)]
+    pub(crate) enum Fp8Scale<'a> {
+        Host(f32),
+        Device(&'a cudarc::driver::CudaSlice<f32>),
+    }
+
     /// A `(rows, cols)` fp8 weight/activation staged as an owned, contiguous, offset-0 device
     /// `F8E4M3` buffer. Staged once (at load for weights; per-forward for activations) so a repeated
     /// GEMM does not re-clone the operand — the difference between the bench's honest compute number
@@ -2198,6 +2329,36 @@ mod cuda_impl {
         pub fn is_e5m2(&self) -> bool {
             self.dtype == sys::cudaDataType_t::CUDA_R_8F_E5M2
         }
+
+        /// Adopt an E4M3 code buffer `(rows, cols)` the fused activation quantizer wrote (no copy).
+        pub(crate) fn from_e4m3_codes(
+            buf: cudarc::driver::CudaSlice<float8::F8E4M3>,
+            rows: usize,
+            cols: usize,
+        ) -> Result<Self> {
+            if buf.len() != rows * cols {
+                candle_core::bail!("E4M3 code buffer of {} for ({rows}, {cols})", buf.len());
+            }
+            Ok(Self {
+                dtype: sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                buf,
+                rows,
+                cols,
+            })
+        }
+
+        /// The staged code bytes, read back (tests compare them byte for byte).
+        #[cfg(test)]
+        pub(crate) fn codes_to_host(&self, lt: &CublasLt) -> Result<Vec<u8>> {
+            Ok(lt
+                .stream
+                .clone_dtoh(&self.buf)
+                .map_err(drv_err)?
+                .into_iter()
+                .map(|c| c.to_bits())
+                .collect())
+        }
+
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {
             if !matches!(t.dtype(), DType::U8 | DType::F8E4M3) {
                 candle_core::bail!("expected E4M3FN or E5M2 code bytes");
@@ -2522,6 +2683,12 @@ mod cuda_impl {
         /// the operand a kernel other than cuBLASLt (the fused W4A8 GEMM) reads.
         pub fn codes(&self) -> &Tensor {
             &self.buf
+        }
+
+        /// The staged code bytes, read back (tests compare them byte for byte).
+        #[cfg(test)]
+        pub(crate) fn bytes_to_host(&self) -> Result<Vec<u8>> {
+            self.buf.flatten_all()?.to_vec1::<u8>()
         }
 
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {

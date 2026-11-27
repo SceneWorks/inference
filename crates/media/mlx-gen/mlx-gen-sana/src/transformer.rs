@@ -148,10 +148,11 @@ fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
     Ok(multiply(&normed.as_dtype(dt)?, weight)?)
 }
 
-/// adaLN-single affine `norm·(1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`).
+/// adaLN-single affine `norm·(1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`), the
+/// `1` in `scale`'s dtype: the shared eager [`mlx_gen::nn::modulate_eager`] (SW-6140), the same
+/// three-op chain as this crate's private copy.
 fn modulate(norm: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let one = scalar(1.0).as_dtype(scale.dtype())?;
-    Ok(add(&multiply(norm, &add(scale, &one)?)?, shift)?)
+    mlx_gen::nn::modulate_eager(norm, scale, shift, true)
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -976,8 +977,7 @@ impl SanaTransformer {
         // F-092: use the config eps, not a hardcoded `1e-6`. (For every shipped SANA config
         // `cfg.norm_eps == 1e-6`, so this is a no-op cleanup that removes the divergence risk.)
         let normed = layer_norm(hidden, None, None, cfg.norm_eps)?;
-        let one = scalar(1.0).as_dtype(scale.dtype())?;
-        let hidden = add(&multiply(&normed, &add(&scale, &one)?)?, &shift)?;
+        let hidden = modulate(&normed, &scale, &shift)?;
 
         let out = self.proj_out.forward(&hidden)?; // [B,N, p·p·out_channels]
                                                    // unpatchify: [B,ph,pw,p,p,out_c] → permute(0,5,1,3,2,4) → [B,out_c,ph·p,pw·p].

@@ -33,10 +33,7 @@
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::module::Param;
 use mlx_rs::nn::Linear;
-use mlx_rs::ops::{
-    add, addmm, concatenate_axis, cos as cos_op, dequantize, matmul, multiply, sin as sin_op,
-    split, subtract,
-};
+use mlx_rs::ops::{add, addmm, cos as cos_op, dequantize, matmul, multiply, sin as sin_op, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{quantized_matmul_with_bias, silu};
@@ -395,22 +392,21 @@ impl ChatGlmModel {
     /// GLM interleaved half-dim RoPE on `x` `[b, s, heads, head_dim]`. Rotate the first `rotary_dim`
     /// dims as adjacent pairs `(x[2i], x[2i+1])` against `(cos, sin)` `[1,s,1,rotary_dim/2]`; pass the
     /// trailing `head_dim - rotary_dim` dims through.
+    ///
+    /// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] (SW-6140) with
+    /// `rot_dims = rotary_dim`: the same adjacent-pair `x0·cos − x1·sin`, `x1·cos + x0·sin` chain
+    /// over the same pre-broadcast `[1,s,1,rotary_dim/2]` tables in the model dtype (no casts), with
+    /// the same untouched tail, as this crate's private copy. Positions are explicit (left-padded
+    /// prompts), so this is not a contiguous 1-D layout and has no fused `fast::rope` route.
     fn apply_rope(&self, x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s, h) = (sh[0], sh[1], sh[2]);
-        let half = self.cfg.rotary_dim / 2;
-        // Equal split because rotary_dim == head_dim / 2 (64 of 128).
-        let parts = split(x, 2, 3)?;
-        let (x_rot, x_pass) = (&parts[0], &parts[1]); // each [b,s,h,rotary_dim or rest]
-        let xr = x_rot.reshape(&[b, s, h, half, 2])?;
-        let pair = split(&xr, 2, 4)?; // 2 × [b,s,h,half,1]
-        let x0 = pair[0].reshape(&[b, s, h, half])?; // even lane
-        let x1 = pair[1].reshape(&[b, s, h, half])?; // odd lane
-        let out0 = subtract(&multiply(&x0, cos)?, &multiply(&x1, sin)?)?;
-        let out1 = add(&multiply(&x1, cos)?, &multiply(&x0, sin)?)?;
-        let rot = concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-            .reshape(&[b, s, h, self.cfg.rotary_dim])?;
-        Ok(concatenate_axis(&[&rot, x_pass], 3)?)
+        mlx_gen::qkv::apply_rope_eager(
+            x,
+            mlx_gen::qkv::RopeTables::new(cos, sin),
+            mlx_gen::qkv::RopeStyle::AdjacentPair,
+            mlx_gen::qkv::RotationAxes::TokenMajor,
+            Some(self.cfg.rotary_dim),
+            mlx_gen::qkv::RopeDtype::Promoted,
+        )
     }
 
     fn attn(

@@ -10,7 +10,7 @@
 
 use mlx_rs::{
     fast::{rms_norm, scaled_dot_product_attention},
-    ops::{concatenate_axis, split, stack_axis},
+    ops::{concatenate_axis, split},
     transforms::checkpoint,
     Array, Dtype,
 };
@@ -291,22 +291,26 @@ impl ZImageAttention {
     }
 
     /// Port of `ZImageAttention._apply_rotary_emb`. `x`:(b,s,h,hd), `fc`:(s,hd/2,2).
+    ///
+    /// The `(cos, sin)` pairs are de-interleaved from `fc` here; the rotation is the shared
+    /// [`mlx_gen::qkv::apply_rope`] (SW-6140) — the same core `rope_rotate` glue kernel (sc-27453)
+    /// over the same `[1, s, 1, hd/2]` tables, no casts, as this crate's private copy.
     fn apply_rope(&self, x: &Array, fc: &Array) -> Result<Array> {
         let sh = x.shape();
-        let (b, s, h, hd) = (sh[0], sh[1], sh[2], sh[3]);
+        let (s, hd) = (sh[1], sh[3]);
         let half = hd / 2;
-        let x5 = x.reshape(&[b, s, h, half, 2])?;
-        let xp = split(&x5, 2, 4)?;
-        let xr = xp[0].reshape(&[b, s, h, half])?;
-        let xi = xp[1].reshape(&[b, s, h, half])?;
         let fc5 = fc.reshape(&[1, s, 1, half, 2])?;
         let fp = split(&fc5, 2, 4)?;
         let cos = fp[0].reshape(&[1, s, 1, half])?;
         let sin = fp[1].reshape(&[1, s, 1, half])?;
-        // The complex rotation is core's fused `rope_rotate` glue (sc-27453): this crate's private
-        // copy added `xr·sin + xi·cos` in the other order, which is bit-identical.
-        let (out_r, out_i) = mlx_gen::nn::rope_rotate(&xr, &xi, &cos, &sin)?;
-        Ok(stack_axis(&[out_r, out_i], 4)?.reshape(&[b, s, h, hd])?)
+        mlx_gen::qkv::apply_rope(
+            x,
+            mlx_gen::qkv::RopeTables::new(&cos, &sin),
+            mlx_gen::qkv::RopeStyle::AdjacentPair,
+            mlx_gen::qkv::RotationAxes::TokenMajor,
+            None,
+            mlx_gen::qkv::RopeDtype::Promoted,
+        )
     }
 }
 
