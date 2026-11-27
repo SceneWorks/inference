@@ -131,10 +131,15 @@ ArtifactInput,
     };
     let bits = marker.get("bits").and_then(serde_json::Value::as_i64);
     let group = marker.get("group_size").and_then(serde_json::Value::as_i64);
+    // A Candle-native GGML tier (SW-7285) declares `{bits, storage: "ggml"}` and no group: its
+    // stored blocks carry their own block geometry.
+    let ggml = marker.get("storage").and_then(serde_json::Value::as_str)
+        == Some(candle_gen::quant::stored_ggml::GGML_STORAGE);
     match (bits, group) {
         (Some(bits), Some(group)) if matches!(bits, 4 | 8) && group == GROUP_SIZE as i64 => {
             Ok(Some(bits))
         }
+        (Some(bits), None) if ggml && matches!(bits, 4 | 8) => Ok(Some(bits)),
         _ => Err(Error::Msg(format!(
             "qwen_image_2_1: {} declares quantization {{bits: {bits:?}, group_size: {group:?}}}; \
              every installable tier of this model is Q4 or Q8 at group {GROUP_SIZE}",
@@ -158,6 +163,35 @@ fn derived_component_bits(component_dir: &Path) -> Result<Option<i64>> {
         // A component with no readable safetensors is the loaders' problem, not this check's.
         Err(_) => return Ok(None),
     };
+    // A Candle-native GGML tier (SW-7285): every stored block weight's block type is its width.
+    let mut stored_counts = std::collections::BTreeMap::<i64, usize>::new();
+    for header in headers.iter().filter(|h| h.is_stored_ggml_block()) {
+        let base = header.name.strip_suffix(".weight").unwrap_or(&header.name);
+        if headers
+            .iter()
+            .any(|other| other.name == format!("{base}.scales"))
+        {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: {} stores {base} as GGML blocks beside an affine triple",
+                component_dir.display()
+            )));
+        }
+        if let Some(bits) = header.stored_ggml_block_bits() {
+            *stored_counts.entry(bits as i64).or_default() += 1;
+        }
+    }
+    if !stored_counts.is_empty() {
+        if headers.iter().any(|h| h.name.ends_with(".scales")) {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: {} mixes stored GGML blocks with affine triples",
+                component_dir.display()
+            )));
+        }
+        // The tier's width is the narrowest block present; wider blocks are precision overrides
+        // the converter keeps (the q4 tiers' Q8_0 `img_mod.1`, listed in the marker's
+        // `overrides`). A tier labelled at any other width is a mislabel.
+        return Ok(stored_counts.keys().next().copied());
+    }
     let Some(base) = headers
         .iter()
         .filter_map(|header| header.name.strip_suffix(".scales"))
@@ -382,6 +416,81 @@ mod tests {
         write_marker(&tmp.path().join("text_encoder"), 8, GROUP_SIZE as i64);
         let err = installed_tier(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("no installable tier"), "{err}");
+    }
+
+    /// SW-7285: a Candle-native GGML tier (`{bits, storage: "ggml"}`, no group; stored `U8 [out,
+    /// in / 32, block_bytes]` blocks) is installable under its own label, its block width is the
+    /// derived width (a lying marker is refused), and a group-less marker WITHOUT the storage tag
+    /// stays a hard error. Header-only.
+    #[test]
+    fn a_stored_ggml_tier_is_installable_and_derived_from_its_blocks() {
+        use candle_core::{DType, Device, Tensor};
+        let write = |dir: &Path, bits: i64, block: usize| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::json!({ "quantization": { "bits": bits, "storage": "ggml" } })
+                    .to_string(),
+            )
+            .unwrap();
+            let tensors = std::collections::HashMap::from([(
+                "img_in.weight".to_owned(),
+                Tensor::zeros((4, 2, block), DType::U8, &Device::Cpu).unwrap(),
+            )]);
+            candle_gen::candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))
+                .unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(&root.join("transformer"), 8, 34);
+        write(&root.join("text_encoder"), 8, 34);
+        assert_eq!(installed_tier(root).unwrap(), Tier::Q8);
+        assert_eq!(
+            resolve_requested_tier(root, Some(Quant::Q8)).unwrap(),
+            Tier::Q8
+        );
+        // A Q8-labelled component of Q4_1 blocks is a mislabel.
+        write(&root.join("transformer"), 8, 20);
+        let err = installed_tier(root).unwrap_err().to_string();
+        assert!(err.contains("Q4"), "{err}");
+
+        // The q4 tier keeps `img_mod.1` at Q8_0 (declared in the marker's `overrides`): a
+        // 4-bit transformer with Q8_0 override blocks is still the q4 tier.
+        let mixed = tmp.path().join("mixed");
+        for component in ["transformer", "text_encoder"] {
+            let dir = mixed.join(component);
+            write(&dir, 4, 20);
+        }
+        std::fs::write(
+            mixed.join("transformer").join("config.json"),
+            serde_json::json!({ "quantization": { "bits": 4, "storage": "ggml", "overrides": [
+                { "pattern": "transformer_blocks\\.\\d+\\.img_mod\\.1", "bits": 8, "count": 1 }
+            ] } })
+            .to_string(),
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &std::collections::HashMap::from([
+                (
+                    "img_in.weight".to_owned(),
+                    Tensor::zeros((4, 2, 20), DType::U8, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "transformer_blocks.0.img_mod.1.weight".to_owned(),
+                    Tensor::zeros((4, 2, 34), DType::U8, &Device::Cpu).unwrap(),
+                ),
+            ]),
+            mixed.join("transformer").join("model.safetensors"),
+        )
+        .unwrap();
+        assert_eq!(installed_tier(&mixed).unwrap(), Tier::Q4);
+
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            r#"{"quantization":{"bits":8}}"#,
+        )
+        .unwrap();
+        assert!(packed_bits(&root.join("transformer")).is_err());
     }
 
     #[test]

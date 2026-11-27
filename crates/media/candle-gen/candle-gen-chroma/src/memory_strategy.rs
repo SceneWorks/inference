@@ -598,6 +598,51 @@ fn inspect_transformer_tier(
         .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let config_packed = config_quant(config)?;
+    // A Candle-native GGML tier (SW-7285): `{base}.weight` stored as GGML blocks (`U8 [out, in /
+    // 32, block_bytes]`, no affine sidecars) whose block type is the physical width.
+    let stored_bases = headers
+        .values()
+        .filter(|header| header.is_stored_ggml_block())
+        .filter_map(|header| header.name.strip_suffix(".weight").map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    if !stored_bases.is_empty() {
+        let Some((bits, group)) = config_packed else {
+            return Err(gen_core::Error::Unsupported(
+                "chroma: stored GGML transformer has no matching config quantization block".into(),
+            ));
+        };
+        for base in &stored_bases {
+            let header = &headers[&format!("{base}.weight")];
+            if packed_bases.contains(base)
+                || headers.contains_key(&format!("{base}.biases"))
+                || header.stored_ggml_block_bits() != Some(usize::from(bits))
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "chroma: stored GGML {base} crosses the config's Q{bits} width or is also \
+                     stored as an affine triple"
+                )));
+            }
+        }
+        if !packed_bases.is_empty() {
+            return Err(gen_core::Error::Unsupported(
+                "chroma: transformer mixes stored GGML blocks with affine triples".into(),
+            ));
+        }
+        for (name, header) in &headers {
+            let stored = name
+                .strip_suffix(".weight")
+                .is_some_and(|base| stored_bases.contains(base));
+            if !stored && header.dtype != Dtype::BF16 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "chroma: non-packed transformer tensor {name} must be BF16"
+                )));
+            }
+        }
+        return Ok((
+            Some(if bits == 4 { Quant::Q4 } else { Quant::Q8 }),
+            Some(group),
+        ));
+    }
     if packed_bases.is_empty() {
         if config_packed.is_some() {
             return Err(gen_core::Error::Unsupported(
@@ -718,6 +763,11 @@ fn projected_transformer_header(
                 gen_core::Error::Unsupported("chroma: packed tensor lacks group size".into())
             })?,
         );
+    }
+    // A stored GGML block (SW-7285; validated by `inspect_transformer_tier`) is built as
+    // published: its stored bytes are the resident weight.
+    if header.name.ends_with(".weight") && header.is_stored_ggml_block() {
+        return Ok(header.data_bytes);
     }
     if header.dtype != gen_core::weightsmeta::Dtype::BF16 {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1834,6 +1884,63 @@ mod tests {
         AdapterSpec, LoadShape, MemoryBudget, MemoryCacheState, MemorySelection,
         MemoryStrategyParameters, OffloadPolicy,
     };
+
+    /// SW-7285: a Candle-native GGML Chroma transformer (stored `U8 [out, in / 32, block_bytes]`
+    /// blocks under a `{bits, storage: "ggml"}` config) resolves to the tier its blocks encode and
+    /// prices them at their stored bytes; the other width, a missing config and a both-forms
+    /// projection are refused. Header-only.
+    #[test]
+    fn stored_ggml_transformer_resolves_and_prices_its_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (bits, block, other) in [(4u8, 20usize, 34usize), (8, 34, 20)] {
+            let dir = tmp.path().join(format!("q{bits}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("model.safetensors");
+            let config = dir.join("config.json");
+            let write_config = |marker: bool| {
+                let body = if marker {
+                    format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#)
+                } else {
+                    "{}".to_owned()
+                };
+                std::fs::write(&config, body).unwrap();
+                gen_core::PinnedWeightsFile::pin(&config).unwrap()
+            };
+            write_safetensors(
+                &model,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("n.weight", "BF16", &[4], 8),
+                ],
+            );
+            let files = vec![model.clone()];
+            let (tier, group) = inspect_transformer_tier(&files, &write_config(true)).unwrap();
+            assert_eq!(tier.map(|q| q.bits()), Some(i32::from(bits)));
+            assert_eq!(group, Some(candle_gen::quant::MLX_GROUP_SIZE));
+            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&model).unwrap();
+            let by_name = headers
+                .iter()
+                .map(|h| (h.name.clone(), h.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let stored = headers.iter().find(|h| h.name == "a.weight").unwrap();
+            assert_eq!(
+                projected_transformer_header(stored, &by_name, &BTreeSet::new(), group).unwrap(),
+                (4 * 2 * block) as u64
+            );
+            assert!(inspect_transformer_tier(&files, &write_config(false)).is_err());
+            write_safetensors(&model, &[("a.weight", "U8", &[4, 2, other], 4 * 2 * other)]);
+            assert!(inspect_transformer_tier(&files, &write_config(true)).is_err());
+            write_safetensors(
+                &model,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("a.scales", "BF16", &[4, 1], 8),
+                    ("a.biases", "BF16", &[4, 1], 8),
+                ],
+            );
+            assert!(inspect_transformer_tier(&files, &write_config(true)).is_err());
+        }
+    }
 
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0_usize;
