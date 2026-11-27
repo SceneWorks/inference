@@ -2169,6 +2169,81 @@
       ]
     },
     {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::fp8_codes_are_byte_identical_to_the_candle_chain",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused fp8 activation quantizer: E4M3 codes and scale bit-identical to the candle reference chain (CPU-cast) over F32/BF16/F16, tails, zeros, signed zeros, E4M3 ties, underflow, inf/NaN. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::int8_codes_are_byte_identical_to_the_candle_chain",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused int8 activation quantizer: F32 codes and scale bit-identical to the candle round/clamp chain, and i8 bytes identical to the cuBLASLt stage of the reference codes, over the same input matrix. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::fp8_divide_rule_matches_the_fp8_linear_quantizer",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA fused fp8 quantizer, Fp8Linear route: codes and scale bit-identical to CublasLt::scaled_fp8_activation (hardware cvt.rn.satfinite) on the same inputs. cfg(cuda), Device::new_cuda(0), sm_89+.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::the_e4m3_rounding_matches_float8_on_a_bit_pattern_sweep",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA software E4M3 rounding vs the float8 crate on a strided sweep of every 251st binary32 bit pattern (about 9M values) plus specials, scale 1. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "act_quant::cuda_tests::the_public_quantizers_report_their_path",
+      "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
+      "reason": "SW-6126 CUDA path telemetry: quantize_activation_fp8/int8 record fused on CUDA, disabled with the switch off (identical output), not_cuda for a CPU tensor. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-llm",
       "kind": "lib",
       "target": "candle_llm",
