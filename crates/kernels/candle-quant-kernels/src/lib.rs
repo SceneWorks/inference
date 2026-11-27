@@ -75,6 +75,7 @@ pub mod fused_decode;
 pub mod fused_path;
 pub mod gated_delta;
 pub mod gdn_prep;
+pub mod media_rope;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -170,6 +171,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    media_rope::MEDIA_ROPE_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 

@@ -37,6 +37,9 @@ mod cuda_proof_pool;
 #[path = "cuda_quant_smoke.rs"]
 mod cuda_quant_smoke;
 
+#[path = "fused_rope_gpu.rs"]
+mod fused_rope_gpu;
+
 #[path = "int8_per_channel_numerics.rs"]
 mod int8_per_channel_numerics;
 

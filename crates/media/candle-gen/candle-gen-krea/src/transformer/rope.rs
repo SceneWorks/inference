@@ -18,7 +18,8 @@
 //! Inverse frequencies + angles are built on the host in **f64** (the reference's `rope` uses
 //! `torch.float64`), then the `cos`/`sin` tables are materialized as f32 (`rope(...).float()`).
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::rope::{apply_rope, RopeLayout, RopeSpec};
 
 /// Precomputed `cos`/`sin` rotary tables for one forward pass, laid out `[1, cap_len + img_len,
 /// head_dim/2]` (f32) in joint `[text; image]` order.
@@ -140,34 +141,23 @@ fn from_positions(
     })
 }
 
+/// Krea's RoPE convention on the shared apply (SW-6128): complex-**interleaved** pairs on
+/// `[b, s, heads, head_dim]`, `cos`/`sin` `[1, s, head_dim/2]` (f32, broadcast over heads), rotated
+/// in f32 (the reference upcasts) and cast back to `x`'s dtype.
+pub const KREA_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bshd);
+
 /// Apply the complex-interleaved rotary embedding to `x` in `[b, s, heads, head_dim]` layout.
 ///
 /// `cos`/`sin` are `[1, s, head_dim/2]` (f32, broadcast over heads). For each adjacent pair
 /// `(x[2k], x[2k+1])`:
 ///   `out[2k]   = x[2k]·cos_k − x[2k+1]·sin_k`
 ///   `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k`
-/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype.
+/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype. This is
+/// `candle_gen::rope::apply_rope` with [`KREA_ROPE`]: the fused strided kernel on CUDA, and on
+/// every other path the narrow / mul / stack chain this module used to carry (now the shared
+/// reference, bit for bit).
 pub fn apply_interleaved_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dt = x.dtype();
-    let (b, s, h, hd) = x.dims4()?;
-    let half = hd / 2;
-
-    // cos/sin: [1, s, half] → [1, s, 1, half] (broadcast over heads + the pair axis). They arrive as
-    // `narrow`ed slices of the rope table, so contiguate before the reshape.
-    let cos = cos.contiguous()?.reshape((1, s, 1, half))?;
-    let sin = sin.contiguous()?.reshape((1, s, 1, half))?;
-
-    // [b, s, h, hd] → [b, s, h, half, 2]; the last axis holds the (even, odd) complex pair.
-    let xr = x.to_dtype(DType::F32)?.reshape((b, s, h, half, 2))?;
-    let xe = xr.narrow(4, 0, 1)?.contiguous()?.reshape((b, s, h, half))?;
-    let xo = xr.narrow(4, 1, 1)?.contiguous()?.reshape((b, s, h, half))?;
-
-    let out_e = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
-    let out_o = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
-
-    // Re-interleave: stack on a new trailing axis → [b, s, h, half, 2] → [b, s, h, hd].
-    let out = Tensor::stack(&[&out_e, &out_o], D::Minus1)?.reshape((b, s, h, hd))?;
-    out.to_dtype(dt)
+    apply_rope(x, cos, sin, &KREA_ROPE)
 }
 
 #[cfg(test)]

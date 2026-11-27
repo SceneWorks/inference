@@ -39,9 +39,13 @@ mod harness;
 #[path = "fused_kernels_bench/act_quant.rs"]
 mod act_quant;
 
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/rope.rs"]
+mod rope;
+
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
-const SUITES: &[(&str, harness::Suite)] = &[("act_quant", act_quant::rows)];
+const SUITES: &[(&str, harness::Suite)] = &[("act_quant", act_quant::rows), ("rope", rope::rows)];
 
 #[cfg(feature = "cuda")]
 fn main() -> candle_gen::candle_core::Result<()> {
