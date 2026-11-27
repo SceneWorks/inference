@@ -1547,12 +1547,20 @@ fn catalog_attention_routing_covers_every_provider() {
         ("krea_2_turbo", Some((true, true))),
         ("wan2_2_ti2v_5b", Some((true, true))),
         ("flux1_dev", Some((true, true))),
-        // f32 attention: the flash toggle reaches it, neither lossy kernel can.
-        ("ltx_2_3_distilled", Some((false, false))),
-        ("flux2_dev", Some((false, false))),
-        // 64-wide heads: INT8 only.
-        ("sdxl", Some((true, false))),
-        ("instantid", Some((true, false))),
+        // f32 attention runs at bf16 in the shared dispatch: both kernels.
+        ("ltx_2_3_distilled", Some((true, true))),
+        ("flux2_dev", Some((true, true))),
+        ("svd_xt", Some((true, true))),
+        // 64 / 120-wide heads are zero-padded to the kernels' widths: both kernels.
+        ("sdxl", Some((true, true))),
+        ("instantid", Some((true, true))),
+        ("boogu_image", Some((true, true))),
+        // Real kernel gaps only: a mask on every call, 256-wide heads, no self-attention.
+        ("mochi_1", Some((false, false))),
+        ("sensenova_u1_8b", Some((false, false))),
+        ("ideogram_4", Some((false, false))),
+        ("qwen_image_2_1", Some((true, false))),
+        ("kolors", Some((false, false))),
         ("moss_image_base", None),
         ("sana_1600m", None),
         ("supra2_img", None),
@@ -1631,20 +1639,30 @@ fn lossy_attention_admission_is_typed() {
         sol: Some(SolConfig::top_k(0.25)),
     };
     unsupported(
-        admit("flux2_dev", &int8),
-        "int8_attention: `flux2_dev` runs its attention in f32",
+        admit("mochi_1", &int8),
+        "int8_attention: `mochi_1` attends under its text padding mask",
     );
-    unsupported(
-        admit("ltx_2_3_distilled", &sol),
-        "sol_attention: `ltx_2_3_distilled` runs its attention in f32",
-    );
-    unsupported(admit("sdxl", &sol), "64-wide attention heads");
-    unsupported(admit("sdxl", &both), "sol_attention: `sdxl`");
-    unsupported(admit("boogu_image", &int8), "120-wide attention heads");
+    unsupported(admit("sensenova_u1_8b", &sol), "block-causal mask");
+    unsupported(admit("ideogram_4", &int8), "256-wide attention heads");
     unsupported(admit("qwen_image_2_1", &sol), "block-causally");
-    if INT8_ATTN_COMPILED {
-        admit("sdxl", &int8).unwrap();
-        admit("instantid", &int8).unwrap();
+    unsupported(
+        admit("qwen_image_2_1", &both),
+        "sol_attention: `qwen_image_2_1`",
+    );
+    unsupported(admit("kolors", &int8), "candle's stock");
+    // Operand layout is never refused: f32 attention and 64 / 120-wide heads take both kernels.
+    if INT8_ATTN_COMPILED && SOL_ATTN_COMPILED {
+        for id in [
+            "flux2_dev",
+            "ltx_2_3_distilled",
+            "svd_xt",
+            "sdxl",
+            "instantid",
+            "boogu_image",
+            "lens",
+        ] {
+            admit(id, &both).unwrap();
+        }
         admit("qwen_image_2_1", &int8).unwrap();
     }
 }

@@ -95,9 +95,10 @@ pub enum SharedAttentionRouting {
     /// toggle reaches it, and so does each lossy kernel the provider can take
     /// ([`LossyServe::Served`]) when opted in. Each call is still eligibility-checked; a call a
     /// lossy kernel cannot serve keeps FlashAttention / the budgeted path, counted in
-    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`. A kernel the provider's attention can
-    /// never take (f32 attention, a head width or attention pattern the kernel does not serve) is
-    /// [`LossyServe::Never`] and refused upfront by [`admit_lossy_attention`].
+    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`. Operand layout is never a reason to
+    /// refuse (the shared dispatch runs f32 at bf16 and zero-pads a head dim below 128); a kernel
+    /// gap the provider's attention always hits (a mask, a head dim above 128, no self-attention
+    /// for Sol-Attn) is [`LossyServe::Never`], refused upfront by [`admit_lossy_attention`].
     SharedHelpers {
         /// Whether the provider's attention can take the INT8 QK kernel (SW-6131).
         int8: LossyServe,
@@ -114,8 +115,9 @@ pub enum SharedAttentionRouting {
 /// kernel at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossyServe {
-    /// Its attention calls are shaped for the kernel (bf16 / f16 on CUDA, a head width and an
-    /// attention pattern the kernel serves); each call is still eligibility-checked.
+    /// Its attention calls can take the kernel (unmasked, a head dim of at most 128, and for
+    /// Sol-Attn a sequence attending to itself; f32 runs at bf16 and a narrower head is
+    /// zero-padded by the shared dispatch); each call is still eligibility-checked.
     Served,
     /// Its attention can never take the kernel, and why (the typed refusal's text): opting in
     /// would only render the exact path.
@@ -155,16 +157,15 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
     use SharedAttentionRouting as R;
     const ALL: R = R::ALL;
     const BESPOKE: R = R::Bespoke;
-    const F32: &str = "runs its attention in f32; the INT8 / Sol-Attn kernels take bf16 / f16 only";
-    const HD64: &str = "has 64-wide attention heads; Sol-Attn takes head dim 128 only";
-    const HD120: &str = "has 120-wide attention heads; the INT8 kernel takes head dim 64 / 128 \
-                         and Sol-Attn 128";
-    const HD256: &str = "has 256-wide attention heads; the INT8 kernel takes head dim 64 / 128 \
-                         and Sol-Attn 128";
-    const BLOCK_CAUSAL: &str = "attends block-causally (no unmasked whole-sequence \
-                                self-attention); Sol-Attn takes only that";
-    const MASKED_F32: &str = "runs its masked attention in f32; the INT8 / Sol-Attn kernels take \
-                              unmasked bf16 / f16 only";
+    // The only `Never`s are kernel gaps. Operand layout is never one: the shared dispatch runs f32
+    // attention at bf16 and zero-pads a head dim below 128 (`candle_gen::fused_attention::
+    // LossyOperandAdapt`), so an f32 model or a 64 / 120-wide head takes both kernels.
+    const HD256: &str =
+        "has 256-wide attention heads: the INT8 kernel is compiled for head dim 64 \
+                         / 128 and Sol-Attn for 128, and a wider head cannot be zero-padded down";
+    const BLOCK_CAUSAL: &str = "attends block-causally: every unmasked call attends a query slice \
+                                to a longer key prefix (Sq != Sk), and Sol-Attn routes only a token \
+                                sequence attending to itself";
     &[
         ("anima_base", ALL),
         ("anima_aesthetic", ALL),
@@ -172,37 +173,41 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         // Bernini renders with Wan's `WanTransformer`.
         ("bernini_renderer", ALL),
         ("bernini", ALL),
-        ("boogu_image", R::exact_only(HD120)),
-        ("boogu_image_turbo", R::exact_only(HD120)),
-        ("boogu_image_edit", R::exact_only(HD120)),
-        // Chroma's DiT loads and attends at f32.
-        ("chroma1_hd", R::exact_only(F32)),
-        ("chroma1_base", R::exact_only(F32)),
-        ("chroma1_flash", R::exact_only(F32)),
+        // 120-wide heads: zero-padded to 128 for both kernels.
+        ("boogu_image", ALL),
+        ("boogu_image_turbo", ALL),
+        ("boogu_image_edit", ALL),
+        // Chroma, FLUX.2, FLUX.3, LTX, SCAIL2 and SVD attend at f32: run at bf16 by the dispatch.
+        ("chroma1_hd", ALL),
+        ("chroma1_base", ALL),
+        ("chroma1_flash", ALL),
         ("flux1_schnell", ALL),
         ("flux1_dev", ALL),
-        // FLUX.2 pins every component's compute dtype to f32.
-        ("flux2_klein_9b", R::exact_only(F32)),
-        ("flux2_dev", R::exact_only(F32)),
-        // FLUX.3's packed attention upcasts its operands to an f32 kernel dtype.
-        ("flux3_klein", R::exact_only(F32)),
-        ("flux3_klein_base", R::exact_only(F32)),
+        ("flux2_klein_9b", ALL),
+        ("flux2_dev", ALL),
+        ("flux3_klein", ALL),
+        ("flux3_klein_base", ALL),
         ("ideogram_4", R::exact_only(HD256)),
         ("ideogram_4_turbo", R::exact_only(HD256)),
         ("iris_3b", ALL),
-        // Kolors' dense UNet is candle's stock f32 attention; its packed UNet is the SDXL UNet at
-        // f32.
-        ("kolors", R::exact_only(F32)),
+        (
+            "kolors",
+            R::exact_only(
+                "denoises a dense snapshot without adapters (its default) with candle's stock \
+                 SDXL UNet attention, outside the shared Candle attention helpers (only its \
+                 packed / adapter UNet routes through them)",
+            ),
+        ),
         ("krea_2_turbo", ALL),
         ("krea_2_raw", ALL),
         ("krea_2_edit", ALL),
         ("krea_2_turbo_edit", ALL),
         ("krea_2_turbo_control", ALL),
-        ("lens_turbo", R::int8_only(HD64)),
-        ("lens", R::int8_only(HD64)),
-        // LTX's DiT attention upcasts Q/K/V to f32 before the shared helper.
-        ("ltx_2_3_distilled", R::exact_only(F32)),
-        ("ltx_2_5_distilled", R::exact_only(F32)),
+        // 64-wide heads: zero-padded to 128 for Sol-Attn (INT8 has a 64 template).
+        ("lens_turbo", ALL),
+        ("lens", ALL),
+        ("ltx_2_3_distilled", ALL),
+        ("ltx_2_5_distilled", ALL),
         // Mage's DiT attention goes through `training_sdpa_bhsd` (the shared planned helper).
         ("mage_flow", ALL),
         ("mage_flow_base", ALL),
@@ -212,8 +217,13 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("mage_flow_edit_turbo", ALL),
         ("minimax_h3", ALL),
         ("minimax_h3_image", ALL),
-        // Mochi's joint attention always carries the text padding mask.
-        ("mochi_1", R::exact_only(MASKED_F32)),
+        (
+            "mochi_1",
+            R::exact_only(
+                "attends under its text padding mask on every call (joint and pooled attention), \
+                 and neither the INT8 nor the Sol-Attn kernel takes an attention mask",
+            ),
+        ),
         // MOSS-Image's DiT attention is its own explicit-f32 materialized path.
         ("moss_image_base", BESPOKE),
         ("moss_image_sft", BESPOKE),
@@ -223,22 +233,31 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         // Sana: ReLU linear self-attention plus its own masked cross-attention.
         ("sana_1600m", BESPOKE),
         ("sana_sprint_1600m", BESPOKE),
-        // SCAIL2's DiT loads at f32.
-        ("scail2_14b", R::exact_only(F32)),
-        ("sd3_5_large", R::int8_only(HD64)),
-        ("sd3_5_large_turbo", R::int8_only(HD64)),
-        ("sd3_5_medium", R::int8_only(HD64)),
-        ("sdxl", R::int8_only(HD64)),
+        ("scail2_14b", ALL),
+        ("sd3_5_large", ALL),
+        ("sd3_5_large_turbo", ALL),
+        ("sd3_5_medium", ALL),
+        ("sdxl", ALL),
         ("seedvr2", ALL),
         ("seedvr2_3b", ALL),
         ("seedvr2_7b", ALL),
-        // SenseNova's block-causal attention widens to f32 activations.
-        ("sensenova_u1_8b", R::exact_only(MASKED_F32)),
-        ("sensenova_u1_8b_fast", R::exact_only(MASKED_F32)),
+        (
+            "sensenova_u1_8b",
+            R::exact_only(
+                "attends under its block-causal mask on every call, and neither the INT8 nor the \
+                 Sol-Attn kernel takes an attention mask",
+            ),
+        ),
+        (
+            "sensenova_u1_8b_fast",
+            R::exact_only(
+                "attends under its block-causal mask on every call, and neither the INT8 nor the \
+                 Sol-Attn kernel takes an attention mask",
+            ),
+        ),
         // Supra-2's DiT has its own materialized `sdpa`.
         ("supra2_img", BESPOKE),
-        // SVD's UNet runs f32 (half precision only under the `SVD_FORCE_*` diagnostics).
-        ("svd_xt", R::exact_only(F32)),
+        ("svd_xt", ALL),
         ("wan2_2_ti2v_5b", ALL),
         ("wan2_2_t2v_14b", ALL),
         ("wan2_2_i2v_14b", ALL),
@@ -247,12 +266,9 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("z_image_turbo", ALL),
         ("z_image", ALL),
         ("iris_3b_restore", ALL),
-        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet (f16).
+        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet.
         (candle_gen_pulid::memory_strategy::PROVIDER_ID, ALL),
-        (
-            candle_gen_instantid::memory_strategy::PROVIDER_ID,
-            R::int8_only(HD64),
-        ),
+        (candle_gen_instantid::memory_strategy::PROVIDER_ID, ALL),
         // The captioner and the CLIP embedders run their own attention.
         ("fancyfeast/llama-joycaption-beta-one-hf-llava", BESPOKE),
         ("clip_vit_l14", BESPOKE),
