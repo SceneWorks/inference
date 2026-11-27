@@ -322015,5 +322015,185 @@
       "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "candle_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+    "source": "crates/media/candle-gen/candle-gen-wan/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for two Wan VAE Resnet blocks (96->192 with 1x1 shortcut at 24x40, 192->192 at 18x30), random activations streamed over 5 frames, f32 and bf16, on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+    "required_environment": [],
+    "device_witness": "The test observes the Resnet outputs on the selected CUDA device and counts every ChanNorm->SiLU->CausalConv3d site through the fused kernel with the switch on (2 per frame) and through the op chain (disabled) with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. f32 fused vs op chain rel-L2 <= 1e-5 (streamed, mixed fused/reference chunks sharing one feat_cache, single pass); a wrong-side causal pad must exceed 1e-2; bf16 fused rel-L2 vs the f32 block <= 1.05x the bf16 op chain's + 1e-4.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Stream both Resnets fused and on the op chain (f32 and bf16), mixed-path chunks, a fused single pass and the wrong-side-pad mutation; assert the path counters and the declared bounds."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "candle_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+    "source": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production real Wan 2.x z16 VAE (the A14B VAE, $WAN_VAE16_SNAPSHOT/vae/diffusion_pytorch_model.safetensors) at bf16 and f32; a fixed host-generated standard-normal latent [1,16,5,60,104] (480x832x17 output).",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary: the fused decode output on the selected CUDA device; the path counters show every norm site fused with the switch on and none with it off.",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof. Per dtype: PSNR fused vs op chain >= 50 dB, the wrong-side-pad mutation < 50 dB, and the fused decode peak (CUDA pool USED_MEM_HIGH above baseline) below the op chain's; prints PSNR, peak MiB and decode ms.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Decode the fixed latent with the fused norm+SiLU+pad off, on, and on with the wrong-side-pad mutation, at bf16 and f32; assert PSNR, path counters and the lower decode peak."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+      "requirements": [
+        {
+          "slot": "wan-direct-actual-vae-file",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-ltx",
+    "target": "candle_gen_ltx",
+    "target_kind": "lib",
+    "fqn": "vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
+    "source": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_ltx",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for LTX VAE DecResBlock and EncResBlock (128ch at 5x16x24, 256ch at 3x12x20), random f32 activations, on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
+    "required_environment": [],
+    "device_witness": "The test observes both block outputs on the selected CUDA device and counts both pixel-norm->SiLU->CausalConv3d sites per block through the fused kernel with the switch on and through the op chain (disabled) with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; the f32 fused block output equals the op chain's exactly (max |d| = 0).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run each block with the fused kernel off and on; assert the path counters and identical f32 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
+      "requirements": []
+    }
   }
 ]
