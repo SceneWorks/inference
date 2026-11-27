@@ -231,7 +231,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    self, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, PidWeights, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
     COMFYUI_VAE_COMPONENT,
 };
@@ -1362,21 +1362,35 @@ pub fn compile_render_plan(
     compile_trajectory_for(req).map(|plan| Some(plan.bind_load(spec)))
 }
 
-const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
-    gen_core::RenderPlanRegistration {
-        provider_id: MODEL_ID,
-        compile: compile_render_plan,
-    };
-
-pub fn edit_descriptor() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = "qwen_image_edit";
-    d.capabilities.supports_low_res_start = false;
-    d.capabilities.conditioning = vec![
+pub(crate) fn route_edit() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = "qwen_image_edit";
+    route.structure.conditioning.kinds = vec![
         gen_core::ConditioningKind::Reference,
         gen_core::ConditioningKind::MultiReference,
     ];
-    d
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::feature_route(Some(MODEL_ID), edit_descriptor)
+        .with_render_plan(compile_edit_render_plan)
+        .with_encoder_contract_parent(MODEL_ID);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_composed_memory_registration(QWEN_EDIT_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                weights_free_qwen_edit_memory_contract,
+            )
+            .with_memory_behavior_registration(QWEN_EDIT_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
+pub fn edit_descriptor() -> ModelDescriptor {
+    route_edit().compute_descriptor()
 }
 
 pub fn compile_edit_render_plan(
@@ -1453,17 +1467,26 @@ pub const EDIT_FEATURE_ROUTE_REGISTRATION: gen_core::FeatureRouteRegistration =
         render_plan: Some(EDIT_RENDER_PLAN_REGISTRATION),
     };
 
-pub fn control_descriptor() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = "qwen_image_control";
-    d.capabilities.supports_low_res_start = false;
-    d.capabilities.conditioning = vec![gen_core::ConditioningKind::Control];
-    d.control_kinds = Some(gen_core::AcceptedControlKinds::Only(vec![
+pub(crate) fn route_control() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = "qwen_image_control";
+    route.structure.conditioning.kinds = vec![gen_core::ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(gen_core::AcceptedControlKinds::Only(vec![
         gen_core::ControlKind::Pose,
         gen_core::ControlKind::Canny,
         gen_core::ControlKind::Depth,
     ]));
-    d
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.bindings = gen_core::RouteBindings::feature_route(Some(MODEL_ID), control_descriptor)
+        .with_render_plan(compile_control_render_plan)
+        .with_encoder_contract_parent(MODEL_ID);
+    route
+}
+
+pub fn control_descriptor() -> ModelDescriptor {
+    route_control().compute_descriptor()
 }
 
 pub fn compile_control_render_plan(
@@ -1561,43 +1584,136 @@ pub fn pag_capability() -> gen_core::PagCapability {
     }
 }
 
-/// Qwen-Image txt2img descriptor — the surface sc-3696 wires: true-CFG txt2img with a negative
-/// prompt; no conditioning (img2img/Edit deferred), with user LoRA/LoKr on the base MMDiT.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Qwen-Image (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load)
+        .with_render_plan(compile_render_plan);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(QWEN_IMAGE_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                weights_free_qwen_image_memory_contract,
+            )
+            .with_memory_behavior_registration(QWEN_IMAGE_MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "qwen-image",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::menu_with_aliases(
-                candle_gen::curated_scheduler_names(),
-                &["flow_match_euler"],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen2_5_vl", None)],
+                encoder_contract: Some(ENCODER_CONTRACT),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["flow_match_euler"],
+                ),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("qwen_image_mmdit")
+                    .with_low_res_start()
+                    .with_pag(pag_capability()),
             ),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            supported_quants: &[] as &[Quant],
-            requires_sigma_shift: true,
-            supports_sequential_offload: true,
-            // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
-            // bidirectional guard sc-16951 added to `candle-gen-catalog`.
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(pag_capability()),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen2_5_vl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["qwen_image_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::DirectoryOrFile,
+                supported_quants: &[] as &[Quant],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("euler"),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Qwen-Image txt2img descriptor — computed from [`route_base`].
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
 }
 
 fn generator_from_pipeline(
@@ -1779,27 +1895,16 @@ pub fn load_from_comfyui_dit(
     load(&spec)
 }
 
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-
-/// Add the Candle Qwen-Image generator to an explicit media registry builder.
+/// Add the Candle Qwen-Image routes to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_render_plan(RENDER_PLAN_REGISTRATION)
-        .register_feature_route(EDIT_FEATURE_ROUTE_REGISTRATION)
-        .register_feature_route(CONTROL_FEATURE_ROUTE_REGISTRATION)
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "qwen_image_edit",
-            provider_id: MODEL_ID,
-        })
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "qwen_image_control",
-            provider_id: MODEL_ID,
-        })
+    registry
+        .register_route(route_base())
+        .register_route(route_edit())
+        .register_route(route_control())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
                 backend: gen_core::CheckpointBackend::Candle,
@@ -1810,12 +1915,7 @@ pub fn register_providers(
                 inherit_adapters: true,
             }],
             ..gen_core::QWEN_IMAGE_CHECKPOINT_ADAPTER
-        });
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR);
-    registry
+        })
 }
 
 /// Register the exhaustive weights-free memory-contract surface on every build platform.

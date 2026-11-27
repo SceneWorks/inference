@@ -103,49 +103,19 @@ pub use base::ZImageBaseGenerator;
 pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAULT_CONTROL_SCALE};
 pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRENGTH};
 
-/// Add every registry-owned Candle Z-Image provider to an explicit media registry builder.
+/// Add every registry-owned Candle Z-Image provider to an explicit media registry builder via
+/// one-call [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 ///
 /// Bespoke control/edit utilities remain direct worker integrations and are intentionally absent.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_generator(base::REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: compile_turbo,
-        })
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: base::MODEL_ID,
-            compile: compile_base,
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "z_image_turbo_control",
-            parent_provider_id: Some(MODEL_ID),
-            descriptor: turbo_control_descriptor,
-            render_plan: Some(gen_core::RenderPlanRegistration {
-                provider_id: "z_image_turbo_control",
-                compile: compile_turbo_control,
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "z_image_control",
-            parent_provider_id: Some(base::MODEL_ID),
-            descriptor: base_control_descriptor,
-            render_plan: Some(gen_core::RenderPlanRegistration {
-                provider_id: "z_image_control",
-                compile: compile_base_control,
-            }),
-        })
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "z_image_turbo_control",
-            provider_id: MODEL_ID,
-        })
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "z_image_control",
-            provider_id: base::MODEL_ID,
-        })
+    registry
+        .register_route(route_turbo())
+        .register_route(route_base())
+        .register_route(route_turbo_control())
+        .register_route(route_base_control())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
                 backend: gen_core::CheckpointBackend::Candle,
@@ -156,14 +126,8 @@ pub fn register_providers(
                 inherit_adapters: true,
             }],
             ..gen_core::Z_IMAGE_CHECKPOINT_ADAPTER
-        });
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
-        .register_memory_behavior(BASE_CONTROL_MEMORY_BEHAVIOR);
-    registry.register_trainer(training::REGISTRATION)
+        })
+        .register_trainer(training::REGISTRATION)
 }
 
 /// Register the exhaustive weights-free memory-contract surface on every build platform.
@@ -243,9 +207,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
-    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    self, AdapterSpec, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -881,22 +845,93 @@ const CONTROL_KINDS: &[gen_core::ControlKind] = &[
     gen_core::ControlKind::Depth,
 ];
 
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    let mut route = base::route_base();
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = route.bindings.with_render_plan(compile_base);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                registered_base_memory_contract,
+            )
+            .with_memory_surface_resolver(weights_free_base_surface_contract)
+            .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
+pub(crate) fn route_turbo_control() -> gen_core::RouteRecord {
+    let mut route = route_turbo();
+    route.route_id = "z_image_turbo_control";
+    route.structure.conditioning.kinds =
+        vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.control_kinds =
+        Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["z_image_vace_control"];
+    route.structure.weight_plan.requires_control_overlay = true;
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings =
+        gen_core::RouteBindings::feature_route(Some(MODEL_ID), turbo_control_descriptor)
+            .with_render_plan(compile_turbo_control)
+            .with_encoder_contract_parent(MODEL_ID);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_composed_memory_registration(TURBO_CONTROL_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                control_memory_contract_surface_specs,
+                registered_turbo_control_memory_contract,
+            )
+            .with_memory_surface_resolver(weights_free_turbo_control_surface_contract)
+            .with_memory_behavior_registration(TURBO_CONTROL_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
+pub(crate) fn route_base_control() -> gen_core::RouteRecord {
+    let mut route = base::route_base();
+    route.route_id = "z_image_control";
+    route.structure.conditioning.kinds =
+        vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.control_kinds =
+        Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["z_image_vace_control"];
+    route.structure.weight_plan.requires_control_overlay = true;
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings =
+        gen_core::RouteBindings::feature_route(Some(base::MODEL_ID), base_control_descriptor)
+            .with_render_plan(compile_base_control)
+            .with_encoder_contract_parent(base::MODEL_ID);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_composed_memory_registration(BASE_CONTROL_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                control_memory_contract_surface_specs,
+                registered_base_control_memory_contract,
+            )
+            .with_memory_surface_resolver(weights_free_base_control_surface_contract)
+            .with_memory_behavior_registration(BASE_CONTROL_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
 pub fn turbo_control_descriptor() -> ModelDescriptor {
-    let mut desc = descriptor();
-    desc.id = "z_image_turbo_control";
-    desc.control_kinds = Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
-    desc.capabilities.conditioning = vec![ConditioningKind::Control, ConditioningKind::Reference];
-    desc.capabilities.supports_low_res_start = false;
-    desc
+    route_turbo_control().compute_descriptor()
 }
 
 pub fn base_control_descriptor() -> ModelDescriptor {
-    let mut desc = base::descriptor();
-    desc.id = "z_image_control";
-    desc.control_kinds = Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
-    desc.capabilities.conditioning = vec![ConditioningKind::Control, ConditioningKind::Reference];
-    desc.capabilities.supports_low_res_start = false;
-    desc
+    route_base_control().compute_descriptor()
 }
 
 fn compile_control_for(
@@ -1011,56 +1046,126 @@ fn experimental_cfg_request(req: &GenerationRequest) -> GenerationRequest {
     request
 }
 
-/// Z-Image-Turbo's identity + the wired surface: distilled txt2img (no CFG, no negative prompt) plus
-/// LoRA/LoKr adapter merge (sc-5166) and reference-guided **img2img** latent-init (sc-11783, a single
-/// `Conditioning::Reference`). Q4/Q8 quantization stays the Python fallback's job until candle wires it,
-/// so the descriptor never promises a path `generate` can't serve. Two backend-correct deviations from
-/// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Z-Image-Turbo (`REG-1`, `AP5`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings =
+        gen_core::RouteBindings::generator(descriptor, load).with_render_plan(compile_turbo);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                weights_free_turbo_memory_contract,
+            )
+            .with_memory_surface_resolver(weights_free_turbo_surface_contract)
+            .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "z-image",
-        // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Turbo is guidance-distilled: no CFG, no negative prompt.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // img2img reference-guided latent-init (sc-11783): a single `Conditioning::Reference` seeds
-            // the CFG-free denoise from the VAE-encoded reference (`render` + `encode_reference`, the
-            // Turbo mirror of the base `z_image` img2img sc-8646). The strict-pose ControlNet + the
-            // `edit_image` masked-edit surfaces stay bespoke worker streams (not registry-advertised).
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr now wired (sc-5166): a trained adapter merges into the dense DiT weights at
-            // load ([`crate::adapters::merge_adapters`]), closing the candle train→infer loop. Q4/Q8
-            // quantization is still deferred (rejected at load, not silently dropped).
-            supports_lora: true,
-            supports_lokr: true,
-            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123). Z-Image-Turbo is
-            // guidance-distilled (4 steps, `euler` recommended), but the curated integrators +
-            // σ-schedules are exposed for ComfyUI parity; the default (`euler` over the native linear
-            // flow-match schedule) is the byte-faithful N1 no-op.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            supports_sequential_offload: true,
-            // Per-step latent previews (epic 16948, sc-16957). Every Turbo render lane emits: the
-            // resident and staged txt2img/img2img routes hand `run_flow_sampler` a projector hook, and
-            // the name-driven control + edit providers' bespoke Euler loops emit directly. The
-            // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(turbo_pag_capability()),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_4b", None)],
+                encoder_contract: Some(ENCODER_CONTRACT),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("z_image_turbo_dit")
+                    .with_low_res_start()
+                    .with_pag(turbo_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(16),
+                ..Default::default()
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_4b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["z_image_turbo_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::DirectoryOrFile,
+                supported_quants: &[],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS as u32),
+            guidance: Some(0.0),
+            sampler: Some("euler"),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Z-Image-Turbo's identity + the wired surface — computed from [`route_turbo`].
+pub fn descriptor() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
 }
 
 fn comfyui_sources_from_spec(
@@ -1314,6 +1419,7 @@ pub fn load_from_comfyui_checkpoint(
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // the explicit family and platform catalogs resolve the candle generator.
+#[cfg(test)]
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 fn registered_turbo_memory_contract(

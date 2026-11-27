@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 
 use crate::memory_strategy::{AdmissionRegistry, SanaLoadSeal, SanaVariant};
@@ -174,91 +174,226 @@ impl SanaGenerator {
     }
 }
 
-/// SANA-1.6B's identity + capabilities — constructible without loading weights for registry
-/// introspection and capability advertisement. True-CFG text-to-image and singular-reference img2img:
-/// negative prompt + guidance scale, flow-match Euler over the unified curated sampler/scheduler menu
-/// (epic 7114).
-/// Control/IP-adapter overlays and LoRA are not wired on the candle base path. The production route
-/// is sealed to the immutable dense upstream snapshot; packed Q4/Q8 and NVFP4 are not advertised.
-/// Backend `"candle"`, `mac_only = false`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle SANA-1.6B base (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "sana",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // A singular reference is latent-init img2img; control/IP-adapter overlays remain unwired.
-            conditioning: vec![ConditioningKind::Reference],
-            // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
-            // native loop (`req.sampler == None`) stays the byte-exact default.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            // A packed quant selector cannot relabel or convert the sealed dense snapshot at load.
-            supported_quants: &[],
-            // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
-            requires_sigma_shift: false,
-            // sc-16959: the base flow lane emits per-step latent previews through
-            // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
-            supports_preview: true,
-            supports_sequential_offload: true,
-            supports_low_res_start: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "gemma2_2b",
+                    Some(crate::text_encoder::MAX_SEQUENCE_LENGTH as u32),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                requires_sigma_shift: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("sana_1600m_dit").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sana_dcae"),
+                output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(32),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["gemma2_2b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["sana_1600m_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sana_dcae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(crate::pipeline::DEFAULT_STEPS as u32),
+            guidance: Some(crate::pipeline::DEFAULT_GUIDANCE),
+            sampler: Some("euler"),
+            shift: Some(3.0),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_render_plan(BASE_RENDER_PLAN_REGISTRATION.compile)
+            .with_memory_registration(crate::memory_strategy::CANDLE_BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(crate::memory_strategy::surface_specs, |spec| {
+                crate::memory_strategy::weights_free_contract(
+                    crate::memory_strategy::SanaVariant::Base,
+                    spec,
+                )
+            })
+            .with_memory_behavior_registration(crate::memory_strategy::BASE_MEMORY_BEHAVIOR),
     }
 }
 
-/// **SANA-Sprint** identity + capabilities (sc-11781) — same `sana` family / `candle` backend / image
-/// modality as the base, but the distilled variant is **CFG-free** (the guidance scale is an *embedded
-/// scalar* fed to the trunk, not classifier-free guidance) and **few-step** (1–4, default 2): so
-/// `supports_true_cfg = false`, `supports_negative_prompt = false`, and NO
-/// `supported_guidance_methods` (the epic-7434 cfg/cfg_rescale/apg/cfg_pp combine operators do not
-/// apply — there is no cond/uncond pair). `supports_guidance` stays `true` because the guidance scale
-/// is still an honored request knob (it modulates the embedded scalar). The SCM/TrigFlow sampler is a
-/// dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised — only
-/// the `"default"` engine sentinel.
-pub fn sprint_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: SPRINT_MODEL_ID,
+/// Primary typed route declaration for Candle SANA-Sprint (`REG-1`, `AP5`).
+pub(crate) fn route_sprint() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: SPRINT_MODEL_ID,
         family: "sana",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
-            supports_negative_prompt: false,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::Reference],
-            // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
-            // epic-7114 `Solver`; only the engine-default sentinel is advertised.
-            samplers: vec!["default"],
-            schedulers: vec!["default"],
-            // CFG-free: no cfg/cfg_rescale/apg/cfg_pp combine (the guidance axis embedded case).
-            supported_guidance_methods: vec![],
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            supported_quants: &[],
-            // sc-16959: the SCM lane emits per-step latent previews through
-            // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
-            // correction the SCM driver's pre-scaled running latent needs.
-            supports_preview: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "gemma2_2b",
+                    Some(crate::text_encoder::MAX_SEQUENCE_LENGTH as u32),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["default"],
+                schedulers: vec!["default"],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "sana_sprint_1600m_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sana_dcae"),
+                output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(32),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["gemma2_2b"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["sana_sprint_1600m_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sana_dcae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(crate::pipeline::SPRINT_DEFAULT_STEPS as u32),
+            guidance: Some(crate::pipeline::SPRINT_DEFAULT_GUIDANCE),
+            sampler: Some("default"),
+            schedule: Some("default"),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(sprint_descriptor, load_sprint)
+            .with_memory_registration(crate::memory_strategy::CANDLE_SPRINT_MEMORY_REGISTRATION)
+            .with_memory_fixture(crate::memory_strategy::surface_specs, |spec| {
+                crate::memory_strategy::weights_free_contract(
+                    crate::memory_strategy::SanaVariant::Sprint,
+                    spec,
+                )
+            })
+            .with_memory_behavior_registration(crate::memory_strategy::SPRINT_MEMORY_BEHAVIOR),
     }
+}
+
+/// SANA-1.6B's identity + capabilities — computed from [`route_base`] without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
+}
+
+/// **SANA-Sprint** identity + capabilities — computed from [`route_sprint`] without loading weights.
+pub fn sprint_descriptor() -> ModelDescriptor {
+    route_sprint().compute_descriptor()
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded weights.
@@ -1071,13 +1206,6 @@ impl Generator for SanaSprintGenerator {
 }
 
 // Named registrations composed by the explicit SANA family and Candle platform catalogs.
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint
-}
-
 pub const BASE_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
     gen_core::RenderPlanRegistration {
         provider_id: MODEL_ID,

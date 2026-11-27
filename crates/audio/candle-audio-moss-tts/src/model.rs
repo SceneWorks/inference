@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
+    self, AudioTrack, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, SpeechSegment, WeightsSource,
 };
 use tokenizers::Tokenizer;
 
@@ -112,29 +112,79 @@ pub const LANGUAGES: &[&str] = &[
     "sv", "hu", "el", "tr",
 ];
 
-/// MOSS-TTSD's identity + capabilities — constructible without weights. `supports_multi_speaker` is
-/// `true` (the model honors `[S1]`/`[S2]` turn labels; the AR brain models them and this is verified
-/// at the token level), with `max_speakers = 2`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[CODEC_COMPONENT_ID],
-        id: MODEL_ID,
+/// Primary typed route declaration for MOSS-TTSD v0.5 (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "moss_ttsd",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            max_count: 1,
-            audio_sample_rates: vec![SAMPLE_RATE],
-            max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_languages: LANGUAGES.to_vec(),
-            supports_multi_speaker: true,
-            max_speakers: Some(MAX_SPEAKERS),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_bpe", None)],
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::non_diffusion("moss_ttsd_ar_delay"),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("xy_tokenizer_codec"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::AudioSynthesize,
+                        ["moss_ttsd_backbone"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["xy_tokenizer_codec"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: &[CODEC_COMPONENT_ID],
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                languages: LANGUAGES.to_vec(),
+                supports_multi_speaker: true,
+                max_speakers: Some(MAX_SPEAKERS),
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
+            max_audio_duration_secs: Some(MAX_DURATION_SECS),
+            ..Default::default()
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// MOSS-TTSD's identity + capabilities — computed from [`route`] without loading weights.
+/// `supports_multi_speaker` is `true` (the model honors `[S1]`/`[S2]` turn labels; the AR brain
+/// models them and this is verified at the token level), with `max_speakers = 2`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Capability-driven request validation, factored out for weightless unit tests.
@@ -460,11 +510,12 @@ candle_audio::register_generators! {
 }
 
 /// Add the MOSS-TTSD multi-speaker dialogue-TTS generator to an explicit audio registry builder
-/// (catalog composition), mirroring the sibling audio provider crates.
+/// via one-call [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry.register_route(route())
 }
 
 /// Build this crate's own explicit provider catalog (its single-generator surface).

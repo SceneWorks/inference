@@ -68,13 +68,18 @@ TEXT_ROUTES = {
 # Most crates expose exactly one model::REGISTRATION. These are the catalog's variant factories,
 # including families which register an array via fold and those re-exporting their builder.
 VARIANT_REGISTRATIONS = {
+    "acestep": {"model::route"},
+    "chatterbox": {"model::route"},
     "kokoro": {"model::route"},
-    "mmaudio": {"generator::REGISTRATION", "generator_44k::REGISTRATION"},
+    "mmaudio": {"generator::route", "generator_44k::route"},
+    "moss-sfx": {"model::route"},
+    "moss-tts": {"route"},
+    "moss-tts-realtime": {"route"},
     "stable-audio-3": {"model::" + symbol for symbol in (
-        "REGISTRATION", "SFX_REGISTRATION", "MEDIUM_REGISTRATION", "MUSIC_BASE_REGISTRATION",
-        "SFX_BASE_REGISTRATION", "MEDIUM_BASE_REGISTRATION")},
-    "yue": {"REGISTRATION_" + language + "_" + mode for language in ("EN", "ZH", "JP_KR") for mode in ("COT", "ICL")},
-    "yue2": {"REGISTRATION"},
+        "route", "sfx_route", "medium_route", "music_base_route",
+        "sfx_base_route", "medium_base_route")},
+    "yue": {"model::route_" + language + "_" + mode for language in ("en", "zh", "jp_kr") for mode in ("cot", "icl")},
+    "yue2": {"provider::route"},
 }
 
 
