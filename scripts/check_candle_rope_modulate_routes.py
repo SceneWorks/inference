@@ -17,7 +17,8 @@ a `?`-chained `+ - *` operator): it delegates to the shared helpers, or only bui
 tables/positions. The justified exceptions (trainer twins that must keep their composable ops -
 epic E9 -, table builders, conventions the shared helpers do not express) are listed with a
 reason in `crates/media/candle-gen/rope_modulate_routes.json`, next to the per-crate route table.
-A new private rotation or modulation therefore fails this gate until it is routed through the
+Each crate row's `modulate` route must name the shared fused AdaLN (`shared fused: ...`), `n/a`
+(no AdaLN) or `kept: <reason>`. A new private rotation or modulation therefore fails this gate until it is routed through the
 shared helpers or recorded with a reason; an exception that no longer matches (renamed, removed, or
 no longer arithmetic) fails as stale, so the table cannot drift from the code. `#[cfg(test)]`
 items and `tests.rs` / `*_tests.rs` files are not scanned.
@@ -42,6 +43,8 @@ CANDLE_GEN = ROOT / "crates" / "media" / "candle-gen"
 TABLE = CANDLE_GEN / "rope_modulate_routes.json"
 EXCEPTION_ROUTES = ("trainer", "table", "kept")
 INLINE_MODULATE_FN = "<inline modulate>"
+# A crate's `modulate` route: the shared fused AdaLN, no AdaLN at all, or kept with a reason.
+MODULATE_ROUTES = ("shared fused:", "n/a", "kept:")
 
 NAME = re.compile(r"rope|rotary|rotate|modulat", re.IGNORECASE)
 FN = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]")
@@ -237,6 +240,15 @@ def check(root: Path = ROOT, table: dict | None = None) -> list[str]:
         for field in ("rope", "modulate"):
             if len(str(row.get(field, "")).strip()) < 4:
                 errors.append(f"{crate}: route table row needs a `{field}` route")
+        # SW-6129: every crate's AdaLN either runs the shared fused kernel or says why not.
+        route = str(row.get("modulate", "")).strip()
+        if not route.startswith(MODULATE_ROUTES):
+            errors.append(
+                f"{crate}: the `modulate` route must start with one of {MODULATE_ROUTES} "
+                "(the shared fused AdaLN, no AdaLN, or a kept reason)"
+            )
+        elif route.startswith("kept:") and len(route) < 25:
+            errors.append(f"{crate}: a kept `modulate` route needs its reason")
     found = scan(root)
     excepted: dict[tuple[str, str], dict] = {}
     for row in data["exceptions"]:

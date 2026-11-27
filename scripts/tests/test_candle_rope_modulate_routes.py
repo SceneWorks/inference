@@ -90,7 +90,7 @@ mod tests {
 }
 """
 
-ROW = {"rope": "shared: rope::apply_rope", "modulate": "shared: modulate::modulate"}
+ROW = {"rope": "shared: rope::apply_rope", "modulate": "shared fused: modulate::adaln_chain"}
 
 
 class RouteGate(unittest.TestCase):
@@ -164,6 +164,19 @@ class RouteGate(unittest.TestCase):
         self.assertEqual(bad, ["candle-gen-demo: has RoPE/modulate functions but no route-table row"])
         ghost = gate.check(self.tree({}, crates={"candle-gen-ghost": ROW}))
         self.assertTrue(any("does not exist: candle-gen-ghost" in e for e in ghost), ghost)
+
+    def test_the_modulate_route_names_the_fused_adaln_or_a_reason(self):
+        files = {"candle-gen-demo/src/attention.rs": SHARED_ROPE}
+        for route, ok in [
+            ("shared fused: modulate::adaln_chain Layer f32", True),
+            ("n/a (no adaLN)", True),
+            ("kept: the norm output is reused unmodulated elsewhere", True),
+            ("kept: why", False),
+            ("shared composable: modulate::modulate", False),
+        ]:
+            crates = {"candle-gen-demo": {**ROW, "modulate": route}}
+            errors = gate.check(self.tree(files, crates=crates))
+            self.assertEqual(errors == [], ok, (route, errors))
 
     def test_comment_and_string_arithmetic_is_ignored(self):
         text = 'fn rope_label() -> &\'static str { "x.broadcast_mul(add(x))" }\n'
