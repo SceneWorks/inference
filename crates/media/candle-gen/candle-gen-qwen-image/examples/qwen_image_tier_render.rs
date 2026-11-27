@@ -104,7 +104,7 @@ fn main() {
     let mut steps_total: Option<u32> = None;
     let mut on_progress = |p: Progress| {
         if let Progress::Step { current, total } = p {
-            steps_total = Some(total as u32);
+            steps_total = Some(total);
             if first_step_secs.is_none() {
                 first_step_secs = Some(started.elapsed().as_secs_f64());
             }
